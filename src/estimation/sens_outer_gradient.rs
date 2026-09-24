@@ -387,6 +387,8 @@ pub(crate) struct Prep {
     /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
     pub(crate) htilde_inv: DMatrix<f64>,
     /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
+    /// Built by `invert_inner_hessian`, whose Cholesky is a **precondition** gate and
+    /// not merely a matrix-shape one — see there before widening it.
     pub(crate) h_inner_inv: DMatrix<f64>,
     /// `wⱼ = H̃⁻¹aⱼ`.
     pub(crate) w: Vec<DVector<f64>>,
@@ -456,12 +458,16 @@ fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
 /// the objective bit-for-bit.
 ///
 /// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) would need
-/// the full dense `M_k`/`B_{kl}` assembly, but such models require a per-CMT / Form-C
-/// or covariate-selected (#669) multi-endpoint readout that is out of analytic scope
-/// (they run FD). The off-diagonal check is a defensive guard: if one ever reaches
-/// here, bail to FD rather than silently drop the off-diagonals. The endpoint keys are
-/// resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row branch — not the
-/// raw CMT column — drives the diagonal variance builders.
+/// the full dense `M_k`/`B_{kl}` assembly, which this path does not have, so such a
+/// subject is declined. That is **not** a rare defensive case: a covariate-selected
+/// (#669) `block_sigma` model with paired rows (`fluconazole_radboudumc`) routes to the
+/// analytic outer gradient at model level, and every paired subject declines here at
+/// every evaluation. The decline is keyed on
+/// [`crate::stats::residual_error::has_cross_observation_residual`] — the same predicate
+/// the outer assembly reads to give these subjects a reconverged gradient rather than the
+/// held-EBE one (#1536) — so the two cannot disagree about which subjects they are. The
+/// endpoint keys are resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row
+/// branch — not the raw CMT column — drives the diagonal variance builders.
 fn corr_residual_diag(
     model: &CompiledModel,
     subject: &Subject,
@@ -473,6 +479,13 @@ fn corr_residual_diag(
         compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
     };
     let es = &model.error_spec;
+    // Only diagonal R is served by the scalar reduction (see the doc above). Keyed on the
+    // pairing itself rather than on `|R_jk| > 0`, so a paired row whose value covariance
+    // is momentarily zero still declines: at `f = 0` on a proportional row its `∂R_jk/∂f`
+    // is not zero, and at ρ = 0 its `∂R_jk/∂ρ` is not — both terms this path would drop.
+    if crate::stats::residual_error::has_cross_observation_residual(es, subject, sigma, corr) {
+        return None;
+    }
     // #669: per-observation endpoint keys must come from the covariate selector
     // (`obs_keys`), not the raw CMT column — a `Selected` spec keys endpoints by
     // branch index, decoupled from `obs_cmts` (typically all-1 on an analytical
@@ -493,14 +506,6 @@ fn corr_residual_diag(
         sigma,
         corr,
     );
-    // Guard: only diagonal R is served by the scalar reduction (see the doc above).
-    for a in 0..n {
-        for b in 0..n {
-            if a != b && r[(a, b)].abs() > 1e-12 {
-                return None;
-            }
-        }
-    }
     let dr = compute_dr_df_matrices(
         es,
         &ipreds,
@@ -1122,6 +1127,62 @@ pub(crate) fn score_core(
     })
 }
 
+/// Invert the exact inner Hessian `H` for the implicit-function derivative
+/// `dη̂/dζ = −H⁻¹M` — **by Cholesky, deliberately** (#1513).
+///
+/// A Cholesky tests positive-definiteness, and `−H⁻¹M` needs only nonsingularity, so this
+/// reads like a gate that is one degree too strict. It is not, and the gap is load-bearing:
+/// at an unconstrained local minimum a nonsingular Hessian *must* be PD, so a failed
+/// Cholesky on a nonsingular `H` is a proof that the `eta_hat` handed to this assembly is
+/// **not the minimizing EBE** the `subject_*_gradient` contract requires. `H` carries the
+/// `∂L/∂f · ∂²f/∂η²` curvature term that the Gauss-Newton `H̃` drops, which is exactly why
+/// it — and not `H̃` — can notice.
+///
+/// The identity `dη̂/dζ = −H⁻¹M` differentiates the inner stationarity condition
+/// `∂l/∂η|η̂ = 0`. Where that condition does not hold the formula is inverting a real
+/// matrix and returning a derivative of nothing: it follows a saddle or non-stationary
+/// branch rather than the profiled minimum the outer objective is defined by. So the
+/// Cholesky is not a matrix-shape check that happens to be conservative — it is the
+/// precondition detector, and it is the only one in this path.
+///
+/// **This was tried.** #1513 proposed falling back to a full-pivot LU here, on the
+/// reasoning above ("exact where the identity holds, nothing substituted"), with a
+/// measured 4.1× fit speedup on a 55-subject ODE model. Measured against
+/// `subject_reconverged_fd_gradient` over the 16 decline events of a full
+/// `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv` fit, with the PD subjects of
+/// the same fit as the noise floor:
+///
+/// | | `‖∂l/∂η‖∞` median | `‖g−g_fd‖₂/‖g_fd‖₂` median | cos(g, g_fd) median / min |
+/// |---|---|---|---|
+/// | PD subjects (this path), n = 904 | 3.9e-6 | 1.4e-3 (max 0.25) | 0.999999 / 0.970 |
+/// | LU-served non-PD, n = 16 | 1.7e-2 | **0.378** | **0.933 / 0.032** |
+///
+/// 10 of the 16 were worse than the *worst* PD subject, and the direction was near
+/// orthogonal to the reconverged-FD gradient at a quarter of them. The `H` matrices were
+/// well-conditioned throughout (spectral condition number 1.2 … 1.7e2), so this is the
+/// broken precondition and not a conditioning artifact. The speedup was bought by
+/// replacing correct-but-slow gradients with fast wrong ones; the fit still landed at the
+/// same optimum, which is why an OFV comparison cannot be the acceptance criterion here.
+///
+/// Two consequences worth keeping in mind before reopening this:
+///
+/// * **A magnitude guard is not a substitute either.** `FullPivLU::is_invertible` tests
+///   the final pivot against *exact* zero, so an LU here would also admit a
+///   condition-1e19 `H` as a huge finite inverse, which
+///   `subject_analytic_outer_gradient`'s `is_finite` backstop accepts into the L-BFGS
+///   memory. The Cholesky declines that case today.
+/// * **The cost is real and belongs elsewhere.** Each decline buys a
+///   `subject_reconverged_fd_gradient` — `2·n_free` warm EBE re-solves for one subject,
+///   0.786 s against 0.0054 s for an entire 55-subject analytic population gradient. The
+///   fix for that is at the policy layer (not spending the salvage at a trial point whose
+///   objective has already blown up) and upstream (the 16 subjects above sit at
+///   `‖∂l/∂η‖∞ ≈ 1.7e-2` while their PD peers reach 3.9e-6 in the same fit, at the same
+///   `inner_tol` — an inner solve that converged would be PD and analytic for free), not
+///   by widening this gate.
+fn invert_inner_hessian(h_inner: DMatrix<f64>) -> Option<DMatrix<f64>> {
+    Some(h_inner.cholesky()?.inverse())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_stacked(
     model: &CompiledModel,
@@ -1152,7 +1213,7 @@ pub(crate) fn prepare_stacked(
     )?;
 
     let htilde_inv = htilde.cholesky()?.inverse();
-    let h_inner_inv = h_inner.cholesky()?.inverse();
+    let h_inner_inv = invert_inner_hessian(h_inner)?;
 
     let mut w: Vec<DVector<f64>> = Vec::with_capacity(n_obs);
     let mut q = vec![0.0f64; n_obs];
@@ -2097,9 +2158,10 @@ fn population_sum(
 /// [`per_subject_packed_gradients`] / [`per_subject_packed_gradients_iov`] via
 /// `population_gradient_sens_mixed`, which keeps the exact analytic gradient for
 /// in-scope, finite subjects and fills only the `None`/non-finite ones with a
-/// per-subject reconverged FD. So a transiently non-PD inner Hessian (e.g. a
-/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` cholesky fails)
-/// degrades **that subject** to FD, not the whole population.
+/// per-subject held-EBE gradient (reconverged FD under IOV; #1529). So a subject the
+/// analytic path declines (e.g. a degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose
+/// `h_inner` is singular — merely indefinite is handled by `invert_inner_hessian`'s LU
+/// fallback, #1513) degrades **that subject**, not the whole population.
 pub fn population_gradient_sens(
     model: &CompiledModel,
     population: &Population,
@@ -2119,7 +2181,7 @@ pub fn population_gradient_sens(
 /// which short-circuits the *whole* population to `None` on the first
 /// out-of-scope subject, this exposes the per-subject result so the caller can
 /// keep the exact analytic gradient for the in-scope subjects and fill only the
-/// out-of-scope ones with a reconverged-FD gradient. One out-of-scope subject no
+/// out-of-scope ones with a per-subject held-EBE gradient (#1529). One out-of-scope subject no
 /// longer disables the exact gradient for the other thousands — the all-or-
 /// nothing fallback dropped to the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum
@@ -2229,14 +2291,68 @@ fn foce_low_rank_trace_quad(
     (trace, quad)
 }
 
-fn foce_rtilde_inverse(
+/// Largest Ω-normalised information trace at which the Woodbury form of `R̃⁻¹` is
+/// still used (#1498).
+///
+/// Woodbury needs `(Ω⁻¹ + JᵀD⁻¹J)⁻¹`. With `Ω = LLᵀ` that is `L(I + LᵀJᵀD⁻¹JL)Lᵀ`
+/// inverted, and [`foce_rtilde_inverse`] factors the bracket — `I + S` with
+/// `S = LᵀJᵀD⁻¹JL ⪰ 0` — rather than the unnormalised `M = Ω⁻¹ + JᵀD⁻¹J`. That matters
+/// because this constant bounds the conditioning of the bracket and of nothing else:
+/// `cond(I + S) ≤ 1 + λ_max(S) ≤ 1 + tr(S)`, while `cond(M) ≥ cond(Ω⁻¹)` carries the
+/// conditioning of Ω itself, which the bound says nothing about (a near-rail
+/// `block_omega`, `ρ → ±1`, makes `cond(M) ~ 1e12` at `tr(S) = O(10³)` — see
+/// `near_rail_block_omega_keeps_woodbury_and_matches_dense`).
+///
+/// `tr(S) = tr(ΩJᵀD⁻¹J) = Σᵢ (JᵢᵀΩJᵢ)/r0ᵢ` — a sum of per-observation
+/// signal-to-noise ratios that [`woodbury_terms`] gets for `n_eta²` flops from the
+/// `JᵀD⁻¹J` the form already builds, and it is basis-independent, so it can be read
+/// before `L` is formed. A Cholesky inverse at condition number `κ` keeps `≈ eps·κ`
+/// relative accuracy, so this is the one quantity available *before* the subtraction
+/// that says whether it has digits left.
+///
+/// Measured (macOS/arm64, debug) over every per-subject FOCE gradient call of a whole
+/// fit, realised as `‖dense⁻¹ − woodbury‖_max / ‖dense⁻¹‖_max`:
+///
+/// | fixture | worst `1 + tr(S)` | worst realised relative error |
+/// |---|---|---|
+/// | `examples/warfarin.ferx` FOCE, 1320 calls, `nq = 11` | `2.742e4` | `1.6e-12` |
+/// | `data/ss_oral_q24.csv` FOCE, `nq = 4` (smallest `1.2e11`) | `3.1e13` | `2.7e-1` |
+///
+/// `1e6` bounds the predicted error at `eps·1e6 ≈ 2.2e-10`, sits 36× above the worst
+/// well-conditioned trace measured and 1.2e5× below the *smallest* ill-conditioned one.
+/// Anywhere in `[1e5, 1e9]` separates the two populations, so the exact value is not
+/// load-bearing; `woodbury_info_trace_straddles_the_gate` pins both sides of it.
+///
+/// What puts the SS-oral fixture seven to nine orders away is structural, not exotic. `R̃`
+/// mixes a Jacobian taken at `η̂` with a residual variance frozen at `η = 0` (ferx's
+/// no-interaction FOCE semantics), so where the *typical* individual's prediction has
+/// decayed below `MIN_VARIANCE` (`1e-12`) but the *subject's* has not, one row enters
+/// `JᵀD⁻¹J` with weight `1e12` and an `O(1)` Jacobian against `Ω⁻¹ = 20·I`. Inverting
+/// that near-rank-one matrix is what destroys the correction term — not the diagonal
+/// subtraction, which is why the diagonal-only stability test this replaces never fired
+/// on it: on #1498 the outer L-BFGS quit after two evaluations on a gradient built from
+/// an `R̃⁻¹` carrying 16–27% error, and the fit reported `converged = false` at OFV
+/// 1012.75 instead of reaching −54.16.
+const WOODBURY_MAX_INFO_TRACE: f64 = 1e6;
+
+/// `D⁻¹J`, `info = JᵀD⁻¹J`, and the gate quantity `1 + tr(Ω·info)`, in one pass.
+///
+/// Single source for [`WOODBURY_MAX_INFO_TRACE`]: the production path below and the
+/// test that pins the threshold's separation read the same number, so the gate cannot
+/// drift from what was measured. `info` is symmetric and `tr(Ω·info) = Σ_ab Ω_ab info_ab`
+/// by the cyclic property, which is the elementwise dot product — no extra matrix
+/// product, and no dependence on `L`, since `tr(LᵀJᵀD⁻¹JL) = tr(ΩJᵀD⁻¹J)`.
+///
+/// A zero or non-finite `r0ᵢ` sends `info_trace` to `∞` (a non-zero Jacobian row over a
+/// zero variance) or to `NaN` (a zero one, from `0·∞`), and the gate is spelled
+/// `!(info_trace <= MAX)` so both fail it. That is the whole of the input-sanity check
+/// on this path — see `woodbury_gate_rejects_a_zero_residual_variance`, which is what
+/// dies if the predicate is respelled `info_trace > MAX`.
+fn woodbury_terms(
     jmat: &DMatrix<f64>,
     omega: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
     r0: &[f64],
-) -> Option<DMatrix<f64>> {
-    // Woodbury: (D + JΩJᵀ)⁻¹ = D⁻¹ − D⁻¹J(Ω⁻¹+JᵀD⁻¹J)⁻¹JᵀD⁻¹.
-    // The expensive factorisation is n_eta×n_eta instead of n_obs×n_obs.
+) -> (DMatrix<f64>, DMatrix<f64>, f64) {
     let mut dinv_j = jmat.clone();
     for i in 0..dinv_j.nrows() {
         let inv = 1.0 / r0[i];
@@ -2244,30 +2360,69 @@ fn foce_rtilde_inverse(
             dinv_j[(i, k)] *= inv;
         }
     }
-    let middle = omega_inv + jmat.transpose() * &dinv_j;
-    let middle_inv = middle.cholesky()?.inverse();
-    let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
-    let mut unstable = false;
-    for i in 0..out.nrows() {
-        let dinv = 1.0 / r0[i];
-        let correction = -out[(i, i)];
-        out[(i, i)] += dinv;
-        // Only the diagonal performs a subtraction. If its result is tiny relative to
-        // the two operands, Woodbury has lost useful digits and the dense form is safer.
-        unstable |= !out[(i, i)].is_finite()
-            || out[(i, i)] <= f64::EPSILON.sqrt() * (dinv + correction).abs();
-    }
-    if !unstable && out.iter().all(|v| v.is_finite()) {
-        return Some(out);
-    }
+    let info = jmat.transpose() * &dinv_j;
+    let info_trace = 1.0 + omega.dot(&info);
+    (dinv_j, info, info_trace)
+}
 
-    // The subtractive Woodbury form can lose all significant digits when D is tiny
-    // relative to JΩJᵀ. The original observation-sized Cholesky is the rare fallback.
-    let mut dense = jmat * omega * jmat.transpose();
-    for i in 0..dense.nrows() {
-        dense[(i, i)] += r0[i];
+/// `(D + JΩJᵀ)⁻¹` over the Sheiner–Beal quantified rows.
+///
+/// Woodbury factors `n_eta×n_eta` instead of `n_obs×n_obs`, but it is a subtractive
+/// identity and loses digits in proportion to the conditioning of the matrix it
+/// factors. So it is written in the **Ω-normalised** form — with `Ω = LLᵀ` and
+/// `B = D⁻¹JL`,
+///
+/// ```text
+/// R̃⁻¹ = D⁻¹ − B (I + LᵀJᵀD⁻¹JL)⁻¹ Bᵀ
+/// ```
+///
+/// which is the same identity (`(Ω⁻¹+JᵀD⁻¹J)⁻¹ = L(I + LᵀJᵀD⁻¹JL)⁻¹Lᵀ`) with the
+/// factored matrix replaced by the one [`WOODBURY_MAX_INFO_TRACE`] actually bounds.
+/// Factoring the unnormalised `Ω⁻¹ + JᵀD⁻¹J` instead inherits `cond(Ω)`, which the gate
+/// does not see: a near-rail `block_omega` degrades it while `1 + tr(S)` stays `O(10³)`.
+///
+/// Above the bound this assembles `R̃` and factors it at observation size, which is
+/// graded-SPD and componentwise stable there. A singular Ω — no Cholesky — takes the
+/// same route, since the dense form needs only `Ω` itself.
+fn foce_rtilde_inverse(
+    jmat: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
+    r0: &[f64],
+) -> Option<DMatrix<f64>> {
+    let (dinv_j, info, info_trace) = woodbury_terms(jmat, omega, r0);
+    // One decision, two reasons to decline, no overlap between them: a conditioning
+    // bound the subtraction can be trusted under — `!(x <= MAX)`, so a non-finite or
+    // `NaN` trace fails it too — and a Cholesky factor of Ω to normalise by, which a
+    // random effect fixed to zero variance does not have. The dense form needs neither,
+    // only Ω itself.
+    let factor = if !(info_trace <= WOODBURY_MAX_INFO_TRACE) {
+        None
+    } else {
+        omega.clone().cholesky().map(|c| c.l())
+    };
+    let Some(l) = factor else {
+        let mut dense = jmat * omega * jmat.transpose();
+        for i in 0..dense.nrows() {
+            dense[(i, i)] += r0[i];
+        }
+        return dense.cholesky().map(|c| c.inverse());
+    };
+
+    let b = &dinv_j * &l;
+    let mut middle = l.transpose() * &info * &l;
+    for a in 0..middle.nrows() {
+        middle[(a, a)] += 1.0;
     }
-    Some(dense.cholesky()?.inverse())
+    // `I + S` is SPD by construction and finite because the trace gate admitted it, so
+    // this `?` is the library's signature rather than a second fallback with a story:
+    // the only way to reach it is to mutate the gate (measured —
+    // `woodbury_gate_rejects_a_zero_residual_variance` is what dies).
+    let middle_inv = middle.cholesky()?.inverse();
+    let mut out = -(&b * middle_inv * b.transpose());
+    for i in 0..out.nrows() {
+        out[(i, i)] += 1.0 / r0[i];
+    }
+    Some(out)
 }
 
 pub fn subject_packed_gradient_foce(
@@ -2418,7 +2573,7 @@ pub fn subject_packed_gradient_foce(
     }
 
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
-    let rtilde_inv = foce_rtilde_inverse(&jmat, omega, &params.omega.inv, &r0)?;
+    let rtilde_inv = foce_rtilde_inverse(&jmat, omega, &r0)?;
     let u = &rtilde_inv * &rho;
     let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×nq)
     let ojt_u = &ojt * &u;

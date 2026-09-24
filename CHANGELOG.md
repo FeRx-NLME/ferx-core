@@ -19,6 +19,149 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **The per-subject finite-difference outer-gradient salvage is no longer bought at a
+  blown-up line-search trial.** A subject the analytic outer gradient declines is salvaged
+  with `2·n_free` warm EBE re-solves — and most of that cost went to trial points the
+  optimizer was about to reject, with individual objectives thousands to `1e15` units above
+  the incumbent. Under NLopt SLSQP and MMA such a subject now contributes nothing to the
+  outer gradient there instead, at points those optimizers' own acceptance tests reject —
+  the guard measures a trial against the point each test compares against, and stays off
+  where no such point is observable (NLopt L-BFGS, the default for analytic models, is
+  unchanged). At every other point the salvage runs exactly as before, and every bundled
+  SLSQP fit the guard fires on keeps its estimates, OFV, iteration count and sdtab
+  byte-identical. The "blown up" line is measured, not chosen: both the subject's and the
+  population's objective must exceed the reference by more than 12 units per observation,
+  which sits in the gap between the largest ordinary rejected trial (6.0) and the smallest
+  blown-up one (21.8) across the bundled examples. The per-subject FD-fallback warning now
+  says how many salvages were skipped (#1520).
+- **A transit / inverse-Gaussian absorption fit that leaves the closed form's domain no
+  longer grinds its inner EBE loop.** When the estimates drive `ke` past the absorption
+  abscissa (`ke ≥ KTR`, the flip-flop regime) ferx reroutes the subject to the model's ODE
+  twin, so its individual objective picks up the adaptive solver's noise floor — but the
+  inner loop's objective-stall stop, which exists for exactly that situation, was keyed
+  only on the subject-static reroutes (time-varying covariate / `TIME` / IOV) and stayed
+  off. Those subjects were held to an exact `gnorm < inner_tol` they cannot reach, ran out
+  of iterations or line-search steps, and each bought a Nelder-Mead recovery of up to
+  `5 × inner_maxiter` iterations. On `examples/one_cpt_transit.ferx` +
+  `data/datsim_oral.csv` (100 subjects, FOCEI) every one of the fit's 8,769 failed inner
+  solves was such a subject and none of its 1,529 in-domain closed-form solves failed;
+  the fit goes from **142.6 s to 3.5 s (41×)** with the OFV moving 6e-4 (1215.9771 →
+  1215.9777). Subjects that were never rerouted — every non-transit/IG model, and any
+  transit/IG fit that stays in domain — are bit-identical
+  ([#1519](https://github.com/FeRx-NLME/ferx-core/issues/1519)).
+- **The covariance step no longer abandons the exact analytic R-matrix for the whole
+  population when one subject is out of scope.** The observed information is the sum
+  `Σᵢ Rᵢ`, and each term is the second derivative of one subject's own marginal, so a
+  subject outside the analytic scope is now finite-differenced **on its own** — from the
+  same objective, at the same converged point, warm-started from the same modes — while
+  every other subject keeps its exact term. On a 55-subject 2-state ODE FOCEI fit with 13
+  free parameters where one subject declined, the covariance step went from 23.4 s to
+  2.0 s (**11.5×**, −38 % total wall) with estimates and OFV identical to every printed
+  digit. Standard errors move 8.4e-5 relative when one subject in ten is salvaged — 3.2×
+  below the gap between the whole-population FD and whole-population analytic routes that
+  ferx already ships as interchangeable. Model-level exclusions (`method = laplace`, a
+  mixture, `gradient = fd`, `analytic_cov_hessian = false`) are unchanged, and a
+  population where at least half the subjects decline still takes the whole-population
+  stencil ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
+### Changed
+- **New informational warning `W_COV_ANALYTIC_SALVAGE`,** emitted when the covariance step
+  assembled the analytic R-matrix for most of the population and finite-differenced the
+  rest. It names the salvaged subjects (the printed id list is deduplicated and capped at ten
+  with a count of the remainder; the counts are per subject) and the split.
+  `severity = info`, `code = covariance_step`: the parameter estimates and the OFV are
+  unaffected and the information matrix is complete, but the standard errors do move slightly,
+  because the salvaged subjects' terms come off a different estimator — measured at 3.7e-4
+  relative for one subject in ten, about a tenth of the gap between the two whole-population
+  estimators ferx already ships as interchangeable. That is what the note is for. It is not
+  emitted under `covariance_method = s`, which reports `S⁻¹` and never uses the R-matrix the
+  salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
+### Fixed
+- **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
+  The floor replaces a direction of negative or near-zero curvature with a finite one, so the
+  condition number and correlations the `max_condition_number` / `max_correlation` gates read
+  no longer showed the problem: on warfarin, `modelsearch`'s collapsed one-peripheral
+  candidate (V2 → 0, Q free, TVQ RSE 293519 %) read a condition number of 2.98 and passed.
+  While either gate is enabled, the `Covariance step regularized: eigenvalue floor applied`
+  warning now fails the fit with its own reason. A resumed search re-judges every journalled
+  candidate from its cached fit rather than trusting the verdict in the journal, so the gate
+  also reaches a run interrupted before this change (#1512).
+- **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
+  that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
+  reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
+  the build info reported an analytic outer gradient where none was used. An explicit
+  optimizer that a mixture replaces with BOBYQA (built-in BFGS/L-BFGS, trust-region) is
+  now reported as `bobyqa` too. Both reports now read the outer loop's own resolution
+  rule (#1540).
+- **A data cell that is not a number is an error instead of a silent `0`.** `DV = abc` used
+  to be scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, and
+  `ADDL = abc` dropped the additional doses, all without a warning. A present cell that is
+  not a number in `TIME`, `EVID`, `MDV`, `AMT`, `RATE`, `II`, `SS`, `ADDL`, `DV`, `TENTRY`
+  or `FREMTYPE` (or a fraction in a whole-number column) is now rejected on a record that
+  reads the column and that `[data_selection]` keeps, naming the subject, time, column and
+  cell — as NONMEM rejects it. A `[data_selection]` rule that would decide a record on such
+  a cell (`ignore = CENS == 0` on `CENS = abc`) is an error naming the rule. Missing cells
+  (`.`, blank, `NA`, `NaN`) keep their defaults — `RATE=NaN` and `SS=NaN` on a dose used to
+  be rejected as non-finite, and `TIME=NaN` read as an undefined time — and `CMT`, the
+  occasion column and `L2` keep their existing handling (#1501).
+- **Two follow-ups to the #1501 cell checks (#1541 review).** A `[data_selection]` rule
+  that reads `SS` on a dose record with `SS = 1.5` or `SS = -1` is refused with the message
+  that says what `SS` accepts (`0` or `1`), the same words the record gets with no rule,
+  instead of the `usize` range the filter reads the column in. And a record whose `EVID`,
+  `MDV` or (with no `EVID` column) `AMT` cell is not a number, removed by a rule that does
+  not read that cell, is now tallied under `Other excluded` rather than as the observation
+  or dose the reader's fallback for the cell made it look like.
+- **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
+  gets the reconverged outer gradient again.** Such a subject (for example, total and
+  unbound assays paired at one time) is outside the analytic outer gradient at every
+  parameter point. Since #1529 it had been given the held-EBE gradient, which omits the
+  EBE-response term, and on a model where every subject is paired that was the only
+  gradient the fit had. The 31-subject `fluconazole_radboudumc` model (FOCEI, L-BFGS)
+  stalled at OFV 810.28 instead of 738.05 (NONMEM: 734.64). It now reaches 738.05 again, in
+  16.5 s against 20.8 s before #1529. Declines that depend on the trial point still follow
+  `reconverge_gradient_interval`. The fallback warning now says how many subjects got each
+  gradient. The analytic path also declines a paired subject whose cross-covariance is
+  momentarily zero (ρ = 0, or `f = 0` on a proportional row), because the derivative terms
+  it would drop are not zero there (#1536).
+- **Analytic ODE covariance: the third-order sweep no longer differences across a
+  lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
+  R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and
+  non-monotone in the step: the sweep's `TVLAG` step (1 % of parameter scale) shifted every
+  arrival by more than the gap to the nearest early sample, so the pair differenced a
+  pre-/post-arrival jump instead of a derivative. The sweep now enumerates the subject's
+  dose events — lagged arrivals, infusion ends, per-route onsets, `zero_order` window edges
+  — at both perturbed points with the ODE engine's own break-time builder and shrinks the
+  step until no observation, `EVID=2`, reset or dose record changes sides of an event. A
+  subject whose mode sits *on* a moving event (a corner minimum of the inner objective,
+  which a lagged arrival at a dense early sample does produce) has no third derivative
+  there and declines to the #1514 per-subject salvage, named in the
+  `W_COV_ANALYTIC_SALVAGE` note. On the regression fixture the default-tolerance standard
+  errors are now within `5e-5` of the `ode_reltol = 1e-9` run and within `1.1e-2` of the
+  finite-difference covariance route. The mixed θ-θ third-order blocks are also
+  symmetrised — the two finite-difference estimates of each pair averaged, as the η pairs
+  already were — so a bounded step on one axis no longer leaves the natural Hessian
+  asymmetric at the `1e-7` level
+  ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)).
+- **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
+  As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
+  units — during exploration γ = 1, so that is a full Newton step to a single draw's
+  score root with no Robbins–Monro averaging, and a log-scale blend is a geometric mean
+  of the σ sequence. On #1445's own sparse combined-error fixture (300 subjects, median
+  one observation each, truth `combined(0.13, 1.8)`) `score_sa` returned `ADD_ERR`
+  0.84 / 0.52 / 1.13 over three seeds where the default solver returns 1.33 / 1.83 /
+  2.17. The σ half of the step now produces a *target* that the same
+  `min(γ, 0.2, γ_mstep)` variance-scale blend the default solver uses moves σ part of
+  the way to: 1.90 / 1.86 / 2.11 on the same three seeds, with the cross-seed spread
+  down from 0.31 to 0.14. `mstep_damping` reaches σ under `score_sa` as a result. Fits
+  that do not set `mstep_solver = score_sa` are bit-identical to before, and on the
+  cefepime model `score_sa`'s objective is unchanged-to-better
+  ([#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480),
+  [#1475](https://github.com/FeRx-NLME/ferx-core/issues/1475)). `score_sa` remains
+  opt-in: it still converges more slowly than `bobyqa` on a no-ETA θ that starts far
+  from its optimum.
+
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
   on being off target.** Under `scale_adaptation = robbins_monro` the step fires only
@@ -221,6 +364,53 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **The `covariance_regularized` warning is graded on magnitude, names the route it applies
+  to, and says how to get off it** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)).
+  Severity used to be a function of the clipped **count** alone, so a single badly-negative
+  eigenvalue — 1 of 13, 7 % — printed *"severity: minor. Standard errors are likely reliable."*
+  directly above a standard error inflated 4400× and a `%RSE` of 24982. It is now graded on
+  `|min eig| / max eig` and on the worst **variance inflation** the eigenvalue floor caused (how
+  much of a parameter's reported variance came out of the floor rather than out of the data),
+  both of which the message now reports. The inflation is measured on the covariance the fit
+  actually **returns** — after the selected estimator (so `covariance_method = rsr`'s sandwich
+  responds to `S`) and after the delta transform that produces a reported block-Ω standard
+  error — and which of the two magnitudes carried the grade decides what the message then says
+  about the standard errors, instead of one sentence being printed for both. The severity tiers
+  are calibrated against measured regularized fits with quoted reference errors rather than
+  picked. When the finite-difference stencil served the step, the message additionally names
+  **every** gate clause that declined the exact analytic covariance R-matrix (`obs_scale`,
+  `gradient = fd`, `method = laplace`, a mixture, a non-Gaussian endpoint, …) and promises a
+  route change only where the named one-line rewrite clears all of them; and — when the model,
+  *or a closed-form absorption model's ODE twin*, integrates looser than `ode_reltol = 1e-6` /
+  `ode_abstol = 1e-8` — names the tolerances and says that the stencil amplifies integration
+  noise by `1/h²`. No default tolerance changes.
+
+- **The "N of M subjects use finite-difference inner gradients" warning now names the ODE
+  tolerance** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). On an `[odes]` model
+  a finite-difference inner (EBE) gradient reads the integrator's noise directly — measured at
+  25–120 OFV of stall on the TMDD QSS fixture at the default tolerance — so the warning now
+  points at `ode_reltol` / `ode_abstol` (next step `1e-9` if the fit still stalls) and at moving
+  the model into the analytic sensitivity scope. It reads the route the subjects **actually**
+  take, so a closed-form transit / inverse-Gaussian model whose subjects reroute to their
+  absorption ODE twin (IOV, time-varying covariates, a `TIME` switch, a steady-state record or
+  an infusion) is told so too, naming the twin. A population where nothing reaches an
+  integrator is told nothing extra.
+
+- **A `CENS` cell that is not a whole number (`1.5`, `abc`, `inf`) is now an error on a
+  Gaussian observation row that carries a `DV` and that `[data_selection]` keeps**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It used to read as `0`
+  without a word, so under `bloq_method = m3` a row that may be below the LLOQ was scored as
+  a measurement at the LLOQ. The error names the subject, the row's time and the cell, and
+  says to correct the cell or, if the column is not a censoring flag, to rename it — in the
+  dataset, or aside in the model's `[data]` block. The fit reader and the simulation reader
+  reject the same rows. These rows never read the cell and are not affected: a dose row, a
+  time-to-event or categorical row, a row whose `DV` is missing, and a row that
+  `[data_selection]` removes. NONMEM 7.6.0 also rejects `abc` on an observation record and
+  accepts it on a record its `IGNORE` removes; unlike ferx, it rejects it on a dose record
+  too. `1.5` is rejected although NONMEM reads it as a number, because ferx gives `CENS` a
+  fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
+  and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
+  ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
   `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
@@ -353,6 +543,45 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **Under `bloq_method = drop` (the default), a nonzero `CENS` row now keeps its IWRES,
+  CWRES, NPD and NPDE — the residual diagnostics no longer treat a row the fit scored as
+  an ordinary observation as if it were censored**
+  ([#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499)). `drop` keeps a `CENS != 0`
+  row as a quantified observation at its `DV`, and the likelihood always did; three
+  diagnostics keyed on the raw flag instead, so a dataset carrying a stray `CENS` column —
+  one left over from another analysis, or the out-of-range values `W_CENS_UNEXPECTED`
+  reports — got blank `IWRES`/`CWRES`/`NPD` cells, a whole subject's `NPDE` blanked, and an
+  ε-shrinkage computed without those rows, with no warning. Because CWRES decorrelates
+  within a subject, excluding one row also shifted **every other** CWRES of that subject
+  (measured on the issue: −0.053139 → −0.052511). All consumers now route through one
+  predicate that reads `bloq_method` as well as the flag, so the two halves of a fit cannot
+  disagree again; `bloq_method = m3` is unchanged. Under `drop`, SAEM's closed-form σ
+  M-step now also stays available on such a dataset instead of falling back to the
+  numerical one.
+- **The covariance regularization warning no longer says "FD Hessian" on the exact analytic
+  route** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). Since #1291 most Gaussian
+  `[odes]` fits take the analytic R-matrix, which never second-differences the objective and has
+  no stencil and no step size; the message named the finite-difference Hessian on it anyway, so
+  the advice a user acted on was about a route their fit had not taken.
+- **FOCE fits with a near-zero typical prediction no longer stall on a wrong gradient**
+  ([#1498](https://github.com/FeRx-NLME/ferx-core/issues/1498)). The Woodbury form
+  introduced in #1486 for the Sheiner–Beal `R̃⁻¹` is a subtractive identity, and it
+  loses digits in proportion to how far the residual variance `R⁰` — frozen at the
+  *typical* individual, `η = 0` — sits below the random-effect variance `JΩJᵀ` taken at
+  the subject's own `η̂`. Where the typical prediction has decayed onto the
+  residual-variance floor while the subject's has not (a proportional error model at a
+  steady-state trough, for example), that ratio reaches `1e13` and the analytic FOCE
+  gradient came back with up to 27 % error in `R̃⁻¹` and, on one measured coordinate,
+  2 000× the true value. The outer L-BFGS then gave up after two evaluations and the fit
+  reported `converged = false` far from the optimum — on the `ss_oral_q24` regression
+  fixture, OFV 1012.75 instead of −54.16. The Woodbury path is now taken only where its
+  conditioning is bounded in advance; above that bound the observation-sized
+  factorization is used, which is stable there. It is also written in its Ω-normalised
+  form, so the matrix being factorized is the one that bound covers — previously a
+  `block_omega` whose correlation sits on its rail could degrade the inverse while the
+  bound stayed small, which affected no released version. Well-conditioned fits are
+  bit-identical and keep #1486's speedup.
+
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**
   ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). pandas writes a whole
@@ -378,7 +607,18 @@ section of the SDLC for the versioning policy).
   that is a defect of its own,
   [#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499). A whole `CENS` value
   outside −128…127 now keeps its sign instead of reading as 0. What
-  a cell that is not a whole number (`1.5`, `abc`) means is unchanged.
+  a cell that is not a whole number (`1.5`, `abc`) means is unchanged, except in `CENS`,
+  where it is now an error (see **Changed**).
+- **`W_CENS_UNEXPECTED` named the wrong tail for a negative flag, and misquoted a large one**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It said every `CENS` value
+  other than `-1`, `0` or `1` was "treated as censored (left tail) under M3", but a negative
+  flag such as `-2` is scored on the upper tail, like `-1`. It also printed the flag after
+  saturation, so `200` was reported as `CENS=127`. It now quotes the cell as written, names
+  the tail by sign — lower for a positive flag, like `1`; upper for a negative one, like `-1`
+  — under `bloq_method = m3`, says that under `drop` the row is scored as an ordinary
+  observation, and is reported once per subject for each sign, so a subject holding both `7`
+  and `-2` hears about both. It is no longer raised on a simulation design row with no `DV`,
+  which is never scored. How such rows are scored is unchanged.
 - **`ferx check --data` reads the dataset through the model file's `[data_selection]`
   clauses, so it no longer rejects a model that fits**
   ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The check read the
@@ -569,6 +809,32 @@ section of the SDLC for the versioning policy).
   including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
 
 ### Performance
+
+- **FOCE/FOCEI gradient fits stop spinning once the objective is flat.** The
+  `stagnation_guard` window is now `max(n+1, 10)` evals instead of `max(3·(n+1), 50)`
+  for a FOCE/FOCEI gradient-based outer optimizer (L-BFGS — the usual default — SLSQP,
+  MMA; not Laplace/AGQ, whose stops are reachable) that has improved on its first evaluation, unless its steps are growing (two
+  consecutive ×1.5 expansions, the signature of a fit creeping off a saddle). Such a
+  fit's outer gradient can plateau at a non-zero norm on a flat objective, so its own
+  stopping test never fires. Estimation time, single-threaded: `clofarabine_brooks`
+  5.3 → 4.1 s (61 → 40 evaluations), `busulfan_shukla` 97 → 61 s, `thiotepa_brooks`
+  104 → 71 s; objectives within 1.3e-3 of before, and unchanged to 2e-6 on 18
+  `examples/` models. A stop forced by the guard now gets the same plateau and
+  cold-restart self-consistency check a bare NLopt `Failure` does — including a latch
+  on the last permitted evaluation — instead of being reported converged unconditionally
+  ([#1530](https://github.com/FeRx-NLME/ferx-core/issues/1530)).
+- **FOCE/FOCEI: a subject the analytic outer gradient declines now follows
+  `reconverge_gradient_interval` instead of always paying for a reconverged gradient.**
+  Such a subject used to get a finite-difference gradient that re-solved its EBE at every
+  perturbed point (`2·n_free` inner solves) whatever the setting. Declines depend on the
+  trial point, so at a blown-up line-search trial most of a population could take that
+  path at once. With the default `reconverge_gradient_interval = 0`, a declined subject now
+  gets the gradient at its held EBE, as the rest of the fixed-EBE machinery does. On the
+  55-subject cyclophosphamide parent–metabolite ODE model (FOCEI, one thread) estimation
+  took 14.3 s instead of 30.5 s, and the final OFV moved from 3242.248 to 3242.281. That is
+  inside the 3241.96–3242.40 spread the same model shows across optimizer settings. The
+  outer-gradient fallback warning now names which gradient those subjects used. IOV
+  models are unchanged: they always reconverge (#1529).
 
 - **Laplace reuses its prepared Hessian factor and no longer allocates one-element grid
   vectors.** The objective hands the regularized Cholesky factor directly to the matching

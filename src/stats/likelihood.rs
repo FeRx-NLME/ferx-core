@@ -749,8 +749,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
     let mut data_ll = 0.0;
-    let has_censored_m3 =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let has_censored_m3 = model.bloq_method.has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
@@ -807,7 +806,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
             ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+            if model.bloq_method.is_censored_row(cens) {
                 data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
             } else {
                 let resid = y - f_pred;
@@ -1116,7 +1115,7 @@ fn obs_nll_subject_from_preds_with_semantics(
                 }
             };
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if m3 && cens != 0 {
+            if model.bloq_method.is_censored_row(cens) {
                 nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
@@ -1648,10 +1647,10 @@ pub fn foce_subject_nll_standard(
     // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
     // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
     // `∂²f/∂η²` term full Laplace keeps).
-    let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let m3 = bloq_method.has_censored_row(&subject.cens);
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
-            .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+            .filter(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)))
             .collect()
     } else {
         (0..n_obs).collect()
@@ -2077,9 +2076,8 @@ fn gaussian_foce_accum(
     let err_keys = error_spec.obs_keys(subject);
 
     // Partition observation indices into quantified vs censored (M3 only).
-    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
-        !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
-    });
+    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs)
+        .partition(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)));
 
     // Accumulate data_ll at η̂ and the conditional Hessian pieces over the
     // quantified rows.  For SDE the EKF process-noise variance `p_obs` inflates
@@ -2565,9 +2563,13 @@ pub fn foce_population_nll(
 /// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
 /// A model with no η has `R̃` diagonal, so every recipe agrees there.
 ///
-/// Censored observations get `NaN` since a weighted Gaussian residual is
-/// undefined when the observed value is censored; they are left out of the
-/// decorrelation.
+/// Rows censored **for this fit** — `CENS != 0` under `bloq_method = m3`, never
+/// under `drop`, see [`BloqMethod::is_censored_row`] — get `NaN`, since a
+/// weighted Gaussian residual is undefined when the observed value is censored,
+/// and are left out of the decorrelation. Under `drop` a `CENS != 0` row is an
+/// ordinary observation the likelihood scored at its `DV`, so it stays in the
+/// system: gating on the raw flag instead blanked it *and* shifted every other
+/// CWRES of that subject, because the decorrelation mixes rows (#1499).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -2591,6 +2593,10 @@ pub fn compute_cwres(
     // fit, `f(η = 0)` under FOCE — NONMEM's `CWRES`. `None` evaluates `R` at
     // the linearized `f0`.
     r_preds: Option<&[f64]>,
+    // How the fit scored `CENS` rows. Only `M3` makes a flagged row censored;
+    // under `Drop` the likelihood kept it as an ordinary observation and so does
+    // this (#1499).
+    bloq_method: BloqMethod,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2641,11 +2647,12 @@ pub fn compute_cwres(
     // decorrelation NONMEM's `CWRES` applies (see the doc comment); a Cholesky
     // factor decorrelates too but yields a different vector, and the marginal
     // `(y − f0)ⱼ / √R̃ⱼⱼ` a third — the three agree only when `H·Ω·Hᵀ` has no
-    // off-diagonals, i.e. with no η. Censored rows are left out of the system
-    // and reported as NaN; a non-positive eigenvalue (a hand-built pathological
-    // input) falls back to the marginal standardisation rather than panicking.
+    // off-diagonals, i.e. with no η. Rows censored for this fit are left out of
+    // the system and reported as NaN; a non-positive eigenvalue (a hand-built
+    // pathological input) falls back to the marginal standardisation rather than
+    // panicking.
     let live: Vec<usize> = (0..n_obs)
-        .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+        .filter(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)))
         .collect();
     let mut out = vec![f64::NAN; n_obs];
     if live.is_empty() {
@@ -2937,7 +2944,7 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             }
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+        if model.bloq_method.is_censored_row(cens) {
             data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
         } else {
             let resid = y - f_pred;
@@ -3160,6 +3167,115 @@ mod tests {
         let nonmem_ofv = 0.691_015_142_109_431_8;
         let ferx_ofv = -4.0 * upper;
         assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
+    }
+
+    /// #1496, site `m3_logcdf` (`cens < 0`): a `CENS` flag outside -1/0/1 is scored
+    /// by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — which is what
+    /// `W_CENS_UNEXPECTED` tells the user. The test above uses only ±1, so it catches
+    /// a swapped tail but not a site that tests `cens == -1` instead of `cens < 0`;
+    /// this one does. The two tails differ at this point (z = ∓1), so neither
+    /// equality holds because the tails happen to agree.
+    #[test]
+    fn m3_logcdf_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| m3_logcdf(10.0, 12.0, 2.0, cens);
+        assert!(at(1).is_finite() && at(-1).is_finite());
+        assert_ne!(
+            at(1).to_bits(),
+            at(-1).to_bits(),
+            "the two tails differ here"
+        );
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                at(flag).to_bits(),
+                at(code).to_bits(),
+                "m3_logcdf: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
+
+    /// #1496: the two claims `W_CENS_UNEXPECTED` makes about the objective, checked
+    /// against the objective rather than restated. Under `m3` an out-of-domain flag
+    /// scores as its sign's code (`7` as `1`, `-2` as `-1`); under `drop` any flag
+    /// scores as the quantified row it is at `0`. Through the three Gaussian
+    /// objectives the message speaks for: the conditional `individual_nll`, and the
+    /// FOCE and FOCEI marginals of `foce_subject_nll`. The straddle is asserted, so
+    /// no equality holds because two arms agree: under `m3`, `1`, `-1` and `0` score
+    /// three different ways on this subject.
+    #[test]
+    fn an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop() {
+        let theta = [5.0, 50.0];
+        let eta = [0.1];
+        let omega = make_omega(0.09);
+        let sigma = [0.2];
+        let setup = |bloq: BloqMethod, flag: i8| {
+            let mut model = make_model();
+            model.bloq_method = bloq;
+            let mut subject = make_simple_subject();
+            // The last row, DV 25 against a prediction near 30: both tails are
+            // live and differ from the quantified term.
+            subject.cens[5] = flag;
+            (model, subject)
+        };
+        let conditional = |bloq: BloqMethod, flag: i8| {
+            let (model, subject) = setup(bloq, flag);
+            individual_nll(&model, &subject, &theta, &eta, &omega, &sigma)
+        };
+        let marginal = |bloq: BloqMethod, flag: i8, interaction: bool| {
+            let (model, subject) = setup(bloq, flag);
+            let eta_hat = DVector::from_vec(eta.to_vec());
+            let h = DMatrix::from_element(subject.obs_times.len(), 1, 4.0);
+            foce_subject_nll(
+                &model,
+                &subject,
+                &theta,
+                &eta_hat,
+                &h,
+                &omega,
+                &sigma,
+                &[],
+                interaction,
+            )
+        };
+        let objectives: [(&str, &dyn Fn(BloqMethod, i8) -> f64); 3] = [
+            ("individual_nll", &conditional),
+            ("FOCE", &|b: BloqMethod, c: i8| marginal(b, c, false)),
+            ("FOCEI", &|b: BloqMethod, c: i8| marginal(b, c, true)),
+        ];
+        for (name, nll) in objectives {
+            let m3 = |flag: i8| nll(BloqMethod::M3, flag);
+            let drop = |flag: i8| nll(BloqMethod::Drop, flag);
+            for flag in [0, 1, -1] {
+                assert!(m3(flag).is_finite(), "{name}: m3, CENS={flag}");
+                assert!(drop(flag).is_finite(), "{name}: drop, CENS={flag}");
+            }
+            assert_ne!(
+                m3(1).to_bits(),
+                m3(-1).to_bits(),
+                "{name}: the tails differ"
+            );
+            assert_ne!(
+                m3(1).to_bits(),
+                m3(0).to_bits(),
+                "{name}: the lower tail is live"
+            );
+            assert_ne!(
+                m3(-1).to_bits(),
+                m3(0).to_bits(),
+                "{name}: the upper tail is live"
+            );
+            // "under bloq_method = m3 a positive flag is scored on the lower tail, like
+            // CENS=1" — and the negative one on the upper tail, like CENS=-1.
+            assert_eq!(m3(7).to_bits(), m3(1).to_bits(), "{name}: m3, 7 as 1");
+            assert_eq!(m3(-2).to_bits(), m3(-1).to_bits(), "{name}: m3, -2 as -1");
+            // "under bloq_method = drop the row is scored as an ordinary observation".
+            for flag in [7, -2, 1, -1] {
+                assert_eq!(
+                    drop(flag).to_bits(),
+                    drop(0).to_bits(),
+                    "{name}: drop, CENS={flag} scores as the quantified row"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4037,6 +4153,7 @@ mod tests {
             Some(0),
             None,
             None,
+            BloqMethod::Drop,
         );
 
         let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
@@ -4081,6 +4198,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::Drop,
         );
         // R̃ = H Ω Hᵀ + σ²I = [[0.5, 0.5], [0.5, 1.25]]; resid = (2, 3).
         let r_tilde = DMatrix::from_row_slice(2, 2, &[0.5, 0.5, 0.5, 1.25]);
@@ -4101,8 +4219,8 @@ mod tests {
         assert!((cwres[1] - 3.0 / 1.25f64.sqrt()).abs() > 0.1);
         assert!((cwres[0] - 2.0 / 0.5f64.sqrt()).abs() > 0.1);
 
-        // A censored first row is NaN and leaves the second row standardised
-        // on its own: 3/√1.25.
+        // A first row censored *for this fit* (`CENS != 0` under M3) is NaN and
+        // leaves the second row standardised on its own: 3/√1.25.
         let mut censored = subject.clone();
         censored.cens = vec![1, 0];
         let cw = compute_cwres(
@@ -4118,6 +4236,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::M3,
         );
         assert!(cw[0].is_nan());
         assert_relative_eq!(cw[1], 3.0 / 1.25f64.sqrt(), epsilon = 1e-12);
@@ -4147,6 +4266,7 @@ mod tests {
             None,
             None,
             Some(&[4.0]),
+            BloqMethod::Drop,
         );
         assert_relative_eq!(
             cw[0],
@@ -4166,6 +4286,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::Drop,
         );
         assert_relative_eq!(
             cw_f0[0],
@@ -4222,6 +4343,7 @@ mod tests {
             None,
             Some(&mult),
             None,
+            BloqMethod::Drop,
         );
         assert_relative_eq!(cwres[0], 2.0 / (1.0 * 2.0), epsilon = 1e-12);
         assert_relative_eq!(cwres[1], 2.0 / (3.0 * 2.0), epsilon = 1e-12);

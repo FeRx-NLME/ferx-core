@@ -311,11 +311,12 @@ fn covariance_se_matches_nonmem_foce_block_omega() {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Foce;
     opts.interaction = false;
-    // Gradient outer optimizer (analytic Dual2 gradient): the derivative-free
-    // BOBYQA default stalls on the weakly identified ω²(KA) direction, leaving
-    // both ω²(KA) and its SE off NONMEM (#423); the gradient optimizer converges
-    // it to the NONMEM-matching optimum where the SE cross-check holds. Do NOT
-    // revert this to the BOBYQA default to "use the default" — BOBYQA is
+    // Gradient outer optimizer (analytic Dual2 gradient): derivative-free BOBYQA
+    // (the outer default before #490) stalls on the weakly identified ω²(KA)
+    // direction, leaving both ω²(KA) and its SE off NONMEM (#423); the gradient
+    // optimizer converges it to the NONMEM-matching optimum where the SE
+    // cross-check holds. Pinned rather than left on `auto` so the arm cannot drift
+    // back to BOBYQA if `auto`'s resolution rule changes — BOBYQA is
     // known-divergent here (#423) and the SE cross-check below would no longer
     // reach the NONMEM optimum, silently losing the regression signal.
     opts.optimizer = Optimizer::Lbfgs;

@@ -251,6 +251,21 @@ if !verdict.passed {
 | `reject_on_boundary` | `true` | a θ is pinned to a declared bound — the same predicate `bootstrap`'s `skip_estimate_near_boundary` applies |
 | `reject_init_stall` | `true` | the fit never left its initial estimates (the #751 signature): the outer optimizer's own escape verdict when the result carries it (`FitResult::left_init`, recorded by the NLopt outer loop), otherwise no free θ/Ω/σ moved more than 1 % of its initial value; a fit with `n_parameters == 0` cannot stall, and one whose only free coordinates are κ / mixture / `block_sigma` entries with no optimizer verdict is `skipped`. This assumes a **cold start** — a candidate warm-started from its parent's estimates legitimately converges where it began, so turn the gate off for such a search |
 
+While either threshold is enabled, a fit whose covariance step had to floor a
+Hessian eigenvalue — the `Covariance step regularized: eigenvalue floor applied …`
+[`covariance_regularized`](../warnings.qmd#codes-convergence) warning — fails
+as well (#1512); the non-finite cross-partial note that shares that code does
+not. The floor replaces a direction of negative or
+near-zero curvature with a finite one, so the matrix both thresholds read no
+longer shows the problem: a collapsed peripheral compartment (V2 → 0, Q free)
+on warfarin read a condition number of 2.98 next to a TVQ RSE of 293519 %, and
+passed. The floor fires only when the Hessian is indefinite or its smallest
+eigenvalue is below `1e-10` of its largest (or below `1e-12` outright, when
+the whole spectrum is that small), the analogue of NONMEM's "R matrix
+algorithmically singular", so the check applies at every `severity` the
+warning reports: that grade measures how much the floor moved the *reported*
+standard errors, not whether the model is identified.
+
 The two thresholds are evaluated only when their input exists — a fit without a
 covariance matrix has no condition number to test. Such a case lands in
 `verdict.skipped` rather than failing or silently passing; pair the thresholds

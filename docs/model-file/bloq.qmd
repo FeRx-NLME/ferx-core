@@ -27,6 +27,23 @@ ID,TIME,DV,CENS,EVID,AMT
 
 Rows with `CENS != 0` and `MDV = 1` are skipped entirely (already excluded by `MDV`). Rows with `CENS = 0` are treated as ordinary quantified observations regardless of their value.
 
+### Out-of-domain values
+
+A missing cell (blank, `.`, `NA`) reads as `0`. A whole number may carry a decimal point — pandas writes an integer column that has a blank cell as `1.0`, and ferx's own sdtab writes the flag as `1.000000` — and either reads as `1`.
+
+Any other **whole number**, such as `7` or `-2`, counts by its sign alone. Under `bloq_method = m3` a positive flag is scored like `1` (the lower tail, below the LLOQ) and a negative one like `-1` (the upper tail, above the ULOQ); under `bloq_method = drop` the row is scored as an ordinary observation, like any other `CENS` row. ferx warns with `W_CENS_UNEXPECTED`, quoting the cell, once per subject for each sign. It does not warn on a simulation design row with no `DV`, since such a row is never scored.
+
+A cell that is **not a whole number**, such as `1.5`, `abc` or `inf`, is an error on a Gaussian observation row that carries a `DV` and that [`[data_selection]`](data-selection.qmd) keeps. This holds whether the file is read for a fit or for a simulation. The message names the subject, the row's time and the cell. Correct the cell; if the column is not a censoring flag at all, rename it, in the dataset or aside in the model's [`[data]`](data.qmd) block.
+
+The same cell is never read, and is not an error, on these rows:
+
+- a dose row;
+- a time-to-event or categorical row;
+- a row whose `DV` is missing;
+- a row that `[data_selection]` removes.
+
+Compared with NONMEM 7.6.0 for `abc`: NONMEM also rejects it on an observation record and accepts it on a record its `IGNORE` removes. Unlike ferx, it rejects it on a dose record too. NONMEM accepts `1.5`, as a number whose meaning your own code decides; ferx gives `CENS` a fixed meaning, so it rejects it, as it rejects `SS=1.5` ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
+
 ---
 
 ## Methods

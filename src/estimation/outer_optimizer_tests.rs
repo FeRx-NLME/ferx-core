@@ -226,7 +226,7 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
 
 /// `resolve_scaling` maps `Auto` to `Abs` (magnitude scaling) for the
 /// gradient-based optimizers (incl. `Slsqp`) and to `None` for the
-/// derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`); explicit
+/// derivative-free `Bobyqa` (and `Mma`/`TrustRegion`); explicit
 /// non-`Auto` values pass through unchanged. Guards the gradient-optimizer
 /// preconditioner routing (Rescale2 → Abs, the fix that recovers warfarin /
 /// tvcov / two_cpt_oral_cov convergence while preserving #335).
@@ -836,7 +836,9 @@ fn fresh_state() -> NloptState {
         prev_x: Vec::new(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
+        recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
+        salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
     }
 }
 
@@ -858,7 +860,7 @@ fn test_detect_stagnation_disabled_never_fires() {
     for n_evals in 0..200 {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, 7, false),
+            !detect_stagnation(&mut state, 7, false, false),
             "enabled=false must never fire (n_evals={n_evals})"
         );
     }
@@ -884,7 +886,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     for n_evals in 1..window {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, n, true),
+            !detect_stagnation(&mut state, n, true, false),
             "must not fire inside window (n_evals={n_evals}, window={window})"
         );
         assert!(!state.stagnation_stopped);
@@ -893,7 +895,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // At the window, fires and latches.
     state.n_evals = window;
     assert!(
-        detect_stagnation(&mut state, n, true),
+        detect_stagnation(&mut state, n, true, false),
         "must fire at window (n_evals={window})"
     );
     assert!(
@@ -906,7 +908,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // the short-circuit is on `stagnation_stopped`, not on the counter.
     state.n_evals = 1;
     assert!(
-        detect_stagnation(&mut state, n, true),
+        detect_stagnation(&mut state, n, true, false),
         "latched state must stay sticky-true regardless of n_evals"
     );
 }
@@ -924,14 +926,14 @@ fn test_detect_stagnation_resets_on_improvement() {
     let n = 7usize;
     // Walk almost up to the window with zero improvement…
     state.n_evals = 49;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
 
     // …then improve OFV by > 1e-3.  Improvement must reset the
     // last-improvement counter so the next 50 evals start fresh.
     state.best_ofv = -100.5;
     state.n_evals = 50;
     assert!(
-        !detect_stagnation(&mut state, n, true),
+        !detect_stagnation(&mut state, n, true, false),
         "improvement must reset the counter"
     );
     assert_eq!(
@@ -945,9 +947,9 @@ fn test_detect_stagnation_resets_on_improvement() {
 
     // Now we need another full window of zero improvement before firing.
     state.n_evals = 99;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
     state.n_evals = 100;
-    assert!(detect_stagnation(&mut state, n, true));
+    assert!(detect_stagnation(&mut state, n, true, false));
 }
 
 /// Improvement *below* the 1e-3 threshold counts as stagnation — the
@@ -966,7 +968,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
     // NOT reset.
     state.best_ofv = -100.0005;
     state.n_evals = 25;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
     assert_eq!(
         state.last_improvement_eval, 0,
         "sub-threshold improvement must not advance the counter"
@@ -974,7 +976,580 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
 
     // 50 evals after the original last_improvement_eval (= 0), it fires.
     state.n_evals = 50;
-    assert!(detect_stagnation(&mut state, n, true));
+    assert!(detect_stagnation(&mut state, n, true, false));
+}
+
+/// Both windows, on both sides of each floor (#1530).
+#[test]
+fn test_stagnation_window_sizes() {
+    // Long: 3*(n+1) floored at 50.
+    assert_eq!(stagnation_window(7, false), 50);
+    assert_eq!(stagnation_window(20, false), 63);
+    // Short: n+1 floored at 10.
+    assert_eq!(stagnation_window(7, true), 10);
+    assert_eq!(stagnation_window(20, true), 21);
+}
+
+/// The short window needs all three parts of its gate: a gradient optimizer,
+/// unreachable stops (not Laplace/AGQ), and a significant feasible improvement *after*
+/// the first feasible eval (#1530).
+#[test]
+fn test_use_short_stagnation_window_gate() {
+    for algo in [
+        nlopt::Algorithm::Lbfgs,
+        nlopt::Algorithm::Slsqp,
+        nlopt::Algorithm::Mma,
+    ] {
+        assert!(
+            use_short_stagnation_window(algo, false, 2),
+            "{algo:?} after descent"
+        );
+        // Feasible eval 1 only sets the baseline; 0 = no feasible eval yet.
+        assert!(
+            !use_short_stagnation_window(algo, false, 1),
+            "{algo:?} at init"
+        );
+        assert!(
+            !use_short_stagnation_window(algo, false, 0),
+            "{algo:?} before any"
+        );
+        // Reachable xtol/ftol stops (Laplace/AGQ) are left to do their job.
+        assert!(
+            !use_short_stagnation_window(algo, true, 2),
+            "{algo:?} with reachable stops"
+        );
+    }
+    // BOBYQA's interpolation rebuilds legitimately run flat: never short.
+    assert!(!use_short_stagnation_window(
+        nlopt::Algorithm::Bobyqa,
+        false,
+        30
+    ));
+}
+
+/// The reachable-stops predicate is the quadrature dispatch: Laplace and FOCEI with
+/// `n_agq > 1` have reachable stops; plain FOCE/FOCEI do not.
+#[test]
+fn test_gradient_run_has_reachable_stops() {
+    let with = |method, n_agq| FitOptions {
+        method,
+        n_agq,
+        ..FitOptions::default()
+    };
+    assert!(!gradient_run_has_reachable_stops(&with(
+        EstimationMethod::FoceI,
+        1
+    )));
+    assert!(!gradient_run_has_reachable_stops(&with(
+        EstimationMethod::Foce,
+        1
+    )));
+    assert!(gradient_run_has_reachable_stops(&with(
+        EstimationMethod::FoceI,
+        3
+    )));
+    assert!(gradient_run_has_reachable_stops(&with(
+        EstimationMethod::Laplace,
+        1
+    )));
+}
+
+/// With the short window, `detect_stagnation` fires at `last_improvement + (n+1).max(10)`,
+/// not one eval sooner, while the long window is still open (#1530).
+#[test]
+fn test_detect_stagnation_short_window_fires_early() {
+    let n = 9usize; // clofarabine_brooks: 9 packed parameters → short window 10
+    let mut short = fresh_state();
+    short.best_ofv = -100.0;
+    short.best_at_last_improvement = -100.0;
+    short.last_improvement_eval = 30;
+    let mut long = fresh_state();
+    long.best_ofv = -100.0;
+    long.best_at_last_improvement = -100.0;
+    long.last_improvement_eval = 30;
+
+    short.n_evals = 39;
+    assert!(!detect_stagnation(&mut short, n, true, true));
+    short.n_evals = 40;
+    assert!(detect_stagnation(&mut short, n, true, true));
+    assert!(short.stagnation_stopped);
+
+    long.n_evals = 40;
+    assert!(!detect_stagnation(&mut long, n, true, false));
+    assert!(!long.stagnation_stopped);
+}
+
+/// `(ofv, scaled step norm)` per eval of the `clofarabine_brooks` FOCEI / `nlopt_lbfgs`
+/// fit from #1530, read from its `optimizer_trace` on main `2e04abba` (`NA` steps as 0).
+/// 61 evals, every one feasible, 9 packed parameters. Flat to 0.0014 from eval 30; the
+/// fit ran to eval 61 and an NLopt line-search failure.
+const CLOFARABINE_TRACE: [(f64, f64); 61] = [
+    (17990.667633, 0.0),
+    (18459.283108, 1.134849),
+    (17976.589768, 1.123500),
+    (19157.512025, 1.869058),
+    (18113.645072, 1.480319),
+    (17920.132433, 0.290089),
+    (17894.007167, 0.044576),
+    (17832.506699, 0.275337),
+    (17808.607629, 0.048530),
+    (17792.214995, 0.113916),
+    (17790.841382, 0.031535),
+    (17793.521502, 0.105289),
+    (17789.336208, 0.063489),
+    (17787.553795, 0.040820),
+    (17786.172738, 0.041357),
+    (17784.412186, 0.073424),
+    (17925.745383, 0.539693),
+    (17783.614723, 0.485724),
+    (17781.381487, 0.074410),
+    (17783.518788, 0.070670),
+    (17780.778915, 0.048350),
+    (17780.429143, 0.040987),
+    (17780.226663, 0.013838),
+    (17779.413337, 0.113517),
+    (17778.970408, 0.072937),
+    (17778.742839, 0.031301),
+    (17778.314832, 0.124304),
+    (17777.781459, 0.075016),
+    (17777.286086, 0.175438),
+    (17777.280048, 0.011104),
+    (17777.280108, 0.000798),
+    (17777.280081, 0.000694),
+    (17777.280028, 0.000099),
+    (17777.282205, 0.010758),
+    (17777.280067, 0.009100),
+    (17777.280070, 0.001300),
+    (17777.280014, 0.000326),
+    (17777.280091, 0.001059),
+    (17777.280049, 0.000860),
+    (17777.279989, 0.000177),
+    (17777.279942, 0.000751),
+    (17777.279791, 0.001947),
+    (17777.279493, 0.004020),
+    (17777.279269, 0.001119),
+    (17777.278695, 0.002336),
+    (17777.279003, 0.001471),
+    (17777.278885, 0.001410),
+    (17777.278700, 0.000060),
+    (17777.278695, 0.000001),
+    (17777.278695, 0.000000),
+    (25802.815749, 1.088310),
+    (17777.994920, 1.077427),
+    (17777.279024, 0.010774),
+    (17777.279008, 0.000103),
+    (17777.278707, 0.000006),
+    (17777.278696, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.0),
+];
+
+/// As [`CLOFARABINE_TRACE`], for `examples/bioavailability.ferx` on
+/// `data/bioavailability.csv` (7 packed parameters, 126 evals). Evals 71–83 sit at
+/// 648.8203 while the L-BFGS line search expands off a saddle (step 3e-6 → 1.4,
+/// ×2.7 per eval); eval 84 then starts a 1.48-unit descent to 647.3434.
+const BIOAVAILABILITY_TRACE: [(f64, f64); 126] = [
+    (7194954.375378, 0.0),
+    (24603.218200, 0.651129),
+    (2388.845089, 3.387715),
+    (4405.265301, 1.256067),
+    (1250.926264, 0.492779),
+    (1254.062244, 0.157309),
+    (1234.682589, 0.077346),
+    (1218.987599, 0.078114),
+    (1195.982797, 0.353085),
+    (1192.868004, 0.069534),
+    (1192.535864, 0.008502),
+    (1191.571728, 0.053948),
+    (1189.392841, 0.063636),
+    (1175.039467, 0.818094),
+    (1174.712194, 0.721230),
+    (1164.380941, 0.099467),
+    (1157.766975, 0.603248),
+    (1107.699257, 2.729534),
+    (28751.057789, 1.437420),
+    (2283.534362, 0.756844),
+    (1131.131055, 0.536730),
+    (1104.543113, 0.109858),
+    (1103.546663, 0.012976),
+    (1103.261876, 0.006934),
+    (1101.605027, 0.048923),
+    (1097.969187, 0.121442),
+    (1085.897735, 0.422991),
+    (1067.307502, 0.605056),
+    (56964667.362342, 1.640905),
+    (313533.178793, 0.643596),
+    (8735.498316, 0.442285),
+    (1260.760855, 0.308131),
+    (1024.330384, 0.145518),
+    (1020.377795, 0.021776),
+    (1016.926778, 0.067611),
+    (1013.793945, 0.020275),
+    (1009.515136, 0.040843),
+    (993.491882, 0.176862),
+    (988.073641, 0.199732),
+    (981.293780, 0.222371),
+    (889.391145, 2.144753),
+    (815.389083, 1.103504),
+    (229143.294360, 2.347156),
+    (8842.837808, 1.103094),
+    (1070.502832, 0.814383),
+    (811.613393, 0.365302),
+    (808.445836, 0.031705),
+    (772.984511, 1.130481),
+    (52214533.142078, 1.482683),
+    (363943.632393, 0.588146),
+    (10873.786644, 0.404851),
+    (1068.795239, 0.284761),
+    (739.921721, 0.135451),
+    (736.163907, 0.015004),
+    (720.307787, 0.077882),
+    (9185.797556, 1.062082),
+    (969.430221, 0.653822),
+    (700.981181, 0.291883),
+    (696.966697, 0.032153),
+    (696.372999, 0.005170),
+    (670.746106, 0.254412),
+    (656.239799, 0.389544),
+    (970110.895780, 1.661986),
+    (1904.154253, 0.942657),
+    (692.914624, 0.321838),
+    (653.596792, 0.223161),
+    (651.402145, 0.077124),
+    (649.231194, 0.035006),
+    (648.832486, 0.015209),
+    (648.820380, 0.007231),
+    (648.820316, 0.000349),
+    (648.820316, 0.000003),
+    (648.820316, 0.000006),
+    (648.820316, 0.000027),
+    (648.820316, 0.000068),
+    (648.820316, 0.000200),
+    (648.820314, 0.000535),
+    (648.820311, 0.001449),
+    (648.820302, 0.003866),
+    (648.820278, 0.010420),
+    (648.820211, 0.028893),
+    (648.819996, 0.088876),
+    (648.817903, 0.459542),
+    (648.671826, 1.378626),
+    (801.662790, 5.514505),
+    (648.370057, 4.963054),
+    (20817.263104, 3.522368),
+    (648.218840, 3.487144),
+    (648.299335, 0.015971),
+    (648.174996, 0.009979),
+    (648.167436, 0.006270),
+    (648.165116, 0.001905),
+    (648.089218, 0.208349),
+    (647.837089, 0.128936),
+    (647.440696, 0.444675),
+    (647.503860, 0.294599),
+    (647.353521, 0.177406),
+    (647.344261, 0.018511),
+    (647.343451, 0.002370),
+    (647.343445, 0.000415),
+    (647.343445, 0.000040),
+    (647.343445, 0.000004),
+    (647.343446, 0.000001),
+    (647.343445, 0.000001),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343446, 0.000025),
+    (647.343444, 0.000025),
+    (647.343445, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343794, 0.000431),
+    (647.343445, 0.000427),
+    (647.343445, 0.000004),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.0),
+    (647.343444, 0.0),
+];
+
+/// As [`CLOFARABINE_TRACE`], for `ferx-testdata/busulfan_shukla/ferx/run1.ferx` (FOCEI with
+/// IOV, 13 packed parameters, 84 evals). The last significant improvement is at eval
+/// 34; the fit then alternates between two points 1.6e-5 apart with steady steps of
+/// ~1e-4 until the long window latched it at eval 84.
+const BUSULFAN_TRACE: [(f64, f64); 84] = [
+    (39620.376276, 0.0),
+    (50582.252303, 1.480839),
+    (39727.117463, 0.651783),
+    (39154.501232, 0.298220),
+    (39615.247888, 0.528136),
+    (39117.746573, 0.443170),
+    (38960.778761, 0.162857),
+    (38568.649254, 0.697336),
+    (38456.381201, 0.312746),
+    (38307.613137, 0.293622),
+    (38383.101434, 0.877396),
+    (38196.180863, 0.444121),
+    (38146.355340, 0.314339),
+    (38126.319009, 0.054384),
+    (38115.734341, 0.100069),
+    (38066.478737, 0.326709),
+    (38064.253253, 0.219353),
+    (38049.587441, 0.080372),
+    (38044.755060, 0.041977),
+    (38038.193804, 0.127458),
+    (38037.504646, 0.060224),
+    (38036.938234, 0.024123),
+    (38036.484800, 0.011203),
+    (38036.282389, 0.010758),
+    (38035.829021, 0.039463),
+    (38035.319956, 0.038455),
+    (38034.539306, 0.099171),
+    (38034.271978, 0.037982),
+    (38034.079359, 0.036486),
+    (38033.913445, 0.028963),
+    (38033.626548, 0.054934),
+    (38033.466518, 0.046241),
+    (38033.450479, 0.011248),
+    (38033.448854, 0.002655),
+    (38033.448380, 0.000860),
+    (38033.448411, 0.000204),
+    (38033.448375, 0.000188),
+    (38033.448394, 0.000380),
+    (38033.448369, 0.000307),
+    (38033.448388, 0.000200),
+    (38033.448366, 0.000184),
+    (38033.448382, 0.000225),
+    (38033.448363, 0.000202),
+    (38033.448382, 0.000182),
+    (38033.448362, 0.000169),
+    (38033.448380, 0.000179),
+    (38033.448361, 0.000166),
+    (38033.448378, 0.000167),
+    (38033.448359, 0.000156),
+    (38033.448376, 0.000160),
+    (38033.448358, 0.000150),
+    (38033.448374, 0.000159),
+    (38033.448357, 0.000149),
+    (38033.448373, 0.000146),
+    (38033.448356, 0.000138),
+    (38033.448371, 0.000140),
+    (38033.448355, 0.000133),
+    (38033.448370, 0.000134),
+    (38033.448354, 0.000127),
+    (38033.448369, 0.000129),
+    (38033.448353, 0.000123),
+    (38033.448368, 0.000124),
+    (38033.448352, 0.000118),
+    (38033.448368, 0.000119),
+    (38033.448351, 0.000114),
+    (38033.448367, 0.000115),
+    (38033.448351, 0.000111),
+    (38033.448367, 0.000111),
+    (38033.448350, 0.000107),
+    (38033.448366, 0.000107),
+    (38033.448349, 0.000104),
+    (38033.448366, 0.000104),
+    (38033.448349, 0.000101),
+    (38033.448366, 0.000101),
+    (38033.448349, 0.000098),
+    (38033.448365, 0.000098),
+    (38033.448348, 0.000096),
+    (38033.448365, 0.000096),
+    (38033.448348, 0.000094),
+    (38033.448365, 0.000094),
+    (38033.448347, 0.000091),
+    (38033.448365, 0.000092),
+    (38033.448347, 0.000090),
+    (38033.448365, 0.000089),
+];
+
+/// Drive the guard through a recorded trace exactly as the objective closure does —
+/// running best, the feasible plateau tracker, the step history, then
+/// `detect_stagnation` — and return `(eval, incumbent)` at the latch, if any.
+fn replay_stagnation(
+    trace: &[(f64, f64)],
+    n: usize,
+    algo: nlopt::Algorithm,
+) -> Option<(usize, f64)> {
+    let mut state = fresh_state();
+    state.best_ofv = f64::INFINITY;
+    // (baseline OFV, last significant feasible eval) — the plateau tracker.
+    let (mut pt_ofv, mut pt_idx) = (f64::INFINITY, 0usize);
+    for (i, &(ofv, step)) in trace.iter().enumerate() {
+        let k = i + 1;
+        state.n_evals = k;
+        state.best_ofv = state.best_ofv.min(ofv);
+        if k == 1 || pt_ofv - ofv > PLATEAU_OFV_THRESHOLD {
+            pt_ofv = ofv;
+            pt_idx = k;
+        }
+        if stagnation_after_eval(&mut state, n, true, algo, false, pt_idx, step) {
+            return Some((k, state.best_ofv));
+        }
+    }
+    None
+}
+
+/// The short window stops the spinning `clofarabine_brooks` fit at eval 40, 21 evals
+/// early, on an incumbent 0.0013 above the eventual best-seen — the 1e-3 improvement
+/// threshold's own resolution. The long window (what BOBYQA gets, and every optimizer
+/// got before #1530) does not close inside the recording.
+#[test]
+fn test_detect_stagnation_replays_clofarabine_plateau() {
+    let (at, best) = replay_stagnation(&CLOFARABINE_TRACE, 9, nlopt::Algorithm::Lbfgs)
+        .expect("short window must latch");
+    assert_eq!(at, 40, "L-BFGS latched at eval {at}");
+    let final_best = CLOFARABINE_TRACE
+        .iter()
+        .map(|t| t.0)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        best - final_best < 2e-3,
+        "latched incumbent {best} vs eventual best {final_best}"
+    );
+    assert_eq!(
+        replay_stagnation(&CLOFARABINE_TRACE, 9, nlopt::Algorithm::Bobyqa),
+        None
+    );
+}
+
+/// The expansion veto is what keeps the short window off a fit creeping off a
+/// saddle. Without it the guard latched `bioavailability` at eval 80 on 648.820 — 1.48
+/// OFV units above the optimum it went on to find (measured end to end before the
+/// veto existed). With it, the latch waits for the real plateau at 647.3434.
+#[test]
+fn test_detect_stagnation_replay_does_not_cut_off_saddle_escape() {
+    let (at, best) = replay_stagnation(&BIOAVAILABILITY_TRACE, 7, nlopt::Algorithm::Lbfgs)
+        .expect("the final plateau must still latch");
+    assert!(
+        at > 100,
+        "latched at eval {at}, before the descent that starts at eval 84"
+    );
+    assert!((best - 647.343444).abs() < 1e-5, "latched incumbent {best}");
+}
+
+/// A steady-step tail is not an expansion, so the short window takes it: busulfan
+/// latches at eval 48 instead of 84, on an incumbent within 2e-5 of the eventual best.
+#[test]
+fn test_detect_stagnation_replays_busulfan_steady_tail() {
+    let (at, best) = replay_stagnation(&BUSULFAN_TRACE, 13, nlopt::Algorithm::Lbfgs)
+        .expect("short window must latch");
+    assert_eq!(at, 48, "L-BFGS latched at eval {at}");
+    let final_best = BUSULFAN_TRACE
+        .iter()
+        .map(|t| t.0)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        best - final_best < 2e-5,
+        "latched incumbent {best} vs eventual best {final_best}"
+    );
+}
+
+/// Two consecutive ×1.5 growths are an expansion; one, a steady or shrinking tail,
+/// or an erratic one is not; nor is a short history, a run of zero steps, or a `NaN`.
+#[test]
+fn test_step_is_expanding() {
+    use std::collections::VecDeque;
+    let h = |v: &[f64]| v.iter().copied().collect::<VecDeque<f64>>();
+    // bioavailability evals 76–78: 2.00e-4, 5.35e-4, 1.449e-3.
+    assert!(step_is_expanding(&h(&[2.00e-4, 5.35e-4, 1.449e-3])));
+    // Exactly at the ratio counts; just under it does not, on either ratio.
+    assert!(step_is_expanding(&h(&[1.0, 1.5, 2.25])));
+    assert!(!step_is_expanding(&h(&[1.0, 1.49, 2.25])));
+    assert!(!step_is_expanding(&h(&[1.0, 1.5, 2.24])));
+    // busulfan_shukla evals 82–84: steady.
+    assert!(!step_is_expanding(&h(&[9.2e-5, 9.0e-5, 8.9e-5])));
+    // clofarabine_brooks evals 38–40: erratic.
+    assert!(!step_is_expanding(&h(&[1.059e-3, 8.60e-4, 1.77e-4])));
+    // From a zero step, growth to a positive one counts; zero to zero does not.
+    assert!(step_is_expanding(&h(&[0.0, 1e-6, 1e-5])));
+    assert!(!step_is_expanding(&h(&[0.0, 0.0, 0.0])));
+    assert!(!step_is_expanding(&h(&[1e-6, 1e-5])));
+    assert!(!step_is_expanding(&h(&[1e-6, 1e-5, f64::NAN])));
+}
+
+/// Only a stop the stagnation guard forced is re-examined — a `Success`, or a
+/// `MaxEvalReached` from a latch on the last permitted eval; a stop NLopt reached on
+/// its own stands, and nothing else is upgraded here (#1530).
+#[test]
+fn test_latched_stop_needs_plateau_check() {
+    // (converged, max_eval_reached, latched)
+    assert!(latched_stop_needs_plateau_check(true, false, true));
+    assert!(latched_stop_needs_plateau_check(false, true, true));
+    assert!(!latched_stop_needs_plateau_check(true, false, false));
+    assert!(!latched_stop_needs_plateau_check(false, true, false));
+    assert!(!latched_stop_needs_plateau_check(false, false, true));
+    assert!(!latched_stop_needs_plateau_check(false, false, false));
+}
+
+/// End to end through `optimize_nlopt_once`, the production wiring of #1530: on
+/// `examples/one_cpt_iv.ferx` FOCEI / L-BFGS the short window latches, and the
+/// latched stop's `converged` comes from the plateau check, not NLopt's forced
+/// `Success`. With the guard off the same fit runs to its own termination, which
+/// before #1530 the 50-eval window never cut short on this model (measured: no
+/// latch on main `2e04abba`) — so the eval-count straddle fails if the closure
+/// goes back to the long window, and `plateau_checked` fails if the verdict
+/// override is dropped.
+#[test]
+fn test_short_window_latch_is_wired_and_plateau_checked() {
+    use crate::estimation::outer_optimizer::{optimize_nlopt_once, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run = |guard: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            stagnation_guard: guard,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let (on, on_outcome) = run(true);
+    let (off, off_outcome) = run(false);
+
+    assert!(on_outcome.stagnation_latched, "the guard must latch");
+    assert!(
+        on_outcome.plateau_checked,
+        "a latched stop must be decided by the plateau check"
+    );
+    assert!(on.converged, "one_cpt_iv's latched optimum is consistent");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches");
+    assert!(
+        on.n_iterations < off.n_iterations,
+        "short-window latch must stop before natural termination: {} vs {}",
+        on.n_iterations,
+        off.n_iterations
+    );
+    assert!(
+        (on.ofv - off.ofv).abs() < 1e-3,
+        "early stop within the guard's resolution: {} vs {}",
+        on.ofv,
+        off.ofv
+    );
 }
 
 #[test]
@@ -1711,10 +2286,21 @@ fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
     };
 
     // (a) No eigenvalue clipping on this well-conditioned surface.
+    //
+    // Asserted on the regularization warning specifically, not on "no warnings at all"
+    // (#1514). The two are not the same claim, and the difference is not hypothetical: the
+    // covariance step also emits purely informational notes — the per-subject salvage note is
+    // one — and an `is_empty()` written under a message about *regularization* turns any of
+    // those into a failure of this test, which is a factor-of-two check whose numeric
+    // assertions sit below this line and would never be reached.
+    let regularizations: Vec<&String> = out
+        .warnings
+        .iter()
+        .filter(|w| w.contains("Covariance step regularized"))
+        .collect();
     assert!(
-        out.warnings.is_empty(),
-        "unexpected covariance regularization: {:?}",
-        out.warnings
+        regularizations.is_empty(),
+        "unexpected covariance regularization: {regularizations:?}"
     );
 
     let fixed = packed_fixed_mask(template);
@@ -4644,7 +5230,23 @@ mod outer_fd_fallback {
             ..FitOptions::default()
         };
         let log = OuterFdDeclineLog::new(pop.subjects.len());
-        let _ = population_gradient_sens_mixed(&x, params, model, pop, &ehs, &bounds, &opts, &log);
+        let hms: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+            .collect();
+        let _ = population_gradient_sens_mixed(
+            &x,
+            params,
+            model,
+            pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
         log
     }
 
@@ -4676,13 +5278,150 @@ mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
+        let w =
+            outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(
+            w.contains("could not be given the exact analytic outer gradient")
+                && w.contains("a trial point where it could not be formed"),
+            "must not attribute every decline to the provider's scope; got: {w}"
+        );
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
         );
         assert!(!w.contains("IN_SCOPE"), "got: {w}");
+        assert!(
+            w.contains("model-level route, not the per-subject one"),
+            "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #1529: the consequence sentence depends on which salvage the route takes, so both
+    /// sides of the `iov` gate are asserted in one test — a gate stuck on either branch
+    /// reddens it. Non-IOV declines take the held-EBE gradient, whose remedy is
+    /// `reconverge_gradient_interval`; IOV declines are still reconverged (the IOV route
+    /// ignores that knob), so pointing an IOV user at it would be false advice.
+    #[test]
+    fn consequence_sentence_follows_the_salvage_route() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
+        // read from the model inside the warning, so pairing the same log with each model
+        // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
+        let iov_model = crate::parser::model_parser::parse_model_string(
+            &WARFARIN_F
+                .replace(
+                    "omega ETA_KA ~ 0.30",
+                    "omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02",
+                )
+                .replace("TVCL * exp(ETA_CL)", "TVCL * exp(ETA_CL + KAPPA_CL)"),
+        )
+        .expect("IOV twin parses");
+        assert!(
+            iov_model.n_kappa > 0 && model.n_kappa == 0,
+            "fixture precondition: the two models must straddle the IOV gate"
+        );
+
+        let non_iov = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        assert!(
+            non_iov.contains("used fixed-EBE outer gradients")
+                && non_iov.contains("omit the EBE-response term"),
+            "non-IOV must name the held-EBE salvage; got: {non_iov}"
+        );
+        assert!(
+            non_iov.contains("`reconverge_gradient_interval = N`"),
+            "non-IOV must name the remedy; got: {non_iov}"
+        );
+        assert!(!non_iov.contains("correct but slower"), "got: {non_iov}");
+
+        let iov = outer_fd_fallback_warning(&iov_model, &pop, &log).expect("must warn");
+        assert!(
+            iov.contains("reconverged finite-difference outer gradients")
+                && iov.contains("correct but slower"),
+            "IOV must name the reconverged salvage; got: {iov}"
+        );
+        assert!(
+            !iov.contains("reconverge_gradient_interval") && !iov.contains("fixed-EBE"),
+            "IOV ignores the interval knob; got: {iov}"
+        );
+    }
+
+    /// #1536: a non-IOV decline takes one of two salvages — reconverged for a structural
+    /// decline, held-EBE otherwise — and the warning must describe each subject by the one
+    /// it got. The input space is the (structural, held-EBE) split of the declined set,
+    /// three non-empty cells; all three are asserted here, each on the sentence that must
+    /// appear *and* the one that must not, so forcing any branch reddens the test.
+    #[test]
+    fn consequence_sentence_names_each_non_iov_salvage_group() {
+        let (model, analytic, declining) = analytic_and_declining();
+        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
+        let pop = mk_pop(vec![analytic, declining]);
+        // Whole sentences, so deleting any clause of either one reddens a cell.
+        const STRUCT: &str = "used reconverged finite-difference outer gradients because \
+             their `block_sigma` residuals are correlated across observation rows (paired \
+             endpoints in one residual block), which the analytic outer gradient does not \
+             cover; those gradients include the EBE-response term but are slower.";
+        const CORRECT: &str = "include the EBE-response term but are slower";
+        const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
+             term the analytic gradient carries. If the fit stalls, \
+             `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
+             evaluation.";
+        const REMEDY: &str = "`reconverge_gradient_interval = N`";
+        const SKIPPED: &str = "1 of their salvage gradients were skipped";
+        let warn_with = |structural: &[usize], skipped: bool| {
+            let log = OuterFdDeclineLog::new(2);
+            log.record(0);
+            log.record(1);
+            for &i in structural {
+                log.record_structural(i);
+            }
+            if skipped {
+                log.record_skipped_salvage();
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("declines warn")
+        };
+        let warn = |structural: &[usize]| warn_with(structural, false);
+
+        let held_only = warn(&[]);
+        assert!(
+            held_only.contains(HELD) && held_only.contains(REMEDY),
+            "got: {held_only}"
+        );
+        assert!(
+            !held_only.contains(STRUCT) && !held_only.contains(CORRECT),
+            "got: {held_only}"
+        );
+
+        let structural_only = warn(&[0, 1]);
+        assert!(
+            structural_only.contains(STRUCT) && structural_only.contains(CORRECT),
+            "got: {structural_only}"
+        );
+        assert!(
+            !structural_only.contains(HELD) && !structural_only.contains(REMEDY),
+            "a reconverged subject must not be pointed at the interval knob; got: \
+             {structural_only}"
+        );
+
+        let split = warn(&[1]);
+        assert!(
+            split.contains(&format!("of these, 1 {STRUCT}"))
+                && split.contains(CORRECT)
+                && split.contains(&format!("The other 1 {HELD}"))
+                && split.contains(REMEDY),
+            "a split population must name both groups with their counts; got: {split}"
+        );
+        assert!(!split.contains(SKIPPED), "no skip recorded; got: {split}");
+
+        // A #1520 skip on a structural fit appends its own sentence without disturbing
+        // the structural one.
+        let skipped = warn_with(&[0, 1], true);
+        assert!(
+            skipped.contains(STRUCT) && skipped.contains(SKIPPED) && !skipped.contains(HELD),
+            "got: {skipped}"
+        );
     }
 
     /// An all-analytic population is silent.
@@ -4691,7 +5430,7 @@ mod outer_fd_fallback {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
         let log = record_one_gradient_eval(&model, &pop);
-        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
+        assert!(outer_fd_fallback_warning(&model, &pop, &log).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -4714,8 +5453,8 @@ mod outer_fd_fallback {
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w =
-            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
+        let w = outer_fd_fallback_warning(&model, &pop, &log)
+            .expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
     }
 
@@ -4725,14 +5464,148 @@ mod outer_fd_fallback {
     /// without touching the analytic branch, so there is nothing to report.
     #[test]
     fn an_untouched_log_says_nothing() {
-        let (_, analytic, declining) = analytic_and_declining();
+        let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         assert!(
-            outer_fd_fallback_warning(&pop, &log).is_none(),
+            outer_fd_fallback_warning(&model, &pop, &log).is_none(),
             "a fit that never evaluated an analytic outer gradient must not warn — even \
              with a subject the provider would decline"
         );
+    }
+
+    /// #1529 review: the three fills of `declined_subject_gradient`, keyed on the held-EBE
+    /// objective and gradient. A repelled subject (the `1e20` sentinel, or NaN/∞) must
+    /// contribute zero rather than a sentinel-driven FD number *or* a reconverge — the
+    /// latter is the #1529 cost at blown-up trials; a usable objective with a non-finite
+    /// gradient must go to the reconverged fallback rather than leak `NaN` into the sum.
+    /// Each arm is pinned both ways so collapsing any two reddens it.
+    #[test]
+    fn declined_fill_keys_on_the_held_ebe_objective_and_gradient() {
+        let finite = [0.5, -1.0];
+        let nan = [0.5, f64::NAN];
+        assert_eq!(declined_fill(12.3, &finite), DeclinedFill::HeldEbe);
+        assert_eq!(declined_fill(12.3, &nan), DeclinedFill::Reconverge);
+        assert_eq!(
+            declined_fill(12.3, &[f64::INFINITY, 0.0]),
+            DeclinedFill::Reconverge
+        );
+        // Sentinel and non-finite objectives are repelled whatever the gradient says.
+        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
+            assert_eq!(
+                declined_fill(nll, &finite),
+                DeclinedFill::Zero,
+                "nll = {nll}"
+            );
+            assert_eq!(declined_fill(nll, &nan), DeclinedFill::Zero, "nll = {nll}");
+        }
+        // Just under the sentinel is a real objective.
+        assert_eq!(declined_fill(9.99e19, &finite), DeclinedFill::HeldEbe);
+    }
+
+    /// #1537 review: a structural decline keys on the held-EBE objective exactly as the
+    /// held-EBE salvage does — zero when repelled — but its usable arm is the reconverged
+    /// gradient, never the held-EBE one it exists to replace. Both arms pinned, and the
+    /// sentinel boundary on both sides.
+    #[test]
+    fn structural_fill_zeroes_a_repelled_subject_and_reconverges_a_real_one() {
+        for nll in [12.3, 9.99e19] {
+            assert_eq!(
+                structural_fill(nll),
+                DeclinedFill::Reconverge,
+                "nll = {nll}"
+            );
+        }
+        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
+            assert_eq!(structural_fill(nll), DeclinedFill::Zero, "nll = {nll}");
+        }
+    }
+
+    /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject
+    /// whose held-EBE objective is the `1e20` sentinel contributes zero, while the
+    /// unguarded reconverged gradient it used to take is large and non-zero at the very
+    /// same inputs. A NaN held Jacobian is what repels the subject here: it poisons `R̃`,
+    /// whose failed Cholesky returns the sentinel (asserted, not assumed). The usable twin
+    /// — same subject, same point, a finite Jacobian — must still take the reconverged
+    /// gradient bit-for-bit, so a guard that zeroes every structural subject also reddens.
+    #[test]
+    fn structural_salvage_zeroes_a_repelled_subject() {
+        let (model, _analytic, declining) = analytic_and_declining();
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let pop = mk_pop(vec![declining.clone()]);
+        let n_obs = declining.observations.len();
+        let eta = DVector::from_element(model.n_eta, 0.1);
+        let h_repelled = DMatrix::from_element(n_obs, model.n_eta, f64::NAN);
+        let h_usable = DMatrix::zeros(n_obs, model.n_eta);
+
+        let p = unpack_params(&x, params);
+        let nll_at = |h: &DMatrix<f64>| {
+            crate::stats::likelihood::foce_subject_nll(
+                &model,
+                &declining,
+                &p.theta,
+                &eta,
+                h,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                true,
+            )
+        };
+        assert_eq!(nll_at(&h_repelled), 1e20, "fixture must hit the sentinel");
+        assert!(
+            crate::estimation::gauss_newton::is_usable_subject_nll(nll_at(&h_usable)),
+            "twin must be a real objective"
+        );
+
+        // The straddle: what the unguarded structural branch returned at these inputs.
+        let unguarded =
+            subject_reconverged_fd_gradient(&x, params, &model, &declining, &eta, &bounds, &opts);
+        assert!(
+            unguarded.iter().any(|g| g.abs() > 1.0),
+            "unguarded reconverge must be non-trivial here, else the zero below is vacuous: \
+             {unguarded:?}"
+        );
+
+        let salvage = |h: &DMatrix<f64>| {
+            non_iov_declined_salvage(true, &x, params, &model, &pop, 0, &eta, h, &bounds, &opts)
+        };
+        assert_eq!(salvage(&h_repelled), vec![0.0; x.len()]);
+        assert_eq!(salvage(&h_usable), unguarded);
+    }
+
+    /// #1537 review: the sentinel is finite, so a central difference with one repelled side
+    /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
+    /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
+    /// that the fixture really straddles the sentinel, and a coordinate with both sides
+    /// usable keeps its true derivative.
+    #[test]
+    fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
+        let x = [0.0, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
+        let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
+        let unmasked = central_diff_packed(&x, &fixed, &bounds, raw);
+        assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
+        let masked = central_diff_packed(&x, &fixed, &bounds, |v| fd_masked_subject_nll(raw(v)));
+        assert_eq!(masked[0], 0.0);
+        assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
+        for nll in [1e20, f64::INFINITY] {
+            assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
+        }
+        assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
@@ -4799,5 +5672,528 @@ mod outer_fd_fallback {
             Some(foce),
             "interaction = false must take the FOCE entry point"
         );
+    }
+
+    // ── #1520: the FD-salvage guard ────────────────────────────────────────────────
+
+    /// The warning's #1520 sentence is present exactly when a salvage was skipped, and
+    /// carries the count. Both sides in one test so a counter that never increments
+    /// (or a sentence that is always emitted) reddens it.
+    #[test]
+    fn warning_names_skipped_salvages_only_when_there_were_any() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        log.record(1);
+        let before = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
+        assert!(
+            !before.contains("skipped"),
+            "no skipped salvage, no sentence about one; got: {before}"
+        );
+        log.record_skipped_salvage();
+        log.record_skipped_salvage();
+        assert_eq!(log.skipped_salvages(), 2);
+        let after = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
+        assert!(
+            after.contains("2 of their salvage gradients were skipped"),
+            "the sentence must carry the count; got: {after}"
+        );
+        assert!(
+            after.starts_with(&before),
+            "the #1520 sentence is appended, the original warning is unchanged"
+        );
+    }
+
+    /// The predicate alone, with fixtures on both sides of **each** gate, and the straddle
+    /// asserted on the constant so the fixture pair cannot drift onto one side. Mutations
+    /// that must redden it: `>` → `>=` (the boundary rows), dropping the `n_obs`
+    /// multiplier (the row whose excess sits between `τ` and `τ·n_obs`), dropping the
+    /// `max(1)` floor (the zero-observation rows), dropping either gate (its "under" row).
+    #[test]
+    fn skip_fd_salvage_straddles_both_gates() {
+        let tau = BLOWN_UP_EXCESS_PER_OBS;
+        // The constant's value against the gap it was measured into (see its doc comment):
+        // the largest ordinary per-observation excess seen at a rejected trial, and the
+        // smallest blown-up one, over the bundled examples. Moving the line outside that
+        // gap — the mutation the rest of this test cannot see, since it reads `tau` —
+        // reddens this before any fit does.
+        assert!(
+            6.0 < tau && tau < 21.8,
+            "BLOWN_UP_EXCESS_PER_OBS = {tau} must sit inside the measured gap (6.0, 21.8)"
+        );
+        // Subject 0: 4 observations; subject 1: 6. Population: 10 observations.
+        let best = [30.0, 50.0];
+        let n_obs = [4usize, 6];
+        let n_total = 10usize;
+        let best_ofv = 80.0;
+        // A trial where the population is blown up by 2τ per observation and subject 0
+        // by 2τ per observation of its own.
+        let blown = [best[0] + 2.0 * tau * 4.0, best[1] + 2.0 * tau * 6.0];
+        let ofv_blown = best_ofv + 2.0 * tau * n_total as f64;
+        let trial = |ofv: f64, contribs: &[f64], incumbent: bool| -> bool {
+            let t = OuterTrial {
+                ofv,
+                contribs,
+                incumbent: incumbent.then_some((best_ofv, &best[..])),
+            };
+            skip_fd_salvage(&t, 0, n_obs[0], n_total)
+        };
+        assert!(
+            trial(ofv_blown, &blown, true),
+            "both gates over the line: fires"
+        );
+        assert!(
+            !trial(ofv_blown, &blown, false),
+            "no incumbent: cannot fire"
+        );
+
+        // Subject gate. Exactly on the line does not fire (strict `>`); just over does.
+        let on_line = [best[0] + tau * 4.0, blown[1]];
+        let just_over = [best[0] + tau * 4.0 + 1e-9, blown[1]];
+        assert!(
+            !trial(ofv_blown, &on_line, true),
+            "subject excess == τ·n_obs: no"
+        );
+        assert!(
+            trial(ofv_blown, &just_over, true),
+            "subject excess > τ·n_obs: yes"
+        );
+        // Between τ and τ·n_obs: an excess that would fire without the per-observation
+        // normalisation must not.
+        let unnormalised = [best[0] + 2.0 * tau, blown[1]];
+        assert!(
+            2.0 * tau < tau * n_obs[0] as f64,
+            "fixture: sits below τ·n_obs"
+        );
+        assert!(
+            !trial(ofv_blown, &unnormalised, true),
+            "τ < excess < τ·n_obs: no"
+        );
+
+        // Population gate. Subject blown up, population exactly on / just over the line.
+        let ofv_on = best_ofv + tau * n_total as f64;
+        assert!(!trial(ofv_on, &blown, true), "population excess == τ·N: no");
+        assert!(
+            trial(ofv_on + 1e-9, &blown, true),
+            "population excess > τ·N: yes"
+        );
+        // A subject blown up at a point *better* than the incumbent — the accepted-point
+        // cell — never fires, whatever the subject did.
+        assert!(!trial(best_ofv - 1.0, &blown, true), "improving point: no");
+
+        // Zero observations: judged on the whole excess (floor of one).
+        let t = OuterTrial {
+            ofv: ofv_blown,
+            contribs: &[best[0] + tau + 1e-9, blown[1]],
+            incumbent: Some((best_ofv, &best[..])),
+        };
+        assert!(
+            skip_fd_salvage(&t, 0, 0, n_total),
+            "n_obs = 0: excess > τ fires"
+        );
+        let t = OuterTrial {
+            ofv: ofv_blown,
+            contribs: &[best[0] + tau - 1e-9, blown[1]],
+            incumbent: Some((best_ofv, &best[..])),
+        };
+        assert!(
+            !skip_fd_salvage(&t, 0, 0, n_total),
+            "n_obs = 0: excess < τ does not"
+        );
+
+        // Non-finite inputs never fire, and a mismatched incumbent disarms the guard.
+        let nan_c = [f64::NAN, blown[1]];
+        assert!(!trial(ofv_blown, &nan_c, true), "NaN contribution: no");
+        assert!(!trial(f64::NAN, &blown, true), "NaN objective: no");
+        let t = OuterTrial {
+            ofv: ofv_blown,
+            contribs: &blown,
+            incumbent: Some((best_ofv, &best[..1])),
+        };
+        assert!(
+            !skip_fd_salvage(&t, 0, n_obs[0], n_total),
+            "length mismatch: no"
+        );
+    }
+
+    /// Per-subject `2·nllᵢ` and the inner solution at packed `x`, the way the optimizer
+    /// closures produce them.
+    fn solve_at(
+        model: &CompiledModel,
+        pop: &Population,
+        template: &ModelParameters,
+        x: &[f64],
+        opts: &FitOptions,
+    ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<f64>) {
+        let params = unpack_params(x, template);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            model,
+            pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            Some(&mu_k),
+            0,
+            0,
+        );
+        let contribs: Vec<f64> = pop
+            .subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                2.0 * subject_nll(
+                    model,
+                    s,
+                    &params,
+                    &ehs[i],
+                    &hms[i],
+                    &kappas[i],
+                    opts.interaction,
+                )
+            })
+            .collect();
+        (ehs, hms, contribs)
+    }
+
+    /// The assembly-level straddle, on the fixture's real declining subject: at an ordinary
+    /// point the guard leaves the assembly bit-identical to the unguarded one and the
+    /// salvage runs; at a blown-up rejected point that subject contributes nothing —
+    /// asserted as bit-equality with the analytic subject's term alone, and as inequality
+    /// with the salvaged assembly, so the two arms are provably distinguishable on this
+    /// fixture. Then each gate's own cell: the same blown-up subject at a point claimed
+    /// *better* than the incumbent (population gate) and a mildly-worse subject at the
+    /// blown-up point (subject gate) both keep the salvage. Deleting either gate leaves the
+    /// other cell green and reddens its own.
+    #[test]
+    fn guard_drops_the_subject_only_at_a_blown_up_rejected_point() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let template = &model.default_params;
+        let PackedStart {
+            packed: x_inc,
+            bounds,
+            ..
+        } = pack_with_bounds(template);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        // The incumbent: the model's own starting point.
+        let (ehs_inc, hms_inc, c_inc) = solve_at(&model, &pop, template, &x_inc, &opts);
+        let ofv_inc: f64 = c_inc.iter().sum();
+        // The blown-up trial: the proportional residual variance at 1/2500 of its value
+        // (a 50× smaller SD), so every standardised residual is 50× larger. A θ move
+        // alone does not do it — the inner loop absorbs a five-fold TVV change into
+        // `ETA_V` at 1.6 units per observation, measured — but no EBE can absorb σ.
+        let mut bad = template.clone();
+        bad.sigma.values[0] /= 2500.0;
+        let x_bad = pack_params(&bad);
+        let (ehs_bad, hms_bad, c_bad) = solve_at(&model, &pop, template, &x_bad, &opts);
+        let ofv_bad: f64 = c_bad.iter().sum();
+        let n_obs_1 = pop.subjects[1].observations.len();
+        let n_total = population_n_obs(&pop);
+        let tau = BLOWN_UP_EXCESS_PER_OBS;
+
+        // Fixture preconditions, asserted: the straddle on both gates with stated
+        // margin, and the same subject declining at both points (the provider's decline
+        // is a property of the records, not of θ) while the other stays analytic.
+        let subj_excess_per_obs = (c_bad[1] - c_inc[1]) / n_obs_1 as f64;
+        let pop_excess_per_obs = (ofv_bad - ofv_inc) / n_total as f64;
+        assert!(
+            subj_excess_per_obs > 10.0 * tau,
+            "the trial must blow the declining subject up by well over τ per observation; \
+             got {subj_excess_per_obs:.3e} against τ = {tau}"
+        );
+        assert!(
+            pop_excess_per_obs > 10.0 * tau,
+            "the trial must blow the population up by well over τ per observation; got \
+             {pop_excess_per_obs:.3e}"
+        );
+        for (x, ehs) in [(&x_inc, &ehs_inc), (&x_bad, &ehs_bad)] {
+            assert!(
+                subject_analytic_outer_gradient(
+                    &model,
+                    &pop.subjects[0],
+                    template,
+                    x,
+                    ehs[0].as_slice(),
+                    true
+                )
+                .is_some(),
+                "the analytic subject must be served at both points"
+            );
+            assert!(
+                subject_analytic_outer_gradient(
+                    &model,
+                    &pop.subjects[1],
+                    template,
+                    x,
+                    ehs[1].as_slice(),
+                    true
+                )
+                .is_none(),
+                "the infusion subject must decline at both points"
+            );
+        }
+
+        let assemble = |x: &[f64], (ehs, hms): (&[DVector<f64>], &[DMatrix<f64>]), trial| {
+            let log = OuterFdDeclineLog::new(pop.subjects.len());
+            let g = population_gradient_sens_mixed(
+                x, template, &model, &pop, ehs, hms, &bounds, &opts, trial, &log,
+            );
+            (g, log)
+        };
+        let at_inc = (ehs_inc.as_slice(), hms_inc.as_slice());
+        let at_bad = (ehs_bad.as_slice(), hms_bad.as_slice());
+
+        // 1. Ordinary point (the incumbent itself): bit-identical to the unguarded
+        //    assembly, salvage run, nothing skipped.
+        let (g_plain, log_plain) = assemble(&x_inc, at_inc, OuterTrial::unknown());
+        let (g_same, log_same) = assemble(
+            &x_inc,
+            at_inc,
+            OuterTrial {
+                ofv: ofv_inc,
+                contribs: &c_inc,
+                incumbent: Some((ofv_inc, &c_inc)),
+            },
+        );
+        assert_eq!(
+            bits(&g_plain),
+            bits(&g_same),
+            "an ordinary point is untouched"
+        );
+        assert_eq!(log_plain.declined_indices(), vec![1]);
+        assert_eq!(log_same.declined_indices(), vec![1]);
+        assert_eq!(log_plain.skipped_salvages(), 0);
+        assert_eq!(log_same.skipped_salvages(), 0);
+
+        // 2. Blown-up rejected point: the declining subject contributes nothing.
+        let blown = OuterTrial {
+            ofv: ofv_bad,
+            contribs: &c_bad,
+            incumbent: Some((ofv_inc, &c_inc)),
+        };
+        let (g_unguarded, _) = assemble(&x_bad, at_bad, OuterTrial::unknown());
+        let (g_guarded, log_guarded) = assemble(&x_bad, at_bad, blown);
+        assert_eq!(log_guarded.declined_indices(), vec![1], "still a decline");
+        assert_eq!(
+            log_guarded.skipped_salvages(),
+            1,
+            "exactly one salvage skipped"
+        );
+        let g0 = subject_analytic_outer_gradient(
+            &model,
+            &pop.subjects[0],
+            template,
+            &x_bad,
+            ehs_bad[0].as_slice(),
+            true,
+        )
+        .expect("served");
+        // The assembly's exact summation order: 0 + 2·g₀ + 2·0, then fixed coordinates
+        // zeroed — replicated so the comparison is bit-exact rather than tolerance-based.
+        let fixed = packed_fixed_mask(template);
+        let expected: Vec<f64> = (0..x_bad.len())
+            .map(|k| {
+                if fixed[k] {
+                    0.0
+                } else {
+                    let mut acc = 0.0f64;
+                    acc += 2.0 * g0[k];
+                    acc += 2.0 * 0.0;
+                    acc
+                }
+            })
+            .collect();
+        assert_eq!(
+            bits(&g_guarded),
+            bits(&expected),
+            "the guarded assembly is the analytic subject's term alone"
+        );
+        assert_ne!(
+            bits(&g_guarded),
+            bits(&g_unguarded),
+            "fixture: the salvaged subject's gradient is non-zero here, or this test \
+             could not tell the arms apart"
+        );
+
+        // 3. Population gate: the same blown-up subject at a point claimed better than
+        //    the incumbent keeps the salvage.
+        let improving = OuterTrial {
+            ofv: ofv_inc - 1.0,
+            contribs: &c_bad,
+            incumbent: Some((ofv_inc, &c_inc)),
+        };
+        let (g_improving, log_improving) = assemble(&x_bad, at_bad, improving);
+        assert_eq!(log_improving.skipped_salvages(), 0, "population gate holds");
+        assert_eq!(bits(&g_improving), bits(&g_unguarded));
+
+        // 4. Subject gate: a subject only mildly worse (half the line) at the blown-up
+        //    point keeps the salvage.
+        let mut c_mild = c_bad.clone();
+        c_mild[1] = c_inc[1] + 0.5 * tau * n_obs_1 as f64;
+        let mild = OuterTrial {
+            ofv: ofv_bad,
+            contribs: &c_mild,
+            incumbent: Some((ofv_inc, &c_inc)),
+        };
+        let (g_mild, log_mild) = assemble(&x_bad, at_bad, mild);
+        assert_eq!(log_mild.skipped_salvages(), 0, "subject gate holds");
+        assert_eq!(bits(&g_mild), bits(&g_unguarded));
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    // ── #1520 review: the per-optimizer reference ──────────────────────────────────
+
+    /// One scripted NLopt SLSQP evaluation sequence, exactly as `slsqp.c` drives ferx's
+    /// objective closure with bounds only, including the review's case — the eleventh
+    /// line-search trial accepted **without** sufficient decrease (`L200`: `line > 10`,
+    /// then `L240` requests `mode = −1` at that point). What the bookkeeping must return:
+    ///
+    /// | evaluation | `mode` | gradient | fresh | reference |
+    /// |---|---|---|---|---|
+    /// | `x0` | 0 → 1, then −1 at the same `x0` | yes, twice | yes / no | `None` (nothing yet) / `None` (not fresh) |
+    /// | first trial `x1`, blown up, rejected | −2 | yes | yes | **`x0`**, the iterate |
+    /// | trials `x2 … x11`, all rejected on `h1 <= h3/10` | 1 | no | — | `None` (no gradient) |
+    /// | `x11` again, accepted on `line > 10`, worse than `x0` | −1 | yes | **no** | **`None`** — the review's hole, closed |
+    /// | next line search's first trial `x12` | −2 | yes | yes | **`x11`**, the new iterate — not `x0`, which is the *best evaluation* |
+    ///
+    /// The last row is the one a "best evaluation" reference gets wrong, and the fourth
+    /// is the one a reference that ignores freshness gets wrong; each is asserted
+    /// against the value the other policy would have produced, so either mutation
+    /// reddens this on its own row.
+    #[test]
+    fn slsqp_reference_is_the_iterate_and_only_at_a_fresh_first_trial() {
+        let mut st = SalvageGuardState::new(SalvageGuardPolicy::LastGradientPointIfFresh);
+        let x0 = [1.0, 2.0];
+        let c0 = vec![40.0, 60.0];
+        // mode 0 → 1: first evaluation, gradient formed (`want_grad` starts at 1).
+        assert!(st.reference(&x0).is_none(), "nothing seen yet");
+        st.observe(&x0, 100.0, c0.clone(), true, true);
+        // mode −1 at the same x0: SLSQP re-requests f and g at the start point.
+        assert!(
+            st.reference(&x0).is_none(),
+            "same xs as the previous evaluation"
+        );
+        st.observe(&x0, 100.0, c0.clone(), true, false);
+        // mode −2: first trial, blown up, rejected. Reference must be the iterate x0.
+        let x1 = [1.5, 2.5];
+        let r = st
+            .reference(&x1)
+            .expect("fresh first trial gets a reference");
+        assert_eq!(r.0, 100.0);
+        assert_eq!(r.1, &c0[..]);
+        st.observe(&x1, 1.0e5, vec![5.0e4, 5.0e4], true, false);
+        // mode 1 ×10: objective-only backtracking trials — no gradient is formed, so the
+        // closure never asks for a reference there; they are only recorded.
+        let mut x = x1;
+        for k in 2..=11 {
+            x = [1.0 + 0.5 / k as f64, 2.0 + 0.5 / k as f64];
+            st.observe(&x, 100.0 + 30.0 / k as f64, vec![55.0, 45.0], false, false);
+        }
+        let x11 = x;
+        // mode −1 at x11: accepted on `line > 10` although worse than x0 (102.7 > 100),
+        // and also worse than the best evaluation. The gradient here feeds SLSQP's BFGS
+        // update — the guard must be off. A reference ignoring freshness would return
+        // x0's (100.0), and the population gate would then be live at an accepted point.
+        assert!(
+            st.reference(&x11).is_none(),
+            "a gradient request at the previous evaluation's xs is the accepted iterate"
+        );
+        st.observe(&x11, 100.0 + 30.0 / 11.0, vec![55.0, 45.0], true, false);
+        // mode −2 of the next line search: fresh, so a reference — and it must be x11,
+        // the iterate SLSQP's merit test compares against, not x0, the best evaluation.
+        let x12 = [3.0, 3.0];
+        let r = st.reference(&x12).expect("fresh first trial");
+        assert_eq!(
+            r.0,
+            100.0 + 30.0 / 11.0,
+            "the last gradient point, i.e. the iterate"
+        );
+        assert_ne!(r.0, 100.0, "not the best evaluation");
+        assert_eq!(r.1, &[55.0, 45.0][..]);
+    }
+
+    /// The other two policies on the same kind of sequence: MMA measures against the best
+    /// evaluation whether or not the point is fresh (its acceptance test is `fcur < minf`),
+    /// and L-BFGS never gets a reference. Both asserted on the row where they differ from
+    /// the SLSQP policy, so a `for_optimizer` mutation that swaps policies dies here.
+    #[test]
+    fn mma_measures_against_the_best_evaluation_and_lbfgs_never_fires() {
+        let mut mma = SalvageGuardState::new(SalvageGuardPolicy::BestEvaluation);
+        let mut lbfgs = SalvageGuardState::new(SalvageGuardPolicy::Off);
+        let x0 = [1.0];
+        for st in [&mut mma, &mut lbfgs] {
+            st.observe(&x0, 100.0, vec![100.0], true, true);
+            st.observe(&[1.5], 500.0, vec![500.0], true, false); // rejected, worse
+            st.observe(&[1.2], 90.0, vec![90.0], true, true); // accepted, new best
+            st.observe(&[1.4], 95.0, vec![95.0], true, false); // rejected but better than x0
+        }
+        // MMA: the best evaluation (90), at a fresh point and at a repeated one alike.
+        let r = mma
+            .reference(&[1.9])
+            .expect("MMA always has a reference once seen");
+        assert_eq!(
+            r.0, 90.0,
+            "best evaluation, not the last gradient point (95)"
+        );
+        let r = mma
+            .reference(&[1.4])
+            .expect("freshness is irrelevant to MMA");
+        assert_eq!(r.0, 90.0);
+        // L-BFGS: nothing, ever.
+        assert!(lbfgs.reference(&[1.9]).is_none());
+        assert!(lbfgs.reference(&[1.4]).is_none());
+    }
+
+    /// A guard-rejected evaluation (EBE guard, non-finite objective) forms no gradient
+    /// and is not adopted: it must neither become the last gradient point nor the best,
+    /// but it *is* the previous evaluation for the freshness test.
+    #[test]
+    fn a_guarded_evaluation_advances_freshness_only() {
+        let mut st = SalvageGuardState::new(SalvageGuardPolicy::LastGradientPointIfFresh);
+        st.observe(&[1.0], 100.0, vec![100.0], true, true);
+        st.observe(&[2.0], 1e12, Vec::new(), false, false); // guarded: sentinel, no gradient
+        let r = st.reference(&[3.0]).expect("fresh");
+        assert_eq!(
+            r.0, 100.0,
+            "the sentinel evaluation is not a gradient point"
+        );
+        assert!(
+            st.reference(&[2.0]).is_none(),
+            "but it was an evaluation, so its xs is not fresh"
+        );
+    }
+
+    /// `for_optimizer` maps each outer optimizer to the policy its acceptance test
+    /// justifies; everything not listed is `Off`.
+    #[test]
+    fn policy_per_optimizer() {
+        use SalvageGuardPolicy::*;
+        assert_eq!(
+            SalvageGuardPolicy::for_optimizer(Optimizer::Slsqp),
+            LastGradientPointIfFresh
+        );
+        assert_eq!(
+            SalvageGuardPolicy::for_optimizer(Optimizer::Mma),
+            BestEvaluation
+        );
+        for o in [
+            Optimizer::NloptLbfgs,
+            Optimizer::Bobyqa,
+            Optimizer::Auto,
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(SalvageGuardPolicy::for_optimizer(o), Off, "{o:?}");
+        }
     }
 }

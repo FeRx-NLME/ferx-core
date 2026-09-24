@@ -1088,6 +1088,269 @@ fn population_packed_gradient_selected_block_sigma_matches_fd() {
     assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
 }
 
+/// A [`SELECTED_BLOCK_SIGMA_1CPT`] subject whose total (`FREE = 0`) and unbound
+/// (`FREE = 1`) rows are **paired** at each time — the `fluconazole_radboudumc` shape
+/// (#1536). Each pair shares a residual block, so `R` has cross-observation entries.
+fn paired_selected_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+    selected_dense_subject(
+        model,
+        theta,
+        &[0.5, 0.5, 2.0, 2.0, 8.0, 8.0],
+        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+    )
+}
+
+/// #1536: [`crate::stats::residual_error::has_cross_observation_residual`] — the gate both
+/// `corr_residual_diag`'s decline and the outer assembly's reconverged salvage read — is
+/// decided by the pairing, which depends on the data, not on values. Each fixture differs
+/// from `paired` or `distinct` in one input and straddles the predicate:
+///
+/// - paired vs distinct times (the `(time, occasion)` block);
+/// - distinct times vs the same rows grouped by an explicit `L2` id (the `L2` block pairs
+///   rows across times, so a predicate that ignored `obs_l2` would serve it diagonally
+///   while the objective's `R` stays coupled);
+/// - paired vs the same times all on one endpoint (slot overlap: two `FREE = 0` rows at
+///   one time share a block but not a correlation);
+/// - ρ = 0.3 vs ρ = 0 on the paired subject: the value covariance vanishes at ρ = 0, so a
+///   gate on `|R_jk| > 0` (the pre-#1536 guard) would serve it analytically and drop
+///   `∂R_jk/∂ρ`. The pairing gate must still decline it.
+///
+/// Each fixture is checked three ways, independently: the predicate, `corr_residual_diag`,
+/// and — at ρ ≠ 0, where a pair has a nonzero value covariance — the off-diagonal of the
+/// `R` the objective builds (`compute_r_matrix_with_correlations`) at the provider's
+/// predictions and the covariate-selected endpoint keys. So the predicate cannot drift from
+/// either the decline or the matrix without this test reddening. (`f = 0` is not reachable
+/// on this IV fixture: every prediction is positive.)
+#[test]
+fn cross_observation_residual_gate_follows_pairing_not_values() {
+    use crate::stats::residual_error::{
+        compute_r_matrix_with_correlations, has_cross_observation_residual,
+    };
+
+    let model = parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+    let theta = [1.1, 11.0];
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    let corr = params.residual_correlations.clone();
+    assert_eq!(corr.len(), 1, "fixture precondition: one correlation");
+    assert!(
+        corr[0].rho != 0.0,
+        "fixture precondition: nonzero declared ρ"
+    );
+    let mut corr_zero = corr.clone();
+    corr_zero[0].rho = 0.0;
+
+    let paired = paired_selected_subject(&model, &theta);
+    let distinct = selected_dense_subject(
+        &model,
+        &theta,
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+    );
+    let mut l2_grouped = distinct.clone();
+    l2_grouped.obs_l2 = vec![1, 1, 2, 2, 3, 3];
+    let one_endpoint =
+        selected_dense_subject(&model, &theta, &[0.5, 0.5, 2.0, 2.0, 8.0, 8.0], &[0.0; 6]);
+
+    let sigma = &params.sigma.values;
+    let zeros = vec![0.0; model.n_eta];
+    let sens_of = |s: &Subject| {
+        crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &zeros).unwrap()
+    };
+    let r_off_diagonal = |s: &Subject, c: &[ResidualCorrelation]| {
+        let ipreds: Vec<f64> = sens_of(s).obs.iter().map(|o| o.f).collect();
+        let r = compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            model.error_spec.obs_keys(s).as_ref(),
+            &s.obs_times,
+            &s.obs_raw_times,
+            &s.occasions,
+            &s.obs_l2,
+            sigma,
+            c,
+        );
+        let n = ipreds.len();
+        (0..n).any(|j| (0..n).any(|k| j != k && r[(j, k)] != 0.0))
+    };
+    for (name, s, c, cross) in [
+        ("paired", &paired, &corr, true),
+        ("paired, rho = 0", &paired, &corr_zero, true),
+        ("distinct times", &distinct, &corr, false),
+        ("L2-grouped distinct times", &l2_grouped, &corr, true),
+        ("one endpoint", &one_endpoint, &corr, false),
+    ] {
+        assert_eq!(
+            has_cross_observation_residual(&model.error_spec, s, sigma, c),
+            cross,
+            "{name}: predicate"
+        );
+        let sens = sens_of(s);
+        assert_eq!(
+            corr_residual_diag(&model, s, &sens, sigma, c).is_some(),
+            !cross,
+            "{name}: corr_residual_diag must decline exactly the cross-observation subjects"
+        );
+        if c[0].rho != 0.0 {
+            assert_eq!(
+                r_off_diagonal(s, c),
+                cross,
+                "{name}: the objective's R must couple rows exactly when the predicate says so"
+            );
+        }
+    }
+    // No correlation at all: nothing can pair.
+    assert!(!has_cross_observation_residual(
+        &model.error_spec,
+        &paired,
+        sigma,
+        &[]
+    ));
+}
+
+/// #1536 regression. A subject whose `block_sigma` residual pairs rows across
+/// observations declines the analytic outer gradient at **every** point, so the
+/// salvage is the only gradient it ever contributes. #1529 made that salvage the
+/// held-EBE gradient, which omits the EBE-response term; on `fluconazole_radboudumc`
+/// (all 31 subjects paired) L-BFGS then stalled at `‖g‖ ≈ 655` and OFV 807.88, against
+/// 738.05 with the reconverged gradient.
+///
+/// For **both** FOCEI and FOCE (the salvage choice must not key on `interaction`), the
+/// assembled mixed gradient must match FD of the **full** objective — the paired subject's
+/// marginal with its EBE re-solved at every point, not held — across every θ/Ω/σ/ρ
+/// coordinate, next to an in-scope subject that keeps the exact analytic gradient.
+///
+/// It also pins the precedence with the #1520 guard: at a blown-up trial the structural
+/// subject contributes **zero** (the guard runs before the salvage is chosen), so the
+/// population gradient is exactly the in-scope subject's term and one skip is recorded.
+#[test]
+fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
+    use crate::estimation::outer_optimizer::{population_gradient_sens_mixed, OuterTrial};
+    use crate::estimation::parameterization::compute_bounds;
+    use crate::types::FitOptions;
+
+    let model = parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+    let theta = [1.1, 11.0];
+    let s_in = selected_dense_subject(
+        &model,
+        &theta,
+        &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0],
+        &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+    );
+    let s_paired = paired_selected_subject(&model, &theta);
+    let pop = Population {
+        subjects: vec![s_in, s_paired],
+        covariate_names: vec!["FREE".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let mut template = model.default_params.clone();
+    template.theta = theta.to_vec();
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+    let bounds = compute_bounds(&template);
+
+    for interaction in [true, false] {
+        let options = FitOptions {
+            interaction,
+            ..Default::default()
+        };
+        // The production per-subject objective with the EBE re-solved at `p`: the
+        // reference both the analytic subject's exact gradient and the paired subject's
+        // reconverged salvage are gradients of.
+        let solve =
+            |s: &Subject, p: &ModelParameters| find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
+        let nll = |s: &Subject, p: &ModelParameters| -> f64 {
+            let e = solve(s, p);
+            foce_subject_nll(
+                &model,
+                s,
+                &p.theta,
+                &e.eta,
+                &e.h_matrix,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                interaction,
+            )
+        };
+
+        let solved: Vec<_> = pop.subjects.iter().map(|s| solve(s, &params)).collect();
+        let ehs: Vec<DVector<f64>> = solved.iter().map(|e| e.eta.clone()).collect();
+        let hms: Vec<DMatrix<f64>> = solved.iter().map(|e| e.h_matrix.clone()).collect();
+
+        // Straddle, asserted: subject 0 is analytic, subject 1 declines.
+        let per_sub =
+            per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, interaction, None);
+        let g_in = per_sub[0]
+            .clone()
+            .unwrap_or_else(|| panic!("interaction = {interaction}: unpaired subject analytic"));
+        assert!(
+            per_sub[1].is_none(),
+            "interaction = {interaction}: paired subject must decline"
+        );
+
+        let declines =
+            crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+        let mixed = population_gradient_sens_mixed(
+            &x,
+            &template,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &options,
+            OuterTrial::unknown(),
+            &declines,
+        );
+        let w =
+            crate::estimation::outer_optimizer::outer_fd_fallback_warning(&model, &pop, &declines)
+                .expect("a declined subject warns");
+        assert!(
+            w.starts_with("1 of 2") && w.contains("correlated across observation rows"),
+            "interaction = {interaction}: the paired subject must be logged as a structural \
+             decline; got: {w}"
+        );
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop.subjects.iter().map(|s| nll(s, &p)).sum::<f64>()
+        };
+        // Measured (FOCEI): worst relative error 9.8e-4, on the ρ coordinate (the salvage's
+        // own single-step central difference against this Richardson reference); every
+        // other coordinate ≤ 6e-6. The held-EBE salvage misses by 1.4e-1 on the first θ,
+        // so the shared 2e-3 bound separates the two by ~70×. FOCE: worst 1.55e-4, also
+        // on ρ.
+        eprintln!("interaction = {interaction}");
+        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 2e-3, 1e-5);
+
+        // #1520 precedence: a blown-up trial (population and subject 1 both 1e6 over an
+        // incumbent of 0) skips the structural subject's salvage. The guard reads only the
+        // trial context, so a synthetic one suffices.
+        let contribs = vec![0.0; 2];
+        let best = vec![0.0, -1e6];
+        let blown = OuterTrial {
+            ofv: 1e6,
+            contribs: &contribs,
+            incumbent: Some((0.0, &best)),
+        };
+        let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(2);
+        let guarded = population_gradient_sens_mixed(
+            &x, &template, &model, &pop, &ehs, &hms, &bounds, &options, blown, &declines,
+        );
+        let expected: Vec<f64> = g_in.iter().map(|g| 2.0 * g).collect();
+        assert_eq!(
+            guarded, expected,
+            "interaction = {interaction}: a skipped structural subject contributes zero"
+        );
+        assert_eq!(declines.skipped_salvages(), 1);
+    }
+}
+
 /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic
 /// FOCEI packed gradient must still match Richardson reconverged FD of the dense marginal
 /// across every θ/Ω/σ coord. Pins the numerical side of the outer half of
@@ -2047,12 +2310,13 @@ fn ss_reset_subject_outer(
 /// Regression for focei-slsqp-fixed-ebe-gradient-bias: a population mixing
 /// in-scope subjects with a single out-of-scope (SS+reset) subject must still
 /// yield the exact analytic gradient for the in-scope subjects, filling only
-/// the out-of-scope one with a reconverged per-subject FD. Before the fix one
-/// such subject forced `population_gradient_sens` to `None`, dropping the
-/// whole population onto the θ-only fixed-EBE gradient whose biased Ω/σ block
-/// left the variance components pinned at their start and stalled SLSQP/
-/// L-BFGS/MMA. The assembled `population_gradient_sens_mixed` must match
-/// reconverged-FD of the FOCEI OFV across every packed coordinate.
+/// the out-of-scope one with a per-subject held-EBE gradient (#1529; it was a
+/// reconverged per-subject FD before). Before the fix one such subject forced
+/// `population_gradient_sens` to `None`, dropping the whole population onto the
+/// θ-only fixed-EBE gradient whose biased Ω/σ block left the variance components
+/// pinned at their start and stalled SLSQP/L-BFGS/MMA. The assembled
+/// `population_gradient_sens_mixed` must match FD of that split objective across
+/// every packed coordinate.
 #[test]
 fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
     use crate::estimation::outer_optimizer::population_gradient_sens_mixed;
@@ -2112,46 +2376,73 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
         "rate-defined infusion under F is out of analytic scope"
     );
 
-    // The assembled mixed gradient (analytic in-scope + per-subject FD for the
-    // out-of-scope subject) must match reconverged-FD of the FOCEI OFV.
+    // The assembled mixed gradient (analytic in-scope + per-subject held-EBE for the
+    // out-of-scope subject, #1529) must match FD of the same split objective: the
+    // in-scope subject's marginal with its EBE re-solved at every point, the
+    // out-of-scope subject's FOCEI objective at its *held* η̂ and prediction Jacobian.
     let options = FitOptions {
         interaction: true,
         ..Default::default()
     };
     let bounds = compute_bounds(&template);
-    let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
-    let mixed = population_gradient_sens_mixed(
-        &x, &template, &model, &pop, &ehs, &bounds, &options, &declines,
-    );
-
-    // FD reference, per subject mirroring the mixed assembly: in-scope
-    // subjects via the analytic-EBE `marginal_nll`, the out-of-scope one via
-    // the production reconverged EBE + `foce_subject_nll` (exactly what the
-    // mixed FD fallback computes internally).
-    let subj_marginal = |s: &Subject, p: &ModelParameters| -> f64 {
-        if in_scope(s) {
-            marginal_nll(&model, s, p)
-        } else {
-            let ebe = find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
-            foce_subject_nll(
+    let hms: Vec<DMatrix<f64>> = pop
+        .subjects
+        .iter()
+        .zip(&ehs)
+        .map(|(s, eta)| {
+            find_ebe(
                 &model,
                 s,
-                &p.theta,
-                &ebe.eta,
-                &ebe.h_matrix,
-                &p.omega,
-                &p.sigma.values,
-                &p.residual_correlations,
-                true,
+                &params,
+                200,
+                1e-12,
+                Some(eta.as_slice()),
+                None,
+                0,
             )
-        }
+            .h_matrix
+        })
+        .collect();
+    let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+    let mixed = population_gradient_sens_mixed(
+        &x,
+        &template,
+        &model,
+        &pop,
+        &ehs,
+        &hms,
+        &bounds,
+        &options,
+        crate::estimation::outer_optimizer::OuterTrial::unknown(),
+        &declines,
+    );
+
+    let held = |i: usize, p: &ModelParameters| -> f64 {
+        foce_subject_nll(
+            &model,
+            &pop.subjects[i],
+            &p.theta,
+            &ehs[i],
+            &hms[i],
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            true,
+        )
     };
     let ofv = |xv: &[f64]| -> f64 {
         let p = unpack_params(xv, &template);
         2.0 * pop
             .subjects
             .iter()
-            .map(|s| subj_marginal(s, &p))
+            .enumerate()
+            .map(|(i, s)| {
+                if in_scope(s) {
+                    marginal_nll(&model, s, &p)
+                } else {
+                    held(i, &p)
+                }
+            })
             .sum::<f64>()
     };
     assert_grad_matches_richardson_fd(&x, &mixed, ofv, 3e-3, 1e-5);
@@ -5840,14 +6131,13 @@ fn power_exponent_with_tad_multiplier_outer_gradient_matches_fd() {
 fn foce_woodbury_inverse_matches_dense_rtilde() {
     let j = DMatrix::from_row_slice(5, 2, &[0.2, -0.1, 0.4, 0.3, -0.2, 0.5, 0.7, -0.4, 0.1, 0.6]);
     let omega = DMatrix::from_row_slice(2, 2, &[0.5, 0.08, 0.08, 0.3]);
-    let omega_inv = omega.clone().try_inverse().unwrap();
     let r0 = [0.4, 0.7, 0.2, 0.9, 0.6];
     let mut dense = &j * &omega * j.transpose();
     for i in 0..r0.len() {
         dense[(i, i)] += r0[i];
     }
     let dense_inv = dense.cholesky().unwrap().inverse();
-    let woodbury = foce_rtilde_inverse(&j, &omega, &omega_inv, &r0).unwrap();
+    let woodbury = foce_rtilde_inverse(&j, &omega, &r0).unwrap();
     assert!((&dense_inv - woodbury).amax() < 2e-14);
 }
 
@@ -5855,8 +6145,7 @@ fn foce_woodbury_inverse_matches_dense_rtilde() {
 fn foce_woodbury_inverse_falls_back_when_subtraction_is_unstable() {
     let j = DMatrix::from_element(1, 1, 100.0);
     let omega = DMatrix::identity(1, 1);
-    let omega_inv = DMatrix::identity(1, 1);
-    let actual = foce_rtilde_inverse(&j, &omega, &omega_inv, &[1e-12]).unwrap();
+    let actual = foce_rtilde_inverse(&j, &omega, &[1e-12]).unwrap();
     let expected = 1.0 / (10000.0 + 1e-12);
     assert!((actual[(0, 0)] - expected).abs() < expected * 1e-12);
 }
@@ -5880,4 +6169,941 @@ fn foce_low_rank_contractions_match_dense_products() {
     let (trace, quad) = foce_low_rank_trace_quad(&rinv, &left, &ojt, &u, &ojt_u);
     assert!((trace - expected_trace).abs() < 2e-15);
     assert!((quad - expected_quad).abs() < 2e-15);
+}
+
+/// The `(J, Ω, R⁰)` a real FOCE gradient call handed [`foce_rtilde_inverse`] on the
+/// `data/ss_oral_q24.csv` fixture, dumped at subject 3 at the model file's own initial
+/// θ = (5, 5, 4.5) — so this is the configuration the Tier-3 `fit_runs_on_ss_oral_dataset`
+/// starts from, not a constructed corner. `R⁰` is frozen at η = 0 where the typical
+/// prediction at t = 23 h has decayed to 2.6e-9, flooring its variance at `MIN_VARIANCE`;
+/// `J` is taken at η̂, where that subject's own prediction is 0.87, so the row's Jacobian
+/// is `O(1)` against a `1e-12` weight.
+fn ss_oral_floored_rtilde_inputs() -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>, [f64; 4]) {
+    let j = DMatrix::from_row_slice(
+        4,
+        3,
+        &[
+            -1.5313758494073593,
+            -2.917595844077402,
+            1.2651231043521114,
+            -2.269596126975547,
+            -1.6188717881200112,
+            -0.19721862814667576,
+            -2.417774604713124,
+            0.6712103959581526,
+            -0.09824892371360211,
+            -1.4430209456103265,
+            0.862519044763247,
+            -0.03265479601364912,
+        ],
+    );
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        0.05073482640308105,
+        0.05008066147006033,
+        0.10050958737301485,
+    ]));
+    let omega_inv = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        19.710326631555624,
+        19.967787378324243,
+        9.94929962540552,
+    ]));
+    let r0 = [
+        0.03986272442615777,
+        0.00016143847027510905,
+        5.752051802992527e-11,
+        1e-12,
+    ];
+    (j, omega, omega_inv, r0)
+}
+
+/// The same triple from a well-conditioned call: `examples/warfarin.ferx` FOCE, subject
+/// 5 at the *worst* `1 + tr(S)` of the whole fit (1320 calls), so the "warfarin stays on
+/// the fast path" half of the gate is pinned at its tightest measured point rather than a
+/// typical one.
+fn warfarin_worst_conditioned_rtilde_inputs() -> (DMatrix<f64>, DMatrix<f64>, [f64; 11]) {
+    let j = DMatrix::from_row_slice(
+        11,
+        3,
+        &[
+            -0.029768931129810137,
+            -6.967924539254377,
+            4.948975469097907,
+            -0.09834765015472043,
+            -10.477360973395433,
+            5.097453089206971,
+            -0.283380786374917,
+            -12.979377390496529,
+            2.656085094787825,
+            -0.6906556891846249,
+            -13.132714326972927,
+            0.24428222979695602,
+            -1.4521833322862439,
+            -11.619779914262153,
+            -0.1506542223968367,
+            -2.121258659600906,
+            -10.171744881463317,
+            -0.14568186444914416,
+            -3.6492253975027307,
+            -6.573556304446947,
+            -0.12117627939102063,
+            -5.131024467108725,
+            -1.938514541873553,
+            -0.0837991516560111,
+            -5.351496170043617,
+            0.46257422524763575,
+            -0.05795109284577438,
+            -4.947776957313305,
+            1.5668552661055273,
+            -0.040075932699239,
+            -4.283957011756255,
+            1.9458891082081913,
+            -0.0277144105977118,
+        ],
+    );
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        0.09464681933668215,
+        0.039659050909063874,
+        0.30601883946029784,
+    ]));
+    let r0 = [
+        0.0047609751837289,
+        0.010226527496192303,
+        0.014884535426780098,
+        0.015250502002621628,
+        0.013086701037493128,
+        0.011166844996535755,
+        0.006937622277129466,
+        0.002677755605861964,
+        0.0010335493629226537,
+        0.0003989252354693375,
+        0.00015397556150027446,
+    ];
+    (j, omega, r0)
+}
+
+/// Both sides of [`WOODBURY_MAX_INFO_TRACE`] in one test, on measured inputs.
+///
+/// Split across two tests, a threshold stuck on one branch still passes half of them; a
+/// mutation moving the constant far enough in either direction has to redden something
+/// here. The assertions are on the gate quantity itself rather than on which value comes
+/// back, because on the warfarin triple the two branches agree to ~1e-12 — the returned
+/// matrix cannot distinguish them, so only the predicate can say the fast path is still
+/// taken.
+#[test]
+fn woodbury_info_trace_straddles_the_gate() {
+    let (wj, womega, wr0) = warfarin_worst_conditioned_rtilde_inputs();
+    let (_, _, warfarin_trace) = woodbury_terms(&wj, &womega, &wr0);
+    let (sj, somega, _, sr0) = ss_oral_floored_rtilde_inputs();
+    let (_, _, ss_trace) = woodbury_terms(&sj, &somega, &sr0);
+
+    // Measured: 2.742e4 and 1.4857e11. Pinned to 3 figures so a change in either
+    // fixture's conditioning shows up as a failure here rather than silently moving
+    // one of them across the threshold.
+    assert!(
+        (warfarin_trace - 2.742e4).abs() < 0.001 * 2.742e4,
+        "warfarin worst trace drifted: {warfarin_trace:e}"
+    );
+    assert!(
+        (ss_trace - 1.4857e11).abs() < 0.001 * 1.4857e11,
+        "SS-oral trace drifted: {ss_trace:e}"
+    );
+    assert!(
+        warfarin_trace <= WOODBURY_MAX_INFO_TRACE,
+        "warfarin must keep the Woodbury fast path: {warfarin_trace:e} > {WOODBURY_MAX_INFO_TRACE:e}"
+    );
+    assert!(
+        ss_trace > WOODBURY_MAX_INFO_TRACE,
+        "the variance-floored SS-oral row must decline Woodbury: {ss_trace:e}"
+    );
+}
+
+/// #1498: on the SS-oral inputs the Woodbury identity loses essentially every digit, and
+/// [`foce_rtilde_inverse`] must not return it.
+///
+/// Two assertions, deliberately: the first certifies that this input *can* expose the
+/// defect (an un-gated Woodbury is 16% off here — without it the second assertion would
+/// pass on any input, including one where both branches agree), the second is the
+/// regression. Realised errors: un-gated `1.592e-1`, gated `0.0` exactly — the gate routes
+/// to the same dense factorization the reference computes, so the only bound that means
+/// anything is "bit-identical", and a mutation raising `WOODBURY_MAX_INFO_TRACE` past
+/// 1.49e11 moves it to 1.592e-1.
+#[test]
+fn foce_rtilde_inverse_declines_woodbury_on_a_variance_floored_row() {
+    let (j, omega, omega_inv, r0) = ss_oral_floored_rtilde_inputs();
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().unwrap().inverse();
+    let scale = reference.amax();
+    assert!(scale.is_finite() && scale > 0.0, "reference must be usable");
+
+    // The un-gated Woodbury identity on the same input, spelled out here so the test
+    // states what it is protecting against rather than trusting the production branch.
+    let (dinv_j, info, _) = woodbury_terms(&j, &omega, &r0);
+    let mut ungated =
+        -(&dinv_j * (&omega_inv + &info).cholesky().unwrap().inverse() * dinv_j.transpose());
+    for i in 0..r0.len() {
+        ungated[(i, i)] += 1.0 / r0[i];
+    }
+    let ungated_err = (&reference - &ungated).amax() / scale;
+    assert!(
+        ungated_err > 1e-2,
+        "fixture no longer exposes the Woodbury loss (realised {ungated_err:e}); \
+         the regression below would pass vacuously"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "a variance-floored row must take the dense factorization"
+    );
+}
+
+/// The `tests/ss_fit_smoke.rs` model, as a Tier-1 fixture.
+///
+/// 1-cpt oral with an `SS = 1` q24 dose and a proportional error model: at the initial
+/// θ the typical (η = 0) prediction at t = 23 h is 2.6e-9, so `R⁰` there is on the
+/// `MIN_VARIANCE` floor while the subject's own η̂ prediction is 0.87 — the
+/// frozen-`R⁰`-vs-`J(η̂)` mismatch that drives `1 + tr(S)` to 1.5e11.
+const SS_ORAL_Q24: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// Subject 3 of `data/ss_oral_q24.csv`, verbatim.
+fn ss_oral_q24_subject() -> Subject {
+    let times = vec![1.0, 4.0, 12.0, 23.0];
+    Subject {
+        id: "3".to_string(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+        obs_times: times.clone(),
+        obs_raw_times: Vec::new(),
+        observations: vec![4.048116, 4.014245, 2.184979, 0.872772],
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1; 4],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// #1498, at the level the optimizer actually consumes: the analytic FOCE packed
+/// gradient must match a reconverged central-difference of ferx's own FOCE marginal on
+/// a subject whose `R⁰` sits on the variance floor.
+///
+/// This is the assertion `foce_rtilde_inverse`'s unit tests cannot make — they compare
+/// two spellings of one matrix, and #1486 shipped with both of them green. The FD here
+/// goes through `foce_subject_nll`, which assembles `R̃` densely and never calls
+/// `foce_rtilde_inverse`, so it is an independent reference for the whole gradient.
+///
+/// Measured: worst realised relative error across the 7 packed coordinates is `8.91e-6`
+/// (the `ω_ETA_V` coordinate) with the fix. With the gate deleted — the smallest edit
+/// that removes it — the *first* coordinate already reads `1663764.7` against an FD of
+/// `795.5`, a relative error of `2.09e3`. So the `1e-3` bound sits 112× above the
+/// realised error and 2.1e6× below the failure it exists to catch; anything in between
+/// would do, and the test does not depend on the exact value. The `epsilon` floor is for
+/// the ω coordinates, whose FD is `O(1)` against θ gradients of `O(100)`.
+#[test]
+fn ss_oral_floored_r0_foce_packed_gradient_matches_fd() {
+    let model = parse_model_string(SS_ORAL_Q24).expect("parse");
+    let subject = ss_oral_q24_subject();
+    let template = model.default_params.clone();
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+
+    // Certify the fixture reaches the ill-conditioned branch at all: without this a
+    // future change to the initial θ could move it onto the fast path, and the parity
+    // assertion below would then pass while testing nothing about #1498.
+    let eta_hat = precise_ebe(&model, &subject, &params);
+    let sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
+            .expect("analytic sensitivities in scope");
+    let zeros = vec![0.0; model.n_eta];
+    let sens0 =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &zeros)
+            .expect("analytic sensitivities at eta = 0");
+    let jmat = DMatrix::from_fn(subject.obs_times.len(), model.n_eta, |i, k| {
+        sens.obs[i].df_deta[k]
+    });
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let r0: Vec<f64> = sens0
+        .obs
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            residual_rd(
+                &model.error_spec,
+                err_keys[j],
+                o.f,
+                &params.sigma.values,
+                None,
+            )
+            .0
+        })
+        .collect();
+    // The floor is what makes this fixture what it is; say so, so a change to
+    // `MIN_VARIANCE` or to the SS closed form surfaces here rather than as a silent
+    // move onto the fast path.
+    assert_eq!(
+        r0[3], 1e-12,
+        "t = 23 h must sit on the residual-variance floor: {r0:?}"
+    );
+    let (_, _, info_trace) = woodbury_terms(&jmat, &params.omega.matrix, &r0);
+    assert!(
+        info_trace > WOODBURY_MAX_INFO_TRACE,
+        "fixture must still decline Woodbury (1 + tr(S) = {info_trace:e})"
+    );
+
+    let analytic = subject_packed_gradient_foce(&model, &subject, &template, &x, &eta_hat)
+        .expect("FOCE packed gradient supported");
+    assert!(
+        analytic.iter().all(|v| v.is_finite()),
+        "FOCE packed gradient must be finite: {analytic:?}"
+    );
+    let ofv = |xv: &[f64]| -> f64 {
+        let p = unpack_params(xv, &template);
+        marginal_nll_foce(&model, &subject, &p)
+    };
+    assert_grad_matches_richardson_fd(&x, &analytic, ofv, 1e-3, 1e-5);
+}
+
+/// The `SS_ORAL_Q24` model with the CL/V random effects moved into a **near-rail**
+/// `block_omega`: `ω²_CL = ω²_V = 0.05` with covariance `0.05·(1 − 1e-12)`, i.e. a
+/// correlation one part in `1e12` short of +1.
+///
+/// That is the regime the [`WOODBURY_MAX_INFO_TRACE`] bound does *not* cover. It bounds
+/// `cond(I + LᵀJᵀD⁻¹JL)`; `cond(Ω)` is a free parameter of the fixture, and an IIV
+/// correlation driven onto its rail — the ordinary way a `block_omega` fails to be
+/// identified — sends `cond(Ω⁻¹ + JᵀD⁻¹J)` with it while the gate quantity stays
+/// `O(10⁴)`. Measured here: `cond(Ω) = 2.000e12`, `cond(M) = 2.006e11`, `1 + tr(S) =
+/// 1.0719e4`.
+const SS_ORAL_Q24_RAIL_BLOCK: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+  block_omega (ETA_CL, ETA_V) = [0.05, 0.04999999999995, 0.05]
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `(J, Ω, Ω⁻¹, R⁰)` as a real FOCE gradient call builds them, for subject 3 of
+/// `data/ss_oral_q24.csv` truncated to `times` and fitted under
+/// [`SS_ORAL_Q24_RAIL_BLOCK`] at the model file's own initial θ.
+///
+/// `J` is taken at the EBE and `R⁰` at η = 0 through the production providers, so which
+/// observations are kept decides whether `R⁰` reaches the `MIN_VARIANCE` floor — the two
+/// callers below use that to sit on opposite sides of the gate with one Ω.
+fn ss_oral_rail_block_rtilde_inputs(
+    times: &[f64],
+) -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+    let model = parse_model_string(SS_ORAL_Q24_RAIL_BLOCK).expect("parse");
+    let full_times = [1.0, 4.0, 12.0, 23.0];
+    let full_obs = [4.048116, 4.014245, 2.184979, 0.872772];
+    let keep: Vec<usize> = (0..4).filter(|&i| times.contains(&full_times[i])).collect();
+    assert_eq!(
+        keep.len(),
+        times.len(),
+        "unknown observation time requested"
+    );
+    let mut subject = ss_oral_q24_subject();
+    subject.obs_times = keep.iter().map(|&i| full_times[i]).collect();
+    subject.observations = keep.iter().map(|&i| full_obs[i]).collect();
+    subject.obs_cmts = vec![1; keep.len()];
+    subject.cens = vec![0; keep.len()];
+    subject.occasions = vec![1; keep.len()];
+
+    let template = model.default_params.clone();
+    let params = unpack_params(&pack_params(&template), &template);
+    let eta_hat = precise_ebe(&model, &subject, &params);
+    let sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
+            .expect("analytic sensitivities in scope");
+    let zeros = vec![0.0; model.n_eta];
+    let sens0 =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &zeros)
+            .expect("analytic sensitivities at eta = 0");
+    let jmat = DMatrix::from_fn(keep.len(), model.n_eta, |i, k| sens.obs[i].df_deta[k]);
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let r0: Vec<f64> = sens0
+        .obs
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            residual_rd(
+                &model.error_spec,
+                err_keys[j],
+                o.f,
+                &params.sigma.values,
+                None,
+            )
+            .0
+        })
+        .collect();
+    (
+        jmat,
+        params.omega.matrix.clone(),
+        params.omega.inv.clone(),
+        r0,
+    )
+}
+
+/// `λ_max/λ_min` of a symmetric matrix, for the conditioning assertions below.
+fn symmetric_condition_number(m: &DMatrix<f64>) -> f64 {
+    let ev = m.clone().symmetric_eigenvalues();
+    ev.amax() / ev.amin()
+}
+
+/// #1498 review: the Woodbury path must factor the matrix whose conditioning the gate
+/// actually bounds.
+///
+/// [`WOODBURY_MAX_INFO_TRACE`] bounds `cond(I + LᵀJᵀD⁻¹JL)`. Factoring the unnormalised
+/// `M = Ω⁻¹ + JᵀD⁻¹J` instead — which is what the first cut of #1498 did — inherits
+/// `cond(Ω)`, and the gate cannot see that: here `1 + tr(S) = 1.0719e4`, two orders
+/// *below* the threshold, while `cond(Ω) = 2.000e12` and `cond(M) = 2.006e11`. So this
+/// input takes the fast path in both spellings and only the returned matrix can tell
+/// them apart — which is why the assertion is parity against the dense factorization
+/// rather than a branch predicate.
+///
+/// Measured (macOS/arm64, debug), as `‖dense⁻¹ − woodbury‖_max / ‖dense⁻¹‖_max`:
+///
+/// | spelling | realised |
+/// |---|---|
+/// | unnormalised `Ω⁻¹ + JᵀD⁻¹J` (the defect) | `2.258e-5` |
+/// | normalised `I + LᵀJᵀD⁻¹JL` (production) | `7.118e-11` |
+///
+/// The bound is `1e-8`: 140× above the realised error and 2 260× below the failure it
+/// exists to catch, with the whole of that 3.2e5× separation coming from `cond(Ω)`, a
+/// property of the model file rather than of the EBE solve, so it does not move with
+/// libm. The first assertion certifies the fixture still *has* that separation, so a
+/// future Ω that drifts off the rail fails here instead of passing vacuously.
+#[test]
+fn near_rail_block_omega_keeps_woodbury_and_matches_dense() {
+    let (j, omega, omega_inv, r0) = ss_oral_rail_block_rtilde_inputs(&[1.0, 4.0]);
+    let (dinv_j, info, info_trace) = woodbury_terms(&j, &omega, &r0);
+
+    // The fixture's defining property: ill-conditioned Ω, well-conditioned gate.
+    let cond_omega = symmetric_condition_number(&omega);
+    let cond_unnormalised = symmetric_condition_number(&(&omega_inv + &info));
+    assert!(
+        cond_omega > 1e11,
+        "block Ω must stay near its correlation rail: cond(Ω) = {cond_omega:e}"
+    );
+    assert!(
+        cond_unnormalised > 1e10,
+        "the unnormalised middle matrix must be the ill-conditioned one: {cond_unnormalised:e}"
+    );
+    assert!(
+        info_trace <= WOODBURY_MAX_INFO_TRACE,
+        "the gate must still admit this input (1 + tr(S) = {info_trace:e})"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let scale = reference.amax();
+    assert!(scale.is_finite() && scale > 0.0, "reference must be usable");
+
+    // The unnormalised spelling, written out so the test states what it protects
+    // against rather than trusting a production branch to still contain it.
+    let mut unnormalised =
+        -(&dinv_j * (&omega_inv + &info).cholesky().unwrap().inverse() * dinv_j.transpose());
+    for i in 0..r0.len() {
+        unnormalised[(i, i)] += 1.0 / r0[i];
+    }
+    let unnormalised_err = (&reference - &unnormalised).amax() / scale;
+    assert!(
+        unnormalised_err.is_finite() && unnormalised_err > 1e-7,
+        "fixture no longer exposes the unnormalised loss (realised {unnormalised_err:e}); \
+         the parity assertion below would pass vacuously"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    let err = (&reference - &actual).amax() / scale;
+    assert!(
+        err.is_finite() && err < 1e-8,
+        "normalised Woodbury must match the dense factorization: realised {err:e}"
+    );
+}
+
+/// The twin of the test above on the other side of the gate: same near-rail block Ω,
+/// one more observation.
+///
+/// Keeping the `t = 12 h` sample puts `R⁰` within `1e-11` of the `MIN_VARIANCE` floor,
+/// which sends `1 + tr(S)` to `2.633e10` — so the *normalised* matrix is now the
+/// ill-conditioned one and the dense fallback has to fire. Measured: the un-gated
+/// Woodbury (either spelling) is `1.928e-1` off, and the production result is
+/// bit-identical to the dense factorization. Without this arm the block-Ω fixture would
+/// only ever exercise the fast path, and a gate stuck open would pass half the pair.
+#[test]
+fn near_rail_block_omega_with_floored_row_falls_back_to_dense() {
+    let (j, omega, _, r0) = ss_oral_rail_block_rtilde_inputs(&[1.0, 4.0, 12.0]);
+    let (_, _, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        symmetric_condition_number(&omega) > 1e11,
+        "the twin must keep the same near-rail Ω"
+    );
+    assert!(
+        info_trace > WOODBURY_MAX_INFO_TRACE,
+        "the floored row must push this arm over the gate (1 + tr(S) = {info_trace:e})"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "over the gate, R̃⁻¹ must be the dense factorization"
+    );
+}
+
+/// #1498 review: the gate is what keeps a non-finite Woodbury result from escaping.
+///
+/// The predicate is spelled `!(info_trace <= MAX)`, so a `NaN` trace fails it. That is
+/// the whole guard: `r0ᵢ = 0` makes `1/r0ᵢ` infinite, and `0·∞` in the `JᵀD⁻¹J` product
+/// makes `info` — and with it the trace — `NaN`, before any Cholesky is attempted.
+/// Measured on this input: the un-gated Woodbury returns `NaN` in every entry, and
+/// `foce_rtilde_inverse` returns the finite dense inverse `diag(2/3, 1)`.
+///
+/// This replaces the `out.iter().all(is_finite)` post-check the first cut of #1498 kept.
+/// With `R⁰` floored at `MIN_VARIANCE = 1e-12` and the trace bounded by `1e6`, the
+/// Woodbury correction is bounded by `‖D⁻¹‖·(1 + tr(S)) ≤ 1e18` — it cannot overflow —
+/// so that check had no reachable input and no test could kill it; the reachable
+/// non-finite cases all arrive through a non-finite or `NaN` trace and are rejected here.
+#[test]
+fn woodbury_gate_rejects_a_zero_residual_variance() {
+    let j = DMatrix::identity(2, 2);
+    let omega = DMatrix::identity(2, 2);
+    let r0 = [0.5, 0.0];
+
+    let (dinv_j, info, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        info_trace.is_nan(),
+        "a zero R⁰ must poison the gate quantity: {info_trace:e}"
+    );
+    // Certify that an un-gated Woodbury really would hand back garbage here.
+    let ungated = -(&dinv_j * &info * dinv_j.transpose());
+    assert!(
+        ungated.iter().all(|v| v.is_nan()),
+        "fixture no longer produces a non-finite Woodbury: {ungated}"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("dense R̃⁻¹ available");
+    let expected = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0 / 1.5, 1.0]));
+    assert!(
+        (&actual - &expected).amax() < 1e-15,
+        "a zero R⁰ must take the dense factorization, got {actual}"
+    );
+}
+
+/// A random effect fixed to zero variance makes Ω singular: no Cholesky factor exists,
+/// so there is no normalised Woodbury form to take and the dense factorization — which
+/// needs only Ω itself — is the answer.
+///
+/// The unnormalised spelling had no such edge: it consumed a precomputed `Ω⁻¹`, which on
+/// a singular Ω is whatever the pseudo-inverse produced. Measured: `Ω = diag(0.5, 0)`
+/// leaves `1 + tr(S) = 1.227` (well inside the gate) and `R̃ = JΩJᵀ + diag(R⁰)` SPD, and
+/// the returned matrix is bit-identical to that dense inverse.
+#[test]
+fn singular_omega_takes_the_dense_factorization() {
+    let j = DMatrix::from_row_slice(2, 2, &[0.3, 0.7, -0.4, 0.2]);
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.5, 0.0]));
+    let r0 = [0.4, 0.7];
+    let (_, _, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        info_trace <= WOODBURY_MAX_INFO_TRACE,
+        "the gate must admit this input, so the Ω-Cholesky is what declines it: {info_trace:e}"
+    );
+    assert!(
+        omega.clone().cholesky().is_none(),
+        "fixture must actually be singular"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "a singular Ω must take the dense factorization"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1513 — the inner-Hessian inverse needs `H` nonsingular, not positive-definite.
+// ---------------------------------------------------------------------------
+
+/// The `(model, params, subject)` triple the #1513 fixtures share: the bundled warfarin
+/// one-compartment oral model, three diagonal etas, five observation times.
+///
+/// `h_inner = Ω⁻¹ + Σⱼ (∂²L/∂f² aⱼaⱼᵀ + ∂L/∂f Aⱼ)` carries the second term — the residual
+/// times the prediction curvature — that the Gauss-Newton `H̃` drops. Away from the EBE
+/// that term can dominate and flip an eigenvalue negative; the etas below are chosen to
+/// straddle exactly that, and each fixture asserts which side it is on rather than
+/// assuming it.
+fn hinner_fixture() -> (CompiledModel, ModelParameters, Subject) {
+    let model = parse_model_string(WARFARIN).expect("parse");
+    let theta = model.default_params.theta.clone();
+    let params = params_with_omega(&model, &theta, &[0.09, 0.04, 0.30]);
+    let subject = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 6.0, 24.0]);
+    (model, params, subject)
+}
+
+/// `h_inner` at `eta`, via the production assembly.
+fn hinner_at(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    subject: &Subject,
+    eta: &[f64],
+) -> DMatrix<f64> {
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)
+        .expect("warfarin is in analytic scope");
+    score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )
+    .expect("score_core serves this subject")
+    .h_inner
+}
+
+/// The eta with an **indefinite** `h_inner` (min eigenvalue −0.1495, det −2.60e3,
+/// symmetric condition number 1.3e3 — nonsingular and well-conditioned, just not PD).
+const HINNER_INDEFINITE_ETA: [f64; 3] = [0.9, 0.0, 1.2];
+/// The same subject at an eta where `h_inner` is **PD**, for the fast-path twin.
+const HINNER_PD_ETA: [f64; 3] = [0.1, -0.05, 0.15];
+
+/// `max|λ| / min|λ|` over every eigenvalue — the **spectral** condition number of a
+/// symmetric matrix.
+///
+/// Extracted and separately tested because the obvious spelling is wrong on exactly the
+/// spectra this is used to screen: a ratio of the *algebraic* extremes
+/// (`max(λ)/|min(λ)|`) agrees with this one whenever the largest-magnitude eigenvalue is
+/// also the algebraic extreme, which is the well-conditioned case, and diverges without
+/// bound on a spectrum straddling zero — the near-singular case. See
+/// [`spectral_condition_is_not_the_algebraic_extreme_ratio`].
+fn spectral_condition(ev: &[f64]) -> f64 {
+    let abs_max = ev.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    let abs_min = ev.iter().fold(f64::INFINITY, |a, v| a.min(v.abs()));
+    abs_max / abs_min
+}
+
+/// The regression [`spectral_condition`] exists to prevent, on the spectrum that exposes
+/// it. `[-10, -1e-12, 1]` is near-singular: `max|λ|/min|λ| = 1e13`. The algebraic-extreme
+/// ratio reports `10` — well inside any sane bound — so a conditioning guard written that
+/// way passes on precisely the fixture it is supposed to reject.
+#[test]
+fn spectral_condition_is_not_the_algebraic_extreme_ratio() {
+    let ev = [-10.0f64, -1e-12, 1.0];
+    approx::assert_relative_eq!(spectral_condition(&ev), 1e13, max_relative = 1e-12);
+
+    let algebraic_max = ev.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let algebraic_min = ev.iter().cloned().fold(f64::INFINITY, f64::min);
+    let wrong =
+        (algebraic_max.abs() / algebraic_min.abs()).max(algebraic_min.abs() / algebraic_max.abs());
+    approx::assert_relative_eq!(wrong, 10.0, max_relative = 1e-12);
+    assert!(
+        wrong < 1e6 && spectral_condition(&ev) > 1e6,
+        "the two spellings must straddle a 1e6 guard, or this test pins nothing"
+    );
+
+    // Where the largest-magnitude eigenvalue *is* the algebraic extreme the two agree —
+    // which is why the bug survived review on the real fixture.
+    let benign = [199.77f64, 87.05, -0.1495];
+    approx::assert_relative_eq!(
+        spectral_condition(&benign),
+        199.77 / 0.1495,
+        max_relative = 1e-12
+    );
+}
+
+/// The gate this change moves, asserted as a straddle rather than assumed: the two
+/// fixture etas must land on **opposite** sides of `h_inner.cholesky()`. Without this,
+/// the pair below silently degenerates to two copies of the same case — the
+/// [`hinner_indefinite_is_inverted_exactly`] "reaches the fallback" claim and the
+/// [`hinner_pd_fast_path_is_bit_identical`] "takes the Cholesky" claim would both be
+/// vacuous if the fixture drifted onto one side.
+#[test]
+fn hinner_fixture_etas_straddle_the_cholesky_gate() {
+    let (model, params, subject) = hinner_fixture();
+
+    let indef = hinner_at(&model, &params, &subject, &HINNER_INDEFINITE_ETA);
+    let ev = indef.clone().symmetric_eigenvalues();
+    assert!(
+        ev.iter().all(|v| v.is_finite()),
+        "eigenvalues must be finite before they are compared: {ev:?}"
+    );
+    let min_ev = ev.iter().cloned().fold(f64::INFINITY, f64::min);
+    assert!(
+        min_ev < 0.0,
+        "the indefinite fixture must have a negative eigenvalue, got min {min_ev:.6e}"
+    );
+    assert!(
+        indef.clone().cholesky().is_none(),
+        "an indefinite h_inner must fail the Cholesky — that is the gate under test"
+    );
+    // Well-conditioned, so the fixture exercises the gate on an ordinary matrix rather
+    // than on a rank deficiency. This is the **spectral** condition number
+    // `max|λ| / min|λ|` over every eigenvalue, not a ratio of the algebraic extremes: on
+    // a spectrum straddling zero the two differ without bound (`[-10, -1e-12, 1]` gives
+    // 10 against a true 1e13), so the algebraic form would pass on exactly the
+    // near-singular fixture this assertion exists to exclude. Measured 1.336e3; 1e6 is
+    // three decades of headroom against fixture drift.
+    let cond = spectral_condition(ev.as_slice());
+    assert!(
+        cond < 1e6,
+        "indefinite fixture must stay well-conditioned, got condition number {cond:.3e}"
+    );
+
+    let pd = hinner_at(&model, &params, &subject, &HINNER_PD_ETA);
+    assert!(
+        pd.clone().cholesky().is_some(),
+        "the PD fixture must pass the Cholesky — that is the other side of the gate"
+    );
+}
+
+/// The gate itself, pinned so that widening it is a deliberate act with a red test rather
+/// than a one-line edit that looks like tidying: an **indefinite** `h_inner` must make
+/// `prepare` decline, sending the subject to `subject_reconverged_fd_gradient`.
+///
+/// This reads like a gate one degree too strict — `−H⁻¹M` needs `H` nonsingular, and this
+/// fixture's `H` *is* nonsingular (`det = −2.60e3`, spectral condition number 1.3e3). #1513
+/// proposed exactly that widening, via a full-pivot LU fallback. The reason it is wrong is
+/// that at an unconstrained local minimum a nonsingular Hessian must be PD, so a failed
+/// Cholesky here is a **proof that `eta_hat` is not the minimizing EBE** the assembly's
+/// contract requires — and `−H⁻¹M` differentiates the stationarity condition
+/// `∂l/∂η|η̂ = 0`, which therefore does not hold. Measured on the 16 decline events of a
+/// full `one_cpt_transit` fit, an LU here disagreed with the reconverged-FD gradient by a
+/// median relative 0.378 against a 1.4e-3 noise floor on the same fit's PD subjects, with
+/// the direction near-orthogonal (cosine 0.032) at the worst event. See
+/// [`invert_inner_hessian`] for the full table.
+///
+/// So the assertion is `is_none()`, and the thing it protects is a *precondition*, not a
+/// matrix shape.
+#[test]
+fn indefinite_hinner_declines_to_the_fd_salvage() {
+    let (model, params, subject) = hinner_fixture();
+    let eta = HINNER_INDEFINITE_ETA;
+    let h = hinner_at(&model, &params, &subject, &eta);
+
+    // The fixture is nonsingular — so this test cannot be satisfied by a "singular matrix
+    // declines" reading, which is the whole distinction #1513 turned on.
+    let det = h.clone().determinant();
+    assert!(
+        det.is_finite() && det.abs() > 1.0,
+        "the fixture must be comfortably nonsingular, got det = {det:.4e}"
+    );
+    assert!(
+        h.clone().cholesky().is_none(),
+        "the fixture must be indefinite, or this test pins nothing"
+    );
+
+    let sens = crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta)
+        .expect("warfarin is in analytic scope");
+    assert!(
+        prepare(&model, &subject, &params, &sens, &eta).is_none(),
+        "an indefinite h_inner proves eta_hat is not the EBE, so the analytic outer \
+         gradient must decline rather than differentiate a broken stationarity condition \
+         (#1513)"
+    );
+}
+
+/// The other side of the same gate: a PD `h_inner` is served, and served through the
+/// Cholesky. Without this, [`indefinite_hinner_declines_to_the_fd_salvage`] is satisfied by
+/// an assembly that declines *everything*.
+#[test]
+fn pd_hinner_is_served_through_the_cholesky() {
+    let (model, params, subject) = hinner_fixture();
+    let eta = HINNER_PD_ETA;
+    let h = hinner_at(&model, &params, &subject, &eta);
+    let reference = h
+        .clone()
+        .cholesky()
+        .expect("the PD fixture passes the Cholesky")
+        .inverse();
+
+    let sens = crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta)
+        .expect("warfarin is in analytic scope");
+    let prep = prepare(&model, &subject, &params, &sens, &eta)
+        .expect("a PD h_inner must be served analytically");
+
+    for (a, r) in prep.h_inner_inv.iter().zip(reference.iter()) {
+        assert!(a.is_finite(), "H⁻¹ must be finite, got {a}");
+        assert_eq!(
+            a.to_bits(),
+            r.to_bits(),
+            "the served inverse must be the plain Cholesky inverse, bit for bit"
+        );
+    }
+}
+
+/// A **singular** `h_inner` declines too. Distinct from
+/// [`indefinite_hinner_declines_to_the_fd_salvage`] in what it rules out: an implementation
+/// that widened the gate to "nonsingular" would still decline this one, so without it the
+/// pair could not tell a correct gate from that widening.
+#[test]
+fn invert_inner_hessian_declines_a_singular_matrix() {
+    // Rank 1: row 2 = 2·row 1. Symmetric, det = 0.
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 4.0]);
+    assert_eq!(h.clone().determinant(), 0.0, "the fixture must be singular");
+    assert!(
+        invert_inner_hessian(h.clone()).is_none(),
+        "a singular h_inner must decline"
+    );
+}
+
+/// `invert_inner_hessian` declines an indefinite matrix **although it is invertible** —
+/// the property asserted directly on the helper, on arithmetic rather than on a fixture.
+/// `[[1, 2], [2, 1]]` has eigenvalues `3` and `−1` and `det = −3`; `H⁻¹ = [[−1, 2],
+/// [2, −1]]/3` exists and is perfectly well-conditioned, and the helper must still say no.
+///
+/// This is the mutation target for the #1513 proposal in its smallest form: a one-line LU
+/// fallback reddens exactly this test and
+/// [`indefinite_hinner_declines_to_the_fd_salvage`], and nothing else in the suite.
+#[test]
+fn invert_inner_hessian_declines_an_invertible_indefinite_matrix() {
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let det = h.clone().determinant();
+    approx::assert_relative_eq!(det, -3.0, max_relative = 1e-14);
+    assert!(
+        h.clone().full_piv_lu().try_inverse().is_some(),
+        "the fixture must be invertible, or 'declines although invertible' is vacuous"
+    );
+    assert!(
+        invert_inner_hessian(h.clone()).is_none(),
+        "positive-definiteness is the gate, not invertibility (#1513)"
+    );
+}
+
+/// The population-level statement of the same thing, on the bundled
+/// `examples/warfarin.ferx` + `data/warfarin.csv`: subjects 2, 4, 7 and 10 have an
+/// indefinite `h_inner` at `η = 0` while all 10 are PD at their EBEs. This is the
+/// configuration `outer_optimizer`'s `outer_fd_fallback_warning` cites for why a decline is
+/// *recorded* as the fit runs rather than *probed* at a chosen parameter point — a zero-η
+/// probe would announce four fallbacks that a fit serving these subjects at their EBEs
+/// never takes.
+///
+/// It also measures the premise of #1513's rejection at population scale: the assembly's
+/// declines away from the mode are common, and they are common precisely because `η = 0` is
+/// not the EBE.
+#[test]
+fn warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not() {
+    let src = std::fs::read_to_string("examples/warfarin.ferx").expect("bundled example");
+    let model = parse_model_string(&src).expect("parse");
+    let pop = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/warfarin.csv"),
+        None,
+        None,
+    )
+    .expect("bundled dataset");
+    let params = model.default_params.clone();
+    let zero = vec![0.0; model.n_eta];
+
+    let mut non_pd = Vec::new();
+    let mut declined = Vec::new();
+    for s in &pop.subjects {
+        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &zero)
+            .expect("warfarin is in analytic scope for every subject");
+        let h = score_core(
+            &model,
+            s,
+            &params,
+            &sens,
+            model.n_eta,
+            &params.omega.inv,
+            &zero,
+            model.residual_error_eta,
+        )
+        .expect("score_core serves every warfarin subject")
+        .h_inner;
+        let ev = h.clone().symmetric_eigenvalues();
+        assert!(
+            ev.iter().all(|v| v.is_finite()),
+            "subject {} has a non-finite h_inner eigenvalue: {ev:?}",
+            s.id
+        );
+        if h.clone().cholesky().is_none() {
+            assert!(
+                ev.iter().cloned().fold(f64::INFINITY, f64::min) < 0.0,
+                "subject {}: a failed Cholesky here must mean a negative eigenvalue",
+                s.id
+            );
+            non_pd.push(s.id.clone());
+        }
+        if prepare(&model, s, &params, &sens, &zero).is_none() {
+            declined.push(s.id.clone());
+        }
+    }
+
+    assert_eq!(
+        non_pd,
+        ["2", "4", "7", "10"],
+        "the fixture must still reach a non-PD h_inner at η = 0, or it pins nothing"
+    );
+    assert_eq!(
+        declined, non_pd,
+        "every non-PD subject declines, and only those — the gate is the Cholesky and \
+         nothing else"
+    );
+
+    // The other half of the claim, and the reason the gate is not merely conservative:
+    // at their **EBEs** all 10 are PD and analytic. If this half failed, declining at
+    // η = 0 would be costing the fit its analytic gradient everywhere, not just off-mode.
+    for s in &pop.subjects {
+        let eh = find_ebe(&model, s, &params, 200, 1e-10, None, None, 0);
+        let eta = eh.eta.as_slice();
+        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, eta)
+            .expect("in scope at the EBE too");
+        assert!(
+            prepare(&model, s, &params, &sens, eta).is_some(),
+            "subject {} must be served analytically at its EBE",
+            s.id
+        );
+    }
 }

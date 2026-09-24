@@ -87,8 +87,19 @@
 //!
 //! Tier 1/2 by construction: these are `predict()` evaluations at fixed
 //! parameters, ~0.5 s in total, so they run on every PR and carry the diff's
-//! coverage. The objective anchors below are gated only for symmetry with the rest
-//! of the suite.
+//! coverage. The two objective anchors below also evaluate once (`maxiter = 0`) but cost
+//! 45 s in the instrumented CI job (~5 s locally), so they stay nightly (#1132) — and the
+//! reason is NOT that the pointwise checks above subsume them. PR #1518's review measured
+//! the opposite: wrapping the `lag >= II` seed phase instead of clamping it, inside the
+//! DUAL walk only (#1121's defect; production reaches the phase through
+//! `crate::dosing::ss_seed_phase`, so every `predict()` value is bit-identical), reddened
+//! these two objectives by 2.47 and 2.34 OFV while the nine pointwise anchors, all of
+//! `sens::` and the whole workspace test run stayed green. The objective sees it because
+//! FOCEI's `h_matrix` is built from the analytic provider (neither dataset reports an
+//! FD fallback). What makes these two nightly-only affordable is the Tier-1 fixture that
+//! closes that gap per-PR at ~0 s:
+//! `sens::ode_provider::tests::ode_provider_ss_lagtime_at_or_past_the_interval_matches_production`,
+//! which straddles the clamp and dies on that same mutation.
 
 use std::path::PathBuf;
 
@@ -379,7 +390,7 @@ const NM_OBJV_GE_II_FLATWT: f64 = -50.236_960_368_462_199;
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    ignore = "45 s in the instrumented CI job; the `lag >= II` dual-walk gap it guards is pinned per-PR by sens::ode_provider::tests::ode_provider_ss_lagtime_at_or_past_the_interval_matches_production (#1132): opt in with --features slow-tests"
 )]
 fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_dosing_interval() {
     let ofv = ferx_ofv("ss_lag_iv_fit.ferx", "ss_lag_ge_ii.csv");
@@ -393,7 +404,7 @@ fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_dosing_interval() {
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    ignore = "45 s in the instrumented CI job; the `lag >= II` dual-walk gap it guards is pinned per-PR by sens::ode_provider::tests::ode_provider_ss_lagtime_at_or_past_the_interval_matches_production (#1132): opt in with --features slow-tests"
 )]
 fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_interval_under_flat_covariates() {
     let ofv = ferx_ofv("ss_lag_iv_fit.ferx", "ss_lag_ge_ii_flatwt.csv");

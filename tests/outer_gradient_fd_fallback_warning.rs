@@ -1,8 +1,8 @@
 //! #1154 — a runtime analytic-sensitivity decline must reach `FitResult::warnings`.
 //!
 //! A subject whose data shape falls out of the outer sensitivity provider's scope is
-//! salvaged onto a per-subject reconverged-FD gradient. That is correct, several times
-//! slower, and — before this — invisible: no warning code, no count, and
+//! salvaged onto a per-subject gradient (held-EBE since #1529; reconverged FD under IOV).
+//! Before #1154 that was invisible: no warning code, no count, and
 //! `FitResult::gradient_method_outer` keeps reporting `analytic (Dual2)` because it reads a
 //! **model**-level predicate. The Tier-1 tests in
 //! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the recording; this pins the
@@ -87,13 +87,14 @@ const MIXTURE_F: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// The FD-fallback sentence `outer_fd_fallback_warning` emits. Matched on the phrase that
+/// The fallback sentence `outer_fd_fallback_warning` emits. Matched on the phrase that
 /// carries the signal rather than the whole sentence, so a wording change does not redden
-/// this while a dropped call does.
+/// this while a dropped call does. (Not on the salvage's name: since #1529 that differs
+/// between the non-IOV held-EBE and the IOV reconverged routes.)
 fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
     warnings
         .iter()
-        .find(|w| w.contains("finite-difference outer gradients"))
+        .find(|w| w.contains("could not be given the exact analytic outer gradient"))
 }
 
 /// The same population with subject 0's bolus replaced by a rate-defined infusion — the
@@ -193,15 +194,17 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 }
 
 /// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
-/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`, a rule
-/// `build_info::gradient_method_outer` does not model — it still classifies the model as
-/// analytic. A derivative-free fit requests no outer gradient at all, so no subject can
-/// have taken an FD *outer* gradient and the warning must stay silent even with a subject
-/// the provider would decline.
+/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`. A
+/// derivative-free fit requests no outer gradient at all, so no subject can have taken an
+/// FD *outer* gradient and the warning must stay silent even with a subject the provider
+/// would decline.
 ///
-/// This passes because the warning reads a runtime log rather than a model-level
-/// predicate; a gate written against `gradient_method_outer` would have emitted
-/// "1 of 2 ... use finite-difference outer gradients" here.
+/// When this test was written `build_info::gradient_method_outer` did not model that
+/// downgrade and still reported `analytic (Dual2)` here, so a gate written against it
+/// would have emitted "1 of 2 ... could not be given the exact analytic outer gradient".
+/// Since #1540 the report resolves through `resolve_outer_optimizer` too and reads `N/A`,
+/// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
+/// comes from its runtime log, not from either report.
 #[test]
 fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");
@@ -221,10 +224,12 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let result = ferx_core::fit(&model, &population, &model.default_params, &options)
         .expect("mixture fit succeeds");
 
+    // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
+    // fit this test is about.
+    assert_eq!(result.optimizer, "auto (bobyqa)");
     assert_eq!(
-        result.gradient_method_outer, "analytic (Dual2)",
-        "fixture precondition: the model-level label must claim analytic, or this test \
-         does not reproduce the reported mismatch"
+        result.gradient_method_outer, "N/A",
+        "a derivative-free fit has no outer gradient to report"
     );
     assert!(
         outer_fd_warning(&result.warnings).is_none(),
@@ -276,6 +281,32 @@ fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
         outer_fd_warning(&result.warnings).is_none(),
         "`reconverge_gradient_interval = 1` bypasses the analytic branch for every \
          subject, which is not a provider scope gap; got {:?}",
+        result.warnings
+    );
+}
+
+/// #1529 review. The flat-theta pre-flight (#826) evaluates one outer gradient for
+/// **every** non-mixture fit, including derivative-free BOBYQA. It used to write to the
+/// same decline log, so a BOBYQA fit with a declining subject warned — and advised
+/// `reconverge_gradient_interval` — about a gradient its optimizer never used. The
+/// pre-flight now keeps its own log. `out_of_scope_subject_warns_while_the_report_still_says_analytic`
+/// is the other side of this gate: the same population on a gradient-driven optimizer
+/// does warn.
+#[test]
+fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "a BOBYQA fit's only outer gradient is the flat-theta pre-flight, which must not \
+         be reported; got {:?}",
         result.warnings
     );
 }

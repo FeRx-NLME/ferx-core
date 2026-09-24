@@ -93,17 +93,15 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// (A per-fit `reconverge_gradient_interval` override can still force FD; this
 /// reports the default in-scope route.)
 ///
-/// **This is the model-level route, not the per-subject one, and it does not model every
-/// optimizer-resolution rule.** The scope predicates it reads take only `&CompiledModel`,
-/// so they answer "may this model use the analytic outer gradient", not "did it":
+/// **This is the model-level route, not the per-subject one, and it is not a runtime
+/// log.** (The optimizer itself is resolved by the outer loop's own
+/// `resolve_outer_optimizer`, mixture downgrade included — #1540.) The scope
+/// predicates it reads take only `&CompiledModel`, so they answer "may this model use
+/// the analytic outer gradient", not "did it":
 ///
-/// - A subject the provider declines at runtime is salvaged onto a per-subject
-///   reconverged-FD gradient (`population_gradient_sens_mixed` / `_iov_mixed`) while this
-///   keeps reporting `Analytic` — correctly, for the model.
-/// - The `optimizer` argument is resolved through [`Optimizer::resolve_auto`], which has no
-///   `[mixture]` branch. `estimation::outer_optimizer::resolve_outer_optimizer` downgrades
-///   `Auto` to derivative-free BOBYQA for a mixture model, so a mixture fit left on `auto`
-///   is reported `Analytic` here and runs no outer gradient at all.
+/// - A subject the provider declines at runtime is salvaged onto a per-subject gradient —
+///   held-EBE in `population_gradient_sens_mixed` (#1529), reconverged FD in `_iov_mixed` —
+///   while this keeps reporting `Analytic` — correctly, for the model.
 /// - A `reconverge_gradient_interval` override forces the reconverged-FD gradient without
 ///   changing this report, as the paragraph above already notes.
 ///
@@ -149,7 +147,17 @@ pub fn gradient_method_outer(
             // `opts.interaction = method == FoceI`, so the two never disagree),
             // not a separate `FitOptions` field this function doesn't receive.
             let interaction = method == EstimationMethod::FoceI;
-            match optimizer.resolve_auto(model, interaction) {
+            // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
+            // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
+            let analytic =
+                crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction);
+            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                optimizer,
+                model,
+                model.mixture.is_some(),
+                analytic,
+            );
+            match resolved {
                 Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
                 // `Auto` is resolved above; only its concrete results reach here.
                 Optimizer::Auto
@@ -165,10 +173,7 @@ pub fn gradient_method_outer(
                     // Shared with `resolve_auto` so the reported method tracks the live outer
                     // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
                     // (#486 σ-magnitude FOCE port), so this no longer narrows by interaction.
-                    if crate::sens::provider::analytic_outer_gradient_for_interaction(
-                        model,
-                        interaction,
-                    ) {
+                    if analytic {
                         GradientMethodKind::Analytic
                     } else {
                         GradientMethodKind::FiniteDifferences
@@ -420,6 +425,50 @@ mod tests {
             ),
             GradientMethodKind::Analytic,
             "FOCE + magnitude with a forced gradient optimizer reports the analytic method"
+        );
+    }
+
+    /// A mixture model left on `auto` runs derivative-free BOBYQA
+    /// (`resolve_outer_optimizer`'s mixture arm), so it has no outer gradient to
+    /// report (#1540). The non-mixture twin — same structural model, in analytic
+    /// scope — must still report `Analytic` under `auto`, or the pair does not
+    /// straddle the gate. An explicit NLopt gradient optimizer is honoured under a
+    /// mixture; an explicit built-in BFGS is replaced by BOBYQA.
+    ///
+    /// Mutation that must redden this: resolving through `Optimizer::resolve_auto`
+    /// again (the pre-#1540 code), which reports the mixture `auto` arm `Analytic`.
+    #[test]
+    fn outer_mixture_auto_reports_no_outer_gradient() {
+        let params = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  omega ETA_CL ~ 0.1\n  sigma EPS ~ 0.01\n";
+        let body = "[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n";
+        let parse = |s: &str| crate::parser::model_parser::parse_model_string(s).expect("parse");
+        let mix = parse(&format!(
+            "{params}[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{body}"
+        ));
+        let plain = parse(&format!("{params}{body}"));
+        assert!(mix.mixture.is_some() && plain.mixture.is_none());
+        let outer = |opt, m: &CompiledModel| {
+            gradient_method_outer(&ad_build(), EstimationMethod::FoceI, opt, m)
+        };
+        assert_eq!(
+            outer(Optimizer::Auto, &plain),
+            GradientMethodKind::Analytic,
+            "the non-mixture twin must be in analytic scope under `auto`"
+        );
+        assert_eq!(
+            outer(Optimizer::Auto, &mix),
+            GradientMethodKind::NotApplicable,
+            "mixture + `auto` runs BOBYQA: no outer gradient"
+        );
+        assert_eq!(
+            outer(Optimizer::NloptLbfgs, &mix),
+            GradientMethodKind::Analytic,
+            "an explicit NLopt gradient optimizer is honoured under a mixture"
+        );
+        assert_eq!(
+            outer(Optimizer::Bfgs, &mix),
+            GradientMethodKind::NotApplicable,
+            "an explicit built-in BFGS is replaced by BOBYQA under a mixture"
         );
     }
 }

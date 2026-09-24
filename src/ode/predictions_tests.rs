@@ -5479,7 +5479,7 @@ fn push_route_lag_break_times_adds_route_onsets() {
     ];
     let subj = make_subject(doses, vec![]);
     let mut breaks = Vec::new();
-    push_route_lag_break_times(&mut breaks, &ode, &subj, &[0.5, 0.0, 0.0], |f| {
+    push_route_lag_break_times(&mut breaks, &ode, &subj, &[0.5, 0.0, 0.0], |f, _| {
         f.route_lag(&params)
     });
     // Only the lagged forcing × the valid dose: 2.0 + 0.5 (cmt lag) + 1.5 (route lag).
@@ -9014,7 +9014,9 @@ fn route_lagged_zero_order_break_builders_agree() {
     // The dense builder additionally brackets the timeline with the integration
     // start and the terminal, so add both to the prediction side before comparing.
     let mut from_predictions = vec![subject_integration_start(&subject), 24.0];
-    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, &pk);
+    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, |_| {
+        &pk[..]
+    });
     let from_predictions = normalize(from_predictions);
 
     let from_dense = build_segment_break_times(&ode, &pk, &subject, &lags, &f_bio, &windows, 24.0);
@@ -9167,7 +9169,9 @@ fn route_lagged_first_order_onset_reaches_both_dense_builders() {
 
     // …and the prediction builder, which always had it, must agree.
     let mut from_predictions = Vec::new();
-    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, &pk);
+    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, |_| {
+        &pk[..]
+    });
     for want in [LAG_CMT + LAG_ROUTE, 12.0 + LAG_CMT + LAG_ROUTE] {
         assert!(
             from_predictions.iter().any(|&t| (t - want).abs() < 1e-12),

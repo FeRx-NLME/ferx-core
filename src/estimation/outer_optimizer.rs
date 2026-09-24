@@ -239,12 +239,16 @@ pub fn optimize_population(
         };
         &owned_opts
     };
-    // Records which subjects actually take the per-subject reconverged-FD outer gradient
-    // (#1154). Created after the `runs_outer_optimizer` short-circuit above, so an
-    // evaluation-only run — which computes no outer gradient — cannot report one. The
-    // flat-theta pre-flight below is a real outer-gradient evaluation, so it writes here
-    // too.
+    // Records which subjects the *optimizer's* outer-gradient evaluations salvaged off the
+    // exact analytic gradient (#1154). Created after the `runs_outer_optimizer` short-circuit
+    // above, so an evaluation-only run — which computes no outer gradient — cannot report
+    // one. The flat-theta pre-flight below writes to a log of its own that is dropped: it
+    // runs for derivative-free BOBYQA and trust-region fits too, and a decline recorded
+    // there would make those fits warn about — and give advice for — a gradient their
+    // optimizer never used (#1529 review). A gradient-driven optimizer re-evaluates the
+    // same start point on its first iteration, so nothing it would report is lost.
     let declines = OuterFdDeclineLog::new(population.subjects.len());
+    let preflight_declines = OuterFdDeclineLog::new(population.subjects.len());
 
     // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
     // identically ~0 at the initial estimate never reaches the objective (typically
@@ -259,7 +263,7 @@ pub fn optimize_population(
     let (init_params, preflight_warnings) = if init_params.mixture.is_some() {
         (init_params, Vec::new())
     } else {
-        match freeze_flat_thetas(model, population, init_params, options, &declines) {
+        match freeze_flat_thetas(model, population, init_params, options, &preflight_declines) {
             Some((fp, w)) => {
                 frozen_params = fp;
                 (&frozen_params, w)
@@ -298,7 +302,7 @@ pub fn optimize_population(
     // the runtime log, rather than from a probe in `fit_inner`: only this scope knows
     // which evaluations ran, and the log is empty for every route that never reaches the
     // analytic branch — so no route gate is needed and none can go stale.
-    if let Some(w) = outer_fd_fallback_warning(population, &declines) {
+    if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
     result
@@ -370,6 +374,7 @@ fn freeze_flat_thetas(
         &bounds,
         options,
         &mut grad_eval_idx,
+        OuterTrial::unknown(),
         declines,
     );
 
@@ -948,7 +953,7 @@ fn run_inner_loop_and_nll(
     Vec<Vec<DVector<f64>>>,
     f64,
 ) {
-    let (etas, h_matrices, stats, kappas, nll, _) = run_inner_loop_and_nll_prepared(
+    let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
         model, population, params, options, prev_etas, mu_k, None, schedules,
     );
     (etas, h_matrices, stats, kappas, nll)
@@ -977,6 +982,11 @@ fn agq_inner_solve_policy(options: &FitOptions, fused_gradient: bool) -> InnerSo
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
 /// `run_global_presearch` build the cache once per fit and pass it through here on every
 /// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
+///
+/// The last element is the per-subject `nllᵢ` the returned total is the sum of, in
+/// `population.subjects` order — what the #1520 salvage guard compares trial against
+/// incumbent on. Empty on the AGQ branch, whose quadrature objective is summed elsewhere;
+/// the guard is then disarmed.
 #[allow(clippy::type_complexity)]
 fn run_inner_loop_and_nll_prepared(
     model: &CompiledModel,
@@ -994,6 +1004,7 @@ fn run_inner_loop_and_nll_prepared(
     Vec<Vec<DVector<f64>>>,
     f64,
     Option<crate::estimation::agq::PopulationEvaluation>,
+    Vec<f64>,
 ) {
     if options.agq_nodes().is_some() {
         // Capture each subject's terminal exact Hessian only where the objective below will
@@ -1082,7 +1093,7 @@ fn run_inner_loop_and_nll_prepared(
             },
             |evaluation| evaluation.nll,
         );
-        return (etas, h_matrices, stats, kappas, nll, evaluation);
+        return (etas, h_matrices, stats, kappas, nll, evaluation, Vec::new());
     }
     let policy = InnerSolvePolicy {
         seed: InnerHessianSeed::for_options(options),
@@ -1132,7 +1143,7 @@ fn run_inner_loop_and_nll_prepared(
         )
     };
     let nll = contributions.iter().sum();
-    (etas, h_matrices, stats, kappas, nll, None)
+    (etas, h_matrices, stats, kappas, nll, None, contributions)
 }
 
 /// State passed through NLopt's user-data mechanism
@@ -1152,10 +1163,17 @@ struct NloptState {
     prev_x: Vec<f64>,
     last_improvement_eval: usize,
     best_at_last_improvement: f64,
+    /// Scaled-space step norms `‖xs − prev_x‖` of the last
+    /// [`EXPANSION_HISTORY`] evals, oldest first. Feeds [`step_is_expanding`] (#1530).
+    recent_steps: std::collections::VecDeque<f64>,
     /// Sticky once latched — subsequent evals return `best_ofv` with zero
     /// gradient so SLSQP/L-BFGS xtol/ftol fires in microseconds instead
     /// of grinding through `maxeval` at full inner-loop cost.
     stagnation_stopped: bool,
+    /// The #1520 salvage guard's bookkeeping: which point a trial is measured against is
+    /// decided per optimizer by [`SalvageGuardPolicy`], and the state remembers the
+    /// candidates (best evaluation, last gradient point, previous `xs`).
+    salvage_guard: SalvageGuardState,
 }
 
 /// Latches `stagnation_stopped` once recent evals show no OFV progress.
@@ -1220,19 +1238,13 @@ fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     BASE + 50.0 * pen
 }
 
-fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
+fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool, short_window: bool) -> bool {
     if !enabled {
         return false;
     }
     if state.stagnation_stopped {
         return true;
     }
-    // Tied to the FD-gradient cost: 3*(n+1) evals = 3 attempted descent
-    // steps with their gradient probes. Minimum of 50 evals so very-small
-    // problems and gradient line searches get a real chance before we declare
-    // stagnation; callback count does not distinguish accepted iterates from
-    // rejected line-search trials.
-    let stagnation_window: usize = (3 * (n + 1)).max(50);
     // Absolute OFV improvement below this is treated as noise. Matches
     // typical FOCE EBE-loop precision (~1e-3 OFV units) — see
     // `inner_tol` default and Sheiner–Beal linearisation comment in
@@ -1244,12 +1256,150 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
         state.last_improvement_eval = state.n_evals;
         state.best_at_last_improvement = state.best_ofv;
         false
-    } else if state.n_evals.saturating_sub(state.last_improvement_eval) >= stagnation_window {
+    } else if state.n_evals.saturating_sub(state.last_improvement_eval)
+        >= stagnation_window(n, short_window)
+    {
         state.stagnation_stopped = true;
         true
     } else {
         false
     }
+}
+
+/// Evals without a significant OFV improvement after which the stagnation
+/// guard latches.
+///
+/// **Long window, `max(3·(n+1), 50)`.** Sized for the FD-gradient era: three
+/// attempted descent steps with their gradient probes, and long enough that a
+/// line search at the start of a fit gets a real chance. It is what BOBYQA gets
+/// (its interpolation-model rebuilds legitimately spend many evals flat, and it has
+/// its own reachable `xtol`/`ftol` stops), and what a gradient fit gets before it
+/// has made any progress (#751's init-stall retry keys off the fit's position, not
+/// this guard, but there is no reason to cut such a fit short either).
+///
+/// **Short window, `max(n+1, 10)`, for a gradient fit that has already
+/// descended (#1530).** A gradient optimizer's callback computes its gradient
+/// inside the same call (analytic, or FD without extra NLopt evals), so every
+/// callback is an iterate or a line-search probe, and `n+1` of them after real
+/// descent with none buying 1e-3 is a run of line searches that have stopped
+/// paying. The FOCE/FOCEI gradient stops are an unreachable `1e-12`, so the
+/// gradient test is the only way out other than this guard — and it cannot fire
+/// when the outer gradient does not vanish at the optimum of the objective being
+/// evaluated. On `clofarabine_brooks` (FOCEI, `nlopt_lbfgs`) it plateaus at a norm
+/// of ≈1.09 while the OFV is flat to the sixth decimal (likely the fixed-EBE
+/// gradient's missing inner-response term, #1529). That fit reached its final OFV
+/// within 0.0014 at eval 30 and then spent evals 31–61 (45% of estimation) until
+/// the line search failed.
+///
+/// The short window applies when [`use_short_stagnation_window`] holds and
+/// [`step_is_expanding`] does not.
+fn stagnation_window(n: usize, short_window: bool) -> usize {
+    if short_window {
+        (n + 1).max(10)
+    } else {
+        (3 * (n + 1)).max(50)
+    }
+}
+
+/// Does a gradient-based NLopt run get reachable `xtol`/`ftol` stops?
+///
+/// Only the quadrature objectives (Laplace, FOCEI with `n_agq > 1`) do: their
+/// gradient is finite-difference-limited, so they stop on objective change and step
+/// size, like BOBYQA. FOCE/FOCEI get unreachable `1e-12` stops and rely on the
+/// gradient norm. One predicate, read both where the tolerances are set and by
+/// [`use_short_stagnation_window`], so the two cannot drift apart.
+fn gradient_run_has_reachable_stops(options: &FitOptions) -> bool {
+    options.agq_nodes().is_some()
+}
+
+/// Whether [`stagnation_window`]'s short window applies: a gradient optimizer
+/// (anything but BOBYQA) with unreachable stops (see
+/// [`gradient_run_has_reachable_stops`]; a run that has reachable ones is left to
+/// them), whose last significant *feasible* improvement (`last_sig_feasible_eval`,
+/// the plateau tracker's index) lies past the first feasible eval, which only sets
+/// the baseline. Feasible-only, so a guard penalty on eval 1 followed by a feasible
+/// eval cannot pass for descent.
+fn use_short_stagnation_window(
+    algo: nlopt::Algorithm,
+    reachable_stops: bool,
+    last_sig_feasible_eval: usize,
+) -> bool {
+    !matches!(algo, nlopt::Algorithm::Bobyqa) && !reachable_stops && last_sig_feasible_eval > 1
+}
+
+/// Steps [`step_is_expanding`] looks at: the latest and the two before it.
+const EXPANSION_HISTORY: usize = 3;
+
+/// Step-to-step growth factor [`step_is_expanding`] counts as an expansion.
+const EXPANSION_RATIO: f64 = 1.5;
+
+/// Is the optimizer's step growing? True when each of the last two steps in `steps`
+/// (oldest first, latest last) is at least [`EXPANSION_RATIO`] times the one before —
+/// the veto on the short stagnation window (#1530).
+///
+/// It separates a fit spinning at its optimum from one creeping off a saddle, which
+/// the OFV alone cannot: both show sub-1e-3 progress for many evals. On
+/// `bioavailability` (`examples/`) the OFV sits at 648.8203 for a dozen evals while
+/// successive steps grow ×2–4.5 each (3e-6 to 1.4), then drops 1.48 units into a
+/// better basin; without this veto the short window latched it at eval 80, above
+/// that basin. A fit at its optimum does not expand: `clofarabine_brooks`'s steps
+/// are small and erratic, `busulfan_shukla`'s steady at ~1e-4 and slowly shrinking.
+/// Two consecutive ratios rather than one, since a single larger probe inside an
+/// erratic tail is not a trend. Fewer than three steps, a zero step followed by a
+/// zero step, or a `NaN` step is not an expansion.
+fn step_is_expanding(steps: &std::collections::VecDeque<f64>) -> bool {
+    if steps.len() < EXPANSION_HISTORY {
+        return false;
+    }
+    let k = steps.len();
+    let grows = |a: f64, b: f64| b >= EXPANSION_RATIO * a && b > 0.0;
+    grows(steps[k - 3], steps[k - 2]) && grows(steps[k - 2], steps[k - 1])
+}
+
+/// The stagnation guard's per-eval step: record this eval's scaled step norm, pick
+/// the window ([`use_short_stagnation_window`], vetoed by [`step_is_expanding`], for
+/// the short one), then [`detect_stagnation`]. The objective closure calls this once per
+/// non-latched eval, after `best_ofv` and the plateau tracker are updated; the
+/// trace-replay tests call it too, so they exercise this code rather than a copy.
+fn stagnation_after_eval(
+    state: &mut NloptState,
+    n: usize,
+    enabled: bool,
+    algo: nlopt::Algorithm,
+    reachable_stops: bool,
+    last_sig_feasible_eval: usize,
+    step: f64,
+) -> bool {
+    if state.recent_steps.len() == EXPANSION_HISTORY {
+        state.recent_steps.pop_front();
+    }
+    state.recent_steps.push_back(step);
+    let short_window = use_short_stagnation_window(algo, reachable_stops, last_sig_feasible_eval)
+        && !step_is_expanding(&state.recent_steps);
+    detect_stagnation(state, n, enabled, short_window)
+}
+
+/// Does a run the stagnation guard stopped need the plateau verdict a bare
+/// `Failure` gets?
+///
+/// A latch hands NLopt a zero gradient at `best_ofv`, so what it returns next is
+/// forced, not found: the same "the OFV stopped moving" claim a `Failure` at a
+/// plateau makes, and it gets the same check — plateau length plus the cold-restart
+/// self-consistency test. That covers a `Success`-class return (`converged`) and a
+/// `MaxEvalReached` (`max_eval_reached`), which a latch on the last permitted eval
+/// produces; without the second, the same fit's verdict would depend on whether the
+/// budget allowed one more zero-gradient callback. A `Failure` after a latch is
+/// already pending and needs nothing here.
+///
+/// Before #1530 a latch was reported converged unconditionally. The short window
+/// makes latches far more common, and on fluconazole the latched best-seen 738.05
+/// re-solves cold to 741.60, the warm-start artifact the check exists to reject.
+fn latched_stop_needs_plateau_check(
+    converged: bool,
+    max_eval_reached: bool,
+    latched: bool,
+) -> bool {
+    latched && (converged || max_eval_reached)
 }
 
 /// Should this evaluation's EBEs become the warm start for the next one? (#1290)
@@ -1276,7 +1426,12 @@ fn adopt_warm_start(guarded: bool, ofv: f64, best_ofv: f64) -> bool {
     !guarded && ofv < best_ofv
 }
 
-fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
+fn new_nlopt_state(
+    n_subj: usize,
+    n_eta: usize,
+    x0: &[f64],
+    salvage_guard: SalvageGuardPolicy,
+) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
         cached_h_mats: Vec::new(),
@@ -1284,9 +1439,11 @@ fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
         best_ofv: f64::INFINITY,
         n_evals: 0,
         n_grad_evals: 0,
+        salvage_guard: SalvageGuardState::new(salvage_guard),
         prev_x: x0.to_vec(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
+        recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
     }
 }
@@ -1396,7 +1553,8 @@ fn run_global_presearch(
         );
     }
 
-    let pre_state = new_nlopt_state(n_subj, n_eta, x0);
+    // Derivative-free pre-search: no gradient is ever formed, so no salvage guard.
+    let pre_state = new_nlopt_state(n_subj, n_eta, x0, SalvageGuardPolicy::Off);
 
     let pre_objective = |xs: &[f64], _grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -1564,7 +1722,7 @@ fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
 /// (warfarin −286, tvcov −188.6 at truth, two_cpt_oral_cov −1165) and preserves
 /// SLSQP's warfarin_iov cold-start win (OFV 307.8, the #335 case).
 ///
-/// The derivative-free default `Bobyqa` is left unscaled — any per-coordinate
+/// The derivative-free `Bobyqa` is left unscaled — any per-coordinate
 /// scaling distorts its trust-region quadratic model and regresses multi-cpt / PD
 /// fits (e.g. emax_pkpd −36.8→−13.5, three_cpt_iv −730.6→−715.9). `Mma` /
 /// `TrustRegion` are left to the unscaled (legacy `scale_params` / IOV-auto)
@@ -2070,6 +2228,11 @@ pub(crate) struct AttemptOutcome {
     /// trace was still descending, at a point that is not a minimum. See
     /// [`resolve_mid_descent_restart`].
     pub(crate) mid_descent_stall: bool,
+    /// The stagnation guard latched during this attempt (#1530).
+    pub(crate) stagnation_latched: bool,
+    /// `converged` was decided by the plateau check ([`failure_is_converged_plateau`])
+    /// rather than read off NLopt's return code.
+    pub(crate) plateau_checked: bool,
 }
 
 /// Run the NLopt outer optimizer, with two guarded second attempts for the two
@@ -2459,8 +2622,9 @@ fn optimize_nlopt_once(
     // (notably MMA, which scaling hurts here), so scope the auto-enable to the
     // IOV + SLSQP combination that actually needs it.
     //
-    // Scope note: as of #155 the default outer optimizer is `Bobyqa`, not
-    // `Slsqp` — so default-IOV fits no longer hit this branch. BOBYQA is
+    // Scope note: since #155 the default outer optimizer is no longer `Slsqp`
+    // (it is now `Auto` → `NloptLbfgs`/`Bobyqa`, #490) — so default-IOV fits no
+    // longer hit this branch. BOBYQA is
     // gradient-free and doesn't suffer the `cap_scaled_gradient` starvation that
     // motivates the scaling here, so leaving it disabled on the default path is
     // intentional. This auto-enable now only fires for an explicit
@@ -2543,13 +2707,22 @@ fn optimize_nlopt_once(
         }
     }
 
-    let state = new_nlopt_state(n_subj, n_eta, &x0);
+    let state = new_nlopt_state(
+        n_subj,
+        n_eta,
+        &x0,
+        SalvageGuardPolicy::for_optimizer(options.optimizer),
+    );
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
     // back after `opt.optimize()`, so we need an Arc to read the final
     // count for reporting. Keep both in sync inside the objective closure.
     let n_evals_outer = Arc::new(AtomicUsize::new(0));
     let n_evals_cl = Arc::clone(&n_evals_outer);
+    // Set when the stagnation guard latches, so the verdict below can tell a
+    // guard-forced `Success` from one NLopt reached on its own (#1530).
+    let stagnation_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stagnation_latched_cl = Arc::clone(&stagnation_latched);
 
     // Best-seen accumulator (issue #59). NLopt returns the last evaluated
     // point, not the best one — when the stagnation guard short-circuits
@@ -2684,6 +2857,10 @@ fn optimize_nlopt_once(
             && options.agq_nodes().is_some()
             && !reconverge_this_eval(options, state.n_grad_evals)
             && crate::estimation::agq::analytic_gradient_available(model);
+        // `contribs` is the per-subject `2·nllᵢ` behind `raw_ofv` (#1520 salvage guard);
+        // left empty on the mixture branch, whose objective has no per-subject
+        // decomposition, which disarms the guard there.
+        let mut contribs: Vec<f64> = Vec::new();
         let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
@@ -2695,7 +2872,7 @@ fn optimize_nlopt_once(
                 n_start_rejected: m.ebe_stats.n_start_rejected,
             };
             let ofv = m.ofv;
-            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA, the default)
+            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
             // never touches `mixeval` or the analytic gradient, so avoid the full
             // per-class EBE cache clone: move `etas_by_class` straight into the
             // warm-start cache and the MIXEST EBEs into the result. When a gradient
@@ -2726,16 +2903,18 @@ fn optimize_nlopt_once(
             }
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, ebe_stats, kappas, nll, prepared) = run_inner_loop_and_nll_prepared(
-                model,
-                population,
-                &params,
-                options,
-                Some(&state.cached_etas),
-                Some(&mu_k),
-                fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
-                Some(&schedule_cache),
-            );
+            let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
+                run_inner_loop_and_nll_prepared(
+                    model,
+                    population,
+                    &params,
+                    options,
+                    Some(&state.cached_etas),
+                    Some(&mu_k),
+                    fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
+                    Some(&schedule_cache),
+                );
+            contribs = nll_i.iter().map(|v| 2.0 * v).collect();
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
@@ -2808,6 +2987,9 @@ fn optimize_nlopt_once(
         // penalty is on; a guarded eval carries its sentinel in both.
         let ofv_clean = if guarded { ofv } else { clean_ofv };
 
+        // #1520: whether a population gradient is formed at this point (recorded for the
+        // salvage guard after the evaluation, below).
+        let gradient_requested = grad.is_some() && !guarded;
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
         // Per-coordinate scaled gradient for the trace (#640); only populated
@@ -2828,6 +3010,9 @@ fn optimize_nlopt_once(
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
                 // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
                 // FD fallback when out of analytic scope.
+                // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
+                // the incumbent the salvage guard may measure this gradient point against.
+                let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
                     crate::estimation::mixture::mixture_gradient(
                         model, population, &params, options, mev,
@@ -2855,6 +3040,16 @@ fn optimize_nlopt_once(
                         options,
                         &mut state.n_grad_evals,
                         agq_evaluation,
+                        // #1520: the optimizer-facing objective at this point and the
+                        // incumbent it will be judged against. `raw_ofv` is the
+                        // penalized value — the one the optimizer ranks on — and the
+                        // EBE-guard sentinel cannot reach here (a guarded evaluation
+                        // takes the center-push arm above).
+                        OuterTrial {
+                            ofv: raw_ofv,
+                            contribs: &contribs,
+                            incumbent: guard_reference,
+                        },
                         declines,
                     )
                 };
@@ -2935,6 +3130,13 @@ fn optimize_nlopt_once(
                 state.cached_etas_by_class = prev;
             }
         }
+        // #1520: record this evaluation for the salvage guard — the objective the
+        // optimizer saw (`ofv`, the sentinel for a guarded evaluation, which the state
+        // ignores because neither flag is set then), its per-subject decomposition, and
+        // whether it was adopted as the fit's incumbent on the warm-start rule.
+        state
+            .salvage_guard
+            .observe(xs, ofv, contribs, gradient_requested, warm_start_improved);
         state.n_evals += 1;
         n_evals_cl.fetch_add(1, Ordering::Relaxed);
         if ofv < state.best_ofv {
@@ -2985,31 +3187,36 @@ fn optimize_nlopt_once(
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
         // top of the closure trips on the next eval.
-        if detect_stagnation(state, n, options.stagnation_guard) && verbose {
+        let step = xs
+            .iter()
+            .zip(&state.prev_x)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let last_sig_feasible_eval = plateau_tracker_cl.lock().unwrap().1;
+        if stagnation_after_eval(
+            state,
+            n,
+            options.stagnation_guard,
+            algo,
+            gradient_run_has_reachable_stops(options),
+            last_sig_feasible_eval,
+            step,
+        ) {
+            stagnation_latched_cl.store(true, Ordering::Relaxed);
+        }
+        if state.stagnation_stopped && verbose {
             eprintln!(
-                "Eval {:>4}: stopping early — OFV has converged (no improvement \
-                 above 1e-3 in last window). This is normal convergence behaviour, \
-                 not an error: further evaluations are unlikely to find a better \
-                 solution.",
+                "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
+                 last window. Whether this is convergence is decided after the \
+                 final inner loop (plateau and cold-restart consistency check).",
                 state.n_evals,
             );
         }
 
         // Optimizer trace (step_norm in scaled space)
         if crate::estimation::trace::is_active() {
-            let step_norm = {
-                let sq: f64 = xs
-                    .iter()
-                    .zip(&state.prev_x)
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum();
-                let n = sq.sqrt();
-                if n > 0.0 {
-                    Some(n)
-                } else {
-                    None
-                }
-            };
+            let step_norm = if step > 0.0 { Some(step) } else { None };
             let method_str = match options.method {
                 EstimationMethod::FoceI => "focei",
                 _ => "foce",
@@ -3096,7 +3303,7 @@ fn optimize_nlopt_once(
         opt.set_initial_step(&init_step).unwrap();
     } else {
         opt.set_maxeval(max_eval).unwrap();
-        if options.agq_nodes().is_some() {
+        if gradient_run_has_reachable_stops(options) {
             // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
             // term and the posterior Hessian are both central differences, so the gradient
             // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
@@ -3178,6 +3385,14 @@ fn optimize_nlopt_once(
             }
         }
     };
+    let latched = stagnation_latched.load(Ordering::Relaxed);
+    if latched_stop_needs_plateau_check(converged, max_eval_reached, latched) {
+        // The guard, not the budget, ended the run — even when its latch landed on
+        // the last permitted eval — so no "increase maxiter" warning either.
+        converged = false;
+        max_eval_reached = false;
+        stationarity_check_pending = true;
+    }
 
     drop(opt);
 
@@ -3602,6 +3817,8 @@ fn optimize_nlopt_once(
                 final_ofv,
                 budget_left,
             ),
+            stagnation_latched: latched,
+            plateau_checked: stationarity_check_pending,
         },
     )
 }
@@ -3731,13 +3948,23 @@ fn optimize_bfgs(
         }
     };
 
+    // `incumbent` is the #1520 salvage guard's reference: the optimizer-facing objective
+    // and per-subject `2·nllᵢ` of the last accepted iterate. Returns this point's
+    // `2·nllᵢ` as its last element so the loop can promote it.
     let fdfg = |x: &[f64],
                 prev_etas: &[DVector<f64>],
-                grad_eval_idx: &mut usize|
-     -> (f64, Vec<f64>, Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
+                grad_eval_idx: &mut usize,
+                incumbent: Option<(f64, &[f64])>|
+     -> (
+        f64,
+        Vec<f64>,
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+        Vec<f64>,
+    ) {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, _, kappas, nll) = run_inner_loop_and_nll(
+        let (ehs, hms, _, kappas, nll, _, contribs) = run_inner_loop_and_nll_prepared(
             model,
             population,
             &params,
@@ -3745,8 +3972,18 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             None,
+            None,
         );
+        let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
         let ofv = 2.0 * nll;
+        // The value the optimizer ranks this point on, for the guard: the penalties are
+        // re-added below together with their gradients, in the original order, so the
+        // returned `f` and `g` are unchanged by this read.
+        let trial = OuterTrial {
+            ofv: ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(x),
+            contribs: &contribs,
+            incumbent,
+        };
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
         let mut g = population_gradient(
             x,
@@ -3760,6 +3997,7 @@ fn optimize_bfgs(
             &bounds,
             options,
             grad_eval_idx,
+            trial,
             declines,
         );
         // Penalized value + matching gradient fed to the optimizer (unregularized
@@ -3770,7 +4008,7 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        (f, g, ehs, hms)
+        (f, g, ehs, hms, contribs)
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -3795,12 +4033,19 @@ fn optimize_bfgs(
     // Wrappers that operate in scaled space; unscale before calling base closures.
     let fdfg_s = |xs: &[f64],
                   prev_etas: &[DVector<f64>],
-                  grad_eval_idx: &mut usize|
-     -> (f64, Vec<f64>, Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
+                  grad_eval_idx: &mut usize,
+                  incumbent: Option<(f64, &[f64])>|
+     -> (
+        f64,
+        Vec<f64>,
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+        Vec<f64>,
+    ) {
         let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-        let (f, g_r, ehs, hms) = fdfg(&x_r, prev_etas, grad_eval_idx);
+        let (f, g_r, ehs, hms, contribs) = fdfg(&x_r, prev_etas, grad_eval_idx, incumbent);
         let g_s: Vec<f64> = (0..n).map(|i| g_r[i] * scale[i]).collect();
-        (f, g_s, ehs, hms)
+        (f, g_s, ehs, hms, contribs)
     };
 
     let f_only_s = |xs: &[f64], prev_etas: &[DVector<f64>]| -> f64 {
@@ -3815,8 +4060,13 @@ fn optimize_bfgs(
     // inside `population_gradient` so it counts actual gradient evals (not
     // outer iterations or objective-only line-search probes).
     let mut grad_eval_idx = 0usize;
-    let (mut f_val, mut g, ehs, _) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx);
+    let (mut f_val, mut g, ehs, _, contribs) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx, None);
     cached_etas = ehs;
+    // #1520: the salvage guard's incumbent. Every `fdfg_s` call below is at a point the
+    // Armijo backtracking (on `f_only_s`) has already accepted, so the incumbent is simply
+    // the previous accepted iterate; the guard can fire here only if a subject blew up
+    // at an accepted point, which the population gate excludes.
+    let mut incumbent: (f64, Vec<f64>) = (f_val, contribs);
 
     // EBE warm-start predictor (Almquist Eq. 48): extrapolate each subject's EBE
     // to the next outer point via dη̂/dx, so the inner solve starts closer and
@@ -3939,8 +4189,14 @@ fn optimize_bfgs(
             ),
             None => cached_etas.clone(),
         };
-        let (f_new, g_new, ehs, _) = fdfg_s(&xs, &warm, &mut grad_eval_idx);
+        let (f_new, g_new, ehs, _, contribs) = fdfg_s(
+            &xs,
+            &warm,
+            &mut grad_eval_idx,
+            Some((incumbent.0, incumbent.1.as_slice())),
+        );
         cached_etas = ehs;
+        incumbent = (f_new, contribs);
         if use_predictor {
             last_jac = crate::estimation::sens_outer_gradient::population_eta_dx(
                 model,
@@ -4306,16 +4562,279 @@ fn central_diff_packed(
     grad
 }
 
-/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges
-/// that one subject's EBE** (warm-started) at every perturbed point. The single-
-/// subject analog of [`reconverged_fd_gradient`], used to fill the handful of
-/// subjects the analytic provider can't handle (SS+reset, time-varying
-/// covariates, modeled-duration doses, EVID=2 reset) inside the otherwise-exact
-/// analytic population gradient. Because the EBEs are re-solved at each ±h, the
-/// Ω/σ EBE-response is included — the term the θ-only fixed-EBE fallback drops,
-/// whose absence stalled the gradient optimizers (focei-slsqp-fixed-ebe-gradient-bias).
-/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
-/// fixed coordinates, matching the analytic per-subject convention.
+/// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
+/// prediction Jacobian — the per-subject term of [`ad_population_gradient`], and the fill
+/// for a subject [`subject_analytic_outer_gradient`] declines inside
+/// [`population_gradient_sens_mixed`] (#1529).
+///
+/// It costs `2·n_free` objective evaluations of this one subject (or one closed-form
+/// Laplace / Sheiner–Beal pass where `subject_nll_pop_grad` has one) and **no** inner
+/// re-solve. For FOCEI the envelope theorem makes the held-η̂ data/prior gradient exact;
+/// what it omits is the `½·∂log|H̃|/∂η · dη̂/dx` EBE response, the same term the
+/// `reconverge_gradient_interval` schedule governs for every other fixed-EBE gradient.
+/// A declined subject therefore follows that schedule like the rest of the fit: an
+/// evaluation the schedule reconverges never reaches the mixed assembly (the whole
+/// population takes [`reconverged_fd_gradient`]), and the evaluations in between charge a
+/// declined subject the cheap gradient rather than `2·n_free` full `find_ebe` solves.
+///
+/// Returns `(nllᵢ, d(nllᵢ)/dx)`, the gradient of length `x.len()`; the caller scales by
+/// 2 and zeroes fixed coordinates, matching the analytic per-subject convention. `nllᵢ`
+/// is the held-EBE objective at `x`, which [`held_ebe_salvage`] reads to tell a
+/// repelled subject from a real one.
+#[allow(clippy::too_many_arguments)]
+fn subject_fixed_ebe_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> (f64, Vec<f64>) {
+    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
+    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
+    // full marginal gradient and reach the true minimum instead of stalling
+    // above it. Reuses the Laplace cache the gradient just formed (one extra
+    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
+    // error.
+    let (nll, mut gi, cache) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+        x,
+        init_params,
+        model,
+        population,
+        subj_idx,
+        eta_hat,
+        h_matrix,
+        kappas,
+        bounds,
+        options,
+    );
+    if let Some(c) = cache.as_ref() {
+        if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
+            Some(c),
+            x,
+            init_params,
+            model,
+            population,
+            subj_idx,
+            eta_hat,
+            h_matrix,
+            bounds,
+            options,
+        ) {
+            for (g, ti) in gi.iter_mut().zip(t.iter()) {
+                *g += *ti;
+            }
+        }
+    }
+    (nll, gi)
+}
+
+/// Is subject `subject`'s analytic outer-gradient decline **structural** — one it takes
+/// at every parameter point of the fit, rather than the parameter-dependent decline
+/// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
+///
+/// One cause today: a `block_sigma` correlation across observation rows. The analytic
+/// assembly serves only a diagonal residual covariance (`corr_residual_diag` declines on
+/// this same predicate), and the pairing depends on the data alone, so the subject
+/// declines at every evaluation. For such a subject the held-EBE gradient is not an
+/// occasional stand-in but the **only** gradient it ever contributes, and its missing
+/// EBE-response term then biases every step: on `fluconazole_radboudumc`, where all 31
+/// subjects have paired total/unbound rows, L-BFGS stalled at `‖g‖ ≈ 655` and OFV
+/// 807.88–810.28, against 738.05 with the reconverged gradient (NONMEM: 734.64).
+fn is_structural_decline(
+    model: &CompiledModel,
+    subject: &Subject,
+    init_params: &ModelParameters,
+) -> bool {
+    crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &init_params.sigma.values,
+        &init_params.residual_correlations,
+    )
+}
+
+/// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed`]:
+/// the reconverged [`subject_reconverged_fd_gradient`] for a structural decline
+/// ([`is_structural_decline`], #1536), otherwise [`held_ebe_salvage`] (#1529).
+///
+/// A structural decline gets the reconverged gradient whatever
+/// `reconverge_gradient_interval` says — the pre-#1529 behaviour, and the correct one:
+/// the interval exists to amortise a gradient that is *usually* exact between
+/// reconvergences, and a subject that is never analytic has no exact evaluations to
+/// amortise over. It is still subject to the #1520 guard, which runs first
+/// ([`declined_subject_gradient`]): at a blown-up SLSQP/MMA trial the subject contributes
+/// zero and this function is not called — the same precedence every other salvage has,
+/// at points those optimizers reject anyway.
+///
+/// Where that guard is off (Luksan L-BFGS, or no incumbent yet) a structural subject can
+/// still arrive **repelled** — its objective at `x`, read at the held EBE, is NaN/∞ or the
+/// `1e20` sentinel. It then contributes zero, exactly as [`held_ebe_salvage`] does
+/// ([`structural_fill`]): a `2·n_free`-solve central difference across a sentinel is a
+/// ~1e24 component, not a derivative, and the re-solves are the #1529 cost at the very
+/// points subjects get repelled (#1537 review).
+#[allow(clippy::too_many_arguments)]
+fn non_iov_declined_salvage(
+    structural: bool,
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    if structural {
+        let subject = &population.subjects[subj_idx];
+        let params = unpack_params(x, init_params);
+        let nll = crate::stats::likelihood::foce_subject_nll(
+            model,
+            subject,
+            &params.theta,
+            eta_hat,
+            h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            options.interaction,
+        );
+        match structural_fill(nll) {
+            DeclinedFill::Zero => vec![0.0; x.len()],
+            _ => subject_reconverged_fd_gradient(
+                x,
+                init_params,
+                model,
+                subject,
+                eta_hat,
+                bounds,
+                options,
+            ),
+        }
+    } else {
+        held_ebe_salvage(
+            x,
+            init_params,
+            model,
+            population,
+            subj_idx,
+            eta_hat,
+            h_matrix,
+            bounds,
+            options,
+        )
+    }
+}
+
+/// The non-IOV salvage for a subject declined by [`subject_analytic_outer_gradient`]
+/// inside [`population_gradient_sens_mixed`] (#1529), used whenever the #1520 guard
+/// ([`declined_subject_gradient`]) does not drop the subject. Three cases, by what the
+/// held-EBE gradient ([`subject_fixed_ebe_gradient`]) returns:
+///
+/// - **Usable objective, finite gradient** — the common case: use it.
+/// - **Unusable objective** (NaN/∞ or the `1e20` sentinel): the subject is repelled at this
+///   trial point, so the population objective the optimizer sees here carries the sentinel
+///   and no line search will accept the point — its gradient is never used to take a step.
+///   There is no derivative of a sentinel to report, so the subject contributes **zero**.
+///   Re-solving it with [`subject_reconverged_fd_gradient`] instead would buy nothing and is
+///   exactly the cost #1529 removed: blown-up trials are where subjects get repelled.
+/// - **Usable objective, non-finite gradient** — a real point where the held-EBE formula
+///   broke down: fall back to [`subject_reconverged_fd_gradient`], whose central difference
+///   drops non-finite coordinates. Rare by construction, so its cost does not matter.
+///
+/// Before this, a sentinel-based `0` from the FD fallback and a `NaN` from a one-sided
+/// difference at a bound both passed straight into the population sum (#1529 review).
+#[allow(clippy::too_many_arguments)]
+fn held_ebe_salvage(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let (nll, g) = subject_fixed_ebe_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        subj_idx,
+        eta_hat,
+        h_matrix,
+        &[],
+        bounds,
+        options,
+    );
+    match declined_fill(nll, &g) {
+        DeclinedFill::HeldEbe => g,
+        DeclinedFill::Zero => vec![0.0; x.len()],
+        DeclinedFill::Reconverge => subject_reconverged_fd_gradient(
+            x,
+            init_params,
+            model,
+            &population.subjects[subj_idx],
+            eta_hat,
+            bounds,
+            options,
+        ),
+    }
+}
+
+/// Which fill [`held_ebe_salvage`] uses; see its docs for the three cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclinedFill {
+    HeldEbe,
+    Zero,
+    Reconverge,
+}
+
+/// The fill for a **structural** decline ([`non_iov_declined_salvage`]), keyed on the
+/// subject's held-EBE objective at `x`: [`DeclinedFill::Zero`] when it is repelled,
+/// otherwise [`DeclinedFill::Reconverge`]. Never [`DeclinedFill::HeldEbe`] — the held-EBE
+/// gradient is what a structural decline exists to avoid (#1536).
+fn structural_fill(nll: f64) -> DeclinedFill {
+    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+        DeclinedFill::Reconverge
+    } else {
+        DeclinedFill::Zero
+    }
+}
+
+/// A per-subject objective as [`central_diff_packed`] must see it: the `1e20` sentinel is
+/// finite, so without this a difference with one repelled side is a finite ~1e24 that
+/// passes its `is_finite()` filter. Mapping it to NaN drops that coordinate to zero, the
+/// same as a genuinely non-finite side (#1537 review).
+fn fd_masked_subject_nll(nll: f64) -> f64 {
+    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+        nll
+    } else {
+        f64::NAN
+    }
+}
+
+fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
+    if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+        DeclinedFill::Zero
+    } else if held_ebe_grad.iter().all(|v| v.is_finite()) {
+        DeclinedFill::HeldEbe
+    } else {
+        DeclinedFill::Reconverge
+    }
+}
+
+/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges that
+/// subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
+/// included. Since #1529 it serves two callers: a structural decline
+/// ([`non_iov_declined_salvage`], #1536), and the last resort of [`held_ebe_salvage`] for
+/// a subject whose held-EBE gradient came back non-finite at a usable objective.
 #[allow(clippy::too_many_arguments)]
 fn subject_reconverged_fd_gradient(
     x: &[f64],
@@ -4329,8 +4848,8 @@ fn subject_reconverged_fd_gradient(
     let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
-    // difference drops to zero for that coordinate.
+    // (`foce_subject_nll`, summed by `pop_nll`); non-finite or sentinel → NaN so the
+    // central difference drops to zero for that coordinate.
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -4344,7 +4863,7 @@ fn subject_reconverged_fd_gradient(
             Some(&mu_k),
             0,
         );
-        crate::stats::likelihood::foce_subject_nll(
+        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll(
             model,
             subject,
             &params.theta,
@@ -4354,14 +4873,17 @@ fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             &params.residual_correlations,
             options.interaction,
-        )
+        ))
     };
     central_diff_packed(x, &fixed, bounds, eval)
 }
 
-/// Per-subject reconverged-FD packed gradient for an **IOV** subject — the IOV analogue of
-/// [`subject_reconverged_fd_gradient`], used to salvage subjects outside the analytic IOV
-/// scope without dropping the whole population to FD (#466 review round 2). `find_ebe`
+/// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
+/// one subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
+/// included. Used to salvage subjects outside the analytic IOV scope without dropping the
+/// whole population to FD (#466 review round 2). IOV fits reconverge unconditionally and
+/// ignore `reconverge_gradient_interval`, so unlike the non-IOV
+/// [`subject_fixed_ebe_gradient`] this salvage keeps the reconverged form (#1529). `find_ebe`
 /// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
 /// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums).
 fn subject_reconverged_fd_gradient_iov(
@@ -4410,7 +4932,7 @@ fn subject_reconverged_fd_gradient_iov(
 /// `None` when this subject does not get one — either because the sensitivity provider
 /// (or the `prepare` assembly behind it) declined the subject's data shape at runtime,
 /// or because a component came back non-finite. Both cases route the subject to
-/// [`subject_reconverged_fd_gradient`], so they are one gate, not two.
+/// [`subject_fixed_ebe_gradient`], so they are one gate, not two.
 ///
 /// The single gate [`population_gradient_sens_mixed`] dispatches on, extracted so the
 /// FOCE/FOCEI entry-point choice and the finiteness backstop live in one place rather
@@ -4476,9 +4998,285 @@ fn subject_analytic_outer_gradient_iov(
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
-/// Which subjects actually took the per-subject **reconverged-FD** outer gradient during
-/// this fit, because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them
-/// (#1154).
+/// What the outer-gradient assembly knows about the point it is asked to differentiate,
+/// beyond `x` itself (#1520): the objective there, the per-subject contributions that
+/// objective is the sum of, and the same pair at the **incumbent** — the best evaluation
+/// the optimizer has accepted so far. [`skip_fd_salvage`] is its only reader.
+///
+/// [`OuterTrial::unknown`] disarms the guard. The first evaluation of a fit, the
+/// `freeze_flat_thetas` pre-flight, the mixture branch (whose objective carries no
+/// per-subject decomposition) and every test that wants the plain assembly pass it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OuterTrial<'a> {
+    /// The objective the optimizer ranks this point on — penalties included, the EBE-guard
+    /// sentinel excluded (a guard-rejected evaluation never asks for a gradient).
+    pub ofv: f64,
+    /// `2·nllᵢ` per subject at this point, in `population.subjects` order.
+    pub contribs: &'a [f64],
+    /// The incumbent's `(ofv, contribs)`, or `None` before one exists.
+    pub incumbent: Option<(f64, &'a [f64])>,
+}
+
+impl OuterTrial<'static> {
+    /// No incumbent: the guard cannot fire and every declined subject takes the salvage.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            ofv: f64::NAN,
+            contribs: &[],
+            incumbent: None,
+        }
+    }
+}
+
+/// Which incumbent the #1520 salvage guard measures a trial point against, per NLopt
+/// algorithm — because "this point cannot be accepted" is a property of each optimizer's
+/// **acceptance test**, not of the objective values alone (PR #1525 review, P1).
+///
+/// The guard's population gate is only a rejected-trial guarantee when the reference it
+/// compares against is the point the optimizer's own acceptance test compares against.
+/// That point is not, in general, the best evaluation seen: a rejected trial can undercut
+/// the current iterate without passing sufficient decrease, and SLSQP's inexact line
+/// search accepts its eleventh trial **without** sufficient decrease (`slsqp.c`, `L200`:
+/// `if (h1 <= h3 / ten || line > 10) goto L240`), after which `L240` requests the
+/// gradient at that point as the new iterate. Measured against the best evaluation, a
+/// guard could then drop a subject's term at an accepted point and feed the hole into
+/// SLSQP's BFGS update. So each algorithm gets the reference its own test justifies, or
+/// none:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SalvageGuardPolicy {
+    /// Never fire. NLopt L-BFGS (Luksan `plis`): its line search requests a gradient at
+    /// every trial and accepts relative to the *current iterate*, which ferx cannot
+    /// observe — a trial that satisfies sufficient decrease but fails the curvature
+    /// condition is rejected yet can be the best evaluation seen, and the eventually
+    /// accepted point can sit any distance above it. No reference ferx can form gives a
+    /// rejected-trial guarantee there, so the salvage is always bought. Also the
+    /// derivative-free pre-search and BOBYQA, which never form a gradient.
+    Off,
+    /// NLopt SLSQP: fire only at a **fresh** point (one whose `xs` differs bitwise from
+    /// the previous evaluation's) and measure it against the **last point at which a
+    /// gradient was requested**. With bounds only (ferx adds no nonlinear constraints)
+    /// SLSQP requests a gradient in exactly two situations: `mode = −2`, the *first*
+    /// trial of a line search, before its sufficient-decrease test; and `mode = −1`, the
+    /// accepted iterate — which was evaluated objective-only (`mode = 1`) at the same
+    /// `xs` immediately before, unless it *was* the first trial, in which case its
+    /// gradient is already in hand and no `−1` follows. Hence a gradient request at a
+    /// fresh point is a first trial, the previous gradient point is the current iterate
+    /// (either the accepted `−1` re-evaluation or an accepted first trial), and a first
+    /// trial worse than the iterate fails `h1 <= h3/10` and is rejected — the guarantee.
+    /// The `line > 10` acceptance is a `−1` re-evaluation at a non-fresh point, where the
+    /// guard is off by construction.
+    LastGradientPointIfFresh,
+    /// NLopt MMA: measure against the **best evaluation** seen. MMA copies a candidate's
+    /// gradient into its model only inside `if (fcur < *minf …)` (`mma.c`), and with
+    /// bounds only every improving evaluation is accepted, so the best evaluation *is*
+    /// the acceptance reference and a point worse than it is never accepted.
+    BestEvaluation,
+}
+
+impl SalvageGuardPolicy {
+    /// The policy for the outer optimizer a fit resolved to. `Auto` is resolved before
+    /// dispatch; if it ever reached here it would map to `Off`, the safe default.
+    pub(crate) fn for_optimizer(optimizer: Optimizer) -> Self {
+        match optimizer {
+            Optimizer::Slsqp => Self::LastGradientPointIfFresh,
+            Optimizer::Mma => Self::BestEvaluation,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// The per-fit bookkeeping behind [`SalvageGuardPolicy`]: what the NLopt objective
+/// closure has to remember between evaluations to hand the mixed assemblies an
+/// [`OuterTrial`] whose incumbent carries a rejected-trial guarantee. Fed by
+/// [`SalvageGuardState::observe`] after every evaluation, read by
+/// [`SalvageGuardState::reference`] before the gradient is formed. Pure bookkeeping, so
+/// the optimizer sequences it exists for — SLSQP's `line > 10` acceptance among them —
+/// can be scripted in a unit test without NLopt.
+#[derive(Debug)]
+pub(crate) struct SalvageGuardState {
+    policy: SalvageGuardPolicy,
+    /// Optimizer-facing objective and per-subject `2·nllᵢ` of the best non-guarded
+    /// evaluation so far (the same adoption rule as the EBE warm start).
+    best: Option<(f64, Vec<f64>)>,
+    /// The same pair at the last evaluation whose gradient was actually formed.
+    last_gradient: Option<(f64, Vec<f64>)>,
+    /// `xs` of the previous evaluation of any kind, for the freshness test.
+    prev_xs: Option<Vec<f64>>,
+}
+
+impl SalvageGuardState {
+    pub(crate) fn new(policy: SalvageGuardPolicy) -> Self {
+        Self {
+            policy,
+            best: None,
+            last_gradient: None,
+            prev_xs: None,
+        }
+    }
+
+    /// The incumbent to measure the gradient evaluation at `xs` against, or `None` when
+    /// the policy gives no rejected-trial guarantee for it. Asked only where a gradient is
+    /// actually formed — the closure's non-guarded gradient arm — since without one there
+    /// is nothing to guard.
+    pub(crate) fn reference(&self, xs: &[f64]) -> Option<(f64, &[f64])> {
+        let pair = match self.policy {
+            SalvageGuardPolicy::Off => None,
+            SalvageGuardPolicy::LastGradientPointIfFresh => {
+                let fresh = self.prev_xs.as_ref().is_none_or(|p| {
+                    p.len() != xs.len() || p.iter().zip(xs).any(|(a, b)| a.to_bits() != b.to_bits())
+                });
+                if fresh {
+                    self.last_gradient.as_ref()
+                } else {
+                    None
+                }
+            }
+            SalvageGuardPolicy::BestEvaluation => self.best.as_ref(),
+        };
+        pair.map(|(f, c)| (*f, c.as_slice()))
+    }
+
+    /// Record an evaluation: `ofv` and `contribs` are its optimizer-facing objective and
+    /// per-subject `2·nllᵢ` (empty when the objective has no per-subject decomposition),
+    /// `gradient_requested` whether a gradient was actually formed there (the optimizer
+    /// asked for one and the EBE guard did not reject the point), and `improved` whether
+    /// the evaluation was adopted as the fit's incumbent (`adopt_warm_start`). A guarded
+    /// evaluation passes `false` for both and only advances the freshness record.
+    pub(crate) fn observe(
+        &mut self,
+        xs: &[f64],
+        ofv: f64,
+        contribs: Vec<f64>,
+        gradient_requested: bool,
+        improved: bool,
+    ) {
+        if gradient_requested {
+            self.last_gradient = Some((ofv, contribs.clone()));
+        }
+        if improved {
+            self.best = Some((ofv, contribs));
+        }
+        self.prev_xs = Some(xs.to_vec());
+    }
+}
+
+/// Excess of an objective over its incumbent value, **per observation**, above which the
+/// point counts as blown up (#1520). Applied to a subject (`2·nllᵢ` against its own
+/// incumbent contribution, over that subject's observations) and to the population (the
+/// optimizer-facing objective against the incumbent's, over every observation), by
+/// [`skip_fd_salvage`].
+///
+/// Measured, not chosen. Every per-subject FD salvage of every gradient-based fit of the
+/// bundled examples (default L-BFGS and SLSQP, 118 decline events at points worse than the
+/// incumbent, 13 example × optimizer pairs) was instrumented with both excesses:
+///
+/// | | ordinary rejected trials | blown-up trials |
+/// |---|---|---|
+/// | subject excess per observation, declining subjects | ≤ **6.0** (`mm_multistart`, SLSQP) | ≥ **21.8** (`warfarin_if`, L-BFGS) |
+/// | population excess per observation | ≤ **4.5** (`transit_2cpt`, SLSQP) | ≥ **36.4** (`mm_multistart`, SLSQP) |
+///
+/// The widest gap in either sorted distribution is the one between those columns (3.6× and
+/// 8×; the next-widest is 2.0×), and 12 sits at its geometric middle: 2.0× above the
+/// largest ordinary subject excess and 1.8× below the smallest blown-up one, 2.7× and 3.0×
+/// for the population. On the far side the excesses run to 1.7e19 per observation (a
+/// subject at the `1e20` non-finite sentinel). In likelihood terms a point over the line is
+/// one at which every observation is, on average, more than `e⁻⁶` times less likely than at
+/// the incumbent. Excesses rather than raw objectives because a `−2LL` difference is
+/// unit-free and a raw `−2LL` is not: the incumbent objective is *negative* on 9 of the 13
+/// pairs measured, so the issue's "relative to the current best objective" cannot be a
+/// ratio of objectives, and a subject contributing 1e3 is ordinary on one dataset and blown
+/// up on another. Per observation because a rich subject legitimately moves by tens of units
+/// between ordinary trials that a sparse one covers in one.
+pub(crate) const BLOWN_UP_EXCESS_PER_OBS: f64 = 12.0;
+
+/// Whether an excess of `excess` objective units, spread over `n_obs` observations, is over
+/// the [`BLOWN_UP_EXCESS_PER_OBS`] line. `n_obs` is floored at one so a subject with no
+/// observation rows (a pure TTE subject) is judged on its whole excess. Any `NaN` compares
+/// false, so a non-finite contribution never fires the guard.
+fn blown_up(excess: f64, n_obs: usize) -> bool {
+    excess > BLOWN_UP_EXCESS_PER_OBS * n_obs.max(1) as f64
+}
+
+/// Whether subject `i`'s per-subject salvage (held-EBE, or reconverged FD under IOV) is
+/// skipped at this trial point, its contribution to the population gradient dropped
+/// instead (#1520). Both gates must hold:
+///
+/// 1. **The population is blown up**: the optimizer-facing objective exceeds the
+///    incumbent's by more than [`BLOWN_UP_EXCESS_PER_OBS`] per observation, over every
+///    observation in the population. This is a rejected-trial guarantee only when
+///    `incumbent` is the point the optimizer's own acceptance test compares against —
+///    which is what [`SalvageGuardPolicy`] supplies, per optimizer, and why NLopt L-BFGS
+///    gets no incumbent at all. With that reference, a point over this line fails the
+///    optimizer's sufficient-decrease test and is never an accepted iterate; the guard
+///    cannot touch a curvature pair or a search direction. The built-in BFGS passes its
+///    last accepted iterate, which its Armijo backtracking makes exact too.
+/// 2. **The subject is blown up**: its `2·nllᵢ` exceeds its incumbent contribution by more
+///    than the same line per observation of its own. This keeps the salvage for a subject
+///    that is merely along for the ride at a bad point, and it is what makes the guard
+///    per-subject rather than per-evaluation.
+///
+/// The two gates reject different inputs — a blown-up subject at a mildly worse point, and
+/// an ordinary subject at a blown-up point — and each has a test that dies when it alone is
+/// removed (`outer_fd_fallback::skip_fd_salvage_straddles_both_gates` on the predicate,
+/// `outer_fd_fallback::guard_drops_the_subject_only_at_a_blown_up_rejected_point` on the
+/// assembly, in the sibling test file). Without an incumbent, or with a contributions
+/// vector that does not match, the guard is off.
+pub(crate) fn skip_fd_salvage(
+    trial: &OuterTrial<'_>,
+    i: usize,
+    n_obs: usize,
+    n_obs_total: usize,
+) -> bool {
+    let Some((best_ofv, best_contribs)) = trial.incumbent else {
+        return false;
+    };
+    if best_contribs.len() != trial.contribs.len() {
+        return false;
+    }
+    let (Some(&c), Some(&b)) = (trial.contribs.get(i), best_contribs.get(i)) else {
+        return false;
+    };
+    blown_up(trial.ofv - best_ofv, n_obs_total) && blown_up(c - b, n_obs)
+}
+
+/// The per-subject gradient a declined subject gets (#1520): **zero** when
+/// [`skip_fd_salvage`] fires for it — the subject's contribution to the population
+/// gradient is dropped at that point — and otherwise the salvage `salvage` computes:
+/// the held-EBE [`held_ebe_salvage`] for non-IOV (#1529), the reconverged-FD
+/// [`subject_reconverged_fd_gradient_iov`] under IOV. Shared by the non-IOV and IOV mixed
+/// assemblies so the guard has one implementation; the assemblies differ only in which
+/// salvage they pass. Records the skip on `declines`.
+///
+/// Zero rather than the fixed-EBE gradient the issue ranked first, on measurement. At the
+/// instrumented blown-up events the reconverged-FD gradient of the blown-up subject has
+/// norm 60 … 180 while the fixed-EBE one has norm 1e3 … 1e4 (relative error 10 … 188): the
+/// profiled objective the outer loop minimises is far flatter there than the fixed-`η̂`
+/// one, because the re-solved EBEs absorb most of the blow-up. Zero is therefore the closer
+/// stand-in for what the salvage would have returned. Where the guard fires — SLSQP and
+/// MMA, see [`SalvageGuardPolicy`] — the optimizer discards the gradient at such a point
+/// anyway, so the choice is moot there and zero is also the cheapest; under Luksan L-BFGS,
+/// whose line search would have read it (measured: 51 → 58 evaluations on `warfarin_if`
+/// with the term dropped, 68 with the fixed-EBE stand-in), the guard is off.
+fn declined_subject_gradient(
+    np: usize,
+    population: &Population,
+    i: usize,
+    trial: &OuterTrial<'_>,
+    n_obs_total: usize,
+    declines: &OuterFdDeclineLog,
+    salvage: impl FnOnce() -> Vec<f64>,
+) -> Vec<f64> {
+    let n_obs = population.subjects[i].observations.len();
+    if skip_fd_salvage(trial, i, n_obs, n_obs_total) {
+        declines.record_skipped_salvage();
+        return vec![0.0; np];
+    }
+    salvage()
+}
+
+/// Which subjects actually took a per-subject salvage outer gradient during this fit —
+/// held-EBE for non-IOV ([`held_ebe_salvage`], #1529), reconverged FD under IOV —
+/// because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them (#1154).
 ///
 /// One `AtomicBool` per subject, set on the fallback arm of the mixed assemblies. Recorded
 /// at the point the gradient is evaluated, so it says what *ran* rather than what a probe
@@ -4491,21 +5289,35 @@ fn subject_analytic_outer_gradient_iov(
 ///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
 ///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
 /// - **The outer *assembly* declines away from the mode for a second reason.**
-///   `prepare_stacked` needs the true inner Hessian to be positive-definite
-///   (`h_inner.cholesky()?`), which holds at the EBE and routinely fails elsewhere:
+///   `prepare_stacked` needs the true inner Hessian `H` to be positive-definite
+///   (`invert_inner_hessian`), which holds at the EBE and routinely fails elsewhere:
 ///   measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10
 ///   subjects (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider
-///   serves all 10 and all 10 are analytic at their EBEs.
+///   serves all 10 and all 10 are analytic at their EBEs. That gate is a *precondition*
+///   detector rather than a matrix-shape check — see `invert_inner_hessian` for why
+///   widening it to nonsingular (#1513) is wrong and what it measures — but for this
+///   function's purposes the consequence is the same: a zero-η probe would announce four
+///   fallbacks that a fit serving these subjects at their EBEs never takes. Pinned by
+///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`.
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
 /// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`], which `build_info::gradient_method_outer` does not model),
+/// [`resolve_outer_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.
 pub(crate) struct OuterFdDeclineLog {
     declined: Vec<std::sync::atomic::AtomicBool>,
+    /// The declined subjects whose decline is structural — a cross-observation residual
+    /// ([`crate::stats::residual_error::has_cross_observation_residual`]) — and who therefore
+    /// take the reconverged salvage rather than the held-EBE one (#1536). A subset of
+    /// `declined`, so the warning can say which subjects got which gradient.
+    structural: Vec<std::sync::atomic::AtomicBool>,
+    /// How many `(subject, evaluation)` salvages [`skip_fd_salvage`] dropped (#1520). A
+    /// count, not a per-subject flag: the same subject declining at two blown-up trials is
+    /// two skipped salvages.
+    skipped_salvages: AtomicUsize,
 }
 
 impl OuterFdDeclineLog {
@@ -4514,6 +5326,10 @@ impl OuterFdDeclineLog {
             declined: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            structural: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            skipped_salvages: AtomicUsize::new(0),
         }
     }
 
@@ -4524,6 +5340,32 @@ impl OuterFdDeclineLog {
         if let Some(flag) = self.declined.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Mark declined subject `i` as a structural decline (#1536). Rayon workers,
+    /// `Relaxed`, as above.
+    fn record_structural(&self, i: usize) {
+        if let Some(flag) = self.structural.get(i) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// How many declined subjects were structural declines.
+    fn n_structural(&self) -> usize {
+        self.structural
+            .iter()
+            .filter(|f| f.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// Count one salvage the guard skipped (#1520). Rayon workers, `Relaxed`, as above.
+    fn record_skipped_salvage(&self) {
+        self.skipped_salvages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many salvages the guard skipped over the fit so far.
+    pub(crate) fn skipped_salvages(&self) -> usize {
+        self.skipped_salvages.load(Ordering::Relaxed)
     }
 
     fn declined_indices(&self) -> Vec<usize> {
@@ -4542,16 +5384,30 @@ impl OuterFdDeclineLog {
 /// ever evaluated (see the log's docs).
 ///
 /// The outer twin of `inner_optimizer::fd_fallback_warning` (#1154). Since #466 the
-/// salvage is per subject, so such a fit is correct and several times slower on those
-/// subjects — and was indistinguishable from a fit that is simply slow: no `W_*` code, no
-/// count, and a `gradient_method_outer` that keeps reporting `analytic (Dual2)` because it
-/// reads a **model**-level predicate. Any non-empty log is therefore already a mismatch
-/// with that label: the analytic branch had to have been selected for a decline to be
-/// recordable at all.
+/// salvage is per subject, and was indistinguishable from a fit that is simply slow: no
+/// `W_*` code, no count, and a `gradient_method_outer` that keeps reporting
+/// `analytic (Dual2)` because it reads a **model**-level predicate. Any non-empty log is
+/// therefore already a mismatch with that label: the analytic branch had to have been
+/// selected for a decline to be recordable at all.
+///
+/// What the salvage *is* depends on the route (#1529), so the consequence sentence does
+/// too: an IOV subject is reconverged (correct, slower); a non-IOV subject takes the
+/// held-EBE gradient (cheap, omits the EBE-response term), and the remedy is
+/// `reconverge_gradient_interval`, which the IOV route ignores. The route is read from the
+/// model here — `n_kappa > 0` is exactly when `iov_sens_supported` sends the gradient to
+/// `population_gradient_sens_iov_mixed` — rather than passed in, so no caller can pair a
+/// log with the wrong sentence.
+///
+/// "Could not be given" rather than "fell outside the provider's scope": the log records
+/// every failure of [`subject_analytic_outer_gradient`], which includes a
+/// non-positive-definite inner Hessian at a trial point and a non-finite analytic
+/// component — not only a data shape the provider declines (#1529 review).
 pub(crate) fn outer_fd_fallback_warning(
+    model: &CompiledModel,
     population: &Population,
     log: &OuterFdDeclineLog,
 ) -> Option<String> {
+    let iov = model.n_kappa > 0;
     let declined = log.declined_indices();
     if declined.is_empty() {
         return None;
@@ -4563,25 +5419,76 @@ pub(crate) fn outer_fd_fallback_warning(
         .and_then(|&i| population.subjects.get(i))
         .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
+    const HELD_EBE: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
+         term the analytic gradient carries. If the fit stalls, \
+         `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
+         evaluation.";
+    const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
+         their `block_sigma` residuals are correlated across observation rows (paired \
+         endpoints in one residual block), which the analytic outer gradient does not \
+         cover; those gradients include the EBE-response term but are slower.";
+    // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
+    // group that is non-empty — never the held-EBE remedy for a subject that was
+    // reconverged, nor "correct" for one that was not.
+    let n_structural = log.n_structural();
+    let consequence = if iov {
+        "used reconverged finite-difference outer gradients; their results are correct but \
+         slower."
+            .to_string()
+    } else if n_structural == 0 {
+        HELD_EBE.to_string()
+    } else if n_structural == n_fd {
+        STRUCTURAL.to_string()
+    } else {
+        format!(
+            "of these, {n_structural} {STRUCTURAL} The other {} {HELD_EBE}",
+            n_fd - n_structural
+        )
+    };
+    // #1520: say when some of those salvages were skipped. One sentence, appended only
+    // when the count is non-zero, so a fit the guard never touched reads as before.
+    let skipped = match log.skipped_salvages() {
+        0 => String::new(),
+        k => format!(
+            " {k} of their salvage gradients were skipped at trial points worse than the \
+             incumbent where the subject's objective had blown up; the subject contributed \
+             nothing to the outer gradient there, at points the optimizer rejects anyway."
+        ),
+    };
     Some(format!(
-        "{n_fd} of {n_total} subjects fell outside the analytic sensitivity provider's \
-         scope during this fit{example} and used finite-difference outer gradients; their \
-         results are correct but slower. The reported outer gradient method is the \
-         model-level route, not the per-subject one."
+        "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
+         gradient during this fit{example} (a data shape outside the sensitivity provider's \
+         scope, or a trial point where it could not be formed) and {consequence} The reported \
+         outer gradient method is the model-level route, not the per-subject one.{skipped}"
     ))
 }
 
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
 /// every subject inside the provider's scope, and a per-subject
-/// [`subject_reconverged_fd_gradient`] for each subject outside it (or whose
-/// analytic gradient came back non-finite). This replaces the all-or-nothing
+/// [`subject_fixed_ebe_gradient`] for each subject outside it (or whose analytic
+/// gradient came back non-finite). This replaces the all-or-nothing
 /// [`population_gradient_sens`]: previously a single out-of-scope subject forced
 /// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block left the variance components pinned at their start and stalled
 /// SLSQP/L-BFGS/MMA above the derivative-free optimum
-/// (focei-slsqp-fixed-ebe-gradient-bias). Returns the packed `2·Σᵢ dᵢ` with
-/// fixed coordinates zeroed.
+/// (focei-slsqp-fixed-ebe-gradient-bias). The in-scope subjects keep the exact
+/// gradient, so only the declined ones carry the fixed-EBE approximation.
+///
+/// A declined subject used to be filled with a per-subject *reconverged* FD
+/// gradient — `2·n_free` full `find_ebe` solves each — regardless of
+/// `reconverge_gradient_interval`. Decline rates are parameter-dependent (the
+/// assembly needs a positive-definite inner Hessian), and at a blown-up
+/// line-search trial most of a population can decline at once: on
+/// cyclophosphamide 46 of 55 subjects did, ~1200 inner re-solves for one gradient
+/// and 82% of the fit's wall time (#1529). Evaluations that the schedule
+/// reconverges never get here, so a declined subject now follows that schedule
+/// like every other fixed-EBE gradient — except a **structural** decline
+/// ([`is_structural_decline`]), which still takes the reconverged gradient (#1536).
+/// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.
+///
+/// `trial` serves the #1520 guard only: a declined subject at a blown-up trial point
+/// ([`skip_fd_salvage`]) contributes nothing instead of taking the salvage.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn population_gradient_sens_mixed(
     x: &[f64],
@@ -4589,11 +5496,14 @@ pub(crate) fn population_gradient_sens_mixed(
     model: &CompiledModel,
     population: &Population,
     ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
     bounds: &PackedBounds,
     options: &FitOptions,
+    trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let np = x.len();
+    let n_obs_total = population_n_obs(population);
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
@@ -4611,17 +5521,36 @@ pub(crate) fn population_gradient_sens_mixed(
             ) {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
                 Some(g) => g,
-                // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
+                // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
+                // or reconverged for a structural decline, #1536), unless the trial point
+                // has blown up (#1520).
                 None => {
                     declines.record(i);
-                    subject_reconverged_fd_gradient(
-                        x,
-                        init_params,
-                        model,
-                        subject,
-                        &ehs[i],
-                        bounds,
-                        options,
+                    let structural = is_structural_decline(model, subject, init_params);
+                    if structural {
+                        declines.record_structural(i);
+                    }
+                    declined_subject_gradient(
+                        np,
+                        population,
+                        i,
+                        &trial,
+                        n_obs_total,
+                        declines,
+                        || {
+                            non_iov_declined_salvage(
+                                structural,
+                                x,
+                                init_params,
+                                model,
+                                population,
+                                i,
+                                &ehs[i],
+                                &hms[i],
+                                bounds,
+                                options,
+                            )
+                        },
                     )
                 }
             }
@@ -4650,6 +5579,8 @@ pub(crate) fn population_gradient_sens_mixed(
 /// population to FD on the first out-of-scope subject — so a single infusion / steady-state
 /// / wide-axis subject no longer forces the entire fit onto FD (#466 review round 2).
 /// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.
+///
+/// `trial` serves the #1520 guard, exactly as on the non-IOV twin.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn population_gradient_sens_iov_mixed(
     x: &[f64],
@@ -4660,9 +5591,11 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
+    trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let np = x.len();
+    let n_obs_total = population_n_obs(population);
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
@@ -4683,14 +5616,24 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 Some(g) => g,
                 None => {
                     declines.record(i);
-                    subject_reconverged_fd_gradient_iov(
-                        x,
-                        init_params,
-                        model,
-                        subject,
-                        &ehs[i],
-                        bounds,
-                        options,
+                    declined_subject_gradient(
+                        np,
+                        population,
+                        i,
+                        &trial,
+                        n_obs_total,
+                        declines,
+                        || {
+                            subject_reconverged_fd_gradient_iov(
+                                x,
+                                init_params,
+                                model,
+                                subject,
+                                &ehs[i],
+                                bounds,
+                                options,
+                            )
+                        },
                     )
                 }
             }
@@ -4732,51 +5675,38 @@ fn ad_population_gradient(
     debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
-    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
-    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
-    // full marginal gradient and reach the true minimum instead of stalling
-    // above it. Reuses the Laplace cache the gradient just formed (one extra
-    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
-    // error. IOV routes through the reconverged-FD gradient, not here, so this
-    // only affects non-IOV FOCEI gradient steps.
+    // IOV routes through the reconverged-FD gradient, not here, so the `log|H̃|`
+    // EBE-response term `subject_fixed_ebe_gradient` adds only affects non-IOV
+    // FOCEI gradient steps.
     let per_subj: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
-            let (_, mut gi, cache) =
-                crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
-                    x,
-                    init_params,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    kappas[i].as_slice(),
-                    bounds,
-                    options,
-                );
-            if let Some(c) = cache.as_ref() {
-                if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
-                    Some(c),
-                    x,
-                    init_params,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    bounds,
-                    options,
-                ) {
-                    for (g, ti) in gi.iter_mut().zip(t.iter()) {
-                        *g += *ti;
-                    }
-                }
-            }
-            gi
+            subject_fixed_ebe_gradient(
+                x,
+                init_params,
+                model,
+                population,
+                i,
+                &ehs[i],
+                &hms[i],
+                kappas[i].as_slice(),
+                bounds,
+                options,
+            )
+            .1
         })
         .collect();
     assemble_population_gradient(&per_subj, np)
+}
+
+/// Total observation rows across the population — the denominator of the population
+/// gate in [`skip_fd_salvage`].
+fn population_n_obs(population: &Population) -> usize {
+    population
+        .subjects
+        .iter()
+        .map(|s| s.observations.len())
+        .sum()
 }
 
 /// Assemble the covariance-step population gradient `2·Σᵢ gᵢ` from per-subject
@@ -4837,6 +5767,7 @@ pub(super) fn population_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
     grad_eval_idx: &mut usize,
+    trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     population_gradient_with_agq_evaluation(
@@ -4852,6 +5783,7 @@ pub(super) fn population_gradient(
         options,
         grad_eval_idx,
         None,
+        trial,
         declines,
     )
 }
@@ -4870,6 +5802,7 @@ fn population_gradient_with_agq_evaluation(
     options: &FitOptions,
     grad_eval_idx: &mut usize,
     agq_evaluation: Option<crate::estimation::agq::PopulationEvaluation>,
+    trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
@@ -4962,11 +5895,12 @@ fn population_gradient_with_agq_evaluation(
                 kappas,
                 bounds,
                 options,
+                trial,
                 declines,
             ))
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
-            // subjects, per-subject reconverged-FD for the few out-of-scope ones.
+            // subjects, held-EBE per-subject gradient for out-of-scope ones (#1529).
             // Always `Some`; the finiteness backstop below still guards it. This
             // is the fix for focei-slsqp-fixed-ebe-gradient-bias: one out-of-scope
             // subject no longer drops the whole population to the biased θ-only
@@ -4977,8 +5911,10 @@ fn population_gradient_with_agq_evaluation(
                 model,
                 population,
                 ehs,
+                hms,
                 bounds,
                 options,
+                trial,
                 declines,
             ))
         };

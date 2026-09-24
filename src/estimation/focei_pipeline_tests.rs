@@ -200,7 +200,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     inner_maxiter: 4,
                     ..Default::default()
                 };
-                let (etas, _, _, kappas) =
+                let (etas, hms, _, kappas) =
                     run_inner_loop_warm(&model, &pop, params, 4, opts.inner_tol, None, None, 0, 0);
                 let per_subject = if iov {
                     crate::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(
@@ -234,7 +234,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     );
                 }
                 let mut expected = vec![0.0; x.len()];
-                for (i, g) in per_subject.into_iter().enumerate() {
+                for (i, g) in per_subject.clone().into_iter().enumerate() {
                     let g = match g {
                         Some(g) if g.iter().all(|v| v.is_finite()) => g,
                         _ if iov => subject_reconverged_fd_gradient_iov(
@@ -246,14 +246,8 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &bounds,
                             &opts,
                         ),
-                        _ => subject_reconverged_fd_gradient(
-                            &x,
-                            params,
-                            &model,
-                            &pop.subjects[i],
-                            &etas[i],
-                            &bounds,
-                            &opts,
+                        _ => held_ebe_salvage(
+                            &x, params, &model, &pop, i, &etas[i], &hms[i], &bounds, &opts,
                         ),
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {
@@ -269,11 +263,29 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                 let declines = OuterFdDeclineLog::new(pop.subjects.len());
                 let actual = if iov {
                     population_gradient_sens_iov_mixed(
-                        &x, params, &model, &pop, &etas, &kappas, &bounds, &opts, &declines,
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &etas,
+                        &kappas,
+                        &bounds,
+                        &opts,
+                        OuterTrial::unknown(),
+                        &declines,
                     )
                 } else {
                     population_gradient_sens_mixed(
-                        &x, params, &model, &pop, &etas, &bounds, &opts, &declines,
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &etas,
+                        &hms,
+                        &bounds,
+                        &opts,
+                        OuterTrial::unknown(),
+                        &declines,
                     )
                 };
                 assert_eq!(bits(&expected), bits(&actual));
@@ -284,6 +296,65 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     "iov = {iov}, mixed = {mixed}, interaction = {interaction}: the decline \
                      log must name exactly the subjects the assembly sent to FD"
                 );
+                assert_eq!(declines.skipped_salvages(), 0, "no incumbent, no skip");
+                if mixed {
+                    // #1520: at a blown-up rejected trial the declining subject 0
+                    // contributes nothing instead of buying the salvage — on **both**
+                    // engines, asserted here for the same reason the decline log is: the
+                    // IOV arm is exercised nowhere else. The trial context is synthetic
+                    // (the guard reads only it): the population and subject 0 are 1e6
+                    // units over an incumbent of 0, far beyond `BLOWN_UP_EXCESS_PER_OBS`.
+                    let n = pop.subjects.len();
+                    let contribs = vec![0.0; n];
+                    let mut best = vec![0.0; n];
+                    best[0] = -1e6;
+                    let blown = OuterTrial {
+                        ofv: 1e6,
+                        contribs: &contribs,
+                        incumbent: Some((0.0, &best)),
+                    };
+                    let declines = OuterFdDeclineLog::new(n);
+                    let guarded = if iov {
+                        population_gradient_sens_iov_mixed(
+                            &x, params, &model, &pop, &etas, &kappas, &bounds, &opts, blown,
+                            &declines,
+                        )
+                    } else {
+                        population_gradient_sens_mixed(
+                            &x, params, &model, &pop, &etas, &hms, &bounds, &opts, blown, &declines,
+                        )
+                    };
+                    // The assembly's own summation order with subject 0's term zero.
+                    let mut expected_guarded = vec![0.0; x.len()];
+                    for (i, g) in per_subject.iter().enumerate() {
+                        let g = if i == 0 {
+                            vec![0.0; x.len()]
+                        } else {
+                            g.clone().expect("subject 1 is analytic")
+                        };
+                        for (acc, value) in expected_guarded.iter_mut().zip(g) {
+                            *acc += 2.0 * value;
+                        }
+                    }
+                    assert_eq!(
+                        declines.skipped_salvages(),
+                        1,
+                        "iov = {iov}, interaction = {interaction}: one salvage skipped"
+                    );
+                    assert_eq!(declines.declined_indices(), vec![0], "still recorded");
+                    assert_eq!(
+                        bits(&expected_guarded),
+                        bits(&guarded),
+                        "iov = {iov}, interaction = {interaction}: subject 0 contributes \
+                         nothing"
+                    );
+                    assert_ne!(
+                        bits(&expected),
+                        bits(&guarded),
+                        "fixture: the salvaged subject's gradient must be non-zero, or \
+                         the arms are indistinguishable here"
+                    );
+                }
             }
         }
     }
