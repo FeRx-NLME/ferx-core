@@ -930,4 +930,107 @@ mod tests {
             "fixed theta must not be overwritten"
         );
     }
+
+    // The early returns of `nca_with_sweep` / `nca_with_ebe` below return `Ok` since
+    // #898, and each is reached only by one fixture shape. The Tier-2 `tests/suggest_start.rs`
+    // covers the ODE fallback and the full sweep, not these.
+
+    /// Two-compartment covariate model with every PK theta fixed: the only unwritten
+    /// thetas left are `THETA_WT` / `THETA_CRCL`, which both sweeps exclude as covariates.
+    fn two_cpt_cov_only_covariates_free() -> (CompiledModel, Population) {
+        let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx")).unwrap();
+        for (i, name) in model.default_params.theta_names.iter().enumerate() {
+            model.default_params.theta_fixed[i] = !name.starts_with("THETA_");
+        }
+        let population =
+            read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None).unwrap();
+        (model, population)
+    }
+
+    #[test]
+    fn nca_sweep_returns_ok_when_only_covariate_thetas_are_unwritten() {
+        let (model, population) = two_cpt_cov_only_covariates_free();
+        let result = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains(
+                "inits_from_nca (nca_sweep): excluded 2 covariate theta(s) from rRMSE sweep"
+            )),
+            "both covariate thetas must be excluded, got: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.params.theta, model.default_params.theta,
+            "nothing is left to sweep, so every theta keeps its default"
+        );
+    }
+
+    #[test]
+    fn nca_ebe_returns_ok_when_only_covariate_thetas_are_unwritten() {
+        let (model, population) = two_cpt_cov_only_covariates_free();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains(
+                "inits_from_nca (nca_ebe): excluded 2 covariate theta(s) from rRMSE sweep"
+            )),
+            "both covariate thetas must be excluded, got: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.params.theta, model.default_params.theta);
+    }
+
+    #[test]
+    fn nca_ebe_returns_ok_when_every_theta_is_fixed() {
+        let mut model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
+        model
+            .default_params
+            .theta_fixed
+            .iter_mut()
+            .for_each(|f| *f = true);
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        assert_eq!(result.params.theta, model.default_params.theta);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("covariate theta")),
+            "no theta reaches the covariate filter, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn nca_ebe_sweeps_a_logit_theta_on_the_etas_zero_path() {
+        // A logit-normal theta is routed to the etas=0 `sweep_unwritten_thetas`, not the
+        // EBE sweep. Fixing the lognormal thetas leaves it the only one to sweep, so the
+        // fit reaches `nca_with_ebe`'s final `Ok` through that arm alone.
+        let mut model = parse_model_file(Path::new("examples/warfarin_logit_f.ferx")).unwrap();
+        let f_idx = model
+            .default_params
+            .theta_names
+            .iter()
+            .position(|n| n == "THETA_F")
+            .unwrap();
+        for (i, fixed) in model.default_params.theta_fixed.iter_mut().enumerate() {
+            *fixed = i != f_idx;
+        }
+        // Start F well below the data-generating 0.80 so the sweep has a direction to move.
+        model.default_params.theta[f_idx] = 0.2;
+        let population =
+            read_nonmem_csv(Path::new("data/warfarin_logit_f.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        let (f, lo, hi) = (
+            result.params.theta[f_idx],
+            result.params.theta_lower[f_idx],
+            result.params.theta_upper[f_idx],
+        );
+        assert!(
+            f.is_finite() && f >= lo && f <= hi,
+            "THETA_F = {f} outside [{lo}, {hi}]"
+        );
+        assert_ne!(
+            f, model.default_params.theta[f_idx],
+            "the logit sweep must move THETA_F off its default"
+        );
+    }
 }
