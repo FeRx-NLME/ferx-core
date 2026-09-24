@@ -197,8 +197,12 @@ exclusions:
 
 `Other excluded` (`n_other_excluded`) counts excluded records that are neither a
 scored observation nor a dose — EVID 2 (other event), EVID 3 (reset), and
-missing-DV observation rows (EVID 0 with MDV 1). The three counts together
-account for every excluded record.
+missing-DV observation rows (EVID 0 with MDV 1). It also counts a record whose
+type ferx could not read — an `EVID`, `MDV` or (with no `EVID` column) `AMT`
+cell that is not a number — when a rule that does not read that cell removed it:
+such a record is not filed as a dose or an observation on the strength of the
+reader's fallback for the cell. The three counts together account for every
+excluded record.
 
 Each fired condition is listed once. Because checks short-circuit on the first
 match (see *Evaluation order*), a record is attributed to the **first** rule

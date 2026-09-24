@@ -90,6 +90,13 @@ section of the SDLC for the versioning policy).
   (`.`, blank, `NA`, `NaN`) keep their defaults — `RATE=NaN` and `SS=NaN` on a dose used to
   be rejected as non-finite, and `TIME=NaN` read as an undefined time — and `CMT`, the
   occasion column and `L2` keep their existing handling (#1501).
+- **Two follow-ups to the #1501 cell checks (#1541 review).** A `[data_selection]` rule
+  that reads `SS` on a dose record with `SS = 1.5` or `SS = -1` is refused with the message
+  that says what `SS` accepts (`0` or `1`), the same words the record gets with no rule,
+  instead of the `usize` range the filter reads the column in. And a record whose `EVID`,
+  `MDV` or (with no `EVID` column) `AMT` cell is not a number, removed by a rule that does
+  not read that cell, is now tallied under `Other excluded` rather than as the observation
+  or dose the reader's fallback for the cell made it look like.
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every
