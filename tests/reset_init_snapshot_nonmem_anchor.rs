@@ -157,6 +157,7 @@ fn ferx_preds_with(model_file: &str, data: &str) -> Vec<(f64, f64)> {
     let pop = ferx_core::read_nonmem_csv(Path::new(&anchor(data)), None, None)
         .expect("the anchor dataset loads");
     ferx_core::predict(&parsed.model, &pop, &parsed.model.default_params)
+        .unwrap()
         .iter()
         .map(|p| (p.time, p.pred))
         .collect()

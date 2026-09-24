@@ -366,7 +366,7 @@ fn degenerate_oracle_matches_static_predict_bit_for_bit() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     assert_eq!(res.ledger.len(), 3, "a dose at every decision");
@@ -444,7 +444,7 @@ fn adaptive_reset_matches_static_predict() {
     let mut static_subject = subj("1", obs.clone(), static_doses);
     static_subject.reset_times = vec![reset_at];
     let static_pop = population(vec![static_subject]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -515,7 +515,7 @@ fn adaptive_reset_reseeds_init_from_the_reset_rows_covariates() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![with_cov(subj("1", obs.clone(), static_doses))]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -649,7 +649,8 @@ fn adaptive_reset_turns_off_spanning_infusion_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     // Locate the t=42 (post-reset) trajectory and assert it washed out.
@@ -1123,7 +1124,7 @@ fn adaptive_loading_dose_only_matches_static_predict() {
 
     // Static reference: the loading regimen alone, scored by predict() (η=0, IPRED).
     let static_pop = population(vec![subj("1", obs.clone(), loading)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -1211,7 +1212,7 @@ fn adaptive_loading_dose_plus_titration_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
@@ -1252,7 +1253,7 @@ fn adaptive_ss_base_dose_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
@@ -1291,7 +1292,7 @@ fn adaptive_base_infusion_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -1407,7 +1408,7 @@ fn adaptive_base_infusion_ending_between_records_matches_static_predict() {
     s2.obs_covariates = cov;
     let mut static_pop = population(vec![s2]);
     static_pop.covariate_names = vec!["CRCL".to_string()];
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), preds.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -2200,7 +2201,8 @@ fn adaptive_base_regimen_with_reset_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -2283,7 +2285,8 @@ fn adaptive_base_infusion_spanning_reset_is_turned_off() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2353,7 +2356,8 @@ fn adaptive_evid4_reset_plus_dose_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2408,7 +2412,8 @@ fn adaptive_ss_base_dose_with_reset_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2546,7 +2551,7 @@ fn adaptive_base_dose_coincident_with_decision_is_observed_pre_dose() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -2630,7 +2635,7 @@ fn adaptive_base_dose_after_controller_stop_still_lands() {
 
     // The base doses (incl. the two past the Stop) are integrated: equals predict() on base.
     let static_pop = population(vec![subj("1", obs.clone(), base)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -3049,7 +3054,7 @@ fn from_spec_degenerate_oracle_matches_static_predict_bit_for_bit() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&parsed.model, &static_pop, &parsed.model.default_params);
+    let preds = predict(&parsed.model, &static_pop, &parsed.model.default_params).unwrap();
     assert_eq!(res.trajectories.len(), preds.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(

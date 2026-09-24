@@ -154,8 +154,8 @@ fn assert_equiv(an_src: &str, ode_src: &str, label: &str, pop: &Population, rtol
         "[{label}] analytic model must be a closed form, not an ODE"
     );
 
-    let pa = predict(&an, pop, &an.default_params);
-    let po = predict(&ode, pop, &ode.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let po = predict(&ode, pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
     // At least one non-trivial prediction (guards against a degenerate all-zero match).
@@ -258,7 +258,7 @@ fn ig_flipflop_lag_f_autoroutes_and_matches_twin() {
         vec![bolus(0.0, 100.0)],
         vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pa = predict(&an, &pop, &an.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
     assert!(
         pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01,
         "the IG twin must produce a non-zero profile (not the closed form's flip-flop clamp)"
@@ -299,8 +299,8 @@ fn ig_flipflop_noncanonical_lag_f_alias_matches_canonical() {
         vec![bolus(0.0, 100.0)],
         vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pc = predict(&canonical, &pop, &canonical.default_params);
-    let pl = predict(&aliased, &pop, &aliased.default_params);
+    let pc = predict(&canonical, &pop, &canonical.default_params).unwrap();
+    let pl = predict(&aliased, &pop, &aliased.default_params).unwrap();
     assert_eq!(pc.len(), pl.len());
     assert!(pc.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01);
     for (x, y) in pc.iter().zip(pl.iter()) {
@@ -387,8 +387,8 @@ fn ig_flip_flop_reroutes_to_ode_twin() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pa = predict(&an, &pop, &an.default_params);
-    let ph = predict(&hd, &pop, &hd.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
+    let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(pa.len(), ph.len());
     assert!(!pa.is_empty());
     // Non-degenerate (the reroute avoids the closed form's spurious zero).
@@ -455,8 +455,8 @@ fn ig_time_desugar_matches_hand_written_ode() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
     );
-    let ps = predict(&sh, &pop, &sh.default_params);
-    let ph = predict(&hd, &pop, &hd.default_params);
+    let ps = predict(&sh, &pop, &sh.default_params).unwrap();
+    let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
     assert!(!ps.is_empty());
     for (x, y) in ps.iter().zip(ph.iter()) {
@@ -497,7 +497,7 @@ fn ig_ofv_matches_ode() {
         // (non-degenerate) residuals to weigh.
         let dose = || vec![bolus(0.0, 100.0)];
         let base = population(dose(), obs_t.clone());
-        let preds = predict(&an, &base, &an.default_params);
+        let preds = predict(&an, &base, &an.default_params).unwrap();
         let n = obs_t.len();
         let mut subjects = Vec::new();
         for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
@@ -542,7 +542,8 @@ fn ig_fit_runs_and_converges() {
     let (an_src, _) = build_pair_1cpt(false, false);
     let model = parse_full_model(&an_src).unwrap().model;
     let base = population(vec![bolus(0.0, 100.0)], obs_t.clone());
-    let sims = ferx_core::simulate_with_seed(&model, &base, &model.default_params, 1, 4321);
+    let sims =
+        ferx_core::simulate_with_seed(&model, &base, &model.default_params, 1, 4321).unwrap();
     let mut pop = base;
     for s in pop.subjects.iter_mut() {
         s.observations = sims
@@ -622,7 +623,8 @@ fn ig_cmt_zero_is_the_default_depot_not_rejected() {
             obs.clone(),
         ),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let default_cmt = predict(
         &model,
         &population(
@@ -630,7 +632,8 @@ fn ig_cmt_zero_is_the_default_depot_not_rejected() {
             obs.clone(),
         ),
         &model.default_params,
-    );
+    )
+    .unwrap();
     assert!(
         depot.iter().any(|p| p.pred > 0.0),
         "control must be non-trivial"
@@ -787,7 +790,7 @@ fn ig_iov_now_served_and_drives_analytic_sens() {
         "IG IOV carries an ODE twin"
     );
     let template = iov_subject();
-    let base = predict(&model, &template, &model.default_params);
+    let base = predict(&model, &template, &model.default_params).unwrap();
     // Two IOV subjects (each with two occasions) so the fit is identifiable; observations are
     // the eta=0 predictions, lightly perturbed per subject.
     let subjects: Vec<_> = [1.0_f64, 1.1]

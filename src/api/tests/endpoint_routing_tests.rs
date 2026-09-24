@@ -233,14 +233,36 @@ fn a_binary_endpoint_gets_the_same_two_codes() {
     );
 }
 
-/// `predict()` returned a concentration for the event row; it now panics, per its
-/// precondition convention (#898), naming the loader.
+/// `predict()` returned a concentration for the event row; it now returns an `Err`
+/// naming the loader (#898).
 #[test]
-#[should_panic(expected = "E_ENDPOINT_UNROUTED")]
-fn predict_panics_on_an_unrouted_population() {
+fn predict_errs_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
-    let _ = predict(&m, &u, &m.default_params);
+    let err = predict(&m, &u, &m.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+}
+
+/// `inits_from_nca`'s sweep strategies score grid points with `predict()`, which checks
+/// endpoint routing; `inits_from_nca` itself pre-checks only two preconditions and not
+/// this one. So the sweep is where an unrouted population is refused — and the refusal
+/// must come back as `inits_from_nca`'s `Err`, not as a panic out of a
+/// `Result`-returning function (#898 PR 2; before it the sweep unwrapped).
+///
+/// Mutation — `.unwrap()` instead of `?` on the sweep's `predict(..)` and this dies on
+/// the panic; swallow the `Err` as `+∞` and `expect_err` dies on the `Ok`.
+#[test]
+fn inits_from_nca_sweep_returns_predicts_err_on_an_unrouted_population() {
+    use crate::suggest_start::inits_from_nca;
+    use crate::NcaInit;
+    let m = model(JOINT_MODEL);
+    let u = unrouted(JOINT_DATA);
+    let want = predict(&m, &u, &m.default_params).expect_err("fixture is refused");
+    for method in [NcaInit::Sweep, NcaInit::Ebe] {
+        let got = inits_from_nca(&m, &u, method)
+            .expect_err("the sweep must hand back predict()'s refusal");
+        assert_eq!(got, want, "{method:?}");
+    }
 }
 
 /// `predict()` on the routed population is unchanged: Gaussian rows only, none of
@@ -249,7 +271,7 @@ fn predict_panics_on_an_unrouted_population() {
 fn predict_on_the_routed_population_returns_the_pk_rows_only() {
     let m = model(JOINT_MODEL);
     let r = routed(&m, JOINT_DATA);
-    let rows = predict(&m, &r, &m.default_params);
+    let rows = predict(&m, &r, &m.default_params).unwrap();
     let n_pk: usize = r.subjects.iter().map(|s| s.obs_times.len()).sum();
     assert!(total_events(&r) > 0);
     assert_eq!(

@@ -108,12 +108,12 @@ fn auto_predicts_what_the_named_stiff_method_predicts() {
     let pop = population(&times);
 
     let auto = model_with_method("auto");
-    let auto_pred = predict(&auto, &pop, &auto.default_params);
+    let auto_pred = predict(&auto, &pop, &auto.default_params).unwrap();
 
     // `auto` escalates this model to `rodas4` at the default tolerance, so that is the
     // method whose numbers it must reproduce — not merely "something plausible".
     let named = model_with_method("rodas4");
-    let named_pred = predict(&named, &pop, &named.default_params);
+    let named_pred = predict(&named, &pop, &named.default_params).unwrap();
 
     assert_eq!(auto_pred.len(), named_pred.len());
     for (a, b) in auto_pred.iter().zip(&named_pred) {
@@ -140,7 +140,7 @@ fn auto_predicts_what_the_named_stiff_method_predicts() {
     // Non-vacuity: the explicit default must give *slightly* different numbers, or the check
     // above would pass even if `auto` had quietly stayed on `rk45`.
     let explicit = model_with_method("rk45");
-    let explicit_pred = predict(&explicit, &pop, &explicit.default_params);
+    let explicit_pred = predict(&explicit, &pop, &explicit.default_params).unwrap();
     let moved = auto_pred
         .iter()
         .zip(&explicit_pred)

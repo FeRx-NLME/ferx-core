@@ -183,8 +183,8 @@ fn algebraic_structural_model_matches_the_dummy_ode_twin() {
     assert!(ode.ode_spec.is_some(), "the twin integrates a state");
 
     let pop = population();
-    let pa = predict(&alg, &pop, &alg.default_params);
-    let po = predict(&ode, &pop, &ode.default_params);
+    let pa = predict(&alg, &pop, &alg.default_params).unwrap();
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     assert!(!pa.is_empty());
 
@@ -212,7 +212,7 @@ fn algebraic_structural_model_predicts_the_written_equation() {
         .expect("compartment-free model parses")
         .model;
     let pop = population();
-    let preds = predict(&alg, &pop, &alg.default_params);
+    let preds = predict(&alg, &pop, &alg.default_params).unwrap();
     assert!(!preds.is_empty());
 
     let (e0, emax, et50) = (10.0_f64, 6.0_f64, 2.0_f64);

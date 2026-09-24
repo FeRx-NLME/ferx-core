@@ -193,8 +193,7 @@ fn run_covariance_scoped(
     // it needs the same dose-compartment precondition `fit()` enforces (#375) —
     // otherwise a caller-supplied population with an unroutable dose aborts the
     // process from inside the walk, from a `Result`-returning API. Matches the
-    // `Result` form used at the adaptive chokepoint rather than the
-    // `predict()`/`simulate()` panic.
+    // `Result` form every other entry point uses (#898).
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
     // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: a
     // population read model-blind carries a joint model's event rows as Gaussian

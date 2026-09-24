@@ -88,7 +88,7 @@ fn simulated_population(model: &ferx_core::types::CompiledModel) -> Population {
     truth.omega = OmegaMatrix::from_diagonal(&[0.08, 0.08], vec!["ETA_CL".into(), "ETA_V".into()]);
     truth.sigma.values = vec![0.05, 3.00];
 
-    let sim = simulate_with_seed(model, &template, &truth, 1, 20260619);
+    let sim = simulate_with_seed(model, &template, &truth, 1, 20260619).unwrap();
     let mut pop = template;
     for subj in pop.subjects.iter_mut() {
         subj.observations = sim
@@ -237,7 +237,7 @@ fn sparse_simulated_population(model: &ferx_core::types::CompiledModel, n: usize
     let mut truth = model.default_params.clone();
     truth.theta = vec![4.0, 22.0, 13.0];
     truth.sigma.values = vec![SPARSE_TRUE_PROP, SPARSE_TRUE_ADD];
-    let sim = simulate_with_seed(model, &template, &truth, 1, 20_260_918);
+    let sim = simulate_with_seed(model, &template, &truth, 1, 20_260_918).unwrap();
     let mut pop = template;
     for subj in pop.subjects.iter_mut() {
         subj.observations = sim

@@ -51,7 +51,7 @@ fn ode_time_builtin_uses_raw_clock_not_elapsed() {
           1,11,0,0,0,0,1\n\
           1,15,0,0,0,0,1\n",
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     assert_eq!(preds.len(), 3);
     assert_eq!(preds[0].time, 10.0, "reported TIME is the raw data clock");
@@ -77,7 +77,7 @@ fn ode_time_builtin_fires_on_zero_origin_data() {
           1,1,0,0,0,0,1\n\
           1,5,0,0,0,0,1\n",
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     assert_eq!(preds.len(), 3);
     assert!(
@@ -133,8 +133,8 @@ fn off_zero_origin_matches_zero_origin_for_time_independent_ode() {
           1,106,0,0,0,0,1\n",
     );
 
-    let pz = predict(&model, &zero, &model.default_params);
-    let po = predict(&model, &off, &model.default_params);
+    let pz = predict(&model, &zero, &model.default_params).unwrap();
+    let po = predict(&model, &off, &model.default_params).unwrap();
 
     assert_eq!(pz.len(), po.len());
     assert_eq!(pz.len(), 3);
@@ -160,7 +160,7 @@ fn single_obs_no_dose_off_zero_still_records() {
         b"ID,TIME,DV,EVID,MDV,AMT,CMT\n\
           1,50,0,0,0,0,1\n",
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 1);
     assert!(
         (preds[0].pred - 100.0).abs() < 1e-9,
@@ -236,8 +236,8 @@ fn time_builtin_cl_switch_matches_nonmem_event_time_semantics() {
                  1,20,0,0,0,0,1\n";
     let pop = read_csv(data);
 
-    let ps = predict(&switch, &pop, &switch.default_params);
-    let pe = predict(&early, &pop, &early.default_params);
+    let ps = predict(&switch, &pop, &switch.default_params).unwrap();
+    let pe = predict(&early, &pop, &early.default_params).unwrap();
     assert_eq!(ps.len(), 2, "two observations");
 
     // Obs @ t=5 (< 10): CL = CL_E ⇒ the closed form and the constant-CL_E twin.

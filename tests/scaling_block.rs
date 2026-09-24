@@ -70,8 +70,8 @@ fn form_a_scalar_scale_divides_predictions_by_exactly_k() {
     assert!(matches!(scaled.scaling, ScalingSpec::ScalarScale(k) if (k - 1000.0).abs() < 1e-12));
 
     let pop = one_subject_pop();
-    let pop_preds = predict(&baseline, &pop, &baseline.default_params);
-    let scaled_preds = predict(&scaled, &pop, &scaled.default_params);
+    let pop_preds = predict(&baseline, &pop, &baseline.default_params).unwrap();
+    let scaled_preds = predict(&scaled, &pop, &scaled.default_params).unwrap();
 
     assert_eq!(pop_preds.len(), scaled_preds.len());
     assert!(!pop_preds.is_empty(), "must have predictions to compare");
@@ -164,8 +164,8 @@ fn form_b_expression_uses_individual_parameter() {
     let scaled = parse_model_string(&scaled_src).expect("Form B with indiv-param parses");
 
     let pop = one_subject_pop();
-    let base_preds = predict(&baseline, &pop, &baseline.default_params);
-    let scaled_preds = predict(&scaled, &pop, &scaled.default_params);
+    let base_preds = predict(&baseline, &pop, &baseline.default_params).unwrap();
+    let scaled_preds = predict(&scaled, &pop, &scaled.default_params).unwrap();
 
     assert_eq!(base_preds.len(), scaled_preds.len());
     assert!(!base_preds.is_empty());
@@ -205,8 +205,8 @@ fn form_c_amount_ode_matches_concentration_ode() {
     ));
 
     let pop = one_subject_pop();
-    let conc_preds = predict(&conc, &pop, &conc.default_params);
-    let amt_preds = predict(&amt, &pop, &amt.default_params);
+    let conc_preds = predict(&conc, &pop, &conc.default_params).unwrap();
+    let amt_preds = predict(&amt, &pop, &amt.default_params).unwrap();
 
     assert_eq!(conc_preds.len(), amt_preds.len());
     assert!(!conc_preds.is_empty(), "must have predictions to compare");
@@ -269,8 +269,8 @@ fn per_cmt_scaling_dispatches_per_observation_through_predict() {
     let scaled = parse_model_string(&scaled_src).expect("per-CMT scaling parses");
 
     let pop = two_cmt_pop();
-    let base_preds = predict(&baseline, &pop, &baseline.default_params);
-    let scaled_preds = predict(&scaled, &pop, &scaled.default_params);
+    let base_preds = predict(&baseline, &pop, &baseline.default_params).unwrap();
+    let scaled_preds = predict(&scaled, &pop, &scaled.default_params).unwrap();
 
     assert_eq!(base_preds.len(), scaled_preds.len());
 

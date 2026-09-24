@@ -243,7 +243,7 @@ fn iiv_on_ruv_focei_recovers_simulated_variance() {
     let design = replicate_population(&design, 5); // ~50 subjects
 
     // Simulate one replicate at the model's declared params (ETA_RUV ~ 0.30).
-    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 20240619);
+    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 20240619).unwrap();
     let population = population_from_sim(&design, &sims);
 
     let mut opts = FitOptions::default();

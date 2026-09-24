@@ -142,6 +142,7 @@ fn ferx_matches_nonmem_when_f_is_applied_only_at_the_dose() {
         .model;
 
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();
@@ -238,6 +239,7 @@ fn ferx_analytical_matches_nonmem_advan2_when_f_is_applied_only_at_the_dose() {
         .model;
 
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();

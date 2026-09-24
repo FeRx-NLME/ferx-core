@@ -68,7 +68,7 @@ fn generate_npde_iov_anchor() {
 
     // Pass 2: one simulated replicate (BSV η + per-occasion κ + proportional residual)
     // becomes the committed DV.
-    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, SIM_SEED);
+    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, SIM_SEED).unwrap();
     assert_eq!(
         sims.len(),
         N_SUBJECTS * OCC_STARTS.len() * TADS.len(),

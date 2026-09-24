@@ -223,20 +223,24 @@ fn positive_arm_sizes_pass_on_the_simulate_path() {
     );
 }
 
-// ── The Vec-returning entry points, and the degenerate oracle (#1083) ────────
+// ── The seeded entry points, and the degenerate oracle (#1083) ───────────────
 //
 // `κ/√W` with `W = 0` does *not* blow up: `BinOp::Div` returns `0.0` when its
 // divisor underflows, so a blank arm-size cell removes the arm's between-arm
 // variability and leaves finite, plottable rows behind. `check_kappa_weights`
 // was therefore the entire defence — and it was absent from `simulate` /
-// `simulate_with_seed`, which return a bare `Vec` and had no check at all.
+// `simulate_with_seed`, which had no check at all.
 
 #[test]
-#[should_panic(expected = "weight `NARM` evaluates to 0")]
-fn the_vec_returning_entry_point_panics_on_a_zero_arm_size() {
+fn the_seeded_entry_point_errs_on_a_zero_arm_size() {
     let model = weighted_kappa_model();
     let pop = population_with_arm_sizes(&[(1, 200.0), (2, 0.0)]);
-    let _ = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let err = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(
+        err.contains("weight `NARM` evaluates to 0"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// [`population_with_arm_sizes`] plus a bolus at t = 0, so the simulated rows

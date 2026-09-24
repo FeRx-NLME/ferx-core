@@ -100,6 +100,7 @@ fn per_cmt_predictions_finite_for_cotemporal_obs() {
     let model = parse_model_string(LINEAR_PKPD).expect("model parses");
     let pop = pkpd_pop(); // obs on CMT 1 and 2 share each timepoint
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();

@@ -103,8 +103,8 @@ fn assert_equiv(label: &str, lag: bool, fbio: bool, pop: &Population, rtol: f64)
         .unwrap_or_else(|e| panic!("[{label}] ODE transit did not parse: {e}"))
         .model;
 
-    let pa = predict(&an, pop, &an.default_params);
-    let po = predict(&ode, pop, &ode.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let po = predict(&ode, pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
     for (x, y) in pa.iter().zip(po.iter()) {
@@ -195,8 +195,8 @@ fn transit_time_desugar_matches_hand_written_ode() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
     );
-    let ps = predict(&sh, &pop, &sh.default_params);
-    let ph = predict(&hd, &pop, &hd.default_params);
+    let ps = predict(&sh, &pop, &sh.default_params).unwrap();
+    let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
     assert!(!ps.is_empty());
     for (x, y) in ps.iter().zip(ph.iter()) {
@@ -309,8 +309,8 @@ fn transit_flip_flop_routes_to_ode_twin() {
         vec![bolus(0.0, 100.0)],
         vec![1.0, 4.0, 8.0, 16.0, 24.0, 48.0, 72.0],
     );
-    let ps = predict(&sh, &pop, &sh.default_params);
-    let ph = predict(&hd, &pop, &hd.default_params);
+    let ps = predict(&sh, &pop, &sh.default_params).unwrap();
+    let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
     assert!(!ps.is_empty());
     // The reroute makes the closed-form model predict its ODE twin's profile …
@@ -390,7 +390,7 @@ fn transit_flip_flop_fit_matches_ode_twin() {
         subjects,
         ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
     };
-    let sims = ferx_core::simulate_with_seed(&hd, &pop, &hd.default_params, 1, 4321);
+    let sims = ferx_core::simulate_with_seed(&hd, &pop, &hd.default_params, 1, 4321).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
             .iter()
@@ -462,7 +462,7 @@ fn transit_ofv_matches_ode() {
     // (non-degenerate) residuals to weigh.
     let dose = || vec![bolus(0.0, 100.0)];
     let base = population(dose(), obs_t.clone());
-    let preds = predict(&an, &base, &an.default_params);
+    let preds = predict(&an, &base, &an.default_params).unwrap();
     let n = obs_t.len();
     let mut subjects = Vec::new();
     for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
@@ -497,7 +497,7 @@ fn transit_ofv_matches_ode() {
 }
 
 // ── Restrictions: features the v1 closed form does not support are rejected
-//    up front by `fit()` (and would panic in `predict()`/`simulate()`), #386. ──
+//    up front by `fit()`, `predict()` and `simulate()` (an `Err`), #386. ──
 
 /// `fit()` the basic analytic transit model on `pop`, expecting an early `Err`.
 fn transit_fit_err(pop: &Population) -> String {
@@ -868,7 +868,8 @@ fn transit_cmt_zero_is_the_default_depot_not_rejected() {
             obs.clone(),
         ),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let default_cmt = predict(
         &model,
         &population(
@@ -876,7 +877,8 @@ fn transit_cmt_zero_is_the_default_depot_not_rejected() {
             obs.clone(),
         ),
         &model.default_params,
-    );
+    )
+    .unwrap();
     assert!(
         depot.iter().any(|p| p.pred > 0.0),
         "control must be non-trivial"
@@ -923,8 +925,8 @@ fn transit_ode_template_matches_pk() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pp = predict(&pk, &pop, &pk.default_params);
-    let pt = predict(&tmpl, &pop, &tmpl.default_params);
+    let pp = predict(&pk, &pop, &pk.default_params).unwrap();
+    let pt = predict(&tmpl, &pop, &tmpl.default_params).unwrap();
     for (x, y) in pp.iter().zip(pt.iter()) {
         let tol = ATOL + RTOL * x.pred.abs();
         assert!(
@@ -984,7 +986,7 @@ fn transit_short_fit_drives_analytic_sens() {
     let model = parse_full_model(&an_src).unwrap().model;
     let obs_t = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
     let base = population(vec![bolus(0.0, 100.0)], obs_t.clone());
-    let preds = predict(&model, &base, &model.default_params);
+    let preds = predict(&model, &base, &model.default_params).unwrap();
     let n = obs_t.len();
     let subjects: Vec<_> = [0.9_f64, 1.0, 1.1]
         .into_iter()
@@ -1021,7 +1023,7 @@ fn transit_ss_dose_predicts_via_ode_twin() {
     let model = parse_full_model(&an_src).unwrap().model;
     let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0); // SS dose
     let pop = population(vec![ss], vec![1.0, 4.0, 8.0]);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3);
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
@@ -1064,7 +1066,7 @@ fn transit_analytic_vs_ode_fit_benchmark() {
         subjects,
         ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
     };
-    let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345);
+    let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
             .iter()
@@ -1164,8 +1166,8 @@ fn assert_equiv_2cpt(label: &str, lag: bool, fbio: bool, pop: &Population, rtol:
     let ode = parse_full_model(&ode_src)
         .unwrap_or_else(|e| panic!("[{label}] ODE 2cpt transit did not parse: {e}"))
         .model;
-    let pa = predict(&an, pop, &an.default_params);
-    let po = predict(&ode, pop, &ode.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let po = predict(&ode, pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
     for (x, y) in pa.iter().zip(po.iter()) {
@@ -1279,8 +1281,8 @@ fn two_cpt_transit_time_desugar_matches_hand_written_ode() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
     );
-    let ps = predict(&sh, &pop, &sh.default_params);
-    let ph = predict(&hd, &pop, &hd.default_params);
+    let ps = predict(&sh, &pop, &sh.default_params).unwrap();
+    let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
     assert!(!ps.is_empty());
     for (x, y) in ps.iter().zip(ph.iter()) {
@@ -1309,7 +1311,7 @@ fn two_cpt_transit_ofv_matches_ode() {
     let ode = parse_full_model(&ode_src).unwrap().model;
     let dose = || vec![bolus(0.0, 100.0)];
     let base = population(dose(), obs_t.clone());
-    let preds = predict(&an, &base, &an.default_params);
+    let preds = predict(&an, &base, &an.default_params).unwrap();
     let n = obs_t.len();
     let mut subjects = Vec::new();
     for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
@@ -1351,7 +1353,7 @@ fn two_cpt_transit_short_fit_drives_analytic_sens() {
     let model = parse_full_model(&an_src).unwrap().model;
     let obs_t = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
     let base = population(vec![bolus(0.0, 100.0)], obs_t.clone());
-    let preds = predict(&model, &base, &model.default_params);
+    let preds = predict(&model, &base, &model.default_params).unwrap();
     let n = obs_t.len();
     let subjects: Vec<_> = [0.9_f64, 1.0, 1.1]
         .into_iter()
@@ -1456,8 +1458,8 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
         vec![bolus(0.0, 100.0)],
         vec![2.0, 8.0, 24.0, 48.0, 96.0, 168.0],
     );
-    let pa = predict(&an, &pop, &an.default_params);
-    let po = predict(&ode, &pop, &ode.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     for (x, y) in pa.iter().zip(po.iter()) {
         assert!(
@@ -1535,26 +1537,28 @@ fn transit_flip_flop_without_twin_is_rejected() {
 /// The twin-less flip-flop reject also fires on the `predict()` path — via a panic,
 /// mirroring the other transit-support rejects (`assert_transit_support`) (#776).
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flip_flop_without_twin_panics_in_predict() {
+fn transit_flip_flop_without_twin_errs_in_predict() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
         .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// The reject also fires on the `simulate()` path — a panic through the
 /// `simulate_inner_with_draw` chokepoint, mirroring the other transit-support
 /// rejects (#776).
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flip_flop_without_twin_panics_in_simulate() {
+fn transit_flip_flop_without_twin_errs_in_simulate() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
         .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
@@ -1605,8 +1609,8 @@ fn transit_flipflop_lag_f_autoroutes_and_matches_twin() {
         vec![bolus(0.0, 100.0)],
         vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pa = predict(&an, &pop, &an.default_params);
-    let po = predict(&ode, &pop, &ode.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     assert!(
         pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01,
@@ -1655,8 +1659,8 @@ fn transit_flipflop_noncanonical_lag_f_alias_matches_canonical() {
         vec![bolus(0.0, 100.0)],
         vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pc = predict(&canonical, &pop, &canonical.default_params);
-    let pl = predict(&aliased, &pop, &aliased.default_params);
+    let pc = predict(&canonical, &pop, &canonical.default_params).unwrap();
+    let pl = predict(&aliased, &pop, &aliased.default_params).unwrap();
     assert_eq!(pc.len(), pl.len());
     assert!(pc.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01);
     for (x, y) in pc.iter().zip(pl.iter()) {
@@ -1739,11 +1743,10 @@ V1 = TVF\n\n\
 }
 
 /// #735 collision guard: the declined-twin flip-flop `f=V1` model reaches the *clean* twin-less
-/// flip-flop rejection (`predict()` panics with "flip-flop regime"), NOT the internal
-/// "same PK slot" build panic it hit before the guard.
+/// flip-flop rejection (`predict()` returns an `Err` naming the "flip-flop regime"), NOT the
+/// internal "same PK slot" build panic it hit before the guard.
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flipflop_f_param_named_disposition_slot_predict_panics_cleanly() {
+fn transit_flipflop_f_param_named_disposition_slot_predict_errs_cleanly() {
     let src = "\
 [parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
 theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
@@ -1754,7 +1757,9 @@ V1 = TVF\n\n\
 [error_model]\n  DV ~ proportional(PROP)\n";
     let model = parse_full_model(src).expect("parses").model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an
@@ -1983,7 +1988,7 @@ fn two_cpt_transit_analytic_vs_ode_fit_benchmark() {
         subjects,
         ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
     };
-    let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345);
+    let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
             .iter()
@@ -2048,8 +2053,8 @@ fn two_cpt_transit_ode_template_matches_pk() {
         vec![bolus(0.0, 100.0)],
         vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
     );
-    let pp = predict(&pk, &pop, &pk.default_params);
-    let pt = predict(&tmpl, &pop, &tmpl.default_params);
+    let pp = predict(&pk, &pop, &pk.default_params).unwrap();
+    let pt = predict(&tmpl, &pop, &tmpl.default_params).unwrap();
     for (x, y) in pp.iter().zip(pt.iter()) {
         let tol = ATOL + RTOL * x.pred.abs();
         assert!(

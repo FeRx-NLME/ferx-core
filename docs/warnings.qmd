@@ -60,8 +60,8 @@ a dose into a compartment the model cannot deliver into, a coded `RATE` with no
 `D{n}` / `R{n}` parameter behind it, a covariate the data does not carry, a
 time-varying covariate on a hazard, an absorption form the closed form cannot
 honour. `fit()` has always returned these as an `Err`. Since ferx 0.4.0 every
-other entry point that returns a `Result` does too — **for the preconditions it
-checks**, which is not the same list on each:
+other entry point does too — **for the preconditions it checks**, which is not
+the same list on each:
 
 | Entry point | Preconditions it checks, in the order it runs them |
 |---|---|
@@ -73,8 +73,8 @@ checks**, which is not the same list on each:
 | `predict_categorical()` | time-varying covariate on the linear predictor, endpoint routing |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
 | `simulate_adaptive()` | its own adaptive-dosing rejections, then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
-| `predict()` | `predict_diag()`'s list, in its order — but the failure is a **panic** whose payload is that same message, because it returns a bare `Vec` and has no error channel. Call `predict_diag()` to handle it instead. |
-| `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks — and as a **panic**, for the same reason. Call `simulate_with_options()` to handle it instead. |
+| `predict()` | `predict_diag()`'s list, in its order. |
+| `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks. |
 
 A precondition an entry point does not check is **not refused** by it: the call
 returns rows computed from an input `fit()` would have rejected. Validate a new
@@ -86,11 +86,12 @@ several preconditions at once, each entry point reports the first one in *its
 own* check order, and the orders differ, so two entry points can name two
 different (both real) defects for the same input.
 
-Before 0.4.0 `predict_survival()`, `predict_categorical()` and
-`inits_from_nca()` returned bare values and panicked, and the three
-`simulate_with_*` forms panicked *out of a function that returns `Result`*, so a
-caller matching on `Err` never saw the failure. The panic text also carried a
-wrapper sentence around the diagnostic; that wording is gone.
+Before 0.4.0 `predict()`, `simulate()`, `simulate_with_seed()`,
+`predict_survival()`, `predict_categorical()` and `inits_from_nca()` returned
+bare values and panicked, and the three `simulate_with_*` forms panicked *out of
+a function that returns `Result`*, so a caller matching on `Err` never saw the
+failure. The panic text also carried a wrapper sentence around the diagnostic;
+that wording is gone.
 
 One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
 *draw* that lands in a twin-less transit model's flip-flop regime is skipped and

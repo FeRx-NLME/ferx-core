@@ -74,7 +74,7 @@ fn analytical_tvcov_intermediate_evid2_matches_nonmem_pred() {
     )
     .expect("dataset loads");
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), NONMEM.len());
 
     for (p, &(t, expected)) in preds.iter().zip(NONMEM) {

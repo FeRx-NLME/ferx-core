@@ -193,6 +193,7 @@ fn single_first_order_curve(ka: f64, obs_times: &[f64]) -> Vec<f64> {
     let mut params = model.default_params.clone();
     params.theta[2] = ka;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -206,6 +207,7 @@ fn single_zero_order_curve(dur: f64, obs_times: &[f64]) -> Vec<f64> {
     let mut params = model.default_params.clone();
     params.theta[2] = dur;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -244,6 +246,7 @@ fn parallel_equals_fraction_weighted_sum_of_single_first_order_pathways() {
         &pop_single(obs_times.clone()),
         &model.default_params,
     )
+    .unwrap()
     .iter()
     .map(|p| p.pred)
     .collect();
@@ -280,6 +283,7 @@ fn mixed_equals_fraction_weighted_sum_of_first_and_zero_order_pathways() {
         &pop_single(obs_times.clone()),
         &model.default_params,
     )
+    .unwrap()
     .iter()
     .map(|p| p.pred)
     .collect();
@@ -316,7 +320,8 @@ fn parallel_and_mixed_recover_full_dose_auc() {
             &model,
             &pop_single(obs_times.clone()),
             &model.default_params,
-        );
+        )
+        .unwrap();
         let auc: f64 = preds
             .windows(2)
             .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
@@ -497,7 +502,7 @@ fn parallel_steady_state_dosing_is_supported() {
         "SS into a parallel (dual first-order) compartment is supported, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
-    let preds = ferx_core::predict(&model, &pop, &model.default_params);
+    let preds = ferx_core::predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), n);
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred >= 0.0),
@@ -525,7 +530,8 @@ fn parallel_fit_recovers_fraction_and_kas() {
         &model,
         &pop_single(obs_times.clone()),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
@@ -568,7 +574,8 @@ fn mixed_fit_recovers_fraction_dur_and_ka() {
         &model,
         &pop_single(obs_times.clone()),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);

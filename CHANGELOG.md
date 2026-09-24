@@ -411,10 +411,11 @@ section of the SDLC for the versioning policy).
   fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
   and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
   ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
-- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
-  that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
-  `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
-  returned bare values and panicked); `simulate_with_options()`,
+- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every predict /
+  simulate entry point (#898).** `predict()`, `simulate()`, `simulate_with_seed()`,
+  `predict_diag()`, `predict_survival()`, `predict_categorical()` and `inits_from_nca()`
+  now return `Result<_, String>` (they returned bare values and panicked); a Rust caller
+  of the first three adds `?` (or `.unwrap()` to keep the old panic); `simulate_with_options()`,
   `simulate_with_options_diag()` and `simulate_with_uncertainty()` keep their signatures but
   no longer panic *out of* a `Result`-returning function — a dose into a compartment the
   model cannot deliver into, a coded `RATE` with no `D{n}`/`R{n}` behind it, an unsupported
@@ -422,9 +423,7 @@ section of the SDLC for the versioning policy).
   gives for that precondition (an input failing several at once is reported by whichever
   each entry point checks first, and the orders differ); the wrapper sentences ("predict()/simulate()
   received …", "fit() reports this as an error rather than panicking") are gone.
-  `predict()`, `simulate()` and `simulate_with_seed()` keep their `Vec` signatures for now
-  and still panic, with exactly that `Err` text as the payload; they become `Result` in a
-  later release. No prediction or simulated row changes. See
+  No prediction or simulated row changes. See
   `docs/warnings.qmd#entry-point-errors`.
 
 - **SAEM default: the MH step scales are now adapted by `scale_adaptation = robbins_monro`

@@ -706,7 +706,7 @@ fn simulate_and_predict_reach_the_pre_arrival_referent() {
     let pop = population("ss_tadlag.csv");
     let want = nonmem_ipred("train_tadlag");
 
-    let preds = ferx_core::api::predict(&m, pop, &m.default_params);
+    let preds = ferx_core::api::predict(&m, pop, &m.default_params).unwrap();
     assert_eq!(preds.len(), want.len(), "predict() row count");
     let mut worst_pred = 0.0_f64;
     for (p, &(t, w)) in preds.iter().zip(&want) {
@@ -723,7 +723,7 @@ fn simulate_and_predict_reach_the_pre_arrival_referent() {
         "predict() vs NONMEM's lagged train: {worst_pred:.3e} (realised 1.69e-8, 6x headroom)"
     );
 
-    let sims = ferx_core::api::simulate_with_seed(&m, pop, &m.default_params, 1, 7);
+    let sims = ferx_core::api::simulate_with_seed(&m, pop, &m.default_params, 1, 7).unwrap();
     let ipreds: Vec<f64> = sims.iter().map(|r| r.ipred).collect();
     assert_eq!(ipreds.len(), want.len(), "simulate() row count");
     let mut worst_sim = 0.0_f64;
