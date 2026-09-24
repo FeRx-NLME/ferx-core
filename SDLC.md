@@ -149,7 +149,7 @@ A `CHANGELOG.md` file should be maintained following [Keep a Changelog](https://
 |----------|----------|---------|
 | Quarto site | `docs/**/*.qmd` | User-facing documentation, model DSL reference, estimation methods |
 | README.md | Project root | Quick start, overview, model syntax examples |
-| CLAUDE.md | Project root | Developer guidance, architecture, build commands |
+| AGENTS.md | Project root | Developer guidance, architecture, build commands |
 
 ### Building documentation
 

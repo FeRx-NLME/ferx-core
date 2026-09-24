@@ -318,7 +318,7 @@ mod tests {
     }
 
     // Use the in-tree warfarin example + data. They live at repo paths
-    // `examples/warfarin.ferx` and `data/warfarin.csv` (see CLAUDE.md);
+    // `examples/warfarin.ferx` and `data/warfarin.csv` (see AGENTS.md);
     // tests run from the crate root, so relative paths work directly.
     const MODEL_PATH: &str = "examples/warfarin.ferx";
     const DATA_PATH: &str = "data/warfarin.csv";

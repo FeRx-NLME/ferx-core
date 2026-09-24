@@ -56,7 +56,7 @@
 //! input breaks that: there is then a distinct `z^{(e)}` per event, the bias FD
 //! returns `Σ_e ∂NLL/∂z_k^{(e)}`, and the per-event terms are not recoverable
 //! from it. [`NnGradPlan::build`] declines in that case and the caller keeps its
-//! per-θ FD loop — the CLAUDE.md "route to FD via a support predicate, and
+//! per-θ FD loop — the AGENTS.md "route to FD via a support predicate, and
 //! unit-test the routing" rule. Non-NN θ are never touched by this module, so a
 //! model with no `[covariate_nn]` block is bit-for-bit unaffected.
 //!

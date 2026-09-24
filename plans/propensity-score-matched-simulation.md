@@ -99,12 +99,12 @@ to R as `match`.)
 - When `!propensity_match`: call the existing `simulate_inner_with_draw`
   untouched.
 
-### 4. ferx-r follow-up (separate PR, per CLAUDE.md)
+### 4. ferx-r follow-up (separate PR, per AGENTS.md)
 - `simulate_with_options` is a new `pub` API → bump `ferx-r` Cargo.lock via
   `tools/update-ferx-core-lock.sh` and surface a `match` argument on the R
   simulate wrapper. Note in PR.
 
-## Tests (per CLAUDE.md tiers)
+## Tests (per AGENTS.md tiers)
 
 - **Tier 1 (unit, `src/propensity_match.rs`)**
   - `optimal_assignment` vs brute-force min-cost permutation for small N
@@ -119,7 +119,7 @@ to R as `match`.)
 - **Regression** — `simulate_with_seed` output is unchanged (matched path not
   taken) for a fixed seed.
 
-## NONMEM / external comparison (per CLAUDE.md)
+## NONMEM / external comparison (per AGENTS.md)
 
 The new numeric kernel is the *matching*, not an estimator. Validate the Rust
 optimal-Mahalanobis assignment against the R reference: dump a fixed set of

@@ -23,7 +23,7 @@
 //! the structural scan over the publishing sites and the warning-payload check,
 //! both of which run against source text or a typed struct. The end-to-end cases
 //! that do call `fit()` / `run_covariance` live in `tests/covariance_method_label.rs`,
-//! which is Tier 2 by CLAUDE.md's rule — public API, returning after a single
+//! which is Tier 2 by AGENTS.md's rule — public API, returning after a single
 //! outer iteration.
 use crate::types::CovarianceMethod;
 

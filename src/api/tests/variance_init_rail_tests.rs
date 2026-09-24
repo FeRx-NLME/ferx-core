@@ -2,7 +2,7 @@
 //! the optimizer's own lower rail (#1229).
 //!
 //! Every assertion here names the regression it exists to catch. Three of them
-//! guard against tests that *cannot fail*, in the shapes CLAUDE.md lists:
+//! guard against tests that *cannot fail*, in the shapes AGENTS.md lists:
 //!
 //! * The rail straddle asserts the **straddle itself** (`pack_params` on either
 //!   side of `-6.0`), so a change to the parser's `1e-8` floor or to

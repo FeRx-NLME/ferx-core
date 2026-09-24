@@ -14,4 +14,4 @@ Process and contributor documentation for the FeRx project, spanning both
   pyramid, NONMEM validation, CI quality gates, releases & versioning,
   maintenance & support, and security.
 
-For the low-level build/test/style rules of each repo, see its `CLAUDE.md`.
+For the low-level build/test/style rules of each repo, see its `AGENTS.md`.

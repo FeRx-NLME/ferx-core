@@ -394,7 +394,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         //
         // Narrowing the recording instead would mean re-deciding "would this row have
         // been scored" at the filter site, a second copy of a predicate the reader owns
-        // two hundred lines down — the arrangement CLAUDE.md's "when two implementations
+        // two hundred lines down — the arrangement AGENTS.md's "when two implementations
         // disagree, the fix is one implementation" rule exists to prevent. So the field
         // keeps recording what it can honestly see, and the sentence claims only that.
         // The intersection is untouched and is what the field is for: without it,
@@ -5425,7 +5425,7 @@ pub(crate) fn check_packed_start_in_box(
     // No `inverted` consult here: `coordinates_outside_bounds` already declines
     // a coordinate whose bounds are not finite and orderable, so a second test
     // would reject exactly what the first one rejects — the redundant gate
-    // CLAUDE.md names as a test hole. The declared-range walk above needs its
+    // AGENTS.md names as a test hole. The declared-range walk above needs its
     // consult because it never looks at the packed box at all.
     for hit in coordinates_outside_bounds(&start, &kinds) {
         // Below a variance rail is #1229's error, reported there with its own

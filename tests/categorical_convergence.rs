@@ -2,7 +2,7 @@
 //!
 //! Gated behind BOTH `survival` (the feature) and `slow-tests` (a full fit to
 //! convergence), so it is skipped on the per-PR job and runs nightly — see the
-//! test-tier rules in CLAUDE.md.
+//! test-tier rules in AGENTS.md.
 //!
 //! **Exact anchor.** A fixed-effects (`n_eta = 0`) logistic fit *is* ordinary
 //! logistic regression, so ferx must reproduce base-R

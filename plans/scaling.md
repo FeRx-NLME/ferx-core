@@ -5,7 +5,7 @@ Related issue: https://github.com/FeRx-NLME/ferx-core/issues/2
 This plan covers Phase 1 only: an explicit `[scaling]` block in `.ferx` model files.
 Phase 2 (automatic unit-based scaling via `dose_units` / `obs_units`) is out of scope and gets its own plan.
 
-Read `CLAUDE.md` first before starting any step.
+Read `AGENTS.md` first before starting any step.
 Complete steps in order — later steps depend on earlier ones.
 Each step specifies the files to touch and the expected outcome — but **the plan
 below is a starting hypothesis, not a fixed recipe**. The actual repository state

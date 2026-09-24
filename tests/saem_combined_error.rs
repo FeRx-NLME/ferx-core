@@ -364,7 +364,7 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
         // ONE lower gate, not two. A separate `add > SIGMA_FLOOR * 1000`
         // (= 0.335) alongside this one would reject nothing the factor-of-two
         // bound (0.9) does not already reject — the "two redundant gates cover
-        // for each other" hole in CLAUDE.md — so the floor lives in the message
+        // for each other" hole in AGENTS.md — so the floor lives in the message
         // as a distance rather than in a predicate of its own.
         assert!(
             add > SPARSE_TRUE_ADD / 2.0 && add < SPARSE_TRUE_ADD * 2.0,

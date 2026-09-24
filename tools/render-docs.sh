@@ -8,7 +8,7 @@
 #
 # Quarto's project input discovery skips every path with a **hidden** (dot-
 # prefixed) directory component. A worktree under `.claude/worktrees/<name>/`
-# — which CLAUDE.md asks for on any branch that is not `main` — is exactly
+# — which AGENTS.md asks for on any branch that is not `main` — is exactly
 # that, so `quarto render docs` there finds *zero* inputs: it writes
 # `robots.txt` and `sitemap.xml`, renders not one page, prints no warning and
 # exits **0**. Nothing tells you the render did not happen; you notice when a

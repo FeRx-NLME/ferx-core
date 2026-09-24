@@ -3331,7 +3331,7 @@ fn oral_infusion_provider_matches_fd_of_production() {
 /// delegate it to the IV core. The value path is pinned against an ODE twin
 /// (`tests/oral_peripheral_infusion.rs`), but the **`Dual2` gradient** has no
 /// second copy of the formula to disagree with it, so it must be asserted
-/// against central FD of the `T = f64` production predictor (CLAUDE.md's
+/// against central FD of the `T = f64` production predictor (AGENTS.md's
 /// `Dual2`-vs-FD rule).
 ///
 /// Cases exercise, in order: peripheral alone; peripheral **overlapping an
@@ -12164,7 +12164,7 @@ const MR_MIXED_1CPT_TAD: &str = r#"
 /// so the jet comes from the ODE provider instead of the closed form; that jet
 /// must agree with finite differences of the production predictor.
 ///
-/// This is the parity check CLAUDE.md requires whenever an analytic sensitivity
+/// This is the parity check AGENTS.md requires whenever an analytic sensitivity
 /// route changes. It is also the assertion the closed form could not have
 /// satisfied: it dropped the `TAD` term from the value *and* from every
 /// derivative, so it agreed with FD **of itself** while disagreeing with FD of
@@ -12245,7 +12245,7 @@ fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
     // forcings are zero before the first dose and `central` is identically zero
     // there, so `(1.0 + 0.3*TAD)` multiplies zero and every quantity
     // `check_full_provider_vs_fd` compares at the pre-arrival observation is
-    // `0.0` vs `0.0`. That is CLAUDE.md's `g(x-) = 0` trap verbatim: the test
+    // `0.0` vs `0.0`. That is AGENTS.md's `g(x-) = 0` trap verbatim: the test
     // would still catch a *NaN* anchor (NaN * 0 is NaN) but not a *wrong* finite
     // one. Seeding a baseline makes the incoming side a real quantity, so a
     // mis-anchored `TAD` moves the prediction and FD sees it. Same device as
@@ -12338,7 +12338,7 @@ fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
 /// the pre-arrival window, this one entirely after the first dose — so the two are
 /// complementary, not duplicates, and neither is redundant with the other.)
 ///
-/// CLAUDE.md requires a `Dual2`-vs-FD parity test for any change to an analytic
+/// AGENTS.md requires a `Dual2`-vs-FD parity test for any change to an analytic
 /// sensitivity route, and this is the route that changed. The preconditions
 /// assert the fixture really is trigger-free apart from model time, so the test
 /// cannot quietly become a second copy of the one above.
@@ -12469,7 +12469,7 @@ const COLLIDING_INFUSION_ODE: &str = r#"
 /// The value side is anchored on the closed form (`ode_predictions` is itself pinned
 /// against NONMEM `break_collision_inf` in `ode/predictions_tests.rs`), and the
 /// derivative side on `check_full_provider_vs_fd`, which finite-differences the `T = f64`
-/// production predictor — so this is the Dual2-vs-FD parity the CLAUDE.md rule requires
+/// production predictor — so this is the Dual2-vs-FD parity the AGENTS.md rule requires
 /// for a change to a sensitivity walk, exercised **on the collision** rather than on a
 /// clean timeline.
 ///

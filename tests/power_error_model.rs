@@ -8,7 +8,7 @@
 //!   — the exponent rides the magnitude channel, and a channel that changed the
 //!   arithmetic on its neutral value would move every base fit a search
 //!   started from. The same evaluation at `P = 1.3` must differ, or the pair
-//!   is a tautology (the CLAUDE.md straddle rule).
+//!   is a tautology (the AGENTS.md straddle rule).
 //! * **Every consumer reads the exponent.** IWRES, CWRES, the simulated draw
 //!   and each estimator route the variance through code the exponent has to
 //!   reach; a path that fell back to the unscaled variance would show as a

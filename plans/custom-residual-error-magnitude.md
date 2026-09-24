@@ -172,7 +172,7 @@ The multiplier programs are already AD-ready (`eval_bytecode_g<Dual2>`), so
 `sens_outer_gradient.rs` and the SAEM M-step, then drop the Phase 4 guard for
 those methods. Tracked separately to keep this PR reviewable.
 
-## Validation vs NONMEM (required by CLAUDE.md)
+## Validation vs NONMEM (required by AGENTS.md)
 
 Build a small time-varying-RUV `.mod` (proportional error inflated for
 `TIME>24` via a theta), fit in NONMEM via the licensed `pmx` container, and

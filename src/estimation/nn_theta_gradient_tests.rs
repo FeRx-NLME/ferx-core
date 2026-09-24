@@ -372,7 +372,7 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
     );
 }
 
-/// CLAUDE.md's routing rule: a model outside the analytic scope must fail
+/// AGENTS.md's routing rule: a model outside the analytic scope must fail
 /// loudly to FD, not silently return a wrong gradient. A time-varying NN input
 /// gives the network a distinct output vector per event, which the
 /// single-`z` factorization cannot represent.
@@ -652,7 +652,7 @@ fn dcm_iov_model() -> CompiledModel {
 /// must match central finite differences of the individual NLL across the whole stacked
 /// `[η_bsv, κ₁ … κ_K]` vector.
 ///
-/// CLAUDE.md's rule applied to a path that has just become analytic. Before this,
+/// AGENTS.md's rule applied to a path that has just become analytic. Before this,
 /// `iov_analytical_supported`'s `n_theta_axis() == model.n_theta` clause could never hold
 /// for a `[covariate_nn]` model — the program's θ axes cover only the *declared* thetas,
 /// never the auto-generated weights — so every DCM+IOV subject fell to finite
@@ -1479,7 +1479,7 @@ fn dcm_two_kappa_model() -> CompiledModel {
 }
 
 /// Three occasions, one 3-hour infusion each, two observations per occasion — the later
-/// doses land with residual drug present (a multi-dose fixture, per CLAUDE.md's
+/// doses land with residual drug present (a multi-dose fixture, per AGENTS.md's
 /// non-degeneracy rule), so κ on a later occasion moves both its own rows and the
 /// carry-over into the next.
 fn dcm_two_kappa_subject() -> Subject {

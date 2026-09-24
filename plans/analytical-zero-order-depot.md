@@ -122,7 +122,7 @@ correct FD gradients without touching the bolus-only AD oral propagators. Note
 this explicitly in the PR; the autodiff oral-infusion arms stay a separate
 follow-up (same status as oral central infusion under AD).
 
-## Tests (all tiers per CLAUDE.md)
+## Tests (all tiers per AGENTS.md)
 
 - **Tier 1 (unit, `src/pk/event_driven.rs`)**: `propagate_*_oral` with `rate_depot>0`
   vs a fine-grained RK45 integration of the same depot-infusion ODE — assert
@@ -137,7 +137,7 @@ follow-up (same status as oral central infusion under AD).
   peripheral) so the error path stays covered.
 - Coverage: the diff carries its own tests (Codecov patch ≥90%).
 
-## NONMEM validation (per CLAUDE.md)
+## NONMEM validation (per AGENTS.md)
 
 Anchor a `one_cpt_oral` + `D1`-into-depot fit (or `predict`) against an
 equivalent NONMEM `ADVAN2`/`$PK D1` zero-order-into-depot run. Record the OFV /

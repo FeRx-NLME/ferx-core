@@ -348,7 +348,7 @@ substantially, but neither side is truth. Anchor A remains the only item with gr
   different target. Its nearest ferx analogue is `method = bayes`, and comparing them conflates
   VI-vs-MCMC with implementation correctness.
 - **Shared blind spot, low weight.** Both implementations hand-roll forward sensitivities rather
-  than using AD, so a common *class* of error is conceivable. CLAUDE.md's `Dual2`-vs-FD parity rule
+  than using AD, so a common *class* of error is conceivable. AGENTS.md's `Dual2`-vs-FD parity rule
   guards this independently.
 - Adjacent but out of scope: 7.0 also ships `est = "vae"` (amortized inference). Not a VI anchor.
 
@@ -882,7 +882,7 @@ authority* into *measured here*:
 per-subject plate with `Trace_ELBO` and Adam is structurally our algorithm, so one model file
 yields three anchors: `Trace_ELBO` vs `TraceMeanField_ELBO` maps onto our `vi_kl = mc` /
 `analytic` split; `log_density` gives **pointwise** checks of the data term and `∂/∂η` at chosen
-`η` (sharper than any fitted-number comparison, and it lands exactly where CLAUDE.md warns a wrong
+`η` (sharper than any fitted-number comparison, and it lands exactly where AGENTS.md warns a wrong
 sensitivity is silent); and NUTS on the same model gives the reference posterior. Stan's ADVI
 cannot express the nested per-subject structure cleanly and is semi-deprecated in favour of
 Pathfinder, so use Stan for NUTS only if at all.
@@ -972,7 +972,7 @@ variance claim and needed none of it.
 
 ## 6. Anchor D — FOCEI / SAEM / NONMEM / nlmixr2 `focei`  *(plumbing and placement)*
 
-**Status:** **done** (2026-08-24). Results in [§6.1](#61-results-2026-08-24); the CLAUDE.md
+**Status:** **done** (2026-08-24). Results in [§6.1](#61-results-2026-08-24); the AGENTS.md
 "compare with NONMEM" obligation for `method = vi` is discharged, and
 `docs/estimation/vi.qmd` carries the filled table instead of the placeholder.
 

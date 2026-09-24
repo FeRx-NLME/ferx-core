@@ -91,7 +91,7 @@ const OBS_T: [f64; 10] = [2.3, 3.1, 4.2, 8.0, 11.5, 12.4, 13.8, 15.0, 18.0, 24.0
 /// Two doses. The second lands at `t = 12` with ~38 mg still in the compartment, so
 /// the later window opens **with drug present** — a single-dose fixture would make
 /// the pre-arrival side identically zero and could not tell a dropped window from a
-/// correct one there (the non-degeneracy rule in `CLAUDE.md`).
+/// correct one there (the non-degeneracy rule in `AGENTS.md`).
 fn two_doses() -> Vec<DoseEvent> {
     vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
