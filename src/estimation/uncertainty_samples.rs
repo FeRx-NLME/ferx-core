@@ -204,11 +204,12 @@ impl LogitThetaCoord {
     /// `dx/dy` at packed coordinate `x`: `1 − θ` for `x = ln θ`, `θ(1 − θ)`
     /// for `x = θ`.
     pub(crate) fn dx_dy(self, x: f64) -> f64 {
-        let t = self.theta_of(x);
         if self.log_packed {
-            1.0 - t
+            // `1 − e^x` as `−expm1(x)`: exact near θ → 1 (x → 0⁻), where
+            // `1.0 - x.exp()` cancels.
+            -x.exp_m1()
         } else {
-            t * (1.0 - t)
+            x * (1.0 - x)
         }
     }
 }
