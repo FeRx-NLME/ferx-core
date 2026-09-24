@@ -506,9 +506,11 @@ impl SearchManifest {
     /// criterion and the strictness gate are deliberately *not* compared —
     /// both are functions of a finished `FitResult`, so a fit another tool
     /// made under a different ranking is re-scored under this one rather
-    /// than refitted. What cannot be re-scored is a journal row without its
-    /// fit; [`check_compatible`](Self::check_compatible) is the test for
-    /// trusting those.
+    /// than refitted — and so is a resumed run's own cached fit, whose
+    /// journalled verdict is a cache of the gate's answer, not the answer
+    /// (#1512). What cannot be re-scored is a journal row without its fit;
+    /// [`check_compatible`](Self::check_compatible) is the test for trusting
+    /// those.
     pub fn same_fits(&self, disk: &SearchManifest, dir: &Path) -> Result<(), String> {
         let refuse = |field: &str, disk: String, now: String| {
             Err(format!(

@@ -85,7 +85,9 @@ section of the SDLC for the versioning policy).
   no longer showed the problem: on warfarin, `modelsearch`'s collapsed one-peripheral
   candidate (V2 → 0, Q free, TVQ RSE 293519 %) read a condition number of 2.98 and passed.
   While either gate is enabled, the `Covariance step regularized: eigenvalue floor applied`
-  warning now fails the fit with its own reason (#1512).
+  warning now fails the fit with its own reason. A resumed search re-judges every journalled
+  candidate from its cached fit rather than trusting the verdict in the journal, so the gate
+  also reaches a run interrupted before this change (#1512).
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every

@@ -261,7 +261,10 @@ retries, the same thread plan and `[odes]` cost tiers. Two consequences:
 
 - **`--resume`** refits nothing the run's own directory already holds. The
   GA is seeded, so a resumed run proposes the same genomes and finds every
-  batch in its journal.
+  batch in its journal. What it finds is re-judged: a journalled row's
+  cached fit goes back through the strictness gate and the criterion, so
+  the verdict is the current engine's, not the one written before an
+  interruption (#1512).
 - **`--reuse-from DIR`** (or `[run] reuse_from = [...]`) points a run at
   *another* search's directory — a modelsearch run, a covsearch run, an
   earlier global search — and a candidate whose canonical text a fit there

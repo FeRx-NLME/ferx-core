@@ -456,7 +456,7 @@ impl Runner {
                 n_reused += 1;
                 outcomes.insert(
                     i,
-                    reused_result(&candidates[i], record, self.cache_dir.as_deref()),
+                    reused_result(&candidates[i], record, self.cache_dir.as_deref(), options),
                 );
             }
         }
@@ -617,14 +617,41 @@ fn record_of(result: &CandidateResult) -> CandidateRecord {
 /// still readable. A missing cache file costs the `FitResult`, not the row —
 /// including the row's `ofv` and `converged`, which are carried across from the
 /// journal rather than read back off the fit that may be gone.
+///
+/// The verdict and the criterion are **recomputed from the cached fit** when it
+/// loads, exactly as [`foreign_result`] does for another directory's fit, and
+/// only read off the row when the fit is gone. Both are functions of a finished
+/// `FitResult` and of this run's options, so the fit is the source of truth
+/// and the row is its cache. The manifest refuses a resume whose gate
+/// *configuration* changed ([`SearchManifest::check_compatible`]); it cannot
+/// see a change in what the same configuration *means* — #1512 made
+/// `check_strictness` fail a regularized covariance step that the previous
+/// build passed — and re-judging the fit is what makes such a change reach a
+/// run interrupted before it, instead of a journalled `passed: true` ranking a
+/// candidate the current gate excludes.
 fn reused_result(
     candidate: &Candidate,
     record: &CandidateRecord,
     dir: Option<&Path>,
+    options: &RunOptions,
 ) -> CandidateResult {
     let fit = match (record.has_fit, dir) {
         (true, Some(dir)) => journal::load_fit(dir, &record.hash),
         _ => None,
+    };
+    let (verdict, criterion) = match &fit {
+        Some(fit) => (
+            check_strictness(fit, &options.strictness),
+            options.criterion.of(fit),
+        ),
+        None => (
+            StrictnessVerdict {
+                passed: record.passed,
+                failures: record.failures.clone(),
+                skipped: record.skipped.clone(),
+            },
+            record.criterion.unwrap_or(f64::NAN),
+        ),
     };
     CandidateResult {
         id: candidate.id.clone(),
@@ -634,12 +661,8 @@ fn reused_result(
         fit,
         ofv: record.ofv,
         converged: record.has_fit.then_some(record.converged),
-        verdict: StrictnessVerdict {
-            passed: record.passed,
-            failures: record.failures.clone(),
-            skipped: record.skipped.clone(),
-        },
-        criterion: record.criterion.unwrap_or(f64::NAN),
+        verdict,
+        criterion,
         seconds: record.seconds,
         error: record.error.clone().map(|message| CandidateError {
             message,
@@ -778,7 +801,9 @@ fn foreign_result(
                 reused: true,
             }
         }
-        Foreign::Row(record) => reused_result(candidate, &record, None),
+        // A row is reused only for a candidate that produced no fit, so there
+        // is nothing to re-judge: its verdict *is* the failure.
+        Foreign::Row(record) => reused_result(candidate, &record, None, options),
     }
 }
 
@@ -786,7 +811,10 @@ fn foreign_result(
 ///
 /// Anything dropped here is simply refitted, so the read errs towards dropping.
 /// The one unsafe outcome is *keeping* a row that does not belong to this run,
-/// which is what [`SearchManifest::check_compatible`] rules out.
+/// which is what [`SearchManifest::check_compatible`] rules out. A kept row is
+/// not believed outright either: [`reused_result`] re-judges and re-scores its
+/// cached fit under this run's options, so the row's own verdict is read only
+/// when the fit file is gone.
 fn load_resumable(dir: &Path, manifest: &SearchManifest) -> Result<Vec<CandidateRecord>, String> {
     let manifest_path = journal::manifest_path(dir);
     if !manifest_path.exists() {
