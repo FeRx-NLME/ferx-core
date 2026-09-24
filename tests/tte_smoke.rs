@@ -415,7 +415,7 @@ mod survival_smoke {
     #[should_panic(expected = "#741")]
     fn tv_cov_hazard_predict_panics() {
         let (model, pop) = tv_cov_hazard_model_and_pop();
-        let _ = ferx_core::predict(&model, &pop, &model.default_params);
+        let _ = ferx_core::predict(&model, &pop, &model.default_params).unwrap();
     }
 
     /// `simulate()` panics on the same combination for the same reason (#741).
@@ -423,7 +423,7 @@ mod survival_smoke {
     #[should_panic(expected = "#741")]
     fn tv_cov_hazard_simulate_panics() {
         let (model, pop) = tv_cov_hazard_model_and_pop();
-        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0);
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0).unwrap();
     }
 
     /// `predict_survival()` refuses too — the survival curves read the hazard at the
@@ -1366,7 +1366,7 @@ mod survival_smoke {
         let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
         let template = common::tte_pop_from_pairs(&vec![(TAU, 0); 300]);
 
-        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 4242);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 4242).unwrap();
         assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
 
         let (mut events, mut censored) = (0usize, 0usize);
@@ -1409,7 +1409,7 @@ mod survival_smoke {
         let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
         let template = common::tte_pop_from_pairs(&vec![(5.0, 1); 300]);
 
-        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 1234);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 1234).unwrap();
         assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
 
         let mut beyond_event_time = 0usize;
@@ -1506,7 +1506,7 @@ mod survival_smoke {
         let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
         // Template: 400 subjects censored at τ on both causes; the draw overwrites.
         let template = common::tte_competing_pop(&vec![(TAU, 0u8); 400]);
-        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 7);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 7).unwrap();
 
         let mut by_id: HashMap<String, Vec<&ferx_core::SimulationResult>> = HashMap::new();
         for s in &sims {
@@ -1566,7 +1566,7 @@ mod survival_smoke {
         // 300 subjects, each with cause A (CMT 2) observed at t=0.5 and cause B
         // (CMT 3) censored at 0.5 — the cause-specific layout of an early event.
         let template = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 300]);
-        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 99);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 99).unwrap();
 
         let max_t = sims
             .iter()
@@ -3816,6 +3816,6 @@ mod survival_smoke {
         // validation chokepoint rather than emitting wrong / no TTE rows.
         let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
         let pop = joint_pktte_pop();
-        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7);
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
     }
 }

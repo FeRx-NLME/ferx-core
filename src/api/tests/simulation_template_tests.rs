@@ -77,7 +77,7 @@ fn simulating_a_dv_dot_template_emits_one_row_per_sampling_time() {
     let (pop, _) =
         read_population_for_simulation(&model, &None, path, None, None, None, &[]).unwrap();
 
-    let sims = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let sims = simulate_with_seed(&model, &pop, &model.default_params, 1, 42).unwrap();
     assert_eq!(sims.len(), 3, "one simulated row per sampling time");
     for (r, t) in sims.iter().zip([0.25, 1.0, 4.0]) {
         assert_eq!(r.time, t);

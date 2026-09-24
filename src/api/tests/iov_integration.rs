@@ -1711,7 +1711,8 @@ fn test_simulate_recovers_block_sigma_cross_branch_correlation() {
     let (model, population) = block_sigma_selected_model_and_population();
 
     let n_sim = 20_000;
-    let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 42);
+    let results =
+        simulate_with_seed(&model, &population, &model.default_params, n_sim, 42).unwrap();
     assert_eq!(results.len(), 2 * n_sim);
 
     let mut resid_total = Vec::with_capacity(n_sim);
@@ -1764,10 +1765,12 @@ fn test_simulate_zero_rho_matches_diagonal_draw_path() {
         sigma_j: 1,
         rho: 0.0,
     }];
-    let dense_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+    let dense_path =
+        simulate_with_seed(&model, &population, &model.default_params, 200, 7).unwrap();
 
     model.residual_correlations.clear();
-    let scalar_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+    let scalar_path =
+        simulate_with_seed(&model, &population, &model.default_params, 200, 7).unwrap();
 
     assert_eq!(dense_path.len(), scalar_path.len());
     for (a, b) in dense_path.iter().zip(scalar_path.iter()) {
@@ -1801,7 +1804,8 @@ fn test_simulate_singular_rho_one_does_not_panic() {
     model.default_params.residual_correlations = singular;
 
     let n_sim = 20_000;
-    let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);
+    let results =
+        simulate_with_seed(&model, &population, &model.default_params, n_sim, 11).unwrap();
     assert_eq!(results.len(), 2 * n_sim);
 
     let mut resid_total = Vec::with_capacity(n_sim);
@@ -2128,7 +2132,7 @@ fn test_simulate_with_seed_panics_when_omega_iov_missing() {
     let params = iov_params_without_omega_iov(&model);
     // No Err channel on this entry point: fail loud rather than emit rows with
     // zero inter-occasion variability.
-    let _ = simulate_with_seed(&model, &population, &params, 1, 1);
+    let _ = simulate_with_seed(&model, &population, &params, 1, 1).unwrap();
 }
 
 #[test]

@@ -41,41 +41,39 @@ use std::time::Instant;
 /// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
-/// # Panics
+/// # Errors
 ///
 /// On a model/data precondition failure — a dose the model cannot route or honour, an
 /// unsupported absorption or survival combination, a covariate the data does not carry, an
 /// IOV model without `omega_iov`, or (under `markov`) a CTMM endpoint, which has no
-/// simulation path yet. The payload is exactly the `Err` text [`simulate_with_options`]
-/// returns for the same input; this `Vec`-returning form has no channel to return it on
-/// (#898). Call
-/// [`simulate_with_options`] to receive it as an `Err` instead.
+/// simulation path yet. The text is exactly the `Err` [`simulate_with_options`] returns for
+/// the same input (#898).
 pub fn simulate(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Vec<SimulationResult> {
+) -> Result<Vec<SimulationResult>, String> {
     let mut rng = rand::rng();
-    simulate_inner(model, population, params, n_sim, &mut rng).unwrap_or_else(|e| panic!("{e}"))
+    simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
 /// Simulate with a fixed seed for reproducibility.
 ///
-/// # Panics
+/// # Errors
 ///
-/// As [`simulate`]: a precondition failure panics with the `Err` text
-/// [`simulate_with_options`] returns for the same input (#898).
+/// As [`simulate`]: a precondition failure is the `Err` [`simulate_with_options`] returns for
+/// the same input (#898).
 pub fn simulate_with_seed(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Vec<SimulationResult> {
+) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    simulate_inner(model, population, params, n_sim, &mut rng).unwrap_or_else(|e| panic!("{e}"))
+    simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
 /// Options controlling [`simulate_with_options`].

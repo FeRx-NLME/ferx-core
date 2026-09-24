@@ -309,8 +309,8 @@ fn assert_equiv(label: &str, analytical_src: &str, ode_src: &str, pop: &Populati
         .unwrap_or_else(|e| panic!("[{label}] ODE model did not parse: {e}"))
         .model;
 
-    let pa = predict(&an, pop, &an.default_params);
-    let po = predict(&ode, pop, &ode.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let po = predict(&ode, pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
 
@@ -541,7 +541,7 @@ fn assert_ofv_equiv(f: &Family) {
     // real (non-degenerate) residuals to weigh.
     let dose = || vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)];
     let base = population(dose(), obs_t.clone(), oc);
-    let preds = predict(&an, &base, &an.default_params);
+    let preds = predict(&an, &base, &an.default_params).unwrap();
     let mut subjects = Vec::new();
     for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
         let mut s = subject(dose(), obs_t.clone(), oc);

@@ -56,16 +56,19 @@ use std::time::Instant;
 /// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
 /// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
 /// empty vec here — call the matching predictor instead. (CTMM has no predictor at all
-/// yet, so a CTMM model with *no* continuous endpoint is rejected fail-loud below rather
+/// yet, so a CTMM model with *no* continuous endpoint is rejected with an `Err` rather
 /// than returning empty; a mixed continuous + CTMM model still gets its Gaussian rows.)
+///
+/// # Errors
+///
+/// Exactly the `Err` of [`predict_diag`] for the same input: the bare check message `fit()`
+/// gives for that precondition (#898).
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Vec<PredictionResult> {
-    predict_diag(model, population, params)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .results
+) -> Result<Vec<PredictionResult>, String> {
+    predict_diag(model, population, params).map(|out| out.results)
 }
 
 /// The rows [`predict`] returns, plus the diagnostics it discards.

@@ -96,7 +96,8 @@ fn binary_simulate_then_fit_recovers_theta() {
     // MLE sits within ~0.1 of truth while keeping the fit fast.
     let n_sim = 20;
     let sims =
-        ferx_core::simulate_with_seed(&parsed.model, &template, &gen_params, n_sim, 20260720);
+        ferx_core::simulate_with_seed(&parsed.model, &template, &gen_params, n_sim, 20260720)
+            .unwrap();
     assert_eq!(
         sims.len(),
         template

@@ -95,12 +95,12 @@ fn fraction_validation_valid_with_f_and_lagtime() {
         "valid F+lag flagged by fit-check"
     );
     // Must not panic:
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_finite()),
         "non-finite pred with F+lag"
     );
-    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7);
+    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn fraction_error_still_caught_with_f_and_lagtime() {
         has_absorption_err(&model, &pop),
         "fit-check should flag Σ≠1 too"
     );
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 #[test]
@@ -156,12 +156,12 @@ fn fraction_validation_valid_with_time_varying_covariate() {
         !has_absorption_err(&model, &pop),
         "valid TV-cov fraction flagged"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_finite()),
         "non-finite pred with TV-cov"
     );
-    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7);
+    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn fraction_validation_valid_with_iov() {
         !has_absorption_err(&model, &pop),
         "valid IOV fraction flagged"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_finite()),
         "non-finite pred with IOV"

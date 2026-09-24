@@ -208,7 +208,7 @@ fn the_vec_returning_entry_point_panics_on_a_zero_weight() {
     // rows whose variability has been quietly removed.
     let model = weighted_model();
     let pop = population_with_weights(&[0.5, 0.0, 2.0]);
-    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42).unwrap();
 }
 
 #[test]

@@ -102,7 +102,7 @@ fn generate_transit_iov_anchor() {
     };
 
     // Simulate one replicate (BSV + per-occasion IOV kappa + proportional residual).
-    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_719);
+    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_719).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
         subj.observations = sims

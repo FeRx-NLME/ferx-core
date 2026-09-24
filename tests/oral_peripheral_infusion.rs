@@ -32,6 +32,7 @@ fn pop_of(csv: &str) -> Population {
 fn preds(src: &str, csv: &str) -> Vec<f64> {
     let m = parse_full_model(src).expect("model parses").model;
     predict(&m, &pop_of(csv), &m.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()

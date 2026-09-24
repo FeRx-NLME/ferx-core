@@ -16,7 +16,7 @@ use crate::types::{CompiledModel, ModelParameters, Population};
 ///
 /// rRMSE = sqrt( mean( ((pred - obs) / obs)² ) ) for obs > 0.
 fn rrmse(model: &CompiledModel, population: &Population, params: &ModelParameters) -> f64 {
-    let preds = predict(model, population, params);
+    let preds = predict(model, population, params).unwrap();
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
     // population.subjects[i].obs_times.

@@ -204,6 +204,7 @@ fn pop_of(csv: &str) -> Population {
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     let pop = pop_of(csv);
     predict(model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()
@@ -635,6 +636,7 @@ fn analytical_modeled_duration_matches_nonmem_closed_form() {
     // Observation times in OBS_ROWS: 1, 3, 5, 8, 12, 18, 24.
     let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();
@@ -918,7 +920,7 @@ fn predict_on_analytical_model_with_modeled_dose_panics() {
     let model = model_of(ANALYTICAL);
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 #[test]
@@ -929,7 +931,7 @@ fn predict_on_ode_missing_param_panics() {
     // first with the actionable `E_MODELED_DURATION_NO_PARAM` message.
     let model = model_of(ODE_NO_D1);
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 #[test]
@@ -939,7 +941,7 @@ fn simulate_on_analytical_model_with_modeled_dose_panics() {
     // `simulate_inner_with_draw` chokepoint.
     let model = model_of(ANALYTICAL);
     let pop = pop_of(&coded_csv());
-    let _ = simulate(&model, &pop, &model.default_params, 1);
+    let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
 }
 
 #[test]
@@ -974,7 +976,7 @@ fn valid_modeled_dose_predicts_without_panicking() {
     // with the matching `D1` predicts normally (the all-`Fixed` Ok path of the
     // entrypoint guard, and a regression guard that the guard isn't over-eager).
     let model = model_of(ODE_D1);
-    let preds = predict(&model, &pop_of(&coded_csv()), &model.default_params);
+    let preds = predict(&model, &pop_of(&coded_csv()), &model.default_params).unwrap();
     assert!(preds.iter().any(|p| p.pred > 0.1), "expected real uptake");
 }
 
@@ -1109,7 +1111,7 @@ fn modeled_duration_matches_nonmem_closed_form() {
     let model = model_of(ODE_D1);
     let population = read_nonmem_csv(Path::new("data/modeled_duration_ref.csv"), None, None)
         .expect("anchor dataset loads");
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), nonmem_ipred.len(), "prediction count mismatch");
 
     for (p, &(t_ref, nm)) in preds.iter().zip(nonmem_ipred) {

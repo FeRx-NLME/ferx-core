@@ -157,7 +157,7 @@ fn fit_accepts_the_original_repro_now_that_oral_peripheral_infusion_is_supported
         check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
         "oral peripheral infusion is supported since #375"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3);
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
@@ -190,7 +190,7 @@ fn predict_panics_before_reaching_the_event_driven_walk() {
     // with no subject/time context; now the entry-point guard intercepts it.
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&unroutable_infusion_csv());
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn predict_panics_before_reaching_the_event_driven_walk() {
 fn simulate_panics_before_reaching_the_event_driven_walk() {
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&unroutable_infusion_csv());
-    let _ = simulate(&model, &pop, &model.default_params, 1);
+    let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
 }
 
 // ── positive controls: the routable compartments still predict ──
@@ -215,7 +215,7 @@ fn central_and_depot_infusions_still_predict_on_the_event_driven_walk() {
             check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
             "{label} infusion must stay accepted"
         );
-        let preds = predict(&model, &pop, &model.default_params);
+        let preds = predict(&model, &pop, &model.default_params).unwrap();
         assert_eq!(preds.len(), 3, "{label}: one row per observation");
         assert!(
             preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
@@ -270,7 +270,7 @@ fn a_zero_amount_in_range_dose_is_still_accepted() {
         check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
         "an inert AMT=0 row into an existing compartment must not fail the fit"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3);
 }
 
@@ -444,7 +444,7 @@ fn pure_tte_high_cmt_dose_predict_refuses_the_model_blind_load() {
         vec![5.0],
         "model-blind loader keeps the TTE row in obs_times"
     );
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 /// `simulate()` on the same model-blind population. #905 pinned "one row with a NaN
@@ -458,7 +458,7 @@ fn pure_tte_high_cmt_dose_simulate_refuses_the_model_blind_load() {
     let model = model_of(TTE_ONLY);
     let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
     assert_eq!(pop.subjects[0].obs_times, vec![5.0]);
-    let _ = simulate(&model, &pop, &model.default_params, 1);
+    let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
 }
 
 /// `fit()` on the model-blind population. #905's contract was "no panic" with a
@@ -504,7 +504,7 @@ fn pure_tte_high_cmt_dose_is_safe_through_the_routed_loader() {
         pop.subjects[0].obs_times.is_empty(),
         "the TTE row is routed to obs_records, not the Gaussian grid"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert!(
         preds.is_empty(),
         "no Gaussian rows remain to predict on the routed load: {preds:?}"
@@ -522,7 +522,7 @@ fn pure_tte_high_cmt_dose_is_safe_through_the_routed_loader() {
 fn a_gaussian_bearing_subject_on_a_tte_model_still_predicts_finite() {
     let model = model_of(TTE_ONLY);
     let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,1,1\n1,3,4.2,0,.,1,0\n");
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 1);
     assert!(
         preds[0].pred.is_finite() && preds[0].pred > 0.0,
@@ -579,7 +579,7 @@ fn pure_tte_iov_high_cmt_dose_simulates_without_panicking() {
         "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n",
     );
     assert!(pop.subjects[0].obs_times.is_empty());
-    let sim = simulate(&model, &pop, &model.default_params, 1);
+    let sim = simulate(&model, &pop, &model.default_params, 1).unwrap();
     assert_eq!(
         sim.len(),
         1,
@@ -630,6 +630,7 @@ fn a_bolus_into_the_peripheral_is_computed_in_the_peripheral() {
         "a peripheral bolus must stay accepted"
     );
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();
@@ -802,7 +803,7 @@ fn check_model_data_reports_the_out_of_range_ode_dose() {
 fn predict_panics_on_an_ode_dose_past_the_declared_states() {
     let model = model_of(ODE_TWO_STATE);
     let pop = pop_of(&ode_csv(3));
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }
 
 /// Positive control — the check must not be over-broad. Every declared state is
@@ -812,7 +813,7 @@ fn every_declared_ode_state_still_predicts() {
     let model = model_of(ODE_TWO_STATE);
     for cmt in 1..=2 {
         let pop = pop_of(&ode_csv(cmt));
-        let preds = predict(&model, &pop, &model.default_params);
+        let preds = predict(&model, &pop, &model.default_params).unwrap();
         assert_eq!(preds.len(), 3, "cmt {cmt}");
         assert!(
             preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
@@ -829,8 +830,8 @@ fn every_declared_ode_state_still_predicts() {
 #[test]
 fn an_ode_cmt_zero_bolus_predicts_like_cmt_one() {
     let model = model_of(ODE_TWO_STATE);
-    let zero = predict(&model, &pop_of(&ode_csv(0)), &model.default_params);
-    let one = predict(&model, &pop_of(&ode_csv(1)), &model.default_params);
+    let zero = predict(&model, &pop_of(&ode_csv(0)), &model.default_params).unwrap();
+    let one = predict(&model, &pop_of(&ode_csv(1)), &model.default_params).unwrap();
     assert_eq!(zero.len(), one.len());
     assert!(
         one.iter().all(|p| p.pred > 0.0),
@@ -860,8 +861,8 @@ fn an_out_of_range_observation_cmt_is_inert_on_a_form_c_readout() {
     ));
     let normal = pop_of(&ode_csv(1));
 
-    let a = predict(&model, &stray, &model.default_params);
-    let b = predict(&model, &normal, &model.default_params);
+    let a = predict(&model, &stray, &model.default_params).unwrap();
+    let b = predict(&model, &normal, &model.default_params).unwrap();
     assert_eq!(a.len(), b.len());
     assert!(
         b.iter().all(|p| p.pred > 0.0),
@@ -937,8 +938,8 @@ fn an_ode_cmt_zero_dose_into_a_zero_order_compartment_predicts_like_cmt_one() {
              1,6,.,3,.,.,.,1\n1,8,3.0,0,.,1,.,0\n"
         ))
     };
-    let zero = predict(&model, &event_driven(0), &model.default_params);
-    let one = predict(&model, &event_driven(1), &model.default_params);
+    let zero = predict(&model, &event_driven(0), &model.default_params).unwrap();
+    let one = predict(&model, &event_driven(1), &model.default_params).unwrap();
     assert_eq!(zero.len(), one.len());
     // The pre-reset obs (t=1, t=4) must be a live zero-order curve on the CMT=1 control,
     // else a dropped CMT=0 window would agree with it vacuously at all-zero.

@@ -78,7 +78,7 @@ fn predict_matches_nonmem_infusion_into_first_order_absorption() {
         "dataset should contain an infusion (RATE>0) dose"
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time.
     let nonmem: &[(f64, f64)] = &[

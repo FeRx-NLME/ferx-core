@@ -539,17 +539,17 @@ fn vec_returning_wrappers_panic_with_exactly_the_err_text() {
     let want = predict_diag(&model, &pop, params).expect_err("fixture is refused");
 
     assert_eq!(
-        panic_text(|| predict(&model, &pop, params)),
+        panic_text(|| predict(&model, &pop, params).unwrap()),
         want,
         "predict"
     );
     assert_eq!(
-        panic_text(|| simulate(&model, &pop, params, 1)),
+        panic_text(|| simulate(&model, &pop, params, 1).unwrap()),
         want,
         "simulate"
     );
     assert_eq!(
-        panic_text(|| simulate_with_seed(&model, &pop, params, 1, 3)),
+        panic_text(|| simulate_with_seed(&model, &pop, params, 1, 3).unwrap()),
         want,
         "simulate_with_seed"
     );
@@ -591,7 +591,7 @@ fn accepted_model_rows_are_bit_identical_across_the_result_and_vec_forms() {
         let diag = predict_diag(&model, &pop, params)
             .expect("accepted")
             .results;
-        let plain = predict(&model, &pop, params);
+        let plain = predict(&model, &pop, params).unwrap();
         let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
         let direct: Vec<f64> = pop
             .subjects
@@ -614,7 +614,7 @@ fn accepted_model_rows_are_bit_identical_across_the_result_and_vec_forms() {
             ..Default::default()
         };
         let via_result = simulate_with_options(&model, &pop, params, 2, &opts).expect("accepted");
-        let via_vec = simulate_with_seed(&model, &pop, params, 2, 11);
+        let via_vec = simulate_with_seed(&model, &pop, params, 2, 11).unwrap();
         assert_eq!(via_result.len(), 18);
         assert_eq!(via_vec.len(), via_result.len());
         for (a, b) in via_result.iter().zip(&via_vec) {

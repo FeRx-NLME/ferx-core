@@ -78,7 +78,7 @@ fn generate_iiv_on_ruv_anchor() {
         &read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap(),
         5,
     );
-    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 409409);
+    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 409409).unwrap();
     let mut pop = design.clone();
     inject(&mut pop, &sims);
 

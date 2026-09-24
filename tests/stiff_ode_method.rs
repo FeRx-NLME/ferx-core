@@ -122,6 +122,7 @@ fn predictions(fit_options: &str, pop: &Population) -> Vec<(f64, f64)> {
         .unwrap_or_else(|e| panic!("model did not parse: {e}"))
         .model;
     predict(&model, pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| (p.time, p.pred))
         .collect()

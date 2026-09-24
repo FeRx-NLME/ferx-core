@@ -87,7 +87,7 @@ fn reset_occasions_are_not_double_dosed() {
         subj2.obs_times
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // Split predictions by subject id.
     let single: Vec<f64> = preds

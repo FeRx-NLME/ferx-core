@@ -240,7 +240,7 @@ fn a_binary_endpoint_gets_the_same_two_codes() {
 fn predict_panics_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
-    let _ = predict(&m, &u, &m.default_params);
+    let _ = predict(&m, &u, &m.default_params).unwrap();
 }
 
 /// `predict()` on the routed population is unchanged: Gaussian rows only, none of
@@ -249,7 +249,7 @@ fn predict_panics_on_an_unrouted_population() {
 fn predict_on_the_routed_population_returns_the_pk_rows_only() {
     let m = model(JOINT_MODEL);
     let r = routed(&m, JOINT_DATA);
-    let rows = predict(&m, &r, &m.default_params);
+    let rows = predict(&m, &r, &m.default_params).unwrap();
     let n_pk: usize = r.subjects.iter().map(|s| s.obs_times.len()).sum();
     assert!(total_events(&r) > 0);
     assert_eq!(

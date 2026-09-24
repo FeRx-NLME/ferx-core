@@ -359,6 +359,7 @@ fn a_lag_non_finite_only_at_an_observation_is_not_rejected_and_still_predicts() 
     // premise above ("the engine reads a lag at dose snapshots only") is wrong and the
     // snapshot set is the thing to revisit.
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();
@@ -469,6 +470,7 @@ fn a_multi_dose_modeled_regimen_with_every_dose_finite_is_not_rejected() {
             codes(&diags)
         );
         let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect();
@@ -497,6 +499,7 @@ fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
         codes(&diags)
     );
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();
@@ -734,6 +737,7 @@ fn transit_subject(
 
 fn preds(model: &ferx_core::types::CompiledModel, pop: &Population) -> Vec<f64> {
     predict(model, pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -942,5 +946,5 @@ fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observati
     s.dose_covariates = vec![wt(0.0)];
     s.obs_covariates = vec![wt(0.0), wt(10.0)];
     let pop = population(s, &["WT"]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let _ = predict(&model, &pop, &model.default_params).unwrap();
 }

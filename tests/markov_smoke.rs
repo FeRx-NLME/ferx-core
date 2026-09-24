@@ -423,7 +423,7 @@ mod ctmm_smoke {
         use ferx_core::simulate;
         let model = parse_model_string(FIXED_MODEL).unwrap();
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
-        let _ = simulate(&model, &pop, &model.default_params, 1);
+        let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
     }
 
     /// A live CTMM fit must still write an sdtab. CTMM observations are
@@ -464,7 +464,7 @@ mod ctmm_smoke {
         use ferx_core::predict;
         let model = parse_model_string(FIXED_MODEL).unwrap();
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
-        let _ = predict(&model, &pop, &model.default_params);
+        let _ = predict(&model, &pop, &model.default_params).unwrap();
     }
 
     /// #898: on the `Result`-returning entry points the same two CTMM refusals are an `Err`,

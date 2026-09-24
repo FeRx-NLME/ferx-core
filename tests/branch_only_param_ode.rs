@@ -111,8 +111,8 @@ fn assert_branch_matches_top_level(wt: f64) {
         .model;
 
     let pop = population(wt);
-    let pt = predict(&top, &pop, &top.default_params);
-    let pb = predict(&branch, &pop, &branch.default_params);
+    let pt = predict(&top, &pop, &top.default_params).unwrap();
+    let pb = predict(&branch, &pop, &branch.default_params).unwrap();
     assert_eq!(pt.len(), pb.len(), "prediction count mismatch (WT={wt})");
     assert!(!pt.is_empty(), "no predictions produced (WT={wt})");
 
@@ -201,8 +201,8 @@ fn unused_branch_f_does_not_hijack_bioavailability() {
         .model;
 
     let pop = population(80.0);
-    let pt = predict(&top, &pop, &top.default_params);
-    let pf = predict(&with_f, &pop, &with_f.default_params);
+    let pt = predict(&top, &pop, &top.default_params).unwrap();
+    let pf = predict(&with_f, &pop, &with_f.default_params).unwrap();
     assert_eq!(pt.len(), pf.len());
     assert!(!pt.is_empty());
     for (x, y) in pt.iter().zip(pf.iter()) {

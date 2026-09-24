@@ -131,6 +131,7 @@ fn ferx_form_c_time_readout_matches_nonmem_error_block() {
         .model;
 
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();

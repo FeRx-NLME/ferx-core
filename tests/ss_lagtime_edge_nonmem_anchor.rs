@@ -155,6 +155,7 @@ fn ferx_pred_table(model: &str, data: &str) -> Vec<(String, f64, f64)> {
     )
     .expect("the anchor dataset loads");
     ferx_core::predict(&parsed.model, &population, &parsed.model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| (p.id, p.time, p.pred))
         .collect()

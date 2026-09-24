@@ -163,8 +163,8 @@ fn assert_equiv(
         .unwrap_or_else(|e| panic!("[{label}] ode_template model did not parse: {e}"))
         .model;
 
-    let pa = predict(&an, pop, &an.default_params);
-    let pt = predict(&tm, pop, &tm.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let pt = predict(&tm, pop, &tm.default_params).unwrap();
     assert_eq!(pa.len(), pt.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
 
@@ -329,6 +329,7 @@ fn ode_template_user_obs_scale_takes_precedence() {
             .unwrap_or_else(|e| panic!("did not parse: {e}"))
             .model;
         predict(&m, &pop, &m.default_params)
+            .unwrap()
             .into_iter()
             .map(|p| p.pred)
             .collect::<Vec<f64>>()
@@ -401,6 +402,7 @@ fn ode_template_conditional_override_keeps_generated_default() {
             .unwrap_or_else(|e| panic!("did not parse: {e}"))
             .model;
         predict(&m, &pop, &m.default_params)
+            .unwrap()
             .into_iter()
             .map(|p| p.pred)
             .collect::<Vec<f64>>()

@@ -166,7 +166,7 @@ fn simulate_dv(
     template: &Population,
     params: &ferx_core::types::ModelParameters,
 ) -> Population {
-    let sims = simulate_with_seed(model, template, params, 1, 528);
+    let sims = simulate_with_seed(model, template, params, 1, 528).unwrap();
     let mut pop = template.clone();
     // Sims are emitted in (subject, observation) order; refill each subject's
     // observation vector in that order.

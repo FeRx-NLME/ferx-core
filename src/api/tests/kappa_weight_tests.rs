@@ -236,7 +236,7 @@ fn positive_arm_sizes_pass_on_the_simulate_path() {
 fn the_vec_returning_entry_point_panics_on_a_zero_arm_size() {
     let model = weighted_kappa_model();
     let pop = population_with_arm_sizes(&[(1, 200.0), (2, 0.0)]);
-    let _ = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let _ = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42).unwrap();
 }
 
 /// [`population_with_arm_sizes`] plus a bolus at t = 0, so the simulated rows

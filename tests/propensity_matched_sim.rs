@@ -69,7 +69,7 @@ fn template_population(n: usize) -> Population {
 /// population looks like real observed data (needed for posthoc etas).
 fn observed_population(model: &ferx_core::types::CompiledModel, n: usize) -> Population {
     let template = template_population(n);
-    let sim = simulate_with_seed(model, &template, &model.default_params, 1, 42);
+    let sim = simulate_with_seed(model, &template, &model.default_params, 1, 42).unwrap();
     let mut pop = template;
     for subj in pop.subjects.iter_mut() {
         subj.observations = sim
@@ -166,7 +166,7 @@ fn unmatched_options_path_equals_simulate_with_seed() {
         horizon: None,
     };
     let via_opts = simulate_with_options(&model, &pop, &model.default_params, 2, &opts).unwrap();
-    let via_seed = simulate_with_seed(&model, &pop, &model.default_params, 2, 99);
+    let via_seed = simulate_with_seed(&model, &pop, &model.default_params, 2, 99).unwrap();
 
     let dv = |rs: &[ferx_core::SimulationResult]| {
         rs.iter()
