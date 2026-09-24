@@ -1,7 +1,7 @@
 # ferx-core Optimization Task Plan (Updated 2026-05-22)
 
 This file is for use with Claude Code in the `ferx-core` repository.
-Read `CLAUDE.md` first before starting any step.
+Read `AGENTS.md` first before starting any step.
 Complete steps in order — later steps depend on earlier ones.
 Each step specifies the files to touch and the expected outcome — but **the plan
 below is a starting hypothesis, not a fixed recipe**. The actual repository state
@@ -103,7 +103,7 @@ phase. Do not start implementation before the plan is reconciled with reality.**
    silently — if a test will need to change, that's a flag that something
    in the plan is wrong or incomplete.
 
-4. **Check `CLAUDE.md` for relevant constraints**. Specifically the AD-safe
+4. **Check `AGENTS.md` for relevant constraints**. Specifically the AD-safe
    code rules (no `f64::max`/`f64::min` in AD-instrumented code), the
    `FitResult.warnings` convention (no stderr printing), and the test-first
    requirement (every new feature requires a test).
@@ -160,7 +160,7 @@ Only now write code. Implement the updated plan from Phase B.
 1. Make changes file by file.
 2. Run `cargo check` after each file to catch type errors early.
 3. Add tests as you go, not at the end. Follow the three-tier structure from
-   `CLAUDE.md`:
+   `AGENTS.md`:
    - **Tier 1 (unit, `src/`)** — Every new helper function (gradient correctness
      check, budget logic, cache hit/miss, leapfrog step) gets an inline
      `#[cfg(test)] mod tests` block in the same `.rs` file. These must not call
@@ -385,7 +385,7 @@ The function should:
 
 **Critical:** The dual-number path must not call `f64::max()` or `f64::min()`.
 Review every function reachable from the dual-number path and replace with
-explicit comparisons as required by CLAUDE.md.
+explicit comparisons as required by AGENTS.md.
 
 **Sub-task 3b — Replace FD in `build_gn_system`**
 

@@ -465,7 +465,7 @@ fn as_declared(x: f64) -> f64 {
 /// One walk, not two: the guards are applied in exactly one place and record
 /// themselves there, so a mutation of the packing reddens the report with it.
 /// A second walk re-deriving "which coordinates would the guard bind on" is the
-/// two-implementations shape CLAUDE.md warns about — and it would be worse than
+/// two-implementations shape AGENTS.md warns about — and it would be worse than
 /// usual here, since the thing being re-derived is a silent clamp.
 pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec<PackMove>) {
     let mut v = Vec::new();
@@ -2570,7 +2570,7 @@ mod tests {
     /// so the pack silently substitutes the floor, while `value < FLOOR` is
     /// `false` for `NaN` and a `<` predicate would say nothing.
     ///
-    /// This is the same shape CLAUDE.md names for folded accumulators: a
+    /// This is the same shape AGENTS.md names for folded accumulators: a
     /// `f64::max` that swallows the one input most likely to mean something has
     /// gone wrong.
     #[test]

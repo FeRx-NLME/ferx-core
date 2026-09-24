@@ -5517,7 +5517,7 @@ pub(crate) enum ThirdOrderAxes {
 ///   (#1508 review §3).
 ///
 /// One implementation for both, because a second enumeration of the same clause list is
-/// exactly the drift CLAUDE.md's one-implementation rule exists to stop.
+/// exactly the drift AGENTS.md's one-implementation rule exists to stop.
 struct DeclineSink<'a> {
     out: &'a mut Vec<CovScopeDecline>,
     first_only: bool,

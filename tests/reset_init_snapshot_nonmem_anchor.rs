@@ -14,7 +14,7 @@
 //!
 //! * **`Dual2`-vs-FD parity cannot see it.** `sens/ode_provider.rs` mirrors the production
 //!   arm deliberately, so the twin differentiates the same convention the value path uses
-//!   and both sides move together. That is the documented failure mode in CLAUDE.md and
+//!   and both sides move together. That is the documented failure mode in AGENTS.md and
 //!   how #1079 survived.
 //! * **An analytic-vs-ODE twin cannot see it either.** The closed-form walk
 //!   (`pk/event_driven.rs`) zeroes every compartment unconditionally and has no `init(...)`
@@ -26,7 +26,7 @@
 //! `CL = 5` and `V = 50` are plain thetas — **`WT` reaches the prediction only through**
 //! `A_0(1) = THETA(3)*WT`, so a divergence here is the reset re-seed's snapshot and
 //! nothing else. A 100 mg bolus at `t = 4` puts residual drug in the compartment when the
-//! reset arrives at `t = 8`, so the reset's *incoming* side is live (CLAUDE.md's
+//! reset arrives at `t = 8`, so the reset's *incoming* side is live (AGENTS.md's
 //! non-degeneracy rule) — NONMEM's arm B shows `9.3208 → 14.0` across it, i.e. the
 //! residue is genuinely discarded and replaced by the seed, not added to.
 //!

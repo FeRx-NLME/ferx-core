@@ -49,13 +49,13 @@ Goal: match the paper end-to-end on a published dataset; prove the plumbing.
 5. **Parameterization** in [src/estimation/parameterization.rs](src/estimation/parameterization.rs): extend the pack/unpack layout to append NN weights after thetas. NN weights are unbounded (no log transform), unlike thetas. Add a `n_nn_weights` field on `ModelParameters`/`CompiledModel` and update `compute_scale` to scale-1.0 the weight block by default.
 6. **MSE objective** (feature-flagged): in [src/api.rs](src/api.rs) `fit()`, when `method = nn_mse` is set in `[fit_options]`, the population NLL routine is replaced by Σ residual² (no omega, no sigma, etas forced to zero). This is the path that reproduces the paper.
 7. **Outer optimizer**: use the existing built-in BFGS or NLopt LBFGS with FD gradients. No new optimizer in M1.
-8. **Tests** (CLAUDE.md mandates one per feature) in `tests/` modules:
+8. **Tests** (AGENTS.md mandates one per feature) in `tests/` modules:
    - Unit: `MlpMapper::forward` matches a hand-set output for known weights.
    - Unit: `MlpMapper::jacobian` matches central FD to 1e-6.
    - Unit: parser rejects mismatched output count between `[covariate_nn]` outputs and `[structural_model]` PK params.
    - Unit: parser rejects a `[covariate_nn]` reference from inside `[odes]` with an error suggesting `[dynamics_nn]` (and the reverse).
    - Regression: a NN with zero hidden weights and a learned bias reproduces a flat typical-value fit on warfarin.
-9. **Docs**: add `docs/src/model-file/covariate-nn.md` and a shared landing page `docs/src/model-file/neural-networks.md` (decision tree: "known PK + uncertain covariate model → covariate_nn; uncertain dynamics → dynamics_nn"). Link both from `docs/src/SUMMARY.md`; rebuild `docs/book/` per CLAUDE.md.
+9. **Docs**: add `docs/src/model-file/covariate-nn.md` and a shared landing page `docs/src/model-file/neural-networks.md` (decision tree: "known PK + uncertain covariate model → covariate_nn; uncertain dynamics → dynamics_nn"). Link both from `docs/src/SUMMARY.md`; rebuild `docs/book/` per AGENTS.md.
 
 ### M2 — Mixed-effects DCM (the production target, ≈ 1–2 weeks on top of M1)
 
@@ -97,7 +97,7 @@ Triggers only if users hit FD-gradient cost limits.
 | [src/estimation/parameterization.rs](src/estimation/parameterization.rs) | pack/unpack NN weights after thetas; unscaled bounds-free block |
 | [src/api.rs](src/api.rs) | `method = nn_mse` shortcut for fixed-effects sanity check |
 | `examples/warfarin_nn.ferx` | new example, M2 deliverable |
-| `docs/src/model-file/covariate-nn.md` + `docs/src/model-file/neural-networks.md` (landing) + `docs/src/SUMMARY.md` | docs (CLAUDE.md requirement) |
+| `docs/src/model-file/covariate-nn.md` + `docs/src/model-file/neural-networks.md` (landing) + `docs/src/SUMMARY.md` | docs (AGENTS.md requirement) |
 | `docs/_site/` | rebuilt via `quarto render docs` (git-ignored, never committed) |
 
 ## Reusing what's already there
@@ -156,7 +156,7 @@ The Bräm method is unusually well-aligned with what's in ferx-core today:
 - **FOCEI inner loop** in [src/estimation/inner_optimizer.rs](src/estimation/inner_optimizer.rs) does not care whether parameters are PK or NN-weight; it just optimizes etas against the individual NLL.
 - **`ad/` Enzyme path** already differentiates through the ODE solver (that's what it does today for analytical etas in `tv * exp(eta)` form). For additive etas on NN weights, the same forward-mode AD applies — the chain rule terminates inside the ODE RHS evaluator regardless of how complicated the expression is.
 
-The CLAUDE.md note about avoiding `f64::max()` / `f64::min()` in AD-instrumented code is directly relevant: Bräm hits the same NONMEM-side issue and implements ReLU as `if x > 0 { x } else { 0.0 }`. That's exactly the form ferx-core already mandates — so the AD-safety story for ReLU is solved by construction.
+The AGENTS.md note about avoiding `f64::max()` / `f64::min()` in AD-instrumented code is directly relevant: Bräm hits the same NONMEM-side issue and implements ReLU as `if x > 0 { x } else { 0.0 }`. That's exactly the form ferx-core already mandates — so the AD-safety story for ReLU is solved by construction.
 
 ## What needs adding
 
@@ -217,7 +217,7 @@ This is purely orchestration in [src/api.rs](src/api.rs) `fit()` — both phases
 
 ### B4 — Tests + docs + example (≈ 2 days)
 
-CLAUDE.md mandates one test per feature.
+AGENTS.md mandates one test per feature.
 
 - Unit: parser accepts `[dynamics_nn]` block, allocates correct theta count, `iiv = additive` auto-emits matching omegas, mu-ref detection treats NN weights as additive-eta parameters.
 - Unit: parser rejects `[dynamics_nn]` referenced from `[individual_parameters]` with an error pointing to `[covariate_nn]`, and the reverse.
@@ -248,7 +248,7 @@ CLAUDE.md mandates one test per feature.
 - `EtaParamType::Additive` (used elsewhere in the parser) — same.
 - `[odes]` block parser and Dormand-Prince solver — unchanged.
 - FOCEI inner loop and Enzyme-AD path — unchanged. The AD path already differentiates through the ODE solver, so additive-eta NN weights inside an ODE RHS are differentiable end-to-end without any new AD wiring.
-- The ReLU-via-`if` style is already mandated for AD-safe code in CLAUDE.md.
+- The ReLU-via-`if` style is already mandated for AD-safe code in AGENTS.md.
 
 ## Verification
 
@@ -263,7 +263,7 @@ End-to-end checks, in order:
 
 ## Open questions
 
-- **Identifiability and standard errors**: Bräm explicitly omits std errors for NN weights because units are interchangeable. ferx-core's covariance estimation in `outer_optimizer.rs` will likely produce ill-conditioned Hessians and may fail or emit warnings. Decision: auto-disable `covariance = true` when `[dynamics_nn]` blocks are present (with a `FitResult.warnings` entry per the CLAUDE.md convention). This is `[dynamics_nn]`-scoped only — `[covariate_nn]` weights are reasonably identifiable and standard covariance estimation should keep working there.
+- **Identifiability and standard errors**: Bräm explicitly omits std errors for NN weights because units are interchangeable. ferx-core's covariance estimation in `outer_optimizer.rs` will likely produce ill-conditioned Hessians and may fail or emit warnings. Decision: auto-disable `covariance = true` when `[dynamics_nn]` blocks are present (with a `FitResult.warnings` entry per the AGENTS.md convention). This is `[dynamics_nn]`-scoped only — `[covariate_nn]` weights are reasonably identifiable and standard covariance estimation should keep working there.
 - **VPC behavior**: Bräm flags that conventional VPCs are unreliable for NODEs (ReLU-discontinuity + non-identifiable weights → unrealistic simulated trajectories). They propose conditional-distribution sampling instead. ferx-core does not currently produce VPCs in the engine (downstream tooling does), so this surfaces as a docs warning rather than code, but worth noting.
 - **Time-dependent NN scope**: only needed for absorption-with-delay and similar patterns. Worth shipping in B1 but small; if it bloats, push to a B5.
 - **Mixing NN and mechanistic in one RHS**: the natural composition (`d/dt(central) = nn(central) - CL/V * central`) Just Works under the proposed design. No special-casing needed — `nn(...)` is just one more expression node.
@@ -315,7 +315,7 @@ Dynamics neural networks substantially increase fit time and reduce parameter id
 Expect 10–100× slowdown vs classical PK and no standard errors for NN weights (Bräm et al. 2025).
 ```
 
-Per CLAUDE.md the warning is also surfaced by the CLI layer. Sets expectations before the user thinks ferx-core is hanging. `[covariate_nn]` does not trigger this warning — DCM runs at roughly classical speed.
+Per AGENTS.md the warning is also surfaced by the CLI layer. Sets expectations before the user thinks ferx-core is hanging. `[covariate_nn]` does not trigger this warning — DCM runs at roughly classical speed.
 
 ### Covariance auto-disable scoped to `[dynamics_nn]`
 

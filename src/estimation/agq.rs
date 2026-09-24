@@ -1576,7 +1576,7 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
     // correct. A `FIX`ed block is unaffected: its ρ carries no free coordinate to miss.
     //
     // Extending the score with a ρ block is tracked in #1216 alongside the estimator-threading
-    // work; until then this is the loud fallback CLAUDE.md asks a scope gap to take.
+    // work; until then this is the loud fallback AGENTS.md asks a scope gap to take.
     !model
         .default_params
         .residual_correlation_fixed

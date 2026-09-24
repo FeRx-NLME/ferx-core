@@ -1493,7 +1493,7 @@ fn iov_families(
         .collect()
 }
 
-/// `Dual2`-vs-FD parity for the **IOV** ELBO gradient (CLAUDE.md's rule applied to the
+/// `Dual2`-vs-FD parity for the **IOV** ELBO gradient (AGENTS.md's rule applied to the
 /// gradient path §10.2b introduced).
 ///
 /// The oracle in `elbo_oracle.rs` checks the ELBO's *value* against a known answer; this

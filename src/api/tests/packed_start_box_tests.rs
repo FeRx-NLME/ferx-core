@@ -2,7 +2,7 @@
 //! outside its own box and is silently clamped onto it (#1251).
 //!
 //! Each test names the regression it exists to catch, and the mutation that
-//! must redden it is recorded in the PR. Four shapes CLAUDE.md warns about are
+//! must redden it is recorded in the PR. Four shapes AGENTS.md warns about are
 //! handled explicitly here:
 //!
 //! * The equality case asserts the **mechanism** (`packed == bound`, so the

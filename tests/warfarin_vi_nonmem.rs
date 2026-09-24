@@ -1,5 +1,5 @@
 //! NONMEM 7.5.1 `METHOD=COND INTERACTION` (FOCEI) cross-check for `method = vi`
-//! — Anchor D of `VI_VALIDATION.md`, and the CLAUDE.md "compare with NONMEM"
+//! — Anchor D of `VI_VALIDATION.md`, and the AGENTS.md "compare with NONMEM"
 //! deliverable for the VI estimator.
 //!
 //! Runs ferx FOCEI, AGQ(9) and VI on warfarin and asserts all three land on

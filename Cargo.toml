@@ -68,7 +68,6 @@ exclude = [
   ".github/*",
   ".githooks/*",
   "AGENTS.md",
-  "CLAUDE.md",
   "SDLC.md",
   "VI_VALIDATION.md",
   "codecov.yml",

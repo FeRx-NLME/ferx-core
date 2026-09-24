@@ -22,7 +22,7 @@
 //! the late observations.
 //!
 //! Gated with `slow-tests` so it runs nightly but is compile-checked on every PR
-//! per CLAUDE.md tiering (Tier-3 "runs fit() to convergence").
+//! per AGENTS.md tiering (Tier-3 "runs fit() to convergence").
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv};

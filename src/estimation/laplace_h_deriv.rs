@@ -213,7 +213,7 @@ pub(crate) fn subject_h_inner_dx(
     // `core.ruv` and every `core.et[..].censored` are already excluded by the
     // `residual_error_eta` / M3-censored checks above — `score_core` derives both directly
     // from those same two model/subject facts, so a second gate here would be redundant
-    // rather than defensive (CLAUDE.md: "two redundant gates cover for each other"). Assert
+    // rather than defensive (AGENTS.md: "two redundant gates cover for each other"). Assert
     // the equivalence instead of re-testing it, so a future `score_core` change that adds a
     // new path to either flag fails loudly here rather than silently degrading `dH/dx`.
     debug_assert!(

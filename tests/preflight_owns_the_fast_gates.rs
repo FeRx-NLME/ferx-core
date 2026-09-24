@@ -744,7 +744,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     //
     // A blanket over EVERY group, not one loop for `clippy` and one for `docs`. Those two
     // rejected exactly the same inputs a single loop does — the two-gates-covering-for-
-    // each-other shape CLAUDE.md calls a test hole, since deleting either left the suite
+    // each-other shape AGENTS.md calls a test hole, since deleting either left the suite
     // green — and being group-scoped they left a `cargo clippy` landing in `check`, `fmt`
     // or `public-api` asserting nothing (`rustdoc` and `docs` have their own blanket loops,
     // `debug-assertions` and `release-semantics` demand `cargo test `). Measured: a clippy

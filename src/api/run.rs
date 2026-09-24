@@ -88,7 +88,7 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 /// - Both given and equal (see `paths_equivalent`) → the shared path, no
 ///   warning.
 /// - Both given and different → `external_path` wins; a warning is returned
-///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the
+///   (not printed — see "Warning and Error Conventions" in AGENTS.md) for the
 ///   caller to attach to `FitResult.warnings` or a `ferx check` diagnostic.
 pub fn resolve_data_path(
     model_data_path: Option<&str>,

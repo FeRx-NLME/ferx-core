@@ -231,7 +231,7 @@ fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
 /// second dose would give `0.002` and `0.240`: every record after `t = 48` short by `H(48)`.
 /// The straddle is asserted below so the arm cannot quietly stop discriminating.
 ///
-/// Non-degenerate on the incoming side, which is what the dose-event rule in CLAUDE.md
+/// Non-degenerate on the incoming side, which is what the dose-event rule in AGENTS.md
 /// requires: the reference's own `IPRED` reads `4.83708578` at `t = 47.9` against `4.78896241`
 /// at the dose times, so drug from the preceding interval is genuinely present when the second
 /// dose lands — never the `g(x-) = 0` of a first dose.
