@@ -157,10 +157,10 @@ on the natural scale, no log transform. Biases initialise to 0.
 | `exp`              | `f(x) = exp(x)`           | Strictly positive, but unbounded; prefer `softplus` |
 
 All activations use `if`/`else` instead of `f64::max`/`f64::min` so they remain
-differentiable under the `Dual2` sensitivity type (see [CLAUDE.qmd] →
+differentiable under the `Dual2` sensitivity type (see [AGENTS.md] →
 "Analytic Sensitivities").
 
-[CLAUDE.qmd]: https://github.com/FeRx-NLME/ferx-core/blob/main/CLAUDE.md
+[AGENTS.md]: https://github.com/FeRx-NLME/ferx-core/blob/main/AGENTS.md
 
 ## Mu-ref composition with etas
 

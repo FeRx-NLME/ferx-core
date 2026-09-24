@@ -96,7 +96,7 @@ fn snap(crcl: f64, wt: f64) -> HashMap<String, f64> {
 
 /// Multi-dose IV subject whose `CRCL` drifts across every record (dose rows included), so
 /// the network output changes at every event, and later doses land with residual drug
-/// present — the incoming side of each dose event is live, per CLAUDE.md's
+/// present — the incoming side of each dose event is live, per AGENTS.md's
 /// non-degeneracy rule. `WT` stays put.
 fn tv_subject() -> Subject {
     let obs_times = vec![1.0, 6.0, 13.0, 20.0, 30.0];

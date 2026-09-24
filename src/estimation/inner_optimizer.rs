@@ -299,7 +299,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
 /// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
 /// population: all-analytic needs no warning, and all-FD is a model-level property
 /// already obvious from the banner and the model itself. Surfaced into
-/// `FitResult.warnings` per the CLAUDE.md convention that non-fatal issues go
+/// `FitResult.warnings` per the AGENTS.md convention that non-fatal issues go
 /// through `warnings`, not the startup banner alone.
 ///
 /// Uses the actual light provider at the prior mode (`η = 0`) so it catches the

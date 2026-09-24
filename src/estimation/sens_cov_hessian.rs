@@ -6225,7 +6225,7 @@ mod tests {
         subject
     }
 
-    /// The multi-dose half of the kink anchor (CLAUDE.md's non-degeneracy rule for a
+    /// The multi-dose half of the kink anchor (AGENTS.md's non-degeneracy rule for a
     /// dose-event fixture). A single-dose subject cannot see a defect on the *incoming* side of
     /// an arrival — the state is zero before a first dose, so the pre-arrival jet is zero and
     /// any error there cancels — and it cannot see a defect in how the enumerator indexes a

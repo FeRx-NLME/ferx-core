@@ -2913,7 +2913,7 @@ mod regularization_tests {
 /// These live in `src/` rather than `tests/` because they reach for
 /// [`NnRegularizer`] and [`MlpMapper::weight_param_indices`], which are
 /// `pub(crate)`: the estimation layer is their only caller, and the workspace
-/// boundary rule (CLAUDE.md) says an item is either public API — documented, in
+/// boundary rule (AGENTS.md) says an item is either public API — documented, in
 /// `api/ferx-core-public-api.txt`, reachable from ferx-r — or it stays
 /// crate-private and the caller does without. A test is not a reason to widen
 /// the surface. What genuinely exercises the *public* path (driving `nn_l2` /
@@ -3123,7 +3123,7 @@ mod regularizer_fit_tests {
     /// this null-covariate dataset the unregularized fit invents a large spurious
     /// CL modulator variance — precisely the overfitting
     /// `nn_l2` exists to suppress — and L2 collapses it to ~0. Asserting both ends
-    /// keeps the oracle non-degenerate in the sense CLAUDE.md requires: an
+    /// keeps the oracle non-degenerate in the sense AGENTS.md requires: an
     /// assertion that the regularized modulator is flat is worthless if the
     /// unregularized one was flat too. It was, on raw inputs, because the network
     /// was saturated rather than because it had learned nothing — see the

@@ -524,7 +524,7 @@ const ONECPT_ODE_INIT_READS_ORDINARY: &str = r#"
 /// bolus and the `∂/∂lag` on the event-time saltation. Those contributions had never
 /// had to compose, because the parser rejected every model that would make them.
 ///
-/// Per CLAUDE.md, a newly reachable analytic-sensitivity path needs a `Dual2`-vs-FD
+/// Per AGENTS.md, a newly reachable analytic-sensitivity path needs a `Dual2`-vs-FD
 /// parity test — the code was not edited, but the set of models that can reach it was
 /// widened, and a wrong composition here would compile, run, and silently return a bad
 /// gradient. Both fixtures put IIV on the attribute so the seed varies with η as well
@@ -552,7 +552,7 @@ fn ode_provider_init_reading_a_dose_attribute_matches_fd() {
         ),
     ] {
         let model = parse_model_string(src).unwrap_or_else(|e| panic!("{label}: parse: {e}"));
-        // The routing half of the CLAUDE.md rule: if one of these ever falls out of
+        // The routing half of the AGENTS.md rule: if one of these ever falls out of
         // analytic scope it must do so loudly here rather than quietly returning a
         // FOCE-shaped gradient from a path that no longer models the seed.
         assert!(
@@ -3723,7 +3723,7 @@ fn ode_provider_ss_linear_bolus_uses_exact_solve() {
     );
 
     // Value + ∂/∂η + ∂/∂θ vs the production predictor, and both Hessian blocks vs FD-of-gradient
-    // — the Dual2-vs-FD parity CLAUDE.md requires for the new exact-solve sensitivity path.
+    // — the Dual2-vs-FD parity AGENTS.md requires for the new exact-solve sensitivity path.
     check_vs_production(&model, &subject, &theta, &eta);
     check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
@@ -5596,7 +5596,7 @@ const ONECPT_IV_INIT_WTV_ODE_IOV: &str = r#"
 ///
 /// `check_vs_production` is the oracle that bites here: it FDs the production predictor,
 /// so a twin that mirrors a stale arm fails on the value comparison before the derivative
-/// one. (The reverse — both sides sharing a wrong convention — is the blind spot CLAUDE.md
+/// one. (The reverse — both sides sharing a wrong convention — is the blind spot AGENTS.md
 /// records, and it is why the value path itself is anchored against NONMEM in
 /// `tests/reset_init_snapshot_nonmem_anchor.rs` rather than against this twin.)
 #[test]
@@ -8665,7 +8665,7 @@ const THREE_STATE_BINDING_AUTO: &str = r#"
   ode_abstol = 1e-12
 "#;
 
-/// CLAUDE.md's `Dual2`-vs-FD rule, applied to the stepper `ode_method = auto` switches into
+/// AGENTS.md's `Dual2`-vs-FD rule, applied to the stepper `ode_method = auto` switches into
 /// (#978).
 ///
 /// `auto` is resolved inside the drivers, so the `T = Dual2` sensitivity solve and the
@@ -10109,7 +10109,7 @@ fn ode_tad_rhs_zero_order_end_inside_a_covariate_step_matches_production() {
 /// decline **at the scope gate**, so the caller drops to FD rather than reaching a dual SS
 /// equilibration that has no accumulator handling (#1210).
 ///
-/// This is the routing CLAUDE.md requires to be unit-tested: a scope gap here does not fail
+/// This is the routing AGENTS.md requires to be unit-tested: a scope gap here does not fail
 /// loudly, it silently returns a jet in which the run-in's hazard has been cycled into
 /// `d/deta` exactly as the f64 path did before #1210.
 ///

@@ -29,7 +29,7 @@
 //! two. The cross term `2·IPRED·ρ·σ₁·σ₂` is a twentieth of the diagonal there,
 //! so the entire ρ = 0.995 → 0.999 effect is 0.012 OFV, while this fixture's own
 //! FOCE-vs-NONMEM baseline gap is 0.005–0.02 — an oracle measuring itself, in
-//! exactly the way CLAUDE.md's "the oracle has to be more accurate than the
+//! exactly the way AGENTS.md's "the oracle has to be more accurate than the
 //! difference you are about to call a defect" warns about.
 //!
 //! The fix is to make ρ bite. With `σ_prop = 0.03`, `σ_prop·IPRED` (0.12–0.30

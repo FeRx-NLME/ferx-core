@@ -395,7 +395,7 @@ mod tests {
     use super::*;
     use crate::api::fit_from_files;
 
-    // In-tree warfarin example + data (see CLAUDE.md). Tests run from the crate
+    // In-tree warfarin example + data (see AGENTS.md). Tests run from the crate
     // root, so relative paths work directly.
     const MODEL_PATH: &str = "examples/warfarin.ferx";
     const DATA_PATH: &str = "data/warfarin.csv";

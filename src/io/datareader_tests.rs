@@ -2991,7 +2991,7 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
     // The standalone `!w.contains('\u{2028}')` that used to sit here was deleted: the
     // loop below already rejects that character, and two gates excluding the same
     // input are a test hole rather than belt-and-braces — deleting either left the
-    // suite green, so neither could fail alone (CLAUDE.md, "two redundant gates cover
+    // suite green, so neither could fail alone (AGENTS.md, "two redundant gates cover
     // for each other").
     assert!(
         w.contains("p\u{fffd}q"),

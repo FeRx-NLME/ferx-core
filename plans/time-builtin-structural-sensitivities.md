@@ -96,7 +96,7 @@ FD-comparison harnesses (analytic dual provider vs central FD of the production 
   paths still on FD, and add a direct-`pk(...=TIME)` mapping twin.
 - f64 oracle already exists: `test_event_pk_params_time_builtin_uses_event_times*` (`pk/mod.rs:2067`).
 
-## NONMEM comparison (required by CLAUDE.md)
+## NONMEM comparison (required by AGENTS.md)
 
 Fit a model with a NONMEM-style time-dependent θ switch (`IF (TIME.GE.45) CL=...`) in ferx vs
 NONMEM `METHOD=1 INTER`; record OFV + parameter + SE agreement in the PR.

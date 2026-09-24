@@ -12,7 +12,7 @@
 //!  -- --ignored --nocapture` to regenerate.
 //!
 //! Gated with `slow-tests` so it runs nightly but is compile-checked on
-//! every PR per CLAUDE.md tiering. The slow-tests gate matches the
+//! every PR per AGENTS.md tiering. The slow-tests gate matches the
 //! Tier-3 "runs fit() to convergence" classification.
 
 use ferx_core::parser::model_parser::parse_full_model;

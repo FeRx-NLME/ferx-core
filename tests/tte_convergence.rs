@@ -2,7 +2,7 @@
 //!
 //! Gated behind BOTH `survival` (the TTE feature) and `slow-tests` (these run a
 //! full fit to convergence, so they are skipped on the per-PR `Test` job and run
-//! nightly via `slow-tests.yml` — see the test-tier rules in CLAUDE.md).
+//! nightly via `slow-tests.yml` — see the test-tier rules in AGENTS.md).
 //!
 //! Two kinds of guard:
 //!
@@ -1302,7 +1302,7 @@ const RTTE_SIM_ANCHOR_CSV: &str = concat!(
     "/tests/reference/rtte_exponential_sim/rtte_sim.csv"
 );
 
-/// **Slice 3.3 cross-tool simulation anchor** (the external, CLAUDE.md-required leg).
+/// **Slice 3.3 cross-tool simulation anchor** (the external, AGENTS.md-required leg).
 /// ferx *simulated* `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects,
 /// truth TVLAMBDA = 0.15, ω² = 0.09, horizon = 20; via `cargo run --bin rtte_sim_anchor
 /// --features survival`). Here ferx **and NONMEM** both *fit* that ferx-simulated file:

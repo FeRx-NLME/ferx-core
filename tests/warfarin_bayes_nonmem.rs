@@ -3,7 +3,7 @@
 //! Runs ferx `method = bayes` (Gibbs-within-HMC) standalone on warfarin and
 //! asserts the posterior means match NONMEM's `METHOD=BAYES` reference on the
 //! same model/data. Bayes is parity-targeted at NONMEM BAYES, so the anchor is
-//! NONMEM itself (CLAUDE.md cross-engine validation for a new estimator).
+//! NONMEM itself (AGENTS.md cross-engine validation for a new estimator).
 //!
 //! Gated behind `slow-tests` (runs a multi-thousand-sweep MCMC); skipped in the
 //! default PR job, run nightly via `slow-tests.yml`.

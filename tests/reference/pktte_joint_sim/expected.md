@@ -60,7 +60,7 @@ NONMEM anchor is recorded reference (NONMEM is licensed and cannot run in CI).
 ## nlmixr2 / rxode2
 
 Not included in this *simulation* anchor. NONMEM is the external comparator here (the
-CLAUDE.md numerical-feature requirement reads "vs NONMEM `$SIM` or rxode2"), and nlmixr2
+AGENTS.md numerical-feature requirement reads "vs NONMEM `$SIM` or rxode2"), and nlmixr2
 already appears in the Slice 2.1 **fit** anchor (`../pktte_joint/expected.md`). A ready
 `rxode2_sim.R` can be added wherever rxode2's model JIT is healthy (it was locally broken at
 authoring time — an rxode2/R-4.5.2 ABI issue, not a toolchain one: a plain `R CMD SHLIB`

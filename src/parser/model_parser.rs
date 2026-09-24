@@ -4015,7 +4015,7 @@ pub fn parse_full_model_with(
     // gradient.
     //
     // Recorded rather than rejected, so the model still fits — it just takes the
-    // per-θ FD path, per the CLAUDE.md rule that a scope gap must route to FD
+    // per-θ FD path, per the AGENTS.md rule that a scope gap must route to FD
     // through a support predicate instead of returning a wrong gradient.
     #[cfg(feature = "nn")]
     {
@@ -16900,7 +16900,7 @@ fn error_model_form_list() -> String {
 ///
 /// One gate, hoisted above every path, rather than teaching each path the same
 /// rule: three copies of a predicate that reject the same inputs is a test hole,
-/// not belt-and-braces (CLAUDE.md, and #1229 is the case that made the rule).
+/// not belt-and-braces (AGENTS.md, and #1229 is the case that made the rule).
 ///
 /// The "is the head complete?" test is [`parse_error_model_inner`] itself — the
 /// real parser, so every form it accepts is covered by construction and a form
@@ -19092,7 +19092,7 @@ thread_local! {
 /// [`IndivParamProgram`], which carries statements and layout but no network — so
 /// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
 /// slice and pushed **0.0**. An NN output silently read as zero is precisely the
-/// class of defect CLAUDE.md's routing rule exists to prevent, and it was reachable
+/// class of defect AGENTS.md's routing rule exists to prevent, and it was reachable
 /// the moment any gate stopped excluding `[covariate_nn]` models from a
 /// program-driven analytic path.
 ///
