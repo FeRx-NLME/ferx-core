@@ -15,8 +15,15 @@ use crate::types::{CompiledModel, ModelParameters, Population};
 /// observed concentrations, pooled across all subjects.
 ///
 /// rRMSE = sqrt( mean( ((pred - obs) / obs)² ) ) for obs > 0.
-fn rrmse(model: &CompiledModel, population: &Population, params: &ModelParameters) -> f64 {
-    let preds = predict(model, population, params).unwrap();
+///
+/// `Err` is `predict()`'s precondition refusal, passed up so `inits_from_nca` returns it
+/// rather than panicking mid-sweep (#898).
+fn rrmse(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Result<f64, String> {
+    let preds = predict(model, population, params)?;
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
     // population.subjects[i].obs_times.
@@ -35,11 +42,11 @@ fn rrmse(model: &CompiledModel, population: &Population, params: &ModelParameter
         }
     }
 
-    if n == 0 {
+    Ok(if n == 0 {
         f64::INFINITY
     } else {
         (sum_sq / n as f64).sqrt()
-    }
+    })
 }
 
 /// Build a log-space grid of `n_pts` values centred on `centre`,
@@ -60,6 +67,8 @@ fn log_grid(centre: f64, factor: f64, n_pts: usize) -> Vec<f64> {
 ///
 /// For each (a, b) grid point, evaluates rRMSE via `predict()` (etas=0) and
 /// returns the params with the best-found values.  Parallelised with rayon.
+///
+/// `Err` is the first `predict()` refusal on the grid (#898).
 pub fn sweep_slots(
     model: &CompiledModel,
     population: &Population,
@@ -69,7 +78,7 @@ pub fn sweep_slots(
     n_pts: usize,
     factor: f64,
     label: &str,
-) -> (ModelParameters, Vec<String>) {
+) -> Result<(ModelParameters, Vec<String>), String> {
     let mut warnings = Vec::new();
 
     let idx_a = find_theta_for_slot(model, slot_a);
@@ -79,7 +88,7 @@ pub fn sweep_slots(
         warnings.push(format!(
             "inits_from_nca (nca_sweep): could not locate theta indices for {label} sweep (PK slots {slot_a}/{slot_b}); keeping current estimates"
         ));
-        return (base.clone(), warnings);
+        return Ok((base.clone(), warnings));
     };
 
     let grid_a = log_grid(base.theta[ia], factor, n_pts);
@@ -98,7 +107,7 @@ pub fn sweep_slots(
             trial.theta[ib] = b.clamp(base.theta_lower[ib], base.theta_upper[ib]);
             rrmse(model, population, &trial)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let best = rrmses
         .iter()
@@ -112,7 +121,7 @@ pub fn sweep_slots(
     result.theta[ia] = best_a.clamp(base.theta_lower[ia], base.theta_upper[ia]);
     result.theta[ib] = best_b.clamp(base.theta_lower[ib], base.theta_upper[ib]);
 
-    (result, warnings)
+    Ok((result, warnings))
 }
 
 /// Sweep all thetas in `targets` (by theta index) sequentially via 1D coordinate
@@ -130,9 +139,9 @@ pub fn sweep_unwritten_thetas(
     targets: &[usize],
     n_pts: usize,
     factor: f64,
-) -> (ModelParameters, Vec<String>) {
+) -> Result<(ModelParameters, Vec<String>), String> {
     if targets.is_empty() {
-        return (base.clone(), Vec::new());
+        return Ok((base.clone(), Vec::new()));
     }
 
     let mut current = base.clone();
@@ -156,7 +165,7 @@ pub fn sweep_unwritten_thetas(
                 trial.theta[idx] = val.clamp(current.theta_lower[idx], current.theta_upper[idx]);
                 rrmse(model, population, &trial)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let best = rrmses
             .iter()
@@ -168,7 +177,7 @@ pub fn sweep_unwritten_thetas(
         current.theta[idx] = grid[best].clamp(current.theta_lower[idx], current.theta_upper[idx]);
     }
 
-    (current, warnings)
+    Ok((current, warnings))
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +396,7 @@ mod tests {
             exclusions: None,
             warnings: vec![],
         };
-        let r = rrmse(&model, &empty_pop, &model.default_params);
+        let r = rrmse(&model, &empty_pop, &model.default_params).unwrap();
         assert!(
             r.is_infinite() && r > 0.0,
             "empty population must give +∞ rRMSE, got {r}"
@@ -439,7 +448,8 @@ mod tests {
             9,
             10.0,
             "CL/Q (synthetic)",
-        );
+        )
+        .unwrap();
         assert_eq!(
             out.theta, base.theta,
             "missing slot must leave base unchanged"
@@ -463,7 +473,8 @@ mod tests {
     fn test_sweep_unwritten_thetas_empty_targets_noop() {
         let (model, population) = warfarin();
         let base = model.default_params.clone();
-        let (out, warnings) = sweep_unwritten_thetas(&model, &population, &base, &[], 9, 10.0);
+        let (out, warnings) =
+            sweep_unwritten_thetas(&model, &population, &base, &[], 9, 10.0).unwrap();
         assert_eq!(out.theta, base.theta);
         assert!(warnings.is_empty());
     }
@@ -475,7 +486,8 @@ mod tests {
         let (model, population) = warfarin();
         let mut base = model.default_params.clone();
         base.theta[0] = 0.0; // force a non-positive theta in slot 0
-        let (out, warnings) = sweep_unwritten_thetas(&model, &population, &base, &[0], 9, 10.0);
+        let (out, warnings) =
+            sweep_unwritten_thetas(&model, &population, &base, &[0], 9, 10.0).unwrap();
         assert_eq!(out.theta[0], 0.0, "non-positive theta must not be touched");
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -592,7 +604,7 @@ mod tests {
         base.theta[theta_idx] = 0.0;
         let theta_name = base.theta_names[theta_idx].clone();
         let (_, warnings) =
-            sweep_unwritten_thetas(&model, &population, &base, &[theta_idx], 5, 5.0);
+            sweep_unwritten_thetas(&model, &population, &base, &[theta_idx], 5, 5.0).unwrap();
         assert!(
             warnings.iter().any(|w| w.contains(&theta_name)),
             "warning must interpolate the theta name '{theta_name}', got: {warnings:?}"

@@ -409,21 +409,23 @@ mod survival_smoke {
         assert!(err.contains("CRCL"), "error must name the covariate: {err}");
     }
 
-    /// `predict()` panics on the same combination — the non-`fit` entry points cannot
+    /// `predict()` errs on the same combination — the non-`fit` entry points cannot
     /// honour a silently-frozen hazard either (#741).
     #[test]
-    #[should_panic(expected = "#741")]
-    fn tv_cov_hazard_predict_panics() {
+    fn tv_cov_hazard_predict_errs() {
         let (model, pop) = tv_cov_hazard_model_and_pop();
-        let _ = ferx_core::predict(&model, &pop, &model.default_params).unwrap();
+        let err = ferx_core::predict(&model, &pop, &model.default_params)
+            .expect_err("predict() must refuse this input");
+        assert!(err.contains("#741"), "unexpected Err: {err}");
     }
 
-    /// `simulate()` panics on the same combination for the same reason (#741).
+    /// `simulate()` errs on the same combination for the same reason (#741).
     #[test]
-    #[should_panic(expected = "#741")]
-    fn tv_cov_hazard_simulate_panics() {
+    fn tv_cov_hazard_simulate_errs() {
         let (model, pop) = tv_cov_hazard_model_and_pop();
-        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0).unwrap();
+        let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0)
+            .expect_err("simulate_with_seed() must refuse this input");
+        assert!(err.contains("#741"), "unexpected Err: {err}");
     }
 
     /// `predict_survival()` refuses too — the survival curves read the hazard at the
@@ -3809,13 +3811,14 @@ mod survival_smoke {
     }
 
     #[test]
-    #[should_panic(expected = "horizon")]
-    fn simulate_seed_ode_hazard_panics() {
-        // The Vec-returning convenience entry can't signal an Err, so an
-        // ODE-accumulated TTE model without a horizon panics at the shared
-        // validation chokepoint rather than emitting wrong / no TTE rows.
+    fn simulate_seed_ode_hazard_errs() {
+        // The seeded convenience entry reaches the horizon check only at the
+        // shared validation chokepoint: an ODE-accumulated TTE model without a
+        // horizon is an `Err` there rather than wrong / no TTE rows.
         let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
         let pop = joint_pktte_pop();
-        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
+        let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7)
+            .expect_err("simulate_with_seed() must refuse this input");
+        assert!(err.contains("horizon"), "unexpected Err: {err}");
     }
 }

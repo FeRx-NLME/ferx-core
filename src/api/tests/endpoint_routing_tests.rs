@@ -236,11 +236,11 @@ fn a_binary_endpoint_gets_the_same_two_codes() {
 /// `predict()` returned a concentration for the event row; it now panics, per its
 /// precondition convention (#898), naming the loader.
 #[test]
-#[should_panic(expected = "E_ENDPOINT_UNROUTED")]
-fn predict_panics_on_an_unrouted_population() {
+fn predict_errs_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
-    let _ = predict(&m, &u, &m.default_params).unwrap();
+    let err = predict(&m, &u, &m.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
 }
 
 /// `predict()` on the routed population is unchanged: Gaussian rows only, none of

@@ -356,7 +356,7 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 
 `simulate()` is occasion-aware for a `kappa` model: it draws one independent κ ~ N(0, Ω~IOV~) per occasion group, so a VPC from an IOV model carries the inter-occasion spread the fit estimated (drawing a single κ for the whole subject would silently under-disperse it).
 
-That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's own parameters (`model.default_params`) always carry it, but a caller that **rebuilds** parameters from a fit must thread the fitted IOV covariance through as well — `estimation::uncertainty_samples::fitted_params_from_result()` does this and is the supported way to go from a `FitResult` to a simulate-ready `ModelParameters`. Parameters with a missing `omega_iov` are rejected: `simulate_with_options()` / `simulate_with_options_diag()` return an `Err` naming the omission, and the `Vec`-returning `simulate()` / `simulate_with_seed()` panic with the same message rather than silently emitting occasion-free draws (issue #1019).
+That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's own parameters (`model.default_params`) always carry it, but a caller that **rebuilds** parameters from a fit must thread the fitted IOV covariance through as well — `estimation::uncertainty_samples::fitted_params_from_result()` does this and is the supported way to go from a `FitResult` to a simulate-ready `ModelParameters`. Parameters with a missing `omega_iov` are rejected: every `simulate*` entry point returns an `Err` naming the omission rather than silently emitting occasion-free draws (issue #1019).
 
 ## Limitations
 

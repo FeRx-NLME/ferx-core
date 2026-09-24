@@ -2090,8 +2090,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
 // dropped `omega_iov`, and the per-occasion κ draw in `emit_subject_rows`
 // unwrapped that `None` — a panic across the FFI boundary that took the R
 // session's error handling with it. The contract is now enforced at every
-// simulate entry point: a clean `Err` where one can be returned, a loud panic
-// on the Vec-returning chokepoint.
+// simulate entry point as a clean `Err` (#898).
 
 /// `params` with the IOV block stripped — exactly what a fit-rebuilt
 /// `ModelParameters` looked like before the fix.
@@ -2125,14 +2124,15 @@ fn test_simulate_with_options_errs_when_omega_iov_missing() {
 }
 
 #[test]
-#[should_panic(expected = "carry no omega_iov")]
-fn test_simulate_with_seed_panics_when_omega_iov_missing() {
+fn test_simulate_with_seed_errs_when_omega_iov_missing() {
     let model = make_iov_model();
     let population = make_iov_population();
     let params = iov_params_without_omega_iov(&model);
-    // No Err channel on this entry point: fail loud rather than emit rows with
-    // zero inter-occasion variability.
-    let _ = simulate_with_seed(&model, &population, &params, 1, 1).unwrap();
+    // The seeded entry point reaches the check only at the chokepoint: an `Err`
+    // there, rather than rows with zero inter-occasion variability.
+    let err = simulate_with_seed(&model, &population, &params, 1, 1)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(err.contains("carry no omega_iov"), "unexpected Err: {err}");
 }
 
 #[test]

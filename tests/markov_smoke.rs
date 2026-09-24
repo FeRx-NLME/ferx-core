@@ -418,12 +418,13 @@ mod ctmm_smoke {
     /// A CTMM endpoint has no simulation path yet: `simulate()` fails loud (panics at the
     /// single simulate chokepoint) rather than emit meaningless all-zero discrete rows.
     #[test]
-    #[should_panic(expected = "CTMM")]
-    fn ctmm_simulate_panics() {
+    fn ctmm_simulate_errs() {
         use ferx_core::simulate;
         let model = parse_model_string(FIXED_MODEL).unwrap();
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
-        let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
+        let err = simulate(&model, &pop, &model.default_params, 1)
+            .expect_err("simulate() must refuse this input");
+        assert!(err.contains("CTMM"), "unexpected Err: {err}");
     }
 
     /// A live CTMM fit must still write an sdtab. CTMM observations are
@@ -459,18 +460,19 @@ mod ctmm_smoke {
     /// `predict()` silently returned zero rows (its discrete records are not on the Gaussian
     /// observation grid). Occupancy prediction π(t) is #820.
     #[test]
-    #[should_panic(expected = "CTMM")]
-    fn ctmm_predict_panics() {
+    fn ctmm_predict_errs() {
         use ferx_core::predict;
         let model = parse_model_string(FIXED_MODEL).unwrap();
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
-        let _ = predict(&model, &pop, &model.default_params).unwrap();
+        let err = predict(&model, &pop, &model.default_params)
+            .expect_err("predict() must refuse this input");
+        assert!(err.contains("CTMM"), "unexpected Err: {err}");
     }
 
-    /// #898: on the `Result`-returning entry points the same two CTMM refusals are an `Err`,
-    /// not a panic — `predict_diag` was new and panicked, `simulate_with_options` returned
-    /// `Result` and panicked out of it. The two `should_panic` tests above stay: `predict` /
-    /// `simulate` keep their `Vec` signatures in this PR and re-raise this text.
+    /// #898: on the `_diag` / `_with_options` entry points the same two CTMM refusals are an
+    /// `Err`, not a panic — `predict_diag` was new and panicked, `simulate_with_options`
+    /// returned `Result` and panicked out of it. The two tests above hold `predict` /
+    /// `simulate` to the same `Err`.
     ///
     /// Mutation — drop the CTMM `return Err` from `predict_diag` and it returns `Ok` with zero
     /// rows; drop it from the simulate chokepoint and it returns `Ok` with all-zero rows.

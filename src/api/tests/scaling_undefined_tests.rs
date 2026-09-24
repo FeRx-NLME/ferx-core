@@ -88,11 +88,15 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
 /// prediction. `fit()` already reported `E_MISSING_COVARIATE` here; `predict()` ran
 /// no data check, so it silently served `PRED = 0` at every row.
 #[test]
-#[should_panic(expected = "TOTALLY_UNDEFINED_NAME")]
 fn predict_rejects_an_undefined_scaling_identifier() {
     let model = parse_model_string(UNDEFINED_READOUT).expect("parse");
     let pop = population(&[], HashMap::new());
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("TOTALLY_UNDEFINED_NAME"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// Positive control: the guard keys on the *data*, not on the name. The identical

@@ -1,5 +1,6 @@
-//! Tier-1 tests for #898 (PR 1 of 2): a model/data precondition failure on a non-`fit()`
-//! entry point is an `Err` carrying **`fit()`'s own text**, not a panic.
+//! Tier-1 tests for #898: a model/data precondition failure on a non-`fit()` entry point is
+//! an `Err` carrying **`fit()`'s own text**, not a panic. PR 1 flipped the `_diag` /
+//! `_with_options` forms; PR 2 flipped `predict` / `simulate` / `simulate_with_seed`.
 //!
 //! # What was measured on `main` (`eb0bcf9a`) before this
 //!
@@ -13,7 +14,7 @@
 //! | Input | Must say | Must not say |
 //! |---|---|---|
 //! | a failed precondition, `Result` form | exactly what `fit()` says | the old wrapper sentences |
-//! | the same, `Vec`-returning wrapper | the same string, as the panic payload | a second wording |
+//! | the same, `predict` / `simulate` / `simulate_with_seed` | the same string, as an `Err` | a second wording, a panic |
 //! | accepted model | nothing — rows unchanged | — |
 //! | `simulate_with_uncertainty`, flip-flop draw | run stays `Ok`, draw skipped | an `Err` naming the draw |
 //!
@@ -25,7 +26,6 @@ use super::*;
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
 use crate::types::{DoseEvent, FitOptions, Population, RateMode, Subject};
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -87,7 +87,7 @@ fn fit_err(model: &CompiledModel, pop: &Population, params: &ModelParameters) ->
 }
 
 /// The three sentences that existed only in the deleted `assert_*` wrappers. None may survive
-/// into an `Err` or a re-raised panic payload.
+/// into an `Err`.
 fn assert_no_wrapper_text(msg: &str) {
     for banned in [
         "predict()/simulate() received",
@@ -95,18 +95,6 @@ fn assert_no_wrapper_text(msg: &str) {
         "panicked",
     ] {
         assert!(!msg.contains(banned), "wrapper text {banned:?} in: {msg}");
-    }
-}
-
-/// The payload of a panic raised by `f`, which must panic with a `String`.
-fn panic_text<T>(f: impl FnOnce() -> T) -> String {
-    let payload = match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(_) => panic!("expected a panic, got a return"),
-        Err(p) => p,
-    };
-    match payload.downcast::<String>() {
-        Ok(s) => *s,
-        Err(_) => panic!("panic payload was not a String"),
     }
 }
 
@@ -524,34 +512,91 @@ fn uncertainty_precondition_failure_is_an_err() {
     assert_eq!(got, fit_err(&model, &pop, &model.default_params));
 }
 
-// ── T4: the Vec-returning wrappers re-raise the same string ──────────────────
+// ── T4: the formerly `Vec`-returning forms return the same `Err` ───────────────
 
-/// `predict` / `simulate` / `simulate_with_seed` keep their signatures in this PR (591 test
-/// call sites; they flip in PR 2), so they still panic — but with the `Err` text and nothing
-/// else, so there is one wording per condition rather than two.
+/// `predict` / `simulate` / `simulate_with_seed` return `Result` since #898 PR 2; they used to
+/// re-raise the `Err` text as a panic. Now they return it — the same string as the `_diag` /
+/// `_with_options` forms, so there is one wording per condition and no panic on the way.
 ///
-/// Mutation — have a wrapper swallow the `Err` (`unwrap_or_default()`) and `panic_text` dies on
-/// the return; change the payload (`panic!("simulate: {e}")`) and the `assert_eq!` dies.
+/// Mutation — reintroduce `unwrap_or_else(|e| panic!("{e}"))` in any wrapper and this test dies
+/// on the unwind; prefix the message (`Err(format!("simulate: {e}"))`) and the `assert_eq!` dies.
 #[test]
-fn vec_returning_wrappers_panic_with_exactly_the_err_text() {
+fn convenience_forms_return_exactly_the_err_text() {
     let (model, pop) = unroutable();
     let params = &model.default_params;
     let want = predict_diag(&model, &pop, params).expect_err("fixture is refused");
 
-    assert_eq!(
-        panic_text(|| predict(&model, &pop, params).unwrap()),
-        want,
-        "predict"
+    let got = predict(&model, &pop, params).expect_err("predict");
+    assert_eq!(got, want, "predict");
+    let got = simulate(&model, &pop, params, 1).expect_err("simulate");
+    assert_eq!(got, want, "simulate");
+    let got = simulate_with_seed(&model, &pop, params, 1, 3).expect_err("simulate_with_seed");
+    assert_eq!(got, want, "simulate_with_seed");
+}
+
+/// The rule after #898 PR 2: no library entry point turns a precondition `Err` back into a
+/// panic. Two idioms did that — the `unwrap_or_else(|e| panic!("{e}"))` re-raise the old
+/// `Vec` wrappers used, and an internal caller unwrapping one of the flipped functions (the
+/// `inits_from_nca` sweep did, and would have panicked out of a `Result`-returning function).
+/// Scans every non-test source under `src/` except the dev binaries in `src/bin`.
+///
+/// Mutation — put `.unwrap_or_else(|e| panic!("{e}"))` back in `predict`, or `.unwrap()` on the
+/// sweep's `predict(..)?`, and this names the file and line.
+#[test]
+fn no_library_code_re_raises_a_precondition_err_as_a_panic() {
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&root.join("src"), &mut files);
+
+    let unwrapped_call =
+        regex::Regex::new(r"(^|[^\w.])(predict|simulate|simulate_with_seed)\(.*\)\.unwrap\(\)")
+            .expect("valid regex");
+    let mut scanned = 0;
+    let mut hits = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(&root)
+            .expect("under the manifest dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.ends_with("_tests.rs") || rel.contains("/tests/") || rel.starts_with("src/bin/") {
+            continue;
+        }
+        scanned += 1;
+        let text = std::fs::read_to_string(file).expect("readable source");
+        // Stop at an inline `mod tests {` — test code may unwrap freely.
+        for (n, line) in text
+            .lines()
+            .take_while(|l| !(l.starts_with("mod ") && l.contains("test") && l.ends_with('{')))
+            .enumerate()
+        {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code.contains("panic!(\"{e}\")") || unwrapped_call.is_match(code) {
+                hits.push(format!("{rel}:{}: {code}", n + 1));
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the scan saw only {scanned} files — it is measuring the walk, not the code"
     );
-    assert_eq!(
-        panic_text(|| simulate(&model, &pop, params, 1).unwrap()),
-        want,
-        "simulate"
-    );
-    assert_eq!(
-        panic_text(|| simulate_with_seed(&model, &pop, params, 1, 3).unwrap()),
-        want,
-        "simulate_with_seed"
+    assert!(
+        hits.is_empty(),
+        "precondition Err re-raised as a panic:\n{}",
+        hits.join("\n")
     );
 }
 
@@ -574,7 +619,7 @@ const ONE_CPT_ODE: &str = "[parameters]\n  theta TVCL(1.0, 0.1, 50.0)\n  \
     [scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP)\n";
 
 /// On an accepted model the change is invisible: the `Result` forms are `Ok`, and their rows
-/// are the rows the `Vec` forms return, bit for bit. `predict_diag` is additionally held to
+/// are the rows the convenience forms return, bit for bit. `predict_diag` is additionally held to
 /// the predictor called directly, so a row perturbed inside `predict_diag` — which the wrapper
 /// would inherit — still reddens this. Analytic and `[odes]`, since the two take different
 /// paths through both entry points.

@@ -106,8 +106,7 @@ pub struct SimulateOptions {
 /// **Repeated events (RTTE, `type = rtte`, Slice 3.3)** are simulated as a recurrent
 /// stream by `simulate_rtte_stream` (analytic hazards only). Several preconditions are
 /// *user-fixable* and would otherwise corrupt the stream silently, so they are rejected
-/// here (a clean `Err` from `simulate_with_options`; the `Vec`-returning entry points
-/// re-raise the same message as a panic):
+/// here (a clean `Err` from every `simulate*` entry point):
 /// - a **finite, positive horizon** is required — the recurrent stream is generated up
 ///   to that administrative window; there is no implicit one;
 /// - **left truncation** (`entry_time > 0`) *is* supported (#740): the stream is drawn on
@@ -420,8 +419,8 @@ pub fn simulate_with_options_diag(
     validate_tte_simulatable(model, population, opts.horizon)?;
 
     // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
-    // as a clean Err here; the Vec-returning entry points enforce the same contract
-    // as a panic at the chokepoint below, since they cannot signal.
+    // as a clean Err here; `simulate` / `simulate_with_seed` get the same `Err` from
+    // the chokepoint below.
     validate_iov_simulatable(model, params)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
@@ -955,10 +954,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // data-check otherwise. #324. The dose-compartment routing guard (#375) rides
     // the same chokepoint.
     //
-    // Every precondition below is an `Err`, never a panic (#898). The `Result`
-    // entry points propagate it; the `Vec`-returning `simulate` /
-    // `simulate_with_seed` cannot signal, so *they* re-raise the identical text
-    // as a panic — one line each, at the public boundary, not in here.
+    // Every precondition below is an `Err`, never a panic (#898), and every
+    // `simulate*` entry point returns it as is.
     check_simulate_preconditions(model, population, &params.theta)?;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
@@ -977,15 +974,14 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and
-    // returns a clean Err; the Vec-returning `simulate` / `simulate_with_seed` reach
-    // them only here, and re-raise this `Err` as a panic at their own boundary rather
-    // than emitting wrong rows.
+    // returns a clean Err; `simulate` / `simulate_with_seed` reach them only here,
+    // and return the same `Err` rather than emitting wrong rows.
     #[cfg(feature = "survival")]
     validate_tte_simulatable(model, population, horizon)?;
 
     // Same split for the IOV precondition (#1019): `simulate_with_options*` already
-    // returned a clean Err; the Vec-returning `simulate` / `simulate_with_seed` reach it
-    // only here, where rows with no inter-occasion variability must not be emitted.
+    // returned a clean Err; `simulate` / `simulate_with_seed` reach it only here,
+    // where rows with no inter-occasion variability must not be emitted.
     validate_iov_simulatable(model, params)?;
 
     // Same split again for the model-vs-population checks (#1083). The

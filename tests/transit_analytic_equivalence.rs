@@ -497,7 +497,7 @@ fn transit_ofv_matches_ode() {
 }
 
 // ── Restrictions: features the v1 closed form does not support are rejected
-//    up front by `fit()` (and would panic in `predict()`/`simulate()`), #386. ──
+//    up front by `fit()`, `predict()` and `simulate()` (an `Err`), #386. ──
 
 /// `fit()` the basic analytic transit model on `pop`, expecting an early `Err`.
 fn transit_fit_err(pop: &Population) -> String {
@@ -1537,26 +1537,28 @@ fn transit_flip_flop_without_twin_is_rejected() {
 /// The twin-less flip-flop reject also fires on the `predict()` path — via a panic,
 /// mirroring the other transit-support rejects (`assert_transit_support`) (#776).
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flip_flop_without_twin_panics_in_predict() {
+fn transit_flip_flop_without_twin_errs_in_predict() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
         .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// The reject also fires on the `simulate()` path — a panic through the
 /// `simulate_inner_with_draw` chokepoint, mirroring the other transit-support
 /// rejects (#776).
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flip_flop_without_twin_panics_in_simulate() {
+fn transit_flip_flop_without_twin_errs_in_simulate() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
         .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42).unwrap();
+    let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
@@ -1741,11 +1743,10 @@ V1 = TVF\n\n\
 }
 
 /// #735 collision guard: the declined-twin flip-flop `f=V1` model reaches the *clean* twin-less
-/// flip-flop rejection (`predict()` panics with "flip-flop regime"), NOT the internal
-/// "same PK slot" build panic it hit before the guard.
+/// flip-flop rejection (`predict()` returns an `Err` naming the "flip-flop regime"), NOT the
+/// internal "same PK slot" build panic it hit before the guard.
 #[test]
-#[should_panic(expected = "flip-flop regime")]
-fn transit_flipflop_f_param_named_disposition_slot_predict_panics_cleanly() {
+fn transit_flipflop_f_param_named_disposition_slot_predict_errs_cleanly() {
     let src = "\
 [parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
 theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
@@ -1756,7 +1757,9 @@ V1 = TVF\n\n\
 [error_model]\n  DV ~ proportional(PROP)\n";
     let model = parse_full_model(src).expect("parses").model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an

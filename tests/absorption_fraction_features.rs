@@ -104,10 +104,9 @@ fn fraction_validation_valid_with_f_and_lagtime() {
 }
 
 #[test]
-#[should_panic(expected = "Pathway fractions on compartment")]
 fn fraction_error_still_caught_with_f_and_lagtime() {
     // Same F+lag model but a malformed split (both fractions 0.6 → Σ=1.2). The
-    // features must not mask the error: predict() must still panic.
+    // features must not mask the error: predict() must still refuse it.
     let src = biphasic(
         "  theta TVF(0.7, 0.01, 1.0)\n  theta TVLAG(1.5, 0.001, 12.0)",
         "  FR1 = TVFR1\n  FR2 = TVFR1\n  F1 = TVF\n  LAGTIME1 = TVLAG",
@@ -118,7 +117,12 @@ fn fraction_error_still_caught_with_f_and_lagtime() {
         has_absorption_err(&model, &pop),
         "fit-check should flag Σ≠1 too"
     );
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("Pathway fractions on compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]

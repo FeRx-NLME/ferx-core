@@ -122,8 +122,7 @@ pub struct PredictionOutput {
 /// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
 /// `markov`) a CTMM-only model, which has no predictor yet. An input failing several at once
 /// reports the first in *this* function's order, which is not `fit()`'s.
-/// [`predict`] re-raises that same text as a panic, having no channel to return it on. Adding
-/// an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
+/// [`predict`] returns that same text. Adding an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
 /// that is what `warnings` is for.
 pub fn predict_diag(
     model: &CompiledModel,

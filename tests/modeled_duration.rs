@@ -910,38 +910,50 @@ const ODE_NO_D1: &str = r#"
 "#;
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn predict_on_analytical_model_with_modeled_dose_panics() {
+fn predict_on_analytical_model_with_modeled_dose_errs() {
     // `predict()` runs no `check_model_data`, so a `RATE=-2` dose on an analytical
     // model with NO matching `D1` would otherwise reach the predictor and silently
     // degrade to a 0-rate "infusion" in release (the `debug_assert` is a no-op).
-    // The entrypoint guard (`check_modeled_dose_rates`) turns it into a loud
-    // panic whose payload *is* the `E_MODELED_DURATION_NO_PARAM` message (#898).
+    // The entrypoint guard (`check_modeled_dose_rates`) turns it into an `Err`
+    // whose text *is* the `E_MODELED_DURATION_NO_PARAM` message (#898).
     let model = model_of(ANALYTICAL);
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn predict_on_ode_missing_param_panics() {
+fn predict_on_ode_missing_param_errs() {
     // RATE=-2 into a compartment with no `D{cmt}` would hit `resolve_rate`'s
     // slot `.expect` deep in the ODE path; the entrypoint guard intercepts it
     // first with the actionable `E_MODELED_DURATION_NO_PARAM` message.
     let model = model_of(ODE_NO_D1);
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn simulate_on_analytical_model_with_modeled_dose_panics() {
+fn simulate_on_analytical_model_with_modeled_dose_errs() {
     // The same guard covers every `simulate*` variant via the shared
     // `simulate_inner_with_draw` chokepoint.
     let model = model_of(ANALYTICAL);
     let pop = pop_of(&coded_csv());
-    let _ = simulate(&model, &pop, &model.default_params, 1).unwrap();
+    let err = simulate(&model, &pop, &model.default_params, 1)
+        .expect_err("simulate() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]

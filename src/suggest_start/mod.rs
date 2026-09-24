@@ -84,11 +84,11 @@ pub fn inits_from_nca(
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
     first_error(&crate::api::check_modeled_dose_rates(model, population))?;
     first_error(&crate::api::check_dose_compartments(model, population))?;
-    Ok(match method {
-        NcaInit::Nca => nca_only(model, population),
+    match method {
+        NcaInit::Nca => Ok(nca_only(model, population)),
         NcaInit::Sweep => nca_with_sweep(model, population),
         NcaInit::Ebe => nca_with_ebe(model, population),
-    })
+    }
 }
 
 /// Fast NCA-based starting value estimation (`NcaInit::Nca`).
@@ -114,7 +114,10 @@ fn nca_only(model: &CompiledModel, population: &Population) -> SuggestedStart {
 /// Cost: 9 `predict()` calls per unwritten theta.  For a typical 2-cpt PK model
 /// where peeling succeeded, 0–2 thetas remain; for a PD model with 5 free
 /// parameters, ~45 calls (~50 ms on 100 subjects).
-fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedStart {
+fn nca_with_sweep(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<SuggestedStart, String> {
     let mut base = nca_only(model, population);
 
     // Collect non-fixed thetas that Option A left unchanged (still at model default).
@@ -126,7 +129,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
         .collect();
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Exclude covariate-effect thetas (e.g. THETA_WT, THETA_CRCL) from the sweep.
@@ -169,7 +172,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
     }
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Joint 2D sweeps for highly correlated pairs before independent 1D sweeps.
@@ -194,7 +197,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
                     9,
                     10.0,
                     label,
-                );
+                )?;
                 base.params = swept;
                 base.warnings.extend(w);
                 remaining.retain(|&i| i != ia && i != ib);
@@ -205,12 +208,12 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
     // Independent 1D sweeps for any remaining unwritten thetas.
     if !remaining.is_empty() {
         let (swept, w) =
-            sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0);
+            sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0)?;
         base.params = swept;
         base.warnings.extend(w);
     }
 
-    base
+    Ok(base)
 }
 
 /// EBE-based NCA + rRMSE sweep (`NcaInit::Ebe`).
@@ -238,18 +241,18 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
 /// afterwards with etas=0 (Option B style).
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
-fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
+fn nca_with_ebe(model: &CompiledModel, population: &Population) -> Result<SuggestedStart, String> {
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
     // defaults.  Delegate to the etas=0 sweep directly (which runs NCA + sweep)
     // rather than calling nca_only() first and then nca_with_sweep()
     // (which would run NCA twice).
     if model.ode_spec.is_some() {
-        let mut result = nca_with_sweep(model, population);
+        let mut result = nca_with_sweep(model, population)?;
         result.warnings.insert(0,
             "inits_from_nca (nca_ebe): ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (nca_sweep).".into(),
         );
-        return result;
+        return Ok(result);
     }
 
     let mut base = nca_only(model, population);
@@ -262,7 +265,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
         .collect();
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // For EBE sweeps, only include lognormal-parameterised thetas
@@ -312,7 +315,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     }
 
     if remaining.is_empty() && logit_remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Joint 2D EBE sweeps for correlated pairs.
@@ -354,12 +357,12 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     // EBE sweeps are unreliable for logit params due to eta-compensation effects.
     if !logit_remaining.is_empty() {
         let (swept, w) =
-            sweep_unwritten_thetas(model, population, &base.params, &logit_remaining, 9, 10.0);
+            sweep_unwritten_thetas(model, population, &base.params, &logit_remaining, 9, 10.0)?;
         base.params = swept;
         base.warnings.extend(w);
     }
 
-    base
+    Ok(base)
 }
 
 // ---------------------------------------------------------------------------

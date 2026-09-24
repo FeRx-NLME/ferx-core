@@ -911,13 +911,12 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 }
 
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
-/// no `check_model_data`, but they *do* run `check_absorption_dosing`, and re-raise its
-/// first error as a panic (the `Result` forms return it as an `Err`, #898). Widening that check's
-/// snapshot set therefore widens what these entry points abort on: a model that returned
-/// numbers before now panics. Deliberate — the numbers it returned came from an
-/// out-of-domain forcing the engine really does apply at that record — and pinned here
-/// so the change cannot happen twice by accident (#898 is the issue for turning these
-/// aborts into diagnostics).
+/// no `check_model_data`, but they *do* run `check_absorption_dosing`, and return its
+/// first error as an `Err` (#898). Widening that check's snapshot set therefore widens
+/// what these entry points refuse: a model that returned numbers before now errs.
+/// Deliberate — the numbers it returned came from an out-of-domain forcing the engine
+/// really does apply at that record — and pinned here so the change cannot happen twice
+/// by accident.
 ///
 /// `E_DOSE_ATTR_NONFINITE` is not among the checks `predict()` runs, so the widening leaves
 /// `predict()` unchanged for it. That gap is #1280 / #898, not something to close by
@@ -930,8 +929,7 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 /// exists to pin was gone, on a panic raised by something else entirely (#1286 review,
 /// finding 5). `observation 2 at TIME=8` can only come from the observation snapshot.
 #[test]
-#[should_panic(expected = "observation 2 at TIME=8")]
-fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observation() {
+fn predict_now_errs_on_an_absorption_domain_error_reached_only_at_an_observation() {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")
         .model;
@@ -946,5 +944,10 @@ fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observati
     s.dose_covariates = vec![wt(0.0)];
     s.obs_covariates = vec![wt(0.0), wt(10.0)];
     let pop = population(s, &["WT"]);
-    let _ = predict(&model, &pop, &model.default_params).unwrap();
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("observation 2 at TIME=8"),
+        "unexpected Err: {err}"
+    );
 }
