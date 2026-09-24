@@ -835,13 +835,20 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
 /// generative path. Simulate a dataset from known (θ, Ω) with ferx's own ODE
 /// event-time sampler, rebuild a fit population, and refit from a perturbed start.
 ///
-/// Scope: this asserts recovery of the **identifiable** parameters — the PK fixed
-/// effects (CL, V, KA) and ω²(CL), which the continuous observations pin sharply —
-/// and that the whole pipeline (root-finder → `simulate_tte` ODE branch →
-/// sim→Population → joint FOCEI fit) runs to a finite OFV. It deliberately does
-/// **not** assert recovery of (H0, BETA): they are collinear at a single-occasion
-/// design (Slice 2.1 `expected.md`; this seed lands at H0≈0.010 / BETA≈0.43, off the
-/// 0.02 / 0.30 truth along the ridge, max |ΔS(t)|≈0.16). Hazard-sampler correctness
+/// Scope: this asserts recovery of the **identifiable** parameters — `ke = CL/V`, `KA`
+/// and ω²(CL), which the continuous observations pin sharply — and that the whole
+/// pipeline (root-finder → `simulate_tte` ODE branch → sim→Population → joint FOCEI
+/// fit) runs to a finite OFV. It deliberately does **not** assert recovery of
+/// (H0, BETA): they are collinear at a single-occasion design (Slice 2.1
+/// `expected.md`; this seed lands at H0≈0.010 / BETA≈0.43, off the 0.02 / 0.30 truth
+/// along the ridge, max |ΔS(t)|≈0.16). Nor does it band `CL` and `V` separately:
+/// `ODE_TTE_FIT` carries no `[scaling]` block, so the observation is the central
+/// *amount*, a function of `ke` alone, and `V` enters only through the hazard's
+/// `BETA * (central / V)` — the objective is **exactly** invariant under
+/// `(TVCL, TVV, TVBETA) → (c·TVCL, c·TVV, c·TVBETA)` (measured at the fitted point:
+/// scaling by 1.3 / 0.7 moves Σ −log L by −5e-11 / +1e-10 and η̂ by ≤ 1.6e-7). Where
+/// BOBYQA stops along that flat direction is path-dependent, and a `CL` band was
+/// green only by path luck (#1551). Hazard-sampler correctness
 /// is validated distribution-free by `joint_pktte_event_times_match_model_survival`
 /// (and cross-tool by the NONMEM `$SIM` / nlmixr2 anchors), NOT by an H0/BETA band
 /// here — a wide "sane-range" band on a non-identified parameter is exactly the kind
@@ -888,15 +895,24 @@ fn joint_pktte_sse_recovers_pk_and_omega() {
         r.ofv
     );
 
-    // PK fixed effects + ω²(CL) are sharply identified by the continuous observations
-    // and recover tightly (truth recovery; bands bracket the seed-fixed deterministic
-    // estimate with the truth inside). A gross sim→fit pipeline break (wrong PK
-    // forcing, scrambled obs write-back) breaks these.
+    // `ke`, `KA` and ω²(CL) are sharply identified by the continuous observations and
+    // recover tightly (truth recovery; bands bracket the measured estimates with the
+    // truth inside). A gross sim→fit pipeline break (wrong PK forcing, scrambled obs
+    // write-back) breaks these.
+    //
+    // `CL` and `V` are asserted only through their ratio — see the doc comment: the
+    // objective is exactly invariant under a common scaling of (CL, V, BETA), so their
+    // separate values are wherever the derivative-free outer optimizer happened to stop
+    // along that direction. Measured across five inner-solve trajectories at the same
+    // data (`main@293ac058`, `main` with `FERX_NO_INNER_HESSIAN_SEED=1`, PR #1504, and
+    // the last two again at `outer_ftol = 1e-10` / `outer_xtol = 1e-8`): CL wandered
+    // over 0.99–1.08 and V over 9.73–10.50 while CL/V stayed within 0.1024–0.1044
+    // (truth 0.1). The band below holds every arm with the truth inside.
+    let ke = cl / v;
     assert!(
-        (0.93..1.06).contains(&cl),
-        "CL not recovered: {cl} (truth 1.0)"
+        (0.095..0.110).contains(&ke),
+        "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})"
     );
-    assert!((9.0..10.2).contains(&v), "V not recovered: {v} (truth 10)");
     assert!(
         (0.92..1.08).contains(&ka),
         "KA not recovered: {ka} (truth 1.0)"
