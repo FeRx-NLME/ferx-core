@@ -1911,8 +1911,11 @@ pub struct CovariateThetaEstimate {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct CovariateRow {
     pub id: String,
+    /// `TIME` of the source row. `NaN` when the cell is not a number, which only a
+    /// row `[data_selection]` removed can carry — on a kept row it fails the read.
     pub time: f64,
-    /// EVID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose).
+    /// EVID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose). On
+    /// a row `[data_selection]` removed, a cell that is not an EVID reads as 0.
     pub evid: u32,
     /// Covariate values, parallel to [`CovariateTable::names`]. A missing value
     /// (blank / `.` / `NA` in the source) is encoded as `f64::NAN`.

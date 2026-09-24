@@ -129,6 +129,23 @@ impl SelectionFilter {
         }
         None
     }
+
+    /// The first ignore/accept clause, in the documented order, whose outcome on
+    /// `ctx` rests on any of `cols` (`FilterClause::depends_on`). A record the
+    /// filter keeps was kept by every clause, so this is the clause that first
+    /// decided it on those columns (#1501).
+    pub(crate) fn first_clause_depending_on(
+        &self,
+        ctx: &RowContext<'_>,
+        cols: &[&str],
+    ) -> Option<Excluder<'_>> {
+        let depends = |c: &&FilterClause| c.depends_on(ctx, cols);
+        self.ignore
+            .iter()
+            .find(depends)
+            .map(Excluder::Ignore)
+            .or_else(|| self.accept.iter().find(depends).map(Excluder::Accept))
+    }
 }
 
 /// Which rule removed a record — the answer [`SelectionFilter::first_excluding_rule`]
@@ -158,6 +175,16 @@ impl Excluder<'_> {
             Excluder::Ignore(c) | Excluder::Accept(c) => {
                 c.columns().any(|x| x.eq_ignore_ascii_case(col))
             }
+        }
+    }
+
+    /// Whether the rule's outcome on `ctx` rests on any of `cols`
+    /// (`FilterClause::depends_on`). The `ignore_subjects` shorthand reads no row
+    /// column.
+    pub(crate) fn depends_on(&self, ctx: &RowContext<'_>, cols: &[&str]) -> bool {
+        match self {
+            Excluder::Subject => false,
+            Excluder::Ignore(c) | Excluder::Accept(c) => c.depends_on(ctx, cols),
         }
     }
 
@@ -965,7 +992,18 @@ fn read_nonmem_csv_impl(
         let id = fields.get(id_col).cloned().unwrap_or_default();
 
         if build_table {
-            let time = parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
+            // The table echoes every input record, including one `[data_selection]`
+            // removes — which the reader never checks (#1501, NONMEM's `IGNORE`
+            // boundary). A `TIME` cell that is not a number is echoed as `NaN`, the
+            // table's missing encoding, rather than as a fabricated `0`; a record the
+            // filter keeps with such a cell fails the read, so it never gets here.
+            // `EVID` is an integer and has no such encoding: an unreadable one on a
+            // removed record is echoed as `effective_evid`'s fallback, 0.
+            let time = if unreadable_cell(&fields, Some(time_col), &TIME_CELL).is_some() {
+                f64::NAN
+            } else {
+                parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"))
+            };
             // Mirror `parse_subject`'s EVID computation (incl. AMT-based dose
             // inference when EVID is absent) so the table's EVID agrees with how
             // each row was classified. #262
@@ -1379,8 +1417,17 @@ fn read_nonmem_csv_impl(
     ))
 }
 
+/// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
+/// `0.0`, the default the numeric columns document. `NaN` used to parse to IEEE
+/// `NaN` here, so `RATE=NaN` was rejected as non-finite and `TIME=NaN` put the
+/// record at an undefined time, while `.` read as the default (#1501 review). A
+/// present cell that is not a number also reads as `0.0`; the caller rejects it
+/// first where the record reads the column (`unreadable_cell`).
 fn parse_f64(s: &str) -> f64 {
-    s.parse::<f64>().unwrap_or(0.0)
+    if is_missing_cell(s) {
+        return 0.0;
+    }
+    s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// Parse a numeric cell for the data-selection filter, mapping missing/blank
@@ -2078,6 +2125,200 @@ fn parse_occ(s: &str) -> Option<u32> {
     parse_unsigned_cell::<u32>(s)
 }
 
+/// What a numeric data column accepts, for the unreadable-cell check (#1501).
+///
+/// Before #1501 each of these columns read a cell it could not parse as `0` —
+/// `DV = abc` was scored as a measured `0.0`, `EVID = abc` made a dose record an
+/// observation, `ADDL = abc` dropped the additional doses — with no warning. NONMEM
+/// rejects such a record (`(DATA ERROR)`; measured on 7.6.0 for `DV`/`CENS` and on
+/// 7.5.1 for every column here, plus `EVID=1.5`/`-1`, `MDV=1.5` and `ADDL=1.5`), and
+/// so does ferx now, on a record that reads the column and that `[data_selection]`
+/// keeps. NONMEM rejects the cell on every record it keeps; ferx, like the `CENS`
+/// check (#1496), only where the column is read.
+///
+/// A missing cell (blank, `.`, `NA`, `NaN`) is never unreadable: each column keeps
+/// its documented default for it. `CMT`, the occasion column and `L2` are not
+/// listed: an unreadable `CMT` is defaulted and counted (`W_CMT_DEFAULTED`, #1009),
+/// an unreadable occasion is counted (`W_IOV_OCC_MISSING`), and an unreadable `L2`
+/// is documented as "ungrouped" (#830).
+#[derive(Debug, Clone, Copy)]
+struct CellSpec {
+    /// The column, as the message names it.
+    name: &'static str,
+    /// What the column holds, completing "is not …".
+    what: &'static str,
+    /// Whether a present, non-missing cell is readable.
+    holds: fn(&str) -> bool,
+}
+
+/// A cell `f64::from_str` accepts. `inf` / `infinity` parse, and keep the
+/// per-column guards they already had (`validate_dose_rate`, `validate_ss`,
+/// `is_dosing_amt`, `checked_integer_dv`): this check is about the text that
+/// silently read as `0`, not about the values those guards judge.
+fn holds_number(t: &str) -> bool {
+    t.parse::<f64>().is_ok()
+}
+
+/// `EVID` reads as a `u32` ([`parse_evid`]).
+fn holds_evid(t: &str) -> bool {
+    parse_unsigned_cell::<u32>(t).is_some()
+}
+
+/// `MDV`, `ADDL` and `SS` in the `[data_selection]` context read as a `usize`.
+fn holds_count(t: &str) -> bool {
+    parse_unsigned_cell::<usize>(t).is_some()
+}
+
+/// `FREMTYPE` reads as a `u16`.
+fn holds_fremtype(t: &str) -> bool {
+    parse_unsigned_cell::<u16>(t).is_some()
+}
+
+/// `CENS` reads any whole number ([`parse_cens`]).
+fn holds_whole(t: &str) -> bool {
+    parse_whole_number_cell(t) != WholeCell::NotWhole
+}
+
+const NOT_A_NUMBER: &str = "a number";
+/// The range each unsigned column is read in, spelled out: a message saying
+/// `70000` "is not a non-negative whole number" would be false (#1501 review).
+/// `unsigned_range_phrases_name_the_type_maximum` pins each maximum to its type.
+const NOT_A_U32: &str = "a whole number from 0 to 4294967295";
+const NOT_A_U16: &str = "a whole number from 0 to 65535";
+/// `usize` on the 64-bit targets ferx builds for. A float-spelled
+/// `18446744073709551615.0` rounds to 2^64 and is rejected although the text names
+/// the maximum — the same measured edge [`parse_cmt_cell`] documents.
+const NOT_A_USIZE: &str = "a whole number from 0 to 18446744073709551615";
+
+const TIME_CELL: CellSpec = CellSpec {
+    name: "TIME",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+const DV_CELL: CellSpec = CellSpec {
+    name: "DV",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+const AMT_CELL: CellSpec = CellSpec {
+    name: "AMT",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+const RATE_CELL: CellSpec = CellSpec {
+    name: "RATE",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+const II_CELL: CellSpec = CellSpec {
+    name: "II",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+/// `SS` on a dose row: [`validate_ss`] already rejects `1.5`, `-1` and `2`, so
+/// only the text that is no number at all is new here.
+const SS_DOSE_CELL: CellSpec = CellSpec {
+    name: "SS",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+/// `SS` as the `[data_selection]` context reads it (`parse_unsigned_cell`).
+const SS_FILTER_CELL: CellSpec = CellSpec {
+    name: "SS",
+    what: NOT_A_USIZE,
+    holds: holds_count,
+};
+const EVID_CELL: CellSpec = CellSpec {
+    name: "EVID",
+    what: NOT_A_U32,
+    holds: holds_evid,
+};
+const MDV_CELL: CellSpec = CellSpec {
+    name: "MDV",
+    what: NOT_A_USIZE,
+    holds: holds_count,
+};
+const ADDL_CELL: CellSpec = CellSpec {
+    name: "ADDL",
+    what: NOT_A_USIZE,
+    holds: holds_count,
+};
+const FREMTYPE_CELL: CellSpec = CellSpec {
+    name: "FREMTYPE",
+    what: NOT_A_U16,
+    holds: holds_fremtype,
+};
+/// `CENS` in the `[data_selection]` context. The observation row keeps its own
+/// message ([`cens_not_whole_error`], #1496).
+const CENS_FILTER_CELL: CellSpec = CellSpec {
+    name: "CENS",
+    what: "a whole number",
+    holds: holds_whole,
+};
+const TENTRY_CELL: CellSpec = CellSpec {
+    name: "TENTRY",
+    what: NOT_A_NUMBER,
+    holds: holds_number,
+};
+
+/// The row's cell in `col`, trimmed, when it is present, not missing, and not
+/// readable as `spec` says; `None` otherwise — including for an absent column and
+/// a row shorter than its header, which read as missing.
+fn unreadable_cell<'a>(row: &'a [String], col: Option<usize>, spec: &CellSpec) -> Option<&'a str> {
+    let t = row.get(col?)?.trim();
+    (!is_missing_cell(t) && !(spec.holds)(t)).then_some(t)
+}
+
+/// How a message names a row: by its `TIME` when that cell is readable, else by
+/// its position among the subject's records (1-based, file order).
+fn row_label(time: f64, time_unreadable: bool, row_seq: usize) -> String {
+    if time_unreadable {
+        format!("record {} of the subject", row_seq + 1)
+    } else {
+        format!("time {time}")
+    }
+}
+
+/// The error for a cell that a record reads and cannot parse (#1501).
+///
+/// `reads` names the columns a `[data_selection]` rule must avoid to remove the
+/// record without reading the cell: the cell's own column, and for `AMT` on a
+/// dataset with no `EVID` column also `EVID`, which ferx infers from it.
+fn unreadable_cell_error(id: &str, at: &str, spec: &CellSpec, cell: &str, reads: &str) -> String {
+    format!(
+        "subject {id}, {at}: {}=\"{}\" is not {}. Correct the cell, or remove the \
+         record with a [data_selection] rule that does not read {reads}.",
+        spec.name,
+        truncate_example(cell),
+        spec.what
+    )
+}
+
+/// The error for a `[data_selection]` rule that decided a record on a cell the
+/// reader could not parse (#1501, and the fourth row of the table in its
+/// discussion).
+///
+/// The filter context reads such a cell as the reader's fallback (`0` for `EVID`,
+/// `MDV`, `SS`, `CENS` and `TIME`; missing for `DV`, `AMT`, `RATE`, `II`), so
+/// `ignore = CENS == 0` would remove a `CENS = abc` record as an ordinary
+/// exclusion, and `accept = DV > 0` a `DV = abc` one. `rule` is the rule's
+/// fired-condition string (`ignore: CENS == 0`).
+fn filter_reads_unreadable_cell_error(
+    id: &str,
+    at: &str,
+    rule: &str,
+    spec: &CellSpec,
+    cell: &str,
+) -> String {
+    format!(
+        "subject {id}, {at}: the [data_selection] rule \"{rule}\" decides this record \
+         on {}=\"{}\", which is not {}. Correct the cell.",
+        spec.name,
+        truncate_example(cell),
+        spec.what
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_subject(
     id: &str,
@@ -2290,6 +2531,20 @@ fn parse_subject(
         // Effective EVID: the column value if present, else inferred from AMT
         // (NONMEM's rule for EVID-less datasets — see `effective_evid`). #262
         let evid = effective_evid(row, evid_col, amt_col);
+        // Cells every kept record reads, and that read as 0 when unparseable (#1501).
+        // Found here so the `[data_selection]` filter can refuse to decide a record
+        // on them; rejected below once the filter has kept the record.
+        let time_unreadable = unreadable_cell(row, Some(time_col), &TIME_CELL);
+        let evid_unreadable = unreadable_cell(row, evid_col, &EVID_CELL);
+        // With no EVID column the record type is inferred from AMT, so every record
+        // reads AMT; with one, only a dose record does (checked in the dose arm).
+        let amt_unreadable = unreadable_cell(row, amt_col, &AMT_CELL);
+        let amt_cols: &[&str] = if evid_col.is_none() {
+            &["amt", "evid"]
+        } else {
+            &["amt"]
+        };
+        let row_at = |t: f64| row_label(t, time_unreadable.is_some(), row_seq);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
             .and_then(|s| parse_unsigned_cell::<usize>(s))
@@ -2372,7 +2627,79 @@ fn parse_subject(
                 covariates: &locf_state,
                 str_covariates: &str_covariates,
             };
-            if let Some(rule) = sel.first_excluding_rule(&ctx) {
+            let fired = sel.first_excluding_rule(&ctx);
+            // A rule must not decide a record on a cell the reader could not parse
+            // (#1501): `ctx` holds the reader's fallback for it, not the dataset's
+            // value. When a rule removed the record, that rule decided it; when the
+            // record survived, every clause did. A clause decided it *on* the cell
+            // only when its outcome rests on it (`FilterClause::depends_on`):
+            // `EVID == 2 && RATE == 0` on an observation is decided by `EVID`. A
+            // rule whose outcome does not rest on these cells may still remove the
+            // record without error — NONMEM checks only the records its `IGNORE`
+            // keeps. `CMT` is left to `W_CMT_DEFAULTED` (`record_filtered` below).
+            // `FREMTYPE` and `TENTRY` have no `RowContext` field: a clause reads them
+            // from the covariate map, where an unparseable cell leaves the previous
+            // record's value in place — a fallback all the same.
+            let filter_cells: [(&CellSpec, Option<&str>, &[&str]); 11] = [
+                (&TIME_CELL, time_unreadable, &["time"]),
+                (
+                    &DV_CELL,
+                    unreadable_cell(row, Some(dv_col), &DV_CELL),
+                    &["dv"],
+                ),
+                (&EVID_CELL, evid_unreadable, &["evid"]),
+                (&AMT_CELL, amt_unreadable, amt_cols),
+                (
+                    &RATE_CELL,
+                    unreadable_cell(row, rate_col, &RATE_CELL),
+                    &["rate"],
+                ),
+                (&II_CELL, unreadable_cell(row, ii_col, &II_CELL), &["ii"]),
+                (
+                    &MDV_CELL,
+                    unreadable_cell(row, mdv_col, &MDV_CELL),
+                    &["mdv"],
+                ),
+                (
+                    &SS_FILTER_CELL,
+                    unreadable_cell(row, ss_col, &SS_FILTER_CELL),
+                    &["ss"],
+                ),
+                (
+                    &CENS_FILTER_CELL,
+                    unreadable_cell(row, cens_col, &CENS_FILTER_CELL),
+                    &["cens"],
+                ),
+                (
+                    &FREMTYPE_CELL,
+                    unreadable_cell(row, fremtype_col, &FREMTYPE_CELL),
+                    &["fremtype"],
+                ),
+                (
+                    &TENTRY_CELL,
+                    unreadable_cell(row, _tentry_col, &TENTRY_CELL),
+                    &["tentry"],
+                ),
+            ];
+            for (spec, cell, cols) in filter_cells {
+                let Some(cell) = cell else { continue };
+                let decider = match &fired {
+                    Some(rule) => rule.depends_on(&ctx, cols).then(|| rule.source(id)),
+                    None => sel
+                        .first_clause_depending_on(&ctx, cols)
+                        .map(|r| r.source(id)),
+                };
+                if let Some(src) = decider {
+                    return Err(filter_reads_unreadable_cell_error(
+                        id,
+                        &row_at(time),
+                        &src,
+                        spec,
+                        cell,
+                    ));
+                }
+            }
+            if let Some(rule) = fired {
                 let src = rule.source(id);
                 if !excl_fired.contains(&src) {
                     excl_fired.push(src);
@@ -2405,6 +2732,50 @@ fn parse_subject(
                     excl_n_other += 1;
                 }
                 continue; // skip this row
+            }
+        }
+
+        // The record survived the filter, so it is read (#1501). Every record reads
+        // TIME and its record type; MDV decides whether an EVID=0 record is an
+        // observation. The dose and observation arms check the cells only they read.
+        if let Some(cell) = time_unreadable {
+            return Err(unreadable_cell_error(
+                id,
+                &row_at(time),
+                &TIME_CELL,
+                cell,
+                "TIME",
+            ));
+        }
+        if let Some(cell) = evid_unreadable {
+            return Err(unreadable_cell_error(
+                id,
+                &row_at(time),
+                &EVID_CELL,
+                cell,
+                "EVID",
+            ));
+        }
+        if evid_col.is_none() {
+            if let Some(cell) = amt_unreadable {
+                return Err(unreadable_cell_error(
+                    id,
+                    &row_at(time),
+                    &AMT_CELL,
+                    cell,
+                    "AMT or EVID (inferred from AMT, as this dataset has no EVID column)",
+                ));
+            }
+        }
+        if evid == 0 {
+            if let Some(cell) = unreadable_cell(row, mdv_col, &MDV_CELL) {
+                return Err(unreadable_cell_error(
+                    id,
+                    &row_at(time),
+                    &MDV_CELL,
+                    cell,
+                    "MDV",
+                ));
             }
         }
 
@@ -2473,7 +2844,25 @@ fn parse_subject(
         if evid == 3 {
             // Pure system reset: no dose, no observation. Nothing else to do.
         } else if is_dose_evid(evid) {
-            // Dose record
+            // Dose record. Each cell below read as 0 when unparseable (#1501): a
+            // zero-amount dose, a bolus, no interval, not steady state, no ADDL.
+            for (spec, col) in [
+                (&AMT_CELL, amt_col),
+                (&RATE_CELL, rate_col),
+                (&II_CELL, ii_col),
+                (&SS_DOSE_CELL, ss_col),
+                (&ADDL_CELL, addl_col),
+            ] {
+                if let Some(cell) = unreadable_cell(row, col, spec) {
+                    return Err(unreadable_cell_error(
+                        id,
+                        &row_at(raw_time),
+                        spec,
+                        cell,
+                        spec.name,
+                    ));
+                }
+            }
             let amt = row_amt;
             let (cmt, cmt_default_cause) = resolve_row_cmt(row, cmt_col);
             // How many doses this row ends up producing is only known after ADDL
@@ -2613,6 +3002,19 @@ fn parse_subject(
             // DV-code semantics and does not use it.
             let dv_missing = is_missing_cell(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
             let skip_missing_dv = dv_missing && routing.missing_dv == MissingDvPolicy::Skip;
+            // A DV that is present but no number read as `0.0` (#1501): a measured
+            // zero on a Gaussian row, a right-censored event on a TTE row, state 0
+            // or count 0 on an integer row. Every endpoint reads DV, so this sits
+            // before the routing.
+            if let Some(cell) = unreadable_cell(row, Some(dv_col), &DV_CELL) {
+                return Err(unreadable_cell_error(
+                    id,
+                    &row_at(raw_time),
+                    &DV_CELL,
+                    cell,
+                    "DV",
+                ));
+            }
 
             // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
             // discrete-state / count endpoint, route the row to `obs_records`
@@ -2623,6 +3025,16 @@ fn parse_subject(
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
+                    // An unparseable TENTRY read as 0, i.e. no left truncation (#1501).
+                    if let Some(cell) = unreadable_cell(row, _tentry_col, &TENTRY_CELL) {
+                        return Err(unreadable_cell_error(
+                            id,
+                            &row_at(raw_time),
+                            &TENTRY_CELL,
+                            cell,
+                            "TENTRY",
+                        ));
+                    }
                     let raw_entry = _tentry_col
                         .and_then(|c| row.get(c))
                         .map(|s| parse_f64(s))
@@ -2813,6 +3225,16 @@ fn parse_subject(
                     occasions.push(occ);
                 }
                 if fremtype_col.is_some() {
+                    // An unparseable FREMTYPE read as 0, i.e. the PK observation (#1501).
+                    if let Some(cell) = unreadable_cell(row, fremtype_col, &FREMTYPE_CELL) {
+                        return Err(unreadable_cell_error(
+                            id,
+                            &row_at(raw_time),
+                            &FREMTYPE_CELL,
+                            cell,
+                            "FREMTYPE",
+                        ));
+                    }
                     let ft = fremtype_col
                         .and_then(|c| row.get(c))
                         .and_then(|s| parse_unsigned_cell::<u16>(s))
