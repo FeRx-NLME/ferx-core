@@ -4156,7 +4156,8 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
 
         // 4. A clause that reads the column and keeps the record decided it on the
         //    fallback. `SS` in the filter context is read as a count, where the dose
-        //    record leaves `1.5` / `2` to `validate_ss`. `FREMTYPE` has no
+        //    record leaves `1.5` / `2` to `validate_ss`; its message names the codes
+        //    `validate_ss` accepts (#1541 review). `FREMTYPE` has no
         //    `RowContext` field; a clause reads it from the covariate map, where the
         //    unparseable cell leaves the previous record's value (#1501 review).
         //    `ADDL` is a documented inert filter target: a clause on it never fires.
@@ -4171,7 +4172,11 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
                 "subject 1, {}: the [data_selection] rule \"ignore: {clause}\" decides \
                  this record on {col}=\"{cell}\", which is not {}. Correct the cell.",
                 case.at,
-                if col == "SS" { usize_ } else { case.what }
+                if col == "SS" {
+                    NOT_AN_SS_CODE
+                } else {
+                    case.what
+                }
             ),
             "{tag}"
         );
@@ -4403,9 +4408,89 @@ fn a_fractional_ss_is_not_decided_on_by_a_data_selection_rule() {
     assert_eq!(
         read_unreadable(csv, Some("SS == 1")).unwrap_err(),
         "subject 1, time 1: the [data_selection] rule \"ignore: SS == 1\" decides this \
-         record on SS=\"1.5\", which is not a whole number from 0 to 18446744073709551615. \
-         Correct the cell."
+         record on SS=\"1.5\", which is not a supported steady-state code; expected 0 (not \
+         steady state) or 1 (reset then dose to steady state). Correct the cell."
     );
+}
+
+/// #1541 review, finding 2: on a *dose* record the filter-context `SS` check runs
+/// before `validate_ss` whenever a rule reads `SS`, so its message must tell the
+/// user what `SS` accepts, as `validate_ss` does — not the type the context reads
+/// the cell in (`a whole number from 0 to 18446744073709551615`). Both sides of
+/// the gate in one test: the same cell with no rule reaches `validate_ss`, and
+/// the two messages name the codes in the same words, pinned to one constant.
+#[test]
+fn the_filter_context_ss_message_names_the_codes_validate_ss_accepts() {
+    assert_eq!(SS_FILTER_CELL.what, NOT_AN_SS_CODE);
+    assert!(NOT_AN_SS_CODE.ends_with(SS_CODES), "{NOT_AN_SS_CODE:?}");
+    for cell in ["1.5", "-1"] {
+        let csv = format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,SS\n\
+             1,0,.,1,1,100,1,{cell}\n\
+             1,1,5.0,0,0,.,1,0\n"
+        );
+        // With a rule that reads SS: the filter-context check, naming the codes.
+        assert_eq!(
+            read_unreadable(&csv, Some("SS == 1")).unwrap_err(),
+            format!(
+                "subject 1, time 0: the [data_selection] rule \"ignore: SS == 1\" decides \
+                 this record on SS=\"{cell}\", which is not {NOT_AN_SS_CODE}. Correct the cell."
+            ),
+            "SS={cell}"
+        );
+        // Without one: `validate_ss`, in the same words.
+        assert_eq!(
+            read_unreadable(&csv, None).unwrap_err(),
+            format!("subject 1, time 0: SS={cell} is not {NOT_AN_SS_CODE}."),
+            "SS={cell}"
+        );
+    }
+}
+
+/// #1541 review, finding 3: a record removed by a rule that does not read the cell
+/// its record type rests on is tallied in the catch-all bucket, not as the reader's
+/// fallback says. `EVID=abc` and `MDV=abc` both read as 0, so the record used to
+/// count as an excluded observation; `AMT=abc` on a dataset with no `EVID` column
+/// likewise. One leg per cell, each with its readable control, so a regression
+/// names its cell.
+#[test]
+fn a_removed_record_of_unreadable_type_is_tallied_as_other() {
+    let tally = |csv: &str, tag: &str| {
+        let pop = read_unreadable(csv, Some("TIME == 1")).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        assert_eq!(
+            pop.subjects[0].observations,
+            vec![4.0],
+            "{tag}: record 2 must be removed"
+        );
+        let e = pop.exclusions.as_ref().expect(tag);
+        (e.n_obs_excluded, e.n_dose_excluded, e.n_other_excluded)
+    };
+    let no_evid = |amt: &str| {
+        format!(
+            "ID,TIME,DV,MDV,AMT\n\
+             1,0,.,1,100\n\
+             1,1,5.0,0,{amt}\n\
+             1,2,4.0,0,.\n"
+        )
+    };
+    for (tag, csv, want) in [
+        (
+            "EVID=0 control",
+            unreadable_fixture("EVID", 1, "0"),
+            (1, 0, 0),
+        ),
+        ("EVID=abc", unreadable_fixture("EVID", 1, "abc"), (0, 0, 1)),
+        (
+            "MDV=0 control",
+            unreadable_fixture("MDV", 1, "0"),
+            (1, 0, 0),
+        ),
+        ("MDV=abc", unreadable_fixture("MDV", 1, "abc"), (0, 0, 1)),
+        ("no EVID, AMT=. control", no_evid("."), (1, 0, 0)),
+        ("no EVID, AMT=abc", no_evid("abc"), (0, 0, 1)),
+    ] {
+        assert_eq!(tally(&csv, tag), want, "{tag}: (obs, dose, other)");
+    }
 }
 
 /// #1501 review of #1502: `data-selection.qmd` claimed a missing cell "never matches

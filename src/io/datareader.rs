@@ -210,7 +210,9 @@ pub(crate) struct SubjectExclusion {
     pub obs_cmts: std::collections::BTreeSet<usize>,
     pub n_dose_excluded: usize,
     /// Records excluded that are neither scored obs nor doses (EVID 2/3, or
-    /// missing-DV obs).
+    /// missing-DV obs), and records whose type the reader could not read (an
+    /// unparseable `EVID`, `MDV` on `EVID=0`, or `AMT` with no `EVID` column)
+    /// that a rule removed without reading that cell (#1501, #1541 review).
     pub n_other_excluded: usize,
     /// Sources that matched at least one row ("ignore: DV < 0.001", etc.).
     pub fired: Vec<String>,
@@ -1937,11 +1939,12 @@ fn is_dose_evid(evid: u32) -> bool {
 }
 
 /// True when an `AMT` value denotes an actual dose: **finite and nonzero**. A
-/// missing cell (or absent column) parses to `0.0` — not a dose. A literal
-/// `nan`/`inf`/`infinity` parses to a non-finite value (Rust's `f64::from_str`
-/// accepts those, and [`parse_f64`] does not route through `is_missing_cell`),
-/// which is malformed and is also rejected here — so a stray non-finite AMT
-/// never silently becomes an infinite/NaN-amount dose (#262).
+/// missing cell (or absent column) parses to `0.0` — not a dose; since #1501 a
+/// literal `nan`/`NA` is a missing spelling too ([`is_missing_cell`], which
+/// [`parse_f64`] checks first), so it reads as `0.0` here, not as IEEE NaN. A
+/// literal `inf`/`infinity` still parses to a non-finite value (Rust's
+/// `f64::from_str` accepts it), which is malformed and is rejected here — so a
+/// stray non-finite AMT never silently becomes an infinite-amount dose (#262).
 fn is_dosing_amt(amt: f64) -> bool {
     amt.is_finite() && amt != 0.0
 }
@@ -2018,8 +2021,7 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
 fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
     if !ss.is_finite() {
         return Err(format!(
-            "subject {id}, time {time}: SS={ss} is not finite; expected 0 (not \
-             steady state) or 1 (reset then dose to steady state)."
+            "subject {id}, time {time}: SS={ss} is not finite; expected {SS_CODES}."
         ));
     }
     // `SS` is a NONMEM integer code. Match on the integer form (mirrors
@@ -2043,9 +2045,7 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
                 ""
             };
             Err(format!(
-                "subject {id}, time {time}: SS={ss} is not a supported \
-                 steady-state code; expected 0 (not steady state) or 1 (reset \
-                 then dose to steady state).{hint}"
+                "subject {id}, time {time}: SS={ss} is not {NOT_AN_SS_CODE}.{hint}"
             ))
         }
     }
@@ -2098,8 +2098,11 @@ fn dose_for_rate_mode(
 /// carries a nonzero `AMT` (infusions too — `RATE` is the rate, `AMT` the
 /// amount), so a `RATE`-only row would just create a no-op zero-amount dose.
 ///
-/// Only a finite, nonzero `AMT` infers a dose: a missing cell parses to `0.0`
-/// and a non-finite `nan`/`inf` is rejected, both via [`is_dosing_amt`].
+/// Only a finite, nonzero `AMT` infers a dose: a missing cell (`.`, blank, `NA`,
+/// `nan`) parses to `0.0` and a non-finite `inf` is rejected, both via
+/// [`is_dosing_amt`]. Any other text that is not a number also parses to `0.0`
+/// and is rejected after the `[data_selection]` filter has kept the record
+/// (#1501): with no `EVID` column every record reads `AMT`.
 fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize>) -> u32 {
     match evid_col {
         Some(c) => row.get(c).map(|s| parse_evid(s)).unwrap_or(0),
@@ -2222,10 +2225,23 @@ const SS_DOSE_CELL: CellSpec = CellSpec {
     what: NOT_A_NUMBER,
     holds: holds_number,
 };
-/// `SS` as the `[data_selection]` context reads it (`parse_unsigned_cell`).
+/// What `SS` accepts, as every message about the cell spells it: [`validate_ss`]
+/// on a dose record and [`SS_FILTER_CELL`] in the `[data_selection]` context, so
+/// the two cannot drift.
+const SS_CODES: &str = "0 (not steady state) or 1 (reset then dose to steady state)";
+/// The `is not …` phrase for an `SS` cell outside [`SS_CODES`].
+const NOT_AN_SS_CODE: &str = "a supported steady-state code; expected 0 (not steady \
+                              state) or 1 (reset then dose to steady state)";
+/// `SS` as the `[data_selection]` context reads it (`parse_unsigned_cell`), so
+/// `holds` is the count predicate. The message names what `SS` *accepts*, as
+/// [`validate_ss`] does, not the type the context reads it in (#1541 review): on
+/// a dose record with a rule that reads `SS`, this check runs before
+/// `validate_ss`, and `SS="1.5" is not a whole number from 0 to 2^64-1` told the
+/// user less than the message the same cell gets with no rule. A cell the
+/// predicate refuses (`1.5`, `-1`, `abc`) is never a code, so the phrase holds.
 const SS_FILTER_CELL: CellSpec = CellSpec {
     name: "SS",
-    what: NOT_A_USIZE,
+    what: NOT_AN_SS_CODE,
     holds: holds_count,
 };
 const EVID_CELL: CellSpec = CellSpec {
@@ -2549,6 +2565,16 @@ fn parse_subject(
             .and_then(|c| row.get(c))
             .and_then(|s| parse_unsigned_cell::<usize>(s))
             .unwrap_or(0);
+        let mdv_unreadable = unreadable_cell(row, mdv_col, &MDV_CELL);
+        // Whether `evid`/`mdv` say what the record *is*, or hold the reader's
+        // fallback for a cell it could not parse: the type rests on `EVID` (on
+        // `AMT` when `EVID` is inferred from it) and, for an `EVID=0` record, on
+        // `MDV`. A rule that reads none of those may still remove the record, and
+        // the exclusion tally must not then file it as the fallback says (#1541
+        // review); a kept record is rejected below.
+        let record_type_unreadable = evid_unreadable.is_some()
+            || (evid_col.is_none() && amt_unreadable.is_some())
+            || (evid == 0 && mdv_unreadable.is_some());
         // Parse OCC. When iov_column is set but a row's value is missing or
         // unparseable, count it (caller emits a single summary warning) and
         // fall back to 0 — matching pre-warning behavior so existing fits
@@ -2655,11 +2681,7 @@ fn parse_subject(
                     &["rate"],
                 ),
                 (&II_CELL, unreadable_cell(row, ii_col, &II_CELL), &["ii"]),
-                (
-                    &MDV_CELL,
-                    unreadable_cell(row, mdv_col, &MDV_CELL),
-                    &["mdv"],
-                ),
+                (&MDV_CELL, mdv_unreadable, &["mdv"]),
                 (
                     &SS_FILTER_CELL,
                     unreadable_cell(row, ss_col, &SS_FILTER_CELL),
@@ -2715,9 +2737,12 @@ fn parse_subject(
                     }
                 }
                 // Count by record type for the summary. The catch-all `other`
-                // bucket (EVID 2/3, missing-DV obs) ensures every excluded
-                // record is reflected in some counter.
-                if is_dose_evid(evid) {
+                // bucket (EVID 2/3, missing-DV obs, and a record whose type the
+                // reader could not read) ensures every excluded record is
+                // reflected in some counter.
+                if record_type_unreadable {
+                    excl_n_other += 1;
+                } else if is_dose_evid(evid) {
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
@@ -2768,7 +2793,7 @@ fn parse_subject(
             }
         }
         if evid == 0 {
-            if let Some(cell) = unreadable_cell(row, mdv_col, &MDV_CELL) {
+            if let Some(cell) = mdv_unreadable {
                 return Err(unreadable_cell_error(
                     id,
                     &row_at(time),
