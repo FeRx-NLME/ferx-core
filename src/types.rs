@@ -1371,10 +1371,12 @@ pub struct ExclusionSummary {
     /// Number of dose records (EVID 1/4) excluded.
     pub n_dose_excluded: usize,
     /// Number of other records excluded that are neither a scored observation
-    /// nor a dose — EVID==2 (other event), EVID==3 (reset), and missing-DV
-    /// observation rows (EVID==0, MDV==1). Tracked so the reported counts sum to
-    /// every excluded record and the summary can't read all-zeros while rows
-    /// were dropped.
+    /// nor a dose — EVID==2 (other event), EVID==3 (reset), missing-DV
+    /// observation rows (EVID==0, MDV==1), and records whose type could not be
+    /// read (an `EVID`, `MDV` or EVID-inferring `AMT` cell that is not a number)
+    /// that a `[data_selection]` rule removed without reading that cell (#1501).
+    /// Tracked so the reported counts sum to every excluded record and the
+    /// summary can't read all-zeros while rows were dropped.
     pub n_other_excluded: usize,
     /// Total CSV records read before any filtering.
     pub n_records_total: usize,
@@ -7084,9 +7086,12 @@ pub struct FitResult {
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
     /// `optimizer = auto` default resolved the choice, the label is the compound
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
-    /// the setting and what actually ran. SAEM/GN/IMP report their own fixed
-    /// labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa"). Always populated;
-    /// the label is the same regardless of method chain length. Consumers that
+    /// the setting and what actually ran. An explicit choice is reported as what
+    /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
+    /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
+    /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
+    /// Always populated; the label is the same regardless of method chain length.
+    /// Consumers that
     /// match on the label should accept the `auto (...)` prefix (#490).
     pub optimizer: String,
     /// Number of random multi-starts attempted. 1 means a single fit from

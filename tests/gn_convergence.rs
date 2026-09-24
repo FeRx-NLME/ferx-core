@@ -27,7 +27,7 @@
 //!
 //! | Dataset           | SLSQP    | GN-TR     | GN-hybrid |
 //! |-------------------|----------|-----------|-----------|
-//! | warfarin          | -278.734 | -279.114  | -279.124  |
+//! | warfarin          | -278.734 | -279.114  | -286.004 (#1540; was -279.124) |
 //! | two_cpt_oral_cov  |-1144.948 |-1153.071  |   —       |
 
 use ferx_core::parser::model_parser::parse_model_file;
@@ -93,12 +93,17 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 /// GN-hybrid trust-region on warfarin: the GN phase followed by FOCEI polish
 /// must reach the known-good minimum.
 ///
-/// Baseline -279.1243: the FOCEI polish (run with the default `bobyqa`
-/// optimizer since #155 — see `FitOptions::default`) improves on pure GN-TR by
-/// ~0.01 OFV.  SLSQP-driven polish only reaches -278.7336 (gap ~0.39 OFV),
-/// so the pass threshold `KNOWN_GOOD_OFV + TOLERANCE` = -278.8743 is
-/// hardcoded below the SLSQP reference: any polish stage that regresses to
-/// SLSQP-level performance fails the assert.  Name says "beats_slsqp"
+/// Baseline -286.0042 (measured on #1540, release, macOS). The FOCEI polish
+/// reaches the same minimum under every outer optimizer measured: `auto` (which
+/// resolves to `nlopt_lbfgs` on warfarin since #490) -286.0042, `slsqp`
+/// -286.0042, `bobyqa` -286.0040. So this test pins the minimum the hybrid
+/// reaches, not which optimizer polishes it. The older -279.1243 (BOBYQA polish)
+/// and -278.7336 (SLSQP polish) baselines predate later engine changes and no
+/// longer describe either optimizer. The previous bound (-278.87) sat 7 OFV above
+/// the current minimum, so a regression to the old one would have passed; the
+/// 0.25 tolerance is ~1000x the measured spread between optimizers (2.4e-4)
+/// and rejects it. It was measured on macOS only; the nightly Linux run is
+/// the cross-platform check. Name says "beats_slsqp"
 /// because of that threshold placement, not because of any direct
 /// `ofv < slsqp_ofv` comparison in the code.  See the module-level
 /// "Baseline history" comment for the Almquist Laplace shift from the
@@ -109,7 +114,7 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn gn_hybrid_tr_warfarin_ofv_beats_slsqp_baseline() {
-    const KNOWN_GOOD_OFV: f64 = -279.1243;
+    const KNOWN_GOOD_OFV: f64 = -286.0042;
     const TOLERANCE: f64 = 0.25;
 
     let (model, population) = warfarin_data_and_model();

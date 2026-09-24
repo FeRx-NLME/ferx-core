@@ -88,6 +88,13 @@ section of the SDLC for the versioning policy).
   warning now fails the fit with its own reason. A resumed search re-judges every journalled
   candidate from its cached fit rather than trusting the verdict in the journal, so the gate
   also reaches a run interrupted before this change (#1512).
+- **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
+  that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
+  reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
+  the build info reported an analytic outer gradient where none was used. An explicit
+  optimizer that a mixture replaces with BOBYQA (built-in BFGS/L-BFGS, trust-region) is
+  now reported as `bobyqa` too. Both reports now read the outer loop's own resolution
+  rule (#1540).
 - **A data cell that is not a number is an error instead of a silent `0`.** `DV = abc` used
   to be scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, and
   `ADDL = abc` dropped the additional doses, all without a warning. A present cell that is
@@ -99,6 +106,13 @@ section of the SDLC for the versioning policy).
   (`.`, blank, `NA`, `NaN`) keep their defaults — `RATE=NaN` and `SS=NaN` on a dose used to
   be rejected as non-finite, and `TIME=NaN` read as an undefined time — and `CMT`, the
   occasion column and `L2` keep their existing handling (#1501).
+- **Two follow-ups to the #1501 cell checks (#1541 review).** A `[data_selection]` rule
+  that reads `SS` on a dose record with `SS = 1.5` or `SS = -1` is refused with the message
+  that says what `SS` accepts (`0` or `1`), the same words the record gets with no rule,
+  instead of the `usize` range the filter reads the column in. And a record whose `EVID`,
+  `MDV` or (with no `EVID` column) `AMT` cell is not a number, removed by a rule that does
+  not read that cell, is now tallied under `Other excluded` rather than as the observation
+  or dose the reader's fallback for the cell made it look like.
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every
