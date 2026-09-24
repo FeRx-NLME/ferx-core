@@ -185,8 +185,16 @@ impl LogitThetaCoord {
 
     /// Logit scale → packed coordinate. `ln(inv_logit(y))` is written as
     /// `−ln(1 + e^{−y})` so it stays accurate for a large negative `y`.
+    ///
+    /// Above [`LOGIT_DRAW_LIMIT`] this returns `+inf`, which every packed
+    /// upper bound rejects: from `y ≈ 36.7` on, `inv_logit(y)` (or
+    /// `exp(ln inv_logit(y))` after unpacking) rounds to exactly `1.0`, so
+    /// accepting the draw would bring back the `F = 1` point mass this type
+    /// exists to remove.
     pub(crate) fn y_to_x(self, y: f64) -> f64 {
-        if self.log_packed {
+        if y > LOGIT_DRAW_LIMIT {
+            f64::INFINITY
+        } else if self.log_packed {
             -(-y).exp().ln_1p()
         } else {
             1.0 / (1.0 + (-y).exp())
@@ -205,29 +213,46 @@ impl LogitThetaCoord {
     }
 }
 
-/// The θ coordinates to draw on the logit scale: `LogitProbability`, not FIX,
-/// and with an estimate strictly inside (0, 1). An estimate outside (0, 1)
-/// has no logit and is left on its packed scale (the fit itself is then
-/// degenerate). An empty `theta_transform` — a `FitResult` written before the
-/// field existed — selects nothing, which is the pre-#1548 behaviour.
+/// The θ coordinates to draw on the logit scale: every free `LogitProbability`
+/// θ. A FIX'd one carries no uncertainty and stays pinned. An empty
+/// `theta_transform` — a `FitResult` written before the field existed —
+/// selects nothing, which is the pre-#1548 behaviour.
+///
+/// A free `LogitProbability` θ whose estimate is not strictly inside (0, 1) is
+/// an `Err`: it has no logit, so there is no logit-scale draw to make, and
+/// falling back to the packed-scale draw would hand back the draws above 1
+/// that `Op::Logit` clamps to a point mass. It is reachable only with a
+/// declared upper bound above 1, where the clamped likelihood is flat past 1.
 pub(crate) fn logit_theta_coords(
     template: &ModelParameters,
     theta_transform: &[ThetaTransform],
     fixed_mask: &[bool],
-) -> Vec<LogitThetaCoord> {
-    (0..template.theta.len())
-        .filter(|&i| {
-            let t = template.theta[i];
-            theta_transform.get(i) == Some(&ThetaTransform::LogitProbability)
-                && !fixed_mask[i]
-                && t > 0.0
-                && t < 1.0
-        })
-        .map(|i| LogitThetaCoord {
+) -> Result<Vec<LogitThetaCoord>, String> {
+    let mut coords = Vec::new();
+    for i in 0..template.theta.len() {
+        if theta_transform.get(i) != Some(&ThetaTransform::LogitProbability) || fixed_mask[i] {
+            continue;
+        }
+        let t = template.theta[i];
+        if !(t > 0.0 && t < 1.0) {
+            let name = template
+                .theta_names
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("?");
+            return Err(format!(
+                "Cannot draw parameter uncertainty for {name}: it is used as \
+                 inv_logit(logit({name}) + ETA), so it must lie strictly inside \
+                 (0, 1), but its estimate is {t}. Declare its upper bound below 1 \
+                 (e.g. 0.999) and refit."
+            ));
+        }
+        coords.push(LogitThetaCoord {
             index: i,
             log_packed: theta_packs_log(template.theta_lower[i]),
-        })
-        .collect()
+        });
+    }
+    Ok(coords)
 }
 
 /// Move a packed centre and its covariance onto the draw scale: each logit
@@ -376,7 +401,7 @@ fn draw_asymptotic(
         moves: _,
     } = pack_with_bounds(template);
     let n_packed = x_hat.len();
-    if cov.nrows() != n_packed {
+    if cov.nrows() != n_packed || cov.ncols() != n_packed {
         return Err(format!(
             "Covariance matrix ({}x{}) doesn't match packed parameters ({})",
             cov.nrows(),
@@ -386,7 +411,7 @@ fn draw_asymptotic(
     }
     // Draw a `LogitProbability` θ on the logit scale (#1548); every other
     // coordinate is drawn on its packed scale as before.
-    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask);
+    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask)?;
     let (y_hat, cov_y) = to_draw_scale(&x_hat, cov, &logit_coords);
     let chol = regularised_cholesky(&cov_y)?;
 
@@ -1037,11 +1062,11 @@ mod tests {
         assert_eq!(cov_y[(1, 1)], 0.5);
     }
 
-    /// Only a free `LogitProbability` θ with an estimate inside (0, 1) is drawn
-    /// on the logit scale; an empty transform list (old `FitResult`) selects
-    /// nothing.
+    /// Every free `LogitProbability` θ is selected; a FIX'd one and an empty
+    /// transform list (an old `FitResult`) select nothing; the packing follows
+    /// the declared lower bound.
     #[test]
-    fn logit_theta_coords_selects_free_in_range_logit_probability_thetas() {
+    fn logit_theta_coords_selects_free_logit_probability_thetas() {
         let (mut template, _) =
             logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
         let tt = [
@@ -1051,26 +1076,116 @@ mod tests {
         ];
         let free = [false; 5];
         assert_eq!(
-            logit_theta_coords(&template, &tt, &free),
+            logit_theta_coords(&template, &tt, &free).unwrap(),
             vec![LogitThetaCoord {
                 index: 2,
                 log_packed: true
             }]
         );
-        assert!(logit_theta_coords(&template, &[], &free).is_empty());
+        assert!(logit_theta_coords(&template, &[], &free)
+            .unwrap()
+            .is_empty());
         let mut fixed = free;
         fixed[2] = true;
-        assert!(logit_theta_coords(&template, &tt, &fixed).is_empty());
-        template.theta[2] = 1.0;
-        assert!(logit_theta_coords(&template, &tt, &free).is_empty());
-        template.theta[2] = 0.5;
+        assert!(logit_theta_coords(&template, &tt, &fixed)
+            .unwrap()
+            .is_empty());
         template.theta_lower[2] = -1.0;
         assert_eq!(
-            logit_theta_coords(&template, &tt, &free),
+            logit_theta_coords(&template, &tt, &free).unwrap(),
             vec![LogitThetaCoord {
                 index: 2,
                 log_packed: false
             }]
         );
+    }
+
+    /// A free `LogitProbability` estimate at or outside (0, 1) — reachable with
+    /// an upper bound above 1 — is an `Err` naming the θ, not a silent fall
+    /// back to the packed-scale draw that reaches past 1. FIX'd, the same
+    /// estimate is fine: it is pinned, never drawn.
+    #[test]
+    fn logit_theta_coords_rejects_a_free_estimate_outside_the_unit_interval() {
+        let tt = [
+            ThetaTransform::Log,
+            ThetaTransform::Log,
+            ThetaTransform::LogitProbability,
+        ];
+        for (f_hat, lower) in [(1.0, 0.001), (1.2, 0.001), (0.0, -1.0), (-0.3, -1.0)] {
+            let (template, _) =
+                logit_fixture(f_hat, lower, 5.0, 0.09, ThetaTransform::LogitProbability);
+            let err = logit_theta_coords(&template, &tt, &[false; 5]).unwrap_err();
+            assert!(
+                err.contains("uncertainty for F") && err.contains(&format!("is {f_hat}")),
+                "{err}"
+            );
+            let mut fixed = [false; 5];
+            fixed[2] = true;
+            assert!(logit_theta_coords(&template, &tt, &fixed)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    /// The `Err` reaches `draw_parameter_samples`'s caller.
+    #[test]
+    fn asymptotic_errors_on_a_logit_probability_estimate_above_one() {
+        let (template, fit) =
+            logit_fixture(1.2, 0.001, 5.0, 0.09, ThetaTransform::LogitProbability);
+        let mut rng = StdRng::seed_from_u64(0);
+        let err =
+            draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap_err();
+        assert!(err.contains("uncertainty for F"), "{err}");
+    }
+
+    /// From `y ≈ 36.7` on, `inv_logit(y)` rounds to exactly 1.0 — through
+    /// `unpack_params`'s `exp` for a log-packed θ too. `y_to_x` returns `+inf`
+    /// above `LOGIT_DRAW_LIMIT` so the bounds check rejects the draw. The
+    /// fixture draws with `sd(logit θ) = 30`, so ~13% of proposals land above
+    /// the limit and ~12% above 36.7: without the cut-off those return F = 1.
+    #[test]
+    fn asymptotic_logit_draws_never_saturate_to_one() {
+        let c = LogitThetaCoord {
+            index: 0,
+            log_packed: false,
+        };
+        assert_eq!(c.y_to_x(40.0), f64::INFINITY);
+        assert!(c.y_to_x(LOGIT_DRAW_LIMIT) < 1.0);
+        let c_log = LogitThetaCoord {
+            index: 0,
+            log_packed: true,
+        };
+        assert_eq!(c_log.y_to_x(40.0), f64::INFINITY);
+        assert!(c_log.y_to_x(LOGIT_DRAW_LIMIT).exp() < 1.0);
+
+        // sd(x) = 30 · dx/dy at 0.7: θ(1 − θ) = 0.21 identity-packed, 1 − θ = 0.3 log-packed.
+        for (lower, sd_x) in [(-1.0, 30.0 * 0.21), (0.001, 30.0 * 0.3)] {
+            let (template, fit) = logit_fixture(
+                0.7,
+                lower,
+                5.0,
+                sd_x * sd_x,
+                ThetaTransform::LogitProbability,
+            );
+            let f = draw_f(&template, &fit, 2000, 3);
+            let at_one = f.iter().filter(|&&t| t >= 1.0).count();
+            assert_eq!(at_one, 0, "lower {lower}: {at_one}/2000 draws at F = 1");
+        }
+    }
+
+    /// A covariance with the right row count but the wrong column count is an
+    /// `Err`, not an out-of-range panic in the draw-scale column scaling.
+    #[test]
+    fn asymptotic_rejects_a_non_square_covariance() {
+        let (template, mut fit) =
+            logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
+        let n = crate::estimation::parameterization::packed_len(&template);
+        fit.covariance_matrix = Some(DMatrix::identity(n, 2) * 0.01);
+        let mut rng = StdRng::seed_from_u64(0);
+        let err =
+            draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap_err();
+        assert!(err.contains("doesn't match packed parameters"), "{err}");
     }
 }

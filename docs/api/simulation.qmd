@@ -404,8 +404,13 @@ What actually happens, for `UncertaintyMethod::Asymptotic`:
   $\theta = \operatorname{inv\_logit}(y)$. The draws are logit-normal with
   the delta-method SD, and never reach 1 whatever the declared upper bound
   ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)). A FIX'd
-  theta, or one whose estimate is not strictly inside (0, 1), is left on its
-  packed scale.
+  theta is pinned as usual. A free one whose estimate is not strictly inside
+  (0, 1) (possible only with an upper bound above 1) has no logit, so the
+  sampler, and SIR, returns an error asking for an upper bound below 1 rather
+  than drawing values that `logit` would clamp. A logit draw above
+  34.5, the clamp `logit` itself applies, is rejected and redrawn like any
+  other out-of-bounds draw: from about 36.7 on, $\operatorname{inv\_logit}$
+  rounds to exactly 1.
 - If `covariance_matrix` is not positive-definite, it is symmetrised and
   eigenvalue-floored before the Cholesky (`regularised_cholesky`). A draw
   from the regularised factor is slightly wider than the raw covariance in

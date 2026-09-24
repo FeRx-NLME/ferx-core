@@ -572,7 +572,7 @@ fn run_sir_core_scoped(
     // likelihood and can be resampled. The proposal lives on the draw scale
     // `y`; the samples are stored, bounds-checked and scored on the packed
     // scale `x`, and the weights carry `|dx/dy|` so the target is unchanged.
-    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask);
+    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)?;
     let draw_bounds = bounds_to_draw_scale(&bounds, &logit_coords);
     let log_jac_hat = log_abs_jacobian(&x_hat, &logit_coords);
 
@@ -945,12 +945,13 @@ mod tests {
         .unwrap();
         let pop = crate::io::datareader::read_nonmem_csv(&data, None, None).unwrap();
 
-        let run = |upper: &str| -> Vec<f64> {
+        let run = |upper: &str, tvp: f64| -> Result<Vec<f64>, String> {
             let model =
                 crate::parser::model_parser::parse_model_string(&model_src.replace("UPPER", upper))
                     .expect("parse");
             assert_eq!(model.theta_transform[3], ThetaTransform::LogitProbability);
-            let params = model.default_params.clone();
+            let mut params = model.default_params.clone();
+            params.theta[3] = tvp;
             let n_packed = crate::estimation::parameterization::packed_len(&params);
             let mut cov = DMatrix::zeros(n_packed, n_packed);
             // sd(ln θ) = 1.5 at θ̂ = 0.5 ⇒ sd(logit θ) = 3: wide enough to
@@ -965,15 +966,15 @@ mod tests {
                 verbose: false,
                 ..FitOptions::default()
             };
-            let r = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts).expect("sir");
-            r.resamples_packed
+            let r = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)?;
+            Ok(r.resamples_packed
                 .expect("kept")
                 .iter()
                 .map(|x| x[3])
-                .collect()
+                .collect())
         };
 
-        let x = run("0.999");
+        let x = run("0.999", 0.5).expect("sir");
         let mean = x.iter().sum::<f64>() / x.len() as f64;
         let want = (f64::ln(0.001) + f64::ln(0.999)) / 2.0;
         assert!(
@@ -981,11 +982,16 @@ mod tests {
             "resampled E[ln θ] = {mean}, flat-in-ln-θ target {want} (no-Jacobian target −1.846)"
         );
 
-        let x_wide = run("5.0");
+        let x_wide = run("5.0", 0.5).expect("sir");
         assert!(
             x_wide.iter().all(|&xi| xi < 0.0),
             "a resampled θ reached 1 with the upper bound widened to 5"
         );
+
+        // An estimate past 1 (reachable only with such a bound) has no logit:
+        // SIR refuses rather than falling back to the packed-scale proposal.
+        let err = run("5.0", 1.2).unwrap_err();
+        assert!(err.contains("uncertainty for TVP"), "{err}");
     }
     // Target sd of ln θ is 6.9/sqrt(12) = 2.0, so 4000 resamples give SE >= 0.03
     // (more after weighting); measured error 0.005. 0.25 is ~5 SE and 6x short
