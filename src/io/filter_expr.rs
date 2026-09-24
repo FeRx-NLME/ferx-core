@@ -285,6 +285,17 @@ impl FilterClause {
         self.exprs.iter().all(|e| e.eval(ctx))
     }
 
+    /// Whether this clause's outcome on `ctx` rests on any of `cols` (#1501).
+    ///
+    /// The clause is a conjunction, so a sub-expression that reads none of `cols`
+    /// and fails makes the clause false whatever `cols` hold: `EVID == 2 && RATE ==
+    /// 0` on an observation record is decided by `EVID` alone. The clause depends on
+    /// `cols` when it reads one of them and every other sub-expression holds.
+    pub(crate) fn depends_on(&self, ctx: &RowContext<'_>, cols: &[&str]) -> bool {
+        let reads = |e: &FilterExpr| cols.iter().any(|c| e.col.eq_ignore_ascii_case(c));
+        self.exprs.iter().any(reads) && self.exprs.iter().filter(|e| !reads(e)).all(|e| e.eval(ctx))
+    }
+
     /// Non-standard (covariate) column names referenced by this clause, in
     /// lowercase. Standard NONMEM columns (ID/TIME/DV/...) are excluded since
     /// they are read directly into [`RowContext`] rather than via the covariate
