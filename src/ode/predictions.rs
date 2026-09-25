@@ -4744,11 +4744,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // is `min(t_base0, first realized controller dose)`, which is exactly the frozen-replay
     // subject's (base ∪ ledger) start; the walk below holds the state at `init` until then.
     //
-    // The seed is the earlier of `t_base0` and the first decision. `t_base0` itself is only
-    // inserted as a break if the walk reaches it un-started (below): once an earlier
+    // The seed only has to be a first break at or before the origin, and it must NOT put
+    // `t_base0` on the timeline up front when a decision precedes it: once an earlier
     // controller dose is the origin, the static engine has no break at `t_base0` on the
-    // constant path (obs are `saveat` points), and adding one would perturb the step sequence
-    // and break the degenerate oracle's bit-equality.
+    // constant path (obs are `saveat` points), and an extra one perturbs the step sequence
+    // (measured: seeding with `t_base0` alone reddens 8 static-oracle tests). `t_base0` is
+    // instead inserted by the walk only if it reaches it un-started (below). Given that, the
+    // seed's VALUE below the first decision is immaterial — `0.0` is an equivalent mutation,
+    // since a decision is already a break and nothing before the origin is integrated — so
+    // the fold is simply "the first decision, or `t_base0` when none precedes it".
     let t_base0 = subject_integration_start(&shadow);
     let t_seed = decision_times.iter().cloned().fold(t_base0, f64::min);
     let mut break_times: Vec<f64> = vec![t_seed, t_last];

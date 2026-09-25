@@ -6286,3 +6286,138 @@ fn adaptive_origin_straddle_record_at_zero_vs_first_record_later() {
         d[1]
     );
 }
+
+#[test]
+fn adaptive_tad_rhs_refuses_an_observation_free_window_after_a_reset_origin() {
+    // #936 review R1. The refusal's state-carry sentence ("No observation is read off that
+    // segment, but the state integrated there carries into every later read") lost its only
+    // end-to-end test when this PR converted #1151's dose-free-window cell into a positive
+    // (its origin moved to the dose). This cell restores a real observation-free window: an
+    // EVID=3 reset at t=0 is the subject's first record, so the origin is 0; the obs are at
+    // 20 and 40 and the first dose is at the decision at 12, so `(0, 12]` is integrated
+    // under an unanchored `TAD` with no read inside it.
+    //
+    // Mutation that reddens it: delete the tail "…but the state integrated there carries
+    // into every later read" from the message (review mutation S2).
+    let model = parse_model_string(ODE_TAD_NO_IIV).unwrap();
+    let mut s = subj("1", vec![20.0, 40.0], vec![]);
+    s.reset_times = vec![0.0];
+    let pop = population(vec![s]);
+    let err = origin_run(&pop, &model, &[12.0, 36.0], vec![0, 1], false)
+        .expect_err("a reset-anchored origin before an unanchored window must be refused");
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+    assert!(
+        err.contains(
+            "No observation is read off that segment, but the state integrated there carries \
+             into every later read."
+        ),
+        "must say the poisoned state — not a readout — is what is refused: {err}"
+    );
+}
+
+#[test]
+fn adaptive_reset_as_first_record_is_the_origin() {
+    // #936 review R3. An EVID=3 reset at t=4 is the subject's first record, so it is the
+    // origin: `init` decays from 4. Hold at 0, bolus at 12, obs 6/20/40. The reset is in
+    // `subject_integration_start`, the same as the static engine.
+    //
+    // Mutation that reddens it: drop `reset_times` from `subject_integration_start`'s fold
+    // (origin 6 on both the driver and `predict()` — the closed form below still says 4).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let obs = [6.0, 20.0, 40.0];
+    let mut s = subj("1", obs.to_vec(), vec![]);
+    s.reset_times = vec![4.0];
+    let pop = population(vec![s]);
+
+    let (driver, _) = origin_run(&pop, &model, &[0.0, 12.0], vec![1], true).expect("run");
+    let closed = origin_closed_form(50.0, 4.0, &[12.0], &obs);
+    // Measured: 6.0e-13 against the closed form.
+    assert_rel(
+        &driver,
+        &closed,
+        1e-10,
+        "driver vs closed form (origin at the reset)",
+    );
+    let mut st = subj(
+        "1",
+        obs.to_vec(),
+        vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+    );
+    st.reset_times = vec![4.0];
+    let static_pred = origin_static(&model, st);
+    assert_rel(&driver, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
+fn adaptive_auc_pass_holds_init_before_the_origin() {
+    // #936 review R3. The AUC-target pass (`adaptive_window_signal_aucs`, dense solve) was
+    // already on the static origin; after #936 the driver shares it. Base record obs 6/20/40,
+    // decisions 0/6/12/24, one ledger bolus at 12. Window [0, 6] lies before the origin (6),
+    // so the state is held at `init` = 50 there and its AUC is exactly 300.
+    //
+    // Mutation that reddens it: seed the dense solve at 0.0 instead of the subject's start
+    // (the [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let ode = model.ode_spec.as_ref().unwrap();
+    let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
+    pk[crate::types::PK_IDX_CL] = 5.0;
+    pk[crate::types::PK_IDX_V] = 50.0;
+    pk[crate::types::PK_IDX_F] = 1.0;
+    let base = subj("1", vec![6.0, 20.0, 40.0], vec![]);
+    let ledger = vec![crate::sim::adaptive::DoseLedgerEntry {
+        subject: "1".into(),
+        draw: 0,
+        sim: 0,
+        dose_idx: 0,
+        time: 12.0,
+        amt: 100.0,
+        cmt: 1,
+        rate: 0.0,
+        decision_idx: 2,
+        rule_fired: "bolus".into(),
+        observed_signals: Vec::new(),
+        pre_state: None,
+        post_state: None,
+        f_applied: 1.0,
+    }];
+    let aucs = crate::ode::predictions::adaptive_window_signal_aucs(
+        ode,
+        &pk,
+        &model.default_params.theta,
+        &[0.0],
+        &base,
+        &[0.0, 6.0, 12.0, 24.0],
+        &ledger,
+        None,
+        1,
+    );
+    let k = K_936;
+    let want = [
+        300.0,
+        (50.0 / k) * (1.0 - (-k * 6.0).exp()),
+        (50.0 / k) * ((-k * 6.0).exp() - (-k * 18.0).exp())
+            + (100.0 / k) * (1.0 - (-k * 12.0).exp()),
+    ];
+    for (i, &a) in aucs.iter().enumerate() {
+        assert!(a.is_finite(), "window {i}: AUC {a} is not finite");
+    }
+    assert_eq!(aucs.len(), 3);
+    // The pre-origin window holds `init` exactly — a constant integrand, no trapezoid error.
+    assert!(
+        (aucs[0] - 300.0).abs() <= 1e-9,
+        "window [0, 6] precedes the origin, so init is held: {aucs:?}"
+    );
+    // Trapezoid error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative; the
+    // bound carries ~7× headroom and is 2 000× below the pre-origin mutation's effect.
+    for i in 1..3 {
+        let rel = ((aucs[i] - want[i]) / want[i]).abs();
+        assert!(
+            rel <= 5e-5,
+            "window {i}: rel {rel:e} (aucs={aucs:?}, want={want:?})"
+        );
+    }
+}
