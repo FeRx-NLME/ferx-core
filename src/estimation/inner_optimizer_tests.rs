@@ -1735,12 +1735,14 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
 
 /// The seed is a *local* model of the individual objective: it accelerates a solve
 /// started near the mode it describes, but from a cold start its Newton-scaled first
-/// step selects the eta basin — measured crossing into a prior-unlikely mode on a
-/// covariate-NN model (slow-tests red since #1389, #1474). Cold starts therefore keep
-/// the historical initialization: a cold solve under a seeded policy must reproduce
-/// the unseeded solve exactly, while a nonzero warm start under the same policy is
-/// seeded and takes a different (faster) path. Zero-vector "warm" starts are cold
-/// placeholders (`freeze_flat_thetas` passes zeros as `prev_etas`) and decline too.
+/// step selects the eta basin (#1474, #1504). A cold start under a seeded policy
+/// therefore runs both metrics and keeps the lower objective, with ties going to the
+/// unseeded solve — so on this unimodal subject, where both reach the same mode, the
+/// cold solve must reproduce the historical unseeded one bit-for-bit, while a nonzero
+/// warm start under the same policy is seeded and takes a different (faster) path.
+/// Zero-vector "warm" starts are cold placeholders (`freeze_flat_thetas` passes zeros
+/// as `prev_etas`). The bimodal cases live in
+/// `cold_seeded_solve_keeps_the_lower_of_both_metrics`.
 #[test]
 fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
     let (model, subject) = wellidentified_oral_fixture();
@@ -1766,10 +1768,42 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
     };
     let cold_unseeded = solve(None, InnerHessianSeed::None);
     for kind in [InnerHessianSeed::GaussNewton, InnerHessianSeed::Exact] {
+        // Premise: the forced-seed cold solve really ran and took another path to the
+        // same mode — otherwise the tie arm below is never exercised.
+        let schedule = cacheable_schedule(&model, &subject);
+        let forced = find_ebe_solve(
+            &model,
+            &subject,
+            &params,
+            100,
+            1e-8,
+            None,
+            None,
+            0,
+            schedule.as_ref(),
+            InnerSolvePolicy {
+                seed: kind,
+                capture_terminal_hessian: false,
+                accelerate_exact_outer: false,
+            },
+            true,
+        )
+        .expect("premise: the seed is in scope on this fixture");
+        assert_ne!(
+            (&forced.eta, forced.nll),
+            (&cold_unseeded.0, cold_unseeded.3),
+            "premise: the {kind:?}-seeded cold solve must differ in its last bits"
+        );
+        assert!(
+            (forced.nll - cold_unseeded.3).abs() < 1e-9,
+            "premise: both metrics reach the same mode ({} vs {})",
+            forced.nll,
+            cold_unseeded.3
+        );
         assert_eq!(
             solve(None, kind),
             cold_unseeded,
-            "{kind:?} seed changed the COLD solve — the warm-only gate is leaking"
+            "{kind:?} seed changed a unimodal COLD solve — a tie must keep the unseeded one"
         );
         assert_eq!(
             solve(Some(&[0.0; 3]), kind),
@@ -1785,6 +1819,103 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
         solve(Some(&warm), InnerHessianSeed::None),
         "premise: the seed must change a warm-started solve, or the gate is vacuous"
     );
+}
+
+/// A cold start under a seeded policy keeps whichever of the unseeded and seeded solves
+/// reaches the lower objective (#1504). Neither metric picks the right η̂ basin everywhere,
+/// and `examples/warfarin_if.ferx` has a subject on each side (FOCEI's Gauss–Newton seed,
+/// cold start, realised −log L):
+///
+/// | θ | subject | unseeded | seeded | kept |
+/// |---|---|---|---|---|
+/// | initial | ID 6 | −29.134 | −35.915 | seeded (6.78 lower) |
+/// | `TVV2 × 5` | ID 11 | −24.772 | −12.653 | unseeded (12.1 lower) |
+///
+/// Under the warm-only gate this replaced, ID 6 took the worse mode on the first outer
+/// evaluation and every warm solve stayed there: the L-BFGS fit converged at −1185.250,
+/// 3.3 OFV above the seeded-everywhere −1188.527. Each case asserts its own straddle, so a
+/// policy that always keeps one side reddens exactly one of them.
+#[test]
+fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_if.ferx"))
+            .expect("warfarin_if parses");
+    let pop = crate::io::datareader::read_nonmem_csv(
+        Path::new("data/warfarin_if.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("warfarin_if data loads");
+    let policy = |seed| InnerSolvePolicy {
+        seed,
+        capture_terminal_hessian: false,
+        accelerate_exact_outer: true,
+    };
+    let cases = [
+        // (subject id, theta index to scale, factor, seeded side should win)
+        ("6", 0, 1.0, true),
+        ("11", 3, 5.0, false),
+    ];
+    for (id, k, factor, seeded_wins) in cases {
+        let subject = pop.subjects.iter().find(|s| s.id == id).expect("subject");
+        let mut params = model.default_params.clone();
+        params.theta[k] *= factor;
+        let schedule = cacheable_schedule(&model, subject);
+        let run = |eta_init: Option<&[f64]>, seed| {
+            find_ebe_cached(
+                &model,
+                subject,
+                &params,
+                500,
+                1e-6,
+                eta_init,
+                None,
+                0,
+                schedule.as_ref(),
+                policy(seed),
+            )
+        };
+        let unseeded = run(None, InnerHessianSeed::None);
+        let forced = find_ebe_solve(
+            &model,
+            subject,
+            &params,
+            500,
+            1e-6,
+            None,
+            None,
+            0,
+            schedule.as_ref(),
+            policy(InnerHessianSeed::GaussNewton),
+            true,
+        )
+        .expect("premise: the seed is in scope");
+        assert!(
+            unseeded.nll.is_finite() && forced.nll.is_finite(),
+            "ID {id}: non-finite cold solve ({} / {})",
+            unseeded.nll,
+            forced.nll
+        );
+        // Straddle: the two metrics land in different modes, on the side this case pins.
+        let gap = forced.nll - unseeded.nll;
+        assert!(
+            if seeded_wins { gap < -1.0 } else { gap > 1.0 },
+            "premise, ID {id}: seeded − unseeded cold −log L = {gap:.4} \
+             (realised −6.781 for ID 6, +12.119 for ID 11)"
+        );
+        let expected = if seeded_wins { &forced } else { &unseeded };
+        for (label, eta_init) in [("None", None), ("zero placeholder", Some(&[0.0; 5][..]))] {
+            let got = run(eta_init, InnerHessianSeed::GaussNewton);
+            assert_eq!(
+                (&got.eta, got.nll),
+                (&expected.eta, expected.nll),
+                "ID {id}, cold start {label}: kept the {} solve, expected the {} one",
+                if seeded_wins { "unseeded" } else { "seeded" },
+                if seeded_wins { "seeded" } else { "unseeded" },
+            );
+        }
+    }
 }
 
 /// `analytic_terminal_work`'s Hessian is trusted verbatim by the objective-only Laplace path in

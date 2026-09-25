@@ -1265,8 +1265,6 @@ fn find_ebe_impl(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
-    let n_eta = model.n_eta;
-
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1277,6 +1275,68 @@ fn find_ebe_impl(
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return find_ebe_iov(model, subject, params, max_iter, tol, eta_init, mu_k);
     }
+
+    let solve = |cold_seed: bool| {
+        find_ebe_solve(
+            model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
+            cold_seed,
+        )
+    };
+    // The Hessian seed is a *local* model of the individual objective. Near the mode it
+    // describes (a genuine warm start: the previous outer iteration's η̂) its Newton-scaled
+    // first step is the speedup it exists for. From a cold start the same full step *selects
+    // the η̂ basin* on a multimodal individual objective, and neither metric picks the right
+    // one everywhere: on a covariate-NN model the seeded step put 23 of 30 subjects into a
+    // prior-unlikely mode (~950 OFV, #1474), while on `warfarin_if` it is the unseeded step
+    // that lands two subjects in the worse mode, and every warm solve after it stays there
+    // (3.3 OFV above the seeded fit under gradient outer optimizers, #1504). So a cold start
+    // under a seeded policy runs both metrics and keeps the lower objective. Ties go to the
+    // unseeded solve, so a unimodal subject is bit-identical to the historical cold solve.
+    //
+    // Cost: one extra inner solve per subject on cold evaluations only (the first outer
+    // evaluation and #833's final cold re-solve), none on the warm hot path. It also keeps
+    // that final re-solve an honest start-dependence probe: it disagrees with the trajectory
+    // only when *neither* cold metric reaches the warm optimum, not merely because the
+    // seeding policy differs between the two solves.
+    //
+    // An all-zero "warm" start is a cold placeholder (the outer loop's first evaluation and
+    // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
+    let genuinely_warm = eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0));
+    let normal = solve(false).expect("an unforced solve always returns a result");
+    if genuinely_warm || policy.seed == InnerHessianSeed::None {
+        return normal;
+    }
+    match solve(true) {
+        Some(seeded) if seeded.nll + COLD_SEED_TIE_TOL < normal.nll => seeded,
+        _ => normal,
+    }
+}
+
+/// Minimum objective improvement for a cold seeded solve to replace the unseeded one (see
+/// `find_ebe_impl`). Two solves reaching the *same* mode by different paths agree far below
+/// this; the second modes it exists for are separated by O(1).
+const COLD_SEED_TIE_TOL: f64 = 1e-9;
+
+/// One inner solve. `cold_seed = false` is the normal solve: the policy's Hessian seed is
+/// used only on a genuinely warm start. `cold_seed = true` forces the seed onto a cold start,
+/// and returns `None` without solving when the seed declines (a policy without one, not the
+/// dense-BFGS route, out of scope, or a failed factorization) — that solve would only
+/// reproduce the `cold_seed = false` one.
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_solve(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+    cold_seed: bool,
+) -> Option<EbeResult> {
+    let n_eta = model.n_eta;
 
     // mu: shift vector (zeros when no mu-referencing)
     // The inner EBE is optimised directly in eta_true space. Mu-referencing is a
@@ -1468,44 +1528,40 @@ fn find_ebe_impl(
     // stage routes this subject to Nelder–Mead or to L-BFGS (`inner_minimize_with_grad`),
     // where the matrix would be computed and dropped.
     //
-    // The seed is additionally gated to *genuinely warm-started* solves. It is a
-    // local model of the individual objective: near the mode it describes (the
-    // previous outer iteration's η̂) its Newton-scaled first step is the speedup
-    // this seed exists for, but from a cold start that same full step can cross
-    // into a neighbouring η̂ basin on a rugged surface — measured on a
-    // covariate-NN model, where cold-seeded first evaluations put 23 of 30
-    // subjects into a prior-unlikely mode and the fit converged ~950 OFV above
-    // the unseeded optimum with `converged = true` (slow-tests red since #1389,
-    // #1474). Cold starts keep the historical metric, which picks the basin.
-    // An all-zero "warm" start is a placeholder for cold (`freeze_flat_thetas`
-    // passes zeros as `prev_etas`), so it is excluded too.
+    // A cold start is seeded only when `find_ebe_impl` asks for it (`cold_seed`),
+    // as the second of the two cold solves it compares. An all-zero "warm" start
+    // is a cold placeholder.
     let seed_kind = policy.seed;
     let dense_bfgs_route = !matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
     let warm_start = eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0));
-    let seed = (seed_kind != InnerHessianSeed::None && dense_bfgs_route && warm_start)
-        .then(|| {
-            analytic_inner_seed_hessian(
-                model,
-                subject,
-                params,
-                &eta,
-                schedule,
-                mult.as_deref(),
-                err_keys.as_ref(),
-                &mut obs_grad_recycle.borrow_mut(),
-                seed_kind == InnerHessianSeed::Exact,
-            )
-        })
-        .flatten();
+    let seed =
+        (seed_kind != InnerHessianSeed::None && dense_bfgs_route && (warm_start || cold_seed))
+            .then(|| {
+                analytic_inner_seed_hessian(
+                    model,
+                    subject,
+                    params,
+                    &eta,
+                    schedule,
+                    mult.as_deref(),
+                    err_keys.as_ref(),
+                    &mut obs_grad_recycle.borrow_mut(),
+                    seed_kind == InnerHessianSeed::Exact,
+                )
+            })
+            .flatten();
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
         }
         hessian
     });
+    if cold_seed && initial_hessian.is_none() {
+        return None;
+    }
     let short_line_search = policy.accelerate_exact_outer
         && use_analytic
         && !enable_stall
@@ -1787,7 +1843,7 @@ fn find_ebe_impl(
         }
     };
 
-    EbeResult {
+    Some(EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
         terminal_hessian,
@@ -1797,7 +1853,7 @@ fn find_ebe_impl(
         nll,
         kappas: Vec::new(),
         hard_reject: false,
-    }
+    })
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
