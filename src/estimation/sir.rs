@@ -12,6 +12,9 @@ use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
+use crate::estimation::uncertainty_samples::{
+    bounds_to_draw_scale, from_draw_scale, log_abs_jacobian, logit_theta_coords, to_draw_scale,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -563,9 +566,20 @@ fn run_sir_core_scoped(
         return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".to_string());
     }
 
+    // A `LogitProbability` θ is proposed on the logit scale (#1548): a proposal
+    // on its packed `ln θ` scale has no ceiling at 1, and when the declared
+    // upper bound is above 1 a draw there is scored with the clamped-logit
+    // likelihood and can be resampled. The proposal lives on the draw scale
+    // `y`; the samples are stored, bounds-checked and scored on the packed
+    // scale `x`, and the weights carry `|dx/dy|` so the target is unchanged.
+    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)?;
+    let draw_bounds = bounds_to_draw_scale(&bounds, &logit_coords);
+    let log_jac_hat = log_abs_jacobian(&x_hat, &logit_coords);
+
     // Symmetrize first, then extract the free block (rows/cols of non-FIX
     // indices) before Cholesky.
-    let sym_cov_full = (proposal_cov + proposal_cov.transpose()) * 0.5;
+    let (y_hat, proposal_cov_y) = to_draw_scale(&x_hat, proposal_cov, &logit_coords);
+    let sym_cov_full = (&proposal_cov_y + proposal_cov_y.transpose()) * 0.5;
     let mut sub_cov = DMatrix::zeros(n_free, n_free);
     for (a, &i) in free_idx.iter().enumerate() {
         for (b, &j) in free_idx.iter().enumerate() {
@@ -596,7 +610,7 @@ fn run_sir_core_scoped(
                 .unwrap_or_else(|| format!("packed[{i}]"))
         })
         .collect();
-    let sd_caps = proposal_sd_caps(&x_hat, &bounds, &free_idx, options.sir_df);
+    let sd_caps = proposal_sd_caps(&y_hat, &draw_bounds, &free_idx, options.sir_df);
     let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names)?;
     if options.verbose {
         for w in conditioned.warnings() {
@@ -643,13 +657,15 @@ fn run_sir_core_scoped(
         let scale = (nu / chi2).sqrt();
         let z_vec_free = DVector::from_column_slice(&z_free);
         let delta_free = &proposal_chol * &z_vec_free * scale;
-        // Build the full packed sample: free indices get x_hat + delta_free,
+        // Build the full packed sample: free indices get y_hat + delta_free,
         // fixed indices stay pinned at x_hat (so the strict bounds check
-        // `lower == upper == x_hat[i]` passes).
-        let mut x_k = x_hat.clone();
+        // `lower == upper == x_hat[i]` passes; a fixed index is never a logit
+        // coordinate, so `y_hat[i] == x_hat[i]` there).
+        let mut x_k = y_hat.clone();
         for (a, &i) in free_idx.iter().enumerate() {
             x_k[i] += delta_free[a];
         }
+        from_draw_scale(&mut x_k, &logit_coords);
         samples.push(x_k);
         // store L_free⁻¹(delta_free) = z_free * scale for the quadratic form
         // in log_q_k. Length = n_free.
@@ -731,8 +747,16 @@ fn run_sir_core_scoped(
             let log_q_k =
                 log_norm - 0.5 * log_det_proposal - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
 
-            // Importance weight: log w_k = -0.5 * dOFV_k - log_q_k + log_q_hat
-            (-0.5 * dofv - log_q_k + log_q_hat, SampleOutcome::Accepted)
+            // The proposal density is on the draw scale, the target on the
+            // packed scale: `π_y(y) = π_x(x(y)) |dx/dy|`. Taken relative to the
+            // centre, like `log_q_hat`; exactly 0 with no logit coordinate.
+            let log_jac = log_abs_jacobian(x_k, &logit_coords) - log_jac_hat;
+
+            // Importance weight: log w_k = -0.5 * dOFV_k + log|dx/dy| - log_q_k + log_q_hat
+            (
+                -0.5 * dofv + log_jac - log_q_k + log_q_hat,
+                SampleOutcome::Accepted,
+            )
         })
         .unzip();
 
@@ -868,6 +892,111 @@ mod tests {
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("P{i}")).collect()
     }
+
+    /// #1548: a `LogitProbability` θ is proposed on the logit scale, and the
+    /// weights carry `|dx/dy|` so the SIR **target** is unchanged — flat in the
+    /// packed `ln θ`, restricted to the declared box.
+    ///
+    /// The fixture makes that target exact: `P` is a `LogitProbability`
+    /// individual parameter the structural model never reads and everything
+    /// else is FIX, so the likelihood is constant in `TVP` and the target is
+    /// uniform on `ln θ ∈ [ln 0.001, ln 0.999]`, `E[ln θ] = −3.454`. Dropping
+    /// the Jacobian makes the target uniform in `logit θ` instead, with
+    /// `E[ln θ] = −E[ln(1 + e^{−y})] = −1.846` (a 1.6-unit gap; that mutation
+    /// measures −1.845).
+    ///
+    /// The mean alone cannot see the packed-scale proposal this replaced — it
+    /// targets the same flat-in-`ln θ` box. The second run can: with the upper
+    /// bound widened to 5, that proposal's draws above 1 score a finite
+    /// clamped-logit likelihood and are resampled, so every resampled `ln θ`
+    /// must stay below 0.
+    #[test]
+    fn sir_logit_probability_proposal_keeps_the_packed_scale_target() {
+        let model_src = "
+[parameters]
+  theta TVCL(5.0, FIX)
+  theta TVV(50.0, FIX)
+  theta TVKA(1.5, FIX)
+  theta TVP(0.5, 0.001, UPPER)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_P ~ 0.1 FIX
+  sigma PROP_ERR ~ 0.15 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  P  = inv_logit(logit(TVP) + ETA_P)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d.csv");
+        std::fs::write(
+            &data,
+            "ID,TIME,AMT,EVID,CMT,DV,MDV\n\
+             1,0,100,1,1,.,1\n1,1,0,0,1,1.2,0\n1,4,0,0,1,1.4,0\n\
+             2,0,100,1,1,.,1\n2,1,0,0,1,1.0,0\n2,4,0,0,1,1.6,0\n",
+        )
+        .unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(&data, None, None).unwrap();
+
+        let run = |upper: &str, tvp: f64| -> Result<Vec<f64>, String> {
+            let model =
+                crate::parser::model_parser::parse_model_string(&model_src.replace("UPPER", upper))
+                    .expect("parse");
+            assert_eq!(model.theta_transform[3], ThetaTransform::LogitProbability);
+            let mut params = model.default_params.clone();
+            params.theta[3] = tvp;
+            let n_packed = crate::estimation::parameterization::packed_len(&params);
+            let mut cov = DMatrix::zeros(n_packed, n_packed);
+            // sd(ln θ) = 1.5 at θ̂ = 0.5 ⇒ sd(logit θ) = 3: wide enough to
+            // cover the whole box, well short of the bound cap's trigger.
+            cov[(3, 3)] = 2.25;
+            let etas = vec![DVector::zeros(2); pop.subjects.len()];
+            let opts = FitOptions {
+                sir_samples: 8000,
+                sir_resamples: 4000,
+                sir_keep_samples: true,
+                sir_seed: Some(7),
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let r = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)?;
+            Ok(r.resamples_packed
+                .expect("kept")
+                .iter()
+                .map(|x| x[3])
+                .collect())
+        };
+
+        let x = run("0.999", 0.5).expect("sir");
+        let mean = x.iter().sum::<f64>() / x.len() as f64;
+        let want = (f64::ln(0.001) + f64::ln(0.999)) / 2.0;
+        assert!(
+            (mean - want).abs() < SIR_MEAN_TOL,
+            "resampled E[ln θ] = {mean}, flat-in-ln-θ target {want} (no-Jacobian target −1.846)"
+        );
+
+        let x_wide = run("5.0", 0.5).expect("sir");
+        assert!(
+            x_wide.iter().all(|&xi| xi < 0.0),
+            "a resampled θ reached 1 with the upper bound widened to 5"
+        );
+
+        // An estimate past 1 (reachable only with such a bound) has no logit:
+        // SIR refuses rather than falling back to the packed-scale proposal.
+        let err = run("5.0", 1.2).unwrap_err();
+        assert!(err.contains("uncertainty for TVP"), "{err}");
+    }
+    // Target sd of ln θ is 6.9/sqrt(12) = 2.0, so 4000 resamples give SE >= 0.03
+    // (more after weighting); measured error 0.005. 0.25 is ~5 SE and 6x short
+    // of the 1.6 gap to the no-Jacobian target.
+    const SIR_MEAN_TOL: f64 = 0.25;
 
     /// A well-conditioned block must come back untouched: no floor, no cap,
     /// and `L·Lᵀ` reproducing the input.
