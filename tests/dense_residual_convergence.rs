@@ -80,15 +80,27 @@ fn fit_source_reconverging(
     fit(&model, &population, &model.default_params, &opts).expect("block_sigma fit must succeed")
 }
 
-/// The analytic dense-R FOCEI gradient reaches an optimum at least as good as the
-/// finite-difference gradient — and, being noise-free, converges to the same region
-/// of parameter space (per-coordinate gradient equality is pinned by the fast FD
-/// unit tests). We do *not* pin the two OFVs to within a shared basin: on this
-/// deliberately tiny, flat 2-subject surface the noisy FD outer gradient stalls at a
-/// shallower point than the analytic path (a ~0.7-unit-higher OFV since #925
-/// sharpened the inner-EBE fallback, though the estimates still agree to a few %).
-/// The invariant that matters — analytic ≤ FD, i.e. the exact gradient never lands
-/// somewhere worse — is what this test guards.
+/// The analytic dense-R FOCEI gradient and the **reconverged** finite-difference gradient
+/// (`reconverge_gradient_interval = 1`: every subject's EBE re-solved at every FD
+/// perturbation — the exact marginal gradient the analytic one must equal) must drive
+/// L-BFGS to the same optimum. The check is two-sided: a one-sided "analytic ≤ FD" bound
+/// cannot see an analytic gradient that lands *lower* in the wrong place, and the held-EBE
+/// FD fit (`reconverge_gradient_interval = 0`) is not a valid reference — it omits the
+/// EBE-response term (#1552; Codex review on #1556).
+///
+/// Measured on this fixture (Linux, `RAYON_NUM_THREADS=1`): analytic OFV 17.630655452624,
+/// reconverged 17.630655451731, |Δ| = 8.9e-10; worst θ relative difference 1.5e-7; ω²
+/// identical (both fits park it on the 6.1e-6 guard). The held-EBE fit lands at
+/// 17.630655604168. Bounds: 1e-7 on the OFV (110× headroom) and 1e-5 on θ (65×).
+///
+/// Mutation sweep on `subject_packed_gradient`, each against these bounds:
+/// - θ₀ gradient sign-flipped → |Δ| = 0.56, θ 7.0e-2 (both bounds fail; so did the old check);
+/// - ω gradient zeroed → |Δ| = 0.75, θ 2.2e-2 (both fail; so did the old check);
+/// - θ₁ gradient × 1.5 → |Δ| = 1.7e-6, θ 1.5e-4 — **passed the old one-sided check**, fails
+///   both bounds here;
+/// - ω gradient × 0.5 → |Δ| = 2.7e-10, θ 2.9e-5 — only the θ bound sees it (3× margin): ω² has
+///   collapsed onto its guard, so its gradient is nearly unobservable on this 3-subject
+///   fixture. A better-conditioned convergence fixture is a follow-up, not this test.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -96,33 +108,41 @@ fn fit_source_reconverging(
 )]
 fn dense_residual_analytic_and_fd_fits_agree() {
     let analytic = fit_with(GradientMethod::Auto);
-    let fd = fit_with(GradientMethod::Fd);
+    let reconverged = fit_source_reconverging(MODEL, GradientMethod::Fd, 1);
 
     assert!(
-        analytic.ofv.is_finite() && fd.ofv.is_finite(),
-        "both OFVs must be finite: analytic {}, fd {}",
+        analytic.ofv.is_finite() && reconverged.ofv.is_finite(),
+        "both OFVs must be finite: analytic {}, reconverged FD {}",
         analytic.ofv,
-        fd.ofv
+        reconverged.ofv
     );
-    // The noise-free analytic gradient reaches an optimum no worse than the FD one.
-    // (We don't pin |analytic - fd| to a shared basin: the flat 2-subject surface lets
-    // the noisy FD path stall at a shallower point — see the doc comment above.)
+    assert!(analytic.converged, "analytic fit did not converge");
+    assert!(reconverged.converged, "reconverged-FD fit did not converge");
+    // Two-sided: measured |Δ| = 8.9e-10, bound 1e-7 (any comparison against NaN is
+    // false, so a NaN OFV fails here too).
     assert!(
-        analytic.ofv <= fd.ofv + 1e-2,
-        "analytic OFV {} should be no worse than FD OFV {}",
+        (analytic.ofv - reconverged.ofv).abs() < 1e-7,
+        "analytic OFV {} vs reconverged-FD OFV {}: |Δ| = {:e} exceeds 1e-7",
         analytic.ofv,
-        fd.ofv
+        reconverged.ofv,
+        (analytic.ofv - reconverged.ofv).abs()
     );
-    // Despite the OFV gap, both paths converge to the same region of parameter space.
+    // Same optimum, not just the same objective value: measured worst θ 1.5e-7, bound 1e-5.
     let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
     for k in 0..analytic.theta.len() {
         assert!(
-            rel(analytic.theta[k], fd.theta[k]) < 5e-2,
-            "theta[{k}] analytic {} vs FD {}",
+            rel(analytic.theta[k], reconverged.theta[k]) < 1e-5,
+            "theta[{k}] analytic {} vs reconverged FD {}",
             analytic.theta[k],
-            fd.theta[k]
+            reconverged.theta[k]
         );
     }
+    assert!(
+        rel(analytic.omega[(0, 0)], reconverged.omega[(0, 0)]) < 1e-5,
+        "omega^2 analytic {} vs reconverged FD {}",
+        analytic.omega[(0, 0)],
+        reconverged.omega[(0, 0)]
+    );
 }
 
 /// #847: a bare `block_sigma` estimates its off-diagonal, so the free-rho fit must
