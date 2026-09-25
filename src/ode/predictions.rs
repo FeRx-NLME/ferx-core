@@ -2862,7 +2862,7 @@ fn unanchored_dose_clock_error(
          static engines anchor such a window at the first one — a dose a reactive run has \
          not decided yet, and may never decide — so this driver refuses the window rather \
          than read one out of the future. Give the subject a pre-scheduled base regimen, or \
-         have the controller dose at a decision placed at the start of the horizon; a \
+         have the controller dose at a decision at or before the subject's first record; a \
          controller that never doses leaves a model reading {slot} unanchored for the whole \
          run."
     ))
@@ -4738,7 +4738,24 @@ pub(crate) fn ode_predictions_adaptive_impl(
     if tv {
         t_last = shadow.pk_only_times.iter().cloned().fold(t_last, f64::max);
     }
-    let mut break_times: Vec<f64> = vec![0.0, t_last];
+    // #936: the base record's origin — its first obs / pk-only / dose / reset, the same
+    // `subject_integration_start` the static engine seeds at (NONMEM's first-record
+    // convention). `shadow.doses` is still only the base regimen here. The run's true origin
+    // is `min(t_base0, first realized controller dose)`, which is exactly the frozen-replay
+    // subject's (base ∪ ledger) start; the walk below holds the state at `init` until then.
+    //
+    // The seed only has to be a first break at or before the origin, and it must NOT put
+    // `t_base0` on the timeline up front when a decision precedes it: once an earlier
+    // controller dose is the origin, the static engine has no break at `t_base0` on the
+    // constant path (obs are `saveat` points), and an extra one perturbs the step sequence
+    // (measured: seeding with `t_base0` alone reddens 8 static-oracle tests). `t_base0` is
+    // instead inserted by the walk only if it reaches it un-started (below). Given that, the
+    // seed's VALUE below the first decision is immaterial — `0.0` is an equivalent mutation,
+    // since a decision is already a break and nothing before the origin is integrated — so
+    // the fold is simply "the first decision, or `t_base0` when none precedes it".
+    let t_base0 = subject_integration_start(&shadow);
+    let t_seed = decision_times.iter().cloned().fold(t_base0, f64::min);
+    let mut break_times: Vec<f64> = vec![t_seed, t_last];
     break_times.extend(decision_times.iter().cloned());
     if tv {
         break_times.extend(shadow.obs_times.iter().cloned());
@@ -4878,8 +4895,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut boundary_obs: Vec<usize> = Vec::new();
     let mut k = 0;
     let mut auto_state = OdeAutoSwitchState::default();
+    // #936: false until the walk reaches the origin — the base record's start `t_base0`, or
+    // an earlier realized controller dose (set at the `update_tafd_anchor` call sites). Before
+    // it the state stays at `init` and no segment is integrated, so a decision there reads
+    // the seeded state, as the static subject (base ∪ ledger) would have it.
+    let mut started = false;
     while k < break_times.len() {
         let t_start = break_times[k];
+        if t_start >= t_base0 - EVENT_MATCH_TOL {
+            started = true;
+        }
 
         // #701 (IOV): a decision break opens its occasion window `g`. Set the LOCF PK
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
@@ -5185,6 +5210,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // the true pre-dose trough above (#933). Recording it in `shadow.doses`
                             // + `injected_f` here is what that pass then applies.
                             update_tafd_anchor(&mut ext_params, t_start);
+                            started = true;
                             shadow
                                 .doses
                                 .push(DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0));
@@ -5237,6 +5263,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             let (_, dur_eff) = dose.bioavailable_infusion(f);
                             insert_break(&mut break_times, t_start + dur_eff);
                             update_tafd_anchor(&mut ext_params, t_start);
+                            started = true;
                             shadow.doses.push(dose);
                             injected_f.push(f);
                             ledger.push(DoseLedgerEntry {
@@ -5366,6 +5393,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // than stopping the loop one short of it — is what lets a decision
         // scheduled at the maximum time still fire: its dose reaches the `ledger`
         // and any coincident observation is recorded post-dose.
+        // #936: still before the origin with no dose issued here — make `t_base0` the next
+        // break so the walk starts integrating exactly there, as the static engine does.
+        if !started {
+            insert_break(&mut break_times, t_base0);
+        }
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
 
@@ -5415,97 +5447,100 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // The pre-segment state is kept for the #1151 causation check below: it is both
             // the "did it go non-finite HERE?" reference and the starting point the
             // counterfactual re-solve replays from. One `n_states` copy per segment.
-            let u_start = u.clone();
-            integrate_segment(
-                ode,
-                &mut u,
-                t_start,
-                t_end,
-                &shadow,
-                &dose_lagtimes,
-                &injected_f,
-                reset_floor,
-                &mut ext_params,
-                seg_pk_values,
-                theta,
-                seg_eta,
-                &obs_map,
-                &mut predictions,
-                None,
-                &mut auto_state,
-                &[],
-                None,
-            );
-
-            // #1151: a segment whose dose clock had no referent — a window before the first
-            // realized (or base) dose on a `TAD`/`TAFD`-reading RHS — integrates `0.0 * NaN`
-            // into the *state*, not just the readout, so every later read inherits it. Refuse
-            // it here rather than leave it to the (default-on, but opt-out) frozen-replay
-            // verifier, whose message names the symptom and not the cause.
-            //
-            // Placed AFTER the solve on purpose: the cheaper pre-integration form refused on
-            // `pk_reads_tad()` alone, which is a syntactic walk and true for a `TAD` in an
-            // untaken branch or in a condition — shapes whose state stays finite. See the
-            // helper's doc comment. `ext_params` now carries the anchors this segment ran
-            // under, so the helper re-folds nothing.
-            //
-            // The closure is the causation check: the same segment, from the same starting
-            // state, with the unanchored slot(s) given a finite value. The helper calls it
-            // once per stand-in (at most twice), only when every cheaper conjunct already
-            // holds, on a segment that has already come back non-finite — and throws the state
-            // away. So the cost is at most two extra segment solves per *non-finite episode*,
-            // not per subject: the driver is reset-aware (#716), and an EVID=3/4 reset that
-            // restores a finite state re-arms this. A fresh `OdeAutoSwitchState` and a
-            // throwaway `predictions` buffer keep it from perturbing the real walk, which
-            // continues unchanged when no counterfactual repairs anything (i.e. when the clock
-            // was not a cause).
-            let refusal = {
-                let shadow_ref = &shadow;
-                let lagtimes_ref = &dose_lagtimes;
-                let injected_ref = &injected_f;
-                let u_start_ref = &u_start;
-                unanchored_dose_clock_error(
+            // #936: nothing evolves before the origin (see `started`).
+            if started {
+                let u_start = u.clone();
+                integrate_segment(
                     ode,
-                    shadow_ref,
-                    u_start_ref,
-                    &u,
-                    &ext_params,
+                    &mut u,
                     t_start,
                     t_end,
-                    |finite_anchor| {
-                        let mut u_cf = u_start_ref.clone();
-                        let mut ext_cf = ext_params;
-                        if ext_cf[crate::types::MAX_PK_PARAMS].is_nan() {
-                            ext_cf[crate::types::MAX_PK_PARAMS] = finite_anchor;
-                        }
-                        let mut preds_cf = vec![f64::NAN; 0];
-                        let mut auto_cf = crate::ode::solver::OdeAutoSwitchState::default();
-                        integrate_segment(
-                            ode,
-                            &mut u_cf,
-                            t_start,
-                            t_end,
-                            shadow_ref,
-                            lagtimes_ref,
-                            injected_ref,
-                            reset_floor,
-                            &mut ext_cf,
-                            seg_pk_values,
-                            theta,
-                            seg_eta,
-                            &HashMap::new(),
-                            &mut preds_cf,
-                            None,
-                            &mut auto_cf,
-                            &[],
-                            Some(finite_anchor),
-                        );
-                        u_cf
-                    },
-                )
-            };
-            if let Some(msg) = refusal {
-                return Err(msg);
+                    &shadow,
+                    &dose_lagtimes,
+                    &injected_f,
+                    reset_floor,
+                    &mut ext_params,
+                    seg_pk_values,
+                    theta,
+                    seg_eta,
+                    &obs_map,
+                    &mut predictions,
+                    None,
+                    &mut auto_state,
+                    &[],
+                    None,
+                );
+
+                // #1151: a segment whose dose clock had no referent — a window before the first
+                // realized (or base) dose on a `TAD`/`TAFD`-reading RHS — integrates `0.0 * NaN`
+                // into the *state*, not just the readout, so every later read inherits it. Refuse
+                // it here rather than leave it to the (default-on, but opt-out) frozen-replay
+                // verifier, whose message names the symptom and not the cause.
+                //
+                // Placed AFTER the solve on purpose: the cheaper pre-integration form refused on
+                // `pk_reads_tad()` alone, which is a syntactic walk and true for a `TAD` in an
+                // untaken branch or in a condition — shapes whose state stays finite. See the
+                // helper's doc comment. `ext_params` now carries the anchors this segment ran
+                // under, so the helper re-folds nothing.
+                //
+                // The closure is the causation check: the same segment, from the same starting
+                // state, with the unanchored slot(s) given a finite value. The helper calls it
+                // once per stand-in (at most twice), only when every cheaper conjunct already
+                // holds, on a segment that has already come back non-finite — and throws the state
+                // away. So the cost is at most two extra segment solves per *non-finite episode*,
+                // not per subject: the driver is reset-aware (#716), and an EVID=3/4 reset that
+                // restores a finite state re-arms this. A fresh `OdeAutoSwitchState` and a
+                // throwaway `predictions` buffer keep it from perturbing the real walk, which
+                // continues unchanged when no counterfactual repairs anything (i.e. when the clock
+                // was not a cause).
+                let refusal = {
+                    let shadow_ref = &shadow;
+                    let lagtimes_ref = &dose_lagtimes;
+                    let injected_ref = &injected_f;
+                    let u_start_ref = &u_start;
+                    unanchored_dose_clock_error(
+                        ode,
+                        shadow_ref,
+                        u_start_ref,
+                        &u,
+                        &ext_params,
+                        t_start,
+                        t_end,
+                        |finite_anchor| {
+                            let mut u_cf = u_start_ref.clone();
+                            let mut ext_cf = ext_params;
+                            if ext_cf[crate::types::MAX_PK_PARAMS].is_nan() {
+                                ext_cf[crate::types::MAX_PK_PARAMS] = finite_anchor;
+                            }
+                            let mut preds_cf = vec![f64::NAN; 0];
+                            let mut auto_cf = crate::ode::solver::OdeAutoSwitchState::default();
+                            integrate_segment(
+                                ode,
+                                &mut u_cf,
+                                t_start,
+                                t_end,
+                                shadow_ref,
+                                lagtimes_ref,
+                                injected_ref,
+                                reset_floor,
+                                &mut ext_cf,
+                                seg_pk_values,
+                                theta,
+                                seg_eta,
+                                &HashMap::new(),
+                                &mut preds_cf,
+                                None,
+                                &mut auto_cf,
+                                &[],
+                                Some(finite_anchor),
+                            );
+                            u_cf
+                        },
+                    )
+                };
+                if let Some(msg) = refusal {
+                    return Err(msg);
+                }
             }
 
             // Advance the LOCF carry: after integrating into `t_end`, the record there
@@ -5834,7 +5869,9 @@ fn adaptive_frozen_replay_tv(
         .chain(subject.pk_only_times.iter())
         .cloned()
         .fold(0.0_f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0, t_last];
+    // #936: start where the static engine starts — this subject is base ∪ ledger, so its
+    // first record or realized dose is the reactive run's origin too.
+    let mut break_times: Vec<f64> = vec![subject_integration_start(subject), t_last];
     // Every break a dose list contributes, through the SAME builder the reactive driver
     // folds its base regimen in with (#1188). The hand-rolled loop this replaces pushed
     // only `d.time` and a real infusion's F-scaled end, so it emitted neither a per-route

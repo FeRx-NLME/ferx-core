@@ -391,6 +391,17 @@ PR by `tests/adaptive_vanco_anchor.rs`.
 
 ## Model time in a reactive run
 
+### Where a reactive run starts
+
+A reactive run starts where `predict()` starts on the same realized schedule: at the
+subject's **first record** (observation, PK-only row, base dose or reset) or at the
+controller's first realized dose, whichever is earlier — NONMEM's first-record
+convention. Before that origin the state is its `init(...)` value and does not evolve,
+so a decision placed earlier reads the `init` state. A dataset whose first record is at
+t = 6 is not integrated over a phantom `[0, 6]` window.
+
+### Dose clocks before the first dose
+
 A `[odes]` RHS may read the dose clocks `TAD` (time since the last dose) and `TAFD`
 (time after the first dose) — a natural shape for a PD controller, where time since
 the last dose drives an effect compartment. Both are supported reactively and match
@@ -410,8 +421,8 @@ unanchored (`TAD` or `TAFD`), and the two fixes:
 
 - give the subject a **pre-scheduled base regimen** — base dose times *are* known up
   front, so they anchor the window exactly as `predict()` does; or
-- place the **first decision at the start of the horizon** and dose there, so no
-  segment is integrated before the first dose.
+- have the controller **dose at a decision at or before the subject's first record**,
+  so no segment is integrated before the first dose.
 
 Neither fix helps a controller that *never* doses: such a run has no anchor at any
 point, and the message says so.
