@@ -79,6 +79,14 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **`simulate_adaptive()` now starts integrating at the subject's first record (or the
+  controller's first realized dose, if earlier), as `predict()` does, instead of at t = 0.**
+  With a non-zero `init(...)` and a first record after t = 0, the reactive trajectory and
+  the state the controller read at each decision were integrated over a phantom `[0, first
+  record]` window. With constant covariates the default frozen-replay check refused the
+  run; with a time-varying covariate or IOV the check shared the same t = 0 start and passed
+  it silently. The refusal for an unanchored `TAD`/`TAFD` window now advises a dose "at or
+  before the subject's first record". (#936)
 - **Adaptive dosing on a `TAD` / `TAFD`-reading `[odes]` RHS no longer returns a silent
   `NaN` trajectory.** With no pre-scheduled base regimen, the reactive driver's dose clock
   has no referent before the controller's first dose — and that `NaN` entered the
