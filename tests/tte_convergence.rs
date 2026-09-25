@@ -843,7 +843,8 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
 /// `expected.md`; this seed lands at H0≈0.010 / BETA≈0.43, off the 0.02 / 0.30 truth
 /// along the ridge, max |ΔS(t)|≈0.16). Nor does it band `CL` and `V` separately:
 /// `ODE_TTE_FIT` carries no `[scaling]` block, so the observation is the central
-/// *amount*, a function of `ke` alone, and `V` enters only through the hazard's
+/// *amount*, which depends on `CL` and `V` only through `ke` (with `KA` and the dosing
+/// design held fixed), and `V` enters elsewhere only through the hazard's
 /// `BETA * (central / V)` — the objective is **exactly** invariant under
 /// `(TVCL, TVV, TVBETA) → (c·TVCL, c·TVV, c·TVBETA)` (measured at the fitted point:
 /// scaling by 1.3 / 0.7 moves Σ −log L by −5e-11 / +1e-10 and η̂ by ≤ 1.6e-7). Where
