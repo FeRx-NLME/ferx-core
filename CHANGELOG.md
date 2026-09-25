@@ -79,6 +79,31 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **Adaptive dosing on a `TAD` / `TAFD`-reading `[odes]` RHS no longer returns a silent
+  `NaN` trajectory.** With no pre-scheduled base regimen, the reactive driver's dose clock
+  has no referent before the controller's first dose — and that `NaN` entered the
+  integrated *state*, so every later prediction came back `NaN` too, including reads taken
+  after the first dose landed. With the frozen-replay verifier on (the default) the run
+  failed with the verifier's message, which never named the cause; with `verify: false` it
+  returned `Ok` with `NaN` rows and no warning at all. `simulate_adaptive()` now refuses
+  that window with a typed error naming the segment, the spelling (`TAD` or `TAFD`) and the
+  two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
+  that doses. The check is gated on the outcome, not on the text of the model: it runs after
+  each segment and fires only when that segment integrated to a non-finite state under an
+  unanchored clock **and** re-solving it with the clock anchored repairs some state that had
+  gone non-finite. So a `TAD` in a branch the pre-dose window never takes, or read only
+  inside a condition, still runs — and a compartment that diverges for its own reasons is
+  not refused, and not blamed on the clock. Runs with a base regimen, with all reads
+  anchored, or on a RHS reading only `TIME` / `T` are likewise unaffected. One shape stays
+  outside it: an unanchored clock consumed by a comparison (`if (TAD < 5)`, `min(TAD, 24)`)
+  leaves the state finite and silently picks a branch, and the default-on frozen-schedule
+  replay verifier is what catches the resulting divergence (#1151).
+- **Note on the diverging-compartment case above**: not being refused is not the same as
+  being correct. When any state goes non-finite the solver stops advancing every state, so
+  the other compartments freeze and come back as finite predictions — from `predict()` as
+  much as from the reactive driver, which is why the replay verifier agrees with them. That
+  is an engine defect in its own right and is tracked separately (#1539); nothing in #1151
+  changes it either way.
 - **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
   The floor replaces a direction of negative or near-zero curvature with a finite one, so the
   condition number and correlations the `max_condition_number` / `max_correlation` gates read
