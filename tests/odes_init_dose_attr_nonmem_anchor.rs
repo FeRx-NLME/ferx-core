@@ -143,6 +143,7 @@ fn preds_on(csv: &str, src: &str) -> Vec<f64> {
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
     let model = parse_full_model(src).expect("the model parses").model;
     predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()

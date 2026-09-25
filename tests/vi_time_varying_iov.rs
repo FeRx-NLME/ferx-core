@@ -212,7 +212,7 @@ fn design() -> Population {
 /// whose true decomposition into `KDEC` and `Ω_iov` is known by construction.
 fn simulated_population(model: &CompiledModel, params: &ModelParameters) -> Population {
     let mut pop = design();
-    let rows = simulate_with_seed(model, &pop, params, 1, SEED);
+    let rows = simulate_with_seed(model, &pop, params, 1, SEED).unwrap();
 
     let mut per_subject: HashMap<String, Vec<f64>> = HashMap::new();
     for r in &rows {

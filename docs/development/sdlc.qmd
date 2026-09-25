@@ -19,7 +19,7 @@ plan for, see [§4](#the-development-workflow-with-ai)).
 > **Scope.** This covers governance, the issue→PR→merge→release flow, the
 > git model, cross-repo synchronization, the testing pyramid, NONMEM
 > validation, and the quality gates enforced by CI. It complements (does not
-> replace) each repo's `CLAUDE.md`, which carries the low-level
+> replace) each repo's `AGENTS.md`, which carries the low-level
 > build/test/style rules.
 >
 > **Want to help?** You don't need to be on the core team — see
@@ -249,7 +249,7 @@ Put the comparison either in the feature's docs page (`docs/...`,
 
 ### 8.1 Testing pyramid
 
-Tests live in three tiers (see `CLAUDE.md` for placement rules). Put a new
+Tests live in three tiers (see `AGENTS.md` for placement rules). Put a new
 test in the **lowest tier whose constraints it fits**.
 
 | Tier | What | Where | When it runs |
@@ -416,7 +416,7 @@ Render locally with `tools/render-docs.sh` before marking documentation-heavy PR
 ready for review. Prefer it to a bare `quarto render docs`: Quarto's project
 input discovery skips any path with a **hidden** (dot-prefixed) directory
 component, so in a worktree under `.claude/worktrees/<name>/` — which
-`CLAUDE.md` asks for on any branch that is not `main` — `quarto render docs`
+`AGENTS.md` asks for on any branch that is not `main` — `quarto render docs`
 finds *zero* inputs. It writes `robots.txt` and `sitemap.xml`, renders not one
 page, prints no warning and **exits 0**. The script stages `docs/` outside the
 dot directory in that case, and fails loudly if a render produces no pages.
@@ -489,7 +489,7 @@ section is what flags that a MAJOR/MINOR bump is due.
 
 **Changelog.** ferx-core keeps a hand-curated `CHANGELOG.md` (Keep a Changelog
 format); add an `[Unreleased]` entry **in the same PR** as any user-facing
-change — `CLAUDE.md` carries the rule. ferx-r keeps the equivalent `NEWS.md`, so
+change — `AGENTS.md` carries the rule. ferx-r keeps the equivalent `NEWS.md`, so
 a cross-repo change may touch both. `release.yml` additionally auto-generates
 GitHub release notes from merged PRs, so keep PR titles in `type(scope): …`
 form. User-facing breaking changes also carry **migration notes** (PR template).
@@ -557,7 +557,7 @@ A bare `cargo update` unpins the patch and CI fails with
   (blocks commits failing `rustfmt`).
 - **Sensitivity-reachable code:** keep functions on the `Dual2` path (the `*_g<T:
   PkNum>` closed forms and propagators) differentiable — use `if`/`else` rather than
-  `f64::max`/`min` where it matters; see "Analytic Sensitivities" in `CLAUDE.md`.
+  `f64::max`/`min` where it matters; see "Analytic Sensitivities" in `AGENTS.md`.
 
 ---
 

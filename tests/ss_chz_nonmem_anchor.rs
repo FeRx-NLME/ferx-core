@@ -231,7 +231,7 @@ fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
 /// second dose would give `0.002` and `0.240`: every record after `t = 48` short by `H(48)`.
 /// The straddle is asserted below so the arm cannot quietly stop discriminating.
 ///
-/// Non-degenerate on the incoming side, which is what the dose-event rule in CLAUDE.md
+/// Non-degenerate on the incoming side, which is what the dose-event rule in AGENTS.md
 /// requires: the reference's own `IPRED` reads `4.83708578` at `t = 47.9` against `4.78896241`
 /// at the dose times, so drug from the preceding interval is genuinely present when the second
 /// dose lands — never the `g(x-) = 0` of a first dose.
@@ -240,7 +240,7 @@ fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
     for arm in ["const", "drug"] {
         let (m, pop) = load_with(arm, DATA_MID_RECORD);
         let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R3).unwrap();
-        let pred = predict(&m, &pop, &m.default_params);
+        let pred = predict(&m, &pop, &m.default_params).unwrap();
         let reference = nonmem_rows_r3(arm);
 
         // The straddle: the reference must carry a materially non-zero hazard into the second
@@ -410,7 +410,7 @@ fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
         "this arm anchors the `lag >= II` regime; got ALAG1={lag}, II={ii}"
     );
     let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R5).unwrap();
-    let pred = predict(&m, &pop, &m.default_params);
+    let pred = predict(&m, &pop, &m.default_params).unwrap();
     let reference = nonmem_rows_r5();
 
     // The straddle, on the reference itself: drug has been present since t = 0 and the hazard
@@ -602,7 +602,7 @@ fn instantaneous_hazard_after_an_ss_dose_matches_nonmem() {
 fn steady_state_predictions_match_nonmem() {
     for arm in ["const", "drug", "tdep"] {
         let (m, pop) = load(arm);
-        let pred = predict(&m, &pop, &m.default_params);
+        let pred = predict(&m, &pop, &m.default_params).unwrap();
         let mut worst = 0.0f64;
         let mut compared = 0usize;
         for (t, ipred, _, _) in nonmem_rows(arm) {
@@ -818,7 +818,7 @@ fn nonmem_rows_r4() -> Vec<(f64, f64, f64, f64)> {
 fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
     let (m, pop) = load_with("const", DATA_RESET);
     let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R4).unwrap();
-    let pred = predict(&m, &pop, &m.default_params);
+    let pred = predict(&m, &pop, &m.default_params).unwrap();
     let reference = nonmem_rows_r4();
 
     // The straddle: the reference must carry a materially non-zero hazard into the reset, or

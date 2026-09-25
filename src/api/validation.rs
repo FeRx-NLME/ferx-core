@@ -394,7 +394,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         //
         // Narrowing the recording instead would mean re-deciding "would this row have
         // been scored" at the filter site, a second copy of a predicate the reader owns
-        // two hundred lines down — the arrangement CLAUDE.md's "when two implementations
+        // two hundred lines down — the arrangement AGENTS.md's "when two implementations
         // disagree, the fix is one implementation" rule exists to prevent. So the field
         // keeps recording what it can honestly see, and the sentence claims only that.
         // The intersection is untouched and is what the field is for: without it,
@@ -2888,10 +2888,8 @@ fn twin_decline_clause(model: &CompiledModel) -> String {
 /// are instead transparently rerouted to the plain form's ODE twin — `transit()` / `igd()`
 /// forcing — via [`CompiledModel::effective_for`]: the twin integrates the cross-occasion
 /// dose carryover (#104/#663) the superposition cannot. Only a form outside that twin's
-/// scope rejects them.) `fit()` and every `Result`-returning predict / simulate entry point
-/// surface this as an `Err`; the `Vec`-returning `predict()` / `simulate()` re-raise the same
-/// text as a panic (#898). Returns the first offending feature's message, or `None` when
-/// compatible.
+/// scope rejects them.) `fit()` and every predict / simulate entry point surface this as an
+/// `Err` (#898). Returns the first offending feature's message, or `None` when compatible.
 pub(crate) fn check_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
@@ -3243,9 +3241,8 @@ pub(crate) fn check_rtte_records(model: &CompiledModel, population: &Population)
 ///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
 ///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
 ///
-/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` and the
-/// `Result`-returning predict / simulate entry points surface the message as an `Err`; the
-/// `Vec`-returning `predict()` / `simulate()` re-raise the same text as a panic (#898).
+/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` and every
+/// predict / simulate entry point surface the message as an `Err` (#898).
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_tv_covariates(
     model: &CompiledModel,
@@ -3430,8 +3427,7 @@ pub(crate) fn check_analytic_readout_support(
 /// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
 /// Returns the first offending subject's message, or `None` when no reject applies
 /// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
-/// an error, as do the `Result`-returning predict / simulate entry points; the `Vec`-returning
-/// `predict()` / `simulate()` re-raise the same text as a panic (#898). Mirrors
+/// an error, as does every predict / simulate entry point (#898). Mirrors
 /// [`check_absorption_closed_form_support`].
 pub(crate) fn check_absorption_flip_flop_no_twin(
     model: &CompiledModel,
@@ -5425,7 +5421,7 @@ pub(crate) fn check_packed_start_in_box(
     // No `inverted` consult here: `coordinates_outside_bounds` already declines
     // a coordinate whose bounds are not finite and orderable, so a second test
     // would reject exactly what the first one rejects — the redundant gate
-    // CLAUDE.md names as a test hole. The declared-range walk above needs its
+    // AGENTS.md names as a test hole. The declared-range walk above needs its
     // consult because it never looks at the packed box at all.
     for hit in coordinates_outside_bounds(&start, &kinds) {
         // Below a variance rail is #1229's error, reported there with its own

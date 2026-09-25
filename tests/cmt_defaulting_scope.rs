@@ -276,6 +276,7 @@ fn try_preds(src: &str, dose_cmt: usize) -> Option<Vec<f64>> {
     let model: CompiledModel = parse_full_model(src).expect("model parses").model;
     Some(
         predict(&model, &pop_of(&csv), &model.default_params)
+            .unwrap()
             .into_iter()
             .map(|p| p.pred)
             .collect(),
@@ -313,7 +314,7 @@ fn base_preds(src: &str, model: PkModel) -> Vec<f64> {
 /// Folded with an explicit `is_finite` guard on both sides rather than through
 /// `f64::max`, which discards `NaN` — a solver returning `NaN` is the likeliest way
 /// to break what this measures, and a plain running max would report the *finite*
-/// rows' answer and pass (CLAUDE.md, "a green test is not evidence that it can
+/// rows' answer and pass (AGENTS.md, "a green test is not evidence that it can
 /// fail").
 fn worst_rel_diff(a: &[f64], b: &[f64], case: &str) -> f64 {
     assert_eq!(a.len(), b.len(), "{case}: row count");

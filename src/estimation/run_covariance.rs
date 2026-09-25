@@ -193,8 +193,7 @@ fn run_covariance_scoped(
     // it needs the same dose-compartment precondition `fit()` enforces (#375) —
     // otherwise a caller-supplied population with an unroutable dose aborts the
     // process from inside the walk, from a `Result`-returning API. Matches the
-    // `Result` form used at the adaptive chokepoint rather than the
-    // `predict()`/`simulate()` panic.
+    // `Result` form every other entry point uses (#898).
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
     // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: a
     // population read model-blind carries a joint model's event rows as Gaussian
@@ -395,10 +394,34 @@ mod tests {
     use super::*;
     use crate::api::fit_from_files;
 
-    // In-tree warfarin example + data (see CLAUDE.md). Tests run from the crate
+    // In-tree warfarin example + data (see AGENTS.md). Tests run from the crate
     // root, so relative paths work directly.
     const MODEL_PATH: &str = "examples/warfarin.ferx";
     const DATA_PATH: &str = "data/warfarin.csv";
+
+    /// #1512: the model-selection strictness gate fails any fit carrying the eigenvalue-floor
+    /// warning, so a re-run that replaces the step (an `r` fit re-run under `s`, whose `S⁻¹`
+    /// never floors) must drop the old one — or the gate would exclude the fit on a floor that
+    /// no longer describes its matrix. Pinned on the real message, chain prefix included.
+    #[test]
+    fn the_eigenvalue_floor_warning_is_superseded_by_a_rerun() {
+        use crate::estimation::cov_diagnostics::{
+            format_regularized_warning, CovHessianSource, CovRegularizationFacts,
+        };
+        let msg = format_regularized_warning(&CovRegularizationFacts {
+            source: CovHessianSource::FdStencil,
+            n_clipped: 1,
+            n_free: 9,
+            min_eigenvalue: 2.028e-7,
+            max_eigenvalue: 2.285e3,
+            floor: 2.285e-7,
+            variance_inflation: 1.190e3,
+            declines: &[],
+            ode: None,
+        });
+        assert!(is_covariance_step_warning(&msg), "{msg}");
+        assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
+    }
 
     fn copy_example_to_tempdir(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         // Hash-mismatch tests mutate the source files; copy them so the

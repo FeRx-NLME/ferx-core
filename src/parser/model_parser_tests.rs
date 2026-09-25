@@ -2311,7 +2311,7 @@ fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
         // subject that would have rerouted is *rejected*, not silently served by the closed
         // form. Reach the guard directly rather than through `fit()` (Tier 1: no convergence
         // loop) — this is the exact call `fit()` makes at its `check_absorption_closed_form_
-        // support` gate, and the same `Option<String>` `predict()`/`simulate()` panic on.
+        // support` gate, and the same `Option<String>` `predict()`/`simulate()` return as their `Err`.
         let rejection =
             crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population())
                 .unwrap_or_else(|| {

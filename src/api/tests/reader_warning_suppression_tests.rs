@@ -676,7 +676,7 @@ fn every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one() {
     // The property the enumeration exists for, and the one no #1404 round could
     // state: each channel is, on its own, a reason to report — and *only* that
     // channel is live on its fixture, so deleting that arm reddens this test rather
-    // than being covered by a neighbour. (CLAUDE.md, "two redundant gates cover for
+    // than being covered by a neighbour. (AGENTS.md, "two redundant gates cover for
     // each other": an arm that never decides anything alone is untested however
     // green the suite is.)
     for c in CmtConsumer::iter() {

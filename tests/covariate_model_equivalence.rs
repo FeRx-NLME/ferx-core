@@ -121,8 +121,8 @@ fn the_block_is_the_classical_model_it_desugars_to() {
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
 
     // 1. Predictions at a fixed parameter vector, bit for bit.
-    let hand_pred = predict(&hand.model, &pop, &hand.model.default_params);
-    let block_pred = predict(&block.model, &pop, &block.model.default_params);
+    let hand_pred = predict(&hand.model, &pop, &hand.model.default_params).unwrap();
+    let block_pred = predict(&block.model, &pop, &block.model.default_params).unwrap();
     assert_eq!(hand_pred.len(), block_pred.len());
     for (h, b) in hand_pred.iter().zip(&block_pred) {
         assert_eq!(h.id, b.id);

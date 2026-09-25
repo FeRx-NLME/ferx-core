@@ -170,7 +170,7 @@ CSV writer (§3 Seam 4).
 1. **Exact, always-available — fixed-effects (n_eta=0) vs R `glm(family=binomial)`.** ferx θ ≈ glm
    coefficients to ~1e-4; ferx OFV ≈ glm deviance (−2·logLik) up to the additive constant. Deterministic,
    license-free, doubles as the D7 smoke test. **This is the gate.** (base-R `stats::glm` confirmed present.)
-2. **NONMEM `F_FLAG=1` LAPLACE (CLAUDE.md-required, mixed case).** Write the `.ctl`, run via Docker.
+2. **NONMEM `F_FLAG=1` LAPLACE (AGENTS.md-required, mixed case).** Write the `.ctl`, run via Docker.
    **⚠ verify the NONMEM Docker image is actually runnable first** — `docker images` did not list
    `nonmemdocker:V0.1` in this environment. Cross-check vs **saemix** on toenail (§14.5: de Backer 1998,
    294 subj; accept OFV ±1.0, fixed FX ±15%) — **⚠ `saemix`/`HSAUR2` not installed** (install or source).

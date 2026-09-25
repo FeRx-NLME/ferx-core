@@ -110,7 +110,7 @@ each combo needs outer + inner + a still-FD edge test.
   ExpressionScale `is_none()` check at `4751-4755`) to now-analytic.
 - Subject builders: `bolus_subject` (`3954`), `bolus_subject_wt` (`4009`), `tvcov_subject` (`6530`).
 
-## NONMEM comparison (required by CLAUDE.md)
+## NONMEM comparison (required by AGENTS.md)
 
 Fit a TV-cov ODE model with (a) an EVID=2 covariate-only row and (b) an `obs_scale = expr(θ,η)`
 readout in ferx vs NONMEM `METHOD=1 INTER`; record OFV + parameter agreement (≤1e-5 OFV) in

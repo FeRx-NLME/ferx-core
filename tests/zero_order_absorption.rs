@@ -113,7 +113,7 @@ fn zero_order_curve_recovers_dose_auc_and_has_flat_input_onset() {
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single(obs_times, 0.0);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // (1) No instantaneous bolus jump: the dose enters as a constant rate over
     //     (0, DUR], so central starts at 0.
@@ -165,9 +165,9 @@ fn zero_order_equals_explicit_infusion_of_the_same_duration() {
         .model;
 
     let obs_times: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
-    let zo_preds = predict(&zo, &pop_single(obs_times.clone(), 0.0), &zo.default_params);
+    let zo_preds = predict(&zo, &pop_single(obs_times.clone(), 0.0), &zo.default_params).unwrap();
     // rate = Dose/DUR = 100/4 = 25 mg/h ⇒ infusion duration = amt/rate = 4 h.
-    let inf_preds = predict(&plain, &pop_single(obs_times, 25.0), &plain.default_params);
+    let inf_preds = predict(&plain, &pop_single(obs_times, 25.0), &plain.default_params).unwrap();
 
     assert_eq!(zo_preds.len(), inf_preds.len());
     for (a, b) in zo_preds.iter().zip(inf_preds.iter()) {
@@ -243,7 +243,7 @@ fn zero_order_matches_nonmem_modeled_duration_pred() {
         .expect("zero_order concentration model parses")
         .model;
     let times: Vec<f64> = nonmem_pred.iter().map(|&(t, _)| t).collect();
-    let preds = predict(&model, &pop_single(times, 0.0), &model.default_params);
+    let preds = predict(&model, &pop_single(times, 0.0), &model.default_params).unwrap();
 
     assert_eq!(preds.len(), nonmem_pred.len());
     for (p, &(t, nm)) in preds.iter().zip(nonmem_pred.iter()) {
@@ -289,7 +289,7 @@ fn zero_order_restarts_after_reset_event_driven_path() {
         warnings: vec![],
         subjects: vec![subject],
     };
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // pred(12 + x) == pred(x) for x ∈ {2, 4, 8}: the reset + re-dose reproduce the
     // first cycle's zero-order absorption exactly.
@@ -355,8 +355,8 @@ fn zero_order_window_open_at_reset_stops_like_a_cut_infusion() {
         }
     };
 
-    let zo_preds = predict(&zo, &mk(0.0), &zo.default_params);
-    let inf_preds = predict(&plain, &mk(25.0), &plain.default_params);
+    let zo_preds = predict(&zo, &mk(0.0), &zo.default_params).unwrap();
+    let inf_preds = predict(&plain, &mk(25.0), &plain.default_params).unwrap();
 
     assert_eq!(zo_preds.len(), inf_preds.len());
     for (a, b) in zo_preds.iter().zip(inf_preds.iter()) {
@@ -454,12 +454,14 @@ fn zero_order_with_lagtime_is_the_unlagged_curve_shifted_by_the_lag() {
         &unlagged,
         &pop_single(base.clone(), 0.0),
         &unlagged.default_params,
-    );
+    )
+    .unwrap();
     let lagged_preds = predict(
         &lagged,
         &pop_single(lagged_times, 0.0),
         &lagged.default_params,
-    );
+    )
+    .unwrap();
 
     // (1) Nothing absorbed before the lag: at the first lagged sample (t = lag) the
     //     amount is still 0 — the window has not opened yet.
@@ -550,7 +552,7 @@ fn sequential_model_parses_and_delivers_full_mass_to_central() {
             vec![2; n], // observe central
         )],
     };
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // central starts empty (the zero-order input fills the depot first, then ka
     // transfers) and the full dose still reaches central: ∫central dt = Dose/ke.
@@ -720,7 +722,8 @@ fn zero_order_fit_recovers_duration() {
         &model,
         &pop_single(obs_times.clone(), 0.0),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);

@@ -1,7 +1,7 @@
 # NONMEM anchor — built-in absorption models (transit / inverse-Gaussian)
 
 Reference NONMEM runs for the built-in absorption input-rate functions, to satisfy
-the CLAUDE.md "compare with NONMEM output" rule:
+the AGENTS.md "compare with NONMEM output" rule:
 
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
@@ -235,7 +235,7 @@ meaningful here: the data were simulated from the Savic transit model, so the IG
 fit is mildly mis-specified (both engines fit the same approximate shape). On that
 mis-specified objective the likelihood surface has a long flat ridge — NONMEM's
 gradient FOCEI climbs it from `MAT≈2` to `MAT≈6.07` over ~30 iterations, while
-ferx's default derivative-free outer optimiser (BOBYQA) takes small steps and
+ferx's derivative-free outer optimiser (BOBYQA, the default when this anchor was recorded) takes small steps and
 stalls partway up (full-fit OFV ≈ −881). The optimiser *path* on a flat surface is
 not the implementation check; the **objective at the optimum** is. (The stall is
 the ODE analogue of the fixed-EBE gradient bias the analytic FOCE/FOCEI gradient

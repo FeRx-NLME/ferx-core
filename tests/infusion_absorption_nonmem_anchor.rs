@@ -14,7 +14,7 @@
 //! order `KA` carries it to central — so a native `ADVAN2` run (no `$DES`) is the reference.
 //! The unit test `ode::predictions::tests::infusion_into_first_order_absorption_matches_subdose_train`
 //! pins the same physics against an explicit sub-dose train; this is the independent NONMEM
-//! cross-check required by CLAUDE.md.
+//! cross-check required by AGENTS.md.
 //!
 //! ## Reproducing the NONMEM reference
 //!
@@ -78,7 +78,7 @@ fn predict_matches_nonmem_infusion_into_first_order_absorption() {
         "dataset should contain an infusion (RATE>0) dose"
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time.
     let nonmem: &[(f64, f64)] = &[

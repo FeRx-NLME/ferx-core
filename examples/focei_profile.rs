@@ -143,7 +143,7 @@ fn fixture(case: &str) -> (CompiledModel, Population) {
         s.cens = vec![0; 8];
     }
     // Check the stiff trajectory against its matrix-exponential closed form.
-    for pred in ferx_core::predict(&model, &pop, &model.default_params) {
+    for pred in ferx_core::predict(&model, &pop, &model.default_params).unwrap() {
         let exact = exact_binding(pred.time, 3.0, 20.0);
         assert!((pred.pred - exact).abs() < 2e-5 * exact.abs().max(1e-6));
     }

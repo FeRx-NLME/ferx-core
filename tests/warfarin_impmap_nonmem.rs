@@ -2,7 +2,7 @@
 //!
 //! Runs ferx IMPMAP standalone on warfarin and asserts the converged estimates
 //! match NONMEM's `METHOD=IMPMAP` reference on the same model/data. This is the
-//! cross-engine validation required for a new estimator (CLAUDE.md): IMPMAP is
+//! cross-engine validation required for a new estimator (AGENTS.md): IMPMAP is
 //! NONMEM's method, so the anchor is NONMEM itself, not just ferx's FOCEI.
 //!
 //! Gated behind `slow-tests` (runs the full 150-iteration MCEM); skipped in the

@@ -250,7 +250,7 @@ pub(crate) fn absorption_flip_flop_at(
 ///
 /// A flip-flop absorption model with no ODE twin has nothing to reroute to, and is rejected
 /// up front at η = 0 typical values by [`crate::api::check_absorption_flip_flop_no_twin`]
-/// (`fit()` → `Err`, `predict()`/`simulate()` panic) rather than silently returning the closed
+/// (`fit()`, `predict()` and `simulate()` all → `Err`) rather than silently returning the closed
 /// form's `0`. (This function still returns the closed form for it — the guard runs first.)
 /// See [`crate::types::CompiledModel::absorption_ode_equivalent`] for what "no twin" covers:
 /// the desugar's by-name declines *and* a twin that was reconstructed and rejected by its own

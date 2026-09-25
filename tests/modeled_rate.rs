@@ -255,6 +255,7 @@ fn pop_of(csv: &str) -> Population {
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     let pop = pop_of(csv);
     predict(model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()
@@ -645,6 +646,7 @@ fn analytical_modeled_rate_matches_nonmem_closed_form() {
     let model = model_of(ANALYTICAL_R1);
     let pop = pop_of(&coded_csv());
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();

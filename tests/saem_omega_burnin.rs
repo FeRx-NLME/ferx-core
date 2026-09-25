@@ -103,7 +103,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
     truth.omega = OmegaMatrix::from_diagonal(&[0.09, 0.09], vec!["ETA_CL".into(), "ETA_V".into()]);
     truth.sigma.values = vec![0.10];
 
-    let sim = simulate_with_seed(model, template, &truth, 1, 20240527);
+    let sim = simulate_with_seed(model, template, &truth, 1, 20240527).unwrap();
 
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {

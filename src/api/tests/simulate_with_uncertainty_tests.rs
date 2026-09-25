@@ -845,7 +845,7 @@ fn legacy_simulate_emits_draw_one() {
     // parameter uncertainty.
     let model = tiny_model();
     let pop = tiny_population();
-    let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
+    let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42).unwrap();
     assert!(rows.iter().all(|r| r.draw == 1));
 }
 

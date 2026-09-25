@@ -1,7 +1,7 @@
 //! NONMEM anchor for additive (`+`) `[covariate_model]` relations (#1313).
 //!
 //! `CL = TVCL*EXP(ETA(1)) + THETA(6)*(WT - 70)` is an ordinary NONMEM model, so
-//! this feature gets an ordinary anchored comparison — none of the CLAUDE.md
+//! this feature gets an ordinary anchored comparison — none of the AGENTS.md
 //! exceptions applies. Two arms, four control streams, all
 //! `$EST MAXEVAL=0 POSTHOC INTERACTION` so nothing is estimated on either side
 //! and the comparison is of arithmetic rather than of where two optimizers
@@ -164,7 +164,7 @@ fn nonmem_pred(file: &str) -> Vec<(String, f64, f64)> {
 fn worst_pred_error(model_src: &str, table: &str) -> f64 {
     let parsed = parse_full_model(model_src).expect("the ferx model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the dataset must load");
-    let ferx = predict(&parsed.model, &pop, &parsed.model.default_params);
+    let ferx = predict(&parsed.model, &pop, &parsed.model.default_params).unwrap();
     let nm = nonmem_pred(table);
 
     let mut worst: f64 = 0.0;

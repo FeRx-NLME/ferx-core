@@ -713,7 +713,7 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 ## ferx-r follow-up (per user-facing feature)
 
-Every user-facing feature here must reach R users through `../ferx-r` (CLAUDE.md: a
+Every user-facing feature here must reach R users through `../ferx-r` (AGENTS.md: a
 newly-`pub` ferx-core change "expects a matching PR in `ferx-r`"). The follow-up for
 this plan is **light**, because the absorption input-rate functions (`transit`, `igd`,
 `weibull`, `zero_order`, `first_order`) and `ode_template` are **model-file DSL/parser
@@ -752,7 +752,7 @@ Per-phase mapping:
 #324's faithful `R1`/`D1` is a separate data-format feature (coded `RATE`), so its ferx-r
 follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324, not here.
 
-## Tests & NONMEM anchoring (CLAUDE.md mandates)
+## Tests & NONMEM anchoring (AGENTS.md mandates)
 
 - **Tier 1 (unit):** input-fn values vs hand-computed; mass-balance integral; `ln_gamma` vs
   reference; every param-validation error/warning.

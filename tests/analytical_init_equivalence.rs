@@ -113,8 +113,8 @@ fn analytical_central_init_matches_ode_init() {
     );
 
     let pop = population();
-    let pa = predict(&an, &pop, &an.default_params);
-    let po = predict(&ode, &pop, &ode.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     assert!(!pa.is_empty());
 
@@ -210,8 +210,8 @@ fn analytical_and_ode_init_agree_when_the_seed_reads_bioavailability() {
     .model;
 
     let pop = population();
-    let pa = predict(&an, &pop, &an.default_params);
-    let po = predict(&ode, &pop, &ode.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     assert!(!pa.is_empty());
 
@@ -254,7 +254,7 @@ fn predict_iov_carries_analytical_init() {
     let pop = population();
     let subject = &pop.subjects[0];
 
-    let public = predict(&an, &pop, &an.default_params);
+    let public = predict(&an, &pop, &an.default_params).unwrap();
     // Non-IOV: no kappa groups. `predict_iov` takes the theta slice directly.
     let iov = predict_iov(&an, subject, &an.default_params.theta, &[0.0; 1], &[]);
 
@@ -325,8 +325,8 @@ fn assert_pred_agrees(an: &str, ode: &str, pop: &Population, t0_conc: f64) {
     let ode = parse_full_model(ode).expect("ODE model parses").model;
     assert_eq!(an.analytical_init.len(), 1);
 
-    let pa = predict(&an, pop, &an.default_params);
-    let po = predict(&ode, pop, &ode.default_params);
+    let pa = predict(&an, pop, &an.default_params).unwrap();
+    let po = predict(&ode, pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
     assert!(!pa.is_empty());
     assert!(
@@ -446,7 +446,7 @@ fn analytical_init_zeroed_after_reset() {
         subjects: vec![subj],
     };
 
-    let pa = predict(&an, &pop, &an.default_params);
+    let pa = predict(&an, &pop, &an.default_params).unwrap();
     assert!(
         (pa[0].pred - 30.0).abs() < 1e-6,
         "pre-reset baseline at t=0 should be 30, got {}",

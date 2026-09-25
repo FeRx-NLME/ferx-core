@@ -281,7 +281,11 @@ a structural search) is the tool's, and omitting it leaves the tool's default.
 `[strictness]` maps one-to-one onto `ferx-core`'s `Strictness` predicate
 (#1177): `require_converged`, `require_covariance`, `max_condition_number`,
 `max_correlation`, `reject_on_boundary`, `reject_init_stall`. Every key is
-optional; an unstated key keeps the engine default. Under automation an init
+optional; an unstated key keeps the engine default. While either threshold
+is enabled (both are by default), a candidate whose covariance step had to floor a Hessian
+eigenvalue is excluded too, since the floor hides exactly the collapse the
+thresholds look for (#1512; see
+[Strictness](../api/fitting.qmd#strictness-check_strictness)). Under automation an init
 stall (#751) or a wrong inner-EBE mode (#864) is a *model-selection* error,
 not a slow fit, so every candidate gets `retries` starts first, then the gate,
 then ranking.
@@ -294,7 +298,11 @@ memory), `retries` (perturbed
 starts per candidate on top of the fit from the exact initials — Pharmpy's
 meaning, so `n_starts = retries + 1`; default 2, i.e. three starts; `0` is a
 single fit), `cache_dir` (the journal a `resume = true` run picks up from,
-relative to the file), `resume`, and `reuse_from` (a list of *other*
+relative to the file), `resume` (a journalled candidate is not refitted, but
+its cached fit *is* re-judged under the gate and re-scored under the
+criterion in force, so a gate the engine has since tightened — #1512 — applies
+to a run interrupted before it; only a row whose `fits/<hash>.json` is gone
+keeps the verdict it was written with), and `reuse_from` (a list of *other*
 searches' directories, relative to the file, whose cached fits every step
 of this run may reuse — a candidate another tool already fitted to the same
 data with the same settings is re-scored under this file's `[rank]` and

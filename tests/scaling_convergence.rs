@@ -24,18 +24,20 @@
 //!
 //! Run on the NONMEM host:  `nmfe75 warfarin_scaled.ctl warfarin_scaled.lst`
 //!
-//! ferx (this engine) converges as below — the default gradient-free BOBYQA and
+//! ferx (this engine) converges as below — the gradient-free BOBYQA and
 //! the gradient-based analytic L-BFGS path agree (the L-BFGS path is the one the
 //! scaling jet transform feeds; both see the same scaled objective):
 //!
-//! | Parameter   | ferx (analytic L-BFGS) | ferx (default BOBYQA) |
+//! | Parameter   | ferx (analytic L-BFGS) | ferx (BOBYQA)         |
 //! |-------------|------------------------|-----------------------|
-//! | OFV         | −740.838               | −740.762              |
-//! | TVCL        | 0.132956               | 0.133164              |
-//! | TVV         | 7.72748                | 7.70177               |
-//! | TVKA        | 0.810476               | 0.826152              |
-//! | ADD (SD)    | 0.008687               | 0.008727              |
-//! | ω²(CL/V/KA) | 0.02876 / 0.00947 / 0.33549 |  0.02726 / 0.01031 / 0.33202 |
+//! | OFV         | −740.838               | −740.825              |
+//! | TVCL        | 0.132943               | 0.132774              |
+//! | TVV         | 7.72789                | 7.73056               |
+//! | TVKA        | 0.810919               | 0.820868              |
+//!
+//! (Measured on #1540, release build, macOS. The BOBYQA arm is pinned: `auto`
+//! resolves to `nlopt_lbfgs` on this model, so the default arm would not be a
+//! second optimizer.)
 //!
 //! NONMEM 7.5.1 (MINIMIZATION SUCCESSFUL) reaches OFV −740.8376 / TVCL 0.132943
 //! / TVV 7.72787 / TVKA 0.810919 / SIGMA(1,1) 7.54671e-5 (SD 0.008687) — matching
@@ -106,7 +108,7 @@ fn expression_scale_matches_nonmem() {
 }
 
 /// The analytic scaling path converges and the gradient-based (analytic
-/// L-BFGS) and gradient-free (default BOBYQA) optimizers agree — the scaling jet
+/// L-BFGS) and gradient-free (BOBYQA) optimizers agree — the scaling jet
 /// transform is self-consistent with the scaled production objective. Pins ferx
 /// estimates as a regression guard; the NONMEM cross-check is the documented
 /// hand-off above.
@@ -143,7 +145,7 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
     // The `converged` flag is the outer gradient-norm criterion; additive error
     // leaves it just above tolerance on warfarin's flat KA ridge. Substantive
     // convergence is asserted below via the OFV/estimate match (anchored to ferx
-    // and, independently, to the default gradient-free optimizer).
+    // and, independently, to the gradient-free BOBYQA optimizer).
     assert!(
         lbfgs.ofv.is_finite(),
         "OFV must be finite, got {}",
@@ -174,30 +176,40 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
         lbfgs.sigma[0]
     );
 
-    // Default gradient-free path sees the same scaled objective: OFV agrees and
+    // The gradient-free path sees the same scaled objective: OFV agrees and
     // the well-determined θ (CL, V) match; TVKA sits on a flat ridge (≈58% CV),
-    // so it gets a wider band.
+    // so it gets a wider band. BOBYQA is pinned, not left on the default: since
+    // #490 `optimizer = auto` resolves to `nlopt_lbfgs` on this in-scope model, so
+    // the default arm would be a second gradient-based fit and the two-optimizer
+    // agreement this test exists for would go untested (#1540).
     let mut opt_def = FitOptions::default();
+    opt_def.optimizer = Optimizer::Bobyqa;
     opt_def.outer_maxiter = 300;
     opt_def.run_covariance_step = false;
     opt_def.verbose = false;
     let def = fit(&model, &population, &model.default_params, &opt_def)
-        .expect("default scaled fit must succeed");
+        .expect("BOBYQA scaled fit must succeed");
+    // The two arms must be two different optimizers, or the agreement below is
+    // L-BFGS against itself.
+    assert_eq!(
+        def.optimizer, "bobyqa",
+        "the gradient-free arm must run BOBYQA"
+    );
     assert!(
         (lbfgs.ofv - def.ofv).abs() < 0.5,
-        "OFV L-BFGS {} vs default {}",
+        "OFV L-BFGS {} vs BOBYQA {}",
         lbfgs.ofv,
         def.ofv
     );
     assert!(
         rel(lbfgs.theta[0], def.theta[0]) < 0.02,
-        "TVCL L-BFGS {} vs default {}",
+        "TVCL L-BFGS {} vs BOBYQA {}",
         lbfgs.theta[0],
         def.theta[0]
     );
     assert!(
         rel(lbfgs.theta[1], def.theta[1]) < 0.02,
-        "TVV L-BFGS {} vs default {}",
+        "TVV L-BFGS {} vs BOBYQA {}",
         lbfgs.theta[1],
         def.theta[1]
     );

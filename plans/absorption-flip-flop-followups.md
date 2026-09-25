@@ -210,7 +210,7 @@ below. (This is the one genuinely new mechanism in the trio.)
   and with `f` now auto-routes to its twin and matches a hand-written ODE `transit()`/`igd()`
   reference carrying the same lag/F — to closed-form↔ODE tolerance. Replace the "warns actionable"
   assertion for the now-supported lag/f cases with an "auto-routes + matches twin" assertion.
-- **NONMEM anchor (CLAUDE.md mandate — this changes numeric output).** A flip-flop
+- **NONMEM anchor (AGENTS.md mandate — this changes numeric output).** A flip-flop
   transit-with-lag model fit/predicted vs an equivalent NONMEM `$DES` transit run (a previously-
   zero-returning model now produces a real profile). Slow-tests-gated, in the example page or PR
   description. The analytic≡ODE equivalence test is the fast per-PR backstop; the NONMEM run is

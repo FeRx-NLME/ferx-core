@@ -110,7 +110,7 @@ Workhorses: `check_vs_production` (`4283`), `check_hessian_vs_fd_of_grad` (`4328
   production:5384`, multi-dose `5442`) with lagtime / reset / TV-cov variants; flip the
   corresponding still-FD assertions.
 
-## NONMEM comparison (required by CLAUDE.md)
+## NONMEM comparison (required by AGENTS.md)
 
 For each combination, fit ferx vs NONMEM `METHOD=1 INTER` with `RATE=-2`/`D1` (and `SS=1`, IOV
 `$OMEGA BLOCK`, reset/`ADDL`, or TV-cov as applicable); record OFV + parameter agreement in the PR.
@@ -139,7 +139,7 @@ For each combination, fit ferx vs NONMEM `METHOD=1 INTER` with `RATE=-2`/`D1` (a
   per-cycle PK jet (`2858-2862`), not from `subject.doses`.
 - **`reset_floor` for zero-order**: a reset-cut window must still fire its rate-off correction
   (`3735`, `K_RESET` at `3497`).
-- **Single-source dual + f64 walks** (CLAUDE.md): keep the boundary-break-time set and floor
+- **Single-source dual + f64 walks** (AGENTS.md): keep the boundary-break-time set and floor
   epsilons (`DURATION_FLOOR`/`RATE_FLOOR`, used `3081`/`3087`) identical to the f64 references
   (`active_zero_order_inputs`/`zero_order_windows`/`resolve_rate` in `ode/predictions.rs` /
   `pk/event_driven.rs`), or the saltation lands off the break.

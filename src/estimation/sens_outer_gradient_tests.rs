@@ -1088,6 +1088,269 @@ fn population_packed_gradient_selected_block_sigma_matches_fd() {
     assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
 }
 
+/// A [`SELECTED_BLOCK_SIGMA_1CPT`] subject whose total (`FREE = 0`) and unbound
+/// (`FREE = 1`) rows are **paired** at each time — the `fluconazole_radboudumc` shape
+/// (#1536). Each pair shares a residual block, so `R` has cross-observation entries.
+fn paired_selected_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+    selected_dense_subject(
+        model,
+        theta,
+        &[0.5, 0.5, 2.0, 2.0, 8.0, 8.0],
+        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+    )
+}
+
+/// #1536: [`crate::stats::residual_error::has_cross_observation_residual`] — the gate both
+/// `corr_residual_diag`'s decline and the outer assembly's reconverged salvage read — is
+/// decided by the pairing, which depends on the data, not on values. Each fixture differs
+/// from `paired` or `distinct` in one input and straddles the predicate:
+///
+/// - paired vs distinct times (the `(time, occasion)` block);
+/// - distinct times vs the same rows grouped by an explicit `L2` id (the `L2` block pairs
+///   rows across times, so a predicate that ignored `obs_l2` would serve it diagonally
+///   while the objective's `R` stays coupled);
+/// - paired vs the same times all on one endpoint (slot overlap: two `FREE = 0` rows at
+///   one time share a block but not a correlation);
+/// - ρ = 0.3 vs ρ = 0 on the paired subject: the value covariance vanishes at ρ = 0, so a
+///   gate on `|R_jk| > 0` (the pre-#1536 guard) would serve it analytically and drop
+///   `∂R_jk/∂ρ`. The pairing gate must still decline it.
+///
+/// Each fixture is checked three ways, independently: the predicate, `corr_residual_diag`,
+/// and — at ρ ≠ 0, where a pair has a nonzero value covariance — the off-diagonal of the
+/// `R` the objective builds (`compute_r_matrix_with_correlations`) at the provider's
+/// predictions and the covariate-selected endpoint keys. So the predicate cannot drift from
+/// either the decline or the matrix without this test reddening. (`f = 0` is not reachable
+/// on this IV fixture: every prediction is positive.)
+#[test]
+fn cross_observation_residual_gate_follows_pairing_not_values() {
+    use crate::stats::residual_error::{
+        compute_r_matrix_with_correlations, has_cross_observation_residual,
+    };
+
+    let model = parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+    let theta = [1.1, 11.0];
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    let corr = params.residual_correlations.clone();
+    assert_eq!(corr.len(), 1, "fixture precondition: one correlation");
+    assert!(
+        corr[0].rho != 0.0,
+        "fixture precondition: nonzero declared ρ"
+    );
+    let mut corr_zero = corr.clone();
+    corr_zero[0].rho = 0.0;
+
+    let paired = paired_selected_subject(&model, &theta);
+    let distinct = selected_dense_subject(
+        &model,
+        &theta,
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+    );
+    let mut l2_grouped = distinct.clone();
+    l2_grouped.obs_l2 = vec![1, 1, 2, 2, 3, 3];
+    let one_endpoint =
+        selected_dense_subject(&model, &theta, &[0.5, 0.5, 2.0, 2.0, 8.0, 8.0], &[0.0; 6]);
+
+    let sigma = &params.sigma.values;
+    let zeros = vec![0.0; model.n_eta];
+    let sens_of = |s: &Subject| {
+        crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &zeros).unwrap()
+    };
+    let r_off_diagonal = |s: &Subject, c: &[ResidualCorrelation]| {
+        let ipreds: Vec<f64> = sens_of(s).obs.iter().map(|o| o.f).collect();
+        let r = compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            model.error_spec.obs_keys(s).as_ref(),
+            &s.obs_times,
+            &s.obs_raw_times,
+            &s.occasions,
+            &s.obs_l2,
+            sigma,
+            c,
+        );
+        let n = ipreds.len();
+        (0..n).any(|j| (0..n).any(|k| j != k && r[(j, k)] != 0.0))
+    };
+    for (name, s, c, cross) in [
+        ("paired", &paired, &corr, true),
+        ("paired, rho = 0", &paired, &corr_zero, true),
+        ("distinct times", &distinct, &corr, false),
+        ("L2-grouped distinct times", &l2_grouped, &corr, true),
+        ("one endpoint", &one_endpoint, &corr, false),
+    ] {
+        assert_eq!(
+            has_cross_observation_residual(&model.error_spec, s, sigma, c),
+            cross,
+            "{name}: predicate"
+        );
+        let sens = sens_of(s);
+        assert_eq!(
+            corr_residual_diag(&model, s, &sens, sigma, c).is_some(),
+            !cross,
+            "{name}: corr_residual_diag must decline exactly the cross-observation subjects"
+        );
+        if c[0].rho != 0.0 {
+            assert_eq!(
+                r_off_diagonal(s, c),
+                cross,
+                "{name}: the objective's R must couple rows exactly when the predicate says so"
+            );
+        }
+    }
+    // No correlation at all: nothing can pair.
+    assert!(!has_cross_observation_residual(
+        &model.error_spec,
+        &paired,
+        sigma,
+        &[]
+    ));
+}
+
+/// #1536 regression. A subject whose `block_sigma` residual pairs rows across
+/// observations declines the analytic outer gradient at **every** point, so the
+/// salvage is the only gradient it ever contributes. #1529 made that salvage the
+/// held-EBE gradient, which omits the EBE-response term; on `fluconazole_radboudumc`
+/// (all 31 subjects paired) L-BFGS then stalled at `‖g‖ ≈ 655` and OFV 807.88, against
+/// 738.05 with the reconverged gradient.
+///
+/// For **both** FOCEI and FOCE (the salvage choice must not key on `interaction`), the
+/// assembled mixed gradient must match FD of the **full** objective — the paired subject's
+/// marginal with its EBE re-solved at every point, not held — across every θ/Ω/σ/ρ
+/// coordinate, next to an in-scope subject that keeps the exact analytic gradient.
+///
+/// It also pins the precedence with the #1520 guard: at a blown-up trial the structural
+/// subject contributes **zero** (the guard runs before the salvage is chosen), so the
+/// population gradient is exactly the in-scope subject's term and one skip is recorded.
+#[test]
+fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
+    use crate::estimation::outer_optimizer::{population_gradient_sens_mixed, OuterTrial};
+    use crate::estimation::parameterization::compute_bounds;
+    use crate::types::FitOptions;
+
+    let model = parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+    let theta = [1.1, 11.0];
+    let s_in = selected_dense_subject(
+        &model,
+        &theta,
+        &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0],
+        &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+    );
+    let s_paired = paired_selected_subject(&model, &theta);
+    let pop = Population {
+        subjects: vec![s_in, s_paired],
+        covariate_names: vec!["FREE".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let mut template = model.default_params.clone();
+    template.theta = theta.to_vec();
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+    let bounds = compute_bounds(&template);
+
+    for interaction in [true, false] {
+        let options = FitOptions {
+            interaction,
+            ..Default::default()
+        };
+        // The production per-subject objective with the EBE re-solved at `p`: the
+        // reference both the analytic subject's exact gradient and the paired subject's
+        // reconverged salvage are gradients of.
+        let solve =
+            |s: &Subject, p: &ModelParameters| find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
+        let nll = |s: &Subject, p: &ModelParameters| -> f64 {
+            let e = solve(s, p);
+            foce_subject_nll(
+                &model,
+                s,
+                &p.theta,
+                &e.eta,
+                &e.h_matrix,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                interaction,
+            )
+        };
+
+        let solved: Vec<_> = pop.subjects.iter().map(|s| solve(s, &params)).collect();
+        let ehs: Vec<DVector<f64>> = solved.iter().map(|e| e.eta.clone()).collect();
+        let hms: Vec<DMatrix<f64>> = solved.iter().map(|e| e.h_matrix.clone()).collect();
+
+        // Straddle, asserted: subject 0 is analytic, subject 1 declines.
+        let per_sub =
+            per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, interaction, None);
+        let g_in = per_sub[0]
+            .clone()
+            .unwrap_or_else(|| panic!("interaction = {interaction}: unpaired subject analytic"));
+        assert!(
+            per_sub[1].is_none(),
+            "interaction = {interaction}: paired subject must decline"
+        );
+
+        let declines =
+            crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+        let mixed = population_gradient_sens_mixed(
+            &x,
+            &template,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &options,
+            OuterTrial::unknown(),
+            &declines,
+        );
+        let w =
+            crate::estimation::outer_optimizer::outer_fd_fallback_warning(&model, &pop, &declines)
+                .expect("a declined subject warns");
+        assert!(
+            w.starts_with("1 of 2") && w.contains("correlated across observation rows"),
+            "interaction = {interaction}: the paired subject must be logged as a structural \
+             decline; got: {w}"
+        );
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop.subjects.iter().map(|s| nll(s, &p)).sum::<f64>()
+        };
+        // Measured (FOCEI): worst relative error 9.8e-4, on the ρ coordinate (the salvage's
+        // own single-step central difference against this Richardson reference); every
+        // other coordinate ≤ 6e-6. The held-EBE salvage misses by 1.4e-1 on the first θ,
+        // so the shared 2e-3 bound separates the two by ~70×. FOCE: worst 1.55e-4, also
+        // on ρ.
+        eprintln!("interaction = {interaction}");
+        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 2e-3, 1e-5);
+
+        // #1520 precedence: a blown-up trial (population and subject 1 both 1e6 over an
+        // incumbent of 0) skips the structural subject's salvage. The guard reads only the
+        // trial context, so a synthetic one suffices.
+        let contribs = vec![0.0; 2];
+        let best = vec![0.0, -1e6];
+        let blown = OuterTrial {
+            ofv: 1e6,
+            contribs: &contribs,
+            incumbent: Some((0.0, &best)),
+        };
+        let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(2);
+        let guarded = population_gradient_sens_mixed(
+            &x, &template, &model, &pop, &ehs, &hms, &bounds, &options, blown, &declines,
+        );
+        let expected: Vec<f64> = g_in.iter().map(|g| 2.0 * g).collect();
+        assert_eq!(
+            guarded, expected,
+            "interaction = {interaction}: a skipped structural subject contributes zero"
+        );
+        assert_eq!(declines.skipped_salvages(), 1);
+    }
+}
+
 /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic
 /// FOCEI packed gradient must still match Richardson reconverged FD of the dense marginal
 /// across every θ/Ω/σ coord. Pins the numerical side of the outer half of

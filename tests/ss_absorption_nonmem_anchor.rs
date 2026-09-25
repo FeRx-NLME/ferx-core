@@ -15,7 +15,7 @@
 //! would land visibly off this reference. The unit test
 //! `ode::predictions::tests::ss_into_first_order_absorption_matches_explicit_run_in`
 //! pins the same physics against an explicit run-in; this is the independent NONMEM
-//! cross-check required by CLAUDE.md.
+//! cross-check required by AGENTS.md.
 //!
 //! ## Reproducing the NONMEM reference
 //!
@@ -108,7 +108,7 @@ fn predict_matches_nonmem_ss_first_order_absorption() {
         "dataset should contain SS=1 doses"
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time.
     let nonmem: &[(f64, f64)] = &[
@@ -281,7 +281,7 @@ fn predict_matches_nonmem_mm_ss_absorption() {
         "dataset should contain SS=1 doses"
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (ADVAN13 general-ODE steady state), keyed by observation time.
     let nonmem: &[(f64, f64)] = &[

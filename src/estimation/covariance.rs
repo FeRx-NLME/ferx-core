@@ -1808,7 +1808,7 @@ pub(crate) struct RegularizedInverse {
 ///
 /// Two guards, and both are load-bearing — each is killed by its own mutation, which is how
 /// they were cut down from three (the third rejected exactly the inputs the first already did,
-/// and deleting it left the suite green: CLAUDE.md's redundant-gate hole):
+/// and deleting it left the suite green: AGENTS.md's redundant-gate hole):
 ///
 /// * **`var[k]` not positive** — the `FIX`ed-parameter cell. A pinned coordinate reports
 ///   `SE = 0` on *both* sides, and `0 / 0` would fall into the `var_ref <= 0` arm below and
@@ -2366,7 +2366,7 @@ mod tests {
         // Both guards, each asserted where **only** it can produce the right answer, so
         // deleting either one reddens this test on its own line. The three-guard version this
         // replaced had a third condition that rejected exactly the inputs the first already
-        // did — deleting it left the suite green, which is CLAUDE.md's redundant-gate hole and
+        // did — deleting it left the suite green, which is AGENTS.md's redundant-gate hole and
         // is why the guards were cut down rather than added to.
         let live = 9.0;
 

@@ -4,9 +4,10 @@
 //! Exercises the analytical 1-cpt oral TV-covariate path end-to-end:
 //!   parser → NONMEM CSV reader (a `WT` column that changes within each subject,
 //!   so the reader emits per-event covariate snapshots and `has_tv_covariates()`)
-//!   → fit() to convergence with a **gradient-based** outer optimizer (`lbfgs`, so
-//!   the analytic TV-cov gradient is actually exercised — the default `bobyqa` is
-//!   gradient-free and would bypass it) → asserts the optimizer flagged
+//!   → fit() to convergence with a **gradient-based** outer optimizer
+//!   (`nlopt_lbfgs`, pinned so the analytic TV-cov gradient is exercised whatever
+//!   `optimizer = auto` resolves to — a gradient-free `bobyqa` would bypass it) →
+//!   asserts the optimizer flagged
 //!   convergence, OFV is finite, and the recovered typical values (incl. the
 //!   allometric WT-on-CL exponent THETA_WT) are within tolerance of the simulation
 //!   truth.
@@ -21,7 +22,7 @@
 //! the late observations.
 //!
 //! Gated with `slow-tests` so it runs nightly but is compile-checked on every PR
-//! per CLAUDE.md tiering (Tier-3 "runs fit() to convergence").
+//! per AGENTS.md tiering (Tier-3 "runs fit() to convergence").
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv};

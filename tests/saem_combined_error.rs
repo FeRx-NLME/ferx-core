@@ -88,7 +88,7 @@ fn simulated_population(model: &ferx_core::types::CompiledModel) -> Population {
     truth.omega = OmegaMatrix::from_diagonal(&[0.08, 0.08], vec!["ETA_CL".into(), "ETA_V".into()]);
     truth.sigma.values = vec![0.05, 3.00];
 
-    let sim = simulate_with_seed(model, &template, &truth, 1, 20260619);
+    let sim = simulate_with_seed(model, &template, &truth, 1, 20260619).unwrap();
     let mut pop = template;
     for subj in pop.subjects.iter_mut() {
         subj.observations = sim
@@ -237,7 +237,7 @@ fn sparse_simulated_population(model: &ferx_core::types::CompiledModel, n: usize
     let mut truth = model.default_params.clone();
     truth.theta = vec![4.0, 22.0, 13.0];
     truth.sigma.values = vec![SPARSE_TRUE_PROP, SPARSE_TRUE_ADD];
-    let sim = simulate_with_seed(model, &template, &truth, 1, 20_260_918);
+    let sim = simulate_with_seed(model, &template, &truth, 1, 20_260_918).unwrap();
     let mut pop = template;
     for subj in pop.subjects.iter_mut() {
         subj.observations = sim
@@ -364,7 +364,7 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
         // ONE lower gate, not two. A separate `add > SIGMA_FLOOR * 1000`
         // (= 0.335) alongside this one would reject nothing the factor-of-two
         // bound (0.9) does not already reject — the "two redundant gates cover
-        // for each other" hole in CLAUDE.md — so the floor lives in the message
+        // for each other" hole in AGENTS.md — so the floor lives in the message
         // as a distance rather than in a predicate of its own.
         assert!(
             add > SPARSE_TRUE_ADD / 2.0 && add < SPARSE_TRUE_ADD * 2.0,

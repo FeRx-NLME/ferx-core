@@ -8,7 +8,7 @@
 //!   — the exponent rides the magnitude channel, and a channel that changed the
 //!   arithmetic on its neutral value would move every base fit a search
 //!   started from. The same evaluation at `P = 1.3` must differ, or the pair
-//!   is a tautology (the CLAUDE.md straddle rule).
+//!   is a tautology (the AGENTS.md straddle rule).
 //! * **Every consumer reads the exponent.** IWRES, CWRES, the simulated draw
 //!   and each estimator route the variance through code the exponent has to
 //!   reach; a path that fell back to the unscaled variance would show as a
@@ -178,7 +178,7 @@ fn simulate_draws_with_the_power_variance() {
     let prop = model("DV ~ proportional(PROP_ERR)", "");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     let spread = |m: &ferx_core::types::CompiledModel| -> f64 {
-        let sim = simulate_with_seed(m, &pop, &m.default_params, 1, 7);
+        let sim = simulate_with_seed(m, &pop, &m.default_params, 1, 7).unwrap();
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
         for row in &sim {

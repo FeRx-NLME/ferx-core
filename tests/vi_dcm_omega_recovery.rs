@@ -332,7 +332,7 @@ fn design(cov: CovariateDesign) -> Population {
 fn simulated_population(cov: CovariateDesign) -> Population {
     let truth_model = parse(TRUTH_SRC);
     let mut pop = design(cov);
-    let rows = simulate_with_seed(&truth_model, &pop, &truth(&truth_model), 1, SEED);
+    let rows = simulate_with_seed(&truth_model, &pop, &truth(&truth_model), 1, SEED).unwrap();
 
     let mut per_subject: HashMap<String, Vec<f64>> = HashMap::new();
     for r in &rows {

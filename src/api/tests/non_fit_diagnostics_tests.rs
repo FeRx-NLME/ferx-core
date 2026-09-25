@@ -233,7 +233,7 @@ fn the_propensity_branch_of_simulate_carries_the_bundle_too() {
 fn predict_returns_exactly_the_diag_forms_rows() {
     let m = ode_model(1.0, 10_000);
     let p = pop(3);
-    let rows = predict(&m, &p, &m.default_params);
+    let rows = predict(&m, &p, &m.default_params).unwrap();
     let out = predict_diag(&m, &p, &m.default_params).unwrap();
     assert_eq!(rows.len(), out.results.len());
     assert!(!rows.is_empty(), "the fixture must produce rows to compare");
@@ -556,7 +556,7 @@ fn the_row_only_entry_points_stay_silent_by_contract() {
     let p = pop_ss_bad_ii(1);
     // `predict` → rows only, and they are the `_diag` form's rows.
     assert_eq!(
-        predict(&m, &p, &m.default_params).len(),
+        predict(&m, &p, &m.default_params).unwrap().len(),
         predict_diag(&m, &p, &m.default_params)
             .unwrap()
             .results

@@ -91,6 +91,8 @@ The salvage follows the [`reconverge_gradient_interval`](#gradient-accuracy-vs-c
 
 The held-EBE gradient differentiates the same per-subject objective the fit reports. Where a closed form would miss a term of it — a θ-dependent residual magnitude, `block_sigma` correlations, M3, IIV on residual error — it is a central difference of that objective instead. A declined subject that is **repelled** at the trial point (its objective is the `1e20` sentinel) contributes a zero gradient: the population objective there carries the sentinel, so no line search accepts the point and its gradient is never used to take a step. If the held-EBE gradient comes back non-finite at a usable objective, that subject alone falls back to the reconverged gradient.
 
+One kind of decline is exempt from the schedule: a **structural** one, which the subject takes at every parameter point rather than at an occasional trial (#1536). Today that means a `block_sigma` correlation across observation rows, such as total and unbound assays paired at one time. The analytic assembly serves only a diagonal residual covariance, and the pairing depends on the data alone, so such a subject is never analytic. The held-EBE gradient would then be the only gradient it ever contributes, and its missing EBE-response term biases every step rather than a few. On a 31-subject fluconazole model with paired total/unbound rows, L-BFGS stalled at OFV 807.9 on the held-EBE gradient against 738.0 with the reconverged one (NONMEM: 734.6). Structural declines therefore take the reconverged gradient whatever `reconverge_gradient_interval` says. The one exception is the blown-up-trial guard (#1520): under SLSQP or MMA, a trial that guard skips gets a zero contribution from a structural decline too, at a point the optimizer rejects anyway. The warning names structural declines separately: `used reconverged finite-difference outer gradients because their block_sigma residuals are correlated across observation rows`.
+
 IOV models (`kappa`/`block_kappa`) always reconverge and ignore `reconverge_gradient_interval`, so a declined IOV subject still takes the reconverged gradient, and the warning says so: `used reconverged finite-difference outer gradients; their results are correct but slower`.
 
 #### How declines are counted {#how-declines-are-counted}
@@ -295,7 +297,7 @@ To amortize that cost, `reconverge_gradient_interval = N` reconverges only every
 | `slsqp` + reconverge every 10 (`interval = 10`) | 66,118 | 633 s |
 | `slsqp` + reconverge every 5 (`interval = 5`) | 66,056 | 1,004 s |
 | `slsqp` + reconverge every eval (`interval = 1`) | **65,485** | 1,871 s |
-| `bobyqa` (derivative-free, **default**) | 65,598 | 315 s |
+| `bobyqa` (derivative-free) | 65,598 | 315 s |
 | ferx OFV evaluated at NONMEM's final estimates | 67,514 | — |
 
 The fixed-EBE gradient stalls `slsqp` ~2,650 OFV units above `bobyqa`. Reconverging the EBEs on every gradient evaluation closes the entire gap and reaches an optimum marginally below `bobyqa`'s — and below the point NONMEM converged to (NONMEM's estimates score 67,514 under ferx's likelihood), confirming the stall was a gradient-bias artifact, not a worse model.
@@ -376,7 +378,7 @@ Set via `[fit_options]`:
 ```
 [fit_options]
   method    = focei
-  optimizer = slsqp    # override the default (bobyqa)
+  optimizer = slsqp    # override the default (auto)
 ```
 
 ## Global Search

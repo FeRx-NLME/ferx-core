@@ -2,7 +2,7 @@
 //!
 //! Gated behind BOTH `survival` (the feature) and `slow-tests` (a full fit to
 //! convergence), so it is skipped on the per-PR job and runs nightly — see the
-//! test-tier rules in CLAUDE.md.
+//! test-tier rules in AGENTS.md.
 //!
 //! **Exact anchor.** A fixed-effects (`n_eta = 0`) logistic fit *is* ordinary
 //! logistic regression, so ferx must reproduce base-R
@@ -96,7 +96,8 @@ fn binary_simulate_then_fit_recovers_theta() {
     // MLE sits within ~0.1 of truth while keeping the fit fast.
     let n_sim = 20;
     let sims =
-        ferx_core::simulate_with_seed(&parsed.model, &template, &gen_params, n_sim, 20260720);
+        ferx_core::simulate_with_seed(&parsed.model, &template, &gen_params, n_sim, 20260720)
+            .unwrap();
     assert_eq!(
         sims.len(),
         template

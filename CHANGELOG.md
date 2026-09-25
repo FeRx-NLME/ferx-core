@@ -104,6 +104,52 @@ section of the SDLC for the versioning policy).
   much as from the reactive driver, which is why the replay verifier agrees with them. That
   is an engine defect in its own right and is tracked separately (#1539); nothing in #1151
   changes it either way.
+- **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
+  The floor replaces a direction of negative or near-zero curvature with a finite one, so the
+  condition number and correlations the `max_condition_number` / `max_correlation` gates read
+  no longer showed the problem: on warfarin, `modelsearch`'s collapsed one-peripheral
+  candidate (V2 → 0, Q free, TVQ RSE 293519 %) read a condition number of 2.98 and passed.
+  While either gate is enabled, the `Covariance step regularized: eigenvalue floor applied`
+  warning now fails the fit with its own reason. A resumed search re-judges every journalled
+  candidate from its cached fit rather than trusting the verdict in the journal, so the gate
+  also reaches a run interrupted before this change (#1512).
+- **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
+  that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
+  reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
+  the build info reported an analytic outer gradient where none was used. An explicit
+  optimizer that a mixture replaces with BOBYQA (built-in BFGS/L-BFGS, trust-region) is
+  now reported as `bobyqa` too. Both reports now read the outer loop's own resolution
+  rule (#1540).
+- **A data cell that is not a number is an error instead of a silent `0`.** `DV = abc` used
+  to be scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, and
+  `ADDL = abc` dropped the additional doses, all without a warning. A present cell that is
+  not a number in `TIME`, `EVID`, `MDV`, `AMT`, `RATE`, `II`, `SS`, `ADDL`, `DV`, `TENTRY`
+  or `FREMTYPE` (or a fraction in a whole-number column) is now rejected on a record that
+  reads the column and that `[data_selection]` keeps, naming the subject, time, column and
+  cell — as NONMEM rejects it. A `[data_selection]` rule that would decide a record on such
+  a cell (`ignore = CENS == 0` on `CENS = abc`) is an error naming the rule. Missing cells
+  (`.`, blank, `NA`, `NaN`) keep their defaults — `RATE=NaN` and `SS=NaN` on a dose used to
+  be rejected as non-finite, and `TIME=NaN` read as an undefined time — and `CMT`, the
+  occasion column and `L2` keep their existing handling (#1501).
+- **Two follow-ups to the #1501 cell checks (#1541 review).** A `[data_selection]` rule
+  that reads `SS` on a dose record with `SS = 1.5` or `SS = -1` is refused with the message
+  that says what `SS` accepts (`0` or `1`), the same words the record gets with no rule,
+  instead of the `usize` range the filter reads the column in. And a record whose `EVID`,
+  `MDV` or (with no `EVID` column) `AMT` cell is not a number, removed by a rule that does
+  not read that cell, is now tallied under `Other excluded` rather than as the observation
+  or dose the reader's fallback for the cell made it look like.
+- **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
+  gets the reconverged outer gradient again.** Such a subject (for example, total and
+  unbound assays paired at one time) is outside the analytic outer gradient at every
+  parameter point. Since #1529 it had been given the held-EBE gradient, which omits the
+  EBE-response term, and on a model where every subject is paired that was the only
+  gradient the fit had. The 31-subject `fluconazole_radboudumc` model (FOCEI, L-BFGS)
+  stalled at OFV 810.28 instead of 738.05 (NONMEM: 734.64). It now reaches 738.05 again, in
+  16.5 s against 20.8 s before #1529. Declines that depend on the trial point still follow
+  `reconverge_gradient_interval`. The fallback warning now says how many subjects got each
+  gradient. The analytic path also declines a paired subject whose cross-covariance is
+  momentarily zero (ρ = 0, or `f = 0` on a proportional row), because the derivative terms
+  it would drop are not zero there (#1536).
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and
@@ -390,10 +436,11 @@ section of the SDLC for the versioning policy).
   fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
   and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
   ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
-- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
-  that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
-  `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
-  returned bare values and panicked); `simulate_with_options()`,
+- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every predict /
+  simulate entry point (#898).** `predict()`, `simulate()`, `simulate_with_seed()`,
+  `predict_diag()`, `predict_survival()`, `predict_categorical()` and `inits_from_nca()`
+  now return `Result<_, String>` (they returned bare values and panicked); a Rust caller
+  of the first three adds `?` (or `.unwrap()` to keep the old panic); `simulate_with_options()`,
   `simulate_with_options_diag()` and `simulate_with_uncertainty()` keep their signatures but
   no longer panic *out of* a `Result`-returning function — a dose into a compartment the
   model cannot deliver into, a coded `RATE` with no `D{n}`/`R{n}` behind it, an unsupported
@@ -401,9 +448,7 @@ section of the SDLC for the versioning policy).
   gives for that precondition (an input failing several at once is reported by whichever
   each entry point checks first, and the orders differ); the wrapper sentences ("predict()/simulate()
   received …", "fit() reports this as an error rather than panicking") are gone.
-  `predict()`, `simulate()` and `simulate_with_seed()` keep their `Vec` signatures for now
-  and still panic, with exactly that `Err` text as the payload; they become `Result` in a
-  later release. No prediction or simulated row changes. See
+  No prediction or simulated row changes. See
   `docs/warnings.qmd#entry-point-errors`.
 
 - **SAEM default: the MH step scales are now adapted by `scale_adaptation = robbins_monro`

@@ -200,15 +200,15 @@ fn simulate_still_runs_with_positive_weights() {
 }
 
 #[test]
-#[should_panic(expected = "sigma slot 0")]
-fn the_vec_returning_entry_point_panics_on_a_zero_weight() {
-    // `simulate` / `simulate_with_seed` return a bare `Vec` and cannot signal, so
-    // the contract is enforced as a panic at the shared chokepoint — the same
-    // split `validate_iov_simulatable` already uses. Failing loud beats emitting
-    // rows whose variability has been quietly removed.
+fn the_seeded_entry_point_errs_on_a_zero_weight() {
+    // `simulate` / `simulate_with_seed` reach this check only at the shared
+    // chokepoint — the same split `validate_iov_simulatable` already uses. An
+    // `Err` beats emitting rows whose variability has been quietly removed.
     let model = weighted_model();
     let pop = population_with_weights(&[0.5, 0.0, 2.0]);
-    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(err.contains("sigma slot 0"), "unexpected Err: {err}");
 }
 
 #[test]

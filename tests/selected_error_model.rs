@@ -108,6 +108,7 @@ fn predictions_finite_and_flag_independent() {
     let model = parse_model_string(FREE_TOTAL).expect("model parses");
     let pop = free_total_pop(1);
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();
@@ -272,7 +273,7 @@ fn selected_error_with_block_sigma_fits() {
     // convergence loop, just a finite OFV out of the dense-R path).
     let design = free_total_pop(8);
     let truth = model.default_params.clone();
-    let sims = simulate_with_seed(&model, &design, &truth, 1, 669669);
+    let sims = simulate_with_seed(&model, &design, &truth, 1, 669669).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
         subj.observations = sims
@@ -311,7 +312,7 @@ fn recovers_free_total_sigma_split() {
 
     // Simulate DVs at the true parameters (σ_total = 0.05, σ_unbound = 0.30).
     let truth = model.default_params.clone();
-    let sims = simulate_with_seed(&model, &design, &truth, 1, 658658);
+    let sims = simulate_with_seed(&model, &design, &truth, 1, 658658).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
         subj.observations = sims

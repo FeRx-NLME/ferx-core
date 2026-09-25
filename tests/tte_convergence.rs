@@ -2,7 +2,7 @@
 //!
 //! Gated behind BOTH `survival` (the TTE feature) and `slow-tests` (these run a
 //! full fit to convergence, so they are skipped on the per-PR `Test` job and run
-//! nightly via `slow-tests.yml` — see the test-tier rules in CLAUDE.md).
+//! nightly via `slow-tests.yml` — see the test-tier rules in AGENTS.md).
 //!
 //! Two kinds of guard:
 //!
@@ -1302,7 +1302,7 @@ const RTTE_SIM_ANCHOR_CSV: &str = concat!(
     "/tests/reference/rtte_exponential_sim/rtte_sim.csv"
 );
 
-/// **Slice 3.3 cross-tool simulation anchor** (the external, CLAUDE.md-required leg).
+/// **Slice 3.3 cross-tool simulation anchor** (the external, AGENTS.md-required leg).
 /// ferx *simulated* `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects,
 /// truth TVLAMBDA = 0.15, ω² = 0.09, horizon = 20; via `cargo run --bin rtte_sim_anchor
 /// --features survival`). Here ferx **and NONMEM** both *fit* that ferx-simulated file:
@@ -1382,7 +1382,7 @@ fn tte_sse_exponential_recovers_truth() {
     let truth = parse_model_string(EXP_TRUTH).expect("truth model must parse");
     let template = tte_sim_template(N, T_CENSOR);
 
-    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED).unwrap();
     assert_eq!(sims.len(), N, "one simulated event per template subject");
 
     let pairs = sims_to_pairs(&sims);
@@ -1442,7 +1442,7 @@ fn tte_sse_competing_risks_recovers_truth() {
     let truth = parse_model_string(COMPETING_TRUTH).expect("competing truth model must parse");
     let template = common::tte_competing_pop(&vec![(T_CENSOR, 0u8); N]);
 
-    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED).unwrap();
     assert_eq!(
         sims.len(),
         2 * N,
@@ -1901,7 +1901,8 @@ fn tte_sse_weibull_recovers_truth() {
         &truth.default_params,
         1,
         SEED,
-    );
+    )
+    .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 
@@ -2145,7 +2146,8 @@ fn tte_sse_gompertz_recovers_truth() {
         &truth.default_params,
         1,
         SEED,
-    );
+    )
+    .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 

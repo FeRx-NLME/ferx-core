@@ -107,13 +107,30 @@ of the CSV).  An entirely excluded subject does not appear in any output.
 
 Column names in expressions are case-insensitive.
 
-A record whose value for a referenced column is **missing** (`.`, blank, `NA`)
+### Missing and unreadable cells
+
+A record whose `DV`, `AMT`, `RATE` or `II` is **missing** (`.`, blank, `NA`)
 never matches a comparison on that column. For example, `ignore = DV < 0.001`
 does **not** exclude dose rows, whose `DV` is `.`; only observation rows with a
 real `DV` below the threshold are dropped. (You can still write
 `ignore = EVID == 0 && DV < 0.001` to be explicit.)
 
-**`CMT` is the exception to that rule**, because it is the one column with a
+`TIME`, `EVID`, `MDV`, `SS` and `CENS` are different: a missing cell reads as
+their default, `0`, before the filter sees it — so `ignore = CENS == 0` **does**
+match a record whose `CENS` is `.`, exactly as it matches one whose `CENS` is
+`0`.
+
+A cell that is present but **not a number** (`abc`, or `1.5` in a whole-number
+column) is not read as anything. A rule whose outcome on that record rests on that
+column — whether it would remove the record or keep it — is an error naming the
+rule, since it would otherwise decide the record on a value the dataset does not
+hold ([#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501)). A rule's
+outcome rests on the column when the rule reads it and every other `&&` term
+holds: `ignore = EVID == 2 && RATE == 0` on an observation is decided by `EVID`,
+whatever its `RATE` cell says. A rule on another column may still remove the
+record, and then the cell is never read, as with NONMEM's `IGNORE`; see [A cell that is not a number](../data-format.qmd#a-cell-that-is-not-a-number).
+
+**`CMT` is the exception to both rules**, because it is the one column with a
 default. A missing (`.`/blank/`NA`) or unreadable cell — and an absent `CMT`
 column altogether — resolves to compartment **1** before the filter ever sees the
 record. The guessed compartment can then go wrong in either direction:
@@ -180,8 +197,12 @@ exclusions:
 
 `Other excluded` (`n_other_excluded`) counts excluded records that are neither a
 scored observation nor a dose — EVID 2 (other event), EVID 3 (reset), and
-missing-DV observation rows (EVID 0 with MDV 1). The three counts together
-account for every excluded record.
+missing-DV observation rows (EVID 0 with MDV 1). It also counts a record whose
+type ferx could not read — an `EVID`, `MDV` or (with no `EVID` column) `AMT`
+cell that is not a number — when a rule that does not read that cell removed it:
+such a record is not filed as a dose or an observation on the strength of the
+reader's fallback for the cell. The three counts together account for every
+excluded record.
 
 Each fired condition is listed once. Because checks short-circuit on the first
 match (see *Evaluation order*), a record is attributed to the **first** rule

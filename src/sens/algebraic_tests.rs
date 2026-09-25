@@ -766,7 +766,7 @@ fn a_population_fit_past_the_cap_still_runs() {
         "",
         "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
     ));
-    let preds = crate::predict(&model, &pop, &model.default_params);
+    let preds = crate::predict(&model, &pop, &model.default_params).unwrap();
     assert!(preds.iter().all(|p| p.pred.is_finite()));
 }
 

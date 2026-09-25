@@ -48,12 +48,12 @@ fn assert_deterministic_across_nested_worker_counts(model_path: &str, copies: us
     let params = &model.default_params;
 
     let serial = PoolPlan::new(1, 1)
-        .install(|| predict(&model, &population, params))
+        .install(|| predict(&model, &population, params).unwrap())
         .expect("one-worker prediction");
     let parallel = PoolPlan::new(4, 1)
-        .install(|| predict(&model, &population, params))
+        .install(|| predict(&model, &population, params).unwrap())
         .expect("four-worker prediction");
-    let standalone = predict(&model, &population, params);
+    let standalone = predict(&model, &population, params).unwrap();
 
     assert_same(&serial, &parallel);
     assert_same(&serial, &standalone);
@@ -75,7 +75,7 @@ fn timed_prediction(
     population: &ferx_core::Population,
 ) -> Duration {
     let start = Instant::now();
-    pool.install(|| black_box(predict(model, population, &model.default_params)))
+    pool.install(|| black_box(predict(model, population, &model.default_params).unwrap()))
         .expect("timed prediction");
     start.elapsed()
 }
@@ -98,10 +98,10 @@ fn report_predict_subject_parallel_speedups() {
         let serial_pool = PoolPlan::new(1, 1);
         let parallel_pool = PoolPlan::new(4, 1);
         let serial_value = serial_pool
-            .install(|| predict(&model, &population, &model.default_params))
+            .install(|| predict(&model, &population, &model.default_params).unwrap())
             .expect("serial warmup");
         let parallel_value = parallel_pool
-            .install(|| predict(&model, &population, &model.default_params))
+            .install(|| predict(&model, &population, &model.default_params).unwrap())
             .expect("parallel warmup");
         assert_same(&serial_value, &parallel_value);
 

@@ -16,7 +16,7 @@
 //! (out of scope) or output-space comparison (less informative than
 //! comparing predictions to real observations, which is what we do here).
 //!
-//! Gated with `slow-tests` per CLAUDE.md. Wall time ~30–60s for `maxiter
+//! Gated with `slow-tests` per AGENTS.md. Wall time ~30–60s for `maxiter
 //! = 50` on the warfarin two-cpt covariate dataset.
 //!
 //! Run via:

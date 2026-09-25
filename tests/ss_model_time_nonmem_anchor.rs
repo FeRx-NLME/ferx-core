@@ -262,7 +262,7 @@ fn ss_tad_objective_engine_matches_nonmem() {
 /// objective test above uses — and only fills the *states* from `ode_dense_solve_states` in
 /// a second pass. So a `.0` comparison here would be the same engine twice under two names:
 /// two callers, not two geometries. This test read `.0` when it was written, and was
-/// therefore a duplicate of its neighbour; it is the exact hazard CLAUDE.md names.
+/// therefore a duplicate of its neighbour; it is the exact hazard AGENTS.md names.
 ///
 /// `ode_dense_solve_states` runs its own steady-state equilibration (`apply_segment_boundary`
 /// → `equilibrate_ss_state`), so it genuinely needs anchoring — it is not along for the ride.
