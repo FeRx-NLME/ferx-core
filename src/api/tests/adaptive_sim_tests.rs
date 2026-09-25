@@ -4685,7 +4685,7 @@ fn tad_oracle_cell(
     }
     static_doses.sort_by(|x, y| x.time.total_cmp(&y.time));
     let static_pop = population(vec![subj("1", obs.to_vec(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     (
         res.trajectories.iter().map(|t| t.ipred).collect(),
@@ -5370,7 +5370,7 @@ fn adaptive_tad_rhs_refuses_when_the_controller_never_doses() {
     // The measurement the conditional rests on: the static engine has no anchor here either.
     let model = parse_model_string(ODE_TAD_NO_IIV).expect("parse TAD-reading ODE model");
     let static_pop = population(vec![subj("1", vec![6.0, 20.0, 40.0], vec![])]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
     assert_eq!(
         static_pred[0], 0.0,
@@ -5625,7 +5625,7 @@ fn adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
     // Measured 27.440581804704640 vs 8.264944411082405 at t=6 — a factor of 3.3, not a
     // tolerance question. Asserting the DIVERGENCE (not a bound) is what keeps this test
