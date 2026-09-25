@@ -1382,7 +1382,7 @@ fn tte_sse_exponential_recovers_truth() {
     let truth = parse_model_string(EXP_TRUTH).expect("truth model must parse");
     let template = tte_sim_template(N, T_CENSOR);
 
-    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED).unwrap();
     assert_eq!(sims.len(), N, "one simulated event per template subject");
 
     let pairs = sims_to_pairs(&sims);
@@ -1442,7 +1442,7 @@ fn tte_sse_competing_risks_recovers_truth() {
     let truth = parse_model_string(COMPETING_TRUTH).expect("competing truth model must parse");
     let template = common::tte_competing_pop(&vec![(T_CENSOR, 0u8); N]);
 
-    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED).unwrap();
     assert_eq!(
         sims.len(),
         2 * N,
@@ -1901,7 +1901,8 @@ fn tte_sse_weibull_recovers_truth() {
         &truth.default_params,
         1,
         SEED,
-    );
+    )
+    .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 
@@ -2145,7 +2146,8 @@ fn tte_sse_gompertz_recovers_truth() {
         &truth.default_params,
         1,
         SEED,
-    );
+    )
+    .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 

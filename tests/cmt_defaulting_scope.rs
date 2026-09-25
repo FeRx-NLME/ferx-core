@@ -276,6 +276,7 @@ fn try_preds(src: &str, dose_cmt: usize) -> Option<Vec<f64>> {
     let model: CompiledModel = parse_full_model(src).expect("model parses").model;
     Some(
         predict(&model, &pop_of(&csv), &model.default_params)
+            .unwrap()
             .into_iter()
             .map(|p| p.pred)
             .collect(),

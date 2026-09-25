@@ -204,6 +204,7 @@ fn pop_of(csv: &str) -> Population {
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     let pop = pop_of(csv);
     predict(model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()
@@ -635,6 +636,7 @@ fn analytical_modeled_duration_matches_nonmem_closed_form() {
     // Observation times in OBS_ROWS: 1, 3, 5, 8, 12, 18, 24.
     let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();
@@ -908,38 +910,50 @@ const ODE_NO_D1: &str = r#"
 "#;
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn predict_on_analytical_model_with_modeled_dose_panics() {
+fn predict_on_analytical_model_with_modeled_dose_errs() {
     // `predict()` runs no `check_model_data`, so a `RATE=-2` dose on an analytical
     // model with NO matching `D1` would otherwise reach the predictor and silently
     // degrade to a 0-rate "infusion" in release (the `debug_assert` is a no-op).
-    // The entrypoint guard (`check_modeled_dose_rates`) turns it into a loud
-    // panic whose payload *is* the `E_MODELED_DURATION_NO_PARAM` message (#898).
+    // The entrypoint guard (`check_modeled_dose_rates`) turns it into an `Err`
+    // whose text *is* the `E_MODELED_DURATION_NO_PARAM` message (#898).
     let model = model_of(ANALYTICAL);
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn predict_on_ode_missing_param_panics() {
+fn predict_on_ode_missing_param_errs() {
     // RATE=-2 into a compartment with no `D{cmt}` would hit `resolve_rate`'s
     // slot `.expect` deep in the ODE path; the entrypoint guard intercepts it
     // first with the actionable `E_MODELED_DURATION_NO_PARAM` message.
     let model = model_of(ODE_NO_D1);
     let pop = pop_of(&coded_csv());
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
-#[should_panic(expected = "RATE=-2 (modeled infusion duration) into compartment")]
-fn simulate_on_analytical_model_with_modeled_dose_panics() {
+fn simulate_on_analytical_model_with_modeled_dose_errs() {
     // The same guard covers every `simulate*` variant via the shared
     // `simulate_inner_with_draw` chokepoint.
     let model = model_of(ANALYTICAL);
     let pop = pop_of(&coded_csv());
-    let _ = simulate(&model, &pop, &model.default_params, 1);
+    let err = simulate(&model, &pop, &model.default_params, 1)
+        .expect_err("simulate() must refuse this input");
+    assert!(
+        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
@@ -974,7 +988,7 @@ fn valid_modeled_dose_predicts_without_panicking() {
     // with the matching `D1` predicts normally (the all-`Fixed` Ok path of the
     // entrypoint guard, and a regression guard that the guard isn't over-eager).
     let model = model_of(ODE_D1);
-    let preds = predict(&model, &pop_of(&coded_csv()), &model.default_params);
+    let preds = predict(&model, &pop_of(&coded_csv()), &model.default_params).unwrap();
     assert!(preds.iter().any(|p| p.pred > 0.1), "expected real uptake");
 }
 
@@ -1109,7 +1123,7 @@ fn modeled_duration_matches_nonmem_closed_form() {
     let model = model_of(ODE_D1);
     let population = read_nonmem_csv(Path::new("data/modeled_duration_ref.csv"), None, None)
         .expect("anchor dataset loads");
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), nonmem_ipred.len(), "prediction count mismatch");
 
     for (p, &(t_ref, nm)) in preds.iter().zip(nonmem_ipred) {

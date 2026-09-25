@@ -134,8 +134,8 @@ fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usiz
     );
 
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("dataset must load");
-    let gen_pred = predict(&gen.model, &pop, &gen.model.default_params);
-    let hand_pred = predict(&hand.model, &pop, &hand.model.default_params);
+    let gen_pred = predict(&gen.model, &pop, &gen.model.default_params).unwrap();
+    let hand_pred = predict(&hand.model, &pop, &hand.model.default_params).unwrap();
     assert_eq!(gen_pred.len(), hand_pred.len());
     for (g, h) in gen_pred.iter().zip(&hand_pred) {
         assert_eq!(g.id, h.id);

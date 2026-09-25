@@ -333,7 +333,7 @@ mod binary_smoke {
         let n_records: usize = subjects.iter().map(|(_, obs)| obs.len()).sum();
         let pop = common::binary_pop(&subjects, 3);
 
-        let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1);
+        let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1).unwrap();
         assert_eq!(
             rows.len(),
             n_records,
@@ -365,6 +365,7 @@ mod binary_smoke {
         let pop = common::binary_pop(&sim_subjects(), 3);
         let states = |seed: u64| -> Vec<usize> {
             ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, seed)
+                .unwrap()
                 .iter()
                 .map(|r| match r.outcome {
                     SimOutcome::Category { state } => state,
@@ -430,7 +431,9 @@ mod binary_smoke {
     fn gaussian_predict_is_empty_for_a_binary_only_model() {
         let model = parse_model_string(MIXED_MODEL).unwrap();
         let pop = common::binary_pop(&sim_subjects(), 3);
-        assert!(ferx_core::predict(&model, &pop, &model.default_params).is_empty());
+        assert!(ferx_core::predict(&model, &pop, &model.default_params)
+            .unwrap()
+            .is_empty());
     }
 
     /// A fit **restored from a `.fitrx` checkpoint** carries no per-record discrete
@@ -666,6 +669,7 @@ mod binary_smoke {
 
         let emitted: Vec<usize> =
             ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 20260721)
+                .unwrap()
                 .iter()
                 .map(|r| match r.outcome {
                     SimOutcome::Category { .. } => r.cmt,
@@ -943,7 +947,8 @@ mod binary_smoke {
         let model = parse_model_string(src).unwrap();
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0)])], 3);
         let n = 4000;
-        let sims = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, n, 20260722);
+        let sims = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, n, 20260722)
+            .unwrap();
         assert_eq!(sims.len(), n, "one row per replicate draw");
         let ones = sims
             .iter()
@@ -1124,7 +1129,7 @@ mod binary_smoke {
             exclusions: None,
             warnings: vec![],
         };
-        let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1);
+        let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1).unwrap();
         let n_cont = rows
             .iter()
             .filter(|r| matches!(r.outcome, SimOutcome::Continuous { .. }))

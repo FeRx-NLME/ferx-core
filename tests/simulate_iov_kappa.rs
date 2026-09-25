@@ -41,7 +41,7 @@ fn simulate_samples_inter_occasion_kappa() {
     let n_sim = 3;
 
     // (a) Simulate with the fitted Omega_IOV.
-    let with_iov = simulate_with_seed(&model, &pop, &model.default_params, n_sim, seed);
+    let with_iov = simulate_with_seed(&model, &pop, &model.default_params, n_sim, seed).unwrap();
 
     // (b) Same everything, but Omega_IOV forced to zero — the old (buggy)
     // behaviour. The per-occasion kappa draws still happen (RNG stays aligned),
@@ -56,7 +56,7 @@ fn simulate_samples_inter_occasion_kappa() {
         om.chol.fill(0.0);
         om.matrix.fill(0.0);
     }
-    let without_iov = simulate_with_seed(&model, &pop, &zero_iov, n_sim, seed);
+    let without_iov = simulate_with_seed(&model, &pop, &zero_iov, n_sim, seed).unwrap();
 
     assert_eq!(
         with_iov.len(),
@@ -82,7 +82,8 @@ fn simulate_samples_inter_occasion_kappa() {
     );
 
     // Reproducibility: same seed + params ⇒ identical draws.
-    let with_iov_again = simulate_with_seed(&model, &pop, &model.default_params, n_sim, seed);
+    let with_iov_again =
+        simulate_with_seed(&model, &pop, &model.default_params, n_sim, seed).unwrap();
     assert_eq!(
         ipreds(&with_iov),
         ipreds(&with_iov_again),
@@ -130,7 +131,7 @@ fn simulate_iov_recovers_omega_iov_variance() {
     // SE (~5e-4) is far below the ferx↔NONMEM gap, turning this into a tight
     // recovery check rather than a noisy one.
     let n_rep = 20;
-    let rows = simulate_with_seed(&model, &pop, &model.default_params, n_rep, 20_260_707);
+    let rows = simulate_with_seed(&model, &pop, &model.default_params, n_rep, 20_260_707).unwrap();
 
     // Group log(IPRED) by (replicate, subject, occasion). Each replicate redraws
     // independent kappa, so the key must include `sim` — pooling across replicates
@@ -202,14 +203,16 @@ fn simulate_iov_applies_scaling_without_occasion_labels() {
         &model.default_params,
         1,
         7,
-    );
+    )
+    .unwrap();
     let no_occ = simulate_with_seed(
         &model,
         &read_nonmem_csv(csv, None, None).expect("iov_scaling data loads (no OCC)"),
         &model.default_params,
         1,
         7,
-    );
+    )
+    .unwrap();
 
     assert_eq!(with_occ.len(), no_occ.len(), "same rows ⇒ same row count");
     assert!(
@@ -275,7 +278,7 @@ fn simulate_iov_scaling_matches_nonmem_occasionless() {
     );
 
     // 20 replicates × 300 subjects ⇒ 6000 IPREDs; SE(mean log) ~ 0.2/sqrt(6000) ~ 0.003.
-    let rows = simulate_with_seed(&model, &pop, &model.default_params, 20, 20_260_708);
+    let rows = simulate_with_seed(&model, &pop, &model.default_params, 20, 20_260_708).unwrap();
     let logs: Vec<f64> = rows
         .iter()
         .map(|r| {

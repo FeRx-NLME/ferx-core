@@ -1056,9 +1056,9 @@ fn event_driven_predictions_with_schedule_impl(
                         state[cmt_idx] += dose_pk.bioavailable_amount(d.amt);
                     } else {
                         // Unreachable from a validated call: `check_dose_compartments`
-                        // (#375) rejects `cmt > n_states` up front — as an `Err` from
-                        // `fit()`, as a panic naming the subject/time from
-                        // `predict()`/`simulate()`. Kept as a defensive guard so an
+                        // (#375) rejects `cmt > n_states` up front — as an `Err`
+                        // naming the subject/time from `fit()`, `predict()` and
+                        // `simulate()` (#898). Kept as a defensive guard so an
                         // internal caller that skips validation still fails loudly
                         // instead of dropping the dose.
                         panic!(

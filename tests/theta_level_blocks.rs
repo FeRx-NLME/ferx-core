@@ -313,7 +313,8 @@ fn predict_runs_on_a_bound_level_block_model() {
     let mut population = ferx_core::read_nonmem_csv(&data_path, None, None).expect("read");
     ferx_core::bind_theta_levels(&mut parsed, &text, &mut population).expect("bind");
 
-    let preds = ferx_core::predict(&parsed.model, &population, &parsed.model.default_params);
+    let preds =
+        ferx_core::predict(&parsed.model, &population, &parsed.model.default_params).unwrap();
     assert_eq!(preds.len(), 6, "one prediction per observation");
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
@@ -337,7 +338,7 @@ fn predict_refuses_a_population_that_was_never_bound() {
     let params = parsed.model.default_params.clone();
     let model = parsed.model;
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ferx_core::predict(&model, &unbound, &params)
+        ferx_core::predict(&model, &unbound, &params).unwrap()
     }))
     .is_err();
     assert!(

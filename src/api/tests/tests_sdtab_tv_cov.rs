@@ -528,7 +528,7 @@ fn test_simulate_honours_tv_covariates() {
         exclusions: None,
         warnings: Vec::new(),
     };
-    let rows = simulate_with_seed(&model, &population, &default_params, 1, 506);
+    let rows = simulate_with_seed(&model, &population, &default_params, 1, 506).unwrap();
     assert_eq!(rows.len(), reference.len());
     for (j, (row, &expected)) in rows.iter().zip(reference.iter()).enumerate() {
         assert!(

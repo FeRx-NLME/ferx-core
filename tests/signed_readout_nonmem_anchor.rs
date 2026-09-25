@@ -91,6 +91,7 @@ fn ferx_form_c_readout_reproduces_nonmem_including_its_negative_predictions() {
     let model = parse_full_model(FERX).expect("model parses").model;
 
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect();

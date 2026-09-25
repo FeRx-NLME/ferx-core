@@ -178,7 +178,7 @@ fn simulate_draws_with_the_power_variance() {
     let prop = model("DV ~ proportional(PROP_ERR)", "");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     let spread = |m: &ferx_core::types::CompiledModel| -> f64 {
-        let sim = simulate_with_seed(m, &pop, &m.default_params, 1, 7);
+        let sim = simulate_with_seed(m, &pop, &m.default_params, 1, 7).unwrap();
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
         for row in &sim {

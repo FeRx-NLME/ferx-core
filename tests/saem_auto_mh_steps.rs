@@ -92,7 +92,7 @@ fn population_with(model: &CompiledModel, n: usize, obs_times: &[f64]) -> Popula
         warnings: vec![],
     };
 
-    let sim = simulate_with_seed(model, &template, &model.default_params, 1, 20260919);
+    let sim = simulate_with_seed(model, &template, &model.default_params, 1, 20260919).unwrap();
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {
         let dv: Vec<f64> = sim

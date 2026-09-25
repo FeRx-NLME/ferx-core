@@ -14,7 +14,7 @@ pub fn simulate(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Vec<SimulationResult>
+) -> Result<Vec<SimulationResult>, String>
 ```
 
 **Parameters:**
@@ -23,7 +23,9 @@ pub fn simulate(
 - `params`: True parameter values for simulation
 - `n_sim`: Number of simulation replicates
 
-**Returns:** Vector of `SimulationResult`, one per observation per subject per replicate.
+**Returns:** `Ok` with a vector of `SimulationResult`, one per observation per subject per
+replicate, or `Err` when the model and data fail a precondition — the same message `fit()`
+gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)).
 
 **Example:**
 ```rust
@@ -33,7 +35,7 @@ let model = parse_model_file(Path::new("model.ferx"))?;
 let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
 
 // Simulate 1000 replicates
-let sims = simulate(&model, &population, &model.default_params, 1000);
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
 
 for sim in &sims[..5] {
     println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
@@ -77,7 +79,7 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 ```rust
 let (population, _covariates) =
     read_population_for_simulation(&model, &None, "design.csv", None, None, None, &[])?;
-let sims = simulate(&model, &population, &model.default_params, 1000);
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
 ```
 
 Read with `read_population_for()` the same file yields zero simulated rows. Rows
@@ -106,7 +108,7 @@ pub fn simulate_with_seed(
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Vec<SimulationResult>
+) -> Result<Vec<SimulationResult>, String>
 ```
 
 ## `simulate_with_options()` — propensity-score matching
@@ -223,14 +225,15 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Vec<PredictionResult>
+) -> Result<Vec<PredictionResult>, String>
 ```
 
-**Returns:** Vector of `PredictionResult` with population-level predictions.
+**Returns:** `Ok` with a vector of `PredictionResult` holding population-level predictions,
+or `Err` on a failed precondition, as for `simulate()`.
 
 **Example:**
 ```rust
-let preds = predict(&model, &population, &model.default_params);
+let preds = predict(&model, &population, &model.default_params)?;
 for p in &preds {
     println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
 }
