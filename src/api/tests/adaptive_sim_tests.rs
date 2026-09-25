@@ -4727,7 +4727,7 @@ fn tad_refusal_error(
 ///
 /// `f64::max` returns the *other* operand on a `NaN`, so folding `worst` over a run that
 /// produced `NaN` would report whatever the finite records produced and pass — the exact hole
-/// CLAUDE.md names. The finiteness of both sides is asserted per element, before the fold.
+/// AGENTS.md names. The finiteness of both sides is asserted per element, before the fold.
 ///
 /// **A zero reference contributes an ABSOLUTE error** (`|got|`), since no relative one exists
 /// there — so a caller's bound is read as absolute for those elements and relative for the
@@ -4960,7 +4960,7 @@ fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
     // `[NaN, NaN, NaN]` (measured at `a6b67de5`), with no warning naming `TAD`.
     //
     // Every sentence of the message is asserted below, so deleting any one of them reddens
-    // this test (CLAUDE.md: a sentence no test can kill is a claim nobody has checked).
+    // this test (AGENTS.md: a sentence no test can kill is a claim nobody has checked).
     let err = tad_refusal_error(
         ODE_TAD_NO_IIV,
         &[12.0, 36.0],
