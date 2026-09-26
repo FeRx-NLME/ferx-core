@@ -474,7 +474,7 @@ Trunk-based, so a release is a **tag on `main`**:
 
 1. Confirm `main` is green (CI), ferx-core ↔ ferx-r are in sync, docs are
    current, and the relevant `Cargo.toml` / `DESCRIPTION` versions are bumped.
-   *(Current: ferx-core `0.1.6`, ferx-r `0.1.5`.)*
+   *(Current: ferx-core `0.4.0`, ferx-r `0.4.0`.)*
 2. Tag `main` with `vX.Y.Z` (e.g. `v0.3.0`). `release.yml` builds the GitHub
    release and generates notes.
 3. Point users at the **tagged release**, not an arbitrary `main` commit.
