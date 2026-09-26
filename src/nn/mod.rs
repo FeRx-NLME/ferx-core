@@ -3108,26 +3108,45 @@ mod regularizer_fit_tests {
     }
 
     /// Growing the L2 strength shrinks the NN weights, flattening the learned
-    /// covariate→modulator curve so the across-subject modulator variance
-    /// collapses toward 0.
+    /// covariate→modulator curve.
     ///
-    /// The robust, deterministic signal is the **fitted weight-block norm**: L2
-    /// adds `2λw` to the weight gradient, so a heavier λ pulls the optimum's
-    /// weights to the optimizer's floor. What is asserted is that floor and not
-    /// an ordering *between* the two λ > 0 fits — see the comment on
-    /// `REGULARIZED_NORM_FLOOR` below, which is the assertion #1277 reported
-    /// failing.
+    /// **Ignored against #1561.** The λ = 0 fit from the default start reports
+    /// `converged = true` at data OFV −259.93, which is 913 above the zero-weight
+    /// (covariate-free) point the λ = 1000 fit reaches at −1173.56, inside the λ = 0
+    /// model's own parameter space. The cross-optimality check below catches exactly
+    /// that. Un-ignore this test when a DCM fit from the default start reaches at
+    /// least the covariate-free optimum.
     ///
-    /// The modulator variance is the *effect* being claimed, and it is only a
-    /// meaningful check when the λ = 0 fit actually produces spread to remove. On
-    /// this null-covariate dataset the unregularized fit invents a large spurious
-    /// CL modulator variance — precisely the overfitting
-    /// `nn_l2` exists to suppress — and L2 collapses it to ~0. Asserting both ends
-    /// keeps the oracle non-degenerate in the sense AGENTS.md requires: an
-    /// assertion that the regularized modulator is flat is worthless if the
-    /// unregularized one was flat too. It was, on raw inputs, because the network
-    /// was saturated rather than because it had learned nothing — see the
-    /// `center` / `scale` note on `MODEL`.
+    /// `two_cpt_oral_cov` is **not** a null-covariate dataset: it was simulated
+    /// with `(WT/70)^θ` on CL and V1 and `(CRCL/100)^θ` on CL
+    /// (`src/bin/generate_data.rs`), and this NN maps (WT, CRCL) → the typical PK
+    /// parameters. With every weight at zero each hidden unit is constant and the
+    /// network collapses to a covariate-free typical value. That is also a stationary
+    /// point of the data objective, because constant hidden units zero the weight
+    /// gradient, so a fit can stop there.
+    ///
+    /// The test used to assert that λ = 5 *and* λ = 100 both reach a ~1e-4 norm
+    /// floor. That tested which basin each fit stopped in, not what L2 does, and it
+    /// flipped with unrelated changes to the inner solve (#1389, #1474) and with the
+    /// toolchain. Measured on the CI ubuntu nn leg and on macOS/arm64 (identical to
+    /// every printed digit): λ = 5 keeps ‖W‖² = 1.485 at data OFV −184.35, and
+    /// λ = 100 lands at W ≈ 0 with +3.06. Under λ = 100's own objective the λ = 5
+    /// point scores 39 lower, so that fit stopped short too.
+    ///
+    /// What is asserted is what a correct optimizer must produce:
+    ///
+    /// 1. every fit converges;
+    /// 2. the λ = 0 fit has weights and CL-modulator spread for L2 to remove;
+    /// 3. **cross-optimality**: under its own λ, each fit's penalized objective is no
+    ///    worse than any other fitted point's. This is a necessary condition of a
+    ///    minimum. It is computed from the three fits alone, because the reported
+    ///    `ofv` excludes the penalty and so does not depend on λ (verified by
+    ///    re-scoring one θ at λ = 0, 5 and 100);
+    /// 4. the mid λ shrinks the weights by orders of magnitude and reduces the
+    ///    modulator spread, while the heavy λ flattens both to the floor.
+    ///    `LAMBDA_BIG = 1000` is far above the λ ≈ 126 at which zero weights first
+    ///    beat the λ = 5 point.
+    ///
     /// Gated with `#[cfg]` rather than the usual Tier-3
     /// `#[cfg_attr(not(feature = "slow-tests"), ignore = "…")]`, because this
     /// test lives in `src/` — which codecov measures — instead of `tests/`,
@@ -3145,6 +3164,7 @@ mod regularizer_fit_tests {
     /// Tier-3 fit — this one included — running in no CI job at all).
     #[test]
     #[cfg(feature = "slow-tests")]
+    #[ignore = "#1561: the λ=0 DCM fit converges 913 OFV above the zero-weight point"]
     fn l2_shrinks_weights_and_modulator_variation() {
         let (model, options, population) = load();
 
@@ -3152,12 +3172,8 @@ mod regularizer_fit_tests {
         // anything: #1277 was three fits whose weight norms were compared without
         // anyone asking whether the optimizer had finished, and two of them had
         // not — L-BFGS quit at eval 12 with the trace still falling ~2600 OFV per
-        // eval, so the "fitted" norms below were wherever the stall happened to
-        // land. Assert it here rather than reading it off the norms, which is a
-        // symptom and a weak one: the λ=0 stall reported ‖W‖² = 287.9 against a
-        // converged 15340.6, a difference no ordering check can distinguish from
-        // a second local optimum.
-        let fit_at = |lambda: f64| -> Vec<f64> {
+        // eval, so the "fitted" norms were wherever the stall happened to land.
+        let fit_at = |lambda: f64| -> (Vec<f64>, f64) {
             let mut o = options.clone();
             o.nn_l2_lambda = lambda;
             let r = crate::fit(&model, &population, &model.default_params, &o)
@@ -3168,92 +3184,87 @@ mod regularizer_fit_tests {
                  quantity at all (OFV {:.4}); warnings: {:?}",
                 r.ofv, r.warnings
             );
-            r.theta
+            assert!(r.ofv.is_finite(), "fit at λ={lambda}: OFV {}", r.ofv);
+            (r.theta, r.ofv)
         };
 
-        let t0 = fit_at(0.0);
-        let t_mid = fit_at(5.0);
-        let t_big = fit_at(100.0);
-
-        let (n0, n_mid, n_big) = (
-            weight_block_sq_norm(&model, &t0),
-            weight_block_sq_norm(&model, &t_mid),
-            weight_block_sq_norm(&model, &t_big),
-        );
-        let (v0, v_mid, v_big) = (
-            cl_modulator_variance(&model, &population, &t0),
-            cl_modulator_variance(&model, &population, &t_mid),
-            cl_modulator_variance(&model, &population, &t_big),
-        );
-        // Printed in scientific notation because the quantities that matter here
-        // are the *regularized* ones, and at ~1e-9 a fixed-point `{:.5}` renders
-        // every one of them as `0.00000` — which is how #1277's failure message
-        // came to read `2225.50764 → 0.00000 → 0.03844`, hiding that the two
-        // numbers being ordered were both at the optimizer's floor.
+        // Zero weights are the λ-optimum among the fitted points only above
+        // λ ≈ 126 (see the doc comment); 1000 leaves ~8x on that threshold.
+        const LAMBDA_MID: f64 = 5.0;
+        const LAMBDA_BIG: f64 = 1000.0;
+        let lambdas = [0.0, LAMBDA_MID, LAMBDA_BIG];
+        let fits: Vec<(Vec<f64>, f64)> = lambdas.iter().map(|&l| fit_at(l)).collect();
+        let norms: Vec<f64> = fits
+            .iter()
+            .map(|(t, _)| weight_block_sq_norm(&model, t))
+            .collect();
+        let vars: Vec<f64> = fits
+            .iter()
+            .map(|(t, _)| cl_modulator_variance(&model, &population, t))
+            .collect();
+        let ofvs: Vec<f64> = fits.iter().map(|(_, o)| *o).collect();
+        let (n0, n_mid, n_big) = (norms[0], norms[1], norms[2]);
+        let (v0, v_mid, v_big) = (vars[0], vars[1], vars[2]);
+        // Scientific notation: at ~1e-9 a fixed-point `{:.5}` renders every
+        // regularized quantity as `0.00000`, which is how #1277's failure message
+        // came to hide that the two numbers being ordered were both at the floor.
         eprintln!(
-            "weight ‖W‖²: λ=0 {n0:e}, λ=5 {n_mid:e}, λ=100 {n_big:e}\n\
-             CL modulator var: λ=0 {v0:e}, λ=5 {v_mid:e}, λ=100 {v_big:e}"
+            "λ: {lambdas:?}\ndata OFV: {ofvs:?}\nweight ‖W‖²: {norms:?}\n\
+             CL modulator var: {vars:?}"
         );
 
-        // The baseline must have weights worth shrinking. Measured: 1.534e4.
+        // (2) The baseline must have weights and spread worth removing, or every
+        // check below is vacuous. Measured: ‖W‖² 7.6e4, var 1.87.
         assert!(
             n0 > 1.0,
-            "the λ=0 fit must leave a weight block for L2 to shrink \
-             (‖W‖² {n0:e}); a baseline already at zero makes every check below \
-             vacuous"
+            "the λ=0 fit must leave a weight block for L2 to shrink (‖W‖² {n0:e})"
         );
-
-        // Decisive signal: heavy L2 drives the fitted weight norm to the
-        // optimizer's floor — twelve orders of magnitude below the λ=0 baseline.
-        //
-        // **Not** asserted as an ordering `n_big <= n_mid`, which is what #1277
-        // reported failing (`0.00000 → 0.03844`). Both regularized norms sit at
-        // that floor, so which of the two is smaller is set by the path BOBYQA
-        // and L-BFGS happen to take, not by λ, and the comparison flips between
-        // platforms while saying nothing about the regularizer. The floor itself
-        // is the stronger claim and the stable one: it implies both orderings
-        // against `n0` and survives either sign of the noise.
-        //
-        // Measured (macOS/arm64, all three fits converged): λ=0 1.534e4,
-        // λ=5 4.03e-8, λ=100 5.92e-11 — worst realised 4.03e-8, so the bound
-        // below carries ~2500x headroom. It still discriminates: #1277's own
-        // λ=100 stall landed at 1.16e-3, an order of magnitude *above* it.
-        //
-        // The ubuntu/x86_64 *values* are not recorded here because a green
-        // `cargo test` captures this test's own trace; what is confirmed on that
-        // platform is the bound, on the `Slow regression tests (nn)` leg of run
-        // 35268862787. Print the trace with `--nocapture` before retuning it.
-        const REGULARIZED_NORM_FLOOR: f64 = 1e-4;
-        assert!(
-            n_mid < REGULARIZED_NORM_FLOOR && n_big < REGULARIZED_NORM_FLOOR,
-            "L2 must drive the fitted weight norm to ~0 at both λ > 0 \
-             (‖W‖²: {n0:e} → {n_mid:e} → {n_big:e}, floor {REGULARIZED_NORM_FLOOR:e})"
-        );
-
-        // The effect: L2 collapses the spurious spread toward a constant map.
-        // Both regularized fits must be flat; their ordering *relative to each
-        // other* is not asserted, for the same reason as the norms above — at
-        // ~1e-23 the difference between them is float noise rather than λ.
         const FLAT_VAR_MAX: f64 = 1e-3;
         assert!(
-            v_mid < FLAT_VAR_MAX && v_big < FLAT_VAR_MAX,
-            "L2 must collapse the spurious CL modulator spread \
-             ({v0:e} → {v_mid:e} → {v_big:e})"
+            v0 > 100.0 * FLAT_VAR_MAX,
+            "the λ=0 fit must carry CL modulator spread for L2 to remove (var {v0:e})"
         );
 
-        // ...and the unregularized fit must actually overfit, or the flatness
-        // check above passes against a baseline that was already flat and proves
-        // nothing. Stated relative to `FLAT_VAR_MAX` rather than as a bare `> 1.0`:
-        // the λ=0 optimum on this null-covariate dataset is one of several the
-        // optimizer can reach, so its absolute spread moves between platforms
-        // (1.245 measured here against the ~480 the fixture was written on) while
-        // the gap to the regularized fits does not — those sit at 1e-23, twenty
-        // orders below either. 100x leaves ~12x headroom on the realised 1.245.
+        // (3) Cross-optimality. `ofv` excludes the penalty, so the penalized
+        // objective of fitted point j under λ_i is `ofv_j + λ_i·‖W_j‖²`.
+        // Today (#1561) this fails first at i = λ0, j = λ1000: J_0 is −259.93 at the
+        // λ=0 point vs −1173.56 at the λ=1000 point. The λ=5 fit fails the same way
+        // (−176.92 vs −1173.56). A converged λ=0 fit can never lose to a point in its
+        // own space, so the check cannot pass on a stuck baseline.
+        let penalized = |i: usize, j: usize| ofvs[j] + lambdas[i] * norms[j];
+        for i in 0..lambdas.len() {
+            for j in 0..lambdas.len() {
+                assert!(
+                    penalized(i, i) <= penalized(i, j) + 1e-3,
+                    "the λ={} fit is not a minimum of its own penalized objective: \
+                     {:.4} at its point vs {:.4} at the λ={} point (data OFV {ofvs:?}, \
+                     ‖W‖² {norms:?})",
+                    lambdas[i],
+                    penalized(i, i),
+                    penalized(i, j),
+                    lambdas[j]
+                );
+            }
+        }
+
+        // (4) The effect. The mid λ is asserted to shrink, not to vanish; measured
+        // ‖W‖² 1.485 (5e4x below the baseline) and var 0.369 against 1.87. The heavy
+        // λ flattens the network; measured ‖W‖² 3.9e-12 and var 1.4e-25, against a
+        // 1e-4 / 1e-3 floor. All values were measured on the #1504 branch.
         assert!(
-            v0 > 100.0 * FLAT_VAR_MAX,
-            "the λ=0 fit must invent real spurious CL spread for this test to have \
-             a baseline to remove (var {v0:e}); a near-zero unregularized variance \
-             means the fixture is degenerate, not that L2 worked"
+            n_mid < 1e-2 * n0,
+            "L2 at λ={LAMBDA_MID} must shrink the weights by orders of magnitude \
+             (‖W‖²: {n0:e} → {n_mid:e})"
+        );
+        assert!(
+            v_mid < v0,
+            "L2 at λ={LAMBDA_MID} must reduce the CL modulator spread ({v0:e} → {v_mid:e})"
+        );
+        const REGULARIZED_NORM_FLOOR: f64 = 1e-4;
+        assert!(
+            n_big < REGULARIZED_NORM_FLOOR && v_big < FLAT_VAR_MAX,
+            "L2 at λ={LAMBDA_BIG} must flatten the network (‖W‖² {n_big:e}, \
+             CL modulator var {v_big:e})"
         );
     }
     /// Each λ must act alone. `nn_l2` on its own is the likeliest real
