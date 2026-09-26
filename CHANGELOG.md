@@ -19,6 +19,37 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-25
+
+**Upgrading from 0.3.1.** Most of this release is fixes, but a few changes can stop an
+existing program, model file or dataset from running, or move its results. Each is
+described in full in its entry below.
+
+- **Rust API (breaking).** `predict()`, `simulate()`, `simulate_with_seed()`,
+  `predict_diag()`, `predict_survival()`, `predict_categorical()` and `inits_from_nca()`
+  now return `Result` instead of panicking (#898). `CovariateForm` gained a variant and,
+  with `ViResult` and `edit::NewParameter`, is now `#[non_exhaustive]` (#1312, #1305,
+  #1181); `ExclusionSummary` gained a field (#1405).
+- **Model files that parsed before can now be rejected**, where ferx used to silently
+  ignore or misread part of them: a call to a function ferx does not have (#1332); a scale
+  tag on a `block_omega` / `block_sigma` / `block_kappa` (#1377); a `[fit_options]` or
+  `[error_model]` line that matches no known form (#1390); more than one plain `DV ~` line
+  (#1022); both spellings of one `pk(...)` slot bound to different values (#1048); a
+  `theta` whose initial estimate lies outside its own bounds (#1251); a free variance
+  declared on the optimizer's lower rail (#1229).
+- **Datasets that read before can now be rejected**: a data cell that is not a number
+  (#1501), and a `CENS` cell that is not a whole number on a kept Gaussian observation row
+  (#1496).
+- **Results that move on an unchanged model**: SAEM now defaults to
+  `scale_adaptation = robbins_monro` (#1449), `n_mh_steps = auto` (#1459) and
+  `mstep_damping = 1.0` outside `iiv_on_ruv` models (#1415); `CWRES` is now NONMEM's
+  decorrelated CWRES (#1182); a plain `block_sigma` now estimates its correlation (#847);
+  ODE solver settings passed to `fit()` in code now take effect (#1212).
+
+**Known issue.** A `[covariate_nn]` (DCM) FOCEI fit can report convergence at an objective
+far above the point where every network weight is zero — 913 OFV above it in the case
+reported in #1561. The slow regression test that exposes it is ignored until that is fixed.
+
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
   on being off target.** Under `scale_adaptation = robbins_monro` the step fires only
@@ -7422,7 +7453,8 @@ and `git log v0.1.0..v0.1.5` for details.
 Initial tagged release. See the
 [GitHub release](https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.5...v0.2.0
