@@ -110,12 +110,26 @@ fn fit_warfarin(dir: &Path, omega_cl: &str) -> FitResult {
 /// | θ, relative (worst of three, `TVV`) | `1.37e-9` |
 /// | ω², relative (worst of three) | `7.30e-11` |
 ///
-/// The bounds below are `1e-6`, i.e. 730× the worst realised error and 1 900×
-/// on the OFV. The headroom is for the libm split between macOS and the Linux
-/// CI container, which moves late digits on a converged FOCE fit; it is not a
-/// hedge about the rails, which agree to nine figures. The two arms are
-/// separate optimizer trajectories from starts 7.2 packed units apart, so
-/// bit-equality is not the right expectation — nine agreeing figures is.
+/// Re-measured after #1389 introduced the warm-started inner BFGS Hessian seed
+/// (2026-09, Windows/x86_64): the seed perturbs the two arms' outer trajectories,
+/// and on the weakly-identified `TVKA` direction they now stop ~2e-6 apart while
+/// still agreeing on the OFV to ~9e-10 — both arms at the documented optimum
+/// (`-280.363962`), `converged = true`. The scatter is the derivative-free outer
+/// optimizer's parameter tolerance on a flat direction, not a wrong basin; it is
+/// intrinsic to any change of inner trajectory, so the θ/ω² bounds are re-derived
+/// from the realised seeded error rather than the pre-seed one:
+///
+/// | quantity | realised (seeded, worst of both arms) | bound | headroom |
+/// |---|---|---|---|
+/// | OFV, absolute | `9e-10` | `1e-6` (unchanged) | ~1 100× |
+/// | θ, relative (worst of three, `TVKA`) | `2.4e-6` (Linux CI: `4.8e-6`) | `1e-4` | ~20–40× |
+/// | ω², relative (worst of three) | `1.4e-5` | `1e-4` | ~7× |
+///
+/// The OFV assertions stay three orders of magnitude tighter than the parameter
+/// ones and remain the primary discriminator: a fit that was repelled rather than
+/// solved (a rail failure) moves the OFV by orders of magnitude, and the hard
+/// `DIVERGENCE_OFV` / `BASE_OPTIMUM_OFV` checks below still separate a solved fit
+/// from a repelled one by eleven orders of magnitude.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -182,7 +196,7 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     for (i, name) in base.theta_names.iter().enumerate() {
         let (b, r) = (base.theta[i], railed.theta[i]);
         assert!(
-            (r - b).abs() <= 1e-6 * b.abs().max(1.0),
+            (r - b).abs() <= 1e-4 * b.abs().max(1.0),
             "{name}: {r} from the +6 rail vs {b} from the base start"
         );
     }
@@ -190,7 +204,7 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     for i in 0..base.omega.nrows() {
         let (b, r) = (base.omega[(i, i)], railed.omega[(i, i)]);
         assert!(
-            (r - b).abs() <= 1e-6 * b.abs().max(1e-8),
+            (r - b).abs() <= 1e-4 * b.abs().max(1e-8),
             "omega[{i},{i}]: {r} from the +6 rail vs {b} from the base start"
         );
     }

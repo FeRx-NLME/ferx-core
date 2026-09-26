@@ -989,7 +989,15 @@ section of the SDLC for the versioning policy).
   included) inner optimization now seed dense BFGS from the current analytical
   Gauss–Newton eta Hessian through a Cholesky solve, fusing the seed and first
   gradient in one first-order sensitivity pass; one-node Laplace uses its exact
-  conditional eta Hessian as the initial BFGS metric for robustness. Objective-only
+  conditional eta Hessian as the initial BFGS metric for robustness. On a cold
+  start the first step selects the eta basin, and neither metric picks the right
+  one everywhere: a cold-seeded Gauss–Newton step put a covariate-NN fit ~950 OFV
+  above the optimum (#1474), while the unseeded step trapped two `warfarin_if`
+  subjects and left gradient fits 3.3 OFV high (#1504). A cold-started solve
+  therefore runs both metrics and keeps the lower objective (ties keep the
+  historical solve), warm-started solves are seeded, and the seed is declined
+  entirely on models with `[covariate_nn]` blocks, where it misleads warm-started
+  solves as well. Objective-only
   Laplace evaluations reuse the exact terminal eta Hessian retained from the inner
   solve — only where it is the anchor Laplace would otherwise recompute (analytic
   score scope; joint PK-TTE / discrete / CTMM models and `gradient = fd` keep their
