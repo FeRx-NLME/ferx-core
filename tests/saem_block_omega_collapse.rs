@@ -128,7 +128,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
     truth.omega = true_omega();
     truth.sigma.values = vec![0.15];
 
-    let sim = simulate_with_seed(model, template, &truth, 1, 20260607);
+    let sim = simulate_with_seed(model, template, &truth, 1, 20260607).unwrap();
 
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {

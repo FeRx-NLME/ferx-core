@@ -204,6 +204,7 @@ fn comp_lag_first_order_curve(ka: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> 
     params.theta[2] = ka;
     params.theta[3] = lag;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -218,6 +219,7 @@ fn comp_lag_zero_order_curve(dur: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> 
     params.theta[2] = dur;
     params.theta[3] = lag;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -259,6 +261,7 @@ fn predict_curve(src: &str, obs_times: &[f64]) -> Vec<f64> {
         &pop_single(obs_times.to_vec()),
         &model.default_params,
     )
+    .unwrap()
     .iter()
     .map(|p| p.pred)
     .collect()
@@ -472,6 +475,7 @@ fn route_lag_multi_dose_equals_compartment_lag() {
     let route = {
         let m = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
         predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect::<Vec<_>>()
@@ -479,6 +483,7 @@ fn route_lag_multi_dose_equals_compartment_lag() {
     let comp = {
         let m = parse_full_model(COMP_LAG_SINGLE).expect("parses").model;
         predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect::<Vec<_>>()
@@ -520,6 +525,7 @@ fn route_lag_on_event_driven_path_equals_compartment_lag() {
             subjects: vec![subj],
         };
         predict(&m, &pop, &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect()
@@ -560,7 +566,8 @@ fn per_route_lag_fit_runs_end_to_end() {
         &model,
         &pop_single(obs_times.clone()),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
@@ -627,7 +634,8 @@ fn per_route_lag_fit_recovers_lag() {
         &model,
         &pop_single(obs_times.clone()),
         &model.default_params,
-    );
+    )
+    .unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
@@ -984,6 +992,7 @@ fn route_lag_multi_dose_equals_compartment_lag_transit() {
     let route = {
         let m = parse_full_model(TRANSIT_ROUTE_LAG).expect("parses").model;
         predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect::<Vec<_>>()
@@ -991,6 +1000,7 @@ fn route_lag_multi_dose_equals_compartment_lag_transit() {
     let comp = {
         let m = parse_full_model(TRANSIT_COMP_LAG).expect("parses").model;
         predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect::<Vec<_>>()
@@ -1071,6 +1081,7 @@ fn infusion_into_per_route_lag_equals_compartment_lag() {
             )],
         };
         predict(&m, &pop, &m.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect::<Vec<_>>()

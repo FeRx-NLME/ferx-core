@@ -86,7 +86,7 @@ fn igd_curve_recovers_dose_auc_and_has_delayed_peak() {
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single_igd(obs_times);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // (1) No instantaneous bolus jump: the dose enters as R_in over time, and
     //     the IG density vanishes at tad → 0, so central starts at exactly 0.
@@ -207,7 +207,7 @@ fn biphasic_igd_recovers_dose_auc() {
         .model;
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single_igd(obs_times);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     assert!(
         preds[0].pred.abs() < 1e-12,
@@ -298,8 +298,7 @@ fn biphasic_igd_fraction_structural_rejected_at_parse() {
 }
 
 #[test]
-#[should_panic(expected = "Pathway fractions on compartment")]
-fn biphasic_igd_fraction_value_error_panics_on_predict() {
+fn biphasic_igd_fraction_value_error_errs_on_predict() {
     // #588: the value fraction checks now guard the `Vec`-returning `predict()` path.
     // A structurally-valid but value-malformed multi-pathway model (both fractions
     // 0.6 → Σ = 1.2, silently over-delivering the dose) is rejected loudly instead of
@@ -307,17 +306,26 @@ fn biphasic_igd_fraction_value_error_panics_on_predict() {
     let src = biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = TVFR1");
     let model = parse_full_model(&src).expect("model parses").model;
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("Pathway fractions on compartment"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
-#[should_panic(expected = "Pathway fractions on compartment")]
-fn biphasic_igd_fraction_value_error_panics_on_simulate() {
+fn biphasic_igd_fraction_value_error_errs_on_simulate() {
     // #588 (simulate path): the same value-malformed multi-pathway model is rejected
     // when *simulated*, via the `simulate_inner_with_draw` chokepoint guard — the exact
     // path the fit-init-only `check_model_data` left open to silently-wrong delivery.
     let src = biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = TVFR1");
     let model = parse_full_model(&src).expect("model parses").model;
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
-    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+    let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
+        .expect_err("simulate_with_seed() must refuse this input");
+    assert!(
+        err.contains("Pathway fractions on compartment"),
+        "unexpected Err: {err}"
+    );
 }

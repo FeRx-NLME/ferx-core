@@ -471,7 +471,7 @@ fn the_run_in_bail_out_follows_bioavailability() {
     let pop = population_with(5.0, 1);
 
     let full = ode_model_with_f(" + 0.003*TAFD", "1.0");
-    let preds = crate::api::predict(&full, &pop, &full.default_params.clone());
+    let preds = crate::api::predict(&full, &pop, &full.default_params.clone()).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_finite()),
         "F = 1 leaves T_inf = 20 > II = 12, so the run-in is skipped and TAFD keeps its \
@@ -490,7 +490,7 @@ fn the_run_in_bail_out_follows_bioavailability() {
     );
 
     let half = ode_model_with_f(" + 0.003*TAFD", "0.5");
-    let preds = crate::api::predict(&half, &pop, &half.default_params.clone());
+    let preds = crate::api::predict(&half, &pop, &half.default_params.clone()).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_nan()),
         "F = 0.5 makes T_inf = 10 <= II = 12, so the run-in does run and TAFD has no \
@@ -520,7 +520,7 @@ fn the_run_in_bail_out_follows_bioavailability() {
         12.0,
         RateMode::ModeledDuration,
     )];
-    let preds = crate::api::predict(&modeled, &pop_d1, &modeled.default_params.clone());
+    let preds = crate::api::predict(&modeled, &pop_d1, &modeled.default_params.clone()).unwrap();
     assert!(
         preds.iter().all(|p| p.pred.is_finite()),
         "a duration-defined infusion keeps its 20-hour length under F = 0.5, so the run-in \

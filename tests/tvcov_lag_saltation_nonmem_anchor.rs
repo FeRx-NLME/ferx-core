@@ -196,7 +196,7 @@ fn ferx_pred_at(data: &str, subject_id: &str, time: f64) -> f64 {
     .expect("the anchor model parses");
     let pop = ferx_core::read_nonmem_csv(Path::new(&anchor(data)), None, None)
         .expect("the anchor dataset loads");
-    let preds = ferx_core::predict(&parsed.model, &pop, &parsed.model.default_params);
+    let preds = ferx_core::predict(&parsed.model, &pop, &parsed.model.default_params).unwrap();
     preds
         .iter()
         .find(|p| p.id == subject_id && (p.time - time).abs() < 1e-9)

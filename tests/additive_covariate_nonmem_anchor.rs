@@ -164,7 +164,7 @@ fn nonmem_pred(file: &str) -> Vec<(String, f64, f64)> {
 fn worst_pred_error(model_src: &str, table: &str) -> f64 {
     let parsed = parse_full_model(model_src).expect("the ferx model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the dataset must load");
-    let ferx = predict(&parsed.model, &pop, &parsed.model.default_params);
+    let ferx = predict(&parsed.model, &pop, &parsed.model.default_params).unwrap();
     let nm = nonmem_pred(table);
 
     let mut worst: f64 = 0.0;

@@ -359,6 +359,7 @@ fn a_lag_non_finite_only_at_an_observation_is_not_rejected_and_still_predicts() 
     // premise above ("the engine reads a lag at dose snapshots only") is wrong and the
     // snapshot set is the thing to revisit.
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();
@@ -469,6 +470,7 @@ fn a_multi_dose_modeled_regimen_with_every_dose_finite_is_not_rejected() {
             codes(&diags)
         );
         let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+            .unwrap()
             .iter()
             .map(|p| p.pred)
             .collect();
@@ -497,6 +499,7 @@ fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
         codes(&diags)
     );
     let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect();
@@ -734,6 +737,7 @@ fn transit_subject(
 
 fn preds(model: &ferx_core::types::CompiledModel, pop: &Population) -> Vec<f64> {
     predict(model, pop, &model.default_params)
+        .unwrap()
         .iter()
         .map(|p| p.pred)
         .collect()
@@ -907,13 +911,12 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 }
 
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
-/// no `check_model_data`, but they *do* run `check_absorption_dosing`, and re-raise its
-/// first error as a panic (the `Result` forms return it as an `Err`, #898). Widening that check's
-/// snapshot set therefore widens what these entry points abort on: a model that returned
-/// numbers before now panics. Deliberate — the numbers it returned came from an
-/// out-of-domain forcing the engine really does apply at that record — and pinned here
-/// so the change cannot happen twice by accident (#898 is the issue for turning these
-/// aborts into diagnostics).
+/// no `check_model_data`, but they *do* run `check_absorption_dosing`, and return its
+/// first error as an `Err` (#898). Widening that check's snapshot set therefore widens
+/// what these entry points refuse: a model that returned numbers before now errs.
+/// Deliberate — the numbers it returned came from an out-of-domain forcing the engine
+/// really does apply at that record — and pinned here so the change cannot happen twice
+/// by accident.
 ///
 /// `E_DOSE_ATTR_NONFINITE` is not among the checks `predict()` runs, so the widening leaves
 /// `predict()` unchanged for it. That gap is #1280 / #898, not something to close by
@@ -926,8 +929,7 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 /// exists to pin was gone, on a panic raised by something else entirely (#1286 review,
 /// finding 5). `observation 2 at TIME=8` can only come from the observation snapshot.
 #[test]
-#[should_panic(expected = "observation 2 at TIME=8")]
-fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observation() {
+fn predict_now_errs_on_an_absorption_domain_error_reached_only_at_an_observation() {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")
         .model;
@@ -942,5 +944,10 @@ fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observati
     s.dose_covariates = vec![wt(0.0)];
     s.obs_covariates = vec![wt(0.0), wt(10.0)];
     let pop = population(s, &["WT"]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("observation 2 at TIME=8"),
+        "unexpected Err: {err}"
+    );
 }

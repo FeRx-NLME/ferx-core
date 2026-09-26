@@ -14,7 +14,7 @@ pub fn simulate(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Vec<SimulationResult>
+) -> Result<Vec<SimulationResult>, String>
 ```
 
 **Parameters:**
@@ -23,7 +23,9 @@ pub fn simulate(
 - `params`: True parameter values for simulation
 - `n_sim`: Number of simulation replicates
 
-**Returns:** Vector of `SimulationResult`, one per observation per subject per replicate.
+**Returns:** `Ok` with a vector of `SimulationResult`, one per observation per subject per
+replicate, or `Err` when the model and data fail a precondition — the same message `fit()`
+gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)).
 
 **Example:**
 ```rust
@@ -33,7 +35,7 @@ let model = parse_model_file(Path::new("model.ferx"))?;
 let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
 
 // Simulate 1000 replicates
-let sims = simulate(&model, &population, &model.default_params, 1000);
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
 
 for sim in &sims[..5] {
     println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
@@ -77,7 +79,7 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 ```rust
 let (population, _covariates) =
     read_population_for_simulation(&model, &None, "design.csv", None, None, None, &[])?;
-let sims = simulate(&model, &population, &model.default_params, 1000);
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
 ```
 
 Read with `read_population_for()` the same file yields zero simulated rows. Rows
@@ -106,7 +108,7 @@ pub fn simulate_with_seed(
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Vec<SimulationResult>
+) -> Result<Vec<SimulationResult>, String>
 ```
 
 ## `simulate_with_options()` — propensity-score matching
@@ -223,14 +225,15 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Vec<PredictionResult>
+) -> Result<Vec<PredictionResult>, String>
 ```
 
-**Returns:** Vector of `PredictionResult` with population-level predictions.
+**Returns:** `Ok` with a vector of `PredictionResult` holding population-level predictions,
+or `Err` on a failed precondition, as for `simulate()`.
 
 **Example:**
 ```rust
-let preds = predict(&model, &population, &model.default_params);
+let preds = predict(&model, &population, &model.default_params)?;
 for p in &preds {
     println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
 }
@@ -393,6 +396,24 @@ What actually happens, for `UncertaintyMethod::Asymptotic`:
   and every draw yields a positive-definite Ω by construction — no rejection
   of non-PD matrices needed. Off-diagonal Cholesky entries are drawn on the
   identity scale.
+- **A probability-scale theta is drawn on the logit scale.** A theta used
+  as `inv_logit(logit(THETA) + ETA)` (`theta_transform = LogitProbability`,
+  e.g. a bioavailability declared on (0, 1)) is packed as $\log\theta$ like
+  any other non-negative theta, and a normal draw there has no ceiling at 1.
+  So that coordinate is moved to $y = \operatorname{logit}\hat\theta$ first,
+  its row and column of the covariance scaled by $dy/dx = 1/(1-\hat\theta)$
+  (or $1/(\hat\theta(1-\hat\theta))$ when the theta is identity-packed
+  because its lower bound is negative), and each draw is mapped back with
+  $\theta = \operatorname{inv\_logit}(y)$. The draws are logit-normal with
+  the delta-method SD, and never reach 1 whatever the declared upper bound
+  ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)). A FIX'd
+  theta is pinned as usual. A free one whose estimate is not strictly inside
+  (0, 1) (possible only with an upper bound above 1) has no logit, so the
+  sampler, and SIR, returns an error asking for an upper bound below 1 rather
+  than drawing values that `logit` would clamp. A logit draw above
+  34.5, the clamp `logit` itself applies, is rejected and redrawn like any
+  other out-of-bounds draw: from about 36.7 on, $\operatorname{inv\_logit}$
+  rounds to exactly 1.
 - If `covariance_matrix` is not positive-definite, it is symmetrised and
   eigenvalue-floored before the Cholesky (`regularised_cholesky`). A draw
   from the regularised factor is slightly wider than the raw covariance in

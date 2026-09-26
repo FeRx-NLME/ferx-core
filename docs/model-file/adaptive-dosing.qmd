@@ -389,6 +389,89 @@ model is `examples/adaptive_vanco_auc.ferx`; the mrgsolve model, R driver, and
 frozen output live in `tests/reference/vanco_mrgsolve/`, exercised on every
 PR by `tests/adaptive_vanco_anchor.rs`.
 
+## Model time in a reactive run
+
+### Where a reactive run starts
+
+A reactive run starts where `predict()` starts on the same realized schedule: at the
+subject's **first record** (observation, PK-only row, base dose or reset) or at the
+controller's first realized dose, whichever is earlier — NONMEM's first-record
+convention. Before that origin the state is its `init(...)` value and does not evolve,
+so a decision placed earlier reads the `init` state. A dataset whose first record is at
+t = 6 is not integrated over a phantom `[0, 6]` window.
+
+### Dose clocks before the first dose
+
+A `[odes]` RHS may read the dose clocks `TAD` (time since the last dose) and `TAFD`
+(time after the first dose) — a natural shape for a PD controller, where time since
+the last dose drives an effect compartment. Both are supported reactively and match
+`predict()` on the realized schedule.
+
+They are anchored **at a dose**, which is the one thing a reactive run does not know
+in advance. Before the controller's first dose — and with no pre-scheduled base
+regimen to anchor them — `TAD` and `TAFD` have no referent at all. Where the record
+*does* contain a dose, `predict()` fills that window by looking ahead to the first
+one, which is a peek a causal simulation has not earned: that dose has not been
+decided yet, and may never be. (On a record with no dose anywhere, `predict()` has no
+anchor either and returns `NaN` in that window too.)
+
+So `simulate_adaptive()` **refuses the window with a typed error** rather than hand
+you an unanchored trajectory. The message names the segment, the spelling that is
+unanchored (`TAD` or `TAFD`), and the two fixes:
+
+- give the subject a **pre-scheduled base regimen** — base dose times *are* known up
+  front, so they anchor the window exactly as `predict()` does; or
+- have the controller **dose at a decision at or before the subject's first record**,
+  so no segment is integrated before the first dose.
+
+Neither fix helps a controller that *never* doses: such a run has no anchor at any
+point, and the message says so.
+
+The refusal covers the whole pre-dose window, not only the observations inside it: an
+unanchored clock enters the integrated **state**, so a read taken later — even after
+the first dose has landed — would inherit it.
+
+**It is gated on the outcome, not on the text of your model.** The check runs after
+each segment is integrated and fires only when three things hold together: the
+segment's state came back non-finite, the clock the RHS reads was unanchored there,
+and re-solving that same segment with the clock anchored *repairs* it — some state
+that had gone non-finite comes back finite. The third one is a counterfactual, and it
+is what makes the message's claim true rather than plausible: a compartment that
+diverges for its own reasons, on a model that merely mentions `TAD` somewhere, is not
+refused and not blamed on the clock. A `TAD` that appears in a branch the pre-dose
+window does not take, or only inside a condition, is likewise left alone. A RHS that
+reads only `TIME` / `T` is unaffected in every case, since that clock is the
+integration axis and is anchored everywhere.
+
+Not being refused is not the same as being right, and on one of those shapes it is
+emphatically not: a model whose *other* compartment has run away is left alone here,
+but the run it then returns is wrong for a reason this page cannot fix. When any
+state goes non-finite the solver stops advancing **every** state, so the remaining
+compartments freeze at their last value and come back as ordinary finite predictions
+— from `predict()` as much as from the reactive driver, which is also why the replay
+verifier agrees with them. That is tracked as a separate engine defect. If a
+compartment of your model can diverge, neither this check nor the verifier will tell
+you.
+
+**One shape it cannot see.** If the unanchored clock is consumed by a *comparison*
+rather than by arithmetic, nothing goes non-finite and the check stays quiet. Every
+comparison against `NaN` is false, and `min` / `max` are built from comparisons — so
+in the pre-dose window `if (TAD < 5)` silently takes the else arm and
+`min(TAD, 24)` silently yields `24`. The run then returns a number that depends on
+which way that comparison fell, and it need not match `predict()` on the realized
+schedule — it happens to match when both spellings of the comparison fall the same
+way, as `if (TAD > 5)` does, and to differ when they do not, as `if (TAD < 5)` does.
+The **frozen-schedule replay verifier**, which is on by default, is the net here: it
+reports the divergence between the reactive walk and the replay, without naming the
+clock as the cause. Two limits on that net are worth knowing. It only fires when the
+branch's effect exceeds its tolerance band — `8 × ode_reltol`, and at least `1e-9`,
+relative — so a small effect passes. And it compares two engines, so it cannot see a
+failure they share, which is exactly the frozen-state case above. Turning it off
+(`verify: false`) on a model that reads `TAD` or `TAFD` inside a comparison removes
+it entirely. Gating on *evaluation* instead — a per-segment "this slot was loaded"
+flag inside the RHS evaluator — would cover this shape too, and is tracked
+separately.
+
 ## Current scope and limits
 
 - **ODE models only** (the reactive driver runs on the ODE engine).

@@ -46,6 +46,17 @@ fn fit_with(gradient: GradientMethod) -> ferx_core::FitResult {
 }
 
 fn fit_source(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
+    fit_source_reconverging(src, gradient, 0)
+}
+
+/// `fit_source` with `reconverge_gradient_interval = interval`. `1` re-solves every
+/// subject's EBE at each FD perturbation on every outer evaluation — the reconverged
+/// FD gradient, i.e. the exact marginal gradient the analytic one must equal.
+fn fit_source_reconverging(
+    src: &str,
+    gradient: GradientMethod,
+    interval: usize,
+) -> ferx_core::FitResult {
     let mut model = parse_model_string(src).expect("block_sigma model must parse");
     assert!(
         !model.residual_correlations.is_empty(),
@@ -64,19 +75,32 @@ fn fit_source(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
     opts.inner_tol = 1e-9;
     opts.outer_maxiter = 300;
     opts.run_covariance_step = false;
+    opts.reconverge_gradient_interval = interval;
     opts.verbose = false;
     fit(&model, &population, &model.default_params, &opts).expect("block_sigma fit must succeed")
 }
 
-/// The analytic dense-R FOCEI gradient reaches an optimum at least as good as the
-/// finite-difference gradient — and, being noise-free, converges to the same region
-/// of parameter space (per-coordinate gradient equality is pinned by the fast FD
-/// unit tests). We do *not* pin the two OFVs to within a shared basin: on this
-/// deliberately tiny, flat 2-subject surface the noisy FD outer gradient stalls at a
-/// shallower point than the analytic path (a ~0.7-unit-higher OFV since #925
-/// sharpened the inner-EBE fallback, though the estimates still agree to a few %).
-/// The invariant that matters — analytic ≤ FD, i.e. the exact gradient never lands
-/// somewhere worse — is what this test guards.
+/// The analytic dense-R FOCEI gradient and the **reconverged** finite-difference gradient
+/// (`reconverge_gradient_interval = 1`: every subject's EBE re-solved at every FD
+/// perturbation — the exact marginal gradient the analytic one must equal) must drive
+/// L-BFGS to the same optimum. The check is two-sided: a one-sided "analytic ≤ FD" bound
+/// cannot see an analytic gradient that lands *lower* in the wrong place, and the held-EBE
+/// FD fit (`reconverge_gradient_interval = 0`) is not a valid reference — it omits the
+/// EBE-response term (#1552; Codex review on #1556).
+///
+/// Measured on this fixture (Linux, `RAYON_NUM_THREADS=1`): analytic OFV 17.630655452624,
+/// reconverged 17.630655451731, |Δ| = 8.9e-10; worst θ relative difference 1.5e-7; ω²
+/// identical (both fits park it on the 6.1e-6 guard). The held-EBE fit lands at
+/// 17.630655604168. Bounds: 1e-7 on the OFV (110× headroom) and 1e-5 on θ (65×).
+///
+/// Mutation sweep on `subject_packed_gradient`, each against these bounds:
+/// - θ₀ gradient sign-flipped → |Δ| = 0.56, θ 7.0e-2 (both bounds fail; so did the old check);
+/// - ω gradient zeroed → |Δ| = 0.75, θ 2.2e-2 (both fail; so did the old check);
+/// - θ₁ gradient × 1.5 → |Δ| = 1.7e-6, θ 1.5e-4 — **passed the old one-sided check**, fails
+///   both bounds here;
+/// - ω gradient × 0.5 → |Δ| = 2.7e-10, θ 2.9e-5 — only the θ bound sees it (3× margin): ω² has
+///   collapsed onto its guard, so its gradient is nearly unobservable on this 3-subject
+///   fixture. A better-conditioned convergence fixture is a follow-up, not this test.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -84,40 +108,48 @@ fn fit_source(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
 )]
 fn dense_residual_analytic_and_fd_fits_agree() {
     let analytic = fit_with(GradientMethod::Auto);
-    let fd = fit_with(GradientMethod::Fd);
+    let reconverged = fit_source_reconverging(MODEL, GradientMethod::Fd, 1);
 
     assert!(
-        analytic.ofv.is_finite() && fd.ofv.is_finite(),
-        "both OFVs must be finite: analytic {}, fd {}",
+        analytic.ofv.is_finite() && reconverged.ofv.is_finite(),
+        "both OFVs must be finite: analytic {}, reconverged FD {}",
         analytic.ofv,
-        fd.ofv
+        reconverged.ofv
     );
-    // The noise-free analytic gradient reaches an optimum no worse than the FD one.
-    // (We don't pin |analytic - fd| to a shared basin: the flat 2-subject surface lets
-    // the noisy FD path stall at a shallower point — see the doc comment above.)
+    assert!(analytic.converged, "analytic fit did not converge");
+    assert!(reconverged.converged, "reconverged-FD fit did not converge");
+    // Two-sided: measured |Δ| = 8.9e-10, bound 1e-7 (any comparison against NaN is
+    // false, so a NaN OFV fails here too).
     assert!(
-        analytic.ofv <= fd.ofv + 1e-2,
-        "analytic OFV {} should be no worse than FD OFV {}",
+        (analytic.ofv - reconverged.ofv).abs() < 1e-7,
+        "analytic OFV {} vs reconverged-FD OFV {}: |Δ| = {:e} exceeds 1e-7",
         analytic.ofv,
-        fd.ofv
+        reconverged.ofv,
+        (analytic.ofv - reconverged.ofv).abs()
     );
-    // Despite the OFV gap, both paths converge to the same region of parameter space.
+    // Same optimum, not just the same objective value: measured worst θ 1.5e-7, bound 1e-5.
     let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
     for k in 0..analytic.theta.len() {
         assert!(
-            rel(analytic.theta[k], fd.theta[k]) < 5e-2,
-            "theta[{k}] analytic {} vs FD {}",
+            rel(analytic.theta[k], reconverged.theta[k]) < 1e-5,
+            "theta[{k}] analytic {} vs reconverged FD {}",
             analytic.theta[k],
-            fd.theta[k]
+            reconverged.theta[k]
         );
     }
+    assert!(
+        rel(analytic.omega[(0, 0)], reconverged.omega[(0, 0)]) < 1e-5,
+        "omega^2 analytic {} vs reconverged FD {}",
+        analytic.omega[(0, 0)],
+        reconverged.omega[(0, 0)]
+    );
 }
 
 /// #847: a bare `block_sigma` estimates its off-diagonal, so the free-rho fit must
-/// (a) actually move rho off its declared value and (b) land at an OFV no worse
-/// than the `FIX`ed fit — the fixed model is the free model restricted to a
-/// single point of the rho axis, so a free fit that scored worse would mean the
-/// rho gradient points the optimizer the wrong way.
+/// (a) actually move rho off its declared value, (b) land at an OFV no worse
+/// than the `FIX`ed fit — `FIX` holds the whole block (both sigmas and rho) at its
+/// declaration, a point the free model contains — and (c) reach the OFV the
+/// reconverged-FD gradient reaches from the same start (#1552).
 ///
 /// This is the convergence-level companion to the per-coordinate parity tests
 /// (`population_packed_gradient_block_sigma_matches_fd` and siblings), which pin
@@ -162,13 +194,47 @@ fn dense_residual_free_rho_beats_fixed_rho() {
         fixed.ofv
     );
 
-    // The analytic rho gradient must reach the same optimum the FD path does —
-    // the rho analogue of `dense_residual_analytic_and_fd_fits_agree`.
-    let free_fd = fit_source(&free_src, GradientMethod::Fd);
+    // The analytic rho gradient must reach the optimum the *reconverged* FD gradient
+    // reaches — the rho analogue of `dense_residual_analytic_and_fd_fits_agree`, but
+    // against the exact oracle rather than the fixed-EBE one (#1552).
+    //
+    // Why not the default `GradientMethod::Fd` fit: without reconvergence that fit takes
+    // the held-EBE gradient, which omits the EBE response — a different, inexact
+    // gradient, so which point it wanders to on this surface says nothing about the
+    // analytic one. The surface is degenerate: omega collapses onto its guard (99%
+    // shrinkage) in every fit, and the objective has several boundary optima. Measured
+    // on this fixture (`main@293ac058`, #1552):
+    //
+    //   analytic (auto)             -14.857433  rho -0.48, PROP_ERR on its lower guard
+    //   reconverged FD (interval 1) -14.857829  rho -0.44, PROP_ERR on its lower guard
+    //   held-EBE FD (default fd)    -15.302520  rho +0.995 on the Fisher-z guard, not converged
+    //   held-EBE FD before #1531    -14.865891  rho frozen at exactly 0.5
+    //
+    // The held-EBE reference was never an oracle here: until #1531 its closed form built
+    // a diagonal `R` and left the packed rho coordinate at zero, so that fit could not
+    // move rho at all, and the old one-sided `analytic <= fd + 1e-2` passed by 1.5e-3.
+    // Once #1531 sent `block_sigma` to the FD fallback its rho moved, and ran to rho -> 1.
+    //
+    // Two-sided, because a broken analytic rho block can land *lower*. Measured with the
+    // analytic rho component of `subject_packed_gradient` mutated (#1552):
+    //
+    //   sign-flipped  -15.294935  gap 4.37e-1  -- passed the old one-sided check
+    //   zeroed        -15.289427  gap 4.32e-1  (also caught by "rho should move" above)
+    //
+    // The realised gap is 3.96e-4: the two paths park rho at different points of the
+    // flat PROP_ERR -> 0 ridge, where rho is unidentified. The bound gives it 5x headroom
+    // and sits two orders of magnitude under either mutation.
+    let free_reconverged = fit_source_reconverging(&free_src, GradientMethod::Fd, 1);
     assert!(
-        free.ofv <= free_fd.ofv + 1e-2,
-        "analytic free-rho OFV {} should be no worse than FD {}",
+        free_reconverged.ofv.is_finite(),
+        "reconverged-FD OFV must be finite, got {}",
+        free_reconverged.ofv
+    );
+    let gap = (free.ofv - free_reconverged.ofv).abs();
+    assert!(
+        gap < 2e-3,
+        "analytic free-rho OFV {} should match the reconverged-FD fit's {} (gap {gap:.3e})",
         free.ofv,
-        free_fd.ofv
+        free_reconverged.ofv
     );
 }

@@ -378,8 +378,8 @@ fn a_generated_candidate_is_the_hand_written_model() {
     );
 
     let pop = &base.prepared.population;
-    let gen_pred = predict(&gen.model, pop, &gen.model.default_params);
-    let hand_pred = predict(&hand.model, pop, &hand.model.default_params);
+    let gen_pred = predict(&gen.model, pop, &gen.model.default_params).unwrap();
+    let hand_pred = predict(&hand.model, pop, &hand.model.default_params).unwrap();
     assert_eq!(gen_pred.len(), hand_pred.len());
     for (g, h) in gen_pred.iter().zip(&hand_pred) {
         assert_eq!(g.id, h.id);
@@ -624,8 +624,8 @@ fn an_estimated_bioavailability_is_carried_across_the_swap() {
         hand.model.default_params.theta
     );
     let pop = &base.prepared.population;
-    let gen_pred = predict(&gen.model, pop, &gen.model.default_params);
-    let hand_pred = predict(&hand.model, pop, &hand.model.default_params);
+    let gen_pred = predict(&gen.model, pop, &gen.model.default_params).unwrap();
+    let hand_pred = predict(&hand.model, pop, &hand.model.default_params).unwrap();
     for (g, h) in gen_pred.iter().zip(&hand_pred) {
         assert_eq!(
             g.pred.to_bits(),

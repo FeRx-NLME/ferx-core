@@ -79,6 +79,47 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **Uncertainty draws of a probability-scale theta are logit-normal and stay below 1.** A
+  theta used as `inv_logit(logit(THETA) + ETA)` was drawn log-normally by
+  `simulate_with_uncertainty()` (asymptotic method) and by the SIR proposal. With an upper
+  bound at or below 1 the draws above it were rejected, so the distribution came out
+  truncated and pulled low. With an upper bound above 1, or none, a draw above 1 was
+  accepted and the clamped `logit` turned it into `F = 1` for every subject. Such a theta is
+  now drawn on the logit scale with the delta-method covariance, and the SIR weights carry
+  the matching Jacobian ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)).
+- **`simulate_adaptive()` now starts integrating at the subject's first record (or the
+  controller's first realized dose, if earlier), as `predict()` does, instead of at t = 0.**
+  With a non-zero `init(...)` and a first record after t = 0, the reactive trajectory and
+  the state the controller read at each decision were integrated over a phantom `[0, first
+  record]` window. With constant covariates the default frozen-replay check refused the
+  run; with a time-varying covariate or IOV the check shared the same t = 0 start and passed
+  it silently. The refusal for an unanchored `TAD`/`TAFD` window now advises a dose "at or
+  before the subject's first record". (#936)
+- **Adaptive dosing on a `TAD` / `TAFD`-reading `[odes]` RHS no longer returns a silent
+  `NaN` trajectory.** With no pre-scheduled base regimen, the reactive driver's dose clock
+  has no referent before the controller's first dose — and that `NaN` entered the
+  integrated *state*, so every later prediction came back `NaN` too, including reads taken
+  after the first dose landed. With the frozen-replay verifier on (the default) the run
+  failed with the verifier's message, which never named the cause; with `verify: false` it
+  returned `Ok` with `NaN` rows and no warning at all. `simulate_adaptive()` now refuses
+  that window with a typed error naming the segment, the spelling (`TAD` or `TAFD`) and the
+  two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
+  that doses. The check is gated on the outcome, not on the text of the model: it runs after
+  each segment and fires only when that segment integrated to a non-finite state under an
+  unanchored clock **and** re-solving it with the clock anchored repairs some state that had
+  gone non-finite. So a `TAD` in a branch the pre-dose window never takes, or read only
+  inside a condition, still runs — and a compartment that diverges for its own reasons is
+  not refused, and not blamed on the clock. Runs with a base regimen, with all reads
+  anchored, or on a RHS reading only `TIME` / `T` are likewise unaffected. One shape stays
+  outside it: an unanchored clock consumed by a comparison (`if (TAD < 5)`, `min(TAD, 24)`)
+  leaves the state finite and silently picks a branch, and the default-on frozen-schedule
+  replay verifier is what catches the resulting divergence (#1151).
+- **Note on the diverging-compartment case above**: not being refused is not the same as
+  being correct. When any state goes non-finite the solver stops advancing every state, so
+  the other compartments freeze and come back as finite predictions — from `predict()` as
+  much as from the reactive driver, which is why the replay verifier agrees with them. That
+  is an engine defect in its own right and is tracked separately (#1539); nothing in #1151
+  changes it either way.
 - **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
   The floor replaces a direction of negative or near-zero curvature with a finite one, so the
   condition number and correlations the `max_condition_number` / `max_correlation` gates read
@@ -411,10 +452,11 @@ section of the SDLC for the versioning policy).
   fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
   and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
   ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
-- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
-  that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
-  `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
-  returned bare values and panicked); `simulate_with_options()`,
+- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every predict /
+  simulate entry point (#898).** `predict()`, `simulate()`, `simulate_with_seed()`,
+  `predict_diag()`, `predict_survival()`, `predict_categorical()` and `inits_from_nca()`
+  now return `Result<_, String>` (they returned bare values and panicked); a Rust caller
+  of the first three adds `?` (or `.unwrap()` to keep the old panic); `simulate_with_options()`,
   `simulate_with_options_diag()` and `simulate_with_uncertainty()` keep their signatures but
   no longer panic *out of* a `Result`-returning function — a dose into a compartment the
   model cannot deliver into, a coded `RATE` with no `D{n}`/`R{n}` behind it, an unsupported
@@ -422,9 +464,7 @@ section of the SDLC for the versioning policy).
   gives for that precondition (an input failing several at once is reported by whichever
   each entry point checks first, and the orders differ); the wrapper sentences ("predict()/simulate()
   received …", "fit() reports this as an error rather than panicking") are gone.
-  `predict()`, `simulate()` and `simulate_with_seed()` keep their `Vec` signatures for now
-  and still panic, with exactly that `Err` text as the payload; they become `Result` in a
-  later release. No prediction or simulated row changes. See
+  No prediction or simulated row changes. See
   `docs/warnings.qmd#entry-point-errors`.
 
 - **SAEM default: the MH step scales are now adapted by `scale_adaptation = robbins_monro`

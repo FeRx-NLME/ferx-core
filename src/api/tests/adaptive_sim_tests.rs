@@ -341,11 +341,19 @@ fn hold_all() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
 }
 
 #[test]
-fn degenerate_oracle_matches_static_predict_bit_for_bit() {
+fn degenerate_oracle_matches_static_predict() {
     // A controller that doses at every decision must reproduce the static
     // engine on the same realized schedule. Last obs (54) is the global max
-    // and a dose lands at every decision, so the segment structures align and
-    // agreement is exact (the verifier, on by default, also passes).
+    // and a dose lands at every decision, so the segment structures align
+    // (the verifier, on by default, also passes).
+    //
+    // The assertion below is a **1e-9 relative band, not bit equality** — the name said
+    // `_bit_for_bit` until #1151 measured what it actually pins. On a model-time-reading RHS
+    // the same comparison at default solver tolerances is 1.3e-6 apart from solver noise
+    // alone, so the band is what this fixture can honestly claim. The bit-equality property
+    // does hold for a read taken ON a boundary with no integration in between, and is
+    // asserted there instead:
+    // `degenerate_oracle_tad_rhs_observation_on_a_decision_boundary_is_bit_identical`.
     let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
     let decisions = vec![0.0, 24.0, 48.0];
     let obs = vec![6.0, 30.0, 54.0];
@@ -366,7 +374,7 @@ fn degenerate_oracle_matches_static_predict_bit_for_bit() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     assert_eq!(res.ledger.len(), 3, "a dose at every decision");
@@ -444,7 +452,7 @@ fn adaptive_reset_matches_static_predict() {
     let mut static_subject = subj("1", obs.clone(), static_doses);
     static_subject.reset_times = vec![reset_at];
     let static_pop = population(vec![static_subject]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -515,7 +523,7 @@ fn adaptive_reset_reseeds_init_from_the_reset_rows_covariates() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![with_cov(subj("1", obs.clone(), static_doses))]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -649,7 +657,8 @@ fn adaptive_reset_turns_off_spanning_infusion_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     // Locate the t=42 (post-reset) trajectory and assert it washed out.
@@ -1123,7 +1132,7 @@ fn adaptive_loading_dose_only_matches_static_predict() {
 
     // Static reference: the loading regimen alone, scored by predict() (η=0, IPRED).
     let static_pop = population(vec![subj("1", obs.clone(), loading)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -1211,7 +1220,7 @@ fn adaptive_loading_dose_plus_titration_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
@@ -1252,7 +1261,7 @@ fn adaptive_ss_base_dose_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
@@ -1291,7 +1300,7 @@ fn adaptive_base_infusion_matches_static_predict() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -1407,7 +1416,7 @@ fn adaptive_base_infusion_ending_between_records_matches_static_predict() {
     s2.obs_covariates = cov;
     let mut static_pop = population(vec![s2]);
     static_pop.covariate_names = vec!["CRCL".to_string()];
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
 
     assert_eq!(res.trajectories.len(), preds.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -2200,7 +2209,8 @@ fn adaptive_base_regimen_with_reset_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
 
     assert_eq!(res.trajectories.len(), obs.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
@@ -2283,7 +2293,8 @@ fn adaptive_base_infusion_spanning_reset_is_turned_off() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2353,7 +2364,8 @@ fn adaptive_evid4_reset_plus_dose_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2408,7 +2420,8 @@ fn adaptive_ss_base_dose_with_reset_matches_static_predict() {
         &model,
         &population(vec![static_subject]),
         &model.default_params,
-    );
+    )
+    .unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
@@ -2546,7 +2559,7 @@ fn adaptive_base_dose_coincident_with_decision_is_observed_pre_dose() {
             .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -2630,7 +2643,7 @@ fn adaptive_base_dose_after_controller_stop_still_lands() {
 
     // The base doses (incl. the two past the Stop) are integrated: equals predict() on base.
     let static_pop = population(vec![subj("1", obs.clone(), base)]);
-    let preds = predict(&model, &static_pop, &model.default_params);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
@@ -3004,12 +3017,13 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
 }
 
 #[test]
-fn from_spec_degenerate_oracle_matches_static_predict_bit_for_bit() {
+fn from_spec_degenerate_oracle_matches_static_predict() {
     // The declarative path's degenerate oracle: a block that never titrates
     // re-issues a fixed 100 mg bolus at every decision, so it must reproduce the
     // static engine on that same realized schedule. A dose lands at every
-    // decision and the last obs (54) is the global max ⇒ bit-exact agreement,
-    // and the frozen-replay verifier (on by default) also passes.
+    // decision and the last obs (54) is the global max, and the frozen-replay
+    // verifier (on by default) also passes. Like its programmatic twin above, the
+    // assertion is a 1e-9 relative band, not bit equality (#1151).
     let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
     let spec = parsed
         .adaptive_dosing
@@ -3049,7 +3063,7 @@ fn from_spec_degenerate_oracle_matches_static_predict_bit_for_bit() {
         .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
         .collect();
     let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&parsed.model, &static_pop, &parsed.model.default_params);
+    let preds = predict(&parsed.model, &static_pop, &parsed.model.default_params).unwrap();
     assert_eq!(res.trajectories.len(), preds.len());
     for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(
@@ -4506,4 +4520,1904 @@ fn simulate_adaptive_carries_the_solver_diagnostics_of_its_own_run() {
         "{:?}",
         clean.warnings
     );
+}
+
+// ===================== #1151: a model-time-reading [odes] RHS =====================
+//
+// The #391 degenerate oracle below (`degenerate_oracle_matches_static_predict`) runs on
+// `ODE_NO_IIV`, whose RHS is **autonomous** — so it cannot see the one thing that split the
+// reactive driver from the static engine in #1124: a RHS that reads model time. These are
+// that missing half.
+//
+// The tolerances here are not decoration. Measured at `a6b67de5` on this model, the adaptive
+// driver and `predict()` agree to **rel 8.6e-16** at `ode_reltol = 1e-12 / ode_abstol =
+// 1e-14`, and both sit within 1.7e-13 of the closed form; at DEFAULT solver tolerances they
+// are **1.3e-6** apart — solver noise that reads exactly like an anchoring defect. A fixture
+// at default tolerances could therefore assert nothing sharper than ~1e-5, which a driver
+// whose anchor was a whole segment stale would still pass.
+
+/// 1-cpt IV ODE whose RHS reads `TAD`: `d/dt(central) = -(CL/V)·central·(1 + KT·TAD)`. The
+/// `KT·TAD` factor makes the decay rate depend on time *since the last dose*, so an anchor
+/// taken at the wrong instant (the segment start, the previous dose, a decision that did not
+/// dose) integrates a different forcing and moves the trajectory.
+///
+/// `ETA_CL ~ 1e-10` is declared but unused by `CL`, so a drawn η leaves the trajectory at the
+/// η=0 value and the adaptive IPRED is comparable to the static PRED. The tight solver
+/// tolerances are what let the oracle assert at 1e-12 (see the module note above).
+///
+/// It has an exact closed form — on a segment after a dose at `t_d`, `TAD = t − t_d`, so
+/// `C(t) = C(t_d⁺)·exp(−k[(t−t_d) + κ(t−t_d)²/2])` with `k = CL/V` and `κ = KT`. That is a
+/// **third** reference, outside both engines: `tad_closed_form` below walks it.
+const ODE_TAD_NO_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKT(0.01, 1e-4, 1.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KT = TVKT
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + KT * TAD)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// 1-cpt IV ODE whose RHS reads `TIME` — the **solver axis**, not a dose clock. It is the
+/// control for #1151's refusal: `TIME` is anchored at the origin of the integration and is
+/// finite everywhere, so a dose-free window carries no `NaN` and must NOT be refused. A guard
+/// keyed on `pk_reads_model_time` (which unions `TAD`, `TAFD`, `T`/`TIME`) rejects this model.
+const ODE_TIME_NO_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + 1e-3 * TIME)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// A controller that doses 100 mg into cmt 1 at the listed decision **indices** and holds at
+/// every other one. `fixed_bolus` (dose at every decision) is the `idx = all` instance; the
+/// interesting cells are the ones where a decision passes without a dose.
+fn dose_at_decisions(idx: Vec<usize>) -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+    move |ctx: &ControllerCtx| {
+        if idx.contains(&ctx.decision_index) {
+            vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    }
+}
+
+/// The closed form of `ODE_TAD_NO_IIV`, walked outside both engines (#1151).
+///
+/// The equation is linear in `central` with a decay rate that depends only on `t`, so the
+/// whole compartment shares one factor per dosing interval: on `(t_d, t']` with the anchor at
+/// `t_d`, `C(t') = C(t_d⁺)·exp(−k[(t'−t_d) + κ(t'−t_d)²/2])`. This walks the realized bolus
+/// schedule and reports the state at each requested time. `doses` and `obs` must be sorted
+/// ascending, and every `obs` must be at or after the first dose (before it the closed form
+/// has no anchor either — which is the whole of #1151's refusal). The walk starts at the
+/// first dose or observation, the subject's origin (#936).
+fn tad_closed_form(doses: &[f64], obs: &[f64]) -> Vec<f64> {
+    let k = 5.0 / 50.0;
+    let kappa = 0.01;
+    let decay = |dt: f64| (-k * (dt + kappa * dt * dt / 2.0)).exp();
+
+    let mut points: Vec<f64> = doses.iter().chain(obs.iter()).copied().collect();
+    points.sort_by(f64::total_cmp);
+    points.dedup();
+
+    let mut c = 0.0f64;
+    let mut anchor = f64::NAN;
+    // The walk starts at the first event, not at t=0 (#936): nothing evolves before the
+    // subject's origin, which is its first record or realized dose.
+    let mut prev = points.first().copied().unwrap_or(0.0);
+    let mut out: Vec<f64> = Vec::with_capacity(obs.len());
+    for t in points {
+        if t > prev {
+            assert!(
+                anchor.is_finite(),
+                "the closed form has no anchor before the first dose either (t={t})"
+            );
+            // One factor for the whole compartment: advance from `prev` to `t` under the
+            // anchor in force, as a ratio of the two elapsed-time factors.
+            c = c * decay(t - anchor) / decay(prev - anchor);
+            prev = t;
+        }
+        if doses.contains(&t) {
+            c += 100.0;
+            anchor = t;
+        }
+        if obs.contains(&t) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `(adaptive IPRED, static PRED)` for one degenerate-oracle cell: the controller doses at
+/// `dose_idx`, and the same realized schedule (plus any base regimen) is pre-scheduled through
+/// `predict()`. The frozen-replay verifier runs too (default `verify: true`), so its `Ok` is
+/// part of every caller's assertion.
+fn tad_oracle_cell(
+    src: &str,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    obs: &[f64],
+    base: Vec<DoseEvent>,
+) -> (Vec<f64>, Vec<f64>) {
+    let model = parse_model_string(src).expect("parse model-time-reading ODE model");
+    let pop = population(vec![subj("1", obs.to_vec(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(dose_idx.clone()),
+        &opts,
+    )
+    .expect("adaptive sim runs (the frozen-replay verifier passes too)");
+
+    let mut static_doses = base;
+    for i in &dose_idx {
+        static_doses.push(DoseEvent::new(decisions[*i], 100.0, 1, 0.0, false, 0.0));
+    }
+    static_doses.sort_by(|x, y| x.time.total_cmp(&y.time));
+    let static_pop = population(vec![subj("1", obs.to_vec(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+
+    (
+        res.trajectories.iter().map(|t| t.ipred).collect(),
+        preds.iter().map(|p| p.pred).collect(),
+    )
+}
+
+/// The `Err` from a `simulate_adaptive` run that must be refused (#1151). `verify: false`, so
+/// the error can only come from the driver's own guard — with the verifier on, a `NaN`
+/// trajectory would be caught by the replay instead and the message would be the verifier's.
+fn tad_refusal_error(
+    src: &str,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    obs: &[f64],
+    base: Vec<DoseEvent>,
+) -> String {
+    let model = parse_model_string(src).expect("parse model-time-reading ODE model");
+    let pop = population(vec![subj("1", obs.to_vec(), base)]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        verify: false,
+        ..Default::default()
+    };
+    let err = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(dose_idx.clone()),
+        &opts,
+    )
+    .expect_err("an unanchored dose clock must be refused, not returned as NaN");
+    format!("{err}")
+}
+
+/// Every prediction is finite, with the worst relative gap against `want` reported.
+///
+/// `f64::max` returns the *other* operand on a `NaN`, so folding `worst` over a run that
+/// produced `NaN` would report whatever the finite records produced and pass — the exact hole
+/// AGENTS.md names. The finiteness of both sides is asserted per element, before the fold.
+///
+/// **A zero reference contributes an ABSOLUTE error** (`|got|`), since no relative one exists
+/// there — so a caller's bound is read as absolute for those elements and relative for the
+/// rest, two scales under one constant (#1534 review, nit 4). Every zero element in this file
+/// is an empty compartment before the first dose, and the cells that have one
+/// (`..._base_dose_anchors_the_window_before_the_first_dose`, the two finding-1 controls) pin
+/// it exactly with `assert_eq!(adaptive[0], 0.0)` of their own; this fold is then only
+/// guarding the non-zero elements, which is where the stated bound was measured.
+fn worst_rel(got: &[f64], want: &[f64], what: &str) -> f64 {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mut worst = 0.0f64;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(g.is_finite(), "{what}: got[{i}] = {g} is not finite");
+        assert!(w.is_finite(), "{what}: want[{i}] = {w} is not finite");
+        let rel = if w == 0.0 {
+            g.abs()
+        } else {
+            (g - w).abs() / w.abs()
+        };
+        worst = worst.max(rel);
+    }
+    worst
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_matches_static_predict_and_the_closed_form() {
+    // T1 (#1151). The #391 degenerate oracle on a TAD-reading RHS: a controller re-emitting a
+    // fixed regimen must equal `predict()` on that regimen — and both must equal the closed
+    // form, which is computed outside either engine.
+    //
+    // Mutation that reddens it: anchor the driver's TAD at the FIRST dose
+    // (`earliest_dose_time`, i.e. TAFD semantics) instead of the most recent one. Measured:
+    // kills this test, T2, T3 and T4, plus seven pre-existing `TAD` tests.
+    //
+    // Note what does NOT redden it: anchoring at the segment start (`t_start`). A dose lands
+    // at every decision here and the decisions are the breaks, so the segment start *is* the
+    // last dose time and that mutation is invisible to this cell — measured, it kills only
+    // the hold cell below. That asymmetry is why T2 exists.
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = [6.0, 30.0, 54.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1, 2], &obs, vec![]);
+    let closed = tad_closed_form(&decisions, &obs);
+
+    // Measured at `a6b67de5`: 8.6e-16 against `predict()`, 1.4e-13 against the closed form.
+    // The bounds carry three orders of headroom over each.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "adaptive vs predict(): worst rel {vs_static:e} > 1e-12 \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+    let vs_closed = worst_rel(&adaptive, &closed, "adaptive vs closed form");
+    assert!(
+        vs_closed <= 1e-10,
+        "adaptive vs closed form: worst rel {vs_closed:e} > 1e-10 \
+         (adaptive={adaptive:?}, closed={closed:?})"
+    );
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_holds_do_not_move_the_anchor() {
+    // T2 (#1151). Decisions at 0/12/24/36, doses only at 0 and 24 — so two decisions pass
+    // with no dose. `TAD` must stay anchored at the last DOSE across them.
+    //
+    // Mutation that reddens it: advance the anchor at every break — `tad_anchor(...)` replaced
+    // by `t_start` — so a decision that did not dose moves it. The obs at 30 and 45 sit in the
+    // window opened at 24; at 45 the mutated anchor would be 36, understating the elapsed time
+    // by 12 h. Measured: this cell is the only one of the four oracle cells that mutation
+    // kills, because it is the only one with a break that is not a dose.
+    let decisions = [0.0, 12.0, 24.0, 36.0];
+    let obs = [6.0, 30.0, 45.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 2], &obs, vec![]);
+    let closed = tad_closed_form(&[0.0, 24.0], &obs);
+
+    // Measured: 4.2e-15 against `predict()`, 4.5e-14 against the closed form.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "adaptive vs predict() across two hold decisions: worst rel {vs_static:e} > 1e-12 \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+    let vs_closed = worst_rel(&adaptive, &closed, "adaptive vs closed form");
+    assert!(
+        vs_closed <= 1e-10,
+        "adaptive vs closed form across two hold decisions: worst rel {vs_closed:e} > 1e-10 \
+         (adaptive={adaptive:?}, closed={closed:?})"
+    );
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_observation_on_a_decision_boundary_is_bit_identical() {
+    // T3 (#1151). An observation lands exactly ON a decision that doses: the read is taken
+    // post-dose at the segment's left boundary, so it is a pure state readout with no
+    // integration between the dose and the read — and the two engines must agree to the BIT,
+    // not to a tolerance.
+    //
+    // Mutation that reddens it: take the boundary read from the pre-dose side, or off the
+    // previous segment's integration. Either moves the value by the whole 100 mg bolus.
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = [24.0, 48.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1, 2], &obs, vec![]);
+
+    for (i, (&a, &s)) in adaptive.iter().zip(static_pred.iter()).enumerate() {
+        assert!(a.is_finite(), "adaptive[{i}] = {a} is not finite");
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "observation on a decision boundary must be bit-identical: \
+             adaptive={a} static={s} at t={}",
+            obs[i]
+        );
+    }
+}
+
+#[test]
+fn adaptive_tad_rhs_base_dose_anchors_the_window_before_the_first_dose() {
+    // T4 (#1151) — and message-table row 3's silence check. A pre-scheduled base dose at
+    // t=10 is known to the driver up front, so `tad_anchor_for`'s first-arrival fallback gives
+    // the pre-dose window a FINITE (negative) `TAD`, exactly as `predict()` does. The window
+    // must not be refused, and the run must match the static engine.
+    //
+    // The read at t=6 is in that pre-dose window and is 0.0 — its job is to pin "not NaN",
+    // since `0.0 * NaN` is what poisons the unanchored case.
+    //
+    // **This cell is degenerate for the anchor VALUE** (#1534 review round 3, finding F), and
+    // the twin below is what is not. `central ≡ 0` on `(0, 10]`, so every anchor gives a zero
+    // derivative there and the window's `TAD` cannot move anything. Measured with a
+    // driver-only mis-anchor — the real `integrate_segment` call forced to `Some(t_start)`
+    // whenever the shadow has no dose at or before `t_start`, leaving `predict()` untouched —
+    // this test stays GREEN at `[0.0, 79.07598442448013, 74.71656464518534]`. So what it pins
+    // is the refusal's scope (a base dose silences it), not the anchoring itself.
+    //
+    // Mutation that reddens it: make the refusal fire whenever an observation precedes the
+    // first REALIZED dose, ignoring base doses.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let base = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1], &obs, base);
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // Measured: 1.5e-15.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "a base-dose-anchored pre-dose window must match predict(): worst rel \
+         {vs_static:e} > 1e-12 (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+/// T4's twin with a **non-zero starting state**, so the value of the base-dose anchor is
+/// observable (#1534 review round 3, finding F). `ODE_TAD_NO_IIV`'s compartment is empty until
+/// the first dose, which makes every anchor give the same zero derivative in the pre-dose
+/// window; here the window integrates a real decay under a real `TAD`, so a mis-anchored
+/// window moves the trajectory.
+const ODE_TAD_INIT50: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKT(0.01, 1e-4, 1.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KT = TVKT
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central * (1.0 + KT * TAD)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_tad_rhs_base_dose_anchor_value_matches_the_static_engine() {
+    // T4's non-degenerate twin (#1534 review round 3, finding F). Same shape as T4 — a
+    // pre-scheduled base dose at t=10, controller doses at 12 and 36, a read at t=6 inside the
+    // pre-dose window — but the compartment starts at 50, so the window integrates under a
+    // real (negative) `TAD` and the anchor's VALUE reaches the trajectory.
+    //
+    // Mutation that reddens it: a driver-only mis-anchor — force the real `integrate_segment`
+    // call to `Some(t_start)` whenever the shadow has no dose at or before `t_start`, which
+    // leaves `predict()` alone. Measured: 26.95107015382148 against 28.617631257835207 at t=6,
+    // and the frozen-replay verifier catches it too. T4 itself stays green under that same
+    // mutation, which is why this twin exists.
+    let decisions = [12.0, 36.0];
+    let obs = [0.0, 6.0, 20.0, 40.0];
+    let base = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_INIT50, &decisions, vec![0, 1], &obs, base);
+
+    // The read at t=0 is the `init` baseline, before anything has happened.
+    assert_eq!(adaptive[0], 50.0, "init(central) = 50: {adaptive:?}");
+    // The read at t=6 is inside the base-dose-anchored window and is NOT zero — that is the
+    // whole point of the twin. Measured 28.617631257835207.
+    assert!(
+        adaptive[1] > 20.0 && adaptive[1] < 40.0,
+        "the pre-dose read must carry the window's integration, not sit at zero: {adaptive:?}"
+    );
+    // Measured worst rel: 8.1e-16.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "a base-dose-anchored pre-dose window must match predict() in VALUE, not only in \
+         finiteness: worst rel {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
+    // T5 (#1151). Dose-free base, first dose realized at the decision at t=12, an observation
+    // at t=6 inside the unanchored window. `TAD` has no referent there in a causal run, and
+    // the driver must say so rather than integrate `0.0 * NaN`.
+    //
+    // Mutation that reddens it: delete the guard — the call then returns `Ok` with
+    // `[NaN, NaN, NaN]` (measured at `a6b67de5`), with no warning naming `TAD`.
+    //
+    // Every sentence of the message is asserted below, so deleting any one of them reddens
+    // this test (AGENTS.md: a sentence no test can kill is a claim nobody has checked).
+    //
+    // #936: the obs at 6 is the subject's first record, so it is the origin and is read at
+    // the refused segment's LEFT boundary (a finite `init` read); the obs at 9 is the one
+    // read off the segment, which sentence 2 names.
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 9.0, 20.0, 40.0],
+        vec![],
+    );
+
+    // Sentence 1 — the two observed facts, and the window they were observed on.
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("integrated to a non-finite state"),
+        "must report the outcome it actually observed: {err}"
+    );
+    assert!(
+        err.contains("no dose has been given in this run"),
+        "must say why the clock is unanchored: {err}"
+    );
+    // #936: the window opens at the subject's first record (t=6), not at t=0 — nothing is
+    // integrated before the origin.
+    assert!(
+        err.contains("(6, 12]"),
+        "must name the refused window: {err}"
+    );
+    // Sentence 2 — which read is affected.
+    assert!(
+        err.contains("The observation at t=9 is read off that segment"),
+        "must name the observation in the window: {err}"
+    );
+    // Sentence 3 — why the static engines' answer is not copied. The leading condition is
+    // load-bearing: on a record with no dose at all, `predict()` returns NaN here too, which
+    // `adaptive_tad_rhs_refuses_when_the_controller_never_doses` pins.
+    assert!(
+        err.contains("Where the record contains a dose"),
+        "the anchoring claim must be conditional on the record carrying a dose: {err}"
+    );
+    assert!(
+        err.contains("not decided yet, and may never decide"),
+        "must say the anchoring dose is undecided, and may never be decided: {err}"
+    );
+    // Sentence 4 — the fixes, and the case neither fix covers.
+    assert!(
+        err.contains("pre-scheduled base regimen"),
+        "must offer the base-regimen fix: {err}"
+    );
+    assert!(
+        err.contains("dose at a decision at or before the subject's first record"),
+        "must offer the earlier-decision fix: {err}"
+    );
+    assert!(
+        !err.contains("start of the horizon"),
+        "#936: the origin is the first record, not t=0 — the old wording no longer holds: {err}"
+    );
+    assert!(
+        err.contains("a controller that never doses leaves a model reading `TAD` unanchored"),
+        "must name the never-dosing case, which neither fix addresses: {err}"
+    );
+    // The must-nots: the model is fine and the controller is not at fault.
+    assert!(
+        !err.contains("unsupported"),
+        "the model is supported — only this window is refused: {err}"
+    );
+
+    // #936: the advice must be TRUE. Applied literally — a controller dose at a decision at
+    // the subject's first record (t=6) — the window disappears and the run is valid, equal to
+    // `predict()` (`tad_oracle_cell` expects `Ok`, with the verifier on).
+    let (fixed, fixed_static) = tad_oracle_cell(
+        ODE_TAD_NO_IIV,
+        &[6.0, 12.0, 36.0],
+        vec![0, 1, 2],
+        &[6.0, 9.0, 20.0, 40.0],
+        vec![],
+    );
+    let vs_static = worst_rel(
+        &fixed,
+        &fixed_static,
+        "advice applied: adaptive vs predict()",
+    );
+    assert!(
+        vs_static <= 1e-12,
+        "with the advice applied the run must match predict(): worst rel {vs_static:e}"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refusal_tracks_the_first_dose_not_the_first_decision() {
+    // T6 (#1151), cell 8. The first decision is at t=0 and HOLDS; the dose lands at the
+    // second, t=24. The window `(0, 24]` is therefore after the run's start AND after the
+    // first decision, yet still before any dose — so it must be refused, and the message must
+    // name that window, not `(0, 12]`-style "before the first decision".
+    //
+    // Mutation that reddens it: key the guard on the decision schedule — run it only while
+    // `t_end <= decision_times[0]`. That still refuses T5's window `(0, 12]` (whose `t_end` is
+    // the first decision) but lets this one through, returning NaN. Measured: it kills this
+    // test and nothing else.
+    //
+    // Since #936 the walk integrates nothing before the origin — here the first record, t=10,
+    // since the hold at t=0 issues no dose — so the refused window is `(10, 24]`. Unanchored
+    // segments are a prefix of the integrated walk (a dose is only ever appended), so the
+    // first refused segment always starts at the origin; this test pins the `t_end` side,
+    // which is the half that can differ.
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[0.0, 24.0],
+        vec![1],
+        &[10.0, 15.0, 30.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(10, 24]"),
+        "the refused window runs from the origin (first record, 10) to the first DOSE (24), \
+         not to the first decision (0): {err}"
+    );
+    assert!(
+        err.contains("The observation at t=15 is read off that segment"),
+        "must name the observation inside that window: {err}"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_dose_free_base_with_every_record_after_the_first_dose_is_valid() {
+    // #936 converts #1151's `..._refuses_a_dose_free_window_with_no_observation_in_it`. That
+    // cell (dose-free base, obs 20/40, first dose at the decision at 12) was refused because
+    // the driver integrated `(0, 12]` from a hard-coded t=0 with no dose clock. But the
+    // subject's first event is the realized dose at 12 — the origin the static engine starts
+    // at — so no window precedes it and the run is valid: `Ok`, equal to `predict()` on the
+    // realized ledger and to the closed form. The #1151 refusal for a window that DOES precede
+    // the first dose is still pinned by `adaptive_tad_rhs_refuses_the_window_before_the_first_dose`
+    // (the same cell with an obs at 6).
+    //
+    // Mutation that reddens it: revert the driver's break seed to `0.0` (the walk then
+    // integrates `(0, 12]` under a `NaN` clock and the run is refused again).
+    let decisions = [12.0, 36.0];
+    let obs = [20.0, 40.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1], &obs, vec![]);
+    let closed = tad_closed_form(&decisions, &obs);
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "adaptive vs predict(): worst rel {vs_static:e} (adaptive={adaptive:?}, \
+         static={static_pred:?})"
+    );
+    let vs_closed = worst_rel(&adaptive, &closed, "adaptive vs closed form");
+    assert!(
+        vs_closed <= 1e-10,
+        "adaptive vs closed form: worst rel {vs_closed:e} (adaptive={adaptive:?}, \
+         closed={closed:?})"
+    );
+}
+
+#[test]
+fn adaptive_tafd_rhs_refuses_the_window_before_the_first_dose() {
+    // T7 (#1151). The same defect on `TAFD`, on the file's existing TAFD fixture — whose
+    // working case (`adaptive_base_regimen_controller_dose_before_base_anchors_tafd_globally`)
+    // carries a base regimen and is T4's shape. The message must name `TAFD`, the spelling
+    // that is actually unanchored.
+    //
+    // Mutation that reddens it: key the guard on `TAD` alone. `ODE_TAFD`'s RHS never reads
+    // `TAD`, so the run returns `Ok` with `[NaN, NaN, NaN]` (measured).
+    let err = tad_refusal_error(
+        ODE_TAFD,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAFD`"), "must name TAFD: {err}");
+    assert!(
+        !err.contains("`TAD`"),
+        "TAD is anchored here — it is not the unanchored slot: {err}"
+    );
+    assert!(
+        err.contains("(6, 12]"),
+        "must name the refused window: {err}"
+    );
+}
+
+#[test]
+fn adaptive_time_reading_rhs_is_not_refused_before_the_first_dose() {
+    // #1151, message-table row 6 — the over-refusal control. `TIME` is the integration axis,
+    // not a dose clock: it is finite in the pre-dose window, so a dose-free run on a
+    // TIME-reading RHS integrates correctly and must be left alone.
+    //
+    // Mutation that reddens it: key the guard on `pk_reads_model_time()` — which unions `TAD`,
+    // `TAFD` and `T`/`TIME` — AND drop the outcome conjunct. As with the autonomous control
+    // below, after the #1534 review moved the guard after the solve neither half alone
+    // suffices: this cell's state stays finite. Before that move, the `pk_reads_model_time()`
+    // mutation alone killed this test, which is how the per-spelling split was pinned.
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TIME_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    // Default solver tolerances on this fixture (the point is the absence of a refusal, not a
+    // sharp oracle), so the bound is the two engines' measured noise floor: worst rel 5.2e-7.
+    //
+    // And note what it cannot see (#1534 review round 3, finding F): the first read is at t=6
+    // and `central ≡ 0` before the first dose, so the agreement below confirms "not `NaN`",
+    // never the value `TIME` took in the pre-dose window. Anything that changes only that
+    // value — #936's integration origin, for one — is invisible here.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-5,
+        "a TIME-reading RHS must run, and agree with predict(): worst rel {vs_static:e} \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
+    // #1151, message-table row 5 — the other over-refusal control. `ODE_NO_IIV`'s RHS reads no
+    // clock at all, so a dose-free window is ordinary integration of an empty compartment.
+    //
+    // Mutation that reddens it: drop the `rhs_program` spelling checks AND the outcome
+    // conjunct — i.e. refuse on the `NaN` anchor alone, which is `NaN` here too, simply never
+    // read. Measured after the #1534 review moved the guard after the solve, neither half
+    // alone is enough: this cell's state stays finite, so the outcome conjunct already blocks
+    // the refusal, and the spelling check alone already did before it. That redundancy is
+    // deliberate — it is the "belt" a future narrowing of either half would land on — but it
+    // means this test's guarantee is "a working run keeps working", not a single-mutation kill.
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    // Measured worst rel: 0e0 — the two engines are BIT-identical here, so the bound is bit
+    // equality rather than a band whose every order would be decoration (#1534 review,
+    // finding 3). Structural, not luck: the autonomous RHS is the same function on both
+    // sides, and the two walks share a break set (doses 12/36 are the driver's decisions, and
+    // `t_last = 40` on both), so the step sequences coincide. The same argument as T3.
+    for (i, (&a, &s)) in adaptive.iter().zip(static_pred.iter()).enumerate() {
+        assert!(a.is_finite(), "adaptive[{i}] = {a} is not finite");
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "an autonomous RHS must run unrefused, and match predict() exactly: \
+             adaptive={adaptive:?}, static={static_pred:?}"
+        );
+    }
+}
+
+// ============ #1534 review, finding 1: a SYNTACTIC TAD read is not a TAD evaluation ============
+//
+// `OdeRhsProgram::pk_reads_tad()` is `stmts_read_slots`, which recurses into `if` arms and into
+// conditions. It is therefore true whenever `TAD` appears anywhere in the `[odes]` body —
+// including where the unanchored window never evaluates it. The two fixtures below are those
+// shapes. Before the guard was moved after `integrate_segment`, both were refused although each
+// returns a finite trajectory (and passes the frozen-replay verifier) with the guard removed.
+
+/// `TAD` read only inside a branch the unanchored window does not take. Over `(0, 12]` the
+/// `TIME > 20` test is false, so the else arm integrates and the `NaN` anchor never reaches the
+/// state; the `TAD` term switches on only at t=20, by which point the dose at 12 has anchored it.
+/// Tight solver tolerances, like the rest of the #1151 block, so the cell is an oracle and not
+/// only a non-refusal smoke test (#1534 review round 2).
+const ODE_TAD_IN_UNTAKEN_BRANCH: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  if (TIME > 20.0) {
+    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)
+  } else {
+    d/dt(central) = -(CL / V) * central
+  }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// `TAD` read only in a *condition*. `NaN > 5.0` is `false` (IEEE: every comparison against NaN
+/// is false, verified by this test's green run, not recalled), so the unanchored window takes the
+/// else arm and nothing non-finite reaches the state — while `pk_reads_tad()` is still true.
+///
+/// **The `NaN` still chose the arm.** This fixture agrees with `predict()` only because
+/// `central ≡ 0` on `(0, 12]`, where both arms give a zero derivative, so which one ran cannot
+/// show. Flip the inequality and give the compartment a non-zero start and the two engines
+/// diverge — that is `ODE_TAD_IN_A_COMPARISON` and row 8b of the message table. So this cell
+/// pins "a condition read is not refused"; it does NOT pin "a condition read is harmless"
+/// (#1534 review round 2, finding B, correcting round 1's reading).
+const ODE_TAD_IN_CONDITION_ONLY: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  if (TAD > 5.0) { d/dt(central) = -(CL / V) * central * 2.0 }
+  else           { d/dt(central) = -(CL / V) * central }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_tad_in_an_untaken_branch_is_not_refused() {
+    // #1534 review, finding 1. Dose-free base, first dose realized at t=12 — the same schedule
+    // T5 refuses — but this RHS only evaluates `TAD` after t=20, when the clock is anchored.
+    // The run must complete and match `predict()` on the realized schedule.
+    //
+    // Mutation that reddens it: move the guard back before `integrate_segment` (equivalently,
+    // drop its `u.iter().all(is_finite)` conjunct). The run is then refused, although the
+    // trajectory it would have produced is finite and verifier-clean.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TAD_IN_UNTAKEN_BRANCH,
+        &decisions,
+        vec![0, 1],
+        &obs,
+        vec![],
+    );
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // At the fixture's tight tolerances, measured worst rel 6.7e-15 — so this is an oracle
+    // cell, not a non-refusal smoke test (#1534 review round 2). At DEFAULT tolerances the
+    // same comparison reads 1.937e-4, because the RHS steps across a discontinuity at t=20
+    // that neither engine breaks on; that number is the solver's, not the driver's.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "a TAD read in an untaken branch must run, and track predict(): worst rel \
+         {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_read_only_in_a_condition_is_not_refused() {
+    // #1534 review, finding 1. Here `TAD` reaches nothing but a comparison. In the unanchored
+    // window the driver tests `NaN > 5.0` and the static engine tests `-6 > 5.0`; both are
+    // false, both take the else arm, and the two agree — the `NaN` is consumed by the predicate
+    // and never enters the state.
+    //
+    // Mutation that reddens it: the same one as the test above.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TAD_IN_CONDITION_ONLY,
+        &decisions,
+        vec![0, 1],
+        &obs,
+        vec![],
+    );
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // Tight tolerances; measured worst rel 4.183e-16. At DEFAULT tolerances the same comparison
+    // reads 4.750e-8, the two engines' noise across the arm switch at TAD = 5.
+    //
+    // Read the fixture's doc comment before trusting this agreement: it is degenerate. Both
+    // arms give a zero derivative on `central ≡ 0`, so equality here does not say the arm
+    // choice was right — `adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier`
+    // is the cell where it shows.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "a TAD read confined to a condition must run, and track predict(): worst rel \
+         {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_when_the_controller_never_doses() {
+    // #1534 review, finding 2 — message-table row 7, the cell the first six rows all assumed
+    // away. Every decision holds, so no dose is ever given and the clock is never anchored.
+    //
+    // The refusal is right, but two of the message's claims are only true BECAUSE they are
+    // stated conditionally, and this test is what pins that:
+    //
+    //   * `predict()` on the very same record returns `[0.0, NaN, NaN]` — measured below rather
+    //     than asserted from the doc comment. So "the static engines anchor such a window at
+    //     the first dose in the whole record" is FALSE here; the message says "Where the record
+    //     contains a dose, …", and that qualifier is load-bearing.
+    //   * "has not been decided yet" would imply a dose is coming. None is. The message says
+    //     "not decided yet, and may never decide".
+    //
+    // The driver cannot distinguish the two cases: the guard fires on the FIRST segment, before
+    // any decision has been observed. So the repair is in the wording, and this test asserts the
+    // wording holds on the cell that falsifies the unconditional version.
+    //
+    // Mutation that reddens it: restore either unconditional sentence.
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[12.0, 36.0],
+        vec![],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("Where the record contains a dose"),
+        "the anchoring claim must be conditional — this record has no dose at all: {err}"
+    );
+    assert!(
+        err.contains("not decided yet, and may never decide"),
+        "must not imply a dose is still coming: {err}"
+    );
+    assert!(
+        err.contains("a controller that never doses leaves a model reading `TAD` unanchored"),
+        "must name this very case: {err}"
+    );
+
+    // The measurement the conditional rests on: the static engine has no anchor here either.
+    let model = parse_model_string(ODE_TAD_NO_IIV).expect("parse TAD-reading ODE model");
+    let static_pop = population(vec![subj("1", vec![6.0, 20.0, 40.0], vec![])]);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+    let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
+    assert_eq!(
+        static_pred[0], 0.0,
+        "the t=0 read is the empty compartment: {static_pred:?}"
+    );
+    assert!(
+        static_pred[1..].iter().all(|v| v.is_nan()),
+        "predict() has no anchor on a dose-free record either, so the message must not claim \
+         it does: {static_pred:?}"
+    );
+}
+
+// ============ #1534 review round 2: what the outcome gate must and must not claim ============
+
+/// `TAD` mentioned only in a branch the unanchored window does not take, PLUS a second state
+/// that diverges for its own reasons (`X' = 0.5·X²` from `X(0) = 1` blows up at t = 2).
+///
+/// Every conjunct of the pre-causation guard held on this model — the segment's state came
+/// back non-finite (in `X`), the `TAD` slot was `NaN`, and `pk_reads_tad()` was true — while
+/// the `TAD` line never ran and `central` was finite throughout. It is the false positive the
+/// counterfactual re-solve exists to remove.
+const ODE_TAD_PLUS_DIVERGENT_STATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, X])
+[odes]
+  init(X) = 1.0
+  if (TIME > 20.0) {
+    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)
+  } else {
+    d/dt(central) = -(CL / V) * central
+  }
+  d/dt(X) = 0.5 * X * X
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `TAD` consumed by a **comparison**, with a non-zero starting state so the arm it chooses is
+/// observable. `NaN < 5.0` is false, so the unanchored window silently takes the else arm; the
+/// state stays finite and the guard never fires. `min`/`max` desugar to the same shape
+/// (`if (a <= b) …`), so `min(TAD, 24)` yields 24 there by the same route.
+///
+/// `init(central) = 50` and an observation at t=0 are both load-bearing. Without the non-zero
+/// start the pre-dose window is identically zero and both arms give a zero derivative, so the
+/// choice cannot show — that degeneracy is why round 1 mis-read this class as harmless. Without
+/// the t=0 observation the static engine starts integrating at the first scored record, which
+/// is #936 and a different confound.
+const ODE_TAD_IN_A_COMPARISON: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }
+  else           { d/dt(central) = -(CL / V) * central }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// The autonomous control for the fixture above: same `init`, same schedule, no clock anywhere.
+/// It agrees with `predict()` exactly, which is what makes the divergence below attributable to
+/// `TAD` rather than to the non-zero start or to #936's integration origin.
+const ODE_INIT50_AUTONOMOUS: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
+    // #1534 review round 2 (finding A), corrected in round 3 (finding C). A compartment that
+    // blows up on its own, on a model that merely *mentions* `TAD` in a branch the unanchored
+    // window does not take. At `68c9f5c0`, before the causation conjunct: `Err` naming `TAD`,
+    // and the advice it gave was actively harmful — adding a base dose silences the message
+    // while `X` stays just as divergent.
+    //
+    // **What this test can and cannot assert.** Round 2 called this "a run that works" and
+    // pinned `worst_rel(adaptive, predict()) <= 1e-9`. That bound held for a reason neither
+    // engine should be proud of: once any state goes non-finite the solve stops advancing
+    // *every* state, so `central` freezes at its post-dose value and BOTH engines report the
+    // frozen number. Measured with `predict()` alone on the autonomous twin of this model
+    // (one dose of 100 at t=12, obs at 1/20/40): `[0.0, 99.99999999935972,
+    // 99.99999999935972]`, against `[0.0, 44.93327596489944, 6.081716633303086]` for the
+    // `X' = 0·X` control, which is what the closed form gives. That is an engine defect
+    // (#1539), not something this guard fixes, and the frozen-replay verifier cannot see it
+    // either, because the two engines share the solver.
+    //
+    // So this test asserts only what it can honestly see: **this guard does not refuse the
+    // run, and no error names the dose clock**. It deliberately does NOT assert that the
+    // numbers are right — they are not — and it does not pin agreement with `predict()`,
+    // which would lock in the frozen output as if it were correct.
+    //
+    // Mutation that reddens it: drop the `resolve_with_finite_clock` conjunct from
+    // `unanchored_dose_clock_error`.
+    let model =
+        parse_model_string(ODE_TAD_PLUS_DIVERGENT_STATE).expect("parse divergent-state model");
+    let obs = vec![0.0, 6.0, 20.0, 40.0];
+    let decisions = vec![12.0, 36.0];
+    let pop = population(vec![subj("1", obs, vec![])]);
+
+    for verify in [false, true] {
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: decisions.clone(),
+            verify,
+            ..Default::default()
+        };
+        match simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            || dose_at_decisions(vec![0, 1]),
+            &opts,
+        ) {
+            // Measured (`verify: false` and `verify: true` alike):
+            // `[0.0, 0.0, 99.99999999935972, 199.99999999807915]`. Finite, frozen and wrong —
+            // see #1539. The value at t=20 should be ~44.93, as the control above shows.
+            Ok(_) => {}
+            Err(e) => {
+                let e = format!("{e}");
+                panic!(
+                    "a divergence in a compartment that never evaluates TAD must not be \
+                     refused by this guard (verify={verify}): {e}"
+                );
+            }
+        }
+    }
+
+    // And the negative half, stated separately so it cannot pass by the run simply erroring:
+    // whatever this model does, no message may name the dose clock for it.
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions,
+        verify: false,
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(vec![0, 1]),
+        &opts,
+    );
+    if let Err(e) = res {
+        let e = format!("{e}");
+        assert!(
+            !e.contains("has no referent"),
+            "the dose clock is not the cause here and must not be named: {e}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier() {
+    // #1534 review round 2, finding B — message-table row 8b, and the honest statement of what
+    // this guard does NOT cover.
+    //
+    // The unanchored `NaN` never reaches the state here: it is consumed by `TAD < 5.0`, which
+    // is false, so the else arm runs. The state stays finite, the outcome conjunct blocks the
+    // refusal, and the run returns a number that depends on which way the comparison fell —
+    // measured [50, 27.44…, 19.02…, 31.28…] against `predict()`'s [50, 8.26…, 16.76…, 31.14…].
+    // The default-on frozen-replay verifier is the one net that catches it, and it reports the
+    // divergence as a symptom without naming the clock.
+    //
+    // The decision to accept that (rather than gate on evaluation, which would need a
+    // per-segment "slot was loaded" flag in the RHS evaluator) is recorded in the docs page
+    // and filed as a follow-up; this test is what stops the behaviour changing silently.
+    //
+    // Mutations that redden it: make the guard fire on this shape (then the `verify: false`
+    // arm errors); or drop the verifier's divergence check (then the `verify: true` arm
+    // returns `Ok`).
+    let model = parse_model_string(ODE_TAD_IN_A_COMPARISON).expect("parse comparison-TAD model");
+    let obs = vec![0.0, 6.0, 20.0, 40.0];
+    let decisions = vec![12.0, 36.0];
+
+    // The control first: the same fixture with the clock removed agrees with `predict()`
+    // exactly, so nothing below is an artifact of `init(central) = 50` or of where the static
+    // engine starts integrating (#936).
+    let (control, control_static) =
+        tad_oracle_cell(ODE_INIT50_AUTONOMOUS, &decisions, vec![0, 1], &obs, vec![]);
+    for (i, (&a, &s)) in control.iter().zip(control_static.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "autonomous control must agree exactly at obs {i}: {control:?} vs {control_static:?}"
+        );
+    }
+
+    // `verify: false` — silent, and wrong.
+    let pop = population(vec![subj("1", obs.clone(), vec![])]);
+    let quiet = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.clone(),
+        verify: false,
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(vec![0, 1]),
+        &quiet,
+    )
+    .expect("with the verifier off, a comparison-consumed NaN is not refused");
+    let adaptive: Vec<f64> = res.trajectories.iter().map(|t| t.ipred).collect();
+    assert!(
+        adaptive.iter().all(|v| v.is_finite()),
+        "the state stays finite — that is the whole point of this cell: {adaptive:?}"
+    );
+
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+    let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
+    // Measured 27.440581804704640 vs 8.264944411082405 at t=6 — a factor of 3.3, not a
+    // tolerance question. Asserting the DIVERGENCE (not a bound) is what keeps this test
+    // honest: it exists to record that the two engines disagree here.
+    let gap = (adaptive[1] - static_pred[1]).abs() / static_pred[1].abs();
+    assert!(
+        gap > 1.0,
+        "the arm the NaN comparison chose must visibly differ from predict()'s: \
+         adaptive={adaptive:?}, static={static_pred:?} (rel gap {gap:e})"
+    );
+
+    // `verify: true` (the default) — the divergence is caught, as a symptom.
+    let verified = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions,
+        ..Default::default()
+    };
+    let err = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(vec![0, 1]),
+        &verified,
+    )
+    .expect_err("the frozen-replay verifier must catch what this guard cannot");
+    let err = format!("{err}");
+    assert!(
+        err.contains("frozen-schedule replay verification failed"),
+        "the net here is the verifier, not the dose-clock guard: {err}"
+    );
+    assert!(
+        !err.contains("has no referent"),
+        "this shape is outside the guard's reach — it must not claim the credit: {err}"
+    );
+}
+
+/// Finite where `predict()` evaluates the clock (pre-dose `TAD` ≤ 0), overflowing where the
+/// `t_start` stand-in puts it (`TAD ∈ [0, L]` for a window of length `L`). With a long
+/// pre-treatment baseline, `exp(TAD)` is the cheapest spelling of a class that is not
+/// contrived: any RHS whose clock term is bounded going backwards and not forwards.
+const ODE_EXP_TAD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + 1e-12 * exp(TAD))
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// Two causes in one segment: a genuine arithmetic `TAD` read in `central`, and a second state
+/// that runs away on its own. A whole-state finiteness test on the counterfactual clears the
+/// clock here — `X` is still `inf` under any anchor — although `TAD` is one of the two causes.
+const ODE_TAD_AND_DIVERGENT_STATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, X])
+[odes]
+  init(X) = 1.0
+  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)
+  d/dt(X) = 0.5 * X * X
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survives() {
+    // #1534 review round 3, finding D1 — why the causation check needs TWO stand-ins.
+    //
+    // The refusal asks a counterfactual: would this segment be finite with the clock anchored?
+    // The anchor it substitutes is not neutral. `t_start` puts `TAD` in `[0, L]`, and `L` here
+    // is 800 h — longer than any `TAD` this model sees after a dose, and the opposite sign
+    // from `predict()`, whose pre-dose `TAD` is ≤ 0. `exp(800)` overflows, so with only that
+    // stand-in the counterfactual diverged too and the clock was cleared: measured at
+    // `62b9a6ef`, `verify: false` returned `Ok([NaN, NaN])` and the default verifier gave its
+    // symptom message (`reactive=NaN, static=54.881163607201266`).
+    //
+    // `t_end` puts `TAD` in `[-L, 0]`, the static convention's own sign, and repairs it. A
+    // second stand-in cannot add a false positive: a different anchor can only repair the
+    // state if the clock was load-bearing.
+    //
+    // Mutation that reddens it: drop the `t_end` stand-in.
+    //
+    // #936: the record at t=0 is what makes `(0, L]` a real pre-dose window. Without it the
+    // subject's first event is the dose at L itself, the run's origin, and nothing is
+    // integrated before it — the run is then valid, not refused.
+    let err = tad_refusal_error(
+        ODE_EXP_TAD,
+        &[800.0, 812.0],
+        vec![0, 1],
+        &[0.0, 806.0, 820.0],
+        vec![],
+    );
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 800]"),
+        "must name the refused window: {err}"
+    );
+
+    // The straddle control: the SAME model over a 600 h window is refused by the `t_start`
+    // stand-in alone (`exp(600)` is finite), so the pair above is not a tautology — it is the
+    // window length that moves the cell across the boundary.
+    let control = tad_refusal_error(
+        ODE_EXP_TAD,
+        &[600.0, 612.0],
+        vec![0, 1],
+        &[0.0, 606.0, 620.0],
+        vec![],
+    );
+    assert!(
+        control.contains("(0, 600]"),
+        "the shorter window must be refused too: {control}"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_when_the_clock_is_one_of_two_causes() {
+    // #1534 review round 3, finding D2 — why the counterfactual is compared component by
+    // component. `central` reads `TAD` arithmetically and breaks because of it; `X` runs away
+    // on its own and is non-finite under every anchor. A whole-state finiteness test on the
+    // counterfactual therefore says "still broken, not the clock's fault" and goes silent,
+    // although the clock IS one of the two causes: measured at `62b9a6ef`, `verify: false`
+    // returned `Ok([0.0, NaN, NaN, NaN])`.
+    //
+    // Comparing per component asks the right question — did some state that broke here come
+    // back? — and `central` does.
+    //
+    // Mutation that reddens it: compare the counterfactual as a whole state.
+    let err = tad_refusal_error(
+        ODE_TAD_AND_DIVERGENT_STATE,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[0.0, 6.0, 20.0, 40.0],
+        vec![],
+    );
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+    assert!(
+        err.contains("The observation at t=6 is read off that segment"),
+        "must name the read in the window: {err}"
+    );
+}
+
+/// The mirror of `ODE_EXP_TAD`: `exp(-TAD)` is bounded where the `t_start` stand-in puts the
+/// clock (`TAD ∈ [0, L]` ⇒ the term is ≤ 1) and overflows where `t_end` puts it
+/// (`TAD ∈ [-L, 0]` ⇒ `exp(L)`). The two fixtures together are why the causation check runs
+/// BOTH stand-ins: each one alone is defeated by one of them.
+const ODE_EXP_NEG_TAD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + 1e-12 * exp(0.0 - TAD))
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_tad_rhs_refuses_a_long_window_whose_clock_term_survives_only_forwards() {
+    // #1534 review round 3, finding D1 — the OTHER half of the straddle, and the reason both
+    // stand-ins are kept.
+    //
+    // `..._longer_than_the_clock_survives` uses `exp(TAD)`, which the `t_start` stand-in
+    // (`TAD ∈ [0, 800]`) overflows and `t_end` (`TAD ∈ [-800, 0]`) survives. This fixture is
+    // its mirror, `exp(-TAD)`: `t_start` survives it and `t_end` overflows. Measured, a sweep
+    // with only `t_end` kills nothing on the rest of the suite — so without this cell the two
+    // stand-ins would be a redundant gate, and dropping `t_start` would look free. It is not:
+    // this cell needs it.
+    //
+    // Mutation that reddens it: drop the `t_start` stand-in.
+    //
+    // #936: the record at t=0 is what makes `(0, L]` a real pre-dose window. Without it the
+    // subject's first event is the dose at L itself, the run's origin, and nothing is
+    // integrated before it — the run is then valid, not refused.
+    let err = tad_refusal_error(
+        ODE_EXP_NEG_TAD,
+        &[800.0, 812.0],
+        vec![0, 1],
+        &[0.0, 806.0, 820.0],
+        vec![],
+    );
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 800]"),
+        "must name the refused window: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #936 — the reactive run's integration origin.
+//
+// The state is `init(...)` and does not evolve until the origin
+// `min(subject_integration_start(base record), first realized controller dose)`, which is the
+// frozen-replay static subject's (base ∪ ledger) `subject_integration_start` — NONMEM's
+// first-record convention (#573). Every cell below starts off-zero with a non-fixed-point
+// `init`, so a phantom `[0, origin]` window is visible in the value. The closed form
+// `50·e^{-k(t − t₀)} + Σ 100·e^{-k(t − tᵈ)}` (k = CL/V = 0.1) is computed outside every engine.
+//
+// Engines, per fixture: the reactive driver (`ode_predictions_adaptive_impl`); the constant-path
+// verifier (`ode_predictions_with_extra_breaks`) and the TV/IOV verifier
+// (`adaptive_frozen_replay_tv`), both run by `verify: true`; and `predict()` / `predict_iov` on
+// the realized ledger as the static reference.
+// ---------------------------------------------------------------------------------------------
+
+const K_936: f64 = 5.0 / 50.0;
+
+/// The closed form of `ODE_INIT50_AUTONOMOUS` (and of `ODE_TV_INIT` with `init = init0`): the
+/// `init` baseline decays from the origin `t0`, and every 100-unit bolus at or before `t`
+/// decays from its own time.
+fn origin_closed_form(init0: f64, t0: f64, doses: &[f64], obs: &[f64]) -> Vec<f64> {
+    obs.iter()
+        .map(|&t| {
+            let mut c = init0 * (-K_936 * (t - t0)).exp();
+            for &d in doses.iter().filter(|&&d| d <= t) {
+                c += 100.0 * (-K_936 * (t - d)).exp();
+            }
+            c
+        })
+        .collect()
+}
+
+/// One reactive run with a controller dosing 100 into cmt 1 at the decisions in `dose_idx`.
+/// Returns the IPREDs and, per decision, the `(t, central)` the controller read.
+fn origin_run(
+    pop: &Population,
+    model: &CompiledModel,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    verify: bool,
+) -> Result<(Vec<f64>, Vec<(f64, f64)>), String> {
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(f64, f64)>::new()));
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        verify,
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        model,
+        pop,
+        &model.default_params,
+        1,
+        || {
+            let reads = reads.clone();
+            let idx = dose_idx.clone();
+            move |ctx: &ControllerCtx| {
+                reads.lock().unwrap().push((ctx.t, ctx.state[0]));
+                if idx.contains(&ctx.decision_index) {
+                    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                } else {
+                    vec![DoseAction::Hold]
+                }
+            }
+        },
+        &opts,
+    )?;
+    let reads = reads.lock().unwrap().clone();
+    Ok((res.trajectories.iter().map(|t| t.ipred).collect(), reads))
+}
+
+/// `predict()` on the base regimen plus the realized controller doses.
+fn origin_static(model: &CompiledModel, subject: Subject) -> Vec<f64> {
+    predict(model, &population(vec![subject]), &model.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| p.pred)
+        .collect()
+}
+
+/// Worst relative gap, finiteness asserted per element (see `worst_rel`); `what` names the
+/// engine side so a failure says which leg drifted.
+fn assert_rel(got: &[f64], want: &[f64], tol: f64, what: &str) {
+    let worst = worst_rel(got, want, what);
+    assert!(
+        worst <= tol,
+        "{what}: worst rel {worst:e} > {tol:e} (got={got:?}, want={want:?})"
+    );
+}
+
+#[test]
+fn adaptive_origin_at_first_record_matches_closed_form() {
+    // T1 (#936), cell A. Dose-free base, first record the obs at 6, first dose at the
+    // decision at 12. The origin is 6: nothing evolves on `[0, 6]`, so the read at 6 is the
+    // `init` baseline 50. Before the fix the driver integrated from a hard-coded t=0 and read
+    // 27.4406 = 50·e^{-0.6} there (measured at `4c09cef1`), and the verifier refused the run.
+    //
+    // Mutation that reddens it: revert the driver's origin — seed `break_times` with 0.0 AND
+    // drop the `started` skip (the pre-#936 driver). Seeding with 0.0 alone is an equivalent
+    // mutation: the un-started walk still inserts `t_base0` and integrates nothing before it.
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![0], false).expect("driver");
+    let closed = origin_closed_form(50.0, 6.0, &[12.0], &obs);
+    assert_rel(&driver, &closed, 1e-10, "driver vs closed form");
+    assert_eq!(
+        driver[0], 50.0,
+        "the read at the origin is the init baseline"
+    );
+
+    let (checked, _) =
+        origin_run(&pop, &model, &decisions, vec![0], true).expect("the verifier agrees");
+    let static_pred = origin_static(
+        &model,
+        subj(
+            "1",
+            obs.to_vec(),
+            vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+        ),
+    );
+    assert_rel(&checked, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
+fn adaptive_hold_before_first_record_does_not_evolve_state() {
+    // T2 (#936), cell B. A hold decision at t=0, before the first record (obs at 6). The
+    // controller must read the un-evolved `init` there, and the trajectory must equal cell A:
+    // a decision is not a record and does not move the origin.
+    //
+    // Mutation that reddens it: drop the `started` skip, keeping the new seed. Decision 0 is
+    // then the first break and `[0, 6]` integrates — the read at 6 falls to 27.44.
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [0.0, 12.0];
+    let obs = [6.0, 20.0, 40.0];
+    let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+
+    let (driver, reads) = origin_run(&pop, &model, &decisions, vec![1], true).expect("run");
+    assert_eq!(
+        reads[0],
+        (0.0, 50.0),
+        "the decision before the origin reads the init state"
+    );
+    // The reading at the decision at 12 is 50·e^{-0.6}, six hours after the origin — not
+    // 50·e^{-1.2}, which a t=0 origin would give.
+    let want12 = 50.0 * (-K_936 * 6.0).exp();
+    assert!(
+        ((reads[1].1 - want12) / want12).abs() <= 1e-10,
+        "the controller's reading at t=12 must be decayed from the origin (6), got {:?}, want \
+         {want12}",
+        reads[1]
+    );
+    let closed = origin_closed_form(50.0, 6.0, &[12.0], &obs);
+    assert_rel(&driver, &closed, 1e-10, "driver vs closed form");
+}
+
+#[test]
+fn adaptive_controller_dose_before_first_record_is_the_origin() {
+    // T3 (#936), cell C. The controller doses at 2, before the first record (obs at 6). That
+    // dose is part of the static subject's record, so IT is the origin: the baseline decays
+    // from 2, not from 6, and the read at 6 is 150·e^{-0.4} = 100.548.
+    //
+    // Mutation that reddens it: make `started` ignore controller doses (origin = `t_base0`
+    // only — the issue body's suggested fix). The dose at 2 then lands on a state that does
+    // not evolve until 6. It also reddens `degenerate_oracle_matches_static_predict` (dose at
+    // 0, first obs at 6).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [2.0, 12.0];
+    let obs = [6.0, 20.0, 40.0];
+    let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![0], true).expect("run");
+    let closed = origin_closed_form(50.0, 2.0, &[2.0], &obs);
+    assert_rel(&driver, &closed, 1e-10, "driver vs closed form");
+    let static_pred = origin_static(
+        &model,
+        subj(
+            "1",
+            obs.to_vec(),
+            vec![DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0)],
+        ),
+    );
+    assert_rel(&driver, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
+fn adaptive_base_dose_after_zero_is_the_origin() {
+    // T4 (#936), cell E. A pre-scheduled base bolus at 4 precedes the first obs (6), so the
+    // base record starts at 4 and the read at 6 is 150·e^{-0.2} = 122.8096.
+    //
+    // Mutation that reddens it: compute the origin from the observations only (ignore base
+    // doses) — the baseline then holds until 6.
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [12.0];
+    let obs = [6.0, 20.0];
+    let base = vec![DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0)];
+    let pop = population(vec![subj("1", obs.to_vec(), base.clone())]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![0], true).expect("run");
+    let closed = origin_closed_form(50.0, 4.0, &[4.0, 12.0], &obs);
+    assert_rel(&driver, &closed, 1e-10, "driver vs closed form");
+    let mut doses = base;
+    doses.push(DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0));
+    let static_pred = origin_static(&model, subj("1", obs.to_vec(), doses));
+    assert_rel(&driver, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
+fn adaptive_tv_origin_matches_predict_and_the_verifier_sees_it() {
+    // T5 (#936), cell TV-A. Cell A's shape on `ODE_TV_INIT`: `init = 10·CRCL`, the first
+    // record carries CRCL 8 (init 80), later ones 5. This routes the verifier to
+    // `adaptive_frozen_replay_tv`, which before the fix shared the driver's hard-coded t=0 —
+    // so `verify: true` returned Ok on a wrong trajectory (43.9049 against 80, measured at
+    // `4c09cef1`). Each engine side is asserted separately and named in its message:
+    //
+    // - DRIVER side (`verify: false` vs closed form and `predict()`): reddened by reverting the
+    //   driver's origin (seed 0.0 + no `started` skip).
+    // - VERIFIER side (`verify: true` must be Ok on the fixed driver): reddened by reverting
+    //   `adaptive_frozen_replay_tv`'s seed to 0.0 alone — the replay then disagrees with the
+    //   correct driver.
+    let model = parse_model_string(ODE_TV_INIT).unwrap();
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let crcl = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+    let with_cov = |mut s: Subject| -> Subject {
+        s.covariates = crcl(8.0);
+        s.obs_covariates = vec![crcl(8.0), crcl(5.0), crcl(5.0)];
+        s.dose_covariates = s.doses.iter().map(|_| crcl(5.0)).collect();
+        s
+    };
+    let base = with_cov(subj("1", obs.to_vec(), vec![]));
+    assert!(
+        base.has_tv_covariates(),
+        "the subject must take the TV path"
+    );
+    let pop = population(vec![base]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![0], false).expect("driver");
+    let closed = origin_closed_form(80.0, 6.0, &[12.0], &obs);
+    assert_rel(&driver, &closed, 1e-9, "DRIVER side: driver vs closed form");
+    let static_pred = origin_static(
+        &model,
+        with_cov(subj(
+            "1",
+            obs.to_vec(),
+            vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+        )),
+    );
+    assert_rel(
+        &driver,
+        &static_pred,
+        1e-9,
+        "DRIVER side: driver vs predict()",
+    );
+
+    let checked = origin_run(&pop, &model, &decisions, vec![0], true);
+    assert!(
+        checked.is_ok(),
+        "VERIFIER side: adaptive_frozen_replay_tv must agree with the correct driver: {:?}",
+        checked.err()
+    );
+}
+
+// `ODE_IOV` with a non-fixed-point `init`, so the origin is visible under IOV too.
+const ODE_IOV_INIT50: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_iov_origin_matches_predict_iov() {
+    // T6 (#936). IOV routes the verifier to `adaptive_frozen_replay_tv` too. Decisions at
+    // 6 / 12 / 24 (a hold at 6, doses at 12 and 24) and obs at 6 / 12 / 24, so every record
+    // has an occasion and `predict_iov`'s obs-derived groups are the identity. The first
+    // record is at 6: the old driver integrated `[0, 6]` and read ~27.4 there.
+    //
+    // DRIVER side: `verify: false` vs `predict_iov` (reddened by reverting the driver origin).
+    // VERIFIER side: `verify: true` must be Ok (reddened by reverting
+    // `adaptive_frozen_replay_tv`'s seed alone).
+    let model = parse_model_string(ODE_IOV_INIT50).unwrap();
+    let decisions = vec![6.0, 12.0, 24.0];
+    let obs = decisions.clone();
+    let seed = 1u64;
+    let pop = population(vec![subj("1", obs.clone(), vec![])]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![1, 2], false).expect("driver");
+
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let kbase = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(kbase, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "κ must be non-zero, else the IOV leg is vacuous"
+    );
+
+    let static_doses = vec![
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.occasions = vec![0, 1, 2];
+    static_subject.dose_occasions = vec![1, 2];
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+    assert_eq!(
+        driver[0], 50.0,
+        "DRIVER side: the read at the origin is init"
+    );
+    assert_rel(&driver, &preds, 1e-9, "DRIVER side: driver vs predict_iov");
+
+    let checked = origin_run(&pop, &model, &decisions, vec![1, 2], true);
+    assert!(
+        checked.is_ok(),
+        "VERIFIER side: adaptive_frozen_replay_tv must agree with the correct driver: {:?}",
+        checked.err()
+    );
+}
+
+#[test]
+fn adaptive_origin_straddle_record_at_zero_vs_first_record_later() {
+    // T7 (#936) — the straddle that keeps T1 from being a tautology. Cell D has a record at
+    // t=0, so its origin is 0 before and after the fix and it must match `predict()` as
+    // before (measured at `4c09cef1`: [50, 27.4406, 51.6997], identical to predict()). Cell A
+    // is the same schedule without that record: its origin moves to 6, and the read at t=6
+    // must differ between the two cells by more than 1 (27.44 vs 50). With the origin still
+    // pinned to 0 the two cells would agree at t=6.
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [12.0];
+    let dose = vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)];
+
+    let obs_d = [0.0, 6.0, 20.0];
+    let pop_d = population(vec![subj("1", obs_d.to_vec(), vec![])]);
+    let (d, _) = origin_run(&pop_d, &model, &decisions, vec![0], true).expect("cell D");
+    let d_static = origin_static(&model, subj("1", obs_d.to_vec(), dose));
+    assert_rel(&d, &d_static, 1e-12, "cell D (origin 0) vs predict()");
+    assert_rel(
+        &d,
+        &origin_closed_form(50.0, 0.0, &[12.0], &obs_d),
+        1e-10,
+        "cell D (origin 0) vs closed form",
+    );
+
+    let obs_a = [6.0, 20.0];
+    let pop_a = population(vec![subj("1", obs_a.to_vec(), vec![])]);
+    let (a, _) = origin_run(&pop_a, &model, &decisions, vec![0], true).expect("cell A");
+    assert!(
+        (a[0] - d[1]).abs() > 1.0,
+        "the straddle: the read at t=6 must depend on whether a record sits at t=0 \
+         (A={}, D={})",
+        a[0],
+        d[1]
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_an_observation_free_window_after_a_reset_origin() {
+    // #936 review R1. The refusal's state-carry sentence ("No observation is read off that
+    // segment, but the state integrated there carries into every later read") lost its only
+    // end-to-end test when this PR converted #1151's dose-free-window cell into a positive
+    // (its origin moved to the dose). This cell restores a real observation-free window: an
+    // EVID=3 reset at t=0 is the subject's first record, so the origin is 0; the obs are at
+    // 20 and 40 and the first dose is at the decision at 12, so `(0, 12]` is integrated
+    // under an unanchored `TAD` with no read inside it.
+    //
+    // Mutation that reddens it: delete the tail "…but the state integrated there carries
+    // into every later read" from the message (review mutation S2).
+    let model = parse_model_string(ODE_TAD_NO_IIV).unwrap();
+    let mut s = subj("1", vec![20.0, 40.0], vec![]);
+    s.reset_times = vec![0.0];
+    let pop = population(vec![s]);
+    let err = origin_run(&pop, &model, &[12.0, 36.0], vec![0, 1], false)
+        .expect_err("a reset-anchored origin before an unanchored window must be refused");
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+    assert!(
+        err.contains(
+            "No observation is read off that segment, but the state integrated there carries \
+             into every later read."
+        ),
+        "must say the poisoned state — not a readout — is what is refused: {err}"
+    );
+}
+
+#[test]
+fn adaptive_reset_as_first_record_is_the_origin() {
+    // #936 review R3. An EVID=3 reset at t=4 is the subject's first record, so it is the
+    // origin: `init` decays from 4. Hold at 0, bolus at 12, obs 6/20/40. The reset is in
+    // `subject_integration_start`, the same as the static engine.
+    //
+    // Mutation that reddens it: drop `reset_times` from `subject_integration_start`'s fold
+    // (origin 6 on both the driver and `predict()` — the closed form below still says 4).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let obs = [6.0, 20.0, 40.0];
+    let mut s = subj("1", obs.to_vec(), vec![]);
+    s.reset_times = vec![4.0];
+    let pop = population(vec![s]);
+
+    let (driver, _) = origin_run(&pop, &model, &[0.0, 12.0], vec![1], true).expect("run");
+    let closed = origin_closed_form(50.0, 4.0, &[12.0], &obs);
+    // Measured: 6.0e-13 against the closed form.
+    assert_rel(
+        &driver,
+        &closed,
+        1e-10,
+        "driver vs closed form (origin at the reset)",
+    );
+    let mut st = subj(
+        "1",
+        obs.to_vec(),
+        vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+    );
+    st.reset_times = vec![4.0];
+    let static_pred = origin_static(&model, st);
+    assert_rel(&driver, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
+fn adaptive_auc_pass_holds_init_before_the_origin() {
+    // #936 review R3. The AUC-target pass (`adaptive_window_signal_aucs`, dense solve) was
+    // already on the static origin; after #936 the driver shares it. Base record obs 6/20/40,
+    // decisions 0/6/12/24, one ledger bolus at 12. Window [0, 6] lies before the origin (6),
+    // so the state is held at `init` = 50 there and its AUC is exactly 300.
+    //
+    // Mutation that reddens it: seed the dense solve at 0.0 instead of the subject's start
+    // (the [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let ode = model.ode_spec.as_ref().unwrap();
+    let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
+    pk[crate::types::PK_IDX_CL] = 5.0;
+    pk[crate::types::PK_IDX_V] = 50.0;
+    pk[crate::types::PK_IDX_F] = 1.0;
+    let base = subj("1", vec![6.0, 20.0, 40.0], vec![]);
+    let ledger = vec![crate::sim::adaptive::DoseLedgerEntry {
+        subject: "1".into(),
+        draw: 0,
+        sim: 0,
+        dose_idx: 0,
+        time: 12.0,
+        amt: 100.0,
+        cmt: 1,
+        rate: 0.0,
+        decision_idx: 2,
+        rule_fired: "bolus".into(),
+        observed_signals: Vec::new(),
+        pre_state: None,
+        post_state: None,
+        f_applied: 1.0,
+    }];
+    let aucs = crate::ode::predictions::adaptive_window_signal_aucs(
+        ode,
+        &pk,
+        &model.default_params.theta,
+        &[0.0],
+        &base,
+        &[0.0, 6.0, 12.0, 24.0],
+        &ledger,
+        None,
+        1,
+    );
+    let k = K_936;
+    let want = [
+        300.0,
+        (50.0 / k) * (1.0 - (-k * 6.0).exp()),
+        (50.0 / k) * ((-k * 6.0).exp() - (-k * 18.0).exp())
+            + (100.0 / k) * (1.0 - (-k * 12.0).exp()),
+    ];
+    for (i, &a) in aucs.iter().enumerate() {
+        assert!(a.is_finite(), "window {i}: AUC {a} is not finite");
+    }
+    assert_eq!(aucs.len(), 3);
+    // The pre-origin window holds `init` exactly — a constant integrand, no trapezoid error.
+    assert!(
+        (aucs[0] - 300.0).abs() <= 1e-9,
+        "window [0, 6] precedes the origin, so init is held: {aucs:?}"
+    );
+    // Trapezoid error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative; the
+    // bound carries ~7× headroom and is 2 000× below the pre-origin mutation's effect.
+    for i in 1..3 {
+        let rel = ((aucs[i] - want[i]) / want[i]).abs();
+        assert!(
+            rel <= 5e-5,
+            "window {i}: rel {rel:e} (aucs={aucs:?}, want={want:?})"
+        );
+    }
 }

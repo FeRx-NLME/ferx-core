@@ -124,7 +124,7 @@ fn simulate_subjects(
         warnings: vec![],
     };
 
-    let sim = simulate_with_seed(model, &pop, params, 1, seed);
+    let sim = simulate_with_seed(model, &pop, params, 1, seed).unwrap();
 
     subjects
         .into_iter()
@@ -602,7 +602,7 @@ fn generate_two_cpt_oral_cov() {
         exclusions: None,
         warnings: vec![],
     };
-    let sim = simulate_with_seed(&model, &pop, &params, 1, 456);
+    let sim = simulate_with_seed(&model, &pop, &params, 1, 456).unwrap();
 
     let result: Vec<_> = pop
         .subjects

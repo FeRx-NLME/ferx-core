@@ -82,7 +82,7 @@ fn predict_matches_nonmem_ss_oral_with_lagtime() {
         "dataset should contain SS=1 doses"
     );
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM PRED keyed by observation time (the DV column of the CSV is the
     // same reference, but we list it here so the assertion is explicit).

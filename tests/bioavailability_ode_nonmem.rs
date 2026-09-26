@@ -117,7 +117,7 @@ fn ode_bioavailability_matches_nonmem() {
     let population = read_nonmem_csv(Path::new("data/bioavailability_ode_ref.csv"), None, None)
         .expect("dataset loads");
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), NONMEM.len());
 
     for (p, &(t, expected)) in preds.iter().zip(NONMEM) {
@@ -150,8 +150,8 @@ fn ode_bioavailability_matches_analytical() {
     let population = read_nonmem_csv(Path::new("data/bioavailability_ode_ref.csv"), None, None)
         .expect("dataset loads");
 
-    let ode_preds = predict(&ode, &population, &ode.default_params);
-    let an_preds = predict(&analytical, &population, &analytical.default_params);
+    let ode_preds = predict(&ode, &population, &ode.default_params).unwrap();
+    let an_preds = predict(&analytical, &population, &analytical.default_params).unwrap();
     assert_eq!(ode_preds.len(), an_preds.len());
 
     for (o, a) in ode_preds.iter().zip(an_preds.iter()) {

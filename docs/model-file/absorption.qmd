@@ -197,11 +197,9 @@ mis-modeled:
 
 > **Note:** these built-in-absorption guards run at `fit()` time and via `ferx
 > check` — where full model–data compatibility is validated — **and on the
-> lower-level predict / simulate paths too** (#588). Every entry point that
-> returns a `Result` (`predict_diag()`, `simulate_with_options()`, …) reports the
-> combination as the same `Err` `fit()` does; only the `Vec`-returning `predict()`,
-> `simulate()` and `simulate_with_seed()` panic, with that same text, because they
-> have no error channel — see
+> lower-level predict / simulate paths too** (#588). Every entry point
+> (`predict()`, `simulate()`, `simulate_with_options()`, …) reports the
+> combination as the same `Err` `fit()` does — see
 > [When a precondition fails](../warnings.qmd#entry-point-errors). The data-independent *structural* rules (e.g. the
 > pathway-fraction partition below) fire even earlier, at parse time, so *every*
 > entry point rejects a malformed model. Other, non-absorption data checks are

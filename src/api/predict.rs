@@ -56,16 +56,19 @@ use std::time::Instant;
 /// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
 /// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
 /// empty vec here — call the matching predictor instead. (CTMM has no predictor at all
-/// yet, so a CTMM model with *no* continuous endpoint is rejected fail-loud below rather
+/// yet, so a CTMM model with *no* continuous endpoint is rejected with an `Err` rather
 /// than returning empty; a mixed continuous + CTMM model still gets its Gaussian rows.)
+///
+/// # Errors
+///
+/// Exactly the `Err` of [`predict_diag`] for the same input: the bare check message `fit()`
+/// gives for that precondition (#898).
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Vec<PredictionResult> {
-    predict_diag(model, population, params)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .results
+) -> Result<Vec<PredictionResult>, String> {
+    predict_diag(model, population, params).map(|out| out.results)
 }
 
 /// The rows [`predict`] returns, plus the diagnostics it discards.
@@ -119,8 +122,7 @@ pub struct PredictionOutput {
 /// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
 /// `markov`) a CTMM-only model, which has no predictor yet. An input failing several at once
 /// reports the first in *this* function's order, which is not `fit()`'s.
-/// [`predict`] re-raises that same text as a panic, having no channel to return it on. Adding
-/// an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
+/// [`predict`] returns that same text. Adding an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
 /// that is what `warnings` is for.
 pub fn predict_diag(
     model: &CompiledModel,

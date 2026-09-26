@@ -84,11 +84,11 @@ pub fn inits_from_nca(
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
     first_error(&crate::api::check_modeled_dose_rates(model, population))?;
     first_error(&crate::api::check_dose_compartments(model, population))?;
-    Ok(match method {
-        NcaInit::Nca => nca_only(model, population),
+    match method {
+        NcaInit::Nca => Ok(nca_only(model, population)),
         NcaInit::Sweep => nca_with_sweep(model, population),
         NcaInit::Ebe => nca_with_ebe(model, population),
-    })
+    }
 }
 
 /// Fast NCA-based starting value estimation (`NcaInit::Nca`).
@@ -114,7 +114,10 @@ fn nca_only(model: &CompiledModel, population: &Population) -> SuggestedStart {
 /// Cost: 9 `predict()` calls per unwritten theta.  For a typical 2-cpt PK model
 /// where peeling succeeded, 0–2 thetas remain; for a PD model with 5 free
 /// parameters, ~45 calls (~50 ms on 100 subjects).
-fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedStart {
+fn nca_with_sweep(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<SuggestedStart, String> {
     let mut base = nca_only(model, population);
 
     // Collect non-fixed thetas that Option A left unchanged (still at model default).
@@ -126,7 +129,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
         .collect();
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Exclude covariate-effect thetas (e.g. THETA_WT, THETA_CRCL) from the sweep.
@@ -169,7 +172,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
     }
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Joint 2D sweeps for highly correlated pairs before independent 1D sweeps.
@@ -194,7 +197,7 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
                     9,
                     10.0,
                     label,
-                );
+                )?;
                 base.params = swept;
                 base.warnings.extend(w);
                 remaining.retain(|&i| i != ia && i != ib);
@@ -205,12 +208,12 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
     // Independent 1D sweeps for any remaining unwritten thetas.
     if !remaining.is_empty() {
         let (swept, w) =
-            sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0);
+            sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0)?;
         base.params = swept;
         base.warnings.extend(w);
     }
 
-    base
+    Ok(base)
 }
 
 /// EBE-based NCA + rRMSE sweep (`NcaInit::Ebe`).
@@ -238,18 +241,18 @@ fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedSt
 /// afterwards with etas=0 (Option B style).
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
-fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
+fn nca_with_ebe(model: &CompiledModel, population: &Population) -> Result<SuggestedStart, String> {
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
     // defaults.  Delegate to the etas=0 sweep directly (which runs NCA + sweep)
     // rather than calling nca_only() first and then nca_with_sweep()
     // (which would run NCA twice).
     if model.ode_spec.is_some() {
-        let mut result = nca_with_sweep(model, population);
+        let mut result = nca_with_sweep(model, population)?;
         result.warnings.insert(0,
             "inits_from_nca (nca_ebe): ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (nca_sweep).".into(),
         );
-        return result;
+        return Ok(result);
     }
 
     let mut base = nca_only(model, population);
@@ -262,7 +265,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
         .collect();
 
     if remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // For EBE sweeps, only include lognormal-parameterised thetas
@@ -312,7 +315,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     }
 
     if remaining.is_empty() && logit_remaining.is_empty() {
-        return base;
+        return Ok(base);
     }
 
     // Joint 2D EBE sweeps for correlated pairs.
@@ -354,12 +357,12 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     // EBE sweeps are unreliable for logit params due to eta-compensation effects.
     if !logit_remaining.is_empty() {
         let (swept, w) =
-            sweep_unwritten_thetas(model, population, &base.params, &logit_remaining, 9, 10.0);
+            sweep_unwritten_thetas(model, population, &base.params, &logit_remaining, 9, 10.0)?;
         base.params = swept;
         base.warnings.extend(w);
     }
 
-    base
+    Ok(base)
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +928,109 @@ mod tests {
         assert_eq!(
             result.params.theta[0], original_val,
             "fixed theta must not be overwritten"
+        );
+    }
+
+    // The early returns of `nca_with_sweep` / `nca_with_ebe` below return `Ok` since
+    // #898, and each is reached only by one fixture shape. The Tier-2 `tests/suggest_start.rs`
+    // covers the ODE fallback and the full sweep, not these.
+
+    /// Two-compartment covariate model with every PK theta fixed: the only unwritten
+    /// thetas left are `THETA_WT` / `THETA_CRCL`, which both sweeps exclude as covariates.
+    fn two_cpt_cov_only_covariates_free() -> (CompiledModel, Population) {
+        let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx")).unwrap();
+        for (i, name) in model.default_params.theta_names.iter().enumerate() {
+            model.default_params.theta_fixed[i] = !name.starts_with("THETA_");
+        }
+        let population =
+            read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None).unwrap();
+        (model, population)
+    }
+
+    #[test]
+    fn nca_sweep_returns_ok_when_only_covariate_thetas_are_unwritten() {
+        let (model, population) = two_cpt_cov_only_covariates_free();
+        let result = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains(
+                "inits_from_nca (nca_sweep): excluded 2 covariate theta(s) from rRMSE sweep"
+            )),
+            "both covariate thetas must be excluded, got: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.params.theta, model.default_params.theta,
+            "nothing is left to sweep, so every theta keeps its default"
+        );
+    }
+
+    #[test]
+    fn nca_ebe_returns_ok_when_only_covariate_thetas_are_unwritten() {
+        let (model, population) = two_cpt_cov_only_covariates_free();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains(
+                "inits_from_nca (nca_ebe): excluded 2 covariate theta(s) from rRMSE sweep"
+            )),
+            "both covariate thetas must be excluded, got: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.params.theta, model.default_params.theta);
+    }
+
+    #[test]
+    fn nca_ebe_returns_ok_when_every_theta_is_fixed() {
+        let mut model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
+        model
+            .default_params
+            .theta_fixed
+            .iter_mut()
+            .for_each(|f| *f = true);
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        assert_eq!(result.params.theta, model.default_params.theta);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("covariate theta")),
+            "no theta reaches the covariate filter, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn nca_ebe_sweeps_a_logit_theta_on_the_etas_zero_path() {
+        // A logit-normal theta is routed to the etas=0 `sweep_unwritten_thetas`, not the
+        // EBE sweep. Fixing the lognormal thetas leaves it the only one to sweep, so the
+        // fit reaches `nca_with_ebe`'s final `Ok` through that arm alone.
+        let mut model = parse_model_file(Path::new("examples/warfarin_logit_f.ferx")).unwrap();
+        let f_idx = model
+            .default_params
+            .theta_names
+            .iter()
+            .position(|n| n == "THETA_F")
+            .unwrap();
+        for (i, fixed) in model.default_params.theta_fixed.iter_mut().enumerate() {
+            *fixed = i != f_idx;
+        }
+        // Start F well below the data-generating 0.80 so the sweep has a direction to move.
+        model.default_params.theta[f_idx] = 0.2;
+        let population =
+            read_nonmem_csv(Path::new("data/warfarin_logit_f.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
+        let (f, lo, hi) = (
+            result.params.theta[f_idx],
+            result.params.theta_lower[f_idx],
+            result.params.theta_upper[f_idx],
+        );
+        assert!(
+            f.is_finite() && f >= lo && f <= hi,
+            "THETA_F = {f} outside [{lo}, {hi}]"
+        );
+        assert_ne!(
+            f, model.default_params.theta[f_idx],
+            "the logit sweep must move THETA_F off its default"
         );
     }
 }

@@ -88,11 +88,15 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
 /// prediction. `fit()` already reported `E_MISSING_COVARIATE` here; `predict()` ran
 /// no data check, so it silently served `PRED = 0` at every row.
 #[test]
-#[should_panic(expected = "TOTALLY_UNDEFINED_NAME")]
 fn predict_rejects_an_undefined_scaling_identifier() {
     let model = parse_model_string(UNDEFINED_READOUT).expect("parse");
     let pop = population(&[], HashMap::new());
-    let _ = predict(&model, &pop, &model.default_params);
+    let err =
+        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
+    assert!(
+        err.contains("TOTALLY_UNDEFINED_NAME"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// Positive control: the guard keys on the *data*, not on the name. The identical
@@ -110,7 +114,7 @@ fn predict_accepts_a_scaling_identifier_the_data_carries() {
         &["SOME_COVARIATE"],
         HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]),
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(
         preds.iter().all(|p| p.pred > 0.0),
@@ -136,7 +140,7 @@ fn predict_accepts_a_covariate_carried_only_by_the_subject_maps() {
         pop.covariate_names.is_empty(),
         "the point of this case is an unpopulated name list"
     );
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(
         preds.iter().all(|p| p.pred > 0.0),

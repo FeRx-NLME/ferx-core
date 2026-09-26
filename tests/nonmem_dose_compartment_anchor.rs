@@ -129,6 +129,7 @@ fn plain_preds(src: &str, dose_cmt: usize, obs_cmt: usize, rate: f64, ss: u8, ii
 
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     predict(model, &pop_of(csv), &model.default_params)
+        .unwrap()
         .into_iter()
         .map(|p| p.pred)
         .collect()

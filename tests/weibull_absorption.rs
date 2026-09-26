@@ -87,7 +87,7 @@ fn weibull_curve_recovers_dose_auc_and_has_delayed_peak() {
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single_weibull(obs_times);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // (1) No instantaneous bolus jump: the dose enters as R_in over time, and the
     //     Weibull density with β > 1 vanishes at tad → 0, so central starts at 0.

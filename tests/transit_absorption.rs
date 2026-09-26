@@ -158,7 +158,7 @@ fn transit_curve_recovers_dose_auc_and_has_delayed_peak() {
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single_oral(obs_times);
-    let preds = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
 
     // (1) No instantaneous bolus jump: the dose enters as R_in over time, so
     //     central starts at exactly 0 (initial state) at the dose time.
@@ -249,7 +249,7 @@ fn ss_dose_into_transit_compartment_is_supported() {
         "SS into a transit compartment is supported and must not raise an SS reject, got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
-    let preds = ferx_core::predict(&model, &pop, &model.default_params);
+    let preds = ferx_core::predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), n);
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred >= 0.0),
@@ -290,7 +290,7 @@ fn infusion_into_transit_compartment_is_supported() {
         "infusion into a transit compartment is supported and must not raise a RATE reject, got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
-    let preds = ferx_core::predict(&model, &pop, &model.default_params);
+    let preds = ferx_core::predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), n);
     assert!(
         preds.iter().all(|p| p.pred.is_finite() && p.pred >= 0.0),

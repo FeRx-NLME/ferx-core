@@ -169,9 +169,9 @@ fn categorical2_is_categorical_at_the_matching_theta() {
         plain.model.theta_names.len() + 1
     );
 
-    let pred_cat = predict(&cat.model, &pop, &cat.model.default_params);
-    let pred_cat2 = predict(&cat2.model, &pop, &cat2.model.default_params);
-    let pred_plain = predict(&plain.model, &pop, &plain.model.default_params);
+    let pred_cat = predict(&cat.model, &pop, &cat.model.default_params).unwrap();
+    let pred_cat2 = predict(&cat2.model, &pop, &cat2.model.default_params).unwrap();
+    let pred_plain = predict(&plain.model, &pop, &plain.model.default_params).unwrap();
 
     // Non-degeneracy 2: the covariate is live — a factor of 1 would make the
     // identity below hold against a model that ignores SEX entirely.
@@ -260,6 +260,7 @@ fn fix_is_the_theta_as_written_so_the_null_moves_with_the_form() {
     let preds = |block: &str| {
         let parsed = parse_full_model(&model(block)).expect("model parses");
         predict(&parsed.model, &pop, &parsed.model.default_params)
+            .unwrap()
             .into_iter()
             .map(|p| p.pred)
             .collect::<Vec<f64>>()

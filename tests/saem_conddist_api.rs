@@ -73,7 +73,7 @@ fn template_population(n: usize) -> Population {
 
 fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population) -> Population {
     let truth = model.default_params.clone();
-    let sim = simulate_with_seed(model, template, &truth, 1, 424242);
+    let sim = simulate_with_seed(model, template, &truth, 1, 424242).unwrap();
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {
         let dv: Vec<f64> = sim

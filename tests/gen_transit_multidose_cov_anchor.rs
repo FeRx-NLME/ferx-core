@@ -122,7 +122,7 @@ fn generate_transit_multidose_cov_anchor() {
     };
 
     // Simulate one replicate (BSV on CL & V + proportional residual) from the analytic model.
-    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_611);
+    let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_611).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
         subj.observations = sims

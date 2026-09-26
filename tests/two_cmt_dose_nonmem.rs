@@ -133,7 +133,7 @@ fn ode_two_cmt_dose_matches_nonmem() {
     let population =
         read_nonmem_csv(Path::new("data/two_cmt_dose_ref.csv"), None, None).expect("dataset loads");
 
-    let preds = predict(&model, &population, &model.default_params);
+    let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), REFERENCE.len());
 
     for (p, &(t, expected)) in preds.iter().zip(REFERENCE) {
