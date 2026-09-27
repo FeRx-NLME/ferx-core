@@ -480,6 +480,18 @@ Trunk-based, so a release is a **tag on `main`**:
 3. Point users at the **tagged release**, not an arbitrary `main` commit.
 4. For an R-side release, ensure `Cargo.lock` pins the intended ferx-core
    commit (see below) so the build is reproducible.
+5. Publish the crates to crates.io from a **clean checkout of the tag** (an
+   untracked file in the tree would otherwise block or leak into the upload):
+
+   ```bash
+   git worktree add --detach ../ferx-publish vX.Y.Z
+   cd ../ferx-publish
+   cargo publish --workspace --exclude docs-lint --dry-run   # then without --dry-run
+   ```
+
+   Cargo publishes `ferx-core` → `ferx-tools` → `ferx-cli` in dependency order.
+   A published version can be yanked but never replaced, so check the dry-run's
+   file list (`cargo package -p <crate> --list`) first.
 
 **Versioning.** Both repos follow **semantic versioning** (`MAJOR.MINOR.PATCH`).
 A breaking change to the `.ferx` format, the public Rust API, or sdtab /
@@ -495,10 +507,11 @@ GitHub release notes from merged PRs, so keep PR titles in `type(scope): …`
 form. User-facing breaking changes also carry **migration notes** (PR template).
 
 **Distribution.** Releases are **GitHub releases** built by `release.yml` on
-each `vX.Y.Z` tag. Today ferx-core is consumed as a **git dependency** (not
-published to crates.io) and ferx-r is installed from source / GitHub
-(`R CMD INSTALL`, e.g. `remotes::install_github`). If we later publish to
-crates.io or a CRAN-style channel, add that publish step here.
+each `vX.Y.Z` tag. Since `0.4.0`, `ferx-core`, `ferx-tools` and `ferx-cli` are
+also published to **crates.io** (step 5 above); `docs-lint` is `publish =
+false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
+`remotes::install_github`). If we later publish to a CRAN-style channel, add
+that step here.
 
 ---
 
