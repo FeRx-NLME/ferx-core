@@ -4874,10 +4874,10 @@ fn adaptive_tad_rhs_base_dose_anchors_the_window_before_the_first_dose() {
     // **This cell is degenerate for the anchor VALUE** (#1534 review round 3, finding F), and
     // the twin below is what is not. `central ≡ 0` on `(0, 10]`, so every anchor gives a zero
     // derivative there and the window's `TAD` cannot move anything. Measured with a
-    // driver-only mis-anchor — the real `integrate_segment` call forced to `Some(t_start)`
-    // whenever the shadow has no dose at or before `t_start`, leaving `predict()` untouched —
-    // this test stays GREEN at `[0.0, 79.07598442448013, 74.71656464518534]`. So what it pins
-    // is the refusal's scope (a base dose silences it), not the anchoring itself.
+    // driver-only mis-anchor — the real `integrate_segment` call's `TAD` anchor forced to
+    // `t_start` whenever the shadow has no dose at or before `t_start`, leaving `predict()`
+    // untouched — this test stays GREEN at `[0.0, 79.07598442448013, 74.71656464518534]`. So
+    // what it pins is the refusal's scope (a base dose silences it), not the anchoring itself.
     //
     // Mutation that reddens it: make the refusal fire whenever an observation precedes the
     // first REALIZED dose, ignoring base doses.
@@ -4939,8 +4939,8 @@ fn adaptive_tad_rhs_base_dose_anchor_value_matches_the_static_engine() {
     // real (negative) `TAD` and the anchor's VALUE reaches the trajectory.
     //
     // Mutation that reddens it: a driver-only mis-anchor — force the real `integrate_segment`
-    // call to `Some(t_start)` whenever the shadow has no dose at or before `t_start`, which
-    // leaves `predict()` alone. Measured: 26.95107015382148 against 28.617631257835207 at t=6,
+    // call's `TAD` anchor to `t_start` whenever the shadow has no dose at or before `t_start`,
+    // which leaves `predict()` alone. Measured: 26.95107015382148 against 28.617631257835207 at t=6,
     // and the frozen-replay verifier catches it too. T4 itself stays green under that same
     // mutation, which is why this twin exists.
     let decisions = [12.0, 36.0];
@@ -5168,11 +5168,12 @@ fn adaptive_time_reading_rhs_is_not_refused_before_the_first_dose() {
     // not a dose clock: it is finite in the pre-dose window, so a dose-free run on a
     // TIME-reading RHS integrates correctly and must be left alone.
     //
-    // Mutation that reddens it: key the guard on `pk_reads_model_time()` — which unions `TAD`,
-    // `TAFD` and `T`/`TIME` — AND drop the outcome conjunct. As with the autonomous control
-    // below, after the #1534 review moved the guard after the solve neither half alone
-    // suffices: this cell's state stays finite. Before that move, the `pk_reads_model_time()`
-    // mutation alone killed this test, which is how the per-spelling split was pinned.
+    // Mutation that reddens it: key the candidate slots on `pk_reads_model_time()` — which
+    // unions `TAD`, `TAFD` and `T`/`TIME` — AND drop the dependence test. Measured on #1535,
+    // neither half alone suffices: this RHS reads no clock slot, so anchoring one cannot move
+    // its derivative, and without the model-time key it has no candidate slot at all. (Before
+    // the #1534 review moved the guard after the solve, the `pk_reads_model_time()` mutation
+    // alone killed this test, which is how the per-spelling split was pinned.)
     let (adaptive, static_pred) = tad_oracle_cell(
         ODE_TIME_NO_IIV,
         &[12.0, 36.0],
@@ -5201,11 +5202,11 @@ fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
     // #1151, message-table row 5 — the other over-refusal control. `ODE_NO_IIV`'s RHS reads no
     // clock at all, so a dose-free window is ordinary integration of an empty compartment.
     //
-    // Mutation that reddens it: drop the `rhs_program` spelling checks AND the outcome
-    // conjunct — i.e. refuse on the `NaN` anchor alone, which is `NaN` here too, simply never
-    // read. Measured after the #1534 review moved the guard after the solve, neither half
-    // alone is enough: this cell's state stays finite, so the outcome conjunct already blocks
-    // the refusal, and the spelling check alone already did before it. That redundancy is
+    // Mutation that reddens it: drop the `rhs_program` spelling checks AND the dependence test
+    // — i.e. refuse on the `NaN` anchor alone, which is `NaN` here too, simply never read.
+    // Measured on #1535, neither half alone is enough: without the spelling checks the
+    // dependence test still finds nothing, since this RHS reads no clock, and without the
+    // dependence test the spelling checks still find no candidate slot. That redundancy is
     // deliberate — it is the "belt" a future narrowing of either half would land on — but it
     // means this test's guarantee is "a working run keeps working", not a single-mutation kill.
     let (adaptive, static_pred) = tad_oracle_cell(
@@ -5239,6 +5240,8 @@ fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
 // including where the unanchored window never evaluates it. The two fixtures below are those
 // shapes. Before the guard was moved after `integrate_segment`, both were refused although each
 // returns a finite trajectory (and passes the frozen-replay verifier) with the guard removed.
+// Since #1535 the guard asks whether the window's derivative depends on the clock, and in
+// neither fixture as written does it.
 
 /// `TAD` read only inside a branch the unanchored window does not take. Over `(0, 12]` the
 /// `TIME > 20` test is false, so the else arm integrates and the `NaN` anchor never reaches the
@@ -5476,7 +5479,7 @@ fn adaptive_tad_rhs_refuses_when_the_controller_never_doses() {
     );
 }
 
-// ============ #1534 review round 2: what the outcome gate must and must not claim ============
+// ============ #1534 review round 2 / #1535: what the gate must and must not claim ============
 
 /// `TAD` mentioned only in a branch the unanchored window does not take, PLUS a second state
 /// that diverges for its own reasons (`X' = 0.5·X²` from `X(0) = 1` blows up at t = 2).
@@ -5484,7 +5487,8 @@ fn adaptive_tad_rhs_refuses_when_the_controller_never_doses() {
 /// Every conjunct of the pre-causation guard held on this model — the segment's state came
 /// back non-finite (in `X`), the `TAD` slot was `NaN`, and `pk_reads_tad()` was true — while
 /// the `TAD` line never ran and `central` was finite throughout. It is the false positive the
-/// counterfactual re-solve exists to remove.
+/// counterfactual re-solve was added to remove, and the one the dependence test (#1535) must
+/// not bring back: no anchor moves a derivative the window never evaluates.
 const ODE_TAD_PLUS_DIVERGENT_STATE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -5620,8 +5624,9 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
     // numbers are right — they are not — and it does not pin agreement with `predict()`,
     // which would lock in the frozen output as if it were correct.
     //
-    // Mutation that reddens it: drop the `resolve_with_finite_clock` conjunct from
-    // `unanchored_dose_clock_error`.
+    // Mutation that reddens it: drop the dependence test from `unanchored_dose_clock_error` —
+    // refuse whenever the clock is read and unanchored (it was the `resolve_with_finite_clock`
+    // conjunct before #1535).
     let model =
         parse_model_string(ODE_TAD_PLUS_DIVERGENT_STATE).expect("parse divergent-state model");
     let obs = vec![0.0, 6.0, 20.0, 40.0];
@@ -5820,8 +5825,10 @@ const ODE_EXP_TAD: &str = r#"
 "#;
 
 /// Two causes in one segment: a genuine arithmetic `TAD` read in `central`, and a second state
-/// that runs away on its own. A whole-state finiteness test on the counterfactual clears the
-/// clock here — `X` is still `inf` under any anchor — although `TAD` is one of the two causes.
+/// that runs away on its own. A whole-state finiteness test on the pre-#1535 counterfactual
+/// cleared the clock here — `X` is still `inf` under any anchor — although `TAD` is one of the
+/// two causes. The dependence test compares derivatives component by component: `X`'s is the
+/// same under every anchor, `central`'s is `NaN` unanchored and finite anchored.
 const ODE_TAD_AND_DIVERGENT_STATE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -5843,9 +5850,10 @@ const ODE_TAD_AND_DIVERGENT_STATE: &str = r#"
 
 #[test]
 fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survives() {
-    // #1534 review round 3, finding D1 — why the causation check needs TWO stand-ins.
+    // #1534 review round 3, finding D1 — why the pre-#1535 causation check needed TWO
+    // stand-ins, kept as the long-window row of the verdict map.
     //
-    // The refusal asks a counterfactual: would this segment be finite with the clock anchored?
+    // That check asked a counterfactual: would this segment be finite with the clock anchored?
     // The anchor it substitutes is not neutral. `t_start` puts `TAD` in `[0, L]`, and `L` here
     // is 800 h — longer than any `TAD` this model sees after a dose, and the opposite sign
     // from `predict()`, whose pre-dose `TAD` is ≤ 0. `exp(800)` overflows, so with only that
@@ -5853,11 +5861,13 @@ fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survive
     // `62b9a6ef`, `verify: false` returned `Ok([NaN, NaN])` and the default verifier gave its
     // symptom message (`reactive=NaN, static=54.881163607201266`).
     //
-    // `t_end` puts `TAD` in `[-L, 0]`, the static convention's own sign, and repairs it. A
-    // second stand-in cannot add a false positive: a different anchor can only repair the
-    // state if the clock was load-bearing.
+    // The dependence test compares the derivative point by point and skips only the grid
+    // points where the anchored value overflows (`TAD` > 709 under `t_start`), so either
+    // stand-in alone now refuses this window — measured on #1535: dropping `t_start` or
+    // `t_end` leaves this test green. The per-stand-in pins moved to
+    // `adaptive_tad_dependence_needs_both_stand_ins`.
     //
-    // Mutation that reddens it: drop the `t_end` stand-in.
+    // Mutation that reddens it: drop the refusal.
     //
     // #936: the record at t=0 is what makes `(0, L]` a real pre-dose window. Without it the
     // subject's first event is the dose at L itself, the run's origin, and nothing is
@@ -5875,9 +5885,10 @@ fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survive
         "must name the refused window: {err}"
     );
 
-    // The straddle control: the SAME model over a 600 h window is refused by the `t_start`
-    // stand-in alone (`exp(600)` is finite), so the pair above is not a tautology — it is the
-    // window length that moves the cell across the boundary.
+    // The 600 h control. Under the counterfactual it was the other side of a straddle — the
+    // `t_start` stand-in alone repaired it, since `exp(600)` is finite — so the window length
+    // moved the cell across that check's boundary. The dependence test has no such boundary,
+    // and refuses both.
     let control = tad_refusal_error(
         ODE_EXP_TAD,
         &[600.0, 612.0],
@@ -5893,17 +5904,20 @@ fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survive
 
 #[test]
 fn adaptive_tad_rhs_refuses_when_the_clock_is_one_of_two_causes() {
-    // #1534 review round 3, finding D2 — why the counterfactual is compared component by
-    // component. `central` reads `TAD` arithmetically and breaks because of it; `X` runs away
-    // on its own and is non-finite under every anchor. A whole-state finiteness test on the
-    // counterfactual therefore says "still broken, not the clock's fault" and goes silent,
-    // although the clock IS one of the two causes: measured at `62b9a6ef`, `verify: false`
-    // returned `Ok([0.0, NaN, NaN, NaN])`.
+    // #1534 review round 3, finding D2 — the clock as one of two causes. `central` reads `TAD`
+    // arithmetically and breaks because of it; `X` runs away on its own and is non-finite
+    // under every anchor. A whole-state finiteness test on the pre-#1535 counterfactual said
+    // "still broken, not the clock's fault" and went silent, although the clock IS one of the
+    // two causes: measured at `62b9a6ef`, `verify: false` returned `Ok([0.0, NaN, NaN, NaN])`.
     //
-    // Comparing per component asks the right question — did some state that broke here come
-    // back? — and `central` does.
+    // The per-component counterfactual that fixed it took its "comes back finite" evidence
+    // from the solver's frozen tail (#1539): with that issue's NaN tail pad applied, this test
+    // went red (re-measured at `2a6076af`). The dependence test re-solves nothing — at
+    // `u_start`, `central`'s derivative is `NaN` unanchored and finite anchored — and stays
+    // refused under the same pad (measured on #1535).
     //
-    // Mutation that reddens it: compare the counterfactual as a whole state.
+    // Mutation that reddens it: take the verdict from a re-solve of the segment again, under
+    // #1539's NaN tail pad.
     let err = tad_refusal_error(
         ODE_TAD_AND_DIVERGENT_STATE,
         &[12.0, 36.0],
@@ -5924,8 +5938,10 @@ fn adaptive_tad_rhs_refuses_when_the_clock_is_one_of_two_causes() {
 
 /// The mirror of `ODE_EXP_TAD`: `exp(-TAD)` is bounded where the `t_start` stand-in puts the
 /// clock (`TAD ∈ [0, L]` ⇒ the term is ≤ 1) and overflows where `t_end` puts it
-/// (`TAD ∈ [-L, 0]` ⇒ `exp(L)`). The two fixtures together are why the causation check runs
-/// BOTH stand-ins: each one alone is defeated by one of them.
+/// (`TAD ∈ [-L, 0]` ⇒ `exp(L)`). The two fixtures together were why the pre-#1535 causation
+/// check ran BOTH stand-ins: each one alone was defeated by one of them. The dependence test is
+/// defeated by neither, since it skips only the overflowing grid points; the pin moved to
+/// `adaptive_tad_dependence_needs_both_stand_ins`.
 const ODE_EXP_NEG_TAD: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -5950,17 +5966,16 @@ const ODE_EXP_NEG_TAD: &str = r#"
 
 #[test]
 fn adaptive_tad_rhs_refuses_a_long_window_whose_clock_term_survives_only_forwards() {
-    // #1534 review round 3, finding D1 — the OTHER half of the straddle, and the reason both
-    // stand-ins are kept.
+    // #1534 review round 3, finding D1 — the OTHER half of the pre-#1535 straddle.
     //
     // `..._longer_than_the_clock_survives` uses `exp(TAD)`, which the `t_start` stand-in
     // (`TAD ∈ [0, 800]`) overflows and `t_end` (`TAD ∈ [-800, 0]`) survives. This fixture is
-    // its mirror, `exp(-TAD)`: `t_start` survives it and `t_end` overflows. Measured, a sweep
-    // with only `t_end` kills nothing on the rest of the suite — so without this cell the two
-    // stand-ins would be a redundant gate, and dropping `t_start` would look free. It is not:
-    // this cell needs it.
+    // its mirror, `exp(-TAD)`: `t_start` survives it and `t_end` overflows. Under the
+    // counterfactual each needed the stand-in the other could do without. The dependence test
+    // skips only the overflowing grid points, so either stand-in alone refuses both — measured
+    // on #1535 — and `adaptive_tad_dependence_needs_both_stand_ins` carries that pin now.
     //
-    // Mutation that reddens it: drop the `t_start` stand-in.
+    // Mutation that reddens it: drop the refusal.
     //
     // #936: the record at t=0 is what makes `(0, L]` a real pre-dose window. Without it the
     // subject's first event is the dose at L itself, the run's origin, and nothing is
@@ -6567,8 +6582,11 @@ fn adaptive_reset_as_first_record_is_the_origin() {
     // origin: `init` decays from 4. Hold at 0, bolus at 12, obs 6/20/40. The reset is in
     // `subject_integration_start`, the same as the static engine.
     //
-    // Mutation that reddens it: drop `reset_times` from `subject_integration_start`'s fold
-    // (origin 6 on both the driver and `predict()` — the closed form below still says 4).
+    // Mutation that reddens it: drop `reset_times` from `subject_integration_start`'s fold.
+    // Measured (#1535): the driver's origin moves to the first observation, 6, while the
+    // frozen-replay verifier's static replay still starts at the reset, so the run itself
+    // errors (`reactive=50, static=40.93653765390065` for the read at t=6) and the test dies
+    // at `.expect("run")` — before the closed-form comparison below, which would also fail.
     let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
     let obs = [6.0, 20.0, 40.0];
     let mut s = subj("1", obs.to_vec(), vec![]);

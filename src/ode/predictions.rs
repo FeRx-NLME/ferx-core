@@ -2734,9 +2734,13 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 ///
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
-/// integrates correctly and must not be refused. (The fixture that pins this starts from an
-/// empty compartment, so what it can see is "not `NaN`", not the value of `TIME` in the
-/// window — `adaptive_time_reading_rhs_is_not_refused_before_the_first_dose`.)
+/// integrates correctly and must not be refused. The dependence test backs that up — such a RHS
+/// reads no clock slot, so no stand-in can move it, and keying the candidates on
+/// `pk_reads_model_time` alone changes no verdict (measured, #1535) — which leaves the
+/// per-spelling keys two jobs: naming the spelling, and keeping the probe off a RHS that reads
+/// neither. (The fixture that pins the `TIME` case starts from an empty compartment, so what it
+/// can see is "not `NaN`", not the value of `TIME` in the window —
+/// `adaptive_time_reading_rhs_is_not_refused_before_the_first_dose`.)
 ///
 /// **And what nothing here sees**: once any state goes non-finite the solve stops advancing
 /// *every* state, so a run that survives this function can still return frozen, finite, wrong
