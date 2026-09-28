@@ -2877,7 +2877,6 @@ struct ClockDependence {
 ///   unanchored arm is the arm every `TAD ≤ 0` takes, so those runs already equal `predict()`
 ///   (measured bit-identical, and to 4.3e-16). The one shape only it could see — a RHS that is
 ///   non-finite on all of `[-L, 0]`, such as `TAD^(-0.5)` — is non-finite in `predict()` too.
-///
 /// - **Only states whose every component is finite** (#1570 review, row 2). `u` is probed as
 ///   well as `u_start` because an empty compartment at the start can hide a comparison that the
 ///   state filled during the segment makes visible. But once any component goes non-finite the
@@ -2887,10 +2886,10 @@ struct ClockDependence {
 ///   probed, which also keeps the verdict the same whatever the pad holds.
 /// - **The grid, not the endpoints.** A condition can hold only inside the window — `TAD`
 ///   between −8 and −6 on a 12 h one — so the ends alone would miss it.
-/// - **Compared only where the anchored derivative is finite.** An anchor that overflows the RHS
-///   by itself (`exp(-TAD)` at `TAD ≈ −800`) says nothing about the clock, and a component
-///   that is non-finite under every anchor — a state that arrived broken, from `init(...)` or a
-///   `NaN` bolus at the break — was not broken by this segment's clock. Then by value, with
+/// - **Compared only where the anchored derivative is finite.** A component whose derivative is
+///   non-finite under the anchor too — the anchor overflows the RHS by itself (`exp(-TAD)` at
+///   `TAD ≈ −800`), or the RHS is non-finite for every clock a schedule can give
+///   (`TAD^(-0.5)`) — is not something an anchor would fix. Then by value, with
 ///   IEEE `!=`: `NaN` differs from every finite value, while `-0.0 == 0.0`, since a zero
 ///   derivative is zero whatever its sign — and on an empty compartment
 ///   `-k·0·(1 − 0.1·min(TAD, 24))` does flip that sign between the unanchored clock and the
