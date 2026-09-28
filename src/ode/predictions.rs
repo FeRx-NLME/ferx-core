@@ -2898,9 +2898,10 @@ struct ClockDependence {
 /// - **All candidate slots take the anchor together for the verdict.** Both clocks are
 ///   unanchored by the same fact, and a reactive run would anchor both at its first dose.
 ///   Anchoring one while the other stays `NaN` would leave `(1 + TAD + TAFD)` non-finite under
-///   the anchor, where the comparison skips it — a false negative. The *naming* is per slot:
-///   with both unanchored, a slot is named when its `NaN` alone, the other anchored, moves the
-///   anchored derivative; when only the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
+///   the anchor, where the comparison skips it — a false negative. The *naming* is per slot, and
+///   is worked out only once the segment is found dependent: with both unanchored, a slot is
+///   named when its `NaN` alone, the other anchored, moves the anchored derivative; when only
+///   the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
 ///
 /// Its limits, stated rather than hidden — measured on #1570, filed as #1572, and left to the
 /// default-on frozen-replay verifier until then:
@@ -2911,9 +2912,9 @@ struct ClockDependence {
 /// - It samples 17 times, at `u_start` and `u` only, so a dependence between two sample times,
 ///   or one that shows only at states inside the window, is missed.
 ///
-/// Cost: at most `2 × 17 × 2` RHS evaluations per segment (`2 × 17 × 4` when both slots are
-/// candidates), and only on a segment with an unanchored clock the program reads. Nothing on
-/// segments with an anchored clock, and nothing on the RHS hot path.
+/// Cost: `2 × 17 × 2` RHS evaluations on a segment with an unanchored clock the program reads,
+/// plus `2 × 17 × 3` to name the slots when both are candidates and the segment is refused.
+/// Nothing on segments with an anchored clock, and nothing on the RHS hot path.
 #[allow(clippy::too_many_arguments)]
 fn unanchored_clock_dependence(
     ode: &OdeSpec,
@@ -2934,23 +2935,22 @@ fn unanchored_clock_dependence(
     let moves = |ran: f64, anchored: f64| anchored.is_finite() && ran != anchored;
 
     let n = u_start.len();
-    let (mut du_ran, mut du_anchored, mut du_alone) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+    let (mut du_ran, mut du_anchored) = (vec![0.0; n], vec![0.0; n]);
     // Every candidate slot at the window's end: the earliest anchor a schedule can give.
     let mut anchored = ext_params.to_vec();
     for &slot in &candidates {
         anchored[slot] = t_end;
     }
-    let mut alone_unanchored = ext_params.to_vec();
-    let mut depends = false;
-    let mut nan_reached_derivative = false;
-    let mut alone = [false; 2];
     let states: Vec<&[f64]> = [u_start, u]
         .into_iter()
         .filter(|state| state.iter().all(|x| x.is_finite()))
         .collect();
+    let times = (0..=CLOCK_PROBE_INTERVALS)
+        .map(|k| t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64));
+    let mut depends = false;
+    let mut nan_reached_derivative = false;
     for &state in &states {
-        for k in 0..=CLOCK_PROBE_INTERVALS {
-            let t = t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64);
+        for t in times.clone() {
             (ode.rhs)(state, ext_params, t, &mut du_ran);
             (ode.rhs)(state, &anchored, t, &mut du_anchored);
             for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
@@ -2959,23 +2959,31 @@ fn unanchored_clock_dependence(
                     nan_reached_derivative |= !ran.is_finite();
                 }
             }
-            // The naming, not the verdict: with both clocks unanchored, which one's `NaN`
-            // alone — the other anchored — moves the anchored derivative?
-            if candidates.len() > 1 {
+        }
+    }
+    if !depends {
+        return None;
+    }
+    // The naming, worked out only now that the segment is refused (#1570 review, row 6): with
+    // both clocks unanchored, which one's `NaN` alone — the other anchored — moves the anchored
+    // derivative?
+    let mut alone = [false; 2];
+    if candidates.len() > 1 {
+        let mut alone_unanchored = anchored.clone();
+        for &state in &states {
+            for t in times.clone() {
+                (ode.rhs)(state, &anchored, t, &mut du_anchored);
                 for (j, &slot) in candidates.iter().enumerate() {
                     alone_unanchored.copy_from_slice(&anchored);
                     alone_unanchored[slot] = f64::NAN;
-                    (ode.rhs)(state, &alone_unanchored, t, &mut du_alone);
-                    alone[j] |= du_alone
+                    (ode.rhs)(state, &alone_unanchored, t, &mut du_ran);
+                    alone[j] |= du_ran
                         .iter()
                         .zip(&du_anchored)
                         .any(|(&ran, &anch)| moves(ran, anch));
                 }
             }
         }
-    }
-    if !depends {
-        return None;
     }
     // One candidate is named by the verdict itself. Two are named by what each does alone —
     // unless only the pair moves the derivative, which names both.
@@ -3289,7 +3297,7 @@ fn integrate_segment(
 
     // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
     // before this segment, SS-aware (gives TAD = t - last_dose_eff).
-    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor(subject, dose_lagtimes, t_start);
+    ext_params[TAD_ANCHOR_SLOT] = tad_anchor(subject, dose_lagtimes, t_start);
 
     // Integrate. If any infusions are active in this segment, wrap
     // the user RHS so it adds `+rate` to each infusion's compartment.
