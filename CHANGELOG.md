@@ -2606,7 +2606,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — and the fit reports them through the `ode_solver` warning (#1080). The
   threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
   convention), so name a method explicitly on an unusual time scale. See
-  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
+  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method--auto).
 - **Fits now report what the ODE solver did (#1080).** A new `ode_solver` warning summarises one
   post-fit prediction pass over every subject: steps that clamped at the minimum step size (a
   stability-limited segment whose un-integrated tail is freeze-padded with the last state), segments
