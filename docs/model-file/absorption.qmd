@@ -80,28 +80,58 @@ delivers the mass.
   as for ordinary doses — see [Bioavailability](ode-models.qmd#bioavailability).
   Do **not** multiply `transit(...)` by `F` in the RHS.
 - **Lagtime** shifts `tad` (the input starts at `dose time + lagtime`).
-- **Multiple doses** superpose: `R_in` is summed per dose. With **IOV** on the
-  transit parameters, an absorption tail that is still appearing when the next
-  occasion begins is evaluated with the *current* occasion's `n`/`mtt` — exact
-  when `II` exceeds the absorption window (the usual case) and for IIV-only
-  models, approximate only for overlapping occasions.
+- **Multiple doses** superpose: `R_in` is summed per dose, each dose through the
+  `n`/`mtt` of **its own dose record** — see
+  [Absorption parameters are read at the dose record](#absorption-at-dose).
+
+### Absorption parameters are read at the dose record {#absorption-at-dose}
+
+Every built-in absorption forcing — `transit`, `igd`, `weibull`, `first_order`,
+`zero_order` — is a **per-dose** input: dose `d` enters as
+`F · Dose · FR · R_in(t − t_d − lagtime − lag_route)`, and `R_in` integrates to 1.
+ferx reads **all** of a dose's absorption parameters at **its own dose record**,
+as it always has for `F` and the lagtime: the kernel (`n`/`mtt`, `mat`/`cv2`,
+`td`/`beta`, `ka`, `dur`), the pathway fraction `FR` and the per-route `lag=`. Only
+the **disposition** — the rest of the right-hand side, e.g. `CL` and `V` — follows
+the current interval.
+
+This matters only when an absorption parameter changes while a dose is still
+absorbing: IOV on `MTT` / `MAT` / `KA`, or a time-varying covariate (or `TIME`) in
+one. Each dose then keeps its own kernel to the end and delivers exactly
+`F · Dose · FR`. Re-reading the kernel in every interval, as ferx did before
+[#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569), splices two densities at
+the same time since dose, and that creates or destroys drug. One transit dose
+(`n = 3`) whose `MTT` changes once, mid-absorption:
+
+| `MTT` change | at `t` | absorbed, re-read per interval | absorbed, fixed at dose |
+|---|---|---|---|
+| 4.0 → 2.5 | 5 | 0.777 | 1.000 |
+| 2.0 → 4.0 | 2 | 1.424 | 1.000 |
+| 4.0 → 2.0 | 3 | 0.504 | 1.000 |
+
+With IOV only on disposition parameters (`CL`, `V`, `Q`, `V2`), or occasions spaced
+beyond the absorption window, the two rules coincide and predictions do not change.
+
+**NONMEM.** A `$DES` that reads the *current* `MTT` for every dose has the same
+artefact. To reproduce ferx, capture each dose's kernel at its dose record in `$PK`
+(under IOV: the dose's occasion) and superpose the doses in `$DES` —
+`nonmem_anchor/transit_iov_mtt.ctl` and `ig_iov_mat.ctl` do exactly that, and are
+the reference ferx is validated against.
 
 ### Parameter domains
 
 The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
 
-- **Typical values** (η = κ = 0) are validated at fit time, at **every dose,
-  observation and EVID=2 record's own snapshot** — that record's covariate values
-  and its `TIME` — because the engine rebuilds this forcing per segment from the
-  last event's snapshot, so a parameter that only leaves the domain at a later
-  observation is one it really does apply
-  ([#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235)). EVID=3/4 **reset**
-  rows are not in that set: the segment ending at a reset is discarded by the
-  re-seed, so a value reached only there is never applied and is not rejected. A
-  non-finite or out-of-domain typical value is rejected with
-  `E_ABSORPTION_DOMAIN` — a clear error, not an opaque `NaN` fit failure — and
-  the message names the record. Constrain the parameter so it stays in range,
-  e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
+- **Typical values** (η = κ = 0) are validated at fit time, at **every dose
+  record's own snapshot** — that record's covariate values and its `TIME` — which
+  is where the engine reads them
+  ([#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235),
+  [#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)). A value that leaves
+  the domain only at an observation, an EVID=2 row or an EVID=3/4 reset is never
+  applied, and is not rejected. A non-finite or out-of-domain typical value is
+  rejected with `E_ABSORPTION_DOMAIN` — a clear error, not an opaque `NaN` fit
+  failure — and the message names the dose. Constrain the parameter so it stays in
+  range, e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
 - **Transient mid-fit excursions** are clamped. With an additive
   parameterisation (`MTT = TVMTT + ETA_MTT`), the inner EBE search or a
   finite-difference step can momentarily push `mtt ≤ 0` / `n < 0` even though the
@@ -498,8 +528,8 @@ convention:
 - **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
   exactly as for `transit`. Do not multiply `igd(...)` by `F`.
 - **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values
-  (`E_ABSORPTION_DOMAIN`), at **every dose, observation and EVID=2 record's own
-  snapshot** exactly as for `transit` above, and clamped for transient mid-fit
+  (`E_ABSORPTION_DOMAIN`), at **every dose record's own snapshot** exactly as for
+  `transit` above, and clamped for transient mid-fit
   excursions — a log-normal parameterisation avoids excursions and is recommended.
 - Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
@@ -546,13 +576,13 @@ Rules for the fraction multiplier:
   is rejected — a single pathway is written bare). This *structural* rule is checked
   at **parse time**, so it fires for every entry point. The *value* checks — each
   fraction in `(0, 1]` and the fractions summing to ≈ 1 (`E_ABSORPTION_FRACTION`) —
-  are evaluated at typical values by `fit()` / `ferx check`, at **every record's own
-  snapshot** as for the domain checks above, and enforced on `predict()` /
-  `simulate()` as well (#588, #1235). On a compartment that mixes a `zero_order`
-  pathway with a density one the sum is checked at **dose records only**, because
-  that is the one record kind at which the engine reads both fractions — the
-  density's per segment, the zero-order's at dose time. Two pathways together still
-  deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
+  are evaluated at typical values by `fit()` / `ferx check`, at **every dose
+  record's own snapshot** as for the domain checks above, and enforced on
+  `predict()` / `simulate()` as well (#588, #1235). A dose's fractions are read at
+  its dose record and held for its whole absorption
+  ([#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)), so the pathways
+  together deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`) even when a
+  covariate moves a fraction mid-absorption.
 - The same multiplier works for `transit`/`weibull`/`first_order` terms, and on
   `zero_order(...)` as part of a `mixed` model — see
   [Parallel / mixed absorption](#parallel-mixed)
@@ -633,8 +663,8 @@ Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
 - **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
   exactly as for `transit`. Do not multiply `weibull(...)` by `F`.
 - **Parameter domains** `td > 0`, `beta > 0` are validated at typical values
-  (`E_ABSORPTION_DOMAIN`), at **every dose, observation and EVID=2 record's own
-  snapshot** exactly as for `transit` above, and clamped for transient mid-fit
+  (`E_ABSORPTION_DOMAIN`), at **every dose record's own snapshot** exactly as for
+  `transit` above, and clamped for transient mid-fit
   excursions — a log-normal parameterisation avoids excursions and is recommended.
 - Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
@@ -792,8 +822,9 @@ See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
 *wider* analytic scope combined with an EVID 3/4 reset or time-varying covariates:
 all four stay analytic there (#486) — the reset case turns off a dose's pre-reset
-tail exactly like the infusion rule, and the TV-cov case hoists the forcing's
-constants fresh per segment on the event-driven walk. Combined with an **estimated
+tail exactly like the infusion rule, and the TV-cov case builds each dose's forcing
+constants once, from its own dose record (#1569), on the event-driven walk. Combined
+with an **estimated
 lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continuous
 `∂R_in/∂lag` rides the walk's dual time-after-dose, and the forcing's onset at the
 dose's lagged arrival is injected as an exact rate-on saltation — the sign-mirror of

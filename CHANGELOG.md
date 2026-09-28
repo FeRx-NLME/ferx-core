@@ -19,6 +19,33 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **A dose now keeps the absorption parameters of its own dose record for its whole
+  absorption** (#1569). Every built-in absorption forcing (`transit`, `igd`, `weibull`,
+  `first_order`) reads its kernel parameters, its pathway fraction `FR` and its per-route
+  `lag=` at the dose record, as `F`, the lagtime and `zero_order`'s window already were.
+  Only the disposition (`CL`, `V`, …) follows the current interval. Until now the kernel
+  was re-read in every interval, so a dose still absorbing when IOV or a time-varying
+  covariate moved `MTT` / `MAT` / `KA` / `FR` / `lag=` created or destroyed drug. One
+  transit dose (`n = 3`) whose `MTT` changes once mid-absorption now absorbs exactly its
+  mass, where it absorbed:
+
+  | `MTT` change | at `t` | before | now |
+  |---|---|---|---|
+  | 4.0 → 2.5 | 5 | 0.777 | 1.000 |
+  | 2.0 → 4.0 | 2 | 1.424 | 1.000 |
+  | 4.0 → 2.0 | 3 | 0.504 | 1.000 |
+
+  **Results move** for models with IOV or a time-varying covariate on an absorption
+  parameter, where a dose is still absorbing when the parameter changes. This includes
+  closed-form `pk *_transit` / `*_ig` models, whose IOV and TV-covariate subjects run on
+  the ODE twin. With IOV or covariates only on disposition parameters, predictions are
+  bit-identical. The typical-value checks `E_ABSORPTION_DOMAIN` / `E_ABSORPTION_FRACTION`
+  now evaluate at dose records only, so a value out of range only at an observation or
+  EVID=2 row, which is never applied, is no longer rejected, and `predict()` serves it.
+  Validated against NONMEM 7.6.0 (`nonmem_anchor/transit_iov_mtt`, `ig_iov_mat`: `$DES`
+  with a per-dose kernel).
+
 ## [0.4.0] - 2026-09-25
 
 **Upgrading from 0.3.1.** Most of this release is fixes, but a few changes can stop an
