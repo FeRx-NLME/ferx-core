@@ -4706,6 +4706,19 @@ fn tad_refusal_error(
     obs: &[f64],
     base: Vec<DoseEvent>,
 ) -> String {
+    tad_refusal(src, decisions, dose_idx, obs, base)
+        .expect("an unanchored dose clock must be refused, not returned as NaN")
+}
+
+/// [`tad_refusal_error`] without the expectation: `Some(message)` when the run is refused,
+/// `None` when it returns — for a cell whose failure message must say which mechanism missed.
+fn tad_refusal(
+    src: &str,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    obs: &[f64],
+    base: Vec<DoseEvent>,
+) -> Option<String> {
     let model = parse_model_string(src).expect("parse model-time-reading ODE model");
     let pop = population(vec![subj("1", obs.to_vec(), base)]);
     let opts = AdaptiveSimulateOptions {
@@ -4714,7 +4727,7 @@ fn tad_refusal_error(
         verify: false,
         ..Default::default()
     };
-    let err = simulate_adaptive(
+    simulate_adaptive(
         &model,
         &pop,
         &model.default_params,
@@ -4722,8 +4735,8 @@ fn tad_refusal_error(
         || dose_at_decisions(dose_idx.clone()),
         &opts,
     )
-    .expect_err("an unanchored dose clock must be refused, not returned as NaN");
-    format!("{err}")
+    .err()
+    .map(|err| format!("{err}"))
 }
 
 /// Every prediction is finite, with the worst relative gap against `want` reported.
@@ -5258,16 +5271,18 @@ const ODE_TAD_IN_UNTAKEN_BRANCH: &str = r#"
   ode_abstol = 1e-14
 "#;
 
-/// `TAD` read only in a *condition*. `NaN > 5.0` is `false` (IEEE: every comparison against NaN
-/// is false, verified by this test's green run, not recalled), so the unanchored window takes the
-/// else arm and nothing non-finite reaches the state — while `pk_reads_tad()` is still true.
+/// `TAD` read only in a *condition*. `NaN > 5.0` is `false` (IEEE: an ordering comparison
+/// against NaN is false, verified by this test's green run, not recalled), so the unanchored
+/// window takes the else arm and nothing non-finite reaches the state — while `pk_reads_tad()` is
+/// still true.
 ///
 /// **The `NaN` still chose the arm.** This fixture agrees with `predict()` only because
-/// `central ≡ 0` on `(0, 12]`, where both arms give a zero derivative, so which one ran cannot
-/// show. Flip the inequality and give the compartment a non-zero start and the two engines
-/// diverge — that is `ODE_TAD_IN_A_COMPARISON` and row 8b of the message table. So this cell
-/// pins "a condition read is not refused"; it does NOT pin "a condition read is harmless"
-/// (#1534 review round 2, finding B, correcting round 1's reading).
+/// `central ≡ 0` on the window, where both arms give a zero derivative, so which one ran cannot
+/// show — and that is exactly why it is not refused: no anchor can move a derivative that is
+/// zero in both arms (#1535). Give the compartment a non-zero start and the arms differ, the
+/// derivative depends on the clock, and the window is refused; the test below runs that twin.
+/// So this cell pins "a condition read that cannot move the derivative is not refused", not
+/// "a condition read is harmless" (#1534 review round 2, finding B).
 const ODE_TAD_IN_CONDITION_ONLY: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -5297,9 +5312,9 @@ fn adaptive_tad_in_an_untaken_branch_is_not_refused() {
     // T5 refuses — but this RHS only evaluates `TAD` after t=20, when the clock is anchored.
     // The run must complete and match `predict()` on the realized schedule.
     //
-    // Mutation that reddens it: move the guard back before `integrate_segment` (equivalently,
-    // drop its `u.iter().all(is_finite)` conjunct). The run is then refused, although the
-    // trajectory it would have produced is finite and verifier-clean.
+    // Mutation that reddens it: drop the dependence test — refuse whenever `TAD` is read and
+    // unanchored, which is also the pre-#1534 guard. The run is then refused, although no
+    // anchor moves this window's derivative and the trajectory is finite and verifier-clean.
     let decisions = [12.0, 36.0];
     let obs = [6.0, 20.0, 40.0];
     let (adaptive, static_pred) = tad_oracle_cell(
@@ -5328,13 +5343,22 @@ fn adaptive_tad_in_an_untaken_branch_is_not_refused() {
 }
 
 #[test]
-fn adaptive_tad_read_only_in_a_condition_is_not_refused() {
-    // #1534 review, finding 1. Here `TAD` reaches nothing but a comparison. In the unanchored
-    // window the driver tests `NaN > 5.0` and the static engine tests `-6 > 5.0`; both are
-    // false, both take the else arm, and the two agree — the `NaN` is consumed by the predicate
-    // and never enters the state.
+fn adaptive_tad_read_only_in_a_condition_is_refused_only_when_the_arm_matters() {
+    // #1534 review, finding 1, and #1535's straddle. Here `TAD` reaches nothing but a
+    // comparison. In the unanchored window the driver tests `NaN > 5.0` and the static engine
+    // tests `-6 > 5.0`; both are false, both take the else arm — the `NaN` is consumed by the
+    // predicate and never enters the state.
     //
-    // Mutation that reddens it: the same one as the test above.
+    // Leg 1, `ODE_TAD_IN_CONDITION_ONLY` as written: `central ≡ 0` on the window, so both arms
+    // give the same zero derivative, no anchor can move it, and the run is valid and matches
+    // `predict()`. Leg 2, its twin with `init(central) = 50` and nothing else changed: the arms
+    // now differ (`TAD > 5` holds at the window's last grid points under the `t_start`
+    // stand-in), the derivative depends on the clock, and the window is refused. One input
+    // varied, in one test, so a gate stuck on either verdict fails here.
+    //
+    // Mutations that redden it: replace the dependence test with a load test — refuse whenever
+    // the clock is read and unanchored (leg 1 is then refused); drop the dependence test's
+    // refusal (leg 2 then runs).
     let decisions = [12.0, 36.0];
     let obs = [6.0, 20.0, 40.0];
     let (adaptive, static_pred) = tad_oracle_cell(
@@ -5355,13 +5379,42 @@ fn adaptive_tad_read_only_in_a_condition_is_not_refused() {
     //
     // Read the fixture's doc comment before trusting this agreement: it is degenerate. Both
     // arms give a zero derivative on `central ≡ 0`, so equality here does not say the arm
-    // choice was right — `adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier`
-    // is the cell where it shows.
+    // choice was right — leg 2 below, and `adaptive_tad_consumed_by_a_comparison_is_refused`,
+    // are the cells where it shows.
     let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
     assert!(
         vs_static <= 1e-12,
-        "a TAD read confined to a condition must run, and track predict(): worst rel \
-         {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+        "leg 1: a TAD read confined to a condition that cannot move the derivative must run, \
+         and track predict(): worst rel {vs_static:e} (adaptive={adaptive:?}, \
+         static={static_pred:?})"
+    );
+
+    // Leg 2: the twin. The straddle is asserted, not assumed — the two sources differ by the
+    // `init` line and by nothing else.
+    let twin =
+        ODE_TAD_IN_CONDITION_ONLY.replacen("[odes]\n", "[odes]\n  init(central) = 50.0\n", 1);
+    assert_ne!(
+        twin, ODE_TAD_IN_CONDITION_ONLY,
+        "the twin must add the init line"
+    );
+    assert_eq!(
+        twin.replacen("  init(central) = 50.0\n", "", 1),
+        ODE_TAD_IN_CONDITION_ONLY,
+        "the twin must differ from leg 1 by the init line alone"
+    );
+    let err = tad_refusal(&twin, &decisions, vec![0, 1], &obs, vec![]).unwrap_or_else(|| {
+        panic!(
+            "leg 2: with `central` at 50 the arms differ, so the unanchored `TAD > 5` decides \
+             the derivative — the window must be refused"
+        )
+    });
+    assert!(
+        err.contains("`TAD`") && err.contains("(6, 12]"),
+        "leg 2: must name the slot and the window: {err}"
+    );
+    assert!(
+        err.contains("The derivative it computes there changes when that clock is anchored"),
+        "leg 2: must say what was measured: {err}"
     );
 }
 
@@ -5456,9 +5509,11 @@ const ODE_TAD_PLUS_DIVERGENT_STATE: &str = r#"
 "#;
 
 /// `TAD` consumed by a **comparison**, with a non-zero starting state so the arm it chooses is
-/// observable. `NaN < 5.0` is false, so the unanchored window silently takes the else arm; the
-/// state stays finite and the guard never fires. `min`/`max` desugar to the same shape
-/// (`if (a <= b) …`), so `min(TAD, 24)` yields 24 there by the same route.
+/// observable. `NaN < 5.0` is false, so the unanchored window silently takes the else arm and
+/// the state stays finite — which, until #1535 gated the refusal on the derivative's dependence
+/// on the clock rather than on a non-finite state, meant the guard never fired. `min`/`max`
+/// desugar to the same shape (`if (a <= b) …`), so `min(TAD, 24)` yields 24 there by the same
+/// route (`ODE_TAD_IN_A_MIN`).
 ///
 /// `init(central) = 50` and an observation at t=0 are both load-bearing. Without the non-zero
 /// start the pre-dose window is identically zero and both arms give a zero derivative, so the
@@ -5489,7 +5544,33 @@ const ODE_TAD_IN_A_COMPARISON: &str = r#"
   ode_abstol = 1e-14
 "#;
 
-/// The autonomous control for the fixture above: same `init`, same schedule, no clock anywhere.
+/// `ODE_TAD_IN_A_COMPARISON`'s other spelling, the #1535 issue's second regression cell: `min`
+/// desugars to `if (a <= b) a else b`, so an unanchored `min(TAD, 24)` silently yields 24.
+const ODE_TAD_IN_A_MIN: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * min(TAD, 24.0))
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// The autonomous control for the two fixtures above: same `init`, same schedule, no clock
+/// anywhere.
 /// It agrees with `predict()` exactly, which is what makes the divergence below attributable to
 /// `TAD` rather than to the non-zero start or to #936's integration origin.
 const ODE_INIT50_AUTONOMOUS: &str = r#"
@@ -5602,25 +5683,22 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
 }
 
 #[test]
-fn adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier() {
-    // #1534 review round 2, finding B — message-table row 8b, and the honest statement of what
-    // this guard does NOT cover.
+fn adaptive_tad_consumed_by_a_comparison_is_refused() {
+    // #1535 — the issue's two regression cells, until then row 8b of the #1534 message table,
+    // "caught only by the verifier". The unanchored `NaN` never reaches the state here: it is
+    // consumed by `TAD < 5.0` (false, so the else arm runs) or by `min(TAD, 24)` (which yields
+    // 24). The run used to return a number that depended on which way the comparison fell —
+    // measured at `68c9f5c0` with `verify: false`: `[50, 27.44…, 19.02…, 31.28…]` and
+    // `[50, 23.76…, 48.43…, 71.53…]`, against `predict()`'s `[50, 8.26…, 16.76…, 31.14…]` and
+    // `[50, 28.96…, 50.56…, 71.75…]` on the realized schedule. With the default `verify: true`
+    // only the frozen-replay verifier caught it, as a symptom that never named the clock.
     //
-    // The unanchored `NaN` never reaches the state here: it is consumed by `TAD < 5.0`, which
-    // is false, so the else arm runs. The state stays finite, the outcome conjunct blocks the
-    // refusal, and the run returns a number that depends on which way the comparison fell —
-    // measured [50, 27.44…, 19.02…, 31.28…] against `predict()`'s [50, 8.26…, 16.76…, 31.14…].
-    // The default-on frozen-replay verifier is the one net that catches it, and it reports the
-    // divergence as a symptom without naming the clock.
+    // The dependence test sees it directly: on `(0, 12]` the derivative changes when `TAD` is
+    // anchored. Both verifier settings must return the typed refusal — the driver refuses
+    // before the verifier runs, so `verify: true` no longer reports the symptom.
     //
-    // The decision to accept that (rather than gate on evaluation, which would need a
-    // per-segment "slot was loaded" flag in the RHS evaluator) is recorded in the docs page
-    // and filed as a follow-up; this test is what stops the behaviour changing silently.
-    //
-    // Mutations that redden it: make the guard fire on this shape (then the `verify: false`
-    // arm errors); or drop the verifier's divergence check (then the `verify: true` arm
-    // returns `Ok`).
-    let model = parse_model_string(ODE_TAD_IN_A_COMPARISON).expect("parse comparison-TAD model");
+    // Mutation that reddens it: restore the finite-state early return
+    // (`if u.iter().all(is_finite) { return None }`) — every arm then runs again.
     let obs = vec![0.0, 6.0, 20.0, 40.0];
     let decisions = vec![12.0, 36.0];
 
@@ -5637,69 +5715,81 @@ fn adaptive_tad_consumed_by_a_comparison_is_caught_only_by_the_verifier() {
         );
     }
 
-    // `verify: false` — silent, and wrong.
     let pop = population(vec![subj("1", obs.clone(), vec![])]);
-    let quiet = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: decisions.clone(),
-        verify: false,
-        ..Default::default()
-    };
-    let res = simulate_adaptive(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        || dose_at_decisions(vec![0, 1]),
-        &quiet,
-    )
-    .expect("with the verifier off, a comparison-consumed NaN is not refused");
-    let adaptive: Vec<f64> = res.trajectories.iter().map(|t| t.ipred).collect();
-    assert!(
-        adaptive.iter().all(|v| v.is_finite()),
-        "the state stays finite — that is the whole point of this cell: {adaptive:?}"
-    );
+    for (shape, src) in [
+        ("if (TAD < 5)", ODE_TAD_IN_A_COMPARISON),
+        ("min(TAD, 24)", ODE_TAD_IN_A_MIN),
+    ] {
+        let model = parse_model_string(src).expect("parse comparison-TAD model");
+        for verify in [false, true] {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(1),
+                decision_times: decisions.clone(),
+                verify,
+                ..Default::default()
+            };
+            let err = simulate_adaptive(
+                &model,
+                &pop,
+                &model.default_params,
+                1,
+                || dose_at_decisions(vec![0, 1]),
+                &opts,
+            )
+            .expect_err("a clock consumed by a comparison must be refused, not returned");
+            let err = format!("{err}");
+            let cell = format!("`{shape}`, verify: {verify}");
+            assert!(
+                err.contains("`TAD`") && err.contains("(0, 12]"),
+                "{cell}: must name the slot and the window: {err}"
+            );
+            assert!(
+                err.contains(
+                    "The derivative it computes there changes when that clock is anchored"
+                ),
+                "{cell}: must say what was measured: {err}"
+            );
+            assert!(
+                err.contains("an `if`, `min` or `max` on it picks a side"),
+                "{cell}: must say how a finite run can depend on the clock: {err}"
+            );
+            assert!(
+                err.contains("The observation at t=6 is read off that segment"),
+                "{cell}: must name the read in the window: {err}"
+            );
+            assert!(
+                !err.contains("non-finite state"),
+                "{cell}: the state stayed finite — the non-finite opener would be false: {err}"
+            );
+            assert!(
+                !err.contains("frozen-schedule replay verification failed"),
+                "{cell}: the driver refuses before the verifier runs: {err}"
+            );
+        }
+    }
 
-    let static_doses: Vec<DoseEvent> = decisions
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
-    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
-    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
-    let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
-    // Measured 27.440581804704640 vs 8.264944411082405 at t=6 — a factor of 3.3, not a
-    // tolerance question. Asserting the DIVERGENCE (not a bound) is what keeps this test
-    // honest: it exists to record that the two engines disagree here.
-    let gap = (adaptive[1] - static_pred[1]).abs() / static_pred[1].abs();
-    assert!(
-        gap > 1.0,
-        "the arm the NaN comparison chose must visibly differ from predict()'s: \
-         adaptive={adaptive:?}, static={static_pred:?} (rel gap {gap:e})"
+    // The advice is true for this class too: a controller dose at the subject's first record
+    // (t=0) leaves no unanchored window, and the run is valid and equal to `predict()`.
+    let (fixed, fixed_static) = tad_oracle_cell(
+        ODE_TAD_IN_A_COMPARISON,
+        &[0.0, 12.0, 36.0],
+        vec![0, 1, 2],
+        &obs,
+        vec![],
     );
-
-    // `verify: true` (the default) — the divergence is caught, as a symptom.
-    let verified = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: decisions,
-        ..Default::default()
-    };
-    let err = simulate_adaptive(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        || dose_at_decisions(vec![0, 1]),
-        &verified,
-    )
-    .expect_err("the frozen-replay verifier must catch what this guard cannot");
-    let err = format!("{err}");
-    assert!(
-        err.contains("frozen-schedule replay verification failed"),
-        "the net here is the verifier, not the dose-clock guard: {err}"
+    // Measured worst rel 5.1e-12, at t=20: the RHS switches arm at `TAD` = 5 (t = 5 and 17),
+    // which neither engine breaks on, so the gap is their two step sequences' error across it
+    // at `ode_reltol = 1e-12` — as in the untaken-branch cell at default tolerances. The bound
+    // carries 20× headroom, against the factor-3.3 gap the unanchored run had at t=6.
+    let vs_static = worst_rel(
+        &fixed,
+        &fixed_static,
+        "advice applied: adaptive vs predict()",
     );
     assert!(
-        !err.contains("has no referent"),
-        "this shape is outside the guard's reach — it must not claim the credit: {err}"
+        vs_static <= 1e-10,
+        "with the advice applied the run must match predict(): worst rel {vs_static:e} \
+         (adaptive={fixed:?}, static={fixed_static:?})"
     );
 }
 
@@ -5886,6 +5976,158 @@ fn adaptive_tad_rhs_refuses_a_long_window_whose_clock_term_survives_only_forward
     assert!(
         err.contains("(0, 800]"),
         "must name the refused window: {err}"
+    );
+}
+
+// ============ #1535: the dependence test's probe — stand-ins and grid ============
+//
+// Each fixture below depends on the unanchored clock in a way only one part of the probe can
+// see, so dropping that part lets the window run unrefused. All three start from
+// `init(central) = 50` (an empty compartment gives a zero derivative under every anchor) with a
+// record at t=0, so the refused window is `(0, 12]`.
+
+/// `TAD` clamped below at zero: `max(TAD, 0)` is `if (TAD >= 0) TAD else 0`. The unanchored
+/// clock takes the else arm (0) — and so does every `TAD ≤ 0`, which is all the `t_end`
+/// stand-in produces (`[-L, 0]`). Only the `t_start` stand-in (`[0, L]`) separates them.
+const ODE_TAD_CLAMPED_BELOW: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central * (1.0 + 0.05 * max(TAD, 0.0))
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// The mirror: `min(TAD, 0)` equals its unanchored arm (0) for every `TAD ≥ 0`, all the
+/// `t_start` stand-in produces, so only the `t_end` stand-in separates them.
+const ODE_TAD_CLAMPED_ABOVE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central * (1.0 - 0.05 * min(TAD, 0.0))
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// A condition that holds only INSIDE the window: `TAD` between 2 and 4. Under the `t_start`
+/// stand-in the grid's interior points `TAD` = 2.25, 3 and 3.75 fall in it; the endpoints
+/// (`TAD` = 0 and 12) and every `t_end` point (`TAD ≤ 0`) take the else arm, as the unanchored
+/// clock does.
+const ODE_TAD_IN_AN_INTERIOR_WINDOW: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  if (TAD > 2.0 && TAD < 4.0) { d/dt(central) = -(CL / V) * central * 3.0 }
+  else                         { d/dt(central) = -(CL / V) * central }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+#[test]
+fn adaptive_tad_dependence_needs_both_stand_ins() {
+    // #1535 T6 — why the dependence test anchors the clock at BOTH `t_start` and `t_end`. Each
+    // fixture is blind to one of them: `max(TAD, 0)` agrees with its unanchored arm on all of
+    // `[-L, 0]`, which is everything the `t_end` stand-in produces, and `min(TAD, 0)` agrees
+    // with it on all of `[0, L]`, everything `t_start` produces. Both are refused only because
+    // both stand-ins run.
+    //
+    // Before #1535 this role belonged to the `exp(±TAD)` pair above, whose counterfactual
+    // re-solve overflowed under one stand-in. The dependence test compares point by point, so
+    // an overflow at some grid points no longer hides the rest, and that pair is now refused
+    // by either stand-in alone.
+    //
+    // Mutations that redden it, one cell each: drop the `t_start` stand-in (the `max` cell
+    // runs); drop the `t_end` stand-in (the `min` cell runs).
+    for (shape, src, only) in [
+        ("max(TAD, 0)", ODE_TAD_CLAMPED_BELOW, "t_start"),
+        ("min(TAD, 0)", ODE_TAD_CLAMPED_ABOVE, "t_end"),
+    ] {
+        let err = tad_refusal(
+            src,
+            &[12.0, 36.0],
+            vec![0, 1],
+            &[0.0, 6.0, 20.0, 40.0],
+            vec![],
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "`{shape}` is seen only by the `{only}` stand-in: without it the unanchored \
+                     window runs unrefused"
+            )
+        });
+        assert!(
+            err.contains("`TAD`") && err.contains("(0, 12]"),
+            "`{shape}`: must name the slot and the window: {err}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_tad_dependence_is_probed_inside_the_window_not_only_at_its_ends() {
+    // #1535 T7. `TAD` between 2 and 4 matters only inside the window: at both of its ends, and
+    // under the `t_end` stand-in everywhere, the unanchored run and the anchored one take the
+    // same arm. Only the grid's interior points 2.25, 3 and 3.75 (under `t_start`) separate
+    // them.
+    //
+    // Mutation that reddens it: probe the endpoints only (`k ∈ {0, 16}`).
+    let err = tad_refusal(
+        ODE_TAD_IN_AN_INTERIOR_WINDOW,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[0.0, 6.0, 20.0, 40.0],
+        vec![],
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "`TAD` in (2, 4) is seen only at the grid's interior points: probing the window's \
+             ends alone lets it run unrefused"
+        )
+    });
+    assert!(
+        err.contains("`TAD`") && err.contains("(0, 12]"),
+        "must name the slot and the window: {err}"
     );
 }
 

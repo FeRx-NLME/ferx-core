@@ -12754,6 +12754,11 @@ fn frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge() {
 /// `rhs_program: None`, which is exactly the "no program ⇒ nothing to refuse" arm. Pair it
 /// with [`dose_clock_ext_params`], which puts `CL = 5`, `V = 50` in the PK slots.
 fn dose_clock_ode_spec(odes: &str) -> OdeSpec {
+    dose_clock_ode_spec_with_states("central", odes)
+}
+
+/// [`dose_clock_ode_spec`] with more states than `central` (which stays the observed one).
+fn dose_clock_ode_spec_with_states(states: &str, odes: &str) -> OdeSpec {
     let src = format!(
         r#"
 [parameters]
@@ -12765,7 +12770,7 @@ fn dose_clock_ode_spec(odes: &str) -> OdeSpec {
   CL = TVCL
   V  = TVV
 [structural_model]
-  ode(obs_cmt=central, states=[central])
+  ode(obs_cmt=central, states=[{states}])
 [odes]
 {odes}
 [error_model]
@@ -12910,6 +12915,59 @@ fn unanchored_dose_clock_error_opens_with_a_non_finite_state_only_when_the_clock
     assert!(
         !d.contains("non-finite state"),
         "cell D: the state is finite: {d}"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_probes_the_end_state_only_when_it_is_finite() {
+    // #1535. A comparison on an EMPTY compartment cannot move the derivative — both arms give
+    // zero — so at `u_start` this window looks clock-independent; by the end state `central`
+    // has filled, and the arms differ. `u` is probed for exactly that, but only when every
+    // component is finite: once any state diverges the solver pads every state with its last
+    // value (#1539), so the finite components of a partly non-finite `u` are that pad, not an
+    // integrated state. Two cells, both sides of the gate:
+    //
+    //   end state `u`   probed   verdict
+    //   [30, 5]         yes      refused — the arms differ at central = 30
+    //   [30, inf]       no       not refused
+    //
+    // Mutations that redden it: drop the end-state probe (the first cell runs); probe a partly
+    // non-finite end state (the second cell is refused).
+    let ode = dose_clock_ode_spec_with_states(
+        "central, X",
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }\n  \
+         d/dt(X) = 0.5 * X * X",
+    );
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = dose_clock_ext_params();
+    let u_start = [0.0, 1.0];
+
+    assert!(
+        unanchored_dose_clock_error(
+            &ode,
+            &subject,
+            &u_start,
+            &[30.0, 5.0],
+            &ext_params,
+            0.0,
+            12.0
+        )
+        .is_some(),
+        "a finite end state where the arms differ shows the clock dependence"
+    );
+    assert!(
+        unanchored_dose_clock_error(
+            &ode,
+            &subject,
+            &u_start,
+            &[30.0, f64::INFINITY],
+            &ext_params,
+            0.0,
+            12.0
+        )
+        .is_none(),
+        "a partly non-finite end state is the solver's pad, and is not taken as evidence"
     );
 }
 

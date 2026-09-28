@@ -2864,6 +2864,11 @@ struct ClockDependence {
 /// depends on the clock iff some derivative component differs. Each of these choices is pinned
 /// by a test:
 ///
+/// - **The end state too, but only a finite one.** An empty compartment at `u_start` can hide a
+///   comparison that the state filled during the segment makes visible, so `u` is probed as
+///   well. But once any component has gone non-finite the solver pads every state with its last
+///   value (#1539), so the finite components of such a `u` are that pad, not an integrated
+///   state — the evidence the old counterfactual was taking. A partly non-finite `u` is skipped.
 /// - **Two stand-ins, `t_start` and `t_end`.** `t_start` puts `TAD` in `[0, L]` for a window of
 ///   length `L`; `t_end` puts it in `[-L, 0]`, the sign `predict()` uses before a dose. A shape
 ///   can be blind to either one: `max(TAD, 0)` equals its `NaN` arm (0) on all of `[-L, 0]`,
@@ -2922,13 +2927,7 @@ fn unanchored_clock_dependence(
     let end_state = u.iter().all(|x| x.is_finite()).then_some(u);
     for state in std::iter::once(u_start).chain(end_state) {
         for k in 0..=CLOCK_PROBE_INTERVALS {
-            // The last point is `t_end` itself, not `t_start + (t_end − t_start)`, which can
-            // round past it and hand the `t_end` stand-in a spurious positive `TAD`.
-            let t = if k == CLOCK_PROBE_INTERVALS {
-                t_end
-            } else {
-                t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64)
-            };
+            let t = t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64);
             (ode.rhs)(state, ext_params, t, &mut du_ran);
             for stand_in in [t_start, t_end] {
                 for &slot in &candidates {
