@@ -2862,10 +2862,11 @@ struct ClockDependence {
 ///
 /// `tad` / `tafd` mark the candidate slots: `NaN` in `ext_params`, and read by the program. The
 /// raw RHS — without the dose forcings, which read no clock — is evaluated at
-/// [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning the segment, at `u_start` and,
-/// when every component is finite, at the end state `u`: once with `ext_params` exactly as the
-/// segment ran, and once with every candidate slot anchored at `t_end`. The segment depends on
-/// the clock iff some derivative component differs. Each of these choices is pinned by a test:
+/// [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning the segment, at `u_start` and
+/// at the end state `u`, each only when every component is finite: once with `ext_params`
+/// exactly as the segment ran, and once with every candidate slot anchored at `t_end`. The
+/// segment depends on the clock iff some derivative component differs. Each of these choices is
+/// pinned by a test:
 ///
 /// - **One anchor: the window's end** (#1570 review, row 1). A window reaches this probe only
 ///   when no dose has landed by `t_start`, so on the realized schedule the first dose — and with
@@ -2877,11 +2878,13 @@ struct ClockDependence {
 ///   (measured bit-identical, and to 4.3e-16). The one shape only it could see — a RHS that is
 ///   non-finite on all of `[-L, 0]`, such as `TAD^(-0.5)` — is non-finite in `predict()` too.
 ///
-/// - **The end state too, but only a finite one.** An empty compartment at `u_start` can hide a
-///   comparison that the state filled during the segment makes visible, so `u` is probed as
-///   well. But once any component has gone non-finite the solver pads every state with its last
-///   value (#1539), so the finite components of such a `u` are that pad, not an integrated
-///   state — the evidence the old counterfactual was taking. A partly non-finite `u` is skipped.
+/// - **Only states whose every component is finite** (#1570 review, row 2). `u` is probed as
+///   well as `u_start` because an empty compartment at the start can hide a comparison that the
+///   state filled during the segment makes visible. But once any component goes non-finite the
+///   solver pads every state with its last value (#1539), so the finite components of such a
+///   state are that pad, not an integrated one: `u` after this segment diverged, or `u_start`
+///   after an earlier segment did — a divergence that is not this window's clock's. Neither is
+///   probed, which also keeps the verdict the same whatever the pad holds.
 /// - **The grid, not the endpoints.** A condition can hold only inside the window — `TAD`
 ///   between −8 and −6 on a 12 h one — so the ends alone would miss it.
 /// - **Compared only where the anchored derivative is finite.** An anchor that overflows the RHS
@@ -2941,8 +2944,11 @@ fn unanchored_clock_dependence(
     let mut depends = false;
     let mut nan_reached_derivative = false;
     let mut alone = [false; 2];
-    let end_state = u.iter().all(|x| x.is_finite()).then_some(u);
-    for state in std::iter::once(u_start).chain(end_state) {
+    let states: Vec<&[f64]> = [u_start, u]
+        .into_iter()
+        .filter(|state| state.iter().all(|x| x.is_finite()))
+        .collect();
+    for &state in &states {
         for k in 0..=CLOCK_PROBE_INTERVALS {
             let t = t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64);
             (ode.rhs)(state, ext_params, t, &mut du_ran);

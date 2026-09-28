@@ -12997,15 +12997,24 @@ fn unanchored_dose_clock_error_is_silent_when_the_derivative_does_not_depend_on_
 
 #[test]
 fn unanchored_dose_clock_error_is_silent_when_the_state_arrived_non_finite() {
-    // #1534 review round 2, finding A (2), under #1535's rule. A component whose derivative is
-    // non-finite under EVERY anchor was not broken by this segment's clock — here the state
-    // arrived `NaN` (from `init(...)`, or a `NaN` bolus applied at the break). The comparison is
-    // made only where the anchored derivative is finite, so nothing is compared and nothing is
-    // refused.
+    // #1534 review round 2, finding A (2), and #1570's review, row 2. A state that arrived with
+    // a non-finite component was broken before this segment — by `init(...)`, a `NaN` bolus at
+    // the break, or an earlier segment's divergence, whose other components the solver then
+    // padded with their last values (#1539). Its finite components are that pad, not an
+    // integrated state, so it is not probed: no verdict rests on it, and none depends on what
+    // the pad holds.
     //
-    // Mutation that reddens it: drop the `anchored.is_finite()` conjunct from the comparison.
-    // IEEE `NaN != NaN` is true, so the stand-in's own `NaN` would then count as a change.
-    let ode = tad_arithmetic_ode_spec();
+    // Two components, because one would not do: here `central` is finite and reads `TAD` in a
+    // comparison whose arms differ at 50, so probing this `u_start` WOULD find a dependence. The
+    // one-component version of this test could not tell the gate from the finite-value filter.
+    //
+    // Mutation that reddens it: probe `u_start` whatever its components (the gate on `u` alone).
+    let ode = dose_clock_ode_spec_with_states(
+        "central, X",
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }\n  \
+         d/dt(X) = 0.5 * X * X",
+    );
     let subject = make_subject(vec![], vec![6.0]);
     let ext_params = dose_clock_ext_params();
 
@@ -13013,14 +13022,38 @@ fn unanchored_dose_clock_error_is_silent_when_the_state_arrived_non_finite() {
         unanchored_dose_clock_error(
             &ode,
             &subject,
-            &[f64::NAN],
-            &[f64::NAN],
+            &[50.0, f64::NAN],
+            &[30.0, f64::NAN],
             &ext_params,
             0.0,
             12.0
         )
         .is_none(),
         "a state that arrived non-finite was not broken by this segment's clock"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_when_no_anchor_makes_the_derivative_finite() {
+    // #1535 and #1570's review, row 1. `TAD^(-0.5)` is non-finite for every clock the window-end
+    // anchor gives the window (`TAD ∈ [-12, 0]`: `NaN`, then `inf` at 0), exactly as for the
+    // unanchored clock. The comparison is made only where the anchored derivative is finite, so
+    // nothing is compared and nothing is refused: the clock a schedule can supply would not fix
+    // it, and `predict()`, which reads that same clock here, is non-finite too. (Only an anchor
+    // at the window's start, `TAD ∈ [0, 12]`, would make it finite — the anchor #1570 dropped.)
+    //
+    // Mutations that redden it: drop the `anchored.is_finite()` conjunct from the comparison
+    // (IEEE `NaN != NaN` is true, so the anchored `NaN` would count as a change); add a
+    // `t_start` anchor back.
+    let ode =
+        dose_clock_ode_spec("  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD^(-0.5))");
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = dose_clock_ext_params();
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[30.0], &ext_params, 0.0, 12.0)
+            .is_none(),
+        "no anchor a schedule can give makes this derivative finite, so it is not the clock's"
     );
 }
 

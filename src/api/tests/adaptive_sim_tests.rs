@@ -5657,66 +5657,77 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
     // numbers are right — they are not — and it does not pin agreement with `predict()`,
     // which would lock in the frozen output as if it were correct.
     //
-    // Mutation that reddens it: drop the dependence test from `unanchored_dose_clock_error` —
+    // #1570 review, row 2 — the second schedule holds at 12 and doses only at 36. `X` diverges
+    // in `(0, 12]`, so the window `(12, 36]` starts from the solver's pad (`X` non-finite,
+    // `central` frozen at 0) with the clock still unanchored. At `494a7af3` that window was
+    // refused — "the segment (12, 36] integrated to a non-finite state, and the [odes] RHS reads
+    // `TAD`" — pinning `X`'s earlier divergence on the clock; a state with a non-finite component
+    // is no longer probed. With the check disabled that run equals `predict()` bit for bit:
+    // frozen in both engines, as above.
+    //
+    // Mutations that redden it: drop the dependence test from `unanchored_dose_clock_error` —
     // refuse whenever the clock is read and unanchored (it was the `resolve_with_finite_clock`
-    // conjunct before #1535).
+    // conjunct before #1535) — for both schedules; probe `u_start` whatever its components,
+    // for the hold schedule.
     let model =
         parse_model_string(ODE_TAD_PLUS_DIVERGENT_STATE).expect("parse divergent-state model");
     let obs = vec![0.0, 6.0, 20.0, 40.0];
     let decisions = vec![12.0, 36.0];
     let pop = population(vec![subj("1", obs, vec![])]);
 
-    for verify in [false, true] {
+    // Measured (`verify: false` and `verify: true` alike), finite, frozen and wrong — see
+    // #1539: `[0.0, 0.0, 99.99999999935972, 199.99999999807915]` for doses at 12 and 36 (the
+    // value at t=20 should be ~44.93, as the control above shows), and
+    // `[0.0, 0.0, 0.0, 99.99999999935972]` for the hold schedule.
+    for (schedule, dose_idx) in [
+        ("doses at 12 and 36", vec![0, 1]),
+        ("a hold at 12 and a dose at 36", vec![1]),
+    ] {
+        for verify in [false, true] {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(1),
+                decision_times: decisions.clone(),
+                verify,
+                ..Default::default()
+            };
+            if let Err(e) = simulate_adaptive(
+                &model,
+                &pop,
+                &model.default_params,
+                1,
+                || dose_at_decisions(dose_idx.clone()),
+                &opts,
+            ) {
+                panic!(
+                    "a divergence in a compartment that never evaluates TAD must not be \
+                     refused by this guard ({schedule}, verify={verify}): {e}"
+                );
+            }
+        }
+
+        // And the negative half, stated separately so it cannot pass by the run simply
+        // erroring: whatever this model does, no message may name the dose clock for it.
         let opts = AdaptiveSimulateOptions {
             seed: Some(1),
             decision_times: decisions.clone(),
-            verify,
+            verify: false,
             ..Default::default()
         };
-        match simulate_adaptive(
+        let res = simulate_adaptive(
             &model,
             &pop,
             &model.default_params,
             1,
-            || dose_at_decisions(vec![0, 1]),
+            || dose_at_decisions(dose_idx.clone()),
             &opts,
-        ) {
-            // Measured (`verify: false` and `verify: true` alike):
-            // `[0.0, 0.0, 99.99999999935972, 199.99999999807915]`. Finite, frozen and wrong —
-            // see #1539. The value at t=20 should be ~44.93, as the control above shows.
-            Ok(_) => {}
-            Err(e) => {
-                let e = format!("{e}");
-                panic!(
-                    "a divergence in a compartment that never evaluates TAD must not be \
-                     refused by this guard (verify={verify}): {e}"
-                );
-            }
-        }
-    }
-
-    // And the negative half, stated separately so it cannot pass by the run simply erroring:
-    // whatever this model does, no message may name the dose clock for it.
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: decisions,
-        verify: false,
-        ..Default::default()
-    };
-    let res = simulate_adaptive(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        || dose_at_decisions(vec![0, 1]),
-        &opts,
-    );
-    if let Err(e) = res {
-        let e = format!("{e}");
-        assert!(
-            !e.contains("has no referent"),
-            "the dose clock is not the cause here and must not be named: {e}"
         );
+        if let Err(e) = res {
+            let e = format!("{e}");
+            assert!(
+                !e.contains("has no referent"),
+                "the dose clock is not the cause here and must not be named ({schedule}): {e}"
+            );
+        }
     }
 }
 
