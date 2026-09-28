@@ -4,7 +4,7 @@ All notable changes to **ferx-core** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(see the [Releases](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#releases)
+(see the [Releases](https://ferx-nlme.org/ferx-core/development/sdlc.html#releases)
 section of the SDLC for the versioning policy).
 
 <!--
@@ -171,7 +171,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   than "the final estimates", and reports the `ode_method` the model actually runs at.
   `predict()`, `simulate()`, `simulate_with_seed()`,
   `simulate_with_options()` and `simulate_with_uncertainty()` still return rows only — see
-  [Which entry points report warnings](https://ferx-nlme.github.io/ferx-core/warnings.html#entry-points)
+  [Which entry points report warnings](https://ferx-nlme.org/ferx-core/warnings.html#entry-points)
   ([#1280](https://github.com/FeRx-NLME/ferx-core/issues/1280),
   [#1304](https://github.com/FeRx-NLME/ferx-core/issues/1304), residual of
   [#959](https://github.com/FeRx-NLME/ferx-core/issues/959)).
@@ -2055,7 +2055,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   tuned with `--spline-df N` (repeatable) and `--no-linear`, the shrinkage warning threshold
   with `--shrink FRAC`. Results are written to `{model}-gam.csv` by default; `--csv PATH`
   redirects the file and `--no-csv` suppresses it. The same screen runs as part of an ordinary
-  fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
+  fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.org/ferx-core/tools/gam-screening.html).
 
 ### Changed
 - **The published tarball no longer ships repo infrastructure (#1170).** `tests/`,
@@ -2125,7 +2125,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   categorical) and ranks covariates by AIC improvement over the null model. High-ΔAIC
   covariates are then prioritised in an SCM. This is the Rust equivalent of Xpose4's
   `xpose.gam()`. Requires `ferx-tools`. See
-  [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
+  [GAM covariate screening](https://ferx-nlme.org/ferx-core/tools/gam-screening.html).
 
   A covariate that cannot be screened is now reported in `GamResult::warnings` rather than
   dropped in silence — being skipped and being screened-but-unimportant are indistinguishable
@@ -2367,7 +2367,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   Repeated headings on a page — four sections called "Syntax" on the absorption page, addressed
   as `#syntax`, `#syntax-1`, `#syntax-2`, `#syntax-3` — were given distinct titles, so some
   anchors on the published site changed. A new `docs-lint` check keeps all four properties true
-  on every PR; see the [Docs linter](https://ferx-nlme.github.io/ferx-core/development/docs-lint.html)
+  on every PR; see the [Docs linter](https://ferx-nlme.org/ferx-core/development/docs-lint.html)
   page.
 - **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
   (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
@@ -2606,7 +2606,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — and the fit reports them through the `ode_solver` warning (#1080). The
   threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
   convention), so name a method explicitly on an unusual time scale. See
-  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
+  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
 - **Fits now report what the ODE solver did (#1080).** A new `ode_solver` warning summarises one
   post-fit prediction pass over every subject: steps that clamped at the minimum step size (a
   stability-limited segment whose un-integrated tail is freeze-padded with the last state), segments
@@ -2631,7 +2631,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   at all below 25 accepted steps, and pays about one probe per 25 steps above that. New
   `ode_auto_switch = false` restores one method per segment, chosen at its start; a named
   `ode_method` is pinned as before. See
-  [ODE models → When a segment turns stiff halfway through](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#mid-segment-switching).
+  [ODE models → When a segment turns stiff halfway through](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#mid-segment-switching).
 - **`ode_stiff_abort_after` bounds what a stalled ODE segment costs (#708, #1080).** A segment that is
   stability-limited keeps stepping at the minimum step size until it exhausts `ode_max_steps`;
   setting this key gives up after that many clamped steps instead. Off by default and deliberately
@@ -2640,7 +2640,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   warning reports aborts is a diagnosis ("these segments are stability-limited"), not an estimate.
   It is a way to make a grinding fit say so quickly, not a substitute for choosing a stiff method.
   On the time-to-event path an abort is reported as a failed segment rather than padded. See
-  [ODE models → Which regime am I in?](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#which-regime-am-i-in).
+  [ODE models → Which regime am I in?](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#which-regime-am-i-in).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
   reference, so a code generator can source the rule from the same binary it will parse with instead
@@ -2650,7 +2650,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   differ: outside `[odes]`, `MACHEPS` / `TAFD` / `TAD` are ordinary covariates rather than
   solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
   rejected in `[initial_conditions]`. Both surfaces are documented side by side under
-  [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+  [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#init-scope).
 - **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
   sees `(x - center) / scale`. Both default to the identity, leaving existing models
   unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
@@ -3194,7 +3194,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   M-step, and forbidden from depending on an eta at all), and `MIXNUM`-switched class typical values
   or identity-scale-dropped log-mu-references, which carry an eta and already get their own message.
   See
-  [SAEM: non-mu-referenced parameters](https://ferx-nlme.github.io/ferx-core/estimation/saem.html).
+  [SAEM: non-mu-referenced parameters](https://ferx-nlme.org/ferx-core/estimation/saem.html).
 - **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
   as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
   time and resolved to one anchor theta per class (any number of classes; a trailing `else` covers
@@ -3739,7 +3739,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   fewer steps than `rk45` and is ~2.3× faster; at default tolerances it is ~1.4× slower, so it
   is a tight-tolerance tool rather than a blanket upgrade. Its in-step readouts interpolate with
   a cubic Hermite (3rd-order) rather than a matching continuous extension — documented under
-  [ODE Models](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#stiff-systems).
+  [ODE Models](https://ferx-nlme.org/ferx-core/model-file/ode-models.html#stiff-systems).
 
   `docs/model-file/ode-models.qmd` now carries a measured "which regime am I in?" table so the
   choice is made from solver statistics rather than guesswork.
@@ -4520,7 +4520,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   single node, no grid — the cheapest configuration, and on warfarin it converges
   *faster than FOCEI* (0.23 s vs 0.60 s); `n_agq > 1` turns it into adaptive
   Gauss–Hermite quadrature over the same objective. See the
-  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
+  [AGQ docs page](https://ferx-nlme.org/ferx-core/estimation/agq.html).
 - **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
   covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
   fall back to finite differences the moment the subject also had IOV, a time-varying
@@ -4557,14 +4557,14 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   the deeper, correct basin. On the fluconazole free/total binding model this
   recovers the NONMEM fit (OFV 734.67 vs NONMEM 734.64, versus 749.3 before). Set
   `inner_restarts = 0` to restore the previous single-start behaviour. See
-  [Fit options](https://ferx-nlme.github.io/ferx-core/model-file/fit-options.html).
+  [Fit options](https://ferx-nlme.org/ferx-core/model-file/fit-options.html).
 - **`L2` data column for correlated observation units** (#827): the reader now
   recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
   value within a subject are paired into one correlated unit for a `block_sigma`
   residual (e.g. the total + unbound rows of one blood draw), giving the user
   explicit control over which records the cross covariance couples instead of
   relying on co-temporal row order. See
-  [Data format](https://ferx-nlme.github.io/ferx-core/data-format.html).
+  [Data format](https://ferx-nlme.org/ferx-core/data-format.html).
 - **Two `block_sigma` / `L2` data diagnostics** (#830), reported by `fit()` and
   `ferx check`: `W_BLOCK_SIGMA_L2_ORDER` when a correlated residual has a
   co-temporal group that can pair more than one way and no `L2` column is present
@@ -4587,8 +4587,8 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   observation gap instead of the closed-form matrix exponential (requires an ODE
   model). Requires the `markov`
   cargo feature. See the
-  [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
-  and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
+  [Markov models](https://ferx-nlme.org/ferx-core/model-file/markov-model.html)
+  and [CTMM estimation](https://ferx-nlme.org/ferx-core/estimation/ctmm.html)
   pages. (mCTMM/DTMM and CTMM simulation are planned follow-ups.)
 - **Adaptive Gaussian quadrature (`method = laplace` with `n_agq > 1`)** (#251):
   generalises Laplace. Instead of approximating each subject's
@@ -4606,7 +4606,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   significant figures on every parameter. Cost is `n_agq ^ n_eta` per subject per
   iteration, so it suits models with few random effects; grids over 100 000 nodes,
   out-of-range node counts, and IOV models are rejected at check time. See the
-  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
+  [AGQ docs page](https://ferx-nlme.org/ferx-core/estimation/agq.html).
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
@@ -4684,14 +4684,14 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   over-parameterization / non-identifiability that names the specific culprits
   (complementing the aggregate `condition_number`). Emitted typed at source with
   `details` listing each `{parameter_a, parameter_b, correlation}`. See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **Inflated-RSE warning** (#781): a fit now emits an `inflated_rse` warning
   when a free THETA's relative standard error (`100 · se / |estimate|`) exceeds
   ~50% — an imprecisely estimated parameter, often a sign of
   over-parameterization. Emitted typed at source with `details` listing each
   `{parameter, estimate, se, rse_pct}`. Requires a successful covariance step
   (no SEs → no warning). See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
   #763): a new entry point returning `SimulationOutput { results, warnings }` — the
   simulation analogue of `FitResult.warnings`. It reports subjects handled specially
@@ -4699,7 +4699,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   letting them look like ordinary censoring. `simulate_with_options` is unchanged (a
   thin wrapper returning just the rows), and `ferx <model> --simulate` now echoes these
   warnings alongside the fit warnings — including in the structured `warnings_structured`
-  / JSON output, under a new typed `simulation` [`WarningCode`](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  / JSON output, under a new typed `simulation` [`WarningCode`](https://ferx-nlme.org/ferx-core/warnings.html).
 - **Boundary-estimate warning** (#781): a fit now emits a `boundary_estimate`
   warning when a free THETA estimate is pinned to an optimizer bound (evaluated
   in the optimizer's packed/log space) — a sign of non-identifiability or a
@@ -4707,7 +4707,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   `{parameter, estimate, bound, side}`, and is emitted **typed at its source**
   (the first warning to use the native at-source path rather than string
   classification). See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **Finer covariance-step warning codes** (#781): the overloaded
   `covariance_step` warning code is split by severity into `covariance_failed`
   (Critical — no standard errors), `covariance_regularized` (Warning — SEs
@@ -4715,14 +4715,14 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   can branch on the outcome. The failure/regularized codes carry `details` with
   `condition_number`, `min_eigenvalue`, and `n_negative_eigenvalues` when those
   were computed. See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **High ETA-shrinkage warning** (#781): a fit now emits an `eta_shrinkage`
   warning when any random-effect (ETA) shrinkage exceeds ~30% (the Savic &
   Karlsson rule of thumb) — the data poorly inform that IIV, so EBE-based
   diagnostics for it are unreliable and removing the IIV is often warranted.
   The structured warning carries `details` listing the affected ETAs and their
   shrinkage percent. See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **Warning `details` payloads for numeric diagnostics** (#781): structured
   warnings for `dw_autocorrelation`, `eps_shrinkage`, and `condition_number` now
   carry a `details` object with the value behind the message (e.g.
@@ -4730,7 +4730,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   fit's typed fields so an agent reads the number directly instead of parsing
   prose. First increment of the at-source warning work; other codes omit
   `details` until converted. See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html#details).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html#details).
 - **Typed warning taxonomy** (#778): structured warnings
   (`FitResult.warnings_structured`, surfaced in the JSON output) now carry a
   typed `WarningCode` instead of a free-text category string — a stable,
@@ -4738,7 +4738,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   serializes as a fixed snake_case token (unchanged from the previous category
   strings, so JSON consumers are unaffected), and each entry gains an optional
   `details` payload for machine-readable numbers behind the message. See the
-  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **Machine-readable JSON fit output** (#777): `ferx <model> --data <csv>
   --output-format json` (or `both`) writes `{model}-fit.json` — the *complete*
   fit result (every estimate, standard error, diagnostic, per-subject record,
@@ -4748,7 +4748,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   floats become JSON `null`. `--output-format yaml` (the default) is unchanged.
   Library callers can get the same payload in-process via
   `FitResult::to_json_value()`. See the
-  [output documentation](https://ferx-nlme.github.io/ferx-core/output.html).
+  [output documentation](https://ferx-nlme.org/ferx-core/output.html).
 - **Experimental `markov` feature — CTMM matrix-exponential foundation**
   (#759): a new default-off `markov` cargo feature adds the numerical core for
   continuous-time Markov models — transition probabilities
@@ -4771,7 +4771,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   (the first occasion starts at `-∞`, the last runs to `+∞`); a leading `0`
   (the `c(0, 24, 48)` habit) is rejected with a message pointing at the correct
   `time(24, 48)` form. See the
-  [IOV documentation](https://ferx-nlme.github.io/ferx-core/model-file/iov.html).
+  [IOV documentation](https://ferx-nlme.org/ferx-core/model-file/iov.html).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
@@ -4806,7 +4806,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   renamed headers are excluded from covariate auto-detection under their old
   name, and typos (absent header, duplicate target, or a target colliding with a
   surviving column) fail loudly. See
-  [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
+  [Data → Column mapping](https://ferx-nlme.org/ferx-core/model-file/data.html).
 
 - **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
   reactive driver recomputes each subject's PK per event/segment from the covariate
@@ -5116,7 +5116,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   silently collapsing that subject's likelihood contribution. The fit now emits a
   typed `flip_flop` warning naming the affected subject(s) and pointing at the ODE
   `transit()`/`igd()` forcing form (which reroutes per subject at the actual η). See
-  the [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+  the [warnings documentation](https://ferx-nlme.org/ferx-core/warnings.html).
 - **`simulate_with_uncertainty` no longer panics when a parameter draw enters the
   flip-flop regime** (#786). For a twin-less transit / IG closed form whose point
   estimate is in-domain, a sampled uncertainty draw that crossed the flip-flop
@@ -5311,7 +5311,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   different branches (e.g. a total/unbound assay pair) pick up the cross-branch
   covariance `ρ·σ_i·σ_j` in the dense residual `R`, exactly as for per-CMT
   endpoints. See
-  [Error model → Covariate-selected error models](https://ferx-nlme.github.io/ferx-core/model-file/error-model.html).
+  [Error model → Covariate-selected error models](https://ferx-nlme.org/ferx-core/model-file/error-model.html).
 - **Full `[scaling] y = <expr>` output readouts (Form C) on analytical PK models** (#650).
   A closed-form (`pk one_cpt_iv(...)`, …) model can now replace the built-in
   concentration output with an arbitrary readout expression — enabling flexible
@@ -5329,7 +5329,7 @@ reported in #1561. The slow regression test that exposes it is ignored until tha
   occasion κ. A readout referencing the oral depot amount, per-CMT readouts, and direct θ/η
   references fall back to finite-difference gradients (the prediction stays exact, and the
   parser emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
-  [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
+  [Scaling → Form C](https://ferx-nlme.org/ferx-core/model-file/scaling.html).
 
 ### Changed
 - **Bumped `MAX_PK_PARAMS` from 16 to 128**, raising the ceiling on ODE structural

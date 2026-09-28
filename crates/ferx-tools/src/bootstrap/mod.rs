@@ -823,7 +823,7 @@ fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
 /// are deliberately *not* represented in [`coordinates`]. There is no longer a
 /// reason to add them.
 ///
-/// [SIR]: https://ferx-nlme.github.io/ferx-core/estimation/sir.html
+/// [SIR]: https://ferx-nlme.org/ferx-core/estimation/sir.html
 fn reject_mixture_model(params: &ModelParameters) -> Result<(), String> {
     if params.mixture.is_some() {
         return Err(

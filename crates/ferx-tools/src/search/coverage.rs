@@ -17,7 +17,7 @@ use super::mfl::{
 };
 
 /// Where the coverage table lives, appended to every gap error.
-pub const COVERAGE_DOCS: &str = "https://ferx-nlme.github.io/ferx-core/tools/search.html#coverage";
+pub const COVERAGE_DOCS: &str = "https://ferx-nlme.org/ferx-core/tools/search.html#coverage";
 
 /// The most peripheral compartments an analytic `pk` template has
 /// (`three_cpt_*`).

@@ -8,7 +8,7 @@ website:
   title: "ferx-core"
   description: "Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics"
   favicon: assets/ferx-favicon.svg
-  site-url: https://ferx-nlme.github.io/ferx-core/
+  site-url: https://ferx-nlme.org/ferx-core/
   open-graph:
     locale: en_US
   twitter-card: true
@@ -23,18 +23,18 @@ website:
       - text: "Get started"
         href: getting-started.qmd
       - text: "Features"
-        href: https://ferx-nlme.github.io/features.html
+        href: https://ferx-nlme.org/features.html
       - text: "Changelog"
-        href: https://ferx-nlme.github.io/changelog.html
+        href: https://ferx-nlme.org/changelog.html
       - text: "Roadmap"
-        href: https://ferx-nlme.github.io/roadmap.html
+        href: https://ferx-nlme.org/roadmap.html
     right:
       - text: "ferx-core"
-        href: https://ferx-nlme.github.io/ferx-core/
+        href: https://ferx-nlme.org/ferx-core/
       - text: "ferx-r"
-        href: https://ferx-nlme.github.io/ferx-book/
+        href: https://ferx-nlme.org/ferx-book/
       - text: "Reference"
-        href: https://ferx-nlme.github.io/reference/
+        href: https://ferx-nlme.org/reference/
       - icon: github
         href: https://github.com/FeRx-NLME
         aria-label: GitHub
