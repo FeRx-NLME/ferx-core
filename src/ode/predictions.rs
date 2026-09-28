@@ -2735,7 +2735,7 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
 /// integrates correctly and must not be refused. The dependence test backs that up — such a RHS
-/// reads no clock slot, so no stand-in can move it, and keying the candidates on
+/// reads no clock slot, so no anchor can move it, and keying the candidates on
 /// `pk_reads_model_time` alone changes no verdict (measured, #1535) — which leaves the
 /// per-spelling keys two jobs: naming the spelling, and keeping the probe off a RHS that reads
 /// neither. (The fixture that pins the `TIME` case starts from an empty compartment, so what it
@@ -2864,42 +2864,51 @@ struct ClockDependence {
 /// raw RHS — without the dose forcings, which read no clock — is evaluated at
 /// [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning the segment, at `u_start` and,
 /// when every component is finite, at the end state `u`: once with `ext_params` exactly as the
-/// segment ran, and once per stand-in anchor with every candidate slot set to it. The segment
-/// depends on the clock iff some derivative component differs. Each of these choices is pinned
-/// by a test:
+/// segment ran, and once with every candidate slot anchored at `t_end`. The segment depends on
+/// the clock iff some derivative component differs. Each of these choices is pinned by a test:
+///
+/// - **One anchor: the window's end** (#1570 review, row 1). A window reaches this probe only
+///   when no dose has landed by `t_start`, so on the realized schedule the first dose — and with
+///   it the static engines' anchor — comes at `t_end` or later, and their clock is ≤ 0 across
+///   the window. A dose landing right at `t_end` is the earliest anchor a schedule can give; it
+///   puts `TAD` in `[-L, 0]` for a window of length `L`. An anchor at `t_start` would put it in
+///   `[0, L]`, where no schedule can: it refused `if (TAD > 5)` and `max(TAD, 0)`, whose
+///   unanchored arm is the arm every `TAD ≤ 0` takes, so those runs already equal `predict()`
+///   (measured bit-identical, and to 4.3e-16). The one shape only it could see — a RHS that is
+///   non-finite on all of `[-L, 0]`, such as `TAD^(-0.5)` — is non-finite in `predict()` too.
 ///
 /// - **The end state too, but only a finite one.** An empty compartment at `u_start` can hide a
 ///   comparison that the state filled during the segment makes visible, so `u` is probed as
 ///   well. But once any component has gone non-finite the solver pads every state with its last
 ///   value (#1539), so the finite components of such a `u` are that pad, not an integrated
 ///   state — the evidence the old counterfactual was taking. A partly non-finite `u` is skipped.
-/// - **Two stand-ins, `t_start` and `t_end`.** `t_start` puts `TAD` in `[0, L]` for a window of
-///   length `L`; `t_end` puts it in `[-L, 0]`, the sign `predict()` uses before a dose. A shape
-///   can be blind to either one: `max(TAD, 0)` equals its `NaN` arm (0) on all of `[-L, 0]`,
-///   and `min(TAD, 0)` on all of `[0, L]`. Either stand-in differing is enough.
 /// - **The grid, not the endpoints.** A condition can hold only inside the window — `TAD`
-///   between 2 and 4 on a 12 h one — so the ends alone would miss it.
-/// - **Compared only where the anchored derivative is finite.** A stand-in that overflows the
-///   RHS by itself (`exp(TAD)` at `TAD ≈ 800`) says nothing about the clock, and a component
+///   between −8 and −6 on a 12 h one — so the ends alone would miss it.
+/// - **Compared only where the anchored derivative is finite.** An anchor that overflows the RHS
+///   by itself (`exp(-TAD)` at `TAD ≈ −800`) says nothing about the clock, and a component
 ///   that is non-finite under every anchor — a state that arrived broken, from `init(...)` or a
 ///   `NaN` bolus at the break — was not broken by this segment's clock. Then by value, with
 ///   IEEE `!=`: `NaN` differs from every finite value, while `-0.0 == 0.0`, since a zero
 ///   derivative is zero whatever its sign — and on an empty compartment
-///   `-k·0·(1 − 0.1·min(TAD, 24))` does flip that sign between arms.
-/// - **All candidate slots take one stand-in for the verdict.** Both clocks are unanchored by
-///   the same fact, and a reactive run would anchor both at its first dose. Anchoring one while
-///   the other stays `NaN` would leave `(1 + TAD + TAFD)` non-finite under the stand-in, where
-///   the comparison skips it — a false negative. The *naming* is per slot: with both
-///   unanchored, a slot is named when its `NaN` alone, the other anchored, moves the anchored
-///   derivative; when only the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
+///   `-k·0·(1 − 0.1·min(TAD, 24))` does flip that sign between the unanchored clock and the
+///   anchored one.
+/// - **All candidate slots take the anchor together for the verdict.** Both clocks are
+///   unanchored by the same fact, and a reactive run would anchor both at its first dose.
+///   Anchoring one while the other stays `NaN` would leave `(1 + TAD + TAFD)` non-finite under
+///   the anchor, where the comparison skips it — a false negative. The *naming* is per slot:
+///   with both unanchored, a slot is named when its `NaN` alone, the other anchored, moves the
+///   anchored derivative; when only the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
 ///
-/// Its limits, stated rather than hidden: a dependence confined between grid points, one that
-/// shows only at states other than `u_start` and `u`, and one on a threshold outside both
-/// stand-in ranges (`if (TAD > 1000)` over a 12 h window) are not seen. The last is benign —
-/// every anchor a reactive run could supply there gives the same derivative — and the
-/// default-on frozen-replay verifier remains the net for the rest.
+/// Its limits, stated rather than hidden — measured on #1570, filed as #1572, and left to the
+/// default-on frozen-replay verifier until then:
 ///
-/// Cost: at most `2 × 17 × 3` RHS evaluations per segment (`2 × 17 × 7` when both slots are
+/// - A first dose later than `t_end` puts the clock further below zero than the anchor reaches,
+///   so a condition that switches only there is not seen: `if (TAD < -20)` over 12 h windows,
+///   with the first dose at 36, runs 23.5× off `predict()` at its worst read.
+/// - It samples 17 times, at `u_start` and `u` only, so a dependence between two sample times,
+///   or one that shows only at states inside the window, is missed.
+///
+/// Cost: at most `2 × 17 × 2` RHS evaluations per segment (`2 × 17 × 4` when both slots are
 /// candidates), and only on a segment with an unanchored clock the program reads. Nothing on
 /// segments with an anchored clock, and nothing on the RHS hot path.
 #[allow(clippy::too_many_arguments)]
@@ -2923,7 +2932,11 @@ fn unanchored_clock_dependence(
 
     let n = u_start.len();
     let (mut du_ran, mut du_anchored, mut du_alone) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+    // Every candidate slot at the window's end: the earliest anchor a schedule can give.
     let mut anchored = ext_params.to_vec();
+    for &slot in &candidates {
+        anchored[slot] = t_end;
+    }
     let mut alone_unanchored = ext_params.to_vec();
     let mut depends = false;
     let mut nan_reached_derivative = false;
@@ -2933,29 +2946,24 @@ fn unanchored_clock_dependence(
         for k in 0..=CLOCK_PROBE_INTERVALS {
             let t = t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64);
             (ode.rhs)(state, ext_params, t, &mut du_ran);
-            for stand_in in [t_start, t_end] {
-                for &slot in &candidates {
-                    anchored[slot] = stand_in;
+            (ode.rhs)(state, &anchored, t, &mut du_anchored);
+            for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
+                if moves(ran, anch) {
+                    depends = true;
+                    nan_reached_derivative |= !ran.is_finite();
                 }
-                (ode.rhs)(state, &anchored, t, &mut du_anchored);
-                for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
-                    if moves(ran, anch) {
-                        depends = true;
-                        nan_reached_derivative |= !ran.is_finite();
-                    }
-                }
-                // The naming, not the verdict: with both clocks unanchored, which one's `NaN`
-                // alone — the other anchored — moves the anchored derivative?
-                if candidates.len() > 1 {
-                    for (j, &slot) in candidates.iter().enumerate() {
-                        alone_unanchored.copy_from_slice(&anchored);
-                        alone_unanchored[slot] = f64::NAN;
-                        (ode.rhs)(state, &alone_unanchored, t, &mut du_alone);
-                        alone[j] |= du_alone
-                            .iter()
-                            .zip(&du_anchored)
-                            .any(|(&ran, &anch)| moves(ran, anch));
-                    }
+            }
+            // The naming, not the verdict: with both clocks unanchored, which one's `NaN`
+            // alone — the other anchored — moves the anchored derivative?
+            if candidates.len() > 1 {
+                for (j, &slot) in candidates.iter().enumerate() {
+                    alone_unanchored.copy_from_slice(&anchored);
+                    alone_unanchored[slot] = f64::NAN;
+                    (ode.rhs)(state, &alone_unanchored, t, &mut du_alone);
+                    alone[j] |= du_alone
+                        .iter()
+                        .zip(&du_anchored)
+                        .any(|(&ran, &anch)| moves(ran, anch));
                 }
             }
         }
