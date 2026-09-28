@@ -11,7 +11,7 @@ use crate::ode::solver::{
     solve_ode, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
     OdeSolverStats,
 };
-use crate::pk::absorption::PreparedInputRate;
+use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
     ControllerDecision, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
@@ -736,7 +736,7 @@ fn equilibrate_ss_input_rate(
     dose: &DoseEvent,
     f_bio: f64,
     opts: &OdeSolverOptions,
-    prepared: &[PreparedInputRate],
+    prepared: &PreparedForcings,
 ) -> Option<Vec<f64>> {
     let n = ode.n_states;
     let ii = dose.ii;
@@ -2083,16 +2083,121 @@ fn gated_infusions(
         .collect()
 }
 
-/// Precompute the per-forcing dose-invariant constants (ln Γ, KTR, ln KTR) for
-/// the segment's PK snapshot `params`, parallel to `ode.input_rate` (#322 #7).
+/// One dose's built-in absorption forcing, read at that dose's own record (#1569): the
+/// kernel constants ([`PreparedInputRate`]: `n`/`mtt`, `mat`/`cv2`, `td`/`β`, `ka`) and the
+/// forcing's two per-dose multipliers — its pathway fraction `FR` (#388) and its own route
+/// lag (`fn(..., lag=L)`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DoseInputRate<T = f64> {
+    pub(crate) prep: PreparedInputRate<T>,
+    pub(crate) frac: T,
+    pub(crate) route_lag: T,
+}
+
+impl<T: crate::sens::num::PkNum> DoseInputRate<T> {
+    fn read(
+        forcing: &InputRateForcing,
+        params: &[T],
+        prep: &impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
+    ) -> Self {
+        Self {
+            prep: prep(forcing, params),
+            frac: forcing.frac(params),
+            route_lag: forcing.route_lag(params),
+        }
+    }
+}
+
+/// The built-in absorption forcings a forcing loop applies: one [`DoseInputRate`] per forcing
+/// (parallel to `ode.input_rate`) and dose.
 ///
-/// Built **once per segment** and reused across every RK45 stage / step inside
-/// the seam, instead of re-running [`InputRateForcing::prepare`] on each RHS
-/// evaluation. `params` (the segment's `ext_params` snapshot) is constant for
-/// the whole segment, so this is an exact hoist. Returns an empty (non-allocating)
-/// vec when the model has no built-in input-rate forcings.
-fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> {
-    ode.input_rate.iter().map(|f| f.prepare(params)).collect()
+/// **Every absorption parameter is read at the dose record (#1569)**, the way `F` and the
+/// compartment lag always were. A built-in forcing is a *per-dose* density — dose `d`
+/// delivers `F·D·frac·R_in(t − t_d − lag − lag_route)` with `∫₀^∞ R_in = 1` — and that
+/// integral is 1 only while each dose is absorbed through one density. Until #1569 the loop
+/// rebuilt the kernel, the fraction and the route lag per segment from the segment's
+/// snapshot, so an `MTT` moved mid-absorption by IOV or a time-varying covariate spliced two
+/// densities at the same time-since-dose and created or destroyed drug: a transit dose
+/// absorbed 0.504–1.424 of its mass under one `MTT` switch
+/// (`an_in_flight_dose_absorbs_exactly_its_mass_when_its_kernel_parameter_switches`). The
+/// disposition is untouched: it acts on the carried amounts, where the segment's snapshot is
+/// exact.
+///
+/// Built once per subject evaluation, not per segment or RHS call.
+pub(crate) struct PreparedForcings<T = f64> {
+    /// `None`: one snapshot serves every dose — one row per forcing. The parameter-static
+    /// engines, and the SS run-ins, whose synthetic pulse trains carry no records of their
+    /// own. `Some(n)`: dose `k` of forcing `f` is row `f·n + k`.
+    per_dose: Option<usize>,
+    rows: Vec<DoseInputRate<T>>,
+}
+
+impl<T: crate::sens::num::PkNum> PreparedForcings<T> {
+    /// Every dose reads the one snapshot `params`.
+    pub(crate) fn shared(
+        ode: &OdeSpec,
+        params: &[T],
+        prep: impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
+    ) -> Self {
+        Self {
+            per_dose: None,
+            rows: ode
+                .input_rate
+                .iter()
+                .map(|f| DoseInputRate::read(f, params, &prep))
+                .collect(),
+        }
+    }
+
+    /// Dose `k` reads its own record's snapshot, `dose_params(k)`.
+    pub(crate) fn per_dose<'p>(
+        ode: &OdeSpec,
+        n_doses: usize,
+        dose_params: impl Fn(usize) -> &'p [T],
+        prep: impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
+    ) -> Self
+    where
+        T: 'p,
+    {
+        let mut rows = Vec::with_capacity(ode.input_rate.len() * n_doses);
+        for f in &ode.input_rate {
+            rows.extend((0..n_doses).map(|k| DoseInputRate::read(f, dose_params(k), &prep)));
+        }
+        Self {
+            per_dose: Some(n_doses),
+            rows,
+        }
+    }
+
+    /// No forcing to apply — the model has no built-in absorption, or no dose carries one.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Forcing `forcing`'s kernel for dose `dose`.
+    #[inline]
+    pub(crate) fn get(&self, forcing: usize, dose: usize) -> &DoseInputRate<T> {
+        match self.per_dose {
+            None => &self.rows[forcing],
+            Some(n) => &self.rows[forcing * n + dose],
+        }
+    }
+
+    /// The fraction that scales forcing `forcing`'s whole dose sum, when one snapshot serves
+    /// every dose. Factoring it out of the sum keeps the parameter-static engines'
+    /// arithmetic bit-for-bit what it was; per dose it cannot factor.
+    #[inline]
+    fn common_frac(&self, forcing: usize) -> Option<T> {
+        match self.per_dose {
+            None => Some(self.rows[forcing].frac),
+            Some(_) => None,
+        }
+    }
+}
+
+/// The `f64` [`PreparedForcings`] for the one snapshot `params`.
+fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> PreparedForcings {
+    PreparedForcings::shared(ode, params, InputRateForcing::prepare)
 }
 
 /// The steady-state periodic-sum forcing of a **single** SS dose into a built-in
@@ -2143,19 +2248,17 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 }
 
 /// Add every built-in absorption input-rate forcing into `dy` at integration
-/// time `t`, using the per-segment-hoisted `prepared` constants. For each
-/// forcing, sums `R_in(tad)` over all doses targeting its compartment (Savic
-/// superposition), with `tad = t − (dose.time + lag)` and dose mass `F·amt`.
-/// `R_in = 0` for `tad ≤ 0`, so future doses contribute nothing. `reset_floor`
-/// turns off doses delivered before the most recent EVID=3/4 reset, mirroring
-/// [`active_infusions`]. This is the input-rate analogue of the `+rate` infusion
-/// injection in the wrapped RHS.
+/// time `t`. For each forcing, sums `frac·R_in(tad)` over all doses targeting its
+/// compartment (Savic superposition), with `tad = t − (dose.time + lag + lag_route)`
+/// and dose mass `F·amt`. `R_in = 0` for `tad ≤ 0`, so future doses contribute
+/// nothing. `reset_floor` turns off doses delivered before the most recent EVID=3/4
+/// reset, mirroring [`active_infusions`]. This is the input-rate analogue of the
+/// `+rate` infusion injection in the wrapped RHS.
 ///
-/// `prepared` is parallel to `ode.input_rate` (built by [`prepare_input_rates`]
-/// from the current segment's snapshot), so with IOV every superposed dose's
-/// tail uses the *current* occasion's `n`/`mtt`. This is exact for IIV and when
-/// `II` exceeds the absorption window; only overlapping-occasion tails are
-/// approximated.
+/// Each dose is absorbed through the kernel, fraction and route lag of **its own dose
+/// record** (`prepared.get(forcing, dose)`, see [`PreparedForcings`]), never the
+/// current segment's: with IOV or a time-varying covariate on an absorption parameter
+/// that is what keeps each dose's delivered mass at exactly `F·amt·frac` (#1569).
 ///
 /// Generic over the numeric type `T: PkNum` so the **single** superposition loop
 /// serves both the production `f64` predictor (`T = f64`, byte-identical to the
@@ -2167,17 +2270,11 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// passes the tracked `reset_floor` for an in-scope EVID 3/4 reset (#486).
 /// `integrate_g` still passes `dose_lagtimes = &[]` (its gate excludes lagtime
 /// subjects, which always route to the TV-cov walk instead).
-///
-/// `params` is the flat individual-parameter vector the `prepared` constants were
-/// built from; it is read here only for the optional pathway-fraction multiplier
-/// (`FR*fn(...)`, #388) via [`InputRateForcing::frac`] — `frac = 1` (no `frac_slot`)
-/// is the single-pathway default, so this is a no-op for unfractioned forcings.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
 pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
-    prepared: &[PreparedInputRate<T>],
-    params: &[T],
+    prepared: &PreparedForcings<T>,
     doses: &[DoseEvent],
     dose_lagtimes: &[T],
     dose_f_bio: &[T],
@@ -2185,7 +2282,13 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     t: f64,
     dy: &mut [T],
 ) {
-    for (forcing, prep) in ode.input_rate.iter().zip(prepared) {
+    debug_assert!(
+        prepared.per_dose.is_none_or(|n| n == doses.len()),
+        "per-dose forcings built for {:?} doses, applied to {}",
+        prepared.per_dose,
+        doses.len()
+    );
+    for (fi, forcing) in ode.input_rate.iter().enumerate() {
         if forcing.cmt >= dy.len() {
             continue;
         }
@@ -2197,21 +2300,17 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         if forcing.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
             continue;
         }
-        // Per-route absorption delay (`fn(..., lag=L)`): an offset ON TOP of the
-        // dose's compartment lag, so each parallel / mixed pathway can switch on at
-        // its own time. Dose-invariant (a property of the forcing, not the dose), so
-        // hoisted out of the per-dose loop; `0` for an unlagged forcing (the common
-        // case), a no-op there. Since #859 a `first_order` per-route lag is analytic on
-        // the `Dual2` event-driven walk: this continuous `∂R_in/∂lag_route` shift flows
-        // here, and the onset discontinuity is supplied separately as the `K_ROUTE_ONSET`
-        // rate-on saltation. Other kernels' route lags stay FD-gated (`zero_order`/
-        // `transit`/`igd` pending their slices; `weibull`'s divergent onset permanently).
-        let route_lag = forcing.route_lag(params);
+        // Pathway fraction (#388): a `FR*fn(...)` term scales its dose's `R_in` by the
+        // declared fraction `FR`; `frac = 1` for an unfractioned single-pathway forcing, so
+        // this is a no-op there. The multiplier flows linearly, so for `T = Dual2` it
+        // carries the exact `∂R_in/∂frac` sensitivity.
+        let common_frac = prepared.common_frac(fi);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt_idx() != forcing.cmt {
                 continue;
             }
+            let dose_rate = prepared.get(fi, k);
             // `dose_lagtimes[k]` (`T`, not `f64`) carries the exact `∂t_eff/∂lag = 1`
             // sensitivity when the caller's lag is itself an estimated parameter (an
             // event-driven walk with an in-scope lagtime, #486) — `T::from_f64(0.0)`
@@ -2220,7 +2319,14 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             // computation there. The gating comparisons use `.val()` (the boundary
             // itself never needs a jet — see `rate_at_zero`'s jump for that).
             let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
-            let t_eff = T::from_f64(d.time) + lag + route_lag;
+            // Per-route absorption delay (`fn(..., lag=L)`): an offset ON TOP of the
+            // dose's compartment lag, so each parallel / mixed pathway can switch on at
+            // its own time; `0` for an unlagged forcing (the common case), a no-op there.
+            // Since #859 a `first_order` per-route lag is analytic on the `Dual2`
+            // event-driven walk: this continuous `∂R_in/∂lag_route` shift flows here, and
+            // the onset discontinuity is supplied separately as the `K_ROUTE_ONSET` rate-on
+            // saltation.
+            let t_eff = T::from_f64(d.time) + lag + dose_rate.route_lag;
             // Doses delivered before the most recent reset are off — the reset
             // zeroed the compartments, same rule as `active_infusions`.
             if t_eff.val() < reset_floor - INFUSION_EPS {
@@ -2229,8 +2335,9 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             let tad = T::from_f64(t) - t_eff;
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
-            if d.ss && d.ii > 0.0 {
-                acc = acc + ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass);
+            let prep = &dose_rate.prep;
+            let rate = if d.ss && d.ii > 0.0 {
+                ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass)
             } else if d.is_infusion() {
                 // Infusion (RATE>0) into a built-in absorption compartment (#719 gap 2): the
                 // dose is a *zero-order source* feeding the kernel — its mass is delivered at a
@@ -2243,19 +2350,22 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 // (`active_infusions` skips input-rate cmts), so there is no double count.
                 let f_bio_k = dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0));
                 let window = d.bioavailable_infusion(f_bio_k.val()).1;
-                acc = acc + prep.rate_infused(tad, dose_mass, T::from_f64(window));
+                prep.rate_infused(tad, dose_mass, T::from_f64(window))
             } else {
                 if tad.val() <= 0.0 {
                     continue;
                 }
-                acc = acc + prep.rate(tad, dose_mass);
-            }
+                prep.rate(tad, dose_mass)
+            };
+            acc = match common_frac {
+                Some(_) => acc + rate,
+                None => acc + dose_rate.frac * rate,
+            };
         }
-        // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
-        // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway
-        // forcing, so this is a no-op there. The multiplier flows linearly, so for
-        // `T = Dual2` it carries the exact `∂R_in/∂frac` sensitivity.
-        dy[forcing.cmt] = dy[forcing.cmt] + acc * forcing.frac(params);
+        dy[forcing.cmt] = match common_frac {
+            Some(frac) => dy[forcing.cmt] + acc * frac,
+            None => dy[forcing.cmt] + acc,
+        };
     }
 }
 
@@ -2273,7 +2383,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
 /// two non-reset paths (`ode_predictions`, `ode_predictions_with_states`) pass
 /// `f64::NEG_INFINITY` because the dispatcher routes reset subjects to the
 /// event-driven walker; the two reset-aware paths pass a real floor. `prepared`
-/// is the per-segment hoist from [`prepare_input_rates`].
+/// holds each dose's absorption forcing, read at its dose record ([`PreparedForcings`]).
 #[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/forcing context
 fn wrap_rhs_with_forcings<'a>(
     ode: &'a OdeSpec,
@@ -2281,7 +2391,7 @@ fn wrap_rhs_with_forcings<'a>(
     dose_lagtimes: &'a [f64],
     dose_f_bio: &'a [f64],
     reset_floor: f64,
-    prepared: &'a [PreparedInputRate],
+    prepared: &'a PreparedForcings,
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
@@ -2322,7 +2432,6 @@ fn wrap_rhs_with_forcings<'a>(
             add_prepared_input_rate_forcing(
                 ode,
                 prepared,
-                p,
                 doses,
                 dose_lagtimes,
                 dose_f_bio,
@@ -6534,6 +6643,17 @@ pub fn ode_predictions_event_driven(
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |k, d| {
         zero_order_dur_and_frac_for_dose(ode, d, &pk_at_dose[k].values)
     });
+    // The smooth absorption kernels (transit / igd / weibull / first_order) take the same
+    // per-dose source (#1569): each dose is absorbed through the kernel, pathway fraction
+    // and route lag of its own record, so its delivered mass stays `F·amt·frac` when IOV
+    // or a time-varying covariate moves an absorption parameter mid-absorption. Built once
+    // here; the segment loop below only chooses the disposition.
+    let prepared = PreparedForcings::per_dose(
+        ode,
+        subject.doses.len(),
+        |k| &pk_at_dose[k].values[..],
+        InputRateForcing::prepare,
+    );
 
     // Parameters for the segment ENDING at each timeline entry (#1073).
     //
@@ -6662,9 +6782,6 @@ pub fn ode_predictions_event_driven(
             // and the constant rate is fixed at dose time (mass-exact under
             // time-varying covariates).
             let zero_order = active_zero_order_inputs(&zo_windows, cur_t, t_event, reset_floor);
-            // Hoist the input-rate constants once per segment (#322 #7); the
-            // segment PK snapshot `ext_params_ed` is constant for the integration.
-            let prepared = prepare_input_rates(ode, &ext_params_ed);
             let wrapped_rhs = wrap_rhs_with_forcings(
                 ode,
                 &subject.doses,
@@ -7413,7 +7530,7 @@ struct SegmentForcings {
     reset_floor: f64,
     gated: Vec<(usize, f64, f64, f64)>,
     zero_order: Vec<(usize, f64)>,
-    prepared: Vec<PreparedInputRate>,
+    prepared: PreparedForcings,
 }
 
 /// Apply a dose segment's boundary events and resolve its forcings — the shared

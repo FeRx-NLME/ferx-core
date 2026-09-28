@@ -48,9 +48,9 @@ use super::dual1::Dual1;
 use super::dual2::Dual2;
 use super::dual_mixed::DualMixed;
 use super::provider::{ObsGrad, ObsSens, SubjectSens};
-use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec};
+use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec, PreparedForcings};
 use crate::ode::solver::{solve_ode_g, solve_ode_g_with_auto_state, OdeAutoSwitchState};
-use crate::pk::absorption::PreparedInputRate;
+use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
 
@@ -607,6 +607,20 @@ fn zero_order_forcing_for_dose<'f, T: crate::sens::num::PkNum>(
         _ => return None,
     };
     Some((f, dur))
+}
+
+/// A forcing's kernel constants over the dual type — the `prep` every dual
+/// [`PreparedForcings`] is built with. The analytic gates admit only
+/// `supported_over_dual()` kinds, for which `prepare_dual` is `Some` (pinned by
+/// `supported_over_dual_agrees_with_prepare_dual`).
+fn prepare_dual_forcing<T: crate::sens::num::PkNum>(
+    f: &InputRateForcing,
+    params: &[T],
+) -> PreparedInputRate<T> {
+    f.prepare_dual::<T>(params).expect(
+        "ode_analytical_supported's supported_over_dual() allowlist guarantees prepare_dual \
+         succeeds for every admitted kind",
+    )
 }
 
 /// True when the time-varying-covariate ODE walk ([`run_subject_tvcov`] /
@@ -2014,11 +2028,12 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     // Built-in absorption input-rate forcings (#430), parallel to `ode.input_rate`,
     // built over the dual type `T` (so they thread through `Dual2`/`Dual1`/`DualMixed`
     // alike). The gate (`ode_analytical_supported`) admits only kinds lifted to
-    // `PkNum`, so `prepare_dual` returns `Some` for each; `?` bails to FD otherwise.
-    let mut prepared_forcings: Vec<PreparedInputRate<T>> = Vec::with_capacity(ode.input_rate.len());
-    for f in &ode.input_rate {
-        prepared_forcings.push(f.prepare_dual::<T>(&params_dual)?);
+    // `PkNum`, so `prepare_dual` returns `Some` for each; bail to FD otherwise. One
+    // subject-static snapshot, so every dose reads the same one — its dose record's.
+    if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
+        return None;
     }
+    let prepared_forcings = PreparedForcings::shared(ode, &params_dual, prepare_dual_forcing::<T>);
 
     // Integrate the dual state through bolus + infusion + absorption-forcing events,
     // capturing the full state at each observation time.
@@ -4203,14 +4218,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     }
     // Built-in absorption forcings prepared from THIS SS dose's snapshot (`params`), mirroring the
     // f64 `prepare_input_rates`. The gate's `supported_over_dual()` allowlist guarantees success.
-    let prepared: Vec<PreparedInputRate<T>> = ode
-        .input_rate
-        .iter()
-        .map(|f| {
-            f.prepare_dual::<T>(params)
-                .expect("gate's supported_over_dual() allowlist guarantees prepare_dual succeeds")
-        })
-        .collect();
+    let prepared = PreparedForcings::shared(ode, params, prepare_dual_forcing::<T>);
 
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
@@ -4249,7 +4257,6 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
         crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
             ode,
             &prepared,
-            ps,
             &local_ss,
             &lag0,
             &fbio1,
@@ -4298,7 +4305,6 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
         crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
             ode,
             &prepared,
-            ps,
             &local_doses,
             &lags,
             &fbios,
@@ -4737,6 +4743,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     } else {
         Vec::new()
     };
+    // Each dose's absorption kernel, pathway fraction and route lag, read at ITS OWN dose
+    // record (#1569) — the dual mirror of `ode_predictions_event_driven`'s
+    // `PreparedForcings::per_dose`. So `∂R_in/∂κ` lands on the κ of the dose's occasion, never
+    // the current segment's, and one kernel set serves every segment and both sides of every
+    // boundary below. Built once; empty when the model has no built-in forcing.
+    let dose_forcings = PreparedForcings::per_dose(
+        ode,
+        subject.doses.len(),
+        |k| &pk_at_dose[k][..],
+        prepare_dual_forcing::<T>,
+    );
 
     // #486: zero-order absorption windows on the event-driven walk — the port of the static
     // `integrate_g`'s `zero_windows` (and the dual mirror of production's `zero_order_windows`
@@ -5031,8 +5048,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // `½(J⁻−J⁺)·f` to the curvature term when the Jacobian jumps across a TV-cov boundary
     // (#653 review #1/#3). `state`/`t_ev`/`last_dose`/`r_floor` are passed per-call (they
     // change each iteration) while the immutable model/subject data and the shared RHS scratch
-    // are captured. `side_prep` is the input-rate forcing set prepared for `side_params`
-    // (empty when the model has none); `add_prepared_input_rate_forcing` skips `ZeroOrder`
+    // are captured. The pointwise input rates read `dose_forcings` — each dose's own kernel,
+    // the same on both sides (#1569); `add_prepared_input_rate_forcing` skips `ZeroOrder`
     // internally, so the zero-order windows below are its sole delivery here.
     //
     // `strict` selects the window-membership rule, which differs by boundary kind (#1060
@@ -5053,7 +5070,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     //   first order and adds a spurious `½(J⁻−J⁺)r` at second.
     let boundary_velocity = |state: &[T],
                              side_params: &[T],
-                             side_prep: &[PreparedInputRate<T>],
                              t_ev: f64,
                              last_dose: T,
                              r_floor: f64,
@@ -5108,13 +5124,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 }
             }
         }
-        // Pointwise input-rate forcings (first_order / transit / igd / weibull), evaluated at
-        // `side_params` — their pre/post difference is the covariate jump for a `mixed` leg.
-        if !side_prep.is_empty() {
+        // Pointwise input-rate forcings (first_order / transit / igd / weibull). Each dose's
+        // kernel is read at its own record (#1569), so they are identical on both sides of the
+        // boundary: they cancel in the first-order jump and enter only the `½(J⁻−J⁺)·f`
+        // curvature term.
+        if !dose_forcings.is_empty() {
             crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
                 ode,
-                side_prep,
-                side_params,
+                &dose_forcings,
                 &subject.doses,
                 &dose_lagtimes_dual,
                 f_bio_at_dose,
@@ -5124,25 +5141,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             );
         }
         v
-    };
-
-    // Prepare the built-in input-rate forcings for an arbitrary PK snapshot (the post-side
-    // params at a rate-off boundary). Mirrors the per-event `prepared_forcings` build at the
-    // top of the loop; empty when the model has no input-rate forcing (#653 review).
-    let prep_for = |params: &[T]| -> Vec<PreparedInputRate<T>> {
-        if has_input_rate {
-            ode.input_rate
-                .iter()
-                .map(|f| {
-                    f.prepare_dual::<T>(params).expect(
-                        "ode_analytical_supported's supported_over_dual() allowlist \
-                         guarantees prepare_dual succeeds for every admitted kind",
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
     };
 
     // The PK snapshot governing the flow immediately AFTER a moving boundary at timeline
@@ -5303,30 +5301,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             K_RESET => last_params,
             _ => next_record_params[p].map(&params_at).unwrap_or(last_params),
         };
-        // Built-in absorption input-rate forcing (#486): hoisted once per event from
-        // this event's own PK snapshot `params` — unlike the static walk's single
-        // subject-constant snapshot, TV-cov can change params at every event, so the
-        // dose-invariant constants (`ln Γ`, `KTR`, …) must be rebuilt per snapshot,
-        // mirroring production's per-segment `prepare_input_rates`
-        // (`ode_predictions_event_driven`). Computed here (rather than only inside
-        // the `t_event > cur_t` segment below) so a `K_DOSE` event whose own segment
-        // is degenerate (zero-length, e.g. the very first event) still has it
-        // available for the onset saltation below. `ode_analytical_supported`'s
-        // `supported_over_dual()` allowlist guarantees every kind reaching here
-        // prepares successfully.
-        let prepared_forcings: Vec<PreparedInputRate<T>> = if has_input_rate {
-            ode.input_rate
-                .iter()
-                .map(|f| {
-                    f.prepare_dual::<T>(params).expect(
-                        "ode_analytical_supported's supported_over_dual() allowlist \
-                         guarantees prepare_dual succeeds for every admitted kind",
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         if t_event > cur_t {
             // Infusions whose (lagged) window fully spans this segment add a constant
             // forcing `F·rate` to their compartment (the timeline breaks at every window
@@ -5421,11 +5395,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // carries the exact continuous `∂R_in/∂lag` through `tad` when the
                 // model has an estimated lagtime; the onset saltation at the dose's
                 // own arrival is injected separately at the `K_DOSE` event below.
-                if !prepared_forcings.is_empty() {
+                if !dose_forcings.is_empty() {
                     crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
                         ode,
-                        &prepared_forcings,
-                        ps,
+                        &dose_forcings,
                         &subject.doses,
                         &dose_lagtimes_dual,
                         f_bio_at_dose,
@@ -5591,25 +5564,20 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
                             let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
-                            // Onset-segment snapshot (#880). Production's `R_in` turns on in the
-                            // segment STARTING at the lagged arrival, integrated (NONMEM
-                            // end-of-interval) with the NEXT record's PK snapshot — not the dose
-                            // record's. So the onset jump's kernel (`ka`/shape, via `prep`) and
-                            // pathway `frac` must be read from that post-arrival snapshot, exactly
-                            // as `add_prepared_input_rate_forcing` reads them for the continuous
-                            // forcing on that segment; under a TV covariate crossing the onset the
-                            // dose snapshot diverges (a several-percent gradient error). The dose
-                            // **mass** `F·amt` stays fixed at dose time (`f_bio_at_dose`,
-                            // mass-exact), matching production. That snapshot is `params`, the
-                            // enclosing record's, for the reason spelled out at the bolus
-                            // arrival below (#1073/#1068): `K_DOSE` sorts before the record
-                            // kinds, so the onset reports the limit from below and both sides
-                            // read one snapshot. No lookahead — see `post_snapshot`'s doc.
+                            // The onset jump is THIS dose's `frac·R_in(0⁺)`: its kernel
+                            // (`ka`/shape) and pathway `frac` are read at its own dose record
+                            // (`dose_forcings`, #1569), exactly as
+                            // `add_prepared_input_rate_forcing` reads them for the continuous
+                            // forcing it switches on. The dose **mass** `F·amt` is fixed at dose
+                            // time too (`f_bio_at_dose`). What stays segment-side is the
+                            // post-side Jacobian of the disposition (`onset_params` below): the
+                            // enclosing record's snapshot, for the reason spelled out at the
+                            // bolus arrival below (#1073/#1068) — `K_DOSE` sorts before the
+                            // record kinds, so the onset reports the limit from below and both
+                            // sides read one snapshot. No lookahead — see `post_snapshot`'s doc.
+                            // (Until #1569 the kernel and `frac` were read from that snapshot
+                            // too, because production's forcing was — #880.)
                             let onset_params: &[T] = params;
-                            // `prepared_forcings` is built from `params` at the top of this
-                            // event, so it already IS `prep_for(onset_params)` — reuse it
-                            // rather than rebuilding a byte-identical copy per lagged dose.
-                            let prep_onset = &prepared_forcings;
                             let mut onset = T::from_f64(0.0);
                             // Onset **slope** `∂Δr/∂tad` (#880), summed over the same forcings
                             // exactly as `onset` sums their values — the curvature companion the
@@ -5618,7 +5586,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // zero-order window below, non-zero for the decaying `first_order`
                             // /Bateman onset that biased the Hessian.
                             let mut onset_dtad = T::from_f64(0.0);
-                            for (f, prep) in ode.input_rate.iter().zip(prep_onset) {
+                            for (fi, f) in ode.input_rate.iter().enumerate() {
                                 // #859: a forcing carrying its own `lag=` switches on later, at
                                 // `t_dose + lag_cmt + lag_route` — its onset saltation is injected
                                 // at its `K_ROUTE_ONSET` event with the combined jet, not summed
@@ -5626,10 +5594,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // unlagged forcing has `lag_slot == None` — the common case, byte-
                                 // identical to the pre-#859 walk).
                                 if f.cmt == cmt_idx && f.lag_slot.is_none() {
-                                    onset =
-                                        onset + f.frac(onset_params) * prep.rate_at_zero(dose_mass);
-                                    onset_dtad = onset_dtad
-                                        + f.frac(onset_params) * prep.rate_dtad_at_zero(dose_mass);
+                                    let dr = dose_forcings.get(fi, idx);
+                                    onset = onset + dr.frac * dr.prep.rate_at_zero(dose_mass);
+                                    onset_dtad =
+                                        onset_dtad + dr.frac * dr.prep.rate_dtad_at_zero(dose_mass);
                                 }
                             }
                             // #486: a zero-order window feeding this compartment also switches
@@ -5772,11 +5740,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // pair at `K_INF_END` still needs the same test, which is what
                             // makes it one shared predicate rather than five spellings.
                             if crate::dosing::infusion_has_rate_channel(d) {
-                                // One snapshot on both sides (#1068), so the post side's
-                                // forcings are the ones already prepared for this event —
-                                // no second `prep_for` per dose per provider evaluation.
+                                // One snapshot on both sides (#1068).
                                 let post_params = params;
-                                let prep_post = &prepared_forcings;
                                 // Strict membership (#1060 review #2): only forcings that
                                 // genuinely straddle this instant belong in both velocities.
                                 // A sibling window that *toggles* here — the co-timed second
@@ -5826,15 +5791,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 };
                                 // Pre side of the rate-on boundary: the field of the
                                 // segment ENDING at the arrival, which since #1073 is the
-                                // enclosing record's snapshot — the same `params` that
-                                // `prepared_forcings` is built from. Reading the dose row
+                                // enclosing record's snapshot `params`. Reading the dose row
                                 // here (as this did when the two were the same object)
-                                // would evaluate the velocity and its forcings under
-                                // different snapshots.
+                                // would evaluate the disposition under the wrong record.
                                 let v_minus = boundary_velocity(
                                     &u,
                                     params,
-                                    &prepared_forcings,
                                     t_event,
                                     pre_anchor,
                                     reset_floor,
@@ -5843,7 +5805,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 let mut v_plus = boundary_velocity(
                                     &u,
                                     post_params,
-                                    prep_post,
                                     t_event,
                                     // Post side: the anchor folded at the top of this arm.
                                     // Identical to `arrival_dual(idx)` in every reachable case
@@ -5914,10 +5875,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // *field* either side of the boundary is not: before #1073 this
                         // binding shadowed the outer `params` with the same object and the
                         // distinction was invisible, but the pre-arrival segment now runs
-                        // on the enclosing record's snapshot (the outer `params`, which
-                        // `prepared_forcings` is also built from). Mixing the two here
-                        // evaluates `g(x⁻)` under one snapshot and its forcings under
-                        // another.
+                        // on the enclosing record's snapshot (the outer `params`). Mixing
+                        // the two here evaluates `g(x⁻)` under the wrong record.
                         let dose_params = &pk_at_dose[idx];
                         let lag = dose_params[dose_lag_slot[idx]];
                         let dlag = jet_only(lag);
@@ -5992,7 +5951,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             boundary_velocity(
                                 &u_minus,
                                 params,
-                                &prepared_forcings,
                                 t_event,
                                 pre_anchor,
                                 reset_floor,
@@ -6000,16 +5958,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             )
                         };
                         u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
-                        // Both sides read one snapshot (#1068), so the post side's `R_in`
-                        // kernels are this event's own prepared forcings. Before #1068 this
-                        // was a slice-identity test with an owned `prep_for` fallback for
-                        // the case where the lookahead returned a different record; that
-                        // case is the defect, not a configuration to support.
-                        let post_prep: &[PreparedInputRate<T>] = &prepared_forcings;
+                        // Both sides read one snapshot (#1068), and the `R_in` kernels are
+                        // each dose's own (#1569), so the post side differs from the pre side
+                        // only by the bolus just applied.
                         let g_plus = boundary_velocity(
                             &u,
                             post_params,
-                            post_prep,
                             t_event,
                             // Post side: the anchor folded at the top of this arm (see the
                             // infusion arm above).
@@ -6101,12 +6055,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             let cmt_idx = d.cmt_idx();
             if cmt_idx < n_states {
                 let f = &ode.input_rate[fi];
-                // #880: read the onset kernel (`ka`/shape via `prep`), pathway `frac`, and the
-                // post-side Jacobian from the segment where this route's `R_in` turns on
-                // (NONMEM end-of-interval) — not the dose record's snapshot. Under a TV
-                // covariate crossing the route onset those diverge (a several-percent gradient
-                // error), exactly as at the shared `K_DOSE` onset. The dose **mass** `F·amt`
-                // stays fixed at dose time (mass-exact).
+                // The onset jump is this dose's own `frac·R_in(0⁺)` — kernel (`ka`/shape),
+                // pathway `frac` and route lag all read at the dose record (#1569), as
+                // `add_prepared_input_rate_forcing` reads them for the continuous forcing it
+                // switches on; the dose **mass** `F·amt` is fixed at dose time too. Only the
+                // post-side Jacobian of the disposition is read from the segment where this
+                // route's `R_in` turns on (NONMEM end-of-interval, #880).
                 //
                 // That snapshot is `params`, the enclosing record's, for the same reason it is
                 // at the shared `K_DOSE` onset — see the long note there (#1060 / #1068).
@@ -6126,22 +6080,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // It is the second site #1069 named, and it resolves its own snapshot rather
                 // than sharing the `K_DOSE` arm's, so fixing the shared arms did not reach it.
                 let onset_params: &[T] = params;
-                // `prepared_forcings` is built from `params` at the top of this event, so it
-                // already IS `prep_for(onset_params)` — reuse it rather than rebuilding a
-                // byte-identical copy per route onset.
-                let prep = &prepared_forcings[fi];
+                let dr = dose_forcings.get(fi, dose_idx);
                 let lag_cmt = if has_lagtime {
                     pk_at_dose[dose_idx][dose_lag_slot[dose_idx]]
                 } else {
                     T::from_f64(0.0)
                 };
-                let dlag = jet_only(lag_cmt + f.route_lag(&pk_at_dose[dose_idx]));
+                let dlag = jet_only(lag_cmt + dr.route_lag);
                 let dose_mass = f_bio_at_dose[dose_idx] * T::from_f64(d.amt);
-                let mut onset = f.frac(onset_params) * prep.rate_at_zero(dose_mass);
+                let mut onset = dr.frac * dr.prep.rate_at_zero(dose_mass);
                 // #880: onset **slope** `∂Δr/∂tad` — the δlag² curvature companion the rate-on
                 // saltation needs (`−dose·ka²` for `first_order`; 0 for the smooth kernels and
                 // for the constant `zero_order` window rate below).
-                let onset_dtad = f.frac(onset_params) * prep.rate_dtad_at_zero(dose_mass);
+                let onset_dtad = dr.frac * dr.prep.rate_dtad_at_zero(dose_mass);
                 // #859 Slice 2: a route-lagged `zero_order` window's rate-on is its constant
                 // window rate (`rate_at_zero` is zero for `ZeroOrder`, so the term above is zero).
                 // One zero-order forcing per compartment, so match this dose's own window here.
@@ -6328,11 +6279,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         &mut d1_stack,
                     );
                 } else {
-                    let prep_post = prep_for(post_params);
                     let v_minus = boundary_velocity(
                         &u,
                         pre_params,
-                        &prepared_forcings,
                         t_event,
                         last_dose_eff,
                         reset_floor,
@@ -6341,7 +6290,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     let mut v_plus = boundary_velocity(
                         &u,
                         post_params,
-                        &prep_post,
                         t_event,
                         last_dose_eff,
                         reset_floor,
@@ -6475,11 +6423,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // Genuine Jacobian jump: build full pre/post velocities (all concurrent
                         // forcings included) and turn every cohort window's own rate off on the
                         // post side; frozen forcings then appear identically on both sides.
-                        let prep_post = prep_for(post_params);
                         let v_minus = boundary_velocity(
                             &u,
                             pre_params,
-                            &prepared_forcings,
                             t_event,
                             last_dose_eff,
                             reset_floor,
@@ -6488,7 +6434,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         let mut v_plus = boundary_velocity(
                             &u,
                             post_params,
-                            &prep_post,
                             t_event,
                             last_dose_eff,
                             reset_floor,
@@ -6589,7 +6534,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     n_states: usize,
     subject: &Subject,
     ode: &OdeSpec,
-    prepared_forcings: &[PreparedInputRate<T>],
+    prepared_forcings: &PreparedForcings<T>,
     params_dual: &[T],
     dose_f_bio: &[T],
     init_state: &[T],
@@ -7065,7 +7010,6 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
                     ode,
                     prepared_forcings,
-                    ps,
                     &subject.doses,
                     &[],
                     dose_f_bio,

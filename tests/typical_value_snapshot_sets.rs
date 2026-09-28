@@ -19,10 +19,14 @@
 //!
 //! The false-positive control is the other half of the contract: the engine reads a lag
 //! at `pk_at_dose[k]` **only**, so a lag that goes non-finite at an *observation*
-//! snapshot is a value the engine never applies and must **not** be rejected — while a
-//! built-in absorption parameter, rebuilt per segment from the last event's snapshot, is
-//! read at every record and **must** be. Two checks, two snapshot sets, asserted against
-//! each other so a shared helper cannot quietly collapse them into one.
+//! snapshot is a value the engine never applies and must **not** be rejected.
+//!
+//! Until #1569 a built-in absorption parameter was the counter-example — rebuilt per
+//! segment from the last event's snapshot, read at every record, and so rejected at an
+//! observation too. Since #1569 every absorption parameter (kernel, pathway fraction,
+//! route lag) is read at the dose record as well, so both checks read **one** snapshot
+//! set, and the absorption arms below assert it from both sides: rejected at a dose,
+//! not rejected — and predicting bit-identically to an in-domain control — anywhere else.
 
 mod common;
 
@@ -134,9 +138,9 @@ const MODELED_RATE_MODEL: &str = r#"
 "#;
 
 /// Transit absorption whose mean transit time is `TVMTT − WT`: in domain at `WT = 0`,
-/// `≤ 0` once `WT` exceeds it. Unlike a lag, the engine rebuilds this forcing **per
-/// segment** from the last event's snapshot, so a value reached only at an observation
-/// is one the engine really does apply.
+/// `≤ 0` once `WT` exceeds it. `WT` reaches nothing else, so a curve that moves with a
+/// non-dose `WT` could only have read `MTT` there. Like a lag, the engine reads this
+/// forcing at the **dose record** only (#1569).
 const TV_COV_TRANSIT_MODEL: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -340,8 +344,8 @@ fn arm_b_a_time_reading_lag_is_rejected_with_no_covariates_at_all() {
 ///
 /// Without this the widening would pass its own arms by rejecting everything: the
 /// engine resolves a lag from `pk_at_dose[k]` and nowhere else, so an observation
-/// snapshot is a value it never applies. This is what pins `SnapshotSet::Doses` for the
-/// dose-attribute check — swap it to `AllRecords` and this test is the one that dies.
+/// snapshot is a value it never applies. This is what pins the dose-only snapshot set for
+/// the dose-attribute check — widen it to observations and this test is the one that dies.
 #[test]
 fn a_lag_non_finite_only_at_an_observation_is_not_rejected_and_still_predicts() {
     let model = parse_full_model(TV_COV_LAG_MODEL)
@@ -521,65 +525,119 @@ fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
 // the absorption pair — the OTHER snapshot set
 // ---------------------------------------------------------------------------
 
-/// A built-in absorption parameter driven out of domain at an **observation** snapshot
-/// is rejected — the opposite verdict to the lag on the same kind of record, because the
-/// engine rebuilds this forcing per segment from the last event's snapshot and so does
-/// apply the bad value.
-///
-/// This is the assertion that stops the shared helper from collapsing the two snapshot
-/// sets: point `check_absorption_dosing` at `SnapshotSet::Doses` and only this side
-/// dies; point `check_dose_attr_finiteness` at `Records` and only the false-positive
-/// control dies.
-#[test]
-fn an_absorption_parameter_out_of_domain_only_at_an_observation_is_rejected() {
-    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
-        .expect("the TV-covariate transit model parses")
-        .model;
+/// One dose at `t = 0` into compartment 1 — the one both absorption models' forcings feed
+/// — observations at 1 and 8 on `obs_cmt`, with `WT` per record.
+fn one_dose_subject(obs_cmt: usize, wt_dose: f64, wt_obs: [f64; 2]) -> Subject {
     let mut s = common::subject(
         "1",
         vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         vec![1.0, 8.0],
         vec![0.0; 2],
-        vec![2; 2],
+        vec![obs_cmt; 2],
     );
     s.covariates = wt(0.0);
-    s.dose_covariates = vec![wt(0.0)];
-    s.obs_covariates = vec![wt(0.0), wt(10.0)];
-    // MTT = 1 − WT: in domain at the dose and the first observation, ≤ 0 at the second.
-    let pop = population(s, &["WT"]);
+    s.dose_covariates = vec![wt(wt_dose)];
+    s.obs_covariates = wt_obs.iter().map(|&v| wt(v)).collect();
+    s
+}
+
+/// A built-in absorption parameter driven out of domain only at an **observation**
+/// snapshot is **not** rejected, and the curve is **bit-identical** to the in-domain
+/// control: the engine reads every absorption parameter at the dose record (#1569), so
+/// that value is never applied. (Until #1569 the kernel was rebuilt per segment, the value
+/// *was* applied, and this was rejected.)
+///
+/// The bit-identity is the load-bearing half — `is_finite()` would pass on a curve that
+/// had silently moved. Dies if the check reads observation snapshots again (rejected), and
+/// if the engine reads the kernel at an observation again (the curve moves off the
+/// control: `MTT = −9` there is clamped, not ignored).
+#[test]
+fn an_absorption_parameter_out_of_domain_only_at_an_observation_is_not_rejected_and_predicts_identically(
+) {
+    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
+        .expect("the TV-covariate transit model parses")
+        .model;
+    // MTT = 1 − WT: 1.0 at the dose and observation 1, −9 at observation 2.
+    let bad = population(one_dose_subject(2, 0.0, [0.0, 10.0]), &["WT"]);
+    let ctl = population(one_dose_subject(2, 0.0, [0.0, 0.0]), &["WT"]);
+    let diags = check_model_data(&model, &bad);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_DOMAIN"),
+        "an observation snapshot is not a read site for an absorption kernel, got {:?}",
+        codes(&diags)
+    );
+    let (b, c) = (preds(&model, &bad), preds(&model, &ctl));
+    assert!(
+        b.iter().all(|p| p.is_finite()),
+        "the subject must still predict finite values, got {b:?}"
+    );
+    assert_eq!(
+        b.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        c.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        "the observation-row `MTT` is never applied: {b:?} vs {c:?}"
+    );
+}
+
+/// The other side of the gate: at the **dose** record the engine does read `MTT`, so an
+/// out-of-domain value there is still rejected, naming the dose. Without this arm a check
+/// that never rejects passes the arm above.
+#[test]
+fn an_absorption_parameter_out_of_domain_at_the_dose_is_still_rejected() {
+    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
+        .expect("the TV-covariate transit model parses")
+        .model;
+    let pop = population(one_dose_subject(2, 10.0, [0.0, 0.0]), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_ABSORPTION_DOMAIN");
     assert!(
-        hit.message.contains("observation 2 at TIME=8"),
-        "must name the record: {}",
+        hit.message.contains("dose 1 at TIME=0"),
+        "must name the dose: {}",
         hit.message
     );
 }
 
-/// The `E_ABSORPTION_FRACTION` counterpart, so both codes on this snapshot set carry
-/// their own control rather than one standing in for the other.
+/// The `E_ABSORPTION_FRACTION` counterpart: a pathway fraction is read at the dose record
+/// too (#1569), so one out of range only at an observation is not rejected and predicts
+/// bit-identically to the control.
 #[test]
-fn a_pathway_fraction_out_of_range_only_at_an_observation_is_rejected() {
+fn a_pathway_fraction_out_of_range_only_at_an_observation_is_not_rejected_and_predicts_identically()
+{
     let model = parse_full_model(TV_COV_PARALLEL_MODEL)
         .expect("the TV-covariate parallel model parses")
         .model;
-    let mut s = common::subject(
-        "1",
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        vec![1.0, 8.0],
-        vec![0.0; 2],
-        vec![1; 2],
+    // FR1 = 0.6 + WT: 0.6 at the dose and observation 1, 5.6 at observation 2.
+    let bad = population(one_dose_subject(1, 0.0, [0.0, 5.0]), &["WT"]);
+    let ctl = population(one_dose_subject(1, 0.0, [0.0, 0.0]), &["WT"]);
+    let diags = check_model_data(&model, &bad);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_FRACTION"),
+        "an observation snapshot is not a read site for a pathway fraction, got {:?}",
+        codes(&diags)
     );
-    s.covariates = wt(0.0);
-    s.dose_covariates = vec![wt(0.0)];
-    s.obs_covariates = vec![wt(0.0), wt(5.0)];
-    // FR1 = 0.6 + WT: in (0, 1] at the dose and the first observation, 5.6 at the second.
-    let pop = population(s, &["WT"]);
+    let (b, c) = (preds(&model, &bad), preds(&model, &ctl));
+    assert!(
+        b.iter().all(|p| p.is_finite()),
+        "the subject must still predict finite values, got {b:?}"
+    );
+    assert_eq!(
+        b.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        c.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        "the observation-row `FR1` is never applied: {b:?} vs {c:?}"
+    );
+}
+
+/// And at the dose record a fraction out of range is still rejected, naming the dose.
+#[test]
+fn a_pathway_fraction_out_of_range_at_the_dose_is_still_rejected() {
+    let model = parse_full_model(TV_COV_PARALLEL_MODEL)
+        .expect("the TV-covariate parallel model parses")
+        .model;
+    let pop = population(one_dose_subject(1, 5.0, [0.0, 0.0]), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_ABSORPTION_FRACTION");
     assert!(
-        hit.message.contains("observation 2 at TIME=8"),
-        "must name the record: {}",
+        hit.message.contains("dose 1 at TIME=0"),
+        "must name the dose: {}",
         hit.message
     );
 }
@@ -652,7 +710,7 @@ fn a_modeled_duration_nonpositive_only_at_a_later_dose_is_warned() {
 }
 
 // ---------------------------------------------------------------------------
-// the read set is `is_record`, not "every record" — #1286 review, findings 1 and 2
+// the read set is the dose records — #1286 review, findings 1 and 2; #1569
 // ---------------------------------------------------------------------------
 
 /// `zero_order` absorption whose window is `TVDUR − WT`: in domain at `WT = 0`, `≤ 0`
@@ -743,24 +801,34 @@ fn preds(model: &ferx_core::types::CompiledModel, pop: &Population) -> Vec<f64> 
         .collect()
 }
 
-/// An EVID=2 row is a governing record — `is_record` admits `Kind::PkOnly` — so an
-/// absorption parameter out of domain only there **is** applied and must be rejected.
-///
-/// Without this the `Records` set is satisfied by one that carries doses and observations
-/// only, which is a different set and wrong in the other direction. Dies if `pk_only` is
-/// dropped from `typical_event_snapshots`.
+/// An EVID=2 row is a governing record — `is_record` admits `Kind::PkOnly` — so it sets
+/// the disposition of the segment it terminates, but since #1569 it is not a read site
+/// for an absorption kernel: a parameter out of domain only there is not rejected, and
+/// the curve is bit-identical to the in-domain control. (Until #1569 it was applied, and
+/// rejected.)
 #[test]
-fn an_absorption_parameter_out_of_domain_only_at_an_evid2_record_is_rejected() {
+fn an_absorption_parameter_out_of_domain_only_at_an_evid2_record_is_not_rejected_and_predicts_identically(
+) {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")
         .model;
-    let pop = population(transit_subject(0.0, [0.0, 0.0], None, Some(10.0)), &["WT"]);
-    let diags = check_model_data(&model, &pop);
-    let hit = find(&diags, "E_ABSORPTION_DOMAIN");
+    let bad = population(transit_subject(0.0, [0.0, 0.0], None, Some(10.0)), &["WT"]);
+    let ctl = population(transit_subject(0.0, [0.0, 0.0], None, Some(0.0)), &["WT"]);
+    let diags = check_model_data(&model, &bad);
     assert!(
-        hit.message.contains("EVID=2 record 1 at TIME=4"),
-        "must name the record: {}",
-        hit.message
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_DOMAIN"),
+        "an EVID=2 snapshot is not a read site for an absorption kernel, got {:?}",
+        codes(&diags)
+    );
+    let (b, c) = (preds(&model, &bad), preds(&model, &ctl));
+    assert!(
+        b.iter().all(|p| p.is_finite()),
+        "the subject must still predict finite values, got {b:?}"
+    );
+    assert_eq!(
+        b.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        c.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        "the EVID=2-row `MTT` is never applied: {b:?} vs {c:?}"
     );
 }
 
@@ -854,13 +922,11 @@ fn a_zero_order_duration_out_of_domain_at_the_dose_is_still_rejected() {
     );
 }
 
-/// The Σ ≈ 1 completeness rule. On a compartment mixing a zero-order pathway with a
-/// density one the engine reads the two fractions at *different* snapshots, so only a
-/// dose record sees the whole partition. A model whose fractions sum to 1 identically
-/// must not be rejected at its first observation for summing to the density share alone.
-///
-/// Dies if the `zero_order_cmt_idx` skip is removed: `FR2 = 0.6 − WT` alone is 0.4 at
-/// observation 2, 0.6 away from 1.
+/// The Σ ≈ 1 completeness rule on a compartment mixing a zero-order pathway with a
+/// density one. Both fractions are read at the dose record (the zero-order's always, the
+/// density's since #1569), so the whole partition is read at one snapshot and a model
+/// whose fractions sum to 1 identically must not be rejected. Dies if either fraction is
+/// dropped from the sum: `FR1 = FR2 = 0.5` at the dose, 0.5 away from 1 alone.
 #[test]
 fn a_mixed_zero_order_and_density_compartment_summing_to_one_is_not_rejected() {
     let model = parse_full_model(TV_COV_MIXED_FRACTION_MODEL)
@@ -912,42 +978,26 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
 /// no `check_model_data`, but they *do* run `check_absorption_dosing`, and return its
-/// first error as an `Err` (#898). Widening that check's snapshot set therefore widens
-/// what these entry points refuse: a model that returned numbers before now errs.
-/// Deliberate — the numbers it returned came from an out-of-domain forcing the engine
-/// really does apply at that record — and pinned here so the change cannot happen twice
-/// by accident.
-///
-/// `E_DOSE_ATTR_NONFINITE` is not among the checks `predict()` runs, so the widening leaves
-/// `predict()` unchanged for it. That gap is #1280 / #898, not something to close by
-/// adding an eleventh check here.
-///
-/// The `expected` string names the **record**, not the check family. Before #898 a wrapper
-/// sentence ("absorption input-rate machinery cannot honour") was emitted for every
-/// `check_absorption_dosing` error there has ever been — an SS/zero-order rejection, a
-/// `[diffusion]` clash — so matching on it would have let this test pass while the widening it
-/// exists to pin was gone, on a panic raised by something else entirely (#1286 review,
-/// finding 5). `observation 2 at TIME=8` can only come from the observation snapshot.
+/// first error as an `Err` (#898). #1235 widened that check to observation snapshots, so
+/// these entry points refused an absorption value reached only at an observation — right
+/// then, because the engine rebuilt the kernel per segment and applied it. Since #1569 the
+/// engine reads every absorption parameter at the dose record, so that value is never
+/// applied and `predict()` returns the in-domain control's curve, bit for bit, instead of
+/// an `Err`. Pinned here so neither direction can change again by accident.
 #[test]
-fn predict_now_errs_on_an_absorption_domain_error_reached_only_at_an_observation() {
+fn predict_returns_the_control_curve_for_an_absorption_value_reached_only_at_an_observation() {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")
         .model;
-    let mut s = common::subject(
-        "1",
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        vec![1.0, 8.0],
-        vec![0.0; 2],
-        vec![2; 2],
-    );
-    s.covariates = wt(0.0);
-    s.dose_covariates = vec![wt(0.0)];
-    s.obs_covariates = vec![wt(0.0), wt(10.0)];
-    let pop = population(s, &["WT"]);
-    let err =
-        predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.contains("observation 2 at TIME=8"),
-        "unexpected Err: {err}"
+    // MTT = 1 − WT: −9 at observation 2 only.
+    let bad = population(one_dose_subject(2, 0.0, [0.0, 10.0]), &["WT"]);
+    let ctl = population(one_dose_subject(2, 0.0, [0.0, 0.0]), &["WT"]);
+    let got = predict(&model, &bad, &model.default_params)
+        .unwrap_or_else(|e| panic!("predict() must serve this input since #1569, got Err: {e}"));
+    let want = predict(&model, &ctl, &model.default_params).expect("the control predicts");
+    assert_eq!(
+        got.iter().map(|p| p.pred.to_bits()).collect::<Vec<_>>(),
+        want.iter().map(|p| p.pred.to_bits()).collect::<Vec<_>>(),
+        "the observation-row `MTT` is never applied, so the curve is the control's"
     );
 }

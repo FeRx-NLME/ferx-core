@@ -1761,10 +1761,11 @@ pub(crate) fn check_absorption_dosing(
     // input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, or igd `mat`/`cv2
     // ≤ 0`) would otherwise propagate as a NaN through the ODE RHS and surface
     // only as an opaque fit failure. Evaluated on typical values (η = κ = 0) at
-    // every record's own snapshot (#1235), so a covariate relationship — or a
-    // `TIME`-reading expression — that pushes a subject's typical parameter out
-    // of range at *any* record is caught, not only at the t=0 baseline. Reported
-    // once — a single fatal error already halts the fit.
+    // every dose record's own snapshot (#1235) — where the engine reads every
+    // absorption parameter (#1569) — so a covariate relationship, or a
+    // `TIME`-reading expression, that pushes a subject's typical parameter out of
+    // range at *any* dose is caught, not only at the t=0 baseline. Reported once —
+    // a single fatal error already halts the fit.
     // Pathway-fraction **value** checks (below): each fraction in (0, 1], and the
     // fractions on a compartment sum to ≈ 1. The companion **structural** rules —
     // every term on a ≥2-pathway compartment must carry a fraction, and a *lone*
@@ -1776,38 +1777,16 @@ pub(crate) fn check_absorption_dosing(
     // check below runs unconditionally on any compartment that carries a fraction.
     use std::collections::BTreeMap;
 
-    // Compartments carrying a zero-order pathway, **0-based** — unlike `zero_order_cmts`
-    // above, which is 1-based to compare against `d.cmt_1based()`. Keyed the way
-    // `forcing.cmt` and `frac_sum` are, and used only for the Σ ≈ 1 completeness rule
-    // below.
-    let zero_order_cmt_idx: BTreeSet<usize> = ode
-        .input_rate
-        .iter()
-        .filter(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
-        .map(|f| f.cmt)
-        .collect();
-
     let mut scratch = TypicalSnapshotScratch::default();
     'subjects: for subject in &population.subjects {
-        // `SnapshotSet::Records`, not `Doses`: the engine rebuilds a *density* input-rate
-        // forcing per segment from `pk_now` — the last event's snapshot
-        // (`prepare_input_rates(ode, &ext_params_ed)`) — so those parameters are read at
-        // every record, observations included, and a covariate (or `TIME`) that pushes
-        // `mtt` out of domain only at a later observation is applied there (#1235).
-        // `Records` excludes EVID=3/4 resets, and `forcing_is_read_at` excludes
-        // `zero_order` off the dose records; both are read sets the engine does not have,
-        // and rejecting on either is a measured false positive (#1286 review, 1 and 2).
-        for snap in typical_event_snapshots(
-            model,
-            subject,
-            &model.default_params.theta,
-            SnapshotSet::Records,
-            &mut scratch,
-        ) {
+        // Dose records only: every forcing — kernel, pathway fraction and route lag — is
+        // read at the dose's own record (`ode::predictions::PreparedForcings`, #1569), so
+        // a value out of domain only at an observation, an EVID=2 row or a reset is a
+        // value the engine never applies, and rejecting it is a false positive.
+        for snap in
+            typical_dose_snapshots(model, subject, &model.default_params.theta, &mut scratch)
+        {
             for forcing in &ode.input_rate {
-                if !forcing_is_read_at(forcing.kind, snap.kind) {
-                    continue;
-                }
                 if let Err(msg) = forcing.validate(snap.values) {
                     diags.push(
                         Diagnostic::error(
@@ -1827,14 +1806,11 @@ pub(crate) fn check_absorption_dosing(
                 }
             }
 
-            // Pathway-fraction value checks (#388, η = 0, per record so a covariate on a
+            // Pathway-fraction value checks (#388, η = 0, per dose so a covariate on a
             // fraction is caught too): each fraction in (0, 1], and the fractions on a
             // compartment sum to ≈ 1. Reported once — a single fatal error halts the fit.
             let mut frac_sum: BTreeMap<usize, f64> = BTreeMap::new();
             for forcing in &ode.input_rate {
-                if !forcing_is_read_at(forcing.kind, snap.kind) {
-                    continue;
-                }
                 let Some(slot) = forcing.frac_slot else {
                     continue;
                 };
@@ -1859,19 +1835,6 @@ pub(crate) fn check_absorption_dosing(
                 *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
             }
             for (&cmt, &sum) in &frac_sum {
-                // **Completeness gate, not a scope gate.** On a compartment mixing a
-                // `zero_order` pathway with a density one (#505), the engine reads the two
-                // fractions at *different* snapshots — the density's per segment
-                // (`add_prepared_input_rate_forcing`), the zero-order's at dose time
-                // (`zero_order_dur_and_frac_for_dose`) — so a non-dose record sees only
-                // part of the partition and `sum` there is the density share alone. A
-                // dose record sees all of them, which is why the Σ check runs on such a
-                // compartment there and only there. Without this, an ordinary
-                // `FR1*zero_order(...) + FR2*first_order(...)` with `FR1 + FR2 == 1`
-                // identically is rejected at its first observation for summing to `FR2`.
-                if snap.kind != RecordKind::Dose && zero_order_cmt_idx.contains(&cmt) {
-                    continue;
-                }
                 // A lone fractioned term is rejected at parse (`build_ode_spec`), so every
                 // compartment reaching `frac_sum` has ≥2 partitioning terms — the Σ ≈ 1
                 // check needs no ≥2-pathway gate here (avoids the misleading "sum to <FR>,
@@ -2327,117 +2290,56 @@ pub(crate) fn check_dose_compartments(
     diags
 }
 
-/// Which of a subject's per-event `$PK` snapshots a data-level typical-value check
-/// evaluates at (#1235).
-///
-/// **The unifying contract is not "one snapshot set for the file" — it is "each check
-/// evaluates at the snapshots the engine reads *that* quantity at".** Measured, the
-/// checks here do not share one set:
-///
-/// * a lag / `F` / modeled `D{n}`/`R{n}` is read from `pk_at_dose[k]` **only**
-///   (`ode::predictions`' per-dose lag/`F` resolve, the sensitivity twin's `lag_val(k)`,
-///   and [`crate::dosing::resolve_subject_doses_with`]'s `pk_for_dose(k)`), so evaluating
-///   those at an *observation* snapshot would be a false positive — the engine never
-///   applies a lag there;
-/// * a built-in absorption input rate is rebuilt **per segment** from `pk_now`, the last
-///   event's snapshot (`prepare_input_rates(ode, &ext_params_ed)`), so its parameters are
-///   read at every record the engine takes segment parameters from.
-///
-/// Naming the set at the call site is what keeps that difference visible instead of
-/// collapsing it into one answer that is wrong for one of the two.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SnapshotSet {
-    /// Dose events only, each at its own `dose.time` and covariate snapshot.
-    Doses,
-    /// Every record the engine resolves **segment** parameters at — dose, observation and
-    /// EVID=2 (pk-only).
-    ///
-    /// **EVID=3/4 resets are deliberately not in this set**, and their absence is a type
-    /// fact rather than a filter: [`RecordKind`] has no `Reset` variant, so there is no
-    /// line to delete. `ode::predictions`' own `is_record` is
-    /// `DoseRecord | PkOnly | Obs`, so `governing_record` never resolves to a reset;
-    /// `pk_now`'s `Kind::Reset` arm takes `last_pk` and the segment terminating at a
-    /// reset is discarded before any readout. A reset row's `$PK` snapshot *is* read —
-    /// but only by the `init(...)` re-seed, straight out of `pk_at_reset` (#1133), which
-    /// is a state, not an input-rate forcing. Measured: a `transit` `mtt` driven out of
-    /// domain **only** on a reset row predicts
-    /// `[0.30509411543990944, 0.22308079058078897]`, bit-identical to the in-domain
-    /// control, so rejecting it is a false positive (#1286 review, finding 1).
-    Records,
-}
-
-/// Which kind of data record a snapshot came from.
-///
-/// A typed discriminator rather than the string the diagnostic prints, because the
-/// per-kind gate below ([`forcing_is_read_at`]) is a correctness rule, not formatting: a
-/// `&'static str` comparison would let a reworded label silently switch a forcing's read
-/// set off.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RecordKind {
-    Dose,
-    Observation,
-    /// An EVID=2 row: a real record `$PK` runs at (`is_record` admits `Kind::PkOnly`).
-    PkOnly,
-}
-
-impl RecordKind {
-    /// The word a diagnostic uses for this kind, matching how a data file reads.
-    fn label(self) -> &'static str {
-        match self {
-            RecordKind::Dose => "dose",
-            RecordKind::Observation => "observation",
-            RecordKind::PkOnly => "EVID=2 record",
-        }
-    }
-}
-
-/// One record's typical-value `$PK` snapshot, with the context a diagnostic needs to
-/// name *which* record went bad. Borrows `values` from the caller's
+/// One dose record's typical-value `$PK` snapshot, with the context a diagnostic needs to
+/// name *which* dose went bad. Borrows `values` from the caller's
 /// [`EventPkParams`](crate::pk::EventPkParams) buffer, so a population sweep costs no
 /// per-record allocation.
-pub(crate) struct EventSnapshot<'a> {
-    /// The `$PK` values the engine resolves at this record — a `PkParams::values`.
+pub(crate) struct DoseSnapshot<'a> {
+    /// The `$PK` values the engine resolves at this dose record — a `PkParams::values`.
     pub values: &'a [f64],
-    /// The record's time, as the engine passes it to `$PK`.
+    /// The dose record's time, as the engine passes it to `$PK`.
     pub time: f64,
-    /// Which kind of record this is — both the diagnostic's wording and the gate
-    /// deciding which forcings the engine actually reads here.
-    pub kind: RecordKind,
-    /// 0-based index of the record within its kind.
+    /// 0-based index of the dose.
     pub index: usize,
 }
 
-impl EventSnapshot<'_> {
-    /// "Which record", for a diagnostic: `dose 2 at TIME=1000`. 1-based within its kind,
-    /// the way a data file reads.
+impl DoseSnapshot<'_> {
+    /// "Which record", for a diagnostic: `dose 2 at TIME=1000`. 1-based, the way a data
+    /// file reads.
     pub(crate) fn record_label(&self) -> String {
-        format!(
-            "{} {} at TIME={}",
-            self.kind.label(),
-            self.index + 1,
-            self.time
-        )
+        format!("dose {} at TIME={}", self.index + 1, self.time)
     }
 }
 
-/// Caller-owned scratch for a population sweep of [`typical_event_snapshots`]: the `$PK`
+/// Caller-owned scratch for a population sweep of [`typical_dose_snapshots`]: the `$PK`
 /// buffer *and* the η = κ = 0 vector, so a population loop allocates once instead of once
 /// per subject (#1286 review, finding 8).
 ///
 /// `zero_eta` lives here rather than in the signature on purpose — an `eta` parameter
 /// that must be all-zero to make the function's name true is a footgun; this way the
-/// "typical" in `typical_event_snapshots` stays a property of the function.
+/// "typical" in `typical_dose_snapshots` stays a property of the function.
 #[derive(Default)]
 pub(crate) struct TypicalSnapshotScratch {
-    pk: crate::pk::EventPkParams,
+    dose: Vec<crate::types::PkParams>,
     zero_eta: Vec<f64>,
 }
 
-/// Materialize the typical-value (η = κ = 0) `$PK` snapshots that `set` names, through
-/// the **engine's own** materializers
-/// ([`compute_event_pk_params_into`](crate::pk::compute_event_pk_params_into), or its
-/// doses-only sibling, which shares the same gate and the same per-dose body) so a check
-/// cannot drift from what the engine resolves.
+/// Materialize the typical-value (η = κ = 0) `$PK` snapshot at each of a subject's **dose
+/// records**, through the **engine's own** materializer
+/// ([`compute_dose_pk_params_into`](crate::pk::compute_dose_pk_params_into), which shares
+/// the full event builder's gate and per-dose body) so a check cannot drift from what the
+/// engine resolves.
+///
+/// **Why dose records only.** Each check here evaluates at the snapshots the engine reads
+/// *that* quantity at (#1235), and every quantity checked is read at the dose record and
+/// nowhere else: a lag / `F` / modeled `D{n}`/`R{n}` from `pk_at_dose[k]`
+/// (`ode::predictions`' per-dose resolve, the sensitivity twin's `lag_val(k)`,
+/// [`crate::dosing::resolve_subject_doses_with`]'s `pk_for_dose(k)`), and — since #1569 —
+/// every built-in absorption forcing parameter (kernel, pathway fraction, route lag),
+/// which `ode::predictions::PreparedForcings` reads per dose, from its record. Until
+/// #1569 the smooth kernels were rebuilt per segment, so their check also covered
+/// observation and EVID=2 records; a value driven out of domain only there is now a
+/// value the engine never applies, and rejecting it would be a false positive.
 ///
 /// Going through the engine's builder rather than re-spelling
 /// `(pk_param_fn)(θ, 0, cov, t)` here is deliberate: it carries the per-event/static
@@ -2453,107 +2355,39 @@ pub(crate) struct TypicalSnapshotScratch {
 /// fit-init data checks, `init_params.theta` for the warning pass, which is evaluated at
 /// the user's initial estimates rather than the compiled defaults.
 ///
-/// `scratch` is caller-owned so a population loop allocates once and refills.
-///
-/// Returns empty for a subject with **no records at all** under
-/// [`SnapshotSet::Records`]: the engine evaluates `$PK` nowhere for such a subject and
-/// integrates nothing, so there is no value it could apply.
-pub(crate) fn typical_event_snapshots<'a>(
+/// `scratch` is caller-owned so a population loop allocates once and refills. The
+/// dose-only materializer skips the observation snapshots no check reads: through the
+/// full builder a synthetic 1000 subjects × (2 doses + 100 observations) measured 102,000
+/// `$PK` evaluations against 2,000 — 111.7 ms of `check_model_data` against 9.9 ms.
+pub(crate) fn typical_dose_snapshots<'a>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
-    set: SnapshotSet,
     scratch: &'a mut TypicalSnapshotScratch,
-) -> Vec<EventSnapshot<'a>> {
+) -> Vec<DoseSnapshot<'a>> {
     let n_zero = model.n_eta + model.n_kappa;
     if scratch.zero_eta.len() != n_zero {
         scratch.zero_eta.clear();
         scratch.zero_eta.resize(n_zero, 0.0);
     }
-    let zero_eta = &scratch.zero_eta;
-    let buf = &mut scratch.pk;
-    match set {
-        // Doses-only takes the cheap materializer: it shares the full builder's gate and
-        // its per-dose body (`pk::fill_dose_pk_params`, pinned bit-for-bit by
-        // `pk::tests::dose_only_snapshots_match_the_full_event_builder`), but skips the
-        // observation snapshots this set never reads. Going through the full builder
-        // instead measured 102,000 `$PK` evaluations against 2,000 on a synthetic 1000
-        // subjects × (2 doses + 100 observations) — 111.7 ms of `check_model_data` against
-        // 9.9 ms, where the whole check cost 9.0 ms before this widening.
-        SnapshotSet::Doses => {
-            crate::pk::compute_dose_pk_params_into(model, subject, theta, zero_eta, &mut buf.dose);
-            // The other three stay empty rather than stale: this buffer is reused across
-            // a population, and the `Records` arm below is the only reader.
-            buf.obs.clear();
-            buf.pk_only.clear();
-            buf.reset.clear();
-        }
-        SnapshotSet::Records => {
-            crate::pk::compute_event_pk_params_into(model, subject, theta, zero_eta, &mut *buf)
-        }
-    }
+    crate::pk::compute_dose_pk_params_into(
+        model,
+        subject,
+        theta,
+        &scratch.zero_eta,
+        &mut scratch.dose,
+    );
     // Downgrade to a shared borrow so the returned snapshots can hold `'a` references
     // into the buffer the call above just filled.
-    let buf: &'a crate::pk::EventPkParams = buf;
-    // Sized from what this `set` will actually push, not from the doses alone — an
-    // observation-rich subject under `Records` otherwise reallocates its way up from two
-    // (#1286 review, finding 9). `buf.reset` is not counted: resets are not in either set.
-    let capacity = match set {
-        SnapshotSet::Doses => buf.dose.len(),
-        SnapshotSet::Records => buf.dose.len() + buf.obs.len() + buf.pk_only.len(),
-    };
-    let mut out: Vec<EventSnapshot<'a>> = Vec::with_capacity(capacity);
-    for (k, p) in buf.dose.iter().enumerate() {
-        out.push(EventSnapshot {
+    let dose: &'a [crate::types::PkParams] = &scratch.dose;
+    dose.iter()
+        .enumerate()
+        .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
             time: subject.doses[k].time,
-            kind: RecordKind::Dose,
             index: k,
-        });
-    }
-    if set == SnapshotSet::Records {
-        for (j, p) in buf.obs.iter().enumerate() {
-            out.push(EventSnapshot {
-                values: &p.values[..],
-                time: subject.obs_times[j],
-                kind: RecordKind::Observation,
-                index: j,
-            });
-        }
-        for (m, p) in buf.pk_only.iter().enumerate() {
-            out.push(EventSnapshot {
-                values: &p.values[..],
-                time: subject.pk_only_times[m],
-                kind: RecordKind::PkOnly,
-                index: m,
-            });
-        }
-        // `buf.reset` is filled by the engine's builder and deliberately not read here:
-        // see `SnapshotSet::Records`. There is no `RecordKind::Reset` to push it as.
-    }
-    out
-}
-
-/// Whether the engine reads a forcing of `kind`'s parameters at a `rec` snapshot.
-///
-/// The smooth densities (`transit` / `igd` / `weibull` / `first_order`) are rebuilt per
-/// segment by `add_prepared_input_rate_forcing` from the terminating record's snapshot,
-/// so every record in [`SnapshotSet::Records`] is a read site for them.
-///
-/// **`zero_order` is not one of them.** `add_prepared_input_rate_forcing` `continue`s on
-/// `InputRateKind::ZeroOrder` before it touches the forcing (`ode/predictions.rs`), because
-/// a zero-order input is a spanning window rather than a pointwise density; its `dur`,
-/// pathway fraction and per-route lag all come from `zero_order_dur_and_frac_for_dose` on
-/// the **dose**'s snapshot, which the event-driven walk documents as fixed at dose time so
-/// the delivered mass is exact under time-varying covariates. Measured: a `dur` driven out
-/// of domain only at an observation predicts
-/// `[0.47581290979331525, 0.24334182605819396]`, bit-identical to the in-domain control
-/// (#1286 review, finding 2).
-fn forcing_is_read_at(kind: crate::pk::absorption::InputRateKind, rec: RecordKind) -> bool {
-    match kind {
-        crate::pk::absorption::InputRateKind::ZeroOrder => rec == RecordKind::Dose,
-        _ => true,
-    }
+        })
+        .collect()
 }
 
 /// Every dose attribute the **engine** applies at a dose event — bioavailability `F`,
@@ -2574,9 +2408,8 @@ fn forcing_is_read_at(kind: crate::pk::absorption::InputRateKind, rec: RecordKin
 /// naming the subject.
 ///
 /// Evaluated at η = κ = 0 at **each dose record's own snapshot** — the subject's
-/// covariate values there and that record's `TIME` — via
-/// [`typical_event_snapshots`]`(.., SnapshotSet::Doses, ..)`, which is the engine's own
-/// per-event materializer. So a covariate relationship that pushes one subject's typical
+/// covariate values there and that record's `TIME` — via [`typical_dose_snapshots`],
+/// which is the engine's own per-dose materializer. So a covariate relationship that pushes one subject's typical
 /// attribute non-finite is caught whether it does so at the first dose or the tenth.
 ///
 /// **Why the snapshot and the time both had to widen (#1235).** The original check
@@ -2597,8 +2430,7 @@ fn forcing_is_read_at(kind: crate::pk::absorption::InputRateKind, rec: RecordKin
 /// [`InputRateForcing::validate`](crate::pk::absorption::InputRateForcing::validate) loop
 /// in [`check_absorption_dosing`], deliberately: that one returns early unless the model
 /// has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt model has
-/// nothing to do with absorption. The two also read *different* snapshot sets — see
-/// [`SnapshotSet`].
+/// nothing to do with absorption.
 ///
 /// **Two failure modes, not one, and the second is worse.** A non-finite lag or `F`
 /// makes the timeline unorderable and every prediction `NaN` — loud. A non-finite
@@ -2674,11 +2506,11 @@ pub(crate) fn check_dose_attr_finiteness(
          `amt / 1e-8` time units so that essentially nothing is delivered. Either way \
          the engine returns finite, silently wrong numbers instead of the infusion the \
          data asks for.";
-    // One scratch for the population: `typical_event_snapshots` resizes and refills it per
+    // One scratch for the population: `typical_dose_snapshots` resizes and refills it per
     // subject, reusing the allocation.
     let mut scratch = TypicalSnapshotScratch::default();
     for subject in &population.subjects {
-        // A **cost** gate, not a correctness one — `SnapshotSet::Doses` already yields
+        // A **cost** gate, not a correctness one — `typical_dose_snapshots` already yields
         // nothing for a doseless subject, so removing this changes no verdict. It earns
         // its place by skipping the snapshot build entirely: that build is the engine's
         // own materializer, which resolves `$PK` at every *observation* too, and a
@@ -2686,16 +2518,12 @@ pub(crate) fn check_dose_attr_finiteness(
         if subject.doses.is_empty() {
             continue;
         }
-        // `SnapshotSet::Doses`, not `Records`: the engine reads a lag / `F` / modeled
-        // `D`/`R` at `pk_at_dose[k]` only, so an observation snapshot driving one
-        // non-finite is a value the engine never applies — a false positive.
-        for snap in typical_event_snapshots(
-            model,
-            subject,
-            &model.default_params.theta,
-            SnapshotSet::Doses,
-            &mut scratch,
-        ) {
+        // Dose snapshots only: the engine reads a lag / `F` / modeled `D`/`R` at
+        // `pk_at_dose[k]` only, so an observation snapshot driving one non-finite is a
+        // value the engine never applies — a false positive.
+        for snap in
+            typical_dose_snapshots(model, subject, &model.default_params.theta, &mut scratch)
+        {
             let dose = &subject.doses[snap.index];
             let cmt = dose.cmt_1based();
             // The modeled infusion parameter, when this dose codes `RATE` (#324). Read
@@ -5976,13 +5804,7 @@ pub fn check_model_data_warnings(
             if !s.doses.iter().any(|d| d.rate_mode != RateMode::Fixed) {
                 continue;
             }
-            for snap in typical_event_snapshots(
-                model,
-                s,
-                &init_params.theta,
-                SnapshotSet::Doses,
-                &mut scratch,
-            ) {
+            for snap in typical_dose_snapshots(model, s, &init_params.theta, &mut scratch) {
                 let d = &s.doses[snap.index];
                 let (attr, floor) = match d.rate_mode {
                     RateMode::Fixed => continue,
