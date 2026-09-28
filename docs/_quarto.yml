@@ -19,6 +19,7 @@ website:
     logo: assets/ferx-dsl-brackets.svg
     logo-dark: assets/ferx-dsl-brackets-dark.svg
     logo-alt: "ferx"
+    logo-href: https://ferx-nlme.org/
     left:
       - text: "Get started"
         href: https://ferx-nlme.org/get-started.html
