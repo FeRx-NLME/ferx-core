@@ -21,13 +21,17 @@ website:
     logo-alt: "ferx"
     left:
       - text: "Get started"
-        href: getting-started.qmd
+        href: https://ferx-nlme.org/get-started.html
+      - text: "Design"
+        href: https://ferx-nlme.org/design.html
       - text: "Features"
         href: https://ferx-nlme.org/features.html
       - text: "Changelog"
         href: https://ferx-nlme.org/changelog.html
       - text: "Roadmap"
         href: https://ferx-nlme.org/roadmap.html
+      - text: "Blog"
+        href: https://ferx-nlme.org/blog/
     right:
       - text: "ferx-core"
         href: https://ferx-nlme.org/ferx-core/
