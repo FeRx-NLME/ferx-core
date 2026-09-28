@@ -2909,8 +2909,10 @@ struct ClockDependence {
 /// - A first dose later than `t_end` puts the clock further below zero than the anchor reaches,
 ///   so a condition that switches only there is not seen: `if (TAD < -20)` over 12 h windows,
 ///   with the first dose at 36, runs 23.5× off `predict()` at its worst read.
-/// - It samples 17 times, at `u_start` and `u` only, so a dependence between two sample times,
-///   or one that shows only at states inside the window, is missed.
+/// - It samples 17 times and pairs the window's start and end states with each. A dependence
+///   between two sample times, or one that shows only at states inside the window, is missed;
+///   and a pairing the trajectory never reaches can be refused although the run matches
+///   `predict()` — measured with a condition on both the state and `TIME`.
 ///
 /// Cost: `2 × 17 × 2` RHS evaluations on a segment with an unanchored clock the program reads,
 /// plus `2 × 17 × 3` to name the slots when both are candidates and the segment is refused.

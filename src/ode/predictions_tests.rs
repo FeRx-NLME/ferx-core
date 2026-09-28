@@ -12860,8 +12860,10 @@ fn unanchored_dose_clock_error_opens_with_a_non_finite_state_only_when_the_clock
     //
     // C is a comparison-read clock while another state diverges on its own: the clock is
     // refused on its own merits, but the non-finite opener would pin that divergence on it. D
-    // is not reachable from the driver — a `NaN` derivative integrates to a `NaN` state — but
-    // it is the cell that separates the outcome conjunct.
+    // is what the driver hits when the probe pairs a state with a time the trajectory never
+    // reaches (#1570 review, row 4: a condition on both the state and `TIME`, whose run matches
+    // `predict()` to 2.5e-12, is refused through this cell) — a false positive tracked in #1572.
+    // Here it is the cell that separates the outcome conjunct.
     //
     // Mutations that redden it: drop the `nan_reached_derivative` conjunct (C flips); drop the
     // outcome conjunct (D flips); either opener unconditionally (A, or B–D). And deleting any

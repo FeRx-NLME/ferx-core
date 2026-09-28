@@ -438,8 +438,9 @@ It is gated on what the clock does, not on the text of your model. After each
 segment is integrated, the check asks whether the right-hand side's derivative over
 that window depends on the missing anchor. It evaluates the `[odes]` right-hand side
 at 17 evenly spaced times across the window — at the state the window started from
-and, when finite, the one it ended at — once as the window ran, and once with the
-clock anchored at the window's end, and refuses only if some derivative differs.
+and the one it ended at, each only when every compartment in it is finite — once as
+the window ran, and once with the clock anchored at the window's end, and refuses
+only if some derivative differs.
 Nothing is re-solved. The anchor is the earliest one a schedule can give: no dose has
 landed by the window's start, so the first dose comes at its end or later, and the
 clock `predict()` reads there is never positive. That covers both ways a clock gets
@@ -479,7 +480,10 @@ you.
 
 It samples, so a dependence confined between two of
 its 17 points, or one that shows only at states in the middle of the window, can
-slip through. And it anchors the clock at the window's end, while a later first dose
+slip through. Because it pairs the window's start and end states with every sample
+time, it can also refuse a combination the run never reaches — a condition on both a
+compartment and `TIME` — although the run would have matched `predict()`. And it
+anchors the clock at the window's end, while a later first dose
 puts the clock further below zero: a condition that only switches there — `if (TAD <
 -20)` over 12-hour windows with the first dose at 36 — is not seen, and the run
 returns numbers that depend on it. Probing every decision a dose could land at
