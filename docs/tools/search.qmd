@@ -258,7 +258,7 @@ The error lists every gap at once and ends with a link back to this table:
   - ABSORPTION(SEQ-ZO-FO): sequential zero-order-then-first-order absorption is not one ...
   - IOV(..., ADD): `ferx-core::edit` writes a κ inside the exponential only
     (`P = TVP * exp(ETA + KAPPA)`), which is the form `[iov]` estimates
-See the coverage table at https://ferx-nlme.github.io/ferx-core/tools/search.html#coverage
+See the coverage table at https://ferx-nlme.org/ferx-core/tools/search.html#coverage
 ```
 
 ## Ranking, strictness and run settings

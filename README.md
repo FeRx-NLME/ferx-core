@@ -7,7 +7,7 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core/badge)](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[Website](https://ferx-nlme.github.io/) · [Documentation](https://ferx-nlme.github.io/ferx-core/) · [R package](https://github.com/FeRx-NLME/ferx-r) · [Examples](https://ferx-nlme.github.io/ferx-core/examples/)
+[Website](https://ferx-nlme.org/) · [Documentation](https://ferx-nlme.org/ferx-core/) · [R package](https://github.com/FeRx-NLME/ferx-r) · [Examples](https://ferx-nlme.org/ferx-core/examples/)
 
 ferx-core is an open-source, high-performance nonlinear mixed-effects (NLME)
 modeling engine for population pharmacokinetic and pharmacodynamic (PopPK/PD)
