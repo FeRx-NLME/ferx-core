@@ -7378,6 +7378,17 @@ fn reset_subject_1148() -> Subject {
     s
 }
 
+/// Closed-form band: 8× the RK45 error control (default reltol 1e-4), the convention the
+/// rest of this file uses. Measured worst realized error across T1–T6: 7.64e-4 (T6's
+/// `ctx.state@18`, 28.3662 vs 28.3654), 6.07e-4 (T5), the rest ≤ 3.3e-4 — against a band of
+/// 1.7e-2..2.3e-2 at these magnitudes, so ~30× headroom. Every stale value the tests exist
+/// to reject sits ≥ 2.6 away (T3b's reset-row value; ≥ 4.6 for the rest), > 100× the band.
+///
+/// The `predict()` comparisons use 1e-9 relative: measured **0** (bit-identical) on every row.
+fn band_1148(want: f64) -> f64 {
+    8.0 * (1e-6 + 1e-4 * want.abs())
+}
+
 /// `100·F·e^(−0.1·Δt)` with `F = 0.8·CRCL/100`.
 fn bolus_closed_form_1148(crcl: f64, dt: f64) -> f64 {
     100.0 * (0.8 * crcl / 100.0) * (-0.1 * dt).exp()
@@ -7395,7 +7406,7 @@ fn adaptive_decision_after_a_reset_reads_the_reset_row() {
     let want = bolus_closed_form_1148(30.0, 6.0); // 13.171479
     let got = ipred_at_1148(&res, 42.0);
     assert!(
-        (got - want).abs() < 1e-3,
+        (got - want).abs() <= band_1148(want),
         "IPRED@42 = {got}: the injected dose's F must come from the reset row \
          (F = 0.24 → {want:.6}); the stale obs@12 snapshot gives F = 0.72 → {:.6}",
         bolus_closed_form_1148(90.0, 6.0)
@@ -7414,7 +7425,7 @@ fn adaptive_decision_after_a_reset_reads_the_reset_row() {
     );
     let p42 = preds.iter().find(|p| (p.0 - 42.0).abs() < 1e-9).unwrap().1;
     assert!(
-        (got - p42).abs() <= 1e-4 * p42.abs(),
+        (got - p42).abs() <= 1e-9 * p42.abs(),
         "IPRED@42 {got} != predict() {p42} on the realized doses"
     );
 }
@@ -7430,7 +7441,7 @@ fn adaptive_iov_decision_after_a_reset_reads_the_reset_row() {
     let want = bolus_closed_form_1148(30.0, 6.0);
     let got = ipred_at_1148(&res, 42.0);
     assert!(
-        (got - want).abs() < 1e-3,
+        (got - want).abs() <= band_1148(want),
         "IOV IPRED@42 = {got}, want the reset row's {want:.6} (stale: {:.6})",
         bolus_closed_form_1148(90.0, 6.0)
     );
@@ -7453,7 +7464,7 @@ fn adaptive_decision_co_timed_with_a_reset_reads_the_reset_row() {
     let want = bolus_closed_form_1148(30.0, 6.0);
     let got = ipred_at_1148(&res, 30.0);
     assert!(
-        (got - want).abs() < 1e-3,
+        (got - want).abs() <= band_1148(want),
         "IPRED@30 = {got}, want {want:.6} (stale: {:.6})",
         bolus_closed_form_1148(90.0, 6.0)
     );
@@ -7482,7 +7493,7 @@ fn adaptive_decision_at_a_reset_and_obs_tie_reads_the_obs() {
     let want = bolus_closed_form_1148(50.0, 18.0);
     let got = ipred_at_1148(&res, 42.0);
     assert!(
-        (got - want).abs() < 1e-3,
+        (got - want).abs() <= band_1148(want),
         "IPRED@42 = {got}, want the obs row's {want:.6} (reset row: {:.6})",
         bolus_closed_form_1148(30.0, 18.0)
     );
@@ -7516,7 +7527,7 @@ fn adaptive_decision_after_a_base_dose_row_reads_that_row() {
         let (res, seen) = run_capture_1148(&model, base_dose_subject_1148(), &[0.0, 36.0]);
         let got = ipred_at_1148(&res, 42.0);
         assert!(
-            (got - want).abs() < 1e-3,
+            (got - want).abs() <= band_1148(want),
             "{label}: IPRED@42 = {got}, want {want:.6} (the IOV path skipping the dose row \
              gave 42.577880)"
         );
@@ -7548,7 +7559,7 @@ fn adaptive_decision_before_any_record_reads_the_baseline() {
         );
         let got = ipred_at_1148(&res, 12.0);
         assert!(
-            (got - want).abs() < 1e-3,
+            (got - want).abs() <= band_1148(want),
             "{label}: IPRED@12 = {got}, want the baseline's {want:.6} (first record ahead: \
              {:.6})",
             100.0 * 0.48 * (-1.2f64).exp()
@@ -7586,7 +7597,7 @@ fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
             .expect("a decision at 18")
             .2;
         assert!(
-            (state18 - want).abs() < 1e-3,
+            (state18 - want).abs() <= band_1148(want),
             "arm obs@42 = {crcl42}: ctx.state@18 = {state18}, want the reset-governed \
              {want:.6} (skipping the reset to obs@42 gives {:.6})",
             skip_reset(crcl42)
@@ -7597,7 +7608,7 @@ fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
         assert_eq!(preds.len(), res.trajectories.len());
         for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
             assert!(
-                (traj.ipred - p.1).abs() <= 1e-6 + 1e-4 * p.1.abs(),
+                (traj.ipred - p.1).abs() <= 1e-9 * p.1.abs(),
                 "arm {crcl42}: IPRED {} != predict() {} at t={}",
                 traj.ipred,
                 p.1,
