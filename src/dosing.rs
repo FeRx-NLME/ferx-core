@@ -1148,9 +1148,16 @@ pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 
 /// lexicographic, so the answer is also correct on an unsorted list (the adaptive shadow
 /// list is base-then-controller).
 ///
-/// The record is the dose row's own `time`, never its lagged arrival: `SS=1` + lag into
-/// an absorption forcing is rejected up front, and the lagged-pending case is #1587.
-/// A running infusion is not stopped here either (#1586). O(n), no allocation.
+/// Both sides of the comparison are dose **records**, never lagged arrivals, and every dose
+/// kind is covered. So a caller that skips non-live doses outright — analytic superposition
+/// (`crate::pk::predict_concentration`, `analytical_state_at_times`, and the dual's two
+/// loops) — also cancels a lagged dose still pending at the record and stops an infusion
+/// still running at it, as NONMEM does. The ODE absorption forcing skips non-live doses
+/// too, so it stops an infusion into the forcing compartment; it only ever sees record =
+/// arrival (`SS=1` + lag into a forcing is rejected up front). The state-propagating
+/// engines (the ODE walkers' compartment states, the analytic event-driven walk) do not
+/// consult this for infusions or pending lagged doses yet: #1586, #1587. O(n), no
+/// allocation.
 #[inline]
 pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
     let mut best: Option<usize> = None;

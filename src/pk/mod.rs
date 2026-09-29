@@ -4452,6 +4452,58 @@ mod tests {
         );
     }
 
+    /// Superposition keys the reset on the dose **record**, so a lagged dose recorded before
+    /// an `SS=1` record but arriving after it is cancelled, as NONMEM does (#1587's measured
+    /// row: dose at 9 with `ALAG1 = 2`, `SS=1` at 10; NONMEM 3.5948 at t = 11.5, `main` +9.8 %).
+    /// The event-driven walkers still key on the arrival (#1587). With `lag < II` the `SS=1`
+    /// dose reads its pre-arrival tail `C_ss(t − rec + II − lag)` before its own arrival.
+    #[test]
+    fn a_pending_lagged_dose_is_cancelled_by_an_ss_record_in_superposition() {
+        let mut pk = ss_reset_pk();
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0;
+        let doses = [ss_reset_bolus(9.0), ss_reset_ss(10.0)];
+        let cases = [
+            (11.5, ss_reset_c_ss(11.5)), // pre-arrival: phase II − lag = 10
+            (13.0, ss_reset_c_ss(1.0)),  // one hour after the SS arrival at 12
+        ];
+        for (t, want) in cases {
+            let got = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                got.is_finite() && rel < 1e-11,
+                "t={t}: got {got} want {want} (rel {rel:e})"
+            );
+        }
+        // Differential: without the `SS=1` row the pending dose is live at 13.
+        let alone = predict_concentration(PkModel::OneCptOral, &doses[..1], 13.0, &pk);
+        assert!(
+            alone > 0.1 * ss_reset_c_ss(1.0),
+            "fixture degenerate: {alone}"
+        );
+    }
+
+    /// A central infusion running across an `SS=1` record into the depot contributes nothing
+    /// after the record on the superposition path (#1586's "infusion into central" row: +110 %
+    /// before). An infusion superposition cannot express (into the depot) routes to the
+    /// event-driven walk, which does not stop it yet (#1586).
+    #[test]
+    fn a_central_infusion_running_across_an_ss_record_stops_in_superposition() {
+        let (cl, _, _, _, _) = SS_RESET_P;
+        let infusion = DoseEvent::new(0.0, 200.0, 2, 10.0, false, 0.0); // 0–20 h into central
+        let doses = [infusion, ss_reset_ss(10.0)];
+        let k = cl / SS_RESET_P.1;
+        ss_reset_check(
+            "central infusion 0–20 h, SS=1 into the depot at 10",
+            &doses,
+            &[
+                (5.0, 10.0 / cl * (1.0 - (-k * 5.0).exp())), // live before the record
+                (10.5, ss_reset_c_ss(0.5)),
+                (15.0, ss_reset_c_ss(5.0)),
+                (21.0, ss_reset_c_ss(11.0)),
+            ],
+        );
+    }
+
     /// The state twin (`[derived]`, sdtab states, depot readout) on row 41: the skip in
     /// `predict_concentration` alone leaves this wrong.
     #[test]

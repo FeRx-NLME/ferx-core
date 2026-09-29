@@ -1292,7 +1292,7 @@ fn ode_provider_ss_record_reset_of_a_transit_forcing_matches_production() {
     let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
     let ss = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, true, 12.0);
     // (label, doses, the one-dose twin, observations, the observations the twin governs)
-    let cases: [(&str, Vec<DoseEvent>, DoseEvent, &[f64], usize); 2] = [
+    let cases: [(&str, Vec<DoseEvent>, DoseEvent, &[f64], usize); 3] = [
         (
             "D2: bolus at 0, SS=1 at 6",
             vec![bolus(0.0), ss(6.0)],
@@ -1305,6 +1305,16 @@ fn ode_provider_ss_record_reset_of_a_transit_forcing_matches_production() {
             vec![ss(0.0), ss(30.0)],
             ss(0.0),
             &[2.0, 10.0, 25.0, 29.5],
+            0,
+        ),
+        (
+            // PR #1589 review finding 1, on a shape the dual walk takes (an infusion into a
+            // forcing routes to FD): a bolus recorded 1 ulp below the record, which the
+            // timeline merges with it, so the walk's segment starts at the lower value.
+            "segment start 1 ulp below the record",
+            vec![bolus(0.7999999999999999), ss(0.8)],
+            ss(0.8),
+            &[1.0, 2.0, 6.0],
             0,
         ),
     ];

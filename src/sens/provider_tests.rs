@@ -5432,6 +5432,52 @@ fn an_ss_record_reset_matches_production_through_both_superposition_loops() {
     }
 }
 
+/// The analytic dual cancels a pending lagged dose at an `SS=1` record exactly as the value
+/// path does (#1576 review round 1, finding 2): the skip in `superpose_doses` keys on the
+/// record, not the arrival. Bolus recorded at 9.5 with `LAGTIME ≈ 0.75`, so it would arrive
+/// at ~10.25, after the `SS=1` record at 10. A lag forces the generic (`superpose_doses`) path.
+#[test]
+fn a_pending_lagged_dose_cancelled_by_an_ss_record_matches_production_on_the_dual() {
+    let m = parse_model_string(ONECPT_ORAL_LAG).expect("parse lag");
+    let (theta, eta) = (vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25, 0.12]);
+    let times = [10.1, 11.0, 14.0];
+    let bolus = DoseEvent::new(9.5, 100.0, 1, 0.0, false, 0.0);
+    let subject = Subject {
+        doses: vec![
+            bolus.clone(),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0),
+        ],
+        ..oral_subject(&times)
+    };
+    // Differential: the pending dose, left alone, is live at t = 11.
+    let alone = compute_predictions_with_tv(
+        &m,
+        &Subject {
+            doses: vec![bolus],
+            ..oral_subject(&times)
+        },
+        &theta,
+        &eta,
+    );
+    assert!(
+        alone[1] > 1.0,
+        "fixture degenerate: pending dose alone {}",
+        alone[1]
+    );
+    let prod = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+    let full = subject_sensitivities(&m, &subject, &theta, &eta).expect("supported");
+    for (j, &f0) in prod.iter().enumerate() {
+        assert!(f0.is_finite(), "production non-finite at obs {j}");
+        assert!(
+            ((full.obs[j].f - f0) / f0).abs() < 1e-9,
+            "superpose_doses f at t={} = {} vs production {f0}",
+            times[j],
+            full.obs[j].f
+        );
+    }
+    check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}
+
 /// A closed-form event walk must carry a lagged SS bolus's previous-cycle tail
 /// from the dose record to its arrival while WT changes inside that window. This
 /// makes the record-time phase seed and the following event-walk propagation both

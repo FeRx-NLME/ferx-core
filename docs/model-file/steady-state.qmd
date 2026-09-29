@@ -73,12 +73,24 @@ two engines did not reset:
 An ODE model with an explicit depot state was already correct, because
 the steady-state solve replaces the compartment state at the record.
 
+The reset is keyed on the dose **record**, so two more cases follow on
+analytic superposition (1-/2-/3-cpt models without time-varying
+covariates or resets). An infusion into central that is still running
+at the record stops there. A lagged dose whose record precedes the
+`SS=1` record but whose arrival follows it is cancelled. An infusion
+into an ODE absorption forcing that is still running at the record also
+stops there. NONMEM does all three.
+
 These cases are not yet covered:
 
-- An infusion that is still running at the record is not stopped on
-  every engine ([#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586)).
-- A lagged dose whose record precedes the `SS=1` record but whose
-  arrival follows it is not cancelled
+- An infusion into a compartment **state** that is still running at the
+  record is not stopped
+  ([#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586)). This
+  applies to the ODE engines and to the analytic event-driven path. That
+  path serves subjects with time-varying covariates or EVID=3/4 resets,
+  and any infusion into the depot.
+- On the same engines, a lagged dose whose record precedes the `SS=1`
+  record but whose arrival follows it is not cancelled
   ([#1587](https://github.com/FeRx-NLME/ferx-core/issues/1587)).
 - A bolus into an ODE compartment state, in a row before a co-timed
   `SS=1` row, is still superposed on the non-event-driven ODE path

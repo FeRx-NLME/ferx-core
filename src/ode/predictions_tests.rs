@@ -4732,7 +4732,7 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
-        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         tad,
         &mut dy_rate,
     );
@@ -4744,7 +4744,7 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
-        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         tad,
         &mut dy_dur,
     );
@@ -5768,7 +5768,7 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
-        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         t,
         &mut dy,
     );
@@ -5785,7 +5785,7 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &lags,
         &f_bio,
         1.0,
-        f64::NEG_INFINITY,
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         t,
         &mut dy_off,
     );
@@ -5921,7 +5921,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &[0.0],
         &f_bio,
         f64::NEG_INFINITY,
-        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         t,
         &mut dy,
     );
@@ -5949,7 +5949,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &[],
         &f_bio_d,
         f64::NEG_INFINITY,
-        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
+        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
         t,
         &mut dyd,
     );
@@ -13720,7 +13720,7 @@ fn an_ss_record_resets_the_absorption_forcing_in_both_walkers() {
     let ss = |t: f64| DoseEvent::new(t, AMT, 1, 0.0, true, II);
     // (label, doses, observation times). The reference reads the same dose list under the
     // #1576 rule, spelled out independently of `crate::dosing` (sorted list, no ties here).
-    let fixtures: [(&str, Vec<DoseEvent>, Vec<f64>); 3] = [
+    let fixtures: [(&str, Vec<DoseEvent>, Vec<f64>); 5] = [
         (
             "row 2 (SS=1 at 0, SS=1 at 120; first regimen observed = D1)",
             vec![ss(0.0), ss(120.0)],
@@ -13738,6 +13738,25 @@ fn an_ss_record_resets_the_absorption_forcing_in_both_walkers() {
             vec![ss(0.0), bolus(120.0)],
             vec![5.0, 100.0, 120.5, 125.0, 131.5],
         ),
+        (
+            // PR #1589 review finding 1: the infusion ends at `0.1 + 0.7 = 0.7999999999999999`,
+            // 1 ulp below the record, and the break dedup (1e-15) keeps that lower value as the
+            // segment start. An exact `t_seg` vs record comparison then read the record as not
+            // yet reached for the whole next segment: SS train off, infusion still live
+            // (−4.6 % / −22 % / −51 % at t = 1 / 2 / 6 against `SS=1` alone).
+            "segment start 1 ulp below the record (infusion 0.1–0.7999…, SS=1 at 0.8)",
+            vec![DoseEvent::new(0.1, 7.0, 1, 10.0, false, 0.0), ss(0.8)],
+            vec![1.0, 2.0, 6.0],
+        ),
+        (
+            // An infusion into the forcing compartment still running at the record (0–20 h,
+            // `SS=1` at 10) is stopped there: the forcing skips it like any preceding dose
+            // (#1586's "infusion into the dosed cmt" row: +81 % on the forcing before). An
+            // infusion into a compartment *state* is not stopped yet (#1586).
+            "infusion into the forcing running across the record (0–20 h, SS=1 at 10)",
+            vec![DoseEvent::new(0.0, 200.0, 1, 10.0, false, 0.0), ss(10.0)],
+            vec![10.5, 15.0, 21.0],
+        ),
     ];
     let kernels: [(InputRateKind, &[usize], [f64; 2]); 2] = [
         (InputRateKind::FirstOrder, &[ARG_1], [0.15, 0.0]),
@@ -13747,10 +13766,12 @@ fn an_ss_record_resets_the_absorption_forcing_in_both_walkers() {
     // gate is error-controlled, so the default leg is where one would show if it survived).
     let mut worst = [[0.0_f64; 2]; 2];
     for (ti, tight) in [true, false].into_iter().enumerate() {
-        // Tight: measured 1.1e-10 in both walkers, ~9x headroom. Default tolerances: measured
-        // 1.74e-3 (`ode_predictions`) and 9.2e-4 (event-driven), both `first_order` and both the
-        // plain single-`SS=1` equilibrium's own accuracy there (t = 0.5 and t = 120.5 read the same
-        // error; `transit` stays under 1e-5), so none of it is reset error; ~3x headroom.
+        // Tight: measured 1.1e-10 in both walkers, ~9x headroom; this leg is the one that tests
+        // the reset. Default tolerances: measured 1.86e-3 (`ode_predictions`, the 1-ulp fixture
+        // 0.2 h after its record) and 9.2e-4 (event-driven), all `first_order`. That is the size
+        // of the plain `SS=1` fixtures' own early-interval error at these tolerances (row 2 reads
+        // 1.74e-3 at both t = 0.5 and t = 120.5; `transit` stays under 1e-5), i.e. solver error,
+        // not reset error; ~2.7x headroom.
         let bound = if tight { 1e-9 } else { 5e-3 };
         for (kind, slots, args) in kernels {
             let mut ode = first_order_one_cpt_spec();
