@@ -4252,6 +4252,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     )];
     let lag0 = [T::from_f64(0.0)];
     let fbio1 = [f_bio];
+    // One cycle from the local pulse's own record: the `SS=1` gate is a no-op (the f64
+    // twin `equilibrate_ss_input_rate` builds the same gate at `0.0`).
+    let ss_gate = crate::ode::predictions::SsResetGate::at_segment(&local_ss, 0.0);
     let forced = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
         disposition(us, ps, t, du);
         crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
@@ -4261,6 +4264,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             &lag0,
             &fbio1,
             f64::NEG_INFINITY,
+            ss_gate,
             t,
             du,
         );
@@ -4300,6 +4304,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
         .collect();
     let lags = vec![T::from_f64(0.0); n_pulses];
     let fbios = vec![f_bio; n_pulses];
+    // Non-SS synthetic pulses: no `SS=1` record, so there is nothing to reach.
+    let ss_gate = crate::ode::predictions::SsResetGate::at_segment(&local_doses, f64::NEG_INFINITY);
     let train = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
         disposition(us, ps, t, du);
         crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
@@ -4309,6 +4315,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             &lags,
             &fbios,
             f64::NEG_INFINITY,
+            ss_gate,
             t,
             du,
         );
@@ -5136,6 +5143,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 &dose_lagtimes_dual,
                 f_bio_at_dose,
                 r_floor,
+                // The `SS=1` reset gate (#1576) at the boundary itself: it only changes at
+                // an `SS=1` record, where the post-record state is the equilibrated trough
+                // (independent of the pre-record state) and no moving boundary lands, since
+                // `SS=1` + lag into a forcing is rejected. So both sides see the same set.
+                crate::ode::predictions::SsResetGate::at_segment(&subject.doses, t_ev),
                 t_ev,
                 &mut v,
             );
@@ -5365,6 +5377,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     .map(|&(cmt, rate, _, _, _, _)| (cmt, rate))
                     .collect()
             };
+            // The segment start: its `f64` twin's `SS=1` reset gate (#1576), once per segment.
+            let ss_gate = crate::ode::predictions::SsResetGate::at_segment(&subject.doses, cur_t);
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -5403,6 +5417,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         &dose_lagtimes_dual,
                         f_bio_at_dose,
                         reset_floor,
+                        ss_gate,
                         t,
                         du,
                     );
@@ -6959,6 +6974,9 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         };
 
         // (`last_dose_eff`, the TAD anchor, was computed once above the saltation block.)
+        // Uniformity with the `f64` twin (#1576): periodic SS is declined upstream of this
+        // walk (`ode_subject_supported`), so no record gates.
+        let ss_gate = crate::ode::predictions::SsResetGate::at_segment(&subject.doses, t_start);
         let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
             eval_rhs_anchored::<T>(
                 program,
@@ -7014,6 +7032,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     &[],
                     dose_f_bio,
                     reset_floor,
+                    ss_gate,
                     t,
                     du,
                 );

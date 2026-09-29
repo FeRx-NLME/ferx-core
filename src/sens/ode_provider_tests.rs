@@ -1274,6 +1274,84 @@ fn ode_provider_ss_transit_1cpt_matches_production() {
     check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
 }
 
+/// An `SS=1` record resets the absorption forcing on the **dual** walk too (#1576). The
+/// forcing loop is shared, but `integrate_tvcov_g` threads its own segment start into it,
+/// so the value path's fix does not reach the gradient unless the dual caller passes the
+/// same one. Two shapes, each on one half of the rule: a bolus still absorbing at a
+/// mid-timeline `SS=1` record (D2), and a later `SS=1` record whose implied pulses must
+/// not reach the observations before it (D1). Each fixture is asserted to be on the dual
+/// walk (`ode_tvcov_supported`, and `ode_subject_sensitivities` returns `Some` rather than
+/// routing to FD). The value is pinned against a one-dose twin the old rule already
+/// served correctly, over the observations the reset governs.
+#[test]
+fn ode_provider_ss_record_reset_of_a_transit_forcing_matches_production() {
+    let model = parse_model_string(ONECPT_SS_TRANSIT).expect("parse SS transit");
+    // Slow chain (n = 3, MTT = 6): the bolus at 0 is far from absorbed at t = 6.
+    let theta = vec![1.0, 20.0, 3.0, 6.0];
+    let eta = vec![0.12];
+    let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let ss = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, true, 12.0);
+    // (label, doses, the one-dose twin, observations, the observations the twin governs)
+    let cases: [(&str, Vec<DoseEvent>, DoseEvent, &[f64], usize); 3] = [
+        (
+            "D2: bolus at 0, SS=1 at 6",
+            vec![bolus(0.0), ss(6.0)],
+            ss(6.0),
+            &[3.0, 6.5, 9.0, 14.0, 20.0],
+            1,
+        ),
+        (
+            "D1: SS=1 at 0, SS=1 at 30",
+            vec![ss(0.0), ss(30.0)],
+            ss(0.0),
+            &[2.0, 10.0, 25.0, 29.5],
+            0,
+        ),
+        (
+            // PR #1589 review finding 1, on a shape the dual walk takes (an infusion into a
+            // forcing routes to FD): a bolus recorded 1 ulp below the record, which the
+            // timeline merges with it, so the walk's segment starts at the lower value.
+            "segment start 1 ulp below the record",
+            vec![bolus(0.7999999999999999), ss(0.8)],
+            ss(0.8),
+            &[1.0, 2.0, 6.0],
+            0,
+        ),
+    ];
+    for (label, doses, twin_dose, times, first_governed) in cases {
+        let mut subj = bolus_subject(times);
+        subj.doses = doses;
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "{label}: must be on the dual walk"
+        );
+        assert!(
+            ode_subject_sensitivities(&model, &subj, &theta, &eta).is_some(),
+            "{label}: routed to FD"
+        );
+        let mut twin = subj.clone();
+        twin.doses = vec![twin_dose];
+        let prod = compute_predictions_with_tv(&model, &subj, &theta, &eta);
+        let want = compute_predictions_with_tv(&model, &twin, &theta, &eta);
+        for j in first_governed..times.len() {
+            assert!(
+                prod[j].is_finite() && want[j] > 0.0,
+                "{label}: obs {j} non-finite"
+            );
+            let rel = ((prod[j] - want[j]) / want[j]).abs();
+            assert!(
+                rel < 1e-8,
+                "{label} t = {}: {} vs one-dose twin {} (rel {rel:e})",
+                times[j],
+                prod[j],
+                want[j]
+            );
+        }
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+    }
+}
+
 #[test]
 fn ode_provider_ss_igd_1cpt_matches_production() {
     let model = parse_model_string(ONECPT_SS_IGD).expect("parse SS igd");
