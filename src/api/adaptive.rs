@@ -253,13 +253,13 @@ where
             .to_string()
     })?;
 
-    // The adaptive assay keys residual variance by the monitored compartment
-    // number (`residual_variance_at(cmt, …)`), but a `Selected` error model's
-    // endpoints are keyed by the covariate selector's 0-based branch index, not
-    // CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
+    // First the data checks every simulate entry point runs: a model covariate
+    // absent from the data would otherwise read as 0.0 (#1571). Then the
+    // `Selected` reject: the adaptive assay keys residual variance by the monitored
+    // compartment number (`residual_variance_at(cmt, …)`), but a `Selected` error
+    // model's endpoints are keyed by the covariate selector's 0-based branch index,
+    // not CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
     // the assay draw. Reject the combination rather than emit NaN observations (#658).
-    // Before that, the data checks every simulate entry point runs: a model
-    // covariate absent from the data would otherwise read as 0.0 (#1571).
     check_adaptive_model_data(model, population)?;
 
     // An empty schedule means the controller is never consulted: the result is a
