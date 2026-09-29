@@ -162,6 +162,34 @@ declared *monitor* — and returns a list of [`DoseAction`]s:
 A `Stop` must be the final action in a decision's list; issuing work after a
 `Stop` is a typed error, not a silently dropped dose.
 
+### What a decision reads
+
+At a decision at time `t`, one data record supplies everything the controller
+reads: `ctx.covariates`, the PK parameters behind every monitored signal, and the
+bioavailability `F` of any dose it issues there. That record is the **latest data
+record at or before `t`**: an observation, an EVID=2 row, a pre-scheduled dose row
+or an EVID=3/4 reset row. When several records share that time, the observation
+wins over an EVID=2 row, which wins over a dose row, which wins over a reset row.
+
+| Decision at `t` | Reads |
+|---|---|
+| before the subject's first record | the baseline covariates and the t = 0 parameters |
+| after an observation, EVID=2 or dose row | that row's covariates and parameters |
+| after an EVID=3/4 reset, with no record in between | the reset row's covariates and parameters |
+| on an IOV model | the same record, under the `kappa` of the decision's own window |
+
+A subject whose covariates never change reads the same values at every decision.
+
+The state a decision reads (`ctx.state`) follows the rule `predict()` uses: an
+interval is integrated under the record that ends it. A reset row is a record,
+so a decision between the last record and a later reset reads a state integrated
+under the reset row's parameters. The reset then restarts the state, so this
+changes what the controller sees before the reset, not any prediction.
+
+A reset row's own `$PK` is anchored to NONMEM (`reset_init_snapshot_J`). NONMEM
+has no feedback dosing, so the decision rule itself has no NONMEM counterpart. It
+is tested against `predict()` on the realized doses and against closed forms.
+
 ### One controller per subject
 
 `simulate_adaptive()` takes a **factory** (`Fn() -> FnMut(...)`), not a single
@@ -299,10 +327,13 @@ On the time-varying-covariate and IOV paths the driver and the replay share
 precomputed per-event / per-occasion PK snapshots, so replay agreement alone would
 only prove the two *consumed* them identically — not that the snapshots were built
 correctly. The verifier therefore also **independently re-derives** each snapshot
-(the per-occasion `kappa`, the per-decision PK at its LOCF covariate, the per-record
-PK) from the run's primitives and bit-checks it against what the driver used, so a
-mis-resolved covariate or occasion fails loudly rather than being applied by both
-sides and slipping through unnoticed (#748).
+(the per-occasion `kappa`, the per-decision PK at the decision's covariate, the
+per-record PK) from the run's primitives and bit-checks it against what the driver
+used, so a mis-resolved covariate or occasion fails loudly rather than being applied
+by both sides and slipping through unnoticed (#748). It finds the decision's record
+with the driver's own resolver, so it checks the plumbing, not which record a
+decision reads ([What a decision reads](#what-a-decision-reads) is tested against
+`predict()` directly).
 
 ## Validation
 
