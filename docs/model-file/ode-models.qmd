@@ -375,7 +375,10 @@ one whose *coefficients* are arbitrary functions of `θ`, `η`, and covariates.
 An explicit method like RK45 is *stability*-limited on a stiff system: it keeps shrinking
 the step to stay stable, not to meet your tolerance. The symptom is a fit that crawls, or an
 integration that silently exhausts `ode_max_steps` and freeze-pads the remainder of the
-segment. Stiffness in PK/PD models typically comes from a wide separation of time scales:
+segment. That freeze-pad applies only to a stop on a *finite* state. When a state has gone
+non-finite (the right-hand side diverged), the rest of the segment is `NaN` in **every** state
+instead, since nothing past that point was integrated, and no `ode_method` can fix it (#1539).
+Stiffness in PK/PD models typically comes from a wide separation of time scales:
 
 - fast reversible binding on top of slow elimination (TMDD and quasi-equilibrium models);
 - Michaelis-Menten elimination with `KM` far below the observed concentrations;
@@ -497,12 +500,19 @@ step counts, and ride along in the `ode_solver` warning's `details` payload:
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
 
-Three more counters close the guard's last ambiguity. Unlike the three above, the first two are
+Four more counters close the guard's last ambiguity. Unlike the three above, the first two are
 recorded under *every* `ode_method`, not just `auto` — an `rk45` fit that runs out of steps shows
 them too.
 
 - **unfinished segments** — attempts that stopped before their requested end and freeze-padded
-  the remaining output times with the last state.
+  the remaining output times with the last state (or `NaN`-padded them, for the diverged
+  subset below).
+- **diverged segments** — the unfinished segments that stopped because a state went non-finite.
+  Their remaining output times are `NaN` in every state, not freeze-padded, including a
+  decoupled observed state that would otherwise have been served frozen at a finite value
+  (#1539). No solver setting repairs this: check the `[odes]` right-hand side and the
+  parameter values. The warning drops its `ode_method` / tolerance advice when every damaged
+  segment diverged.
 - **discarded unfinished segments** — the subset belonging to stiff attempts the guard threw
   away, so the difference (`kept_unfinished_segments`) is the number of unfinished trajectories
   the caller actually received.

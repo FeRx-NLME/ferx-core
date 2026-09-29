@@ -1258,3 +1258,260 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
          {both}"
     );
 }
+
+// ── #1539: the diverged clause and its advice gate ───────────────────────────
+//
+// The text input space (plan §3), one row per test leg:
+//
+// | input class                                   | leg                                          |
+// |-----------------------------------------------|----------------------------------------------|
+// | diverged only (the issue repro)               | `…_dropped_only_when_every_…`, leg 1         |
+// | diverged + a separate finite unfinished one   | `…_dropped_only_when_every_…`, leg 2         |
+// | diverged + a rejection the fallback repaired  | `…_dropped_only_when_every_…`, leg 3         |
+// | diverged + a finite budgeted abort            | `…_dropped_only_when_every_…`, leg 4         |
+// | diverged + a jet-only rejection               | `…_dropped_only_when_every_…`, leg 5         |
+// | finite freeze-pad only                        | `a_finite_freeze_pad_message_is_unchanged…`  |
+// | diverged at segment entry (no clamps)         | `a_divergence_at_segment_entry_…`            |
+// | auto discarded, fallback also diverged        | leg 1 (its stats are exactly that shape)     |
+// | pass label                                    | leg 1, over every phase                      |
+
+use super::non_fit_diagnostics_tests::{
+    ADVICE_A_DIVERGENCE_MUST_NOT_GET, DIVERGED_CLAUSE_SENTENCES,
+};
+
+/// The advice gate, both sides in one test so a gate stuck on either branch fails it.
+///
+/// Mutations that redden it: drop `only_diverged` from any of the four advice sites (leg 1);
+/// make the gate unconditional — `only_diverged = diverged > 0` (legs 2, 3 and 4); drop the
+/// `aborted == 0` conjunct (leg 4); add a `rejected_jets == 0` conjunct (leg 5); stop
+/// subtracting `diverged` from the unfinished remainder (leg 2's partition); delete any
+/// sentence of the diverged clause (leg 1, every phase).
+#[test]
+fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
+    // Leg 1 — every damaged segment diverged. The issue's shape under `auto`: the escalation
+    // was discarded, its explicit re-solve diverged too, and the steps clamped chasing it.
+    let only = OdeSolverStats {
+        min_step_clamped_steps: 131,
+        auto_stiff_segments: 1,
+        auto_stiff_rejected: 1,
+        auto_fallback_failed: 1,
+        unfinished_segments: 3,
+        discarded_unfinished_segments: 1,
+        diverged_segments: 2,
+        ..Default::default()
+    };
+    for (phase, at, pass) in [
+        (
+            SolverStatsPhase::PostfitPredictions,
+            "at the final estimates",
+            "from the post-fit prediction pass",
+        ),
+        (
+            SolverStatsPhase::Predict,
+            "at the supplied parameters",
+            "from this predict() pass",
+        ),
+        (
+            SolverStatsPhase::Simulate,
+            "at the supplied parameters",
+            "from this simulate() pass",
+        ),
+        (
+            SolverStatsPhase::SimulateAdaptive,
+            "at the supplied parameters",
+            "from this simulate_adaptive() pass",
+        ),
+    ] {
+        let (msg, entry) = ode_solver_diagnostics_warning(&only, &FitOptions::default(), phase)
+            .expect("a warning");
+        assert_eq!(entry.severity, WarningSeverity::Warning);
+        for want in DIVERGED_CLAUSE_SENTENCES {
+            assert!(msg.contains(want), "{phase:?}: missing {want:?}: {msg}");
+        }
+        assert!(msg.contains("2 returned segment(s) had a state"), "{msg}");
+        assert!(msg.contains(at) && msg.contains(pass), "{phase:?}: {msg}");
+        // Both attempts failing is still said — it is true — beside the divergence.
+        assert!(msg.contains("1 segment(s) had both attempts fail"), "{msg}");
+        assert!(msg.contains("131 step(s) clamped"), "{msg}");
+        for unwanted in ADVICE_A_DIVERGENCE_MUST_NOT_GET {
+            assert!(
+                !msg.contains(unwanted),
+                "{phase:?}: must not say {unwanted:?}: {msg}"
+            );
+        }
+        // The two diverged segments are not reported again as ordinary stopped ones.
+        assert!(!msg.contains("returned segment(s) stopped"), "{msg}");
+        assert_eq!(
+            entry.details.as_ref().unwrap()["diverged_segments"],
+            serde_json::json!(2)
+        );
+    }
+
+    // Leg 2 — one diverged and one finite unfinished segment: both clauses, counts that
+    // partition (1 + 1 = the 2 kept unfinished), and the solver advice back for the finite one.
+    let mixed = OdeSolverStats {
+        min_step_clamped_steps: 4,
+        unfinished_segments: 2,
+        diverged_segments: 1,
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&mixed, &FitOptions::default(), SolverStatsPhase::Predict)
+            .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
+    assert!(msg.contains("freeze-padded with the last state"), "{msg}");
+    assert!(
+        msg.contains("The diverged segment(s) are not an ode_method or tolerance problem"),
+        "{msg}"
+    );
+
+    // Leg 3 — a divergence beside a rejected escalation that the explicit re-solve *repaired*
+    // (2 rejected, 1 fallback failed): the `rodas5p` advice is true of the repaired one.
+    let repaired = OdeSolverStats {
+        auto_stiff_segments: 2,
+        auto_stiff_rejected: 2,
+        auto_fallback_failed: 1,
+        unfinished_segments: 3,
+        discarded_unfinished_segments: 2,
+        diverged_segments: 1,
+        ..Default::default()
+    };
+    let (msg, _) = ode_solver_diagnostics_warning(
+        &repaired,
+        &FitOptions::default(),
+        SolverStatsPhase::Predict,
+    )
+    .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(msg.contains("rodas5p"), "{msg}");
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
+    // The other side of leg 1's diagnosis gate (#1577 review, row 2): with a repaired rejection
+    // present, the stiffness diagnosis is true again and must still be said.
+    assert!(msg.contains("the stiffness probe was right"), "{msg}");
+
+    // Leg 4 — a divergence beside a finite segment cut short by `ode_stiff_abort_after`, with
+    // no ordinary unfinished remainder (`2 − 1 aborted − 1 diverged = 0`). The aborted segment
+    // is finite and freeze-padded, so the knob advice and the stability-limited reading are
+    // true of it and must survive (#1577 review, row 1 — the `aborted == 0` conjunct).
+    let aborted = OdeSolverStats {
+        min_step_clamped_steps: 5,
+        unfinished_segments: 2,
+        stiff_aborted_segments: 1,
+        diverged_segments: 1,
+        ..Default::default()
+    };
+    let abort_opts = FitOptions {
+        ode_stiff_abort_after: Some(3),
+        ..Default::default()
+    };
+    let (msg, _) = ode_solver_diagnostics_warning(&aborted, &abort_opts, SolverStatsPhase::Predict)
+        .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(msg.contains("1 segment(s) were abandoned early"), "{msg}");
+    assert!(!msg.contains("returned segment(s) stopped"), "{msg}");
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
+    assert!(msg.contains("stability-limited"), "{msg}");
+
+    // Leg 5 — a divergence beside a jet-only rejection from the sensitivity sweep. The jet
+    // clause itself says a different `ode_method` will not help, so the knob advice is dropped
+    // here too rather than contradicting it (#1577 review, row 1: `rejected_jets` is
+    // deliberately not a conjunct of the gate).
+    let jets = OdeSolverStats {
+        unfinished_segments: 1,
+        diverged_segments: 1,
+        auto_stiff_rejected_jets: 1,
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&jets, &FitOptions::default(), SolverStatsPhase::Predict)
+            .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(
+        msg.contains("naming a different ode_method will not help"),
+        "{msg}"
+    );
+    assert!(!msg.contains("consider a different ode_method"), "{msg}");
+}
+
+/// A divergence that stopped a segment which *entered* non-finite takes no clamped steps worth
+/// reporting — nothing was integrated — so the message must not invent a clamp count, while the
+/// diverged clause stays. Mutation that reddens it: an unconditional clamp clause.
+#[test]
+fn a_divergence_at_segment_entry_names_no_clamps() {
+    let stats = OdeSolverStats {
+        unfinished_segments: 1,
+        diverged_segments: 1,
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default(), SolverStatsPhase::Predict)
+            .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(!msg.contains("clamped"), "{msg}");
+    for unwanted in ADVICE_A_DIVERGENCE_MUST_NOT_GET {
+        assert!(!msg.contains(unwanted), "must not say {unwanted:?}: {msg}");
+    }
+}
+
+/// With no divergence the message is today's, byte for byte — #1539 adds a clause and gates
+/// advice, and neither may leak into a finite freeze-pad. Pinned whole rather than by fragment,
+/// so a stray space from the split clamp clause fails it too.
+///
+/// Mutations that redden it: attach the diverged advice unconditionally; drop the clamp
+/// clause's `reading` half when nothing diverged.
+#[test]
+fn a_finite_freeze_pad_message_is_unchanged_by_the_divergence_clause() {
+    let stats = OdeSolverStats {
+        min_step_clamped_steps: 5,
+        unfinished_segments: 1,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default(), SolverStatsPhase::Predict)
+            .expect("a warning");
+    assert_eq!(
+        msg,
+        "W_ODE_SOLVER_DIAGNOSTICS: the ODE solver did not integrate cleanly at the supplied \
+         parameters (ode_method = auto): 5 step(s) clamped at the minimum step size — the \
+         local-error test failed and the step was accepted anyway because dt could not shrink \
+         further, so those segments are stability-limited rather than accuracy-limited, and \
+         any output times left in a segment the solver could not finish are freeze-padded with \
+         the last state (finite, but not integrated); 1 returned segment(s) stopped before \
+         their requested end time and freeze-padded the remaining output times with the last \
+         state — they exhausted ode_max_steps, or could not form a step at the minimum step \
+         size; segments abandoned by ode_stiff_abort_after are counted in their own clause \
+         instead of this one. Counters are from this predict() pass over all subjects. For the \
+         segments that did integrate, consider a different ode_method, a looser ode_reltol / \
+         ode_abstol, or checking the parameter estimates that produce these dynamics."
+    );
+    assert!(!msg.contains("non-finite"), "{msg}");
+    assert_eq!(
+        entry.details.as_ref().unwrap()["diverged_segments"],
+        serde_json::json!(0)
+    );
+}
+
+/// The abort and diverged counters are disjoint by construction (the solver counts a budgeted
+/// stop on a non-finite state as a divergence), and the unfinished remainder subtracts both, so
+/// a reader who adds the three clauses up gets the number of kept unfinished segments.
+/// Mutation that reddens it: subtract only `aborted` from the remainder.
+#[test]
+fn the_unfinished_remainder_subtracts_aborted_and_diverged_segments() {
+    let stats = OdeSolverStats {
+        unfinished_segments: 4,
+        stiff_aborted_segments: 1,
+        diverged_segments: 2,
+        ..Default::default()
+    };
+    let opts = FitOptions {
+        ode_stiff_abort_after: Some(3),
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::Predict).expect("warn");
+    assert!(msg.contains("2 returned segment(s) had a state"), "{msg}");
+    assert!(msg.contains("1 segment(s) were abandoned early"), "{msg}");
+    assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
+}

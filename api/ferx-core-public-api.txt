@@ -1161,6 +1161,7 @@ pub ferx_core::ode::solver::OdeSolverStats::auto_stiff_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::auto_switched_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::discarded_clamped_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::discarded_unfinished_segments: usize
+pub ferx_core::ode::solver::OdeSolverStats::diverged_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::min_step_clamped_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::rejected_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::stiff_aborted_segments: usize
@@ -1230,6 +1231,7 @@ pub ferx_core::ode::OdeSolverStats::auto_stiff_segments: usize
 pub ferx_core::ode::OdeSolverStats::auto_switched_segments: usize
 pub ferx_core::ode::OdeSolverStats::discarded_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::discarded_unfinished_segments: usize
+pub ferx_core::ode::OdeSolverStats::diverged_segments: usize
 pub ferx_core::ode::OdeSolverStats::min_step_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::rejected_steps: usize
 pub ferx_core::ode::OdeSolverStats::stiff_aborted_segments: usize

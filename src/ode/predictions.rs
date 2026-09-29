@@ -5903,10 +5903,18 @@ pub(crate) fn verify_adaptive_frozen_replay(
     let rel_tol = (REPLAY_TOL_FACTOR * replay_opts.reltol).max(1e-9);
     let abs_tol = (REPLAY_TOL_FACTOR * replay_opts.abstol).max(1e-12);
     for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
-        // Unrecorded slots are NaN in both engines (same observation grid), so
-        // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
+        // `NaN == NaN` is **not** agreement (#1539). Both engines share the solver, so a
+        // state that went non-finite NaN-pads the same rows in both, and counting that as a
+        // match would certify a run whose predictions were never integrated. A NaN row is one
+        // the replay cannot confirm, whatever produced it; a NaN-vs-finite split falls through
+        // to the comparison below, which fails it as a divergence.
         if got.is_nan() && want.is_nan() {
-            continue;
+            return Err(format!(
+                "prediction {j} is NaN in both the reactive run and the frozen-schedule \
+                 replay, so the replay cannot confirm it. A NaN prediction usually means an \
+                 ODE state became non-finite (the [odes] right-hand side diverged): check the \
+                 right-hand side and the parameter values"
+            ));
         }
         let diff = (got - want).abs();
         let tol = abs_tol + rel_tol * want.abs();

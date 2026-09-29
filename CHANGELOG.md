@@ -50,6 +50,20 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A diverging ODE state no longer freezes the other states at finite, wrong values**
+  (#1539). When one state went non-finite (e.g. an unobserved `d/dt(X) = 0.5 * X * X` past
+  its pole), the solver stopped every state and padded the rest of the segment with the
+  frozen last state. A decoupled, observed compartment was then served as a plausible
+  finite number: `central` read `100` instead of `44.93` / `6.08`, 16× high. `predict()`,
+  `simulate()`, `fit()` and the EKF all served it. Those output times are now `NaN` in every
+  state, including the derivative jets on the analytic-sensitivity path. A stop for a finite
+  reason (`ode_max_steps`, `ode_stiff_abort_after`) still freeze-pads, as before.
+  `W_ODE_SOLVER_DIAGNOSTICS` gains a clause saying a state became non-finite, and it drops
+  the `ode_method` / tolerance / `rodas5p` advice when every damaged segment diverged. That
+  advice was wrong for this case, since no stepper can integrate it. `OdeSolverStats` gains
+  `diverged_segments`. `simulate_adaptive()` with `verify: true` no longer counts `NaN == NaN` as
+  agreement in its frozen-schedule replay, so a run with `NaN` rows is not reported as
+  verified. The EKF also stops rewriting a `NaN` mean to `0.0`.
 - **`simulate_adaptive()` now refuses a pre-dose window whose `[odes]` right-hand side
   reads an unanchored `TAD` / `TAFD` through a comparison** — `if (TAD < 5)`,
   `min(TAD, 24)` — instead of silently taking one branch. An ordering comparison against

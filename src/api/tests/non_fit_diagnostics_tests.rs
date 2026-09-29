@@ -1210,3 +1210,126 @@ fn reader_warnings_go_through_the_same_suppression_filter_fit_uses() {
         reported.warnings
     );
 }
+
+// ── #1539: a diverged state is NaN, and the warning says so ──────────────────
+
+/// The #1539 model: `central` observed and decaying with `k = CL/V = 0.1`; `X` decoupled,
+/// unobserved, and running to its pole at t = 2 when `x_rate = 0.5` (`X = 1/(1 − 0.5t)`).
+/// `x_rate = 0.0` is the control. `ode_method` is left at the default (`auto`) because that is
+/// what the issue measured, and it is what makes the stiff-escalation clauses live.
+fn divergent_x_model(x_rate: &str) -> CompiledModel {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, X])
+[odes]
+  init(X) = 1.0
+  d/dt(central) = -(CL / V) * central
+  d/dt(X) = {x_rate} * X * X
+[error_model]
+  DV ~ proportional(PROP)
+"#
+    ))
+    .expect("parse")
+}
+
+/// One bolus of 100 into `central` at t = 12; observations at 1 / 20 / 40.
+fn divergent_x_pop() -> Population {
+    let mut p = pop(1);
+    let s = &mut p.subjects[0];
+    s.obs_times = vec![1.0, 20.0, 40.0];
+    s.observations = vec![0.0, 45.0, 6.0];
+    s.obs_cmts = vec![1; 3];
+    s.cens = vec![0; 3];
+    s.doses = vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)];
+    p
+}
+
+/// T5 (#1539): the issue repro through `predict_diag`.
+///
+/// Measured at `75f5aa83`: `central` = `[0.0, 99.99999999935972, 99.99999999935972]` — frozen
+/// at the post-dose value, 16× the closed form at t = 40 — with a `W_ODE_SOLVER_DIAGNOSTICS`
+/// that blamed stiffness and advised `rodas5p`. Now the rows past the pole are `NaN`, and the
+/// message says why and advises nothing a solver setting could do.
+///
+/// The control straddles it on the same code path: `0·X` integrates, matches
+/// `100·e^{−0.1(t−12)}` at the typical η = 0, and carries no solver warning at all.
+///
+/// Engine: `predict_diag` → `ode_predictions` → `integrate_dense_g`, `T = f64`. Mutations that
+/// redden it: revert the tail pad (the `is_nan` legs); drop the diverged clause, or any one of
+/// its sentences (the clause legs); keep the knob / `rodas5p` / freeze-pad wording when every
+/// damaged segment diverged (the negative legs).
+#[test]
+fn predict_serves_nan_past_a_diverged_state_and_says_so() {
+    let p = divergent_x_pop();
+    let control_m = divergent_x_model("0.0");
+    let control = predict_diag(&control_m, &p, &control_m.default_params).unwrap();
+    let m = divergent_x_model("0.5");
+    let out = predict_diag(&m, &p, &m.default_params).unwrap();
+    let c: Vec<f64> = control.results.iter().map(|r| r.pred).collect();
+    let d: Vec<f64> = out.results.iter().map(|r| r.pred).collect();
+    assert_eq!(c.len(), 3);
+    assert_eq!(d.len(), 3);
+
+    assert_eq!(
+        d[0].to_bits(),
+        c[0].to_bits(),
+        "pre-dose row: {d:?} vs {c:?}"
+    );
+    assert!(d[0].is_finite());
+    for (i, t) in [(1, 20.0), (2, 40.0)] {
+        let want = 100.0 * (-0.1f64 * (t - 12.0)).exp();
+        assert!(
+            c[i].is_finite() && (c[i] - want).abs() <= 1e-3 * want,
+            "control {c:?}"
+        );
+        assert!(
+            d[i].is_nan(),
+            "t={t} must be NaN, not a frozen value: {d:?}"
+        );
+    }
+
+    assert!(!has(&control.warnings, SOLVER), "{:?}", control.warnings);
+    let msg = out
+        .warnings
+        .iter()
+        .find(|w| w.contains(SOLVER))
+        .unwrap_or_else(|| panic!("a solver warning: {:?}", out.warnings));
+    for want in DIVERGED_CLAUSE_SENTENCES {
+        assert!(msg.contains(want), "missing {want:?}: {msg}");
+    }
+    assert!(msg.contains("this predict() pass"), "{msg}");
+    for unwanted in ADVICE_A_DIVERGENCE_MUST_NOT_GET {
+        assert!(!msg.contains(unwanted), "must not say {unwanted:?}: {msg}");
+    }
+}
+
+/// One fragment per sentence of the #1539 clause and its advice, so deleting any one of them
+/// reddens every test that loops over this list.
+pub(super) const DIVERGED_CLAUSE_SENTENCES: [&str; 8] = [
+    "returned segment(s) had a state become non-finite",
+    "the [odes] right-hand side diverged",
+    "so every output time after that point is NaN rather than an integrated value",
+    "The NaN covers every state of the segment, not only the one that diverged",
+    "the states are integrated together, so none of them was integrated past that point",
+    "The diverged segment(s) are not an ode_method or tolerance problem",
+    "no stepper integrates past a state that has become non-finite",
+    "check the [odes] right-hand side and the parameter values that drive it",
+];
+
+/// The solver advice that is false for a segment whose state went non-finite.
+pub(super) const ADVICE_A_DIVERGENCE_MUST_NOT_GET: [&str; 5] = [
+    "consider a different ode_method",
+    "rodas5p",
+    "the stiffness probe was right",
+    "freeze-padded with the last state",
+    "stability-limited",
+];
