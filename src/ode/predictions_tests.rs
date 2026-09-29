@@ -13355,3 +13355,125 @@ fn each_dose_absorbs_through_its_own_kernel_fraction_and_route_lag() {
          (ferx {got:?})"
     );
 }
+
+/// **A steady-state dose superposes its implied past pulses through its own kernel** (#1573
+/// review, finding 1). The forcing loop's `SS=1` arm sums the in-flight tails of the dose's
+/// implied pulse train (`ss_periodic_forcing`), and that sum must use the kernel of the SS
+/// dose's own record: the one `equilibrate_ss_state` seeds the trough with, from `pk_at_dose`.
+///
+/// Two `SS=1` regimens switch the kernel, as a formulation change on a new occasion would,
+/// and the observation records carry a third kernel that the engine must never apply. The
+/// second regimen's dose is **dose 1**, which is what the single-dose SS fixtures (#719)
+/// cannot provide: their only dose is dose 0, so an SS arm reading dose 0's kernel passes
+/// them. Only the second regimen is observed, because that is where dose 1's kernel is in
+/// flight. The first regimen's kernels are fast enough that its tail at `SECOND_REGIMEN` is
+/// below 1e-15 of a dose.
+///
+/// The disposition is one compartment (`ke = CL/V`), and the reference is the steady state
+/// in closed form, outside every engine: `A(τ) = D·Σ_{j≥0} g(τ + j·II)`, where `g` is the
+/// kernel convolved with first-order elimination:
+///
+/// * `first_order(ka)`: `g(t) = ka/(ka − ke)·(e^{−ke·t} − e^{−ka·t})`;
+/// * `transit(n, mtt)`, integer `n`, `ktr = (n+1)/mtt`, `x = (ktr − ke)·t`:
+///   `g(t) = (ktr/(ktr − ke))^{n+1}·e^{−ke·t}·(1 − e^{−x}·Σ_{k≤n} x^k/k!)`.
+#[test]
+fn a_steady_state_dose_superposes_its_past_pulses_through_its_own_kernel() {
+    const CL: f64 = 2.0;
+    const V: f64 = 20.0;
+    const II: f64 = 12.0;
+    const AMT: f64 = 100.0;
+    const SECOND_REGIMEN: f64 = 120.0;
+    let ke = CL / V;
+    // The steady state needs an eliminating state, which the accumulator above does not have.
+    let one_cpt_with = |kernel: InputRateForcing| {
+        let mut ode = first_order_one_cpt_spec();
+        ode.input_rate = vec![kernel];
+        ode.solver_opts.reltol = 1e-12;
+        ode.solver_opts.abstol = 1e-12;
+        ode
+    };
+    let first_order_g = |ka: f64, t: f64| ka / (ka - ke) * ((-ke * t).exp() - (-ka * t).exp());
+    let transit_g = |n: f64, mtt: f64, t: f64| {
+        let ktr = (n + 1.0) / mtt;
+        let x = (ktr - ke) * t;
+        let (mut term, mut partial) = (1.0, 1.0);
+        for k in 1..=(n as usize) {
+            term *= x / k as f64;
+            partial += term;
+        }
+        (ktr / (ktr - ke)).powf(n + 1.0) * (-ke * t).exp() * (1.0 - (-x).exp() * partial)
+    };
+    // (kind, arg slots, regimen 1's kernel, regimen 2's kernel, the observations' kernel)
+    let cases: [(InputRateKind, &[usize], [f64; 2], [f64; 2], [f64; 2]); 2] = [
+        (
+            InputRateKind::FirstOrder,
+            &[ARG_1],
+            [0.3, 0.0],
+            [0.4, 0.0],
+            [5.0, 0.0],
+        ),
+        (
+            InputRateKind::Transit,
+            &[ARG_1, ARG_2],
+            [3.0, 6.0],
+            [3.0, 2.5],
+            [3.0, 0.5],
+        ),
+    ];
+    let obs: Vec<f64> = [0.5, 2.0, 5.0, 11.5]
+        .iter()
+        .map(|o| SECOND_REGIMEN + o)
+        .collect();
+    let subject = make_subject(
+        vec![
+            DoseEvent::new(0.0, AMT, 1, 0.0, true, II),
+            DoseEvent::new(SECOND_REGIMEN, AMT, 1, 0.0, true, II),
+        ],
+        obs.clone(),
+    );
+    let mut worst = 0.0_f64;
+    for (kind, slots, regimen_1, regimen_2, elsewhere) in cases {
+        let ode = one_cpt_with(forcing(kind, slots.to_vec()));
+        let rec = |args: [f64; 2]| {
+            snapshot(&[
+                (crate::types::PK_IDX_CL, CL),
+                (crate::types::PK_IDX_V, V),
+                (ARG_1, args[0]),
+                (ARG_2, args[1]),
+            ])
+        };
+        let got = ode_predictions_event_driven(
+            &ode,
+            &subject,
+            &[],
+            &[],
+            &[rec(regimen_1), rec(regimen_2)],
+            &vec![rec(elsewhere); obs.len()],
+            &[],
+            &[],
+        );
+        let g = |t: f64| match kind {
+            InputRateKind::FirstOrder => first_order_g(regimen_2[0], t),
+            _ => transit_g(regimen_2[0], regimen_2[1], t),
+        };
+        for (j, &t) in obs.iter().enumerate() {
+            let want: f64 = AMT
+                * (0..400)
+                    .map(|p| g(t - SECOND_REGIMEN + p as f64 * II))
+                    .sum::<f64>();
+            assert!(
+                got[j].is_finite() && want > 0.0,
+                "{kind:?} obs {j} (t = {t}): ferx {} vs closed form {want}",
+                got[j]
+            );
+            worst = worst.max((got[j] - want).abs() / want);
+        }
+    }
+    // Measured: 5.4e-11 (`first_order`), 1.2e-12 (`transit`); the bound carries ~18x.
+    println!("#1573 steady-state kernel per dose: worst rel {worst:.3e}");
+    assert!(
+        worst < 1e-9,
+        "each SS dose must superpose its past pulses through its own record's kernel; worst \
+         rel {worst:.3e}"
+    );
+}
