@@ -40,9 +40,11 @@ section of the SDLC for the versioning policy).
   parameter, where a dose is still absorbing when the parameter changes. This includes
   closed-form `pk *_transit` / `*_ig` models, whose IOV and TV-covariate subjects run on
   the ODE twin. With IOV or covariates only on disposition parameters, predictions are
-  bit-identical. The typical-value checks `E_ABSORPTION_DOMAIN` / `E_ABSORPTION_FRACTION`
-  now evaluate at dose records only, so a value out of range only at an observation or
-  EVID=2 row, which is never applied, is no longer rejected, and `predict()` serves it.
+  unchanged: bit-identical, except that fractioned (`FR*`) pathways with overlapping
+  doses can move at rounding level (measured ≤ 5.3e-15 relative). The typical-value
+  checks `E_ABSORPTION_DOMAIN` / `E_ABSORPTION_FRACTION` now evaluate at dose records
+  only, so a value out of range only at an observation or EVID=2 row is no longer
+  rejected: `IPRED` and `PRED` never apply it, and `predict()` serves it.
   Validated against NONMEM 7.6.0 (`nonmem_anchor/transit_iov_mtt`, `ig_iov_mat`: `$DES`
   with a per-dose kernel).
 

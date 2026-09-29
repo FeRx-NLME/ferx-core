@@ -714,8 +714,9 @@ fn a_modeled_duration_nonpositive_only_at_a_later_dose_is_warned() {
 // ---------------------------------------------------------------------------
 
 /// `zero_order` absorption whose window is `TVDUR − WT`: in domain at `WT = 0`, `≤ 0`
-/// once `WT` exceeds it. Unlike the density kernels, the engine skips this kind in the
-/// per-segment RHS loop entirely and takes `dur` off the **dose**'s snapshot.
+/// once `WT` exceeds it. The engine delivers this kind as a spanning window, outside the
+/// pointwise forcing loop, and takes `dur` off the **dose**'s snapshot — as it takes every
+/// absorption parameter since #1569.
 const TV_COV_ZERO_ORDER_MODEL: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -833,15 +834,16 @@ fn an_absorption_parameter_out_of_domain_only_at_an_evid2_record_is_not_rejected
 }
 
 /// **Finding 1.** An EVID=3/4 **reset** row's snapshot is not a read site for any
-/// input-rate forcing: `is_record` excludes `Kind::Reset`, `pk_now`'s reset arm takes
-/// `last_pk`, and the segment terminating at a reset is overwritten by the re-seed before
-/// any readout. So a parameter out of domain only there must **not** be rejected — and it
-/// is not merely un-rejected, the prediction is **bit-identical** to the in-domain
-/// control, which is what proves the engine never applied it.
+/// input-rate forcing: every forcing is read at its dose record (#1569), and a reset row's
+/// own snapshot only re-seeds `init(...)` (#1133). So a parameter out of domain only there
+/// must **not** be rejected — and it is not merely un-rejected, the prediction is
+/// **bit-identical** to the in-domain control, which is what proves the engine never
+/// applied it.
 ///
 /// The bit-identity is the load-bearing half. `is_finite()` would pass on a subject whose
 /// curve had silently moved; only equality against the control can fail for the right
-/// reason. Dies if a `reset` arm is added back to `typical_event_snapshots`.
+/// reason. Dies if the domain check reads the reset row's snapshot, i.e. if
+/// `typical_dose_snapshots` yields anything but dose records.
 #[test]
 fn an_absorption_parameter_out_of_domain_only_at_a_reset_is_not_rejected_and_predicts_identically()
 {
@@ -901,11 +903,11 @@ fn a_zero_order_duration_out_of_domain_only_at_an_observation_is_not_rejected() 
     );
 }
 
-/// The other side of the same gate, and the reason `forcing_is_read_at` cannot be
-/// "`ZeroOrder` is never checked": at a **dose** record the engine really does read
+/// The other side of the same gate: at a **dose** record the engine really does read
 /// `dur`, so an out-of-domain value there must still be rejected, naming the dose.
 ///
-/// Without this arm, `forcing_is_read_at(ZeroOrder, _) = false` passes the whole file.
+/// Without this arm, a domain check that skipped `zero_order` altogether would pass the
+/// whole file.
 #[test]
 fn a_zero_order_duration_out_of_domain_at_the_dose_is_still_rejected() {
     let model = parse_full_model(TV_COV_ZERO_ORDER_MODEL)
@@ -946,9 +948,9 @@ fn a_mixed_zero_order_and_density_compartment_summing_to_one_is_not_rejected() {
     );
 }
 
-/// The in-domain acceptance control for the whole `Records` set: a subject carrying
-/// **every** record kind — dose, observations, EVID=2 and a reset — with the covariate in
-/// domain at all of them must produce no absorption diagnostic at all.
+/// The in-domain acceptance control across record kinds: a subject carrying **every**
+/// record kind — dose, observations, EVID=2 and a reset — with the covariate in domain at
+/// all of them must produce no absorption diagnostic at all.
 ///
 /// Without it the arms above are all satisfied by a check that rejects any subject with
 /// an EVID=2 or reset row (#1286 review, finding 6).

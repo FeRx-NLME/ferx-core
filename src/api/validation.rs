@@ -1781,8 +1781,11 @@ pub(crate) fn check_absorption_dosing(
     'subjects: for subject in &population.subjects {
         // Dose records only: every forcing — kernel, pathway fraction and route lag — is
         // read at the dose's own record (`ode::predictions::PreparedForcings`, #1569), so
-        // a value out of domain only at an observation, an EVID=2 row or a reset is a
-        // value the engine never applies, and rejecting it is a false positive.
+        // a value out of domain only at an observation, an EVID=2 row or a reset never
+        // enters IPRED or PRED, and rejecting it is a false positive. (The approximate
+        // one-snapshot passes of a time-varying subject still read one snapshot that need
+        // not be a dose record's: the compartment-state pass the first observation's, an
+        // ODE-accumulated hazard the baseline's.)
         for snap in
             typical_dose_snapshots(model, subject, &model.default_params.theta, &mut scratch)
         {
@@ -2331,15 +2334,18 @@ pub(crate) struct TypicalSnapshotScratch {
 /// engine resolves.
 ///
 /// **Why dose records only.** Each check here evaluates at the snapshots the engine reads
-/// *that* quantity at (#1235), and every quantity checked is read at the dose record and
-/// nowhere else: a lag / `F` / modeled `D{n}`/`R{n}` from `pk_at_dose[k]`
-/// (`ode::predictions`' per-dose resolve, the sensitivity twin's `lag_val(k)`,
-/// [`crate::dosing::resolve_subject_doses_with`]'s `pk_for_dose(k)`), and — since #1569 —
-/// every built-in absorption forcing parameter (kernel, pathway fraction, route lag),
-/// which `ode::predictions::PreparedForcings` reads per dose, from its record. Until
-/// #1569 the smooth kernels were rebuilt per segment, so their check also covered
-/// observation and EVID=2 records; a value driven out of domain only there is now a
-/// value the engine never applies, and rejecting it would be a false positive.
+/// *that* quantity at (#1235), and the per-event engines read every quantity checked at
+/// the dose record and nowhere else: a lag / `F` / modeled `D{n}`/`R{n}` from
+/// `pk_at_dose[k]` (`ode::predictions`' per-dose resolve, the sensitivity twin's
+/// `lag_val(k)`, [`crate::dosing::resolve_subject_doses_with`]'s `pk_for_dose(k)`), and —
+/// since #1569 — every built-in absorption forcing parameter (kernel, pathway fraction,
+/// route lag), which `ode::predictions::PreparedForcings` reads per dose, from its record.
+/// Until #1569 the smooth kernels were rebuilt per segment, so their check also covered
+/// observation and EVID=2 records; a value driven out of domain only there now never
+/// enters IPRED or PRED, and rejecting it would be a false positive. The exceptions are
+/// the approximate one-snapshot passes of a time-varying subject, which read one snapshot
+/// for the whole timeline: the compartment-state pass (`W_DERIVED_CMT_TV_ODE`) the first
+/// observation's, an ODE-accumulated hazard the baseline's.
 ///
 /// Going through the engine's builder rather than re-spelling
 /// `(pk_param_fn)(θ, 0, cov, t)` here is deliberate: it carries the per-event/static
