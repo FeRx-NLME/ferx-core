@@ -5359,6 +5359,79 @@ fn provider_lagtime_matches_production() {
     }
 }
 
+/// An `SS=1` record resets the system at its record (#1576): a bolus before a
+/// mid-timeline `SS=1` record (row 5 of the #1576 plan) contributes nothing at or
+/// after it. The analytic dual has **two** superposition loops, and each carries
+/// its own copy of the skip, so the fixture runs twice and asserts which loop ran:
+/// with a lag the whole subject takes the generic `superpose_doses`; without one the
+/// explicit-kernel loop in `run_obs` serves the full provider (the light η-provider
+/// is `superpose_doses` either way). Every assertion names its loop, so deleting the
+/// skip from one loop reddens the case that exercises it.
+#[test]
+fn an_ss_record_reset_matches_production_through_both_superposition_loops() {
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+    ];
+    let times = [10.0, 24.5, 30.0, 35.0, 40.0];
+    let mk = |d: &[DoseEvent]| Subject {
+        doses: d.to_vec(),
+        ..oral_subject(&times)
+    };
+    let cases = [
+        (
+            "lag > 0 (superpose_doses)",
+            parse_model_string(ONECPT_ORAL_LAG).expect("parse lag"),
+            vec![0.2, 10.0, 1.5, 0.75],
+            vec![0.15, -0.10, 0.25, 0.12],
+            false,
+        ),
+        (
+            "lag = 0 (explicit-kernel loop)",
+            parse_model_string(WARFARIN).expect("parse"),
+            vec![0.2, 10.0, 1.5],
+            vec![0.15, -0.10, 0.25],
+            true,
+        ),
+    ];
+    for (label, m, theta, eta, explicit) in &cases {
+        let subject = mk(&doses);
+        // Differential: the bolus is live at t = 30 without the reset, so the
+        // fixture straddles the rule — a dual that ignored it could not agree.
+        let no_reset = compute_predictions_with_tv(m, &mk(&doses[..1]), theta, eta)[2];
+        let prod = compute_predictions_with_tv(m, &subject, theta, eta);
+        assert!(
+            no_reset > 0.05 * prod[2],
+            "{label}: fixture degenerate: bolus tail {no_reset}"
+        );
+
+        EXPLICIT_ANALYTIC_OBS.with(|n| n.set(0));
+        let full = subject_sensitivities(m, &subject, theta, eta).expect("supported");
+        let ran_explicit = EXPLICIT_ANALYTIC_OBS.with(|n| n.get()) > 0;
+        assert_eq!(
+            ran_explicit, *explicit,
+            "{label}: wrong loop ran (explicit={ran_explicit})"
+        );
+        let light = subject_eta_grad(m, &subject, theta, eta).expect("light");
+        for (j, &f0) in prod.iter().enumerate() {
+            assert!(f0.is_finite(), "{label}: production non-finite at obs {j}");
+            assert!(
+                ((full.obs[j].f - f0) / f0).abs() < 1e-9,
+                "{label}: full provider f at t={} = {} vs production {f0}",
+                times[j],
+                full.obs[j].f
+            );
+            assert!(
+                ((light[j].f - f0) / f0).abs() < 1e-9,
+                "{label}: light provider (superpose_doses) f at t={} = {} vs production {f0}",
+                times[j],
+                light[j].f
+            );
+        }
+        check_full_provider_vs_fd(m, &subject, theta, eta);
+    }
+}
+
 /// A closed-form event walk must carry a lagged SS bolus's previous-cycle tail
 /// from the dose record to its arrival while WT changes inside that window. This
 /// makes the record-time phase seed and the following event-walk propagation both

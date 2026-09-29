@@ -759,6 +759,9 @@ fn equilibrate_ss_input_rate(
         &no_lag,
         &local_f_bio,
         f64::NEG_INFINITY,
+        // The one cycle `[0, II]` is a single segment starting at the local pulse's own
+        // record, so the `SS=1` gate is a no-op here: the cutoff is `local_ss` itself.
+        0.0,
         prepared,
         InfusionInput::Spanning(Vec::new()),
         &no_zero,
@@ -1285,6 +1288,9 @@ fn equilibrate_ss_pk_state(
             &local_doses,
             &no_lag,
             &local_f_bio,
+            f64::NEG_INFINITY,
+            // Every synthetic pulse is non-SS, so there is no `SS=1` record to reset at and
+            // the segment start is immaterial; one closure serves every cycle.
             f64::NEG_INFINITY,
             &prepared,
             InfusionInput::Spanning(Vec::new()),
@@ -2255,6 +2261,17 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// reset, mirroring [`active_infusions`]. This is the input-rate analogue of the
 /// `+rate` infusion injection in the wrapped RHS.
 ///
+/// `t_seg` is the start of the segment being integrated and carries the `SS=1` reset
+/// (#1576): a dose that precedes the latest `SS=1` record reached by `t_seg` in
+/// (time, row order) contributes nothing ([`crate::dosing::ss_reset_cutoff`]), and an
+/// `SS=1` dose's implied pulse train contributes nothing before its own record. Both
+/// are gated **per segment, not pointwise**: the gate changes exactly at a dose record,
+/// which is always a break, and Dormand–Prince evaluates its last stage at the right
+/// end of the step, so a pointwise `t ≥ t_s` gate would feed the next regimen's tails
+/// into the last stage of the segment that *ends* at `t_s` (the same reason
+/// `reset_floor` is per segment). The record is the dose row's own time: `SS=1` + lag
+/// into a forcing is rejected up front.
+///
 /// Each dose is absorbed through the kernel, fraction and route lag of **its own dose
 /// record** (`prepared.get(forcing, dose)`, see [`PreparedForcings`]), never the
 /// current segment's: with IOV or a time-varying covariate on an absorption parameter
@@ -2279,6 +2296,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     dose_lagtimes: &[T],
     dose_f_bio: &[T],
     reset_floor: f64,
+    t_seg: f64,
     t: f64,
     dy: &mut [T],
 ) {
@@ -2288,6 +2306,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         prepared.per_dose,
         doses.len()
     );
+    let ss_cutoff = crate::dosing::ss_reset_cutoff(doses, t_seg);
     for (fi, forcing) in ode.input_rate.iter().enumerate() {
         if forcing.cmt >= dy.len() {
             continue;
@@ -2307,7 +2326,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         let common_frac = prepared.common_frac(fi);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
-            if d.cmt_idx() != forcing.cmt {
+            if d.cmt_idx() != forcing.cmt || !crate::dosing::ss_reset_live(doses, ss_cutoff, k) {
                 continue;
             }
             let dose_rate = prepared.get(fi, k);
@@ -2337,6 +2356,10 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             let prep = &dose_rate.prep;
             let rate = if d.ss && d.ii > 0.0 {
+                // The implied train starts at the record: nothing before it (#1576).
+                if t_seg < d.time {
+                    continue;
+                }
                 ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass)
             } else if d.is_infusion() {
                 // Infusion (RATE>0) into a built-in absorption compartment (#719 gap 2): the
@@ -2382,7 +2405,9 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
 /// `reset_floor` is threaded per call and **intentionally differs** by path: the
 /// two non-reset paths (`ode_predictions`, `ode_predictions_with_states`) pass
 /// `f64::NEG_INFINITY` because the dispatcher routes reset subjects to the
-/// event-driven walker; the two reset-aware paths pass a real floor. `prepared`
+/// event-driven walker; the two reset-aware paths pass a real floor. `t_seg` is the
+/// start of the segment the closure integrates, which carries the `SS=1` reset into the
+/// forcing (see [`add_prepared_input_rate_forcing`]). `prepared`
 /// holds each dose's absorption forcing, read at its dose record ([`PreparedForcings`]).
 #[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/forcing context
 fn wrap_rhs_with_forcings<'a>(
@@ -2391,6 +2416,7 @@ fn wrap_rhs_with_forcings<'a>(
     dose_lagtimes: &'a [f64],
     dose_f_bio: &'a [f64],
     reset_floor: f64,
+    t_seg: f64,
     prepared: &'a PreparedForcings,
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
@@ -2436,6 +2462,7 @@ fn wrap_rhs_with_forcings<'a>(
                 dose_lagtimes,
                 dose_f_bio,
                 reset_floor,
+                t_seg,
                 t,
                 dy,
             );
@@ -3445,6 +3472,7 @@ fn integrate_segment(
         dose_lagtimes,
         dose_f_bio,
         reset_floor,
+        t_start,
         &prepared,
         InfusionInput::Spanning(active),
         &zero_order,
@@ -6869,6 +6897,7 @@ pub fn ode_predictions_event_driven(
                 &dose_lagtimes,
                 &dose_f_bio,
                 reset_floor,
+                cur_t,
                 &prepared,
                 InfusionInput::Spanning(active),
                 &zero_order,
@@ -7428,6 +7457,7 @@ pub fn ode_predictions_with_states(
             &dose_lagtimes,
             &dose_f_bio,
             f64::NEG_INFINITY,
+            t_start,
             &prepared,
             InfusionInput::Gated(gated),
             &zero_order,
@@ -7941,6 +7971,7 @@ pub fn ode_dense_solve_states(
             &dose_lagtimes,
             &dose_f_bio,
             forcings.reset_floor,
+            t_start,
             &forcings.prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
@@ -8117,6 +8148,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &dose_lagtimes,
             &dose_f_bio,
             forcings.reset_floor,
+            t_start,
             &forcings.prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,

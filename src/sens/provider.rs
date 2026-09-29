@@ -445,8 +445,12 @@ fn superpose_doses<T: PkNum>(
     reset_floor: f64,
 ) -> T {
     let mut fd = T::from_f64(0.0);
-    for dose in &subject.doses {
-        if dose.time + d.lag_val < reset_floor {
+    // The value path's `SS=1` reset (#1576): `crate::pk::predict_concentration`.
+    let ss_cutoff = crate::dosing::ss_reset_cutoff(&subject.doses, t_obs);
+    for (k, dose) in subject.doses.iter().enumerate() {
+        if dose.time + d.lag_val < reset_floor
+            || !crate::dosing::ss_reset_live(&subject.doses, ss_cutoff, k)
+        {
             continue;
         }
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
@@ -616,6 +620,9 @@ const _: () = assert!(ANALYTIC_MIXED_N[0] == 4 && ANALYTIC_MIXED_N[1] == 6);
 #[cfg(test)]
 thread_local! {
     static MIXED_ANALYTIC_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Observations whose jet came from the explicit-kernel loop in `run_obs` rather
+    /// than `superpose_doses` — the discriminator a two-loop parity test asserts (#1576).
+    static EXPLICIT_ANALYTIC_OBS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
@@ -7514,12 +7521,19 @@ fn run_obs<const NA: usize, const N: usize, const PARTIAL: bool>(
         // Build the compact PK-space jet from the explicit kernel when available,
         // otherwise by propagating the selected dual type through the closed form.
         let jet = if let (false, Some(kind)) = (PARTIAL, explicit_kind) {
+            #[cfg(test)]
+            EXPLICIT_ANALYTIC_OBS.with(|n| n.set(n.get() + 1));
             let mut gv = [0.0; N];
             let mut hv = [[0.0; N]; N];
             let mut val = 0.0;
-            for dose in &subject.doses {
+            // `superpose_doses`' `SS=1` reset (#1576), on the same predicate.
+            let ss_cutoff = crate::dosing::ss_reset_cutoff(&subject.doses, t_obs);
+            for (k, dose) in subject.doses.iter().enumerate() {
                 let elapsed = t_obs - dose.time;
-                if elapsed < 0.0 || dose.time < reset_floor {
+                if elapsed < 0.0
+                    || dose.time < reset_floor
+                    || !crate::dosing::ss_reset_live(&subject.doses, ss_cutoff, k)
+                {
                     continue;
                 }
                 val += eval_dose_explicit(

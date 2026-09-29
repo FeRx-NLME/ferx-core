@@ -4732,6 +4732,7 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         tad,
         &mut dy_rate,
     );
@@ -4743,6 +4744,7 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         tad,
         &mut dy_dur,
     );
@@ -5766,6 +5768,7 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         t,
         &mut dy,
     );
@@ -5775,7 +5778,17 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
 
     // A reset_floor after the dose time turns its forcing off.
     let mut dy_off = vec![0.0];
-    add_prepared_input_rate_forcing(&ode, &prepared, &doses, &lags, &f_bio, 1.0, t, &mut dy_off);
+    add_prepared_input_rate_forcing(
+        &ode,
+        &prepared,
+        &doses,
+        &lags,
+        &f_bio,
+        1.0,
+        f64::NEG_INFINITY,
+        t,
+        &mut dy_off,
+    );
     assert_eq!(dy_off[0], 0.0);
 }
 
@@ -5908,6 +5921,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &[0.0],
         &f_bio,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         t,
         &mut dy,
     );
@@ -5935,6 +5949,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &[],
         &f_bio_d,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         t,
         &mut dyd,
     );
@@ -5955,6 +5970,7 @@ fn seam_spanning_adds_base_rhs_and_infusion() {
         &[],
         &[],
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         &prepared,
         InfusionInput::Spanning(vec![(0, 7.0)]),
         &[],
@@ -5975,6 +5991,7 @@ fn seam_gated_infusion_active_only_inside_window() {
         &[],
         &[],
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         &prepared,
         InfusionInput::Gated(vec![(0, 3.0, 2.0, 5.0)]),
         &[],
@@ -6006,6 +6023,7 @@ fn seam_applies_input_rate_forcing_on_top_of_base_rhs() {
         &lags,
         &f_bio,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         &prepared,
         InfusionInput::Spanning(Vec::new()),
         &[],
@@ -7865,6 +7883,7 @@ fn explicit_ss_run_in(
         &no_lag,
         &fbios,
         f64::NEG_INFINITY,
+        f64::NEG_INFINITY, // t_seg: no SS=1 record in these doses
         &prepared,
         InfusionInput::Spanning(Vec::new()),
         &no_zero,
@@ -13663,4 +13682,202 @@ fn a_steady_state_dose_superposes_its_past_pulses_through_its_own_kernel() {
         "each SS dose must superpose its past pulses through its own record's kernel; worst \
          rel {worst:.3e}"
     );
+}
+
+/// **An `SS=1` record resets the absorption forcing** (#1576). The forcing loop is shared by
+/// every ODE walker, and before the fix its `SS=1` arm had no record guard and no
+/// supersession, so two defects showed in the forcing alone (an explicit depot state was
+/// already right, because the equilibration replaces the compartment state at the record):
+///
+/// * **D1**: a *later* `SS=1` record leaked its implied past pulses into observations
+///   *before* it (row 2 of the #1576 plan: +11 % … +4.7e3×);
+/// * **D2**: an *earlier* dose kept absorbing after an `SS=1` record (row 5: +0.3 … +1.6 %).
+///
+/// A non-SS dose after an `SS=1` record must still superpose (row 4, the control). Every
+/// fixture runs through `ode_predictions` **and** `ode_predictions_event_driven`, each named
+/// in its failure. The reference is outside both engines: with `g` the kernel convolved with
+/// first-order elimination (the previous test's closed forms), a single dose is `D·g(τ)` and
+/// an `SS=1` dose is `D·Σ_{j≥0} g(τ + j·II)`, both zero for `τ < 0`.
+#[test]
+fn an_ss_record_resets_the_absorption_forcing_in_both_walkers() {
+    const CL: f64 = 2.0;
+    const V: f64 = 20.0;
+    const II: f64 = 12.0;
+    const AMT: f64 = 100.0;
+    let ke = CL / V;
+    let first_order_g = |ka: f64, t: f64| ka / (ka - ke) * ((-ke * t).exp() - (-ka * t).exp());
+    let transit_g = |n: f64, mtt: f64, t: f64| {
+        let ktr = (n + 1.0) / mtt;
+        let x = (ktr - ke) * t;
+        let (mut term, mut partial) = (1.0, 1.0);
+        for k in 1..=(n as usize) {
+            term *= x / k as f64;
+            partial += term;
+        }
+        (ktr / (ktr - ke)).powf(n + 1.0) * (-ke * t).exp() * (1.0 - (-x).exp() * partial)
+    };
+    let bolus = |t: f64| DoseEvent::new(t, AMT, 1, 0.0, false, 0.0);
+    let ss = |t: f64| DoseEvent::new(t, AMT, 1, 0.0, true, II);
+    // (label, doses, observation times). The reference reads the same dose list under the
+    // #1576 rule, spelled out independently of `crate::dosing` (sorted list, no ties here).
+    let fixtures: [(&str, Vec<DoseEvent>, Vec<f64>); 3] = [
+        (
+            "row 2 (SS=1 at 0, SS=1 at 120; first regimen observed = D1)",
+            vec![ss(0.0), ss(120.0)],
+            vec![
+                0.5, 2.0, 5.0, 11.5, 100.0, 119.5, 120.5, 122.0, 125.0, 131.5,
+            ],
+        ),
+        (
+            "row 5 (bolus at 0, SS=1 at 24 = D2)",
+            vec![bolus(0.0), ss(24.0)],
+            vec![10.0, 23.5, 24.5, 30.0, 35.0],
+        ),
+        (
+            "row 4 (SS=1 at 0, bolus at 120 = control)",
+            vec![ss(0.0), bolus(120.0)],
+            vec![5.0, 100.0, 120.5, 125.0, 131.5],
+        ),
+    ];
+    let kernels: [(InputRateKind, &[usize], [f64; 2]); 2] = [
+        (InputRateKind::FirstOrder, &[ARG_1], [0.15, 0.0]),
+        (InputRateKind::Transit, &[ARG_1, ARG_2], [3.0, 6.0]),
+    ];
+    // Tight tolerances (the bound), then the solver's defaults (§4 of the plan: a pointwise
+    // gate is error-controlled, so the default leg is where one would show if it survived).
+    let mut worst = [[0.0_f64; 2]; 2];
+    for (ti, tight) in [true, false].into_iter().enumerate() {
+        // Tight: measured 1.1e-10 in both walkers, ~9x headroom. Default tolerances: measured
+        // 1.74e-3 (`ode_predictions`) and 9.2e-4 (event-driven), both `first_order` and both the
+        // plain single-`SS=1` equilibrium's own accuracy there (t = 0.5 and t = 120.5 read the same
+        // error; `transit` stays under 1e-5), so none of it is reset error; ~3x headroom.
+        let bound = if tight { 1e-9 } else { 5e-3 };
+        for (kind, slots, args) in kernels {
+            let mut ode = first_order_one_cpt_spec();
+            ode.input_rate = vec![forcing(kind, slots.to_vec())];
+            if tight {
+                ode.solver_opts.reltol = 1e-12;
+                ode.solver_opts.abstol = 1e-12;
+            }
+            let pk = snapshot(&[
+                (crate::types::PK_IDX_CL, CL),
+                (crate::types::PK_IDX_V, V),
+                (ARG_1, args[0]),
+                (ARG_2, args[1]),
+            ]);
+            let g = |t: f64| match kind {
+                InputRateKind::FirstOrder => first_order_g(args[0], t),
+                _ => transit_g(args[0], args[1], t),
+            };
+            for (label, doses, obs) in &fixtures {
+                let want: Vec<f64> = obs
+                    .iter()
+                    .map(|&t| {
+                        // The latest `SS=1` record at or before `t` kills every earlier dose.
+                        let cut = doses.iter().rposition(|d| d.ss && d.time <= t).unwrap_or(0);
+                        doses[cut..]
+                            .iter()
+                            .filter(|d| d.time <= t)
+                            .map(|d| {
+                                let tau = t - d.time;
+                                if d.ss {
+                                    AMT * (0..400).map(|j| g(tau + j as f64 * II)).sum::<f64>()
+                                } else {
+                                    AMT * g(tau)
+                                }
+                            })
+                            .sum()
+                    })
+                    .collect();
+                let subject = make_subject(doses.clone(), obs.clone());
+                let n_obs = obs.len();
+                let walkers: [(&str, Vec<f64>); 2] = [
+                    (
+                        "ode_predictions",
+                        ode_predictions(&ode, &pk.values, &[], &[], &subject),
+                    ),
+                    (
+                        "ode_predictions_event_driven",
+                        ode_predictions_event_driven(
+                            &ode,
+                            &subject,
+                            &[],
+                            &[],
+                            &vec![pk; doses.len()],
+                            &vec![pk; n_obs],
+                            &[],
+                            &[],
+                        ),
+                    ),
+                ];
+                for (wi, (walker, got)) in walkers.iter().enumerate() {
+                    for (j, &t) in obs.iter().enumerate() {
+                        assert!(
+                            got[j].is_finite() && want[j] > 0.0,
+                            "{walker} {kind:?} {label} t = {t}: ferx {} vs closed form {}",
+                            got[j],
+                            want[j]
+                        );
+                        let rel = (got[j] - want[j]).abs() / want[j];
+                        assert!(
+                        rel < bound,
+                        "{walker} {kind:?} {label} t = {t} (tight = {tight}): ferx {} vs closed \
+                         form {} (rel {rel:.3e})",
+                        got[j],
+                        want[j]
+                    );
+                        worst[ti][wi] = worst[ti][wi].max(rel);
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "#1576 SS=1 forcing reset: worst rel [tight, default] x [ode_predictions, event_driven] \
+         {worst:?}"
+    );
+}
+
+/// **The `SS=1` reset leaves the SS equilibration bit-identical** (#1576). The equilibration
+/// integrates one local `SS=1` pulse at `0` over `[0, II]` through the same forcing loop, so
+/// it now passes a segment start (`0.0`) as well. The cutoff there is the local pulse itself
+/// and `t_seg ≥ d.time`, so nothing may change — but a rule that also gated the SS dose's own
+/// train (say `t > record` on its `j = 0` term, or a cutoff that cancelled the record itself)
+/// would move the trough while every tolerance-based SS test stayed green. The bits below
+/// were recorded on `a1084260`, before the argument existed, for both kernels at the model's
+/// default tolerances.
+#[test]
+fn the_ss_equilibration_trough_is_bit_identical_under_the_reset_gate() {
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    let kernels: [(InputRateKind, &[usize], [f64; 2], [u64; 1]); 2] = [
+        (
+            InputRateKind::FirstOrder,
+            &[ARG_1],
+            [0.15, 0.0],
+            [4634618751664397139],
+        ),
+        (
+            InputRateKind::Transit,
+            &[ARG_1, ARG_2],
+            [3.0, 6.0],
+            [4635133047215333974],
+        ),
+    ];
+    for (kind, slots, args, bits) in kernels {
+        let mut ode = first_order_one_cpt_spec();
+        ode.input_rate = vec![forcing(kind, slots.to_vec())];
+        let pk = snapshot(&[
+            (crate::types::PK_IDX_CL, 2.0),
+            (crate::types::PK_IDX_V, 20.0),
+            (ARG_1, args[0]),
+            (ARG_2, args[1]),
+        ]);
+        let prepared = prepare_input_rates(&ode, &pk.values);
+        let trough =
+            equilibrate_ss_input_rate(&ode, &pk.values, &dose, 1.0, &ode.solver_opts, &prepared)
+                .expect("linear disposition: closed-form fixed point");
+        let got: Vec<u64> = trough.iter().map(|x| x.to_bits()).collect();
+        println!("{kind:?} trough {trough:?} bits {got:?}");
+        assert_eq!(got, bits, "{kind:?}: SS trough moved (values {trough:?})");
+    }
 }

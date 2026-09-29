@@ -1133,6 +1133,49 @@ pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 
     }
 }
 
+/// The `SS=1` record that resets the system at `t`, as an index into `doses` (#1576).
+///
+/// An `SS=1` record resets the system at its record, like NONMEM: every dose that
+/// precedes it in **(time, row order)** contributes nothing at or after it, and its own
+/// implied pulse train contributes nothing before it. This returns the `SS=1` dose
+/// (`ss && ii > 0`) with the largest `(time, index)` among those with `time ≤ t`, or
+/// `None` when no such record has been reached. Dose `k` is live at `t` iff
+/// [`ss_reset_live`] holds.
+///
+/// Row order is load-bearing, and NONMEM-measured: a bolus row *before* a co-timed
+/// `SS=1` row is wiped, one *after* it superposes. `subject.doses` is stable-sorted by
+/// time, so a tie keeps file order and the index is the row order. The comparison is
+/// lexicographic, so the answer is also correct on an unsorted list (the adaptive shadow
+/// list is base-then-controller).
+///
+/// The record is the dose row's own `time`, never its lagged arrival: `SS=1` + lag into
+/// an absorption forcing is rejected up front, and the lagged-pending case is #1587.
+/// A running infusion is not stopped here either (#1586). O(n), no allocation.
+#[inline]
+pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, d) in doses.iter().enumerate() {
+        if !(d.ss && d.ii > 0.0) || d.time > t {
+            continue;
+        }
+        best = match best {
+            Some(b) if (doses[b].time, b) > (d.time, i) => Some(b),
+            _ => Some(i),
+        };
+    }
+    best
+}
+
+/// Whether dose `k` is live under the reset `cutoff` from [`ss_reset_cutoff`]:
+/// `(t_k, k) ≥ (t_s, s)` lexicographically, or no cutoff at all.
+#[inline]
+pub(crate) fn ss_reset_live(doses: &[DoseEvent], cutoff: Option<usize>, k: usize) -> bool {
+    match cutoff {
+        None => true,
+        Some(s) => (doses[k].time, k) >= (doses[s].time, s),
+    }
+}
+
 #[cfg(test)]
 mod governing_record_tests {
     use super::governing_record_indices;
@@ -1529,5 +1572,92 @@ mod infusion_rate_channel_tests {
         let inf_cmt0 = DoseEvent::new(0.0, 100.0, 0, 40.0, false, 0.0);
         assert!(!is_real_infusion(&bolus_cmt0) && !infusion_has_rate_channel(&bolus_cmt0));
         assert!(is_real_infusion(&inf_cmt0) && !infusion_has_rate_channel(&inf_cmt0));
+    }
+}
+
+#[cfg(test)]
+mod ss_reset_tests {
+    use super::*;
+
+    fn bolus(t: f64) -> DoseEvent {
+        DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)
+    }
+    fn ss(t: f64) -> DoseEvent {
+        DoseEvent::new(t, 100.0, 1, 0.0, true, 12.0)
+    }
+    /// Indices live at `t`, the observable of the rule.
+    fn live(doses: &[DoseEvent], t: f64) -> Vec<usize> {
+        let c = ss_reset_cutoff(doses, t);
+        (0..doses.len())
+            .filter(|&k| ss_reset_live(doses, c, k))
+            .collect()
+    }
+
+    #[test]
+    fn with_no_ss_record_every_dose_is_live() {
+        let doses = [bolus(0.0), bolus(12.0), bolus(24.0)];
+        assert_eq!(ss_reset_cutoff(&doses, 100.0), None);
+        assert_eq!(live(&doses, 100.0), vec![0, 1, 2]);
+        // `SS=1` with `II = 0` is not a periodic record and resets nothing.
+        let ii0 = [bolus(0.0), DoseEvent::new(10.0, 100.0, 1, 0.0, true, 0.0)];
+        assert_eq!(ss_reset_cutoff(&ii0, 100.0), None);
+    }
+
+    #[test]
+    fn an_ss_first_dose_and_later_non_ss_doses_all_stay_live() {
+        // Row 4's shape: `SS=1` first, a non-SS continuation superposes on it.
+        let doses = [ss(0.0), bolus(120.0)];
+        assert_eq!(ss_reset_cutoff(&doses, 130.0), Some(0));
+        assert_eq!(live(&doses, 130.0), vec![0, 1]);
+    }
+
+    #[test]
+    fn an_ss_record_is_not_reached_before_its_time() {
+        // Row 5's shape: before the record the bolus is the only thing live; at and after
+        // it the bolus is dead.
+        let doses = [bolus(0.0), ss(24.0)];
+        assert_eq!(ss_reset_cutoff(&doses, 23.999), None);
+        assert_eq!(live(&doses, 23.999), vec![0, 1]);
+        assert_eq!(ss_reset_cutoff(&doses, 24.0), Some(1));
+        assert_eq!(live(&doses, 24.0), vec![1]);
+        assert_eq!(live(&doses, 50.0), vec![1]);
+    }
+
+    /// Both sides of the tie in one test (rows 51/52), so a predicate stuck on either
+    /// branch reddens it: strict-time (`t_k > t_s`) wipes row 52's bolus, and a
+    /// time-only `≥` keeps row 51's.
+    #[test]
+    fn a_co_timed_dose_is_wiped_before_the_ss_row_and_live_after_it() {
+        let row51 = [bolus(10.0), ss(10.0)];
+        assert_eq!(
+            live(&row51, 10.0),
+            vec![1],
+            "row 51: bolus row BEFORE the SS row is wiped"
+        );
+        let row52 = [ss(10.0), bolus(10.0)];
+        assert_eq!(
+            live(&row52, 10.0),
+            vec![0, 1],
+            "row 52: bolus row AFTER the SS row superposes"
+        );
+    }
+
+    #[test]
+    fn the_latest_of_two_ss_records_governs() {
+        // Row 41 (TDM "SS on every visit"): only the latest reached record is live.
+        let doses = [ss(0.0), ss(12.0), ss(24.0)];
+        assert_eq!(ss_reset_cutoff(&doses, 13.0), Some(1));
+        assert_eq!(live(&doses, 13.0), vec![1, 2]);
+        assert_eq!(live(&doses, 30.0), vec![2]);
+    }
+
+    #[test]
+    fn an_unsorted_list_is_ordered_by_time_then_index() {
+        // Base-then-controller shadow list: the later record sits earlier in the vector.
+        let doses = [bolus(0.0), ss(48.0), ss(24.0), bolus(30.0)];
+        assert_eq!(ss_reset_cutoff(&doses, 40.0), Some(2));
+        assert_eq!(live(&doses, 40.0), vec![1, 2, 3]);
+        assert_eq!(ss_reset_cutoff(&doses, 60.0), Some(1));
+        assert_eq!(live(&doses, 60.0), vec![1]);
     }
 }

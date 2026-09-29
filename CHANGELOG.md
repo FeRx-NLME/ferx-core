@@ -50,6 +50,15 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A mid-timeline `SS=1` record now resets the system, as in NONMEM** (#1576). A dose that
+  precedes the record (in time, or in an earlier row at the same time) no longer contributes
+  after it, and the `SS=1` dose's implied past pulses no longer reach observations before it.
+  Two engines had this wrong: analytic superposition summed every dose (`SS=1` on every visit
+  read up to 91 % high), and an ODE absorption forcing (`first_order(...)`, `transit(...)`, …)
+  leaked a later `SS=1` record's pulses backwards and kept absorbing an earlier dose. ODE
+  models with an explicit depot state were already correct. A running infusion (#1586), a
+  pending lagged dose (#1587) and a co-timed state bolus on the static ODE path (#1588) are
+  not yet reset.
 - **A diverging ODE state no longer freezes the other states at finite, wrong values**
   (#1539). When one state went non-finite (e.g. an unobserved `d/dt(X) = 0.5 * X * X` past
   its pole), the solver stopped every state and padded the rest of the segment with the

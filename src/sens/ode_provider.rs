@@ -4261,6 +4261,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             &lag0,
             &fbio1,
             f64::NEG_INFINITY,
+            // One cycle from the local pulse's own record: the `SS=1` gate is a no-op
+            // (the f64 twin `equilibrate_ss_input_rate` passes the same `0.0`).
+            0.0,
             t,
             du,
         );
@@ -4308,6 +4311,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             &local_doses,
             &lags,
             &fbios,
+            f64::NEG_INFINITY,
+            // Non-SS synthetic pulses: no `SS=1` record, so the segment start is immaterial.
             f64::NEG_INFINITY,
             t,
             du,
@@ -5136,6 +5141,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 &dose_lagtimes_dual,
                 f_bio_at_dose,
                 r_floor,
+                // The `SS=1` reset gate (#1576) at the boundary itself: it only changes at
+                // an `SS=1` record, where the post-record state is the equilibrated trough
+                // (independent of the pre-record state) and no moving boundary lands, since
+                // `SS=1` + lag into a forcing is rejected. So both sides see the same set.
+                t_ev,
                 t_ev,
                 &mut v,
             );
@@ -5403,6 +5413,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         &dose_lagtimes_dual,
                         f_bio_at_dose,
                         reset_floor,
+                        // The segment start: its `f64` twin's `SS=1` reset gate (#1576).
+                        cur_t,
                         t,
                         du,
                     );
@@ -7014,6 +7026,9 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     &[],
                     dose_f_bio,
                     reset_floor,
+                    // Uniformity with the `f64` twin (#1576): periodic SS is declined
+                    // upstream of this walk (`ode_subject_supported`), so no record gates.
+                    t_start,
                     t,
                     du,
                 );

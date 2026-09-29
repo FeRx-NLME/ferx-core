@@ -1789,8 +1789,14 @@ pub fn predict_concentration(
     if superposition_arrival_non_finite(doses, lagtime) {
         return f64::NAN;
     }
+    // An `SS=1` record resets the system (#1576): a dose that precedes the latest
+    // reached record in (time, row order) contributes nothing here.
+    let cutoff = crate::dosing::ss_reset_cutoff(doses, t);
     let mut conc = 0.0;
-    for dose in doses {
+    for (k, dose) in doses.iter().enumerate() {
+        if !crate::dosing::ss_reset_live(doses, cutoff, k) {
+            continue;
+        }
         let t_eff = dose.time + lagtime;
         if t_eff <= t {
             let tau = t - t_eff;
@@ -2426,7 +2432,12 @@ pub fn analytical_state_at_times(
         .iter()
         .map(|&t| {
             let mut state = vec![0.0_f64; n_states];
-            for dose in &subject.doses {
+            // The value twin's `SS=1` reset (#1576), on the same predicate.
+            let cutoff = crate::dosing::ss_reset_cutoff(&subject.doses, t);
+            for (k, dose) in subject.doses.iter().enumerate() {
+                if !crate::dosing::ss_reset_live(&subject.doses, cutoff, k) {
+                    continue;
+                }
                 let t_eff = dose.time + lagtime;
                 let tau = if t_eff <= t {
                     t - t_eff
@@ -4329,6 +4340,145 @@ mod tests {
         // With II = 24 and k = 0.1, KA = 1.5: exp(-k·II) ≈ 0.091, so the SS
         // tail adds ~10% to the slow term. Sanity: under 50%.
         assert!((c_ss / c_single) < 1.5);
+    }
+
+    // ── SS=1 resets the system at its record (#1576) ─────────────────────────
+    //
+    // The oracle is the closed form, written out here rather than read from the
+    // engine: `C_single(τ) = D·ka/(V(ka−k))·(e^{−kτ} − e^{−ka·τ})` and
+    // `C_ss(τ) = D·ka/(V(ka−k))·(e^{−kτ}/(1−e^{−k·II}) − e^{−ka·τ}/(1−e^{−ka·II}))`.
+    // NONMEM ADVAN2 equals `C_ss` to 7.8e-16 on every reset row
+    // (`nonmem_anchor/ss_reset`); these pin the analytic superposition to it.
+    const SS_RESET_P: (f64, f64, f64, f64, f64) = (2.0, 20.0, 0.15, 100.0, 12.0); // CL V KA D II
+
+    fn ss_reset_c_single(tau: f64) -> f64 {
+        let (cl, v, ka, d, _) = SS_RESET_P;
+        let k = cl / v;
+        d * ka / (v * (ka - k)) * ((-k * tau).exp() - (-ka * tau).exp())
+    }
+    fn ss_reset_c_ss(tau: f64) -> f64 {
+        let (cl, v, ka, d, ii) = SS_RESET_P;
+        let k = cl / v;
+        d * ka / (v * (ka - k))
+            * ((-k * tau).exp() / (1.0 - (-k * ii).exp())
+                - (-ka * tau).exp() / (1.0 - (-ka * ii).exp()))
+    }
+    fn ss_reset_bolus(t: f64) -> DoseEvent {
+        DoseEvent::new(t, SS_RESET_P.3, 1, 0.0, false, 0.0)
+    }
+    fn ss_reset_ss(t: f64) -> DoseEvent {
+        DoseEvent::new(t, SS_RESET_P.3, 1, 0.0, true, SS_RESET_P.4)
+    }
+    fn ss_reset_pk() -> PkParams {
+        oral_pk_params(SS_RESET_P.0, SS_RESET_P.1, SS_RESET_P.2)
+    }
+    fn ss_reset_check(label: &str, doses: &[DoseEvent], cases: &[(f64, f64)]) {
+        let pk = ss_reset_pk();
+        for &(t, want) in cases {
+            let got = predict_concentration(PkModel::OneCptOral, doses, t, &pk);
+            assert!(got.is_finite(), "{label}: non-finite at t={t}");
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-11,
+                "{label}: t={t} got {got} want {want} (rel {rel:e})"
+            );
+        }
+    }
+
+    /// Row 5: a bolus before a mid-timeline `SS=1` record is dead at and after it
+    /// (was +10 … +24 %), and fully live before it.
+    #[test]
+    fn an_ss_record_wipes_an_earlier_bolus_in_analytic_superposition() {
+        let doses = [ss_reset_bolus(0.0), ss_reset_ss(24.0)];
+        ss_reset_check(
+            "row 5",
+            &doses,
+            &[
+                (10.0, ss_reset_c_single(10.0)),
+                (24.5, ss_reset_c_ss(0.5)),
+                (30.0, ss_reset_c_ss(6.0)),
+                (35.0, ss_reset_c_ss(11.0)),
+            ],
+        );
+    }
+
+    /// Row 41, the TDM "SS on every visit" idiom (was +91 % at t = 12.5): only the
+    /// latest reached record is live, so every interval reads `C_ss` exactly.
+    #[test]
+    fn ss_on_every_dose_record_reads_the_steady_state_in_every_interval() {
+        let doses: Vec<_> = (0..4).map(|i| ss_reset_ss(12.0 * i as f64)).collect();
+        ss_reset_check(
+            "row 41",
+            &doses,
+            &[
+                (6.0, ss_reset_c_ss(6.0)),
+                (12.5, ss_reset_c_ss(0.5)),
+                (30.0, ss_reset_c_ss(6.0)),
+                (40.0, ss_reset_c_ss(4.0)),
+                (60.0, ss_reset_c_ss(24.0)),
+            ],
+        );
+    }
+
+    /// Rows 51/52 in one test, both sides of the tie: a bolus row before a co-timed
+    /// `SS=1` row is wiped, one after it superposes (NONMEM-measured row order).
+    #[test]
+    fn a_co_timed_bolus_is_wiped_before_the_ss_row_and_superposes_after_it() {
+        ss_reset_check(
+            "row 51 (bolus row, then SS row)",
+            &[ss_reset_bolus(10.0), ss_reset_ss(10.0)],
+            &[(10.5, ss_reset_c_ss(0.5)), (15.0, ss_reset_c_ss(5.0))],
+        );
+        ss_reset_check(
+            "row 52 (SS row, then bolus row)",
+            &[ss_reset_ss(10.0), ss_reset_bolus(10.0)],
+            &[
+                (10.5, ss_reset_c_ss(0.5) + ss_reset_c_single(0.5)),
+                (15.0, ss_reset_c_ss(5.0) + ss_reset_c_single(5.0)),
+            ],
+        );
+    }
+
+    /// Row 4, the control: a non-SS dose after an `SS=1` record still superposes.
+    #[test]
+    fn a_non_ss_dose_after_an_ss_record_still_superposes() {
+        ss_reset_check(
+            "row 4",
+            &[ss_reset_ss(0.0), ss_reset_bolus(120.0)],
+            &[
+                (100.0, ss_reset_c_ss(100.0)),
+                (125.0, ss_reset_c_ss(125.0) + ss_reset_c_single(5.0)),
+            ],
+        );
+    }
+
+    /// The state twin (`[derived]`, sdtab states, depot readout) on row 41: the skip in
+    /// `predict_concentration` alone leaves this wrong.
+    #[test]
+    fn analytical_states_reset_at_every_ss_record_too() {
+        let (_, _, ka, d, ii) = SS_RESET_P;
+        let subj = Subject {
+            doses: (0..4).map(|i| ss_reset_ss(12.0 * i as f64)).collect(),
+            ..make_subject_with_tv(HashMap::new(), vec![], vec![], 0, 0)
+        };
+        let times = [6.0, 12.5, 30.0, 40.0];
+        let states = analytical_state_at_times(PkModel::OneCptOral, &subj, &ss_reset_pk(), &times);
+        for (&t, st) in times.iter().zip(&states) {
+            // Elapsed time since the latest reached record (records at 0, 12, 24, 36).
+            let tau = t - (12.0 * (t / 12.0).floor()).min(36.0);
+            let depot = d * (-ka * tau).exp() / (1.0 - (-ka * ii).exp());
+            for (name, got, want) in [
+                ("depot", st[0], depot),
+                ("central", st[1], ss_reset_c_ss(tau)),
+            ] {
+                assert!(got.is_finite(), "{name} non-finite at t={t}");
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-11,
+                    "{name} at t={t}: got {got} want {want} (rel {rel:e})"
+                );
+            }
+        }
     }
 
     // ── apply_scaling ───────────────────────────────────────────────────────

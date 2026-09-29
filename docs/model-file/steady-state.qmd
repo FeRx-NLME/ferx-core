@@ -37,6 +37,58 @@ infusion row (`RATE>0`), `SS=1` works the same way — the steady-state
 state is computed from the corresponding single-dose response repeated
 every `II`.
 
+## A later `SS=1` record resets the system
+
+An `SS=1` record does more than set the state at its own time. Like
+NONMEM, it **resets the system** at the record:
+
+- A dose that precedes the record contributes nothing at or after it.
+  This holds for bolus, oral and absorption-forcing doses
+  (`first_order(...)`, `transit(...)`, ...).
+- The `SS=1` dose's implied train of past pulses contributes nothing
+  before its own record.
+
+"Precedes" means earlier in time, or at the **same time in an earlier
+row**. A dose row written before a co-timed `SS=1` row is wiped. A dose
+row written after it superposes on the steady state. NONMEM uses the
+same row order.
+
+Doses after the record are unaffected. A non-SS dose superposes on the
+steady state, and a later `SS=1` record resets the system again. So a
+dataset that flags `SS=1` on every visit reads the steady state of the
+latest visit's regimen in each interval.
+
+A subject whose only `SS=1` record is its first dose is unaffected by
+this rule.
+
+Before [#1576](https://github.com/FeRx-NLME/ferx-core/issues/1576),
+two engines did not reset:
+
+- Analytic superposition summed every dose. `SS=1` on every visit read
+  up to 91 % high.
+- An ODE absorption forcing leaked a later `SS=1` record's past pulses
+  into the observations before it, and kept absorbing an earlier dose
+  after the record.
+
+An ODE model with an explicit depot state was already correct, because
+the steady-state solve replaces the compartment state at the record.
+
+These cases are not yet covered:
+
+- An infusion that is still running at the record is not stopped on
+  every engine ([#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586)).
+- A lagged dose whose record precedes the `SS=1` record but whose
+  arrival follows it is not cancelled
+  ([#1587](https://github.com/FeRx-NLME/ferx-core/issues/1587)).
+- A bolus into an ODE compartment state, in a row before a co-timed
+  `SS=1` row, is still superposed on the non-event-driven ODE path
+  ([#1588](https://github.com/FeRx-NLME/ferx-core/issues/1588)).
+- An analytic `init()` baseline is still superposed on an `SS=1` dose,
+  as the `W_STEADY_STATE_INIT` warning says.
+
+`SS=1` combined with a lagtime into an absorption forcing is still
+rejected.
+
 ## Supported prediction paths
 
 Every prediction path in ferx-core honours `SS=1`:
