@@ -62,7 +62,12 @@ const E7: f64 = -1.0 / 40.0;
 /// before an integration segment is treated as unrecoverably pathological.
 ///
 /// The break is gated on a non-finite error norm (NaN/∞) on purpose: that is the signature
-/// of a diverging trajectory whose padded-out predictions the likelihood will reject anyway.
+/// of a diverging trajectory. It used to be said that the likelihood would reject such a
+/// trajectory's padded-out predictions anyway, which holds only when the observed state is
+/// the one that diverged — a runaway state *decoupled* from the observed one left the
+/// observed compartment frozen at a finite value that was served, fitted and verified as a
+/// real prediction (#1539). So a stop on a non-finite state now pads its tail with `NaN` in
+/// every component (`integrate_dense_g`, [`OdeSolverStats::diverged_segments`]).
 /// A *finite* error above tolerance at `min_dt` is merely a stiff or under-resolved segment —
 /// truncating it would freeze-pad the remaining save points with finite (but wrong) values
 /// that the likelihood would silently accept, so those are left to run to `max_steps` as
@@ -643,7 +648,9 @@ pub struct OdeSolverStats {
     /// counted here and a zero is not by itself proof that every solve in the fit was clean.
     pub auto_fallback_failed: usize,
     /// Integration attempts that stopped before reaching the end of their segment and
-    /// freeze-padded the remaining output times with the last state.
+    /// freeze-padded the remaining output times with the last state — or, when the stop was on
+    /// a state that had gone non-finite, padded them with `NaN`; those are also counted in
+    /// [`diverged_segments`](Self::diverged_segments) (#1539).
     ///
     /// This counts attempts, including stiff attempts the `auto` guard later discarded.
     /// Subtract [`discarded_unfinished_segments`](Self::discarded_unfinished_segments) to
@@ -672,7 +679,10 @@ pub struct OdeSolverStats {
     /// Counts truncated **results**, not truncated attempts: an abort inside an `auto`
     /// escalation that the guard then discarded is not counted, because the caller received
     /// the explicit re-solve instead. A segment whose final step clamps but which still
-    /// reaches the end of its span is likewise not counted — nothing was abandoned.
+    /// reaches the end of its span is likewise not counted — nothing was abandoned. Nor is a
+    /// budgeted stop on a state that had already gone non-finite: that segment's tail is `NaN`,
+    /// not freeze-padded, and it is counted in
+    /// [`diverged_segments`](Self::diverged_segments) instead (#1539).
     pub stiff_aborted_segments: usize,
     /// Of [`min_step_clamped_steps`](Self::min_step_clamped_steps), the ones taken inside an
     /// `auto` escalation the guard then **discarded** — work that was really done, on a
@@ -746,6 +756,24 @@ pub struct OdeSolverStats {
     /// deposited here would either be discarded or — if that copy were widened — fire a warning
     /// clause about predictions.
     pub abandoned_non_finite_timeline: usize,
+    /// Segments whose integration stopped short **because a state went non-finite** — the
+    /// right-hand side diverged — so the output times it did not reach were padded with `NaN`
+    /// in every component rather than with the last state (#1539).
+    ///
+    /// A subset of [`unfinished_segments`](Self::unfinished_segments), disjoint from
+    /// [`stiff_aborted_segments`](Self::stiff_aborted_segments), that counts **results**, not
+    /// attempts: like `stiff_aborted_segments`, a diverged
+    /// `auto` escalation the guard discarded is not counted, because the caller received the
+    /// explicit re-solve instead. It also covers a segment that *entered* already non-finite
+    /// (the one after the divergence), which stops the same way.
+    ///
+    /// It is the one unfinished shape no `ode_method` or tolerance can repair — no stepper
+    /// integrates `x → ∞` — so the fit's `ode_solver` warning reports it apart and drops the
+    /// solver advice when every damaged segment is one of these. Non-zero means some
+    /// predictions are `NaN` by construction; check the `[odes]` right-hand side and the
+    /// parameter values. Like the other step counters it is a floor:
+    /// [`solve_ode_until_threshold`] takes no stats.
+    pub diverged_segments: usize,
 }
 
 impl OdeSolverStats {
@@ -787,6 +815,7 @@ impl OdeSolverStats {
             discarded_clamped_steps,
             discarded_unfinished_segments,
             abandoned_non_finite_timeline,
+            diverged_segments,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -803,6 +832,7 @@ impl OdeSolverStats {
         self.discarded_clamped_steps += discarded_clamped_steps;
         self.discarded_unfinished_segments += discarded_unfinished_segments;
         self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
+        self.diverged_segments += diverged_segments;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -1356,8 +1386,13 @@ fn integrate_dense_g<T: PkNum>(
                 .stiff_abort_after
                 .is_some_and(|budget| min_step_clamps >= budget.max(1))
         {
+            // A budgeted stop on a state that has already gone non-finite is a divergence, and
+            // is counted as one below (`diverged_segments`) rather than here: its tail is
+            // `NaN`, not freeze-padded, so the two counters partition the stopped segments.
             if let Some(s) = stats.as_deref_mut() {
-                s.stiff_aborted_segments += 1;
+                if u.iter().all(|v| v.val().is_finite()) {
+                    s.stiff_aborted_segments += 1;
+                }
             }
             break;
         }
@@ -1376,27 +1411,48 @@ fn integrate_dense_g<T: PkNum>(
         dt = dt.max(opts.min_dt);
     }
 
+    // A segment that stopped short with a non-finite component in its carried state diverged
+    // (#1539). Read by value only, like every other driver decision, so the `f64` and dual
+    // solves agree on it.
+    let unfinished = t < tf - 1e-15;
+    let diverged = unfinished && u.iter().any(|v| !v.val().is_finite());
     // Written once here rather than inside `record`, which cannot see which stepper is active.
     if let Some(s) = stats.as_deref_mut() {
         s.stiff_min_step_clamped_steps += stiff_min_step_clamps;
-        if t < tf - 1e-15 {
+        if unfinished {
             s.unfinished_segments += 1;
+        }
+        if diverged {
+            s.diverged_segments += 1;
         }
     }
     auto_state.accepted_since_probe = accepted_since_probe;
 
-    // Fill any remaining saveat / interp times with the last state.
+    // Fill any remaining saveat / interp times the integrator did not reach. A stop for a
+    // finite reason (the step budget, `stiff_abort_after`, an unusable attempt on a finite
+    // state) pads with the last state, as decided in #603 / #959. A diverged stop pads with
+    // `NaN` in every component, jets included (#1539): the RK stages couple every component
+    // through `u`, so once one state is non-finite no component past that point is an
+    // integrated value — and a decoupled, observed state frozen at a finite value is exactly
+    // the prediction nothing downstream can tell from a real one.
+    let tail: Vec<T> = if diverged {
+        // `v · NaN` rather than `from_f64(NaN)`: a dual constant carries zero jets, while the
+        // product rule puts `NaN` into the gradient and the Hessian block as well.
+        u.iter().map(|&v| v * T::from_f64(f64::NAN)).collect()
+    } else {
+        u.clone()
+    };
     while save_idx < saveat.len() {
         results.push(SolPointG {
             t: saveat[save_idx],
-            u: u.clone(),
+            u: tail.clone(),
         });
         save_idx += 1;
     }
     while interp_idx < interp_at.len() {
         interp_results.push(SolPointG {
             t: interp_at[interp_idx],
-            u: u.clone(),
+            u: tail.clone(),
         });
         interp_idx += 1;
     }
@@ -2240,6 +2296,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
         attempt.discarded_clamped_steps = attempt.min_step_clamped_steps;
         attempt.discarded_unfinished_segments = attempt.unfinished_segments;
         attempt.stiff_aborted_segments = 0;
+        attempt.diverged_segments = 0;
     }
     // The stiff attempt's steps stay counted either way — they were taken, and they cost what
     // they cost. A fit that reads slow *and* shows a rejection is paying for both solves.
@@ -4026,5 +4083,256 @@ mod tests {
 
         state.reset_rk45_verdict();
         assert!(!state.observe_rk45(0.0));
+    }
+
+    // -- #1539: a diverged state NaN-pads the tail --------------------------------------
+    //
+    // Fixture: `central' = −0.1·central` (decoupled) next to `X' = 0.5·X²`, `X(0) = 1`, whose
+    // closed form `X = 1/(1 − 0.5t)` has a pole at t = 2. `central = 100·e^{−0.1t}` is finite
+    // and well-defined for every t, so a frozen `central` past the pole is a wrong value served
+    // as a real one — the #1539 defect — and the `0·X` control integrates it cleanly.
+
+    fn diverging_rhs(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+        du[0] = -0.1 * u[0];
+        du[1] = 0.5 * u[1] * u[1];
+    }
+
+    fn control_rhs(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+        du[0] = -0.1 * u[0];
+        du[1] = 0.0 * u[1];
+    }
+
+    /// T1: the saved and interpolated points past the pole are `NaN` in **every** component,
+    /// the decoupled `central` included; the pre-pole point is an integrated value.
+    ///
+    /// Engine: `integrate_dense_g` at `T = f64`, through `solve_ode_g_dense` (both the
+    /// `saveat` and the `interp_at` tail). Mutations that redden it: revert the tail pad to
+    /// `u.clone()` (both legs); pad only the `saveat` loop (the interp leg).
+    #[test]
+    fn a_diverged_state_nan_pads_every_component_of_the_tail() {
+        let opts = OdeSolverOptions::default();
+        let mut stats = OdeSolverStats::default();
+        let (saved, interp) = solve_ode_g_dense::<f64>(
+            &diverging_rhs,
+            &[100.0, 1.0],
+            (0.0, 10.0),
+            &[],
+            &[1.0, 5.0, 10.0],
+            &[0.8, 7.0],
+            &opts,
+            Some(&mut stats),
+        );
+        assert_eq!(saved.len(), 3);
+        assert_eq!(interp.len(), 2);
+
+        // Before the pole: integrated, against the closed forms.
+        for (p, t) in [(&saved[0], 1.0), (&interp[0], 0.8)] {
+            assert!(
+                p.u.iter().all(|v| v.is_finite()),
+                "pre-pole t={t}: {:?}",
+                p.u
+            );
+            let central = 100.0 * (-0.1 * t).exp();
+            let x = 1.0 / (1.0 - 0.5 * t);
+            assert!(
+                (p.u[0] - central).abs() <= 1e-3 * central,
+                "t={t}: {:?}",
+                p.u
+            );
+            assert!((p.u[1] - x).abs() <= 1e-3 * x, "t={t}: {:?}", p.u);
+        }
+        // Past the pole: nothing was integrated, so nothing is a number — `central` included,
+        // which is the component the freeze-pad used to serve as a finite 100·e^{−0.1·2}.
+        for p in [&saved[1], &saved[2], &interp[1]] {
+            assert!(
+                p.u.iter().all(|v| v.is_nan()),
+                "post-pole t={}: every component must be NaN, got {:?}",
+                p.t,
+                p.u
+            );
+        }
+        assert_eq!(stats.diverged_segments, 1);
+        assert!(stats.unfinished_segments >= stats.diverged_segments);
+    }
+
+    /// T2: the tail fill also covers a segment that **enters** already non-finite — the
+    /// post-dose segment after a divergence — so no separate entry check exists. Two legs, each
+    /// stopping by a different break: the non-finite clamp break (default options), and
+    /// `ode_stiff_abort_after`, which fires before the clamp break can. A stop on a non-finite
+    /// state is a divergence whatever break took it, and is not counted as a budgeted abort.
+    ///
+    /// Engine: `integrate_dense_g` at `T = f64`, through `solve_ode_with_stats`. Mutation that
+    /// reddens it: pad with `NaN` only when the break was the non-finite clamp break (the
+    /// budget leg).
+    #[test]
+    fn the_nan_tail_covers_a_segment_that_enters_non_finite() {
+        for (label, budget) in [("clamp break", None), ("stiff_abort_after", Some(2))] {
+            let opts = OdeSolverOptions {
+                stiff_abort_after: budget,
+                ..OdeSolverOptions::default()
+            };
+            let mut stats = OdeSolverStats::default();
+            let saved = solve_ode_with_stats(
+                &diverging_rhs,
+                &[100.0, f64::INFINITY],
+                (0.0, 10.0),
+                &[],
+                &[1.0, 5.0],
+                &opts,
+                Some(&mut stats),
+            );
+            assert_eq!(saved.len(), 2, "{label}");
+            for p in &saved {
+                assert!(
+                    p.u.iter().all(|v| v.is_nan()),
+                    "{label}: t={} must be NaN in every component, got {:?}",
+                    p.t,
+                    p.u
+                );
+            }
+            assert_eq!(stats.diverged_segments, 1, "{label}: {stats:?}");
+            assert_eq!(stats.stiff_aborted_segments, 0, "{label}: {stats:?}");
+        }
+    }
+
+    /// T3: the dual leg. A padded point carries `NaN` in the value **and every jet** — the
+    /// gradient and the Hessian — so the analytic-sensitivity solve cannot hand FOCEI a zero
+    /// derivative for a prediction that was never integrated. The pre-pole point keeps finite
+    /// jets, and its `∂central/∂k` matches the closed form `−t·central`.
+    ///
+    /// Engine: `integrate_dense_g` at `T = Dual2<1>`, through `solve_ode_g_with_stats`.
+    /// Mutations that redden it: pad with `T::from_f64(NaN)` (a dual constant: `NaN` value,
+    /// zero jets); revert the pad to `u.clone()`.
+    #[test]
+    fn a_dual_nan_tail_is_nan_in_every_jet() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = -(p[0] * u[0]);
+            du[1] = Dual2::constant(0.5) * u[1] * u[1];
+        };
+        let k = Dual2::<1>::var(0.1, 0);
+        let mut stats = OdeSolverStats::default();
+        let saved = solve_ode_g_with_stats(
+            &rhs,
+            &[Dual2::constant(100.0), Dual2::constant(1.0)],
+            (0.0, 10.0),
+            &[k],
+            &[1.0, 5.0],
+            &OdeSolverOptions::default(),
+            Some(&mut stats),
+        );
+        assert_eq!(saved.len(), 2);
+        let pre = &saved[0];
+        for v in &pre.u {
+            assert!(v.value.is_finite() && v.grad[0].is_finite() && v.hess[0][0].is_finite());
+        }
+        let central = 100.0 * (-0.1f64).exp();
+        assert!(
+            (pre.u[0].grad[0] + central).abs() <= 1e-3 * central,
+            "{:?}",
+            pre.u[0]
+        );
+        for v in &saved[1].u {
+            assert!(v.value.is_nan(), "value: {v:?}");
+            assert!(v.grad[0].is_nan(), "gradient: {v:?}");
+            assert!(v.hess[0][0].is_nan(), "Hessian: {v:?}");
+        }
+        assert_eq!(stats.diverged_segments, 1);
+    }
+
+    /// T4: the straddle, all three legs in one test so a pad stuck on either branch fails it.
+    ///
+    /// * **diverge** — `X' = 0.5·X²`: the tail is `NaN`.
+    /// * **control** — `X' = 0·X`: finishes, never reaches the tail fill, and is bit-identical
+    ///   to the value measured at `75f5aa83`, before #1539.
+    /// * **finite stop** — the finite-stiff forcing of
+    ///   [`stiff_abort_after_stops_a_clamping_segment_at_the_budget`], stopped by the budget on
+    ///   a finite state: still freeze-padded with the last state, bit-identical to `75f5aa83`
+    ///   (#603 / #959 are not reopened).
+    ///
+    /// Engine: `integrate_dense_g` at `T = f64`, through `solve_ode_with_stats`. Mutations that
+    /// redden it: an unconditional `NaN` pad (the finite-stop leg); no pad at all (the diverge
+    /// leg); a divergence test that reads any component rather than a non-finite one (the
+    /// control and finite-stop legs).
+    #[test]
+    fn the_nan_pad_straddles_diverged_and_finite_stops() {
+        let opts = OdeSolverOptions::default();
+        let saveat = [1.0, 5.0, 10.0];
+
+        let mut diverged = OdeSolverStats::default();
+        let d = solve_ode_with_stats(
+            &diverging_rhs,
+            &[100.0, 1.0],
+            (0.0, 10.0),
+            &[],
+            &saveat,
+            &opts,
+            Some(&mut diverged),
+        );
+        assert!(d[0].u.iter().all(|v| v.is_finite()), "{:?}", d[0].u);
+        assert!(d[2].u.iter().all(|v| v.is_nan()), "{:?}", d[2].u);
+        assert_eq!(diverged.diverged_segments, 1);
+
+        let mut control = OdeSolverStats::default();
+        let c = solve_ode_with_stats(
+            &control_rhs,
+            &[100.0, 1.0],
+            (0.0, 10.0),
+            &[],
+            &saveat,
+            &opts,
+            Some(&mut control),
+        );
+        // `[90.48374180413369, 60.65306897273051, 36.78829764176734]`, against the closed form
+        // `100·e^{−0.1t}` = `[90.4837418, 60.6530660, 36.7879441]`.
+        let got: Vec<u64> = c.iter().map(|p| p.u[0].to_bits()).collect();
+        assert_eq!(
+            got,
+            [
+                4636067644216122773,
+                4633732977897763958,
+                4630374309920469964
+            ],
+            "control: {:?}",
+            c.iter().map(|p| p.u[0]).collect::<Vec<_>>()
+        );
+        assert_eq!(control.unfinished_segments, 0);
+        assert_eq!(control.diverged_segments, 0);
+        assert!(c.iter().all(|p| p.u[1] == 1.0));
+
+        let stiff = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let stiff_opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            stiff_abort_after: Some(5),
+            ..OdeSolverOptions::default()
+        };
+        let mut finite = OdeSolverStats::default();
+        let f = solve_ode_with_stats(
+            &stiff,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[0.5, 1.0],
+            &stiff_opts,
+            Some(&mut finite),
+        );
+        // Both output times sit past the abort at t = 0.005, so both carry the frozen last
+        // state, `453.1784280109106` — finite, and the same bits for each.
+        for p in &f {
+            assert_eq!(
+                p.u[0].to_bits(),
+                4646680015408494802,
+                "finite stop: {:?}",
+                p.u
+            );
+        }
+        assert_eq!(finite.stiff_aborted_segments, 1);
+        assert_eq!(finite.diverged_segments, 0);
     }
 }
