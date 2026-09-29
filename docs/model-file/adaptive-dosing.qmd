@@ -427,21 +427,44 @@ unanchored (`TAD` or `TAFD`), and the two fixes:
 Neither fix helps a controller that *never* doses: such a run has no anchor at any
 point, and the message says so.
 
-The refusal covers the whole pre-dose window, not only the observations inside it: an
-unanchored clock enters the integrated **state**, so a read taken later — even after
-the first dose has landed — would inherit it.
+The refusal covers the whole pre-dose window, not only the observations inside it: what
+an unanchored clock does to the derivative is integrated into the **state** — as a `NaN`,
+or as the wrong branch — so a read taken later, even after the first dose has landed,
+would inherit it.
 
-**It is gated on the outcome, not on the text of your model.** The check runs after
-each segment is integrated and fires only when three things hold together: the
-segment's state came back non-finite, the clock the RHS reads was unanchored there,
-and re-solving that same segment with the clock anchored *repairs* it — some state
-that had gone non-finite comes back finite. The third one is a counterfactual, and it
-is what makes the message's claim true rather than plausible: a compartment that
-diverges for its own reasons, on a model that merely mentions `TAD` somewhere, is not
-refused and not blamed on the clock. A `TAD` that appears in a branch the pre-dose
-window does not take, or only inside a condition, is likewise left alone. A RHS that
-reads only `TIME` / `T` is unaffected in every case, since that clock is the
-integration axis and is anchored everywhere.
+#### How the check decides
+
+It is gated on what the clock does, not on the text of your model. After each
+segment is integrated, the check asks whether the right-hand side's derivative over
+that window depends on the missing anchor. It evaluates the `[odes]` right-hand side
+at 17 evenly spaced times across the window — at the state the window started from
+and the one it ended at, each only when every compartment in it is finite — once as
+the window ran, and once with the clock anchored at the window's end, and refuses
+only if some derivative differs.
+Nothing is re-solved. The anchor is the earliest one a schedule can give: no dose has
+landed by the window's start, so the first dose comes at its end or later, and the
+clock `predict()` reads there is never positive. That covers both ways a clock gets
+in:
+
+- through **arithmetic**, as in `(1 + KT * TAD)`: the `NaN` reaches the state and
+  the message says the segment "integrated to a non-finite state";
+- through a **comparison** — `if (TAD < 5)`, `min(TAD, 24)`, `min(TAD, 0)`: an
+  ordering comparison against the unanchored clock is false, so the window silently
+  takes one branch and the state stays finite, but the answer depends on which way
+  the comparison fell. The message says the derivative changes when the clock is
+  anchored.
+
+A comparison that only switches for a *positive* clock — `if (TAD > 5)`,
+`max(TAD, 0)` — is not refused, and needs no refusal: the unanchored clock takes the
+same branch that every clock a schedule can give the window takes, so the run already
+matches `predict()`.
+
+A `TAD` that appears in a branch the pre-dose window does not take, or only in a
+condition on an empty compartment (where every branch gives the same zero
+derivative), is left alone. So is a compartment that diverges for its own reasons on
+a model that merely mentions `TAD` somewhere — it is not refused, and not blamed on
+the clock. A RHS that reads only `TIME` / `T` is unaffected in every case, since that
+clock is the integration axis and is anchored everywhere.
 
 Not being refused is not the same as being right, and on one of those shapes it is
 emphatically not: a model whose *other* compartment has run away is left alone here,
@@ -453,24 +476,22 @@ verifier agrees with them. That is tracked as a separate engine defect. If a
 compartment of your model can diverge, neither this check nor the verifier will tell
 you.
 
-**One shape it cannot see.** If the unanchored clock is consumed by a *comparison*
-rather than by arithmetic, nothing goes non-finite and the check stays quiet. Every
-comparison against `NaN` is false, and `min` / `max` are built from comparisons — so
-in the pre-dose window `if (TAD < 5)` silently takes the else arm and
-`min(TAD, 24)` silently yields `24`. The run then returns a number that depends on
-which way that comparison fell, and it need not match `predict()` on the realized
-schedule — it happens to match when both spellings of the comparison fall the same
-way, as `if (TAD > 5)` does, and to differ when they do not, as `if (TAD < 5)` does.
-The **frozen-schedule replay verifier**, which is on by default, is the net here: it
-reports the divergence between the reactive walk and the replay, without naming the
-clock as the cause. Two limits on that net are worth knowing. It only fires when the
-branch's effect exceeds its tolerance band — `8 × ode_reltol`, and at least `1e-9`,
-relative — so a small effect passes. And it compares two engines, so it cannot see a
-failure they share, which is exactly the frozen-state case above. Turning it off
-(`verify: false`) on a model that reads `TAD` or `TAFD` inside a comparison removes
-it entirely. Gating on *evaluation* instead — a per-segment "this slot was loaded"
-flag inside the RHS evaluator — would cover this shape too, and is tracked
-separately.
+#### What the check cannot see
+
+It samples, so a dependence confined between two of
+its 17 points, or one that shows only at states in the middle of the window, can
+slip through. Because it pairs the window's start and end states with every sample
+time, it can also refuse a combination the run never reaches — a condition on both a
+compartment and `TIME` — although the run would have matched `predict()`. And it
+anchors the clock at the window's end, while a later first dose
+puts the clock further below zero: a condition that only switches there — `if (TAD <
+-20)` over 12-hour windows with the first dose at 36 — is not seen, and the run
+returns numbers that depend on it. Probing every decision a dose could land at
+instead is tracked separately. The **frozen-schedule replay verifier**, on by default,
+remains the net for these, with two limits of its own:
+it fires only when an effect exceeds its tolerance band — `8 × ode_reltol`, and at
+least `1e-9`, relative — and it compares two engines, so it cannot see a failure they
+share, which is exactly the frozen-state case above.
 
 ## Current scope and limits
 

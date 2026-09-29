@@ -844,7 +844,6 @@ fn integrate_segment_zero_length_is_a_noop() {
         None,
         &mut auto_state,
         &[],
-        None,
     );
 
     assert_eq!(u, vec![10.0], "zero-length segment must not change state");
@@ -887,7 +886,6 @@ fn integrate_segment_advances_state_and_records_obs() {
         None,
         &mut auto_state,
         &[],
-        None,
     );
 
     let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
@@ -4124,7 +4122,6 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
         None,
         &mut auto_state,
         &[],
-        None,
     );
 
     // TAD anchor must be the dose time (0.0), not NaN.
@@ -12785,11 +12782,18 @@ fn frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge() {
     );
 }
 
-/// A 1-cpt IV ODE whose RHS reads BOTH dose clocks, compiled through the parser so the
-/// resulting [`OdeSpec`] carries a real `rhs_program` (#1151). The hand-built specs in this
-/// file set `rhs_program: None`, which is exactly the "no program ⇒ nothing to refuse" arm.
-fn tad_and_tafd_ode_spec() -> OdeSpec {
-    let src = r#"
+/// A 1-cpt IV `[odes]` body compiled through the parser, so the resulting [`OdeSpec`] carries
+/// a real `rhs_program` (#1151 / #1535). The hand-built specs in this file set
+/// `rhs_program: None`, which is exactly the "no program ⇒ nothing to refuse" arm. Pair it
+/// with [`dose_clock_ext_params`], which puts `CL = 5`, `V = 50` in the PK slots.
+fn dose_clock_ode_spec(odes: &str) -> OdeSpec {
+    dose_clock_ode_spec_with_states("central", odes)
+}
+
+/// [`dose_clock_ode_spec`] with more states than `central` (which stays the observed one).
+fn dose_clock_ode_spec_with_states(states: &str, odes: &str) -> OdeSpec {
+    let src = format!(
+        r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 1.0, 500.0)
@@ -12799,30 +12803,47 @@ fn tad_and_tafd_ode_spec() -> OdeSpec {
   CL = TVCL
   V  = TVV
 [structural_model]
-  ode(states=[central])
+  ode(obs_cmt=central, states=[{states}])
 [odes]
-  d/dt(central) = -(CL / V) * central * (1.0 + 1e-3 * TAD + 1e-3 * TAFD)
-[scaling]
-  y = central
+{odes}
 [error_model]
   DV ~ proportional(PROP)
-"#;
-    crate::parser::model_parser::parse_model_string(src)
-        .expect("parse TAD+TAFD ODE model")
+"#
+    );
+    crate::parser::model_parser::parse_model_string(&src)
+        .expect("parse dose-clock ODE model")
         .ode_spec
         .expect("the model is an ODE model")
 }
 
-/// The counterfactual a passing causation check supplies: the segment would have been finite
-/// under an anchored clock, so the `NaN` clock is what broke it.
-fn cf_finite(_anchor: f64) -> Vec<f64> {
-    vec![1.0]
+/// The extended-parameter array as the reactive driver holds it before the first dose: the PK
+/// snapshot in its slots (`CL = 5`, `V = 50`), and both dose-clock anchors `NaN` — the `TAD`
+/// slot from `integrate_segment`'s empty fold, the `TAFD` slot until `update_tafd_anchor`
+/// lowers it at the first realized dose.
+fn dose_clock_ext_params() -> [f64; crate::types::MAX_PK_PARAMS + 2] {
+    let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
+    pk[crate::types::PK_IDX_CL] = 5.0;
+    pk[crate::types::PK_IDX_V] = 50.0;
+    seed_ext_params(&pk, f64::INFINITY)
 }
 
-/// The counterfactual of a segment that diverges for its own reasons — it is still non-finite
-/// with the clock anchored, so the clock is not the cause.
-fn cf_still_non_finite(_anchor: f64) -> Vec<f64> {
-    vec![f64::INFINITY]
+/// A RHS reading BOTH dose clocks, in arithmetic.
+fn tad_and_tafd_ode_spec() -> OdeSpec {
+    dose_clock_ode_spec("  d/dt(central) = -(CL / V) * central * (1.0 + 1e-3 * TAD + 1e-3 * TAFD)")
+}
+
+/// A RHS reading `TAD` in arithmetic: an unanchored clock puts `NaN` into the derivative.
+fn tad_arithmetic_ode_spec() -> OdeSpec {
+    dose_clock_ode_spec("  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)")
+}
+
+/// A RHS reading `TAD` only in a comparison: an unanchored clock silently takes the else arm,
+/// and on a non-empty compartment the two arms' derivatives differ.
+fn tad_comparison_ode_spec() -> OdeSpec {
+    dose_clock_ode_spec(
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }",
+    )
 }
 
 #[test]
@@ -12832,28 +12853,21 @@ fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
     // each (`ODE_TAD_NO_IIV`, `ODE_TAFD`), which leaves this arm of the message unreachable
     // from there.
     //
-    // Mutation that reddens it: collapse the slot match to a bare "`TAD`".
+    // It is also the cell that makes the verdict give both slots ONE stand-in (#1535):
+    // anchoring either slot alone leaves the other's `NaN` in `(1 + TAD + TAFD)`, so the
+    // stand-in derivative stays non-finite and the comparison skips it.
+    //
+    // Mutations that redden it: collapse the slot match to a bare "`TAD`"; anchor one slot at
+    // a time for the verdict (the helper then returns `None`).
     let ode = tad_and_tafd_ode_spec();
     let subject = make_subject(vec![], vec![6.0]);
-    // Both anchors as the driver holds them before the first dose: `integrate_segment` writes
-    // the TAD slot from an empty dose list (NaN), and the TAFD slot stays NaN until
-    // `update_tafd_anchor` lowers it at the first realized dose.
-    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let ext_params = dose_clock_ext_params();
     // The state before and after this segment: finite in, non-finite out.
     let u_start = [0.0];
     let u = [f64::NAN];
 
-    let msg = unanchored_dose_clock_error(
-        &ode,
-        &subject,
-        &u_start,
-        &u,
-        &ext_params,
-        0.0,
-        12.0,
-        cf_finite,
-    )
-    .expect("a dose-free window on a TAD+TAFD RHS is refused");
+    let msg = unanchored_dose_clock_error(&ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0)
+        .expect("a dose-free window on a TAD+TAFD RHS is refused");
     assert!(
         msg.contains("`TAD` and `TAFD`"),
         "both unanchored spellings must be named: {msg}"
@@ -12865,100 +12879,189 @@ fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
 }
 
 #[test]
-fn unanchored_dose_clock_error_ignores_a_segment_that_stayed_finite() {
-    // #1151 (PR #1534 review round 1, finding 1). The outcome conjunct, isolated: identical
-    // inputs to the test above — unanchored `TAD` and `TAFD` slots, a RHS that reads both —
-    // except that the segment's state came back finite. Nothing is refused.
+fn unanchored_dose_clock_error_opens_with_a_non_finite_state_only_when_the_clock_caused_one() {
+    // #1535, the message's two openers. "Integrated to a non-finite state" is a claim about
+    // the outcome AND its cause, so it takes two conjuncts: the state went non-finite, and the
+    // clock's `NaN` reached the derivative. Four cells in one test, so a gate stuck on either
+    // conjunct, or on either opener, fails here:
     //
-    // This is one of two conjuncts that make the syntactic `pk_reads_tad()` /
-    // `pk_reads_tafd()` walk safe to ask. `stmts_read_slots` recurses into `if` arms and into
-    // conditions, so it is true for a `TAD` the unanchored window never evaluates; the
-    // driver-level twins (`adaptive_tad_in_an_untaken_branch_is_not_refused`,
-    // `adaptive_tad_read_only_in_a_condition_is_not_refused`) run those shapes end to end.
+    //   cell  RHS          end state  evidence         opener
+    //   A     arithmetic   NaN        NaN derivative   non-finite state
+    //   B     comparison   finite     finite change    derivative changes
+    //   C     comparison   NaN        finite change    derivative changes
+    //   D     arithmetic   finite     NaN derivative   derivative changes
     //
-    // Mutation that reddens it: drop the `u.iter().all(is_finite)` early return — the guard
-    // then refuses on the anchor and the parse walk alone, which is the pre-review behaviour.
-    let ode = tad_and_tafd_ode_spec();
+    // C is a comparison-read clock while another state diverges on its own: the clock is
+    // refused on its own merits, but the non-finite opener would pin that divergence on it. D
+    // is what the driver hits when the probe pairs a state with a time the trajectory never
+    // reaches (#1570 review, row 4: a condition on both the state and `TIME`, whose run matches
+    // `predict()` to 2.5e-12, is refused through this cell) — a false positive tracked in #1572.
+    // Here it is the cell that separates the outcome conjunct.
+    //
+    // Mutations that redden it: drop the `nan_reached_derivative` conjunct (C flips); drop the
+    // outcome conjunct (D flips); either opener unconditionally (A, or B–D). And deleting any
+    // one sentence of the derivative-changes opener (cell B's three `contains`).
     let subject = make_subject(vec![], vec![6.0]);
-    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let u_start = [0.0];
-    let u = [42.0];
+    let ext_params = dose_clock_ext_params();
+    let u_start = [50.0];
+    let refuse = |ode: &OdeSpec, u: [f64; 1], cell: &str| {
+        unanchored_dose_clock_error(ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0)
+            .unwrap_or_else(|| panic!("cell {cell}: the clock moves the derivative — refuse"))
+    };
+    let non_finite = "integrated to a non-finite state";
+    let changes = "The derivative it computes there changes when that clock is anchored";
 
+    let a = refuse(&tad_arithmetic_ode_spec(), [f64::NAN], "A");
+    assert!(a.contains(non_finite), "cell A: {a}");
+    assert!(!a.contains(changes), "cell A: one opener, not both: {a}");
+
+    let b = refuse(&tad_comparison_ode_spec(), [30.0], "B");
     assert!(
-        unanchored_dose_clock_error(
-            &ode,
-            &subject,
-            &u_start,
-            &u,
-            &ext_params,
-            0.0,
-            12.0,
-            cf_finite,
-        )
-        .is_none(),
-        "a segment whose state stayed finite never evaluated the unanchored slot"
+        b.contains(
+            "over the segment (0, 12] the [odes] RHS reads `TAD`, which has no referent there"
+        ),
+        "cell B, sentence 1 — the window, the slot, and that it has no referent: {b}"
+    );
+    assert!(
+        b.contains(
+            "The derivative it computes there changes when that clock is anchored, so the \
+             trajectory depends on a dose time this run does not have."
+        ),
+        "cell B, sentence 2 — what the probe measured, and why it matters: {b}"
+    );
+    assert!(
+        b.contains("an `if`, `min` or `max` on it picks a side without producing a `NaN`"),
+        "cell B, sentence 3 — how a finite run can depend on the clock: {b}"
+    );
+    assert!(
+        !b.contains("non-finite state"),
+        "cell B: the state is finite: {b}"
+    );
+
+    let c = refuse(&tad_comparison_ode_spec(), [f64::NAN], "C");
+    assert!(c.contains(changes), "cell C: {c}");
+    assert!(
+        !c.contains("non-finite state"),
+        "cell C: the clock only chose a branch — the non-finite state is not its doing: {c}"
+    );
+
+    let d = refuse(&tad_arithmetic_ode_spec(), [30.0], "D");
+    assert!(d.contains(changes), "cell D: {d}");
+    assert!(
+        !d.contains("non-finite state"),
+        "cell D: the state is finite: {d}"
     );
 }
 
 #[test]
-fn unanchored_dose_clock_error_is_silent_when_the_clock_was_not_the_cause() {
-    // #1534 review round 2, finding A. The causation conjunct, isolated. Every cheaper
-    // conjunct holds — finite in, non-finite out, both slots NaN, a RHS that mentions both —
-    // but the counterfactual re-solve under a FINITE clock is still non-finite, so the
-    // divergence came from somewhere else and this message would misattribute it.
+fn unanchored_dose_clock_error_probes_the_end_state_only_when_it_is_finite() {
+    // #1535. A comparison on an EMPTY compartment cannot move the derivative — both arms give
+    // zero — so at `u_start` this window looks clock-independent; by the end state `central`
+    // has filled, and the arms differ. `u` is probed for exactly that, but only when every
+    // component is finite: once any state diverges the solver pads every state with its last
+    // value (#1539), so the finite components of a partly non-finite `u` are that pad, not an
+    // integrated state. Two cells, both sides of the gate:
     //
-    // Measured end to end: a second state with `X' = 0.5·X²` blows up on its own at t = 2
-    // while `TAD` sits in an untaken branch of the first. Before this conjunct the run was
-    // refused although `predict()` and the frozen-replay verifier both returned finite
-    // predictions (`adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock`).
+    //   end state `u`   probed   verdict
+    //   [30, 5]         yes      refused — the arms differ at central = 30
+    //   [30, inf]       no       not refused
     //
-    // Mutation that reddens it: drop the `resolve_with_finite_clock` check.
-    let ode = tad_and_tafd_ode_spec();
+    // Mutations that redden it: drop the end-state probe (the first cell runs); probe a partly
+    // non-finite end state (the second cell is refused).
+    let ode = dose_clock_ode_spec_with_states(
+        "central, X",
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }\n  \
+         d/dt(X) = 0.5 * X * X",
+    );
     let subject = make_subject(vec![], vec![6.0]);
-    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let u_start = [0.0];
-    let u = [f64::NAN];
+    let ext_params = dose_clock_ext_params();
+    let u_start = [0.0, 1.0];
 
     assert!(
         unanchored_dose_clock_error(
             &ode,
             &subject,
             &u_start,
-            &u,
+            &[30.0, 5.0],
             &ext_params,
             0.0,
-            12.0,
-            cf_still_non_finite,
+            12.0
+        )
+        .is_some(),
+        "a finite end state where the arms differ shows the clock dependence"
+    );
+    assert!(
+        unanchored_dose_clock_error(
+            &ode,
+            &subject,
+            &u_start,
+            &[30.0, f64::INFINITY],
+            &ext_params,
+            0.0,
+            12.0
         )
         .is_none(),
-        "a divergence that survives an anchored clock is not the clock's fault"
+        "a partly non-finite end state is the solver's pad, and is not taken as evidence"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_when_the_derivative_does_not_depend_on_the_clock() {
+    // #1534 review round 2, finding A, under #1535's rule. The segment came back non-finite
+    // and `TAD` is unanchored and read — but only in a branch the window never takes
+    // (`TIME > 20` over `(0, 12]`), so no stand-in moves the derivative: the divergence came
+    // from somewhere else, and this message would misattribute it. The driver-level twin is
+    // `adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock`.
+    //
+    // Mutation that reddens it: refuse on "unanchored and read" alone — drop the dependence
+    // test, which is also the pre-#1534 form of the guard.
+    let ode = dose_clock_ode_spec(
+        "  if (TIME > 20.0) {\n    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)\n  \
+         } else {\n    d/dt(central) = -(CL / V) * central\n  }",
+    );
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = dose_clock_ext_params();
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[f64::NAN], &ext_params, 0.0, 12.0)
+            .is_none(),
+        "a derivative no anchor can move does not depend on the clock"
     );
 }
 
 #[test]
 fn unanchored_dose_clock_error_is_silent_when_the_state_arrived_non_finite() {
-    // #1534 review round 2, finding A (2). A state that was already non-finite at `t_start`
-    // was not broken by THIS segment — it came from `init(...)`, or from a `NaN` bolus applied
-    // at the break — so this segment's clock is not the story. The counterfactual would
-    // happily come back finite here, which is why this is checked before it.
+    // #1534 review round 2, finding A (2), and #1570's review, row 2. A state that arrived with
+    // a non-finite component was broken before this segment — by `init(...)`, a `NaN` bolus at
+    // the break, or an earlier segment's divergence, whose other components the solver then
+    // padded with their last values (#1539). Its finite components are that pad, not an
+    // integrated state, so it is not probed: no verdict rests on it, and none depends on what
+    // the pad holds.
     //
-    // Mutation that reddens it: drop the `u_start` finiteness check.
-    let ode = tad_and_tafd_ode_spec();
+    // Two components, because one would not do: here `central` is finite and reads `TAD` in a
+    // comparison whose arms differ at 50, so probing this `u_start` WOULD find a dependence. The
+    // one-component version of this test could not tell the gate from the finite-value filter.
+    //
+    // Mutation that reddens it: probe `u_start` whatever its components (the gate on `u` alone).
+    let ode = dose_clock_ode_spec_with_states(
+        "central, X",
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }\n  \
+         d/dt(X) = 0.5 * X * X",
+    );
     let subject = make_subject(vec![], vec![6.0]);
-    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let u_start = [f64::NAN];
-    let u = [f64::NAN];
+    let ext_params = dose_clock_ext_params();
 
     assert!(
         unanchored_dose_clock_error(
             &ode,
             &subject,
-            &u_start,
-            &u,
+            &[50.0, f64::NAN],
+            &[30.0, f64::NAN],
             &ext_params,
             0.0,
-            12.0,
-            cf_finite,
+            12.0
         )
         .is_none(),
         "a state that arrived non-finite was not broken by this segment's clock"
@@ -12966,35 +13069,138 @@ fn unanchored_dose_clock_error_is_silent_when_the_state_arrived_non_finite() {
 }
 
 #[test]
-fn unanchored_dose_clock_error_is_silent_when_the_anchor_is_finite() {
-    // #1151 (PR #1534 review round 1, finding 1). The other half of the conjunction: a
-    // non-finite state under an ANCHORED clock is somebody else's problem — a stiff blow-up,
-    // a bad parameter draw — and reporting it here would misattribute it. Same RHS, both
-    // anchors finite, state NaN.
+fn unanchored_dose_clock_error_is_silent_when_no_anchor_makes_the_derivative_finite() {
+    // #1535 and #1570's review, row 1. `TAD^(-0.5)` is non-finite for every clock the window-end
+    // anchor gives the window (`TAD ∈ [-12, 0]`: `NaN`, then `inf` at 0), exactly as for the
+    // unanchored clock. The comparison is made only where the anchored derivative is finite, so
+    // nothing is compared and nothing is refused: the clock a schedule can supply would not fix
+    // it, and `predict()`, which reads that same clock here, is non-finite too. (Only an anchor
+    // at the window's start, `TAD ∈ [0, 12]`, would make it finite — the anchor #1570 dropped.)
     //
-    // Mutation that reddens it: report on non-finiteness alone.
-    let ode = tad_and_tafd_ode_spec();
+    // Mutations that redden it: drop the `anchored.is_finite()` conjunct from the comparison
+    // (IEEE `NaN != NaN` is true, so the anchored `NaN` would count as a change); add a
+    // `t_start` anchor back.
+    let ode =
+        dose_clock_ode_spec("  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD^(-0.5))");
     let subject = make_subject(vec![], vec![6.0]);
-    let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
-    ext_params[crate::types::MAX_PK_PARAMS] = 0.0; // TAFD anchored at the first dose
-    ext_params[crate::types::MAX_PK_PARAMS + 1] = 0.0; // TAD anchored at the last dose
-    let u_start = [0.0];
-    let u = [f64::NAN];
+    let ext_params = dose_clock_ext_params();
 
     assert!(
-        unanchored_dose_clock_error(
-            &ode,
-            &subject,
-            &u_start,
-            &u,
-            &ext_params,
-            0.0,
-            12.0,
-            cf_finite,
-        )
-        .is_none(),
+        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[30.0], &ext_params, 0.0, 12.0)
+            .is_none(),
+        "no anchor a schedule can give makes this derivative finite, so it is not the clock's"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_on_a_zero_derivative_of_either_sign() {
+    // #1535. The comparison is by value (IEEE `!=`), not by bits. On an empty compartment
+    // `-(CL/V)·0·(1 − 0.1·min(TAD, 24))` is a zero derivative whichever arm runs — but its SIGN
+    // follows the factor's: the unanchored `min` yields 24 (factor −1.4, derivative `+0.0`),
+    // while an anchored `TAD < 10` gives a positive factor and `-0.0`. A bit comparison calls
+    // that a dependence and refuses a window in which nothing can move.
+    //
+    // Mutation that reddens it: compare `to_bits()` instead of by value.
+    let ode =
+        dose_clock_ode_spec("  d/dt(central) = -(CL / V) * central * (1.0 - 0.1 * min(TAD, 24.0))");
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = dose_clock_ext_params();
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[0.0], &[0.0], &ext_params, 0.0, 12.0)
+            .is_none(),
+        "an empty compartment has a zero derivative under every anchor, whatever its sign"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_when_the_anchor_is_finite() {
+    // #1151 (PR #1534 review round 1, finding 1). A non-finite state under an ANCHORED clock is
+    // somebody else's problem — a stiff blow-up, a bad parameter draw — and reporting it here
+    // would misattribute it. Same RHS, both anchors finite (a dose at t=0), state NaN.
+    //
+    // Mutation that reddens it: drop the `is_nan()` half of the candidate test. The `t_end`
+    // stand-in then replaces the real anchor, and on the non-empty compartment the derivative
+    // moves with it.
+    let ode = tad_and_tafd_ode_spec();
+    let subject = make_subject(vec![], vec![6.0]);
+    let mut ext_params = dose_clock_ext_params();
+    ext_params[crate::types::MAX_PK_PARAMS] = 0.0; // TAFD anchored at the first dose
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = 0.0; // TAD anchored at the last dose
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[f64::NAN], &ext_params, 0.0, 12.0)
+            .is_none(),
         "a diverged solve under an anchored clock must not be blamed on TAD/TAFD"
     );
+}
+
+#[test]
+fn unanchored_dose_clock_error_names_only_the_clock_the_derivative_depends_on() {
+    // #1535, per-slot naming. Both clocks are unanchored and both are read, but in the first
+    // two cells only one of them moves the derivative — the other sits in a branch the window
+    // never takes — so the message must name that one: naming both sends the reader to a line
+    // that did not run. The third cell moves it only as a PAIR (`TAD < 5 || TAFD < 5`: either
+    // anchored clock alone keeps the condition true), so both are named. The fourth has `TAD`
+    // anchored, so only `TAFD` is unanchored at all.
+    //
+    // Mutations that redden it: name the slots by "unanchored and read" instead of by what each
+    // does alone (cells 1 and 2 then say "`TAD` and `TAFD`"); name only the slots that move it
+    // alone, with no fallback for a pair (cell 3 then names one); drop the `is_nan()` half of
+    // the candidate test (cell 4 then names `TAD` too).
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = dose_clock_ext_params();
+    let msg = |odes: &str, ext: &[f64]| {
+        unanchored_dose_clock_error(
+            &dose_clock_ode_spec(odes),
+            &subject,
+            &[50.0],
+            &[30.0],
+            ext,
+            0.0,
+            12.0,
+        )
+        .expect("the derivative depends on an unanchored clock")
+    };
+    let only = |m: &str, named: &str, other: &str, cell: &str| {
+        assert!(m.contains(named), "cell {cell}: must name {named}: {m}");
+        assert!(
+            !m.contains(other),
+            "cell {cell}: must not name {other}: {m}"
+        );
+    };
+
+    let tad_moves = msg(
+        "  if (TIME > 20.0) {\n    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD + 0.01 * TAFD)\n  \
+         } else {\n    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)\n  }",
+        &ext_params,
+    );
+    only(&tad_moves, "`TAD`", "`TAFD`", "1 (TAD moves it)");
+
+    let tafd_moves = msg(
+        "  if (TIME > 20.0) {\n    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD + 0.01 * TAFD)\n  \
+         } else {\n    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAFD)\n  }",
+        &ext_params,
+    );
+    only(&tafd_moves, "`TAFD`", "`TAD`", "2 (TAFD moves it)");
+
+    let pair = msg(
+        "  if (TAD < 5.0 || TAFD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else { d/dt(central) = -(CL / V) * central }",
+        &ext_params,
+    );
+    assert!(
+        pair.contains("`TAD` and `TAFD`"),
+        "cell 3 (only the pair moves it): must name both: {pair}"
+    );
+
+    let mut tad_anchored = ext_params;
+    tad_anchored[crate::types::MAX_PK_PARAMS + 1] = 0.0;
+    let tafd_only = msg(
+        "  d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD + 0.01 * TAFD)",
+        &tad_anchored,
+    );
+    only(&tafd_only, "`TAFD`", "`TAD`", "4 (TAD anchored)");
 }
 
 #[test]
@@ -13008,21 +13214,12 @@ fn unanchored_dose_clock_error_does_not_name_a_read_in_the_segments_closing_band
     // Mutation that reddens it: drop the `(t_end - t).abs() > EVENT_MATCH_TOL` filter.
     let ode = tad_and_tafd_ode_spec();
     let subject = make_subject(vec![], vec![12.0, 40.0]);
-    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let ext_params = dose_clock_ext_params();
     let u_start = [0.0];
     let u = [f64::NAN];
 
-    let msg = unanchored_dose_clock_error(
-        &ode,
-        &subject,
-        &u_start,
-        &u,
-        &ext_params,
-        0.0,
-        12.0,
-        cf_finite,
-    )
-    .expect("the window is still refused");
+    let msg = unanchored_dose_clock_error(&ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0)
+        .expect("the window is still refused");
     assert!(
         !msg.contains("The observation at t=12"),
         "the read at t_end is reported post-dose, so it is not read off this segment: {msg}"
@@ -13045,17 +13242,7 @@ fn unanchored_dose_clock_error_is_silent_without_a_compiled_rhs_program() {
     let u = [f64::NAN];
 
     assert!(
-        unanchored_dose_clock_error(
-            &ode,
-            &subject,
-            &u_start,
-            &u,
-            &ext_params,
-            0.0,
-            12.0,
-            cf_finite,
-        )
-        .is_none(),
+        unanchored_dose_clock_error(&ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0).is_none(),
         "no compiled RHS program ⇒ no dose clock to refuse"
     );
 }
