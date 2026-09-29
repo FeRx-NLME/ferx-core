@@ -12032,7 +12032,7 @@ fn ode_provider_ss_record_wipes_a_preceding_or_pending_dose_matches_production()
         Vec<f64>,
         Vec<DoseEvent>,
         Vec<DoseEvent>,
-    ); 5] = [
+    ); 6] = [
         (
             "ID 1, lag 0: bolus central, then SS=1 (the value/gradient seam)",
             &depot_model,
@@ -12060,6 +12060,18 @@ fn ode_provider_ss_record_wipes_a_preceding_or_pending_dose_matches_production()
             vec![2.0, 20.0, 0.15, 2.0],
             vec![depot(9.0), ss(10.0, 100.0, 1)],
             vec![ss(10.0, 100.0, 1)],
+        ),
+        (
+            // The only shape where the SS re-equilibration gate alone matters: the wiped
+            // `SS=1` dose is unlagged (re-equilibrated at its arrival), the live one lagged
+            // (seeded at the record, not re-equilibrated), so nothing later overwrites an
+            // ungated re-equilibration. With both lagged or both unlagged, the live dose's
+            // own load erases it.
+            "ID 12, lag 2: SS=1 central 100, then SS=1 depot 200 (co-timed)",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 2.0],
+            vec![ss(10.0, 100.0, 2), ss(10.0, 200.0, 1)],
+            vec![ss(10.0, 200.0, 1)],
         ),
         (
             "forcing, lag 2: bolus into the forcing at 9 (arrives 11), SS=1 depot2 at 10",

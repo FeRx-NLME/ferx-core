@@ -60,8 +60,19 @@ section of the SDLC for the versioning policy).
   the dose record, analytic superposition also stops an infusion into central and cancels a
   pending lagged dose at the record, and the ODE forcing stops an infusion into the forcing
   compartment. On the ODE engines and the analytic event-driven path, an infusion into a
-  compartment state (#1586) and a pending lagged dose (#1587) are not yet reset, nor is a
-  co-timed state bolus on the static ODE path (#1588).
+  compartment state is not yet reset (#1586); a co-timed or pending lagged dose now is (#1588).
+- **An `SS=1` record now wipes a co-timed dose in an earlier row, and a pending lagged dose,
+  on every state engine** (#1588). NONMEM resets at an `SS=1` record in row order: a dose row
+  *before* a co-timed `SS=1` row contributes nothing, one *after* it superposes. The static
+  ODE walker and the adaptive driver applied the earlier row's bolus on top of the steady
+  state regardless (up to +127 % against NONMEM), and once the `SS=1` dose carried a lag
+  (`ALAG`) every state engine did — the ODE walkers, the analytic event-driven walk, and the
+  analytic gradients (FOCE/FOCEI) of both. A lagged dose whose record precedes an `SS=1`
+  record but whose arrival follows it is now cancelled too (the `SS=1` half of #1587). At lag
+  0 the gradient walk was already right while the prediction was not, so the objective and
+  its gradient disagreed; they now agree. Still open: with a lagged `SS=1` dose, a dose
+  landing between its record and its arrival is wiped on the non-event-driven ODE paths
+  (#1275).
 - **`simulate_adaptive()` now rejects a model covariate missing from the data** (#1571).
   The programmatic (closure-controller) Rust entry point skipped the data checks every
   other simulate entry point runs, so a covariate such as `WT` with no data column was

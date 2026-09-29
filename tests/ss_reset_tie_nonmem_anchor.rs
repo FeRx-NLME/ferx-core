@@ -14,7 +14,7 @@
 //! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `II = 12`, `AMT = 100`:
 //! `nonmem_anchor/ss_reset_tie.{csv,ctl}` (`ALAG1 = 0`) and `ss_reset_tie_lag.ctl`
 //! (`ALAG1 = 2`, depot doses only). On the wiped cells NONMEM equals the `SS=1`-alone
-//! closed form (an independent Python pulse-train sum) to printed precision. IDs:
+//! closed form (an independent Python pulse-train sum) to 8.8e-16. IDs:
 //!
 //! | ID | rows at t = 10 (row order) | NONMEM |
 //! |---|---|---|
