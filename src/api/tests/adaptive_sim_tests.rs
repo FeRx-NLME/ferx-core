@@ -7384,6 +7384,9 @@ fn reset_subject_1148() -> Subject {
 /// 1.7e-2..2.3e-2 at these magnitudes, so ~30× headroom. Every stale value the tests exist
 /// to reject sits ≥ 2.6 away (T3b's reset-row value; ≥ 4.6 for the rest), > 100× the band.
 ///
+/// The review-r1 fixtures: 4.49e-4 (the carry past the final instant; the first-record rule
+/// is 10.1 away) and 1.97e-4 (the IOV decision-window κ; the record's-window F is 7.7 away).
+///
 /// The `predict()` comparisons use 1e-9 relative: measured **0** (bit-identical) on every row.
 fn band_1148(want: f64) -> f64 {
     8.0 * (1e-6 + 1e-4 * want.abs())
@@ -7417,6 +7420,9 @@ fn adaptive_decision_after_a_reset_reads_the_reset_row() {
         "ctx CRCL at the t=36 decision must be the reset row's 30 (stale: the obs@12's 90)"
     );
 
+    // Not an oracle for the rule: the t=36 dose row below is handed the covariate the rule
+    // should pick (CRCL 30), so agreement restates that choice. The closed form above judges
+    // the rule; this checks that the reactive engine, given the rule, reproduces the dense one.
     let preds = predict_realized_1148(
         &model,
         reset_subject_1148(),
@@ -7615,5 +7621,134 @@ fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
                 traj.time
             );
         }
+    }
+}
+
+// `ODE_TV_F_IOV` with a real κ on F (ω_IOV² = 0.09), so a decision's window and the window of
+// the record it reads can carry distinguishably different F.
+const ODE_TV_F_IOV_WIDE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_F ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  F  = TVF * CRCL / 100.0 * exp(KAPPA_F)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn adaptive_iov_decision_reads_its_record_under_the_decisions_own_kappa() {
+    // #1148 review r1 finding 1. Under IOV a decision reads the in-force record's
+    // covariates, but under the κ of the DECISION's window — not the record's own window.
+    // T2 / T4 / T5 run `kappa ~ 1e-12` and cannot tell the two apart; this fixture can.
+    //
+    // T4's geometry: the base dose row@24 (CRCL 30) is the in-force record for the decision
+    // at 36. With decisions at [0, 36] the dose row sits in window 0 and the decision opens
+    // window 1, so the injected dose's F is 0.24·e^κ₁ (the rule) versus 0.24·e^κ₀ (the
+    // record's own snapshot, `event_pk.dose[0]`).
+    let model = parse_model_string(ODE_TV_F_IOV_WIDE).expect("parse wide-κ TV-F IOV model");
+    let decisions = [0.0, 36.0];
+    let (res, seen) = run_capture_1148(&model, base_dose_subject_1148(), &decisions);
+    assert_eq!(crcl_seen_at_1148(&seen, 36.0), 30.0, "ctx CRCL at t=36");
+
+    // The κ `run_capture_1148` drew (seed 1148, subject "1", sim 1).
+    let kappas = reconstruct_kappas(&model, 1148, "1", decisions.len());
+    let (k0, k1) = (kappas[0][0], kappas[1][0]);
+    let dose36 = |k: f64| 100.0 * 0.24 * k.exp() * (-0.6f64).exp();
+    let rest = 72.0 * k0.exp() * (-4.2f64).exp() // decision@0: baseline CRCL 90, window 0
+        + 50.0 * 0.24 * k0.exp() * (-1.8f64).exp(); // base dose@24: its own row, window 0
+    let want = rest + dose36(k1);
+    let wrong = rest + dose36(k0);
+    // Non-vacuity: the record's-window answer must sit well outside the band, or this
+    // fixture would pass either rule — the defect T2 / T4 / T5 had.
+    assert!(
+        (want - wrong).abs() > 10.0 * band_1148(want),
+        "κ₀ = {k0}, κ₁ = {k1} too close: the record's-window F would pass the band"
+    );
+
+    let got = ipred_at_1148(&res, 42.0);
+    assert!(
+        (got - want).abs() <= band_1148(want),
+        "IPRED@42 = {got}: the t=36 dose's F must use the decision's window (κ₁ = {k1:.4} → \
+         {want:.6}); the dose row's own window (κ₀ = {k0:.4}) gives {wrong:.6}"
+    );
+}
+
+#[test]
+fn adaptive_carry_past_the_final_instant_takes_the_last_co_timed_record() {
+    // #1148 review r1 finding 2. The LOCF carry (`last_pk`) advances through the LAST record
+    // of a co-timed group (`last_at`), not the first (`at`). Past the subject's final record
+    // nothing ahead governs a segment, so the carry is what the walk integrates under — and a
+    // decision there reads that state.
+    //
+    // `ODE_TV_COV` (k = 0.1·CRCL/100). The final instant, t=24, holds a base dose row
+    // (50 units, CRCL 30) and an observation (CRCL 60) at the same time. Processing order is
+    // Dose then Obs, so the obs is left in force: (24, 30] runs at k = 0.06, as `predict()`'s
+    // dense walk does. Taking the first record (the dose row) would run it at k = 0.03.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![12.0, 24.0],
+        vec![DoseEvent::new(24.0, 50.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(60.0)];
+    s.dose_covariates = vec![crcl_1148(30.0)];
+    let (res, seen) = run_capture_1148(&model, s.clone(), &[0.0, 30.0]);
+
+    // (0, 12] under obs@12 (k 0.09); (12, 24] under the dose row that terminates it
+    // (k 0.03); +50 at 24; (24, 30] under the carry.
+    let a24 = 100.0 * (-0.09f64 * 12.0).exp() * (-0.03f64 * 12.0).exp() + 50.0;
+    let want = a24 * (-0.06f64 * 6.0).exp();
+    let first_record = a24 * (-0.03f64 * 6.0).exp();
+    let state30 = seen
+        .iter()
+        .find(|x| (x.0 - 30.0).abs() < 1e-9)
+        .expect("a decision at 30")
+        .2;
+    assert!(
+        (state30 - want).abs() <= band_1148(want),
+        "ctx.state@30 = {state30}: past the final instant the carry must be the obs@24 \
+         (CRCL 60 → {want:.6}); the co-timed dose row (CRCL 30) gives {first_record:.6}"
+    );
+    assert_eq!(crcl_seen_at_1148(&seen, 30.0), 60.0, "ctx CRCL at t=30");
+
+    // The trajectory still agrees with `predict()` on the realized doses (base dose kept).
+    let mut st = s;
+    st.doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, 1, 0.0, false, 0.0)),
+    );
+    st.doses.sort_by(|a, b| a.time.total_cmp(&b.time));
+    st.dose_occasions = vec![1; st.doses.len()];
+    st.dose_covariates = st
+        .doses
+        .iter()
+        .map(|d| crcl_1148(if d.time == 24.0 { 30.0 } else { 90.0 }))
+        .collect();
+    let mut pop = population(vec![st]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
+    for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - p.pred).abs() <= 1e-9 * p.pred.abs(),
+            "IPRED {} != predict() {} at t={}",
+            traj.ipred,
+            p.pred,
+            traj.time
+        );
     }
 }

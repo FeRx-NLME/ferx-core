@@ -4457,6 +4457,14 @@ impl AdaptiveRecordIndex {
         i.checked_sub(1).and_then(|i| self.last_at(self.times[i]))
     }
 
+    /// The PK the LOCF carry (`last_pk`) takes after the walk integrates into `t_end`: the
+    /// snapshot of the LAST record at `t_end` in processing order, or `None` when `t_end`
+    /// is not a record and the carry stays put. Shared by the driver and its frozen replay,
+    /// so the two cannot advance the carry differently.
+    fn carried_pk_at(&self, t_end: f64, event_pk: &crate::pk::EventPkParams) -> Option<PkParams> {
+        self.last_at(t_end).map(|rec| rec.pk(event_pk))
+    }
+
     /// Time of the record that GOVERNS the segment ending at `t_end` (#1073): `t_end`
     /// itself when a record sits there, otherwise the **next record ahead** — a boundary
     /// that is not a data record (a lagged dose arrival, an infusion end, a zero-order
@@ -4469,6 +4477,14 @@ impl AdaptiveRecordIndex {
     /// Observation, EVID=2 and decision times are bit-identical to their break times —
     /// the `#700` survival guard fails loudly otherwise — so the search needs no
     /// tolerance.
+    ///
+    /// **Reset** times are the exception: the walk matches a reset to its break within
+    /// `EVENT_MATCH_TOL`, because the 1e-15 dedup can merge a reset into a neighbouring
+    /// break with different bits. Then the segment ending at that break may resolve past
+    /// the reset rather than to it. That is harmless: the reset is applied at the start of
+    /// the break it was merged into, so it overwrites that segment's state before any
+    /// decision or observation reads it, and a decision earlier in the interval still finds
+    /// the reset's exact time here as the next record ahead.
     ///
     /// Base **dose** rows are deliberately not added to that guard, because their
     /// commonest collision is legitimate: a dose row co-timed with an observation. The
@@ -5791,8 +5807,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // `last_params`. An EVID=3/4 reset is a record (#1133, #1148); of a co-timed
             // group the LAST in processing order is the one left in force (`last_at`).
             if tv {
-                if let (Some(rec), Some(ev)) = (records.last_at(t_end), event_pk) {
-                    last_pk = rec.pk(ev);
+                if let Some(pk) = event_pk.and_then(|ev| records.carried_pk_at(t_end, ev)) {
+                    last_pk = pk;
                     last_occ = seg_occ;
                 }
             }
@@ -6305,9 +6321,11 @@ fn adaptive_frozen_replay_tv(
             // driver uses, and for the identical reason: since #1073 `seg_pk` looks
             // FORWARD at a non-record break, so carrying it would move `last_pk` onto a
             // record this walk has not reached. The two must agree here or the replay
-            // stops being bit-aligned with the run it is verifying.
-            if let Some(rec) = records.last_at(t_end) {
-                last_pk = rec.pk(event_pk);
+            // stops being bit-aligned with the run it is verifying — which is why both call
+            // the one `carried_pk_at` (#1148 review): past the final record no prediction
+            // reads this carry, so a replay-only copy could drift with no test able to see it.
+            if let Some(pk) = records.carried_pk_at(t_end, event_pk) {
+                last_pk = pk;
                 last_occ = seg_occ;
             }
         }
