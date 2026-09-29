@@ -45,6 +45,14 @@ use crate::sens::num::PkNum;
 use crate::sens::propagate::{propagate_two_cpt_core_g, PkDual, TwoCptEigen};
 use crate::types::{CompiledModel, PkModel, PkParams, Subject};
 
+#[cfg(test)]
+thread_local! {
+    /// Runs of [`closed_form_sens_walk_g`]'s transit/IG branch. The twin's ODE provider and
+    /// the walk both return `Some`, so a route test reads this to know which one served.
+    pub(crate) static ABSORPTION_SENS_WALK_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// One dose as the walk sees it: every attribute is the dose record's own (#1569).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AbsDose<T: PkNum> {
@@ -396,6 +404,81 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     Some(preds)
 }
 
+/// The closed-form event walk for the analytic-sensitivity providers
+/// (`crate::sens::provider`'s IOV and TV-covariate walks, outer `Dual2` and inner `Dual1`):
+/// the absorption walk for a transit/IG model, the ordinary event-driven walk
+/// ([`crate::sens::propagate::event_driven_sens_with_doses_g`]) for every other one. One
+/// dispatch for all four callers, so none of them can reach a transit/IG model with the
+/// ordinary walk, which does not implement it.
+///
+/// For transit/IG, `slot_dual(k, slot)` supplies dose `k`'s kernel parameters as duals at
+/// **its own record** — the fixed-at-dose rule (#1569), which puts `∂/∂κ` of an absorbing
+/// dose on its dose occasion's κ. `F` is `pk_at_dose[k].f` and the lag the per-dose
+/// `dose_lag_dual` (or the schedule's constant lag when the model has none in scope).
+/// `None` when [`walk_domain`] sends the subject to the twin: the router decides that on the
+/// same values before calling, so it means a routing disagreement, and the caller's `None`
+/// sends the subject to finite differences rather than to a wrong jet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn closed_form_sens_walk_g<T: PkNum>(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    eff_doses: &[crate::types::DoseEvent],
+    dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>],
+    pk_at_pk_only: &[PkDual<T>],
+    slot_dual: &dyn Fn(usize, usize) -> T,
+) -> Option<Vec<T>> {
+    use crate::types::{PK_IDX_CV2, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N};
+    let Some((kernel, _)) = kernel_of(pk_model) else {
+        return Some(crate::sens::propagate::event_driven_sens_with_doses_g(
+            pk_model,
+            subject,
+            schedule,
+            eff_doses,
+            dose_lag_dual,
+            dose_inf_dual,
+            pk_at_dose,
+            pk_at_obs,
+            pk_at_pk_only,
+        ));
+    };
+    #[cfg(test)]
+    ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(c.get() + 1));
+    let (slot_a, slot_b) = match kernel {
+        Kernel::Transit => (PK_IDX_N, PK_IDX_MTT),
+        Kernel::Ig => (PK_IDX_MAT, PK_IDX_CV2),
+    };
+    let doses: Vec<AbsDose<T>> = eff_doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            let lag = dose_lag_dual
+                .get(k)
+                .copied()
+                .unwrap_or_else(|| T::from_f64(schedule.dose_lagtimes[k]));
+            AbsDose {
+                arrival: T::from_f64(d.time) + lag,
+                mass: pk_at_dose[k].f * T::from_f64(d.amt),
+                a: slot_dual(k, slot_a),
+                b: slot_dual(k, slot_b),
+            }
+        })
+        .collect();
+    absorption_walk_g(
+        pk_model,
+        schedule,
+        &doses,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+        subject.obs_times.len(),
+        None,
+    )
+}
+
 /// Whether the walk may serve this subject at all — the structural half of the routing,
 /// before any parameter is known. A closed-form transit/IG model whose subject the static
 /// superposition cannot serve **only** because of IOV or time-varying covariates, and which
@@ -404,9 +487,14 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
 /// Everything else keeps its existing engine: a `TIME` read, a periodic SS dose, an infusion
 /// or a reset still routes to the twin through [`CompiledModel::effective_for`] (#719), and a
 /// static subject stays on the static superposition. `effective_for` itself is deliberately
-/// unchanged — it has consumers (state/`[derived]` outputs, covariance diagnostics, the
-/// inner-optimizer schedule gates) that know nothing of this walk, and for them the twin
-/// remains the right, if slower, answer.
+/// unchanged — it is the parameter-free reroute, and consumers that cannot know the
+/// parameters (the inner-optimizer stall gate) keep reading it.
+///
+/// The last clause keeps the twin wherever the walk's **gradient** would not be analytic
+/// ([`crate::sens::provider::absorption_walk_sens_in_scope`]): the twin's ODE provider serves
+/// a wider scope (96 stacked IOV axes against the dual walk's 24), and the walk must not
+/// trade a subject's analytic gradient for finite differences. Prediction and gradient read
+/// this one predicate, so they stay on the same engine.
 pub(crate) fn walk_eligible(model: &CompiledModel, subject: &Subject) -> bool {
     is_absorption_closed_form(model.pk_model)
         && model.ode_spec.is_none()
@@ -417,6 +505,7 @@ pub(crate) fn walk_eligible(model: &CompiledModel, subject: &Subject) -> bool {
         && !subject.has_periodic_ss_dose()
         && !subject.doses.iter().any(|d| d.is_infusion())
         && !subject.has_resets()
+        && crate::sens::provider::absorption_walk_sens_in_scope(model, subject)
 }
 
 /// The disposition slots of a `PkParams` as the walk's `f64` [`PkDual`].
@@ -465,6 +554,56 @@ pub(crate) fn walk_schedule(
     EventSchedule::for_subject(subject, pk_model, &subject.doses, &lags)
 }
 
+/// The walk's `f64` inputs, built once from per-event `PkParams`.
+struct F64Inputs {
+    schedule: EventSchedule,
+    doses: Vec<AbsDose<f64>>,
+    dose_disp: Vec<PkDual<f64>>,
+    obs_disp: Vec<PkDual<f64>>,
+    only_disp: Vec<PkDual<f64>>,
+}
+
+fn f64_inputs(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> F64Inputs {
+    F64Inputs {
+        schedule: walk_schedule(subject, pk_model, pk_at_dose),
+        doses: pk_at_dose
+            .iter()
+            .enumerate()
+            .map(|(k, p)| dose_f64(pk_model, subject, k, p))
+            .collect(),
+        dose_disp: pk_at_dose.iter().map(disp_f64).collect(),
+        obs_disp: pk_at_obs.iter().map(disp_f64).collect(),
+        only_disp: pk_at_pk_only.iter().map(disp_f64).collect(),
+    }
+}
+
+/// The router's question, from the same per-event parameters the value path uses: does
+/// the walk serve this subject (in domain, or non-physical — both answered by the walk) or
+/// must the twin? The [`walk_domain`] verdict, nothing else.
+pub(crate) fn walk_serves(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> bool {
+    let x = f64_inputs(pk_model, subject, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    walk_domain(
+        pk_model,
+        &x.schedule,
+        &x.doses,
+        &x.dose_disp,
+        &x.obs_disp,
+        &x.only_disp,
+    ) != WalkDomain::Twin
+}
+
 /// The value path: predictions (and optionally states) for an eligible subject from its
 /// per-event `f64` parameters, or `None` for the twin.
 pub(crate) fn absorption_walk_predictions(
@@ -475,22 +614,14 @@ pub(crate) fn absorption_walk_predictions(
     pk_at_pk_only: &[PkParams],
     states: Option<&mut Vec<Vec<f64>>>,
 ) -> Option<Vec<f64>> {
-    let schedule = walk_schedule(subject, pk_model, pk_at_dose);
-    let doses: Vec<AbsDose<f64>> = pk_at_dose
-        .iter()
-        .enumerate()
-        .map(|(k, p)| dose_f64(pk_model, subject, k, p))
-        .collect();
-    let dose_disp: Vec<PkDual<f64>> = pk_at_dose.iter().map(disp_f64).collect();
-    let obs_disp: Vec<PkDual<f64>> = pk_at_obs.iter().map(disp_f64).collect();
-    let only_disp: Vec<PkDual<f64>> = pk_at_pk_only.iter().map(disp_f64).collect();
+    let x = f64_inputs(pk_model, subject, pk_at_dose, pk_at_obs, pk_at_pk_only);
     absorption_walk_g(
         pk_model,
-        &schedule,
-        &doses,
-        &dose_disp,
-        &obs_disp,
-        &only_disp,
+        &x.schedule,
+        &x.doses,
+        &x.dose_disp,
+        &x.obs_disp,
+        &x.only_disp,
         subject.obs_times.len(),
         states,
     )

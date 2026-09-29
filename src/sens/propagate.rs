@@ -989,20 +989,17 @@ fn apply_step_g<T: PkNum>(
     let (rate_central, rate_periph1, rate_periph2, rate_depot) = rates;
     {
         match pk_model {
-            // See event_driven::propagate — transit / IG cannot be state-propagated; the
-            // Dual2 superposition path serves their sensitivities instead (#386/#790).
-            PkModel::OneCptTransit => unreachable!(
-                "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            // See `event_driven::propagate_with_bounds` — transit / IG cannot be
+            // state-propagated: the Dual2 superposition serves a static subject, and
+            // `pk::absorption_walk::closed_form_sens_walk_g` an IOV / TV one (#1560), which
+            // every provider calls instead of this walk for these models.
+            PkModel::OneCptTransit
+            | PkModel::TwoCptTransit
+            | PkModel::OneCptIg
+            | PkModel::TwoCptIg => unreachable!(
+                "{pk_model:?} is served by its closed form or the absorption walk — never by \
+                 this event-driven walk"
             ),
-            PkModel::TwoCptTransit => unreachable!(
-                "two_cpt_transit uses closed-form superposition, not the event-driven walk"
-            ),
-            PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig uses closed-form superposition, not the event-driven walk")
-            }
-            PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig uses closed-form superposition, not the event-driven walk")
-            }
             PkModel::OneCptIv => propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central),
             PkModel::OneCptOral => {
                 propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka, rate_central, rate_depot)

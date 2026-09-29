@@ -1255,23 +1255,18 @@ fn propagate_with_bounds(
             propagate_two_cpt_oral_core_g,
         };
         match pk_model {
-            // Transit's continuous-n convolution memory is not a finite state vector,
-            // so it never uses the event-driven walk — it is restricted to closed-form
-            // superposition (SS/IOV/TV/modeled-infusion are rejected at parse, #386).
-            PkModel::OneCptTransit => unreachable!(
-                "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            // Transit's and IG's convolution memory is not a finite state vector, so they
+            // never use this walk: a static subject takes the closed-form superposition, an
+            // IOV / time-varying-covariate subject the absorption walk
+            // (`pk::absorption_walk`, #1560), and a `TIME` / SS / infusion / flip-flop subject
+            // the ODE twin (#719).
+            PkModel::OneCptTransit
+            | PkModel::TwoCptTransit
+            | PkModel::OneCptIg
+            | PkModel::TwoCptIg => unreachable!(
+                "{pk_model:?} is served by its closed form, the absorption walk or its ODE \
+                 twin — never by this event-driven walk"
             ),
-            PkModel::TwoCptTransit => unreachable!(
-                "two_cpt_transit uses closed-form superposition, not the event-driven walk"
-            ),
-            // IG's inverse-Gaussian convolution memory is likewise not a finite state
-            // vector, so it never uses the event-driven walk (#790).
-            PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig uses closed-form superposition, not the event-driven walk")
-            }
-            PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig uses closed-form superposition, not the event-driven walk")
-            }
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
             }

@@ -257,9 +257,10 @@ impl OdeToleranceFacts {
     /// subject reaches an integrator at all.
     ///
     /// Not `model.ode_spec.is_some()`. A closed-form transit / inverse-Gaussian model carries
-    /// an ODE twin, and [`CompiledModel::effective_for`] reroutes a subject onto it for IOV,
-    /// time-varying covariates, a `TIME`-dependent structural parameter, a steady-state record
-    /// or an infusion — with IOV, *every* subject. Keying on `ode_spec` alone suppressed the
+    /// an ODE twin, and [`CompiledModel::effective_for`] reroutes a subject onto it for a
+    /// `TIME`-dependent structural parameter, a steady-state record or an infusion. (IOV and
+    /// time-varying covariates alone no longer reach it: the exact absorption walk serves
+    /// those subjects since #1560, and they integrate only in the flip-flop regime below.) Keying on `ode_spec` alone suppressed the
     /// tolerance guidance on exactly those fits, whose FD covariance stencil reads the twin's
     /// integration noise like any other (#1508 review §4). `sync_ode_solver_opts` stamps the
     /// fit's tolerances onto the twin too, so the numbers reported are the ones in force.
@@ -287,6 +288,7 @@ impl OdeToleranceFacts {
         population
             .subjects
             .iter()
+            .filter(|s| !crate::pk::absorption_walk::walk_eligible(model, s))
             .find_map(|s| model.effective_for(s).ode_spec.as_ref())
             .map(|spec| opts(spec, true))
     }

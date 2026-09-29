@@ -1663,15 +1663,23 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     if model.frem_config.is_some() {
         return false;
     }
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptIv
-            | PkModel::OneCptOral
-            | PkModel::TwoCptIv
-            | PkModel::TwoCptOral
-            | PkModel::ThreeCptIv
-            | PkModel::ThreeCptOral
-    ) {
+    // The four closed-form absorption models ride the same stacked-κ walk through
+    // `absorption_walk::closed_form_sens_walk_g` (#1560) — but only with an ODE twin, which
+    // is what serves a subject whose (interval, open dose) pairs leave the tilting domain.
+    // A twin-less transit/IG model with IOV is rejected at validation anyway.
+    let absorption = crate::pk::absorption_walk::is_absorption_closed_form(model.pk_model)
+        && model.absorption_ode_equivalent.is_some();
+    if !absorption
+        && !matches!(
+            model.pk_model,
+            PkModel::OneCptIv
+                | PkModel::OneCptOral
+                | PkModel::TwoCptIv
+                | PkModel::TwoCptOral
+                | PkModel::ThreeCptIv
+                | PkModel::ThreeCptOral
+        )
+    {
         return false;
     }
     // Output scaling: `None` (raw jet), a constant `ScalarScale` divisor, or a differentiable
@@ -1773,6 +1781,25 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     }
 }
 
+/// Whether the analytic providers can differentiate `subject` on the transit/IG absorption
+/// walk (#1560) — the scope half of [`crate::pk::absorption_walk::walk_eligible`]. The walk
+/// takes over a subject from the ODE twin only where its gradient is analytic, so no subject
+/// trades the twin's analytic ODE sensitivities for finite differences:
+///
+/// * IOV: the closed-form IOV scope, and a stacked width `n_eta + K·n_kappa` below the dual
+///   walk's cap (`MAX_TVCOV_AXES = 24`; the outer seeds at least one θ column beside it). The
+///   twin's ODE IOV provider reaches 96, so a many-occasion subject past 24 stays there;
+/// * time-varying covariates: the closed-form TV-walk scope ([`tvcov_analytical_supported`]).
+pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
+    if model.n_kappa > 0 {
+        let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+        iov_analytical_supported_core(model, true)
+            && model.n_eta + k * model.n_kappa < MAX_TVCOV_AXES
+    } else {
+        tvcov_analytical_supported(model)
+    }
+}
+
 /// True when the exact analytic IOV outer gradient applies to this model: either the
 /// closed-form analytical IOV provider ([`iov_analytical_supported`]) or the ODE IOV
 /// provider ([`crate::sens::ode_provider::ode_iov_supported`]). Gates the IOV branch
@@ -1803,9 +1830,13 @@ pub(crate) fn iov_sens_eta_supported(model: &CompiledModel) -> bool {
 /// program's θ axes to seed `∂p/∂θ`) or the η-only one (`false`); every other clause applies
 /// to both.
 fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
-    // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
-    // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
-    // is the twin's ODE-IOV scope. (The twin is built at parse time, #1008.)
+    // A closed-form transit/IG IOV model has two routes per subject (#1560): the absorption
+    // walk, and its ODE twin (`crate::pk::effective_model_for_eval_iov`). The walk takes a
+    // subject only when its gradient is analytic (`absorption_walk_sens_in_scope` is part of
+    // `walk_eligible`), so every subject is analytic exactly when the twin's ODE-IOV scope
+    // covers the rest — the flip-flop and out-of-scope subjects it still serves. That is this
+    // predicate, unchanged since #719, and the honest report (#637). (The twin is built at
+    // parse time, #1008.)
     if model.n_kappa > 0 {
         if let Some(eq) = &model.absorption_ode_equivalent {
             return ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(eq.built());
@@ -1830,9 +1861,9 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    // Closed-form transit/IG IOV → its ODE twin (issue #719); no-op otherwise. See
-    // `subject_sensitivities_iov`.
-    let model = model.effective_for(subject);
+    // Closed-form transit/IG IOV → the absorption walk or its ODE twin (#1560, #719); a
+    // no-op otherwise. See `subject_sensitivities_iov`.
+    let model = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
     // Compartment-free (#811) first: `ode_spec` is `None` and `pk_model` is a
     // placeholder, so the closed-form branch below would misread it.
     if model.is_algebraic() {
@@ -1896,11 +1927,11 @@ pub fn subject_sensitivities_iov(
     if !model.ode_spec.is_some() && ss_lagtime_walk_unsupported(model, subject) {
         return None;
     }
-    // Closed-form transit/IG IOV is served by its ODE twin (issue #719) — the twin carries
-    // cross-occasion dose amounts exactly (#104/#663), which the closed-form superposition
-    // cannot. A no-op for every other model, so the `ode_spec` branch below then picks up the
-    // twin's analytic ODE-IOV sensitivities.
-    let model = model.effective_for(subject);
+    // Closed-form transit/IG IOV: the absorption walk when it serves this subject at these
+    // parameters, else the ODE twin (#1560, #719) — `predict_iov`'s own decision, so the
+    // gradient differentiates the function that was predicted. A no-op for every other
+    // model; a twin subject then takes the `ode_spec` branch below.
+    let model = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
     // ODE IOV: route RHS-program models to the ODE provider, which runs the same
     // stacked-`(θ, η_bsv, κ)` layout over the event-driven RK45 walk (the TV-cov
     // walk fed per-occasion params). Returns the identical `SubjectSens` shape, so
@@ -2404,7 +2435,7 @@ fn run_obs_iov<const M: usize>(
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
     into: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
-    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+    use crate::sens::propagate::PkDual;
 
     // Chunk width: the stacked block sits right after this chunk's θ columns.
     let nc = theta_cols.len();
@@ -2515,7 +2546,7 @@ fn run_obs_iov<const M: usize>(
     };
     let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, &slot_dual);
     let dose_lag_dual = dose_lag_duals::<Dual2<M>>(model, subject, &slot_dual);
-    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
+    let conc = crate::pk::absorption_walk::closed_form_sens_walk_g::<Dual2<M>>(
         model.pk_model,
         subject,
         schedule,
@@ -2525,7 +2556,8 @@ fn run_obs_iov<const M: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
-    );
+        &slot_dual,
+    )?;
 
     // Analytic Form C readout (#655): scratch for the per-observation dual eval.
     let mut ro_state: Vec<Dual2<M>> = Vec::new();
@@ -2796,7 +2828,7 @@ fn run_obs_iov_eta<const N: usize>(
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+    use crate::sens::propagate::PkDual;
 
     // First-order stacked-η seed (no θ axes): η_bsv column `c` → axis `c`; κ column
     // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
@@ -2886,7 +2918,7 @@ fn run_obs_iov_eta<const N: usize>(
     let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, &slot_dual);
     let dose_lag_dual = dose_lag_duals::<Dual1<N>>(model, subject, &slot_dual);
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
-    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
+    let conc = crate::pk::absorption_walk::closed_form_sens_walk_g::<Dual1<N>>(
         model.pk_model,
         subject,
         &schedule,
@@ -2896,7 +2928,8 @@ fn run_obs_iov_eta<const N: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
-    );
+        &slot_dual,
+    )?;
 
     // Analytic Form C readout (#655): scratch for the per-observation dual eval.
     let mut ro_state: Vec<Dual1<N>> = Vec::new();
@@ -4035,7 +4068,7 @@ fn run_obs_tvcov<const M: usize>(
     into: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+    use crate::sens::propagate::PkDual;
 
     debug_assert_eq!(M, theta_cols.len() + n_eta);
 
@@ -4121,7 +4154,7 @@ fn run_obs_tvcov<const M: usize>(
     };
     let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, &slot_dual);
     let dose_lag_dual = dose_lag_duals::<Dual2<M>>(model, subject, &slot_dual);
-    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
+    let conc = crate::pk::absorption_walk::closed_form_sens_walk_g::<Dual2<M>>(
         model.pk_model,
         subject,
         &schedule,
@@ -4131,7 +4164,8 @@ fn run_obs_tvcov<const M: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
-    );
+        &slot_dual,
+    )?;
 
     // Readout params past the eight structural slots (#486). The walk's `PkDual` carries only
     // CL/V/Q/V2/KA/F/Q3/V3, so a readout referencing a 9th+ individual parameter (a 3-cpt-oral
@@ -4384,7 +4418,7 @@ fn run_obs_grad_tvcov<const N: usize>(
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+    use crate::sens::propagate::PkDual;
 
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` clamps below are
     // no-ops — flat `0..n_eta` loops (#449 re-review #5, mirroring #15).
@@ -4534,7 +4568,7 @@ fn run_obs_grad_tvcov<const N: usize>(
             &owned_schedule
         }
     };
-    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
+    let conc = crate::pk::absorption_walk::closed_form_sens_walk_g::<Dual1<N>>(
         model.pk_model,
         subject,
         schedule,
@@ -4544,7 +4578,8 @@ fn run_obs_grad_tvcov<const N: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
-    );
+        &slot_dual,
+    )?;
 
     // Analytic Form C readout (#650): per-observation dual eval scratch (Dual1).
     // Readout params past the eight structural slots — the inner (`Dual1`, η-only) mirror of
@@ -5286,8 +5321,9 @@ fn kink_anchor_times(subject: &Subject) -> Vec<f64> {
 }
 
 /// The model whose provider serves `(theta, b)` for this subject: the model itself for an
-/// `[odes]` model, the subject's IOV twin under `iov`, else the parameter-selected closed-form
-/// / ODE-twin dispatch. One function so the route-switch guard, the tolerance lookup and the
+/// `[odes]` model, else the parameter-selected closed-form / ODE-twin dispatch — the IOV one
+/// ([`crate::pk::effective_model_for_eval_iov`], #1560) under `iov`, the non-IOV one
+/// otherwise. One function so the route-switch guard, the tolerance lookup and the
 /// kink bound in [`covariance_sensitivities`] all read the same answer.
 fn effective_provider_model<'a>(
     model: &'a CompiledModel,
@@ -5299,7 +5335,7 @@ fn effective_provider_model<'a>(
     if model.ode_spec.is_some() {
         model
     } else if iov {
-        model.effective_for(subject)
+        crate::pk::effective_model_for_eval_iov(model, subject, theta, b)
     } else {
         crate::pk::effective_model_for_eval(model, subject, theta, b)
     }
@@ -6802,6 +6838,15 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
     // (`run_obs`), whose t=0 snapshot reproduces production's transit prediction exactly —
     // so a transit subject with time-varying covariates / a `TIME` switch stays analytic
     // (matching production), rather than silently zeroing or dropping to FD.
+    //
+    // Since #1560 a transit/IG subject whose closed form cannot serve it only because of
+    // time-varying covariates or IOV *does* take the walk — its own absorption walk, which
+    // `absorption_walk::closed_form_sens_walk_g` dispatches to. The same structural test
+    // the value path applies; a subject whose pairs leave the tilting domain never gets
+    // here, since `effective_model_for_eval` has already sent it to the twin.
+    if crate::pk::absorption_walk::walk_eligible(model, subject) {
+        return crate::pk::subject_feeds_analytical_pk(model, subject);
+    }
     if !crate::pk::event_driven::supports_event_driven(model.pk_model) {
         return false;
     }

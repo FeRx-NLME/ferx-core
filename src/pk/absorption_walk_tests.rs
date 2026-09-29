@@ -608,3 +608,345 @@ fn walk_domain_is_decided_per_interval_and_open_dose_pair() {
     )
     .is_none());
 }
+
+// ── Routing (T6) ──────────────────────────────────────────────────────────────────────
+
+/// 1-cpt transit, IOV on `CL` only (`KTR = 3/4 = 0.75`, `ke = 0.12·e^κ`). WT on `CL` too, so
+/// the non-IOV route can be pushed across the same boundary by the covariate.
+const TRANSIT_IOV_CL: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(25.0, 1.0, 500.0)
+  theta TVN(2.0, 0.0, 30.0)
+  theta TVMTT(4.0, 0.05, 24.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^3 * exp(KAPPA_CL)
+  V   = TVV * exp(ETA_V)
+  NTR = TVN
+  MTT = TVMTT
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// T6 (#1560): the route is decided per subject **at its parameters**, on both sides of the
+/// flip-flop gate, and every consumer takes the same one.
+///
+/// Occasion 2 opens at `t = 5` while dose 1 (`KTR = 0.75`) is still absorbing. `κ_CL(occ 2)`
+/// sets that occasion's `ke`: at `ln(0.9/0.12)` it is `0.9 ≥ KTR` → the **twin**; at
+/// `ln(0.5/0.12)` it is `0.5 < KTR` → the **walk**. Occasion 1's `ke` is `0.12` in both, so a
+/// router that looked only at `t = 0` / η (the pre-#1560 `absorption_flip_flop_at`) or ignored
+/// κ would call both "walk". For each side, three consumers must agree: the router
+/// (`effective_model_for_eval_iov`), the value path (`predict_iov`, bit-identical to the
+/// chosen engine) and the outer sensitivities (walk counter). The non-IOV route is then pushed
+/// across the same boundary by a covariate instead: `WT` on `CL` to the third power.
+/// Finally the structural exclusions — SS, infusion — never reach the walk.
+#[test]
+fn route_is_decided_per_subject_at_its_parameters_on_both_sides_of_flip_flop() {
+    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
+    let tw = twin(&model);
+    let theta = model.default_params.theta.clone();
+    let subject = subject_from(
+        &[(0.0, 1, 70.0), (6.0, 2, 70.0)],
+        &[
+            (1.0, 1, 70.0),
+            (3.0, 1, 70.0),
+            (5.0, 2, 70.0),
+            (7.0, 2, 70.0),
+            (9.0, 2, 70.0),
+        ],
+    );
+    assert!(walk_eligible(&model, &subject));
+    for (ke2, want_walk) in [(0.9, false), (0.5, true)] {
+        let kappas = vec![vec![0.0], vec![(ke2 / 0.12_f64).ln()]];
+        let stacked = [ETA_V, kappas[0][0], kappas[1][0]];
+        let route = crate::pk::effective_model_for_eval_iov(&model, &subject, &theta, &stacked);
+        assert_eq!(
+            std::ptr::eq(route, &model),
+            want_walk,
+            "ke₂ = {ke2}: router says {}",
+            if std::ptr::eq(route, &model) {
+                "walk"
+            } else {
+                "twin"
+            }
+        );
+        let got = crate::pk::predict_iov(&model, &subject, &theta, &[ETA_V], &kappas);
+        let engine = if want_walk {
+            let (d, o, p) = iov_event_params(&model, &subject, &theta, &[ETA_V], &kappas);
+            absorption_walk_predictions(model.pk_model, &subject, &d, &o, &p, None)
+                .expect("in domain")
+        } else {
+            crate::pk::predict_iov(tw, &subject, &theta, &[ETA_V], &kappas)
+        };
+        for (a, b) in got.iter().zip(&engine) {
+            assert!(
+                a.is_finite() && a.to_bits() == b.to_bits(),
+                "ke₂ = {ke2}: {a} vs {b}"
+            );
+        }
+        use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
+        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
+        crate::sens::provider::subject_sensitivities_iov(&model, &subject, &theta, &stacked)
+            .expect("analytic on either route");
+        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs > 0,
+            want_walk,
+            "ke₂ = {ke2}: sens walk ran {runs} times"
+        );
+    }
+
+    // Non-IOV: the same boundary crossed by WT (CL ∝ WT³), κ = 0.
+    for (wt2, want_walk) in [(137.0, false), (112.0, true)] {
+        let mut tv = subject_from(
+            &[(0.0, 1, 70.0), (6.0, 2, wt2)],
+            &[
+                (1.0, 1, 70.0),
+                (3.0, 1, 70.0),
+                (5.0, 2, wt2),
+                (7.0, 2, wt2),
+                (9.0, 2, wt2),
+            ],
+        );
+        tv.occasions.clear();
+        tv.dose_occasions.clear();
+        let eta = [ETA_V, 0.0];
+        // ke = 0.12·(WT/70)³: 0.90 at 137 kg, 0.52 at 112 kg, against KTR = 0.75.
+        let route = crate::pk::effective_model_for_eval(&model, &tv, &theta, &eta);
+        assert_eq!(std::ptr::eq(route, &model), want_walk, "WT₂ = {wt2}");
+        let got = crate::pk::compute_predictions_with_tv(&model, &tv, &theta, &eta);
+        let want = if want_walk {
+            let mut ev = crate::pk::EventPkParams::default();
+            crate::pk::compute_event_pk_params_into(&model, &tv, &theta, &eta, &mut ev);
+            absorption_walk_predictions(model.pk_model, &tv, &ev.dose, &ev.obs, &ev.pk_only, None)
+                .expect("in domain")
+        } else {
+            crate::pk::compute_predictions_with_tv(tw, &tv, &theta, &eta)
+        };
+        for (a, b) in got.iter().zip(&want) {
+            assert!(a.is_finite() && a.to_bits() == b.to_bits(), "WT₂ = {wt2}");
+        }
+    }
+
+    // Structural exclusions: an SS dose or an infusion is never walk-eligible.
+    let mut ss = subject.clone();
+    ss.doses[1] = DoseEvent::new(6.0, 100.0, 1, 0.0, true, 12.0);
+    let mut inf = subject.clone();
+    inf.doses[1] = DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0);
+    for (name, s) in [("SS", &ss), ("infusion", &inf)] {
+        assert!(!walk_eligible(&model, s), "{name}");
+        assert!(
+            std::ptr::eq(
+                crate::pk::effective_model_for_eval_iov(&model, s, &theta, &[ETA_V, 0.0, 0.0]),
+                tw
+            ),
+            "{name}: the twin"
+        );
+    }
+}
+
+/// The walk takes a subject from the twin only where its gradient stays analytic
+/// (`absorption_walk_sens_in_scope`). The closed-form IOV dual walk seeds at most 24 stacked
+/// axes (`n_eta + K·n_kappa`, with a θ column beside them); the twin's ODE IOV provider seeds
+/// up to 96. On `n_eta = n_kappa = 1`, `K = 22` occasions (23 axes) is on the walk and `K = 23`
+/// (24 axes) stays on the twin — **analytic** there, not finite differences, which is what a
+/// many-occasion subject had before #1560 and must keep.
+#[test]
+fn a_subject_past_the_dual_walks_axis_cap_keeps_the_twin_and_its_analytic_gradient() {
+    // `Dual2<24>` carries a 24×24 Hessian per value; like production fits, run on the 32 MiB
+    // stack (`api::FIT_RAYON_STACK_SIZE`) rather than the 2 MiB test-thread default.
+    std::thread::Builder::new()
+        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
+        .spawn(axis_cap_body)
+        .expect("spawn wide-stack test thread")
+        .join()
+        .expect("axis-cap routing test panicked");
+}
+
+fn axis_cap_body() {
+    use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
+    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
+    let theta = model.default_params.theta.clone();
+    for (k, want_walk) in [(22usize, true), (23, false)] {
+        let obs: Vec<(f64, u32, f64)> = (0..k)
+            .map(|i| (1.0 + 2.0 * i as f64, i as u32 + 1, 70.0))
+            .collect();
+        let subject = subject_from(&[(0.0, 1, 70.0)], &obs);
+        assert_eq!(
+            crate::stats::likelihood::iov_occasion_groups(&subject).len(),
+            k
+        );
+        assert_eq!(walk_eligible(&model, &subject), want_walk, "K = {k}");
+        let stacked: Vec<f64> = std::iter::once(ETA_V)
+            .chain((0..k).map(|g| 0.01 * g as f64))
+            .collect();
+        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
+        let sens =
+            crate::sens::provider::subject_sensitivities_iov(&model, &subject, &theta, &stacked);
+        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
+        assert!(
+            sens.is_some(),
+            "K = {k}: the gradient stays analytic on either engine"
+        );
+        assert_eq!(runs > 0, want_walk, "K = {k}: walk ran {runs} times");
+    }
+}
+
+/// Whitespace-split rows of a NONMEM output file.
+fn nm_rows(path: &str) -> Vec<Vec<String>> {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .lines()
+        .map(|l| l.split_whitespace().map(str::to_string).collect())
+        .collect()
+}
+
+/// `THETA1..n` of the final-estimate row of `nonmem_anchor/results/<name>.ext`.
+fn nm_thetas(name: &str, n: usize) -> Vec<f64> {
+    let rows = nm_rows(&format!("nonmem_anchor/results/{name}.ext"));
+    let header = rows
+        .iter()
+        .find(|r| r[0] == "ITERATION")
+        .expect(".ext header");
+    let last = rows
+        .iter()
+        .find(|r| r[0] == "-1000000000")
+        .expect(".ext final row");
+    (1..=n)
+        .map(|k| {
+            let i = header
+                .iter()
+                .position(|h| *h == format!("THETA{k}"))
+                .expect("THETA");
+            last[i].parse().expect("a float")
+        })
+        .collect()
+}
+
+/// Per subject ID, `ETA(1..n)` of `nonmem_anchor/results/<name>.phi`.
+fn nm_etas(name: &str, n: usize) -> HashMap<String, Vec<f64>> {
+    let rows = nm_rows(&format!("nonmem_anchor/results/{name}.phi"));
+    let header = rows
+        .iter()
+        .find(|r| r.first().map(String::as_str) == Some("SUBJECT_NO"))
+        .expect(".phi header");
+    let at = |l: &str| header.iter().position(|h| h == l).expect(l);
+    let id_col = at("ID");
+    rows.iter()
+        .filter(|r| r.len() == header.len() && r[0] != "SUBJECT_NO")
+        .map(|r| {
+            let id: f64 = r[id_col].parse().expect("ID");
+            let eta = (1..=n)
+                .map(|k| r[at(&format!("ETA({k})"))].parse().expect("ETA"))
+                .collect();
+            (format!("{}", id as i64), eta)
+        })
+        .collect()
+}
+
+/// The route on the committed NONMEM anchor populations (#1560 plan, Step 4: measure the
+/// fraction the walk hands back to the twin): every subject of `transit_iov` (IOV on `CL`),
+/// `transit_iov_mtt` and `ig_iov_mat` (IOV on `CL` **and** the kernel, doses absorbing across
+/// the occasion boundary), each at NONMEM's final θ and POSTHOC η/κ — the point the IPRED
+/// anchors (`tests/absorption_iov_carryover_nonmem_anchor.rs`) evaluate — is served by the
+/// walk unless a pair leaves the tilting domain, and `predict_iov` on a walk subject equals
+/// the walk's own output bit for bit. Measured at 0507337a: `transit_iov` 24 / 24 and
+/// `transit_iov_mtt` 24 / 24 on the walk, `ig_iov_mat` **13 / 24** — the other 11 have an
+/// occasion whose `ke` reaches `1/(2·MAT·CV²)` of a dose still in the walk (its `CV² = 0.5`
+/// puts the IG abscissa near `ke`), and go to the twin. Pinned exactly, so a router that
+/// admits more subjects (or fewer) than the domain allows changes a count.
+#[test]
+fn nonmem_anchor_populations_route_to_the_walk_at_nonmem_ebes() {
+    // (name, pk line, kernel lines, κ names, ETA count, ETA → ([η], [κ per occasion]))
+    type Split = fn(&[f64]) -> (Vec<f64>, Vec<Vec<f64>>);
+    let expected = [24usize, 24, 13];
+    let cases: [(&str, &str, &str, &str, usize, Split); 3] = [
+        (
+            "transit_iov",
+            "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)",
+            "  CL = TVCL * exp(KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  MTT = TVA\n  NTR = TVB",
+            "  omega ETA_V ~ 0.1\n  kappa KAPPA_CL ~ 0.05",
+            4,
+            |e| (vec![e[0]], (0..3).map(|g| vec![e[1 + g]]).collect()),
+        ),
+        (
+            "transit_iov_mtt",
+            "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             MTT = TVA * exp(KAPPA_ABS)\n  NTR = TVB",
+            "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa KAPPA_CL ~ 0.05\n  \
+             kappa KAPPA_ABS ~ 0.05",
+            8,
+            |e| {
+                let k = (0..3).map(|g| vec![e[2 + g], e[5 + g]]).collect();
+                (e[..2].to_vec(), k)
+            },
+        ),
+        (
+            "ig_iov_mat",
+            "pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             MAT = TVA * exp(KAPPA_ABS)\n  CV2 = TVB",
+            "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa KAPPA_CL ~ 0.05\n  \
+             kappa KAPPA_ABS ~ 0.05",
+            8,
+            |e| {
+                let k = (0..3).map(|g| vec![e[2 + g], e[5 + g]]).collect();
+                (e[..2].to_vec(), k)
+            },
+        ),
+    ];
+    for ((name, pk, kernel, randoms, n_eta, split), want_walked) in cases.into_iter().zip(expected)
+    {
+        let th = nm_thetas(name, 4);
+        let src = format!(
+            "[parameters]\n  theta TVCL({}, FIX)\n  theta TVV({}, FIX)\n  theta TVA({}, FIX)\n  \
+             theta TVB({}, FIX)\n{randoms}\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n{kernel}\n[structural_model]\n  {pk}\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n",
+            th[0], th[1], th[2], th[3]
+        );
+        let model = parse_model_string(&src).expect("the anchor model parses");
+        let pop = crate::read_nonmem_csv(
+            std::path::Path::new(&format!("nonmem_anchor/{name}.csv")),
+            None,
+            Some("OCC"),
+        )
+        .expect("the anchor data loads");
+        let etas = nm_etas(name, n_eta);
+        let theta = model.default_params.theta.clone();
+        let mut walked = 0usize;
+        for s in &pop.subjects {
+            let (bsv, kappas) = split(&etas[&s.id]);
+            let stacked: Vec<f64> = bsv.iter().chain(kappas.iter().flatten()).copied().collect();
+            let route = crate::pk::effective_model_for_eval_iov(&model, s, &theta, &stacked);
+            if std::ptr::eq(route, &model) {
+                walked += 1;
+                let got = crate::pk::predict_iov(&model, s, &theta, &bsv, &kappas);
+                let (d, o, p) = iov_event_params(&model, s, &theta, &bsv, &kappas);
+                let want = absorption_walk_predictions(model.pk_model, s, &d, &o, &p, None)
+                    .expect("the router admitted it");
+                assert!(
+                    got.iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.is_finite() && a.to_bits() == b.to_bits()),
+                    "{name} subject {}: predict_iov is not the walk",
+                    s.id
+                );
+            }
+        }
+        println!(
+            "#1560 route on {name}: {walked} of {} subjects on the walk at NONMEM's EBEs",
+            pop.subjects.len()
+        );
+        assert_eq!(pop.subjects.len(), 24, "{name}: subject count");
+        assert_eq!(walked, want_walked, "{name}: subjects on the walk");
+    }
+}

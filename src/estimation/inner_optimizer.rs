@@ -224,7 +224,10 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
     // analytic primary's own `ode_spec` is `None` — the same reroute `is_ode_iov` and
     // `inner_stall_enabled` already track. `effective_for` returns `self` for a genuine ODE
-    // model and for every non-rerouted subject, so this is unchanged for them.
+    // model and for every non-rerouted subject, so this is unchanged for them. A subject the
+    // absorption walk serves (#1560) is never here: the walk takes only subjects whose
+    // gradient it can serve analytically (`walk_eligible`), so an FD subject of such a model
+    // is one the twin served — which is what `effective_for` names.
     let eff = model.effective_for(subject);
     if eff.ode_spec.is_some() {
         // Single scan for the periodic steady-state predicate, mirroring

@@ -885,6 +885,29 @@ fn the_tolerance_facts_are_read_from_the_route_the_subjects_take() {
     assert_eq!(facts.abstol, 1e-6);
     assert!(facts.looser_than_cov_plateau());
 
+    // A time-varying-covariate subject used to reroute to the twin too; since #1560 the exact
+    // absorption walk serves it, which integrates nothing. The same subject with an SS dose
+    // stays on the twin — the straddle, so the filter cannot be dropped or over-applied.
+    let tv = |ss: bool| {
+        let mut s = subject_with_dose(true);
+        s.doses[0] = DoseEvent::new(0.0, 100.0, 1, 0.0, ss, if ss { 12.0 } else { 0.0 });
+        s.dose_covariates = vec![[("WT".to_string(), 70.0)].into_iter().collect()];
+        assert!(s.has_tv_covariates());
+        s
+    };
+    assert!(crate::pk::absorption_walk::walk_eligible(
+        &transit,
+        &tv(false)
+    ));
+    assert!(
+        OdeToleranceFacts::from_route(&transit, &population_of(vec![tv(false)])).is_none(),
+        "a TV-covariate transit subject on the walk never integrates"
+    );
+    assert!(
+        OdeToleranceFacts::from_route(&transit, &population_of(vec![tv(true)])).is_some(),
+        "the same subject with an SS dose integrates on the twin"
+    );
+
     // And a model with its own `[odes]` block is never reported as a twin.
     let ode = crate::parser::model_parser::parse_model_string(&ode_model_src("")).unwrap();
     let facts = OdeToleranceFacts::from_route(&ode, &bolus_pop).expect("an [odes] model");
