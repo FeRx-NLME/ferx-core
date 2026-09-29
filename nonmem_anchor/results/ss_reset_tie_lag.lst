@@ -1,6 +1,6 @@
-Tue Sep 29 05:42:49 PM UTC 2026
+Tue Sep 29 07:19:00 PM UTC 2026
 $PROBLEM ferx #1588: bolus row co-timed with an SS=1 row, ALAG1=2
-$DATA tie.csv IGNORE=@
+$DATA ss_reset_tie.csv IGNORE=@
 $INPUT ID TIME DV EVID AMT CMT MDV II SS RATE
 $SUBROUTINES ADVAN2 TRANS2
 $PK
@@ -44,7 +44,7 @@ Days until program expires : 320
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
  CREATE/ADD TO FDATA.csv:        YES
- NO. OF DATA RECS IN DATA SET:       89
+ NO. OF DATA RECS IN DATA SET:      105
  NO. OF DATA ITEMS IN DATA SET:  10
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -56,8 +56,8 @@ Days until program expires : 320
 0FORMAT FOR DATA:
  (10E5.0)
 
- TOT. NO. OF OBS RECS:       66
- TOT. NO. OF INDIVIDUALS:       11
+ TOT. NO. OF OBS RECS:       78
+ TOT. NO. OF INDIVIDUALS:       13
 0LENGTH OF THETA:   3
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -160,7 +160,7 @@ Days until program expires : 320
  EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
        IN SHRINKAGE (ETASTYPE):             NO
  NON-INFL. ETA CORRECTION (NONINFETA):      0
- RAW OUTPUT FILE (FILE): tie.ext
+ RAW OUTPUT FILE (FILE): ss_reset_tie_lag.ext
  EXCLUDE TITLE (NOTITLE):                   NO
  EXCLUDE COLUMN LABELS (NOLABEL):           NO
  FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
@@ -216,7 +216,7 @@ Days until program expires : 320
 
 
 
- #OBJV:********************************************          6502.371       *********************************************
+ #OBJV:********************************************          7686.138       *********************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -276,6 +276,6 @@ Days until program expires : 320
 +        1.00E-01
  
  Elapsed finaloutput time in seconds:     0.00
- #CPUT: Total CPU Time in Seconds,        0.051
+ #CPUT: Total CPU Time in Seconds,        0.049
 Stop Time:
-Tue Sep 29 05:42:53 PM UTC 2026
+Tue Sep 29 07:19:04 PM UTC 2026

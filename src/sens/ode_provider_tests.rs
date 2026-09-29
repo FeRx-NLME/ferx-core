@@ -12067,7 +12067,7 @@ fn ode_provider_ss_record_wipes_a_preceding_or_pending_dose_matches_production()
             // (seeded at the record, not re-equilibrated), so nothing later overwrites an
             // ungated re-equilibration. With both lagged or both unlagged, the live dose's
             // own load erases it.
-            "ID 12, lag 2: SS=1 central 100, then SS=1 depot 200 (co-timed)",
+            "ID 13, lag 2: SS=1 central 100, then SS=1 depot 200 (co-timed)",
             &depot_model,
             vec![2.0, 20.0, 0.15, 2.0],
             vec![ss(10.0, 100.0, 2), ss(10.0, 200.0, 1)],

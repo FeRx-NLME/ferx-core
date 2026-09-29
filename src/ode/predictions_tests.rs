@@ -13978,7 +13978,7 @@ fn ss_tie_fixtures() -> Vec<(&'static str, Vec<DoseEvent>, Vec<DoseEvent>)> {
             // An unlagged `SS=1` row wiped by a co-timed lagged one: at lag 2 the live dose
             // is seeded at the record and not re-equilibrated at its arrival, so an ungated
             // re-equilibration of the wiped one is not overwritten by anything later.
-            "ID 12: SS=1 central 100, then SS=1 depot 200 (co-timed)",
+            "ID 13: SS=1 central 100, then SS=1 depot 200 (co-timed)",
             vec![
                 DoseEvent::new(10.0, 100.0, 2, 0.0, true, 12.0),
                 ss(10.0, 200.0),
@@ -14065,13 +14065,13 @@ fn ss_tie_engines(
 /// and at lag 2 every engine did, because the record-time seed sorts before every co-timed
 /// arrival. ID 9 at lag 2 is the fixture that reaches the arrival re-equilibration gate
 /// alone: the first `SS=1` dose's jump is already skipped by the bolus gate, but its arrival
-/// at 12 would re-load its own trough over the second record's seed. ID 12 at lag 2 is the
+/// at 12 would re-load its own trough over the second record's seed. ID 13 at lag 2 is the
 /// one that reaches the re-equilibration gate of the single-pass walks (the wiped `SS=1`
 /// dose unlagged, the live one seeded at the record, so nothing later overwrites it).
 ///
 /// Measured mutations (each alone): the static bolus gate, the static re-equilibration gate
 /// (ID 9), `ode_predictions_with_states`' and `apply_segment_boundary`'s bolus and
-/// re-equilibration gates (ID 12 for the latter), and the event-driven gate each redden the
+/// re-equilibration gates (ID 13 for the latter), and the event-driven gate each redden the
 /// line naming their engine; so does replacing the static walker's two passes by one
 /// list-order loop, at lag 2 only.
 ///

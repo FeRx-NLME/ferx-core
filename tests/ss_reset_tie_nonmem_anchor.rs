@@ -13,8 +13,8 @@
 //! The reference is NONMEM 7.6.0 (`nm3`, `anchor` build), `ADVAN2 TRANS2`, `MAXEVAL=0`,
 //! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `II = 12`, `AMT = 100`:
 //! `nonmem_anchor/ss_reset_tie.{csv,ctl}` (`ALAG1 = 0`) and `ss_reset_tie_lag.ctl`
-//! (`ALAG1 = 2`, depot doses only). On the wiped cells NONMEM equals the `SS=1`-alone
-//! closed form (an independent Python pulse-train sum) to 8.8e-16. IDs:
+//! (`ALAG1 = 2`, depot doses only). On the wiped cells NONMEM equals the surviving `SS=1`
+//! regimen's closed form (an independent Python pulse-train sum) to 8.8e-16. IDs:
 //!
 //! | ID | rows at t = 10 (row order) | NONMEM |
 //! |---|---|---|
@@ -29,15 +29,22 @@
 //! | 9 | `SS=1` 100 at 10; `SS=1` 200 at 11 | the second resets the first |
 //! | 10 | depot bolus at 9, `SS=1` at 10 | lag 2: the bolus (arrives 11) is cancelled |
 //! | 11 | `SS=1` 100, then `SS=1` 200, co-timed | the second wins |
+//! | 12 | depot bolus at 8, `SS=1` at 10 | lag 2: the bolus arrives **exactly at** the record, and is wiped |
+//! | 13 | `SS=1` 100 central (unlagged), then `SS=1` 200 depot, co-timed | the second wins |
 //!
+//! ID 12 pins the edge of "reached" (`SsResetGate` adds `EVENT_MATCH_TOL` to the break):
+//! an arrival that lands on the record's own time. ID 13 is the one shape where only the
+//! arrival re-equilibration gate decides the answer at lag 2: the wiped `SS=1` dose is
+//! unlagged, the live one is seeded at its record, so nothing later overwrites a wrong
+//! re-equilibration (PR #1601 review finding 1).
 //! **Skipped, by name: IDs 2, 5, 8 at lag 2 on the dense ODE walks** (static, with-states,
 //! adaptive) — #1275. Where `ss_arrival_is_trough`, those walks re-equilibrate at the
 //! lagged `SS=1` arrival (t = 12) and wipe a dose that landed between the record and the
 //! arrival (−51 … −54 %). The event-driven walks do not, and are asserted on them.
 //!
-//! **Analytic at lag 2 is asserted on the depot-only IDs** (3, 4, 6, 9, 10, 11): the
+//! **Analytic at lag 2 is asserted on the depot-only IDs** (3, 4, 6, 9, 10, 11, 12): the
 //! analytic `lagtime=` slot lags every dose record, so it cannot express NONMEM's
-//! depot-only `ALAG1` on a central bolus.
+//! depot-only `ALAG1` on a central dose.
 //!
 //! The event-driven variant of each engine is reached by prefixing every subject with an
 //! `EVID=3` row at t = 0, generated here from the committed csv (a reset before anything
@@ -61,8 +68,8 @@ const TABLE_LAG2: &str = "nonmem_anchor/results/ss_reset_tie_lag.sdtab";
 /// #1275: a dose between a lagged `SS=1` record and its arrival, wiped by the dense walks'
 /// arrival re-equilibration. Skipped on those walks at lag 2 only.
 const M2_1275: &[&str] = &["2", "5", "8"];
-/// IDs with a central (CMT 2) bolus, which the analytic single `lagtime` slot would lag.
-const CENTRAL_BOLUS: &[&str] = &["1", "2", "5", "7", "8"];
+/// IDs with a central (CMT 2) dose, which the analytic single `lagtime` slot would lag.
+const CENTRAL_DOSE: &[&str] = &["1", "2", "5", "7", "8", "13"];
 
 fn ode_depot(lag: f64) -> CompiledModel {
     let src = format!(
@@ -401,7 +408,7 @@ fn analytic_superposition_resets_a_co_timed_dose_by_row_order() {
         &got,
         TABLE_LAG2,
         ANALYTIC_BOUND,
-        CENTRAL_BOLUS,
+        CENTRAL_DOSE,
     );
 }
 
@@ -421,6 +428,6 @@ fn analytic_event_driven_walk_resets_a_co_timed_dose_by_row_order() {
         &got,
         TABLE_LAG2,
         ANALYTIC_BOUND,
-        CENTRAL_BOLUS,
+        CENTRAL_DOSE,
     );
 }

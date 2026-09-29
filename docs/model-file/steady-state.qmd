@@ -80,9 +80,9 @@ time-varying covariates or resets), an infusion into central that is
 still running at the record also stops there, and so does an infusion
 into an ODE absorption forcing. NONMEM does all of these.
 
-The row-order rule holds on every engine
+For boluses and `SS=1` loads, the row-order rule holds on every engine
 ([#1588](https://github.com/FeRx-NLME/ferx-core/issues/1588)), with or
-without a lagtime on the `SS=1` dose.
+without a lagtime on the `SS=1` dose. The exceptions are listed below.
 
 These cases are not yet covered:
 
