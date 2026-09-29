@@ -19,6 +19,25 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`simulate_adaptive()` now refuses a pre-dose window whose `[odes]` right-hand side
+  reads an unanchored `TAD` / `TAFD` through a comparison** — `if (TAD < 5)`,
+  `min(TAD, 24)` — instead of silently taking one branch. An ordering comparison against
+  the unanchored clock is false, so such a window kept a finite state and the run
+  returned numbers that depended on which way the comparison fell: `Ok` with
+  `verify: false`, and with the default `verify: true` only a frozen-schedule replay
+  mismatch that never named the clock. The refusal is now gated on whether the right-hand
+  side's derivative over the window changes when the clock is anchored at the window's
+  end — the earliest a first dose can land — instead of on the window's state going
+  non-finite, so these runs get the same typed error, naming the window, the spelling and
+  the two fixes, with a first sentence that says what was found. A clock that cannot
+  change the derivative still runs: in a branch the window never takes, in a condition on
+  an empty compartment, or in a comparison that only switches for a positive clock
+  (`if (TAD > 5)`, `max(TAD, 0)`), which no schedule can give a pre-dose window — those
+  runs already match `predict()`. A compartment that diverges on its own is still not
+  blamed on the clock (#1535).
+
 ## [0.4.0] - 2026-09-25
 
 **Upgrading from 0.3.1.** Most of this release is fixes, but a few changes can stop an

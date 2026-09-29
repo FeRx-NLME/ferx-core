@@ -2682,7 +2682,7 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
     doses.iter().map(|d| d.time).fold(f64::INFINITY, f64::min)
 }
 
-/// #1151: the reactive driver's refusal of a **dose-clock window with no referent**.
+/// #1151 / #1535: the reactive driver's refusal of a **dose-clock window with no referent**.
 ///
 /// `TAD` and `TAFD` are anchored at a dose. In a *causal* run the driver's shadow subject
 /// carries only the doses realized so far, so before the first one it is dose-free and both
@@ -2695,81 +2695,52 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// `NaN` there too, measured — so the anchoring claim is conditional on the record carrying
 /// one, and the message says so.)
 ///
-/// Returns `Some(message)` when the segment `(t_start, t_end]` must be refused. Measured at
-/// `a6b67de5`, this is not a readout defect but a state one: with `u = 0` and a `NaN` anchor
-/// the RHS evaluates `0.0 * NaN = NaN`, the integrator carries it, and **every later
-/// observation is `NaN` too — including reads after the first dose lands**. So the refusal is
-/// keyed on the segment being integrated, not on it carrying an observation: a dose-free
-/// window with no observation in it still poisons the run (`[NaN, NaN]` for obs at 20/40 with
-/// the first dose at 12, measured).
+/// Returns `Some(message)` when the segment `(t_start, t_end]` must be refused: **a dose-clock
+/// slot the `[odes]` RHS reads is unanchored (`NaN`) there, and the RHS's derivative over the
+/// segment depends on that slot's value** — measured by [`unanchored_clock_dependence`], which
+/// evaluates the RHS directly and re-solves nothing. Called after [`integrate_segment`], so
+/// `ext_params` holds the anchors the segment actually ran under and `u` its advanced state. A
+/// zero-length segment needs no special case: [`integrate_segment`] returns before touching
+/// either, so `u` is whatever the previous segment left.
 ///
-/// **Called *after* [`integrate_segment`], and gated on what actually happened.** Two earlier
-/// forms each shipped a "no false positive by construction" claim that measurement falsified,
-/// which is why the current one confirms rather than asserts:
+/// That asks the harm question directly — would the answer change if the clock had a value? —
+/// and it replaced three approximations of it, each falsified by a measurement:
 ///
-/// - **Before the solve, on `pk_reads_tad() && anchor.is_nan()`** (round 1 of the #1534
-///   review). `pk_reads_tad` is a *syntactic* walk (`stmts_read_slots`) that recurses into `if`
-///   arms and into conditions, so it is true whenever `TAD` appears anywhere in the `[odes]`
-///   body. It refused a `TAD` term in a branch the unanchored window does not take, and a
-///   `TAD` read that occurs only in a *condition* — both measured returning finite
-///   trajectories with the guard removed. Input present is not path ran (#1278).
-/// - **After the solve, on "state non-finite **and** anchor `NaN` **and** RHS reads the slot"**
-///   (round 2). `u.iter().all(is_finite)` looks at *every* compartment while the third
-///   conjunct is still a parse walk, so nothing tied them together: a second state blowing up
-///   on its own (`X' = 0.5·X²`) with `TAD` in an untaken branch of the first satisfied all
-///   three, and the run was refused. Worse, the advice it gave — add a base regimen —
-///   silences the message while the divergence stays.
+/// - **The parse walk alone** (#1534 review, round 1). `pk_reads_tad()` is a *syntactic* walk
+///   (`stmts_read_slots`) that recurses into `if` arms and into conditions, so it is true for a
+///   `TAD` in a branch the window never takes, and for one that only feeds a condition on an
+///   empty compartment — both finite and verifier-clean. It stays as a pre-filter: a slot the
+///   program never reads cannot move a derivative, so the walk cannot cause a false negative,
+///   and it keeps the probe off every model that reads no dose clock.
+/// - **The outcome** (#1534 review, rounds 2–3). Refusing only a segment that integrated to a
+///   non-finite state missed every `NaN` consumed by a *comparison*. `min`/`max` desugar to
+///   `if (a <= b) …`, and an ordering comparison against `NaN` is always false, so
+///   `min(TAD, 24)` silently yielded 24 and `if (TAD < 5)` silently took its else arm: the
+///   state stayed finite, and the run returned a number that depended on which way the
+///   comparison fell. The counterfactual re-solve that confirmed causation on the non-finite
+///   path also took its evidence from the frozen tail the solver pads a diverged segment with
+///   (#1539), so it would have gone silent once that tail is fixed.
+/// - **A "slot was loaded" flag** (#1535's proposal). A load refuses `if (TAD > 5) {…} else
+///   {…}` on an empty compartment, where both arms give the same zero derivative, and it puts a
+///   branch on every RHS evaluation in the process.
 ///
-/// So the refusal **confirms causation**. `resolve_with_finite_clock` re-integrates this same
-/// segment from `u_start` with the unanchored slot(s) set to a finite stand-in, and the
-/// message is returned only if that run repairs the state. Otherwise this returns `None` and
-/// the caller carries on. The extra solves cost one segment each, on a path that has already
-/// failed.
-///
-/// Two details of that comparison are load-bearing, both measured on #1534 round 3:
-///
-/// - **Component by component, not whole-state.** A segment can have *two* causes: the clock
-///   and something else. With `central' = …·(1 + 0.01·TAD)` alongside `X' = 0.5·X²`, the
-///   counterfactual still has `X = inf`, so a whole-state finiteness test cleared the clock
-///   and the run went silent although `TAD` was genuinely one of the causes. The rule is
-///   therefore: refuse if **some component** that is non-finite in the real solve comes back
-///   finite under an anchored clock.
-/// - **Two stand-ins, `t_start` and `t_end`.** A single stand-in is not arbitrary: `t_start`
-///   puts `TAD` in `[0, L]` for a window of length `L`, which can exceed anything the model
-///   ever sees after a dose — and anything `predict()` sees, whose pre-dose `TAD` is ≤ 0. A
-///   RHS that is finite where `predict()` evaluates it but overflows on `[0, L]`
-///   (`exp(TAD)` over a 600 h pre-treatment baseline, measured) made the counterfactual itself
-///   diverge, so the clock was cleared. `t_end` gives `TAD ∈ [t_start − t_end, 0]`, the same
-///   sign as the static convention. Either stand-in repairing a component is enough: a
-///   different anchor can only repair the state if the clock was load-bearing, so adding one
-///   cannot add a false positive.
-///
-/// `u_start` must itself be finite: a state that arrived non-finite (from `init(...)`, or a
-/// `NaN` bolus applied at the break) was not broken here. Non-finiteness **alone** is never
-/// reported either — that would misattribute every diverging solve.
-///
-/// `ext_params` must be the array [`integrate_segment`] just used, so the `TAD` slot holds
-/// the anchor that segment actually integrated under rather than a recomputed twin, and `u`
-/// its advanced state. A zero-length segment needs no special case: [`integrate_segment`]
-/// returns before touching either, so `u` is whatever the previous segment left — finite,
-/// or the run would already have stopped there.
+/// The message opens with what happened, and there are two openers. A segment whose state went
+/// non-finite **and** whose derivative the unanchored clock itself made non-finite keeps the
+/// #1151 one ("integrated to a non-finite state"). Every other refused segment — a clock
+/// consumed by a comparison, including one that only chose a branch while some other state
+/// diverged on its own — is told that its derivative changes with the clock's value, which is
+/// true of all of them; the non-finite opener would pin on the clock a symptom it did not
+/// cause.
 ///
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
-/// integrates correctly and must not be refused. (The fixture that pins this starts from an
-/// empty compartment, so what it can see is "not `NaN`", not the value of `TIME` in the
-/// window — `adaptive_time_reading_rhs_is_not_refused_before_the_first_dose`.)
-///
-/// **What it still does not see**: a `NaN` clock consumed by a *comparison* rather than by
-/// arithmetic. `min`/`max` desugar to `if (a <= b) …`, and every comparison against `NaN` is
-/// false, so `min(TAD, 24)` silently yields `24` and `if (TAD < 5)` silently takes the else
-/// arm. The state stays finite, so the first conjunct blocks this function and the run
-/// returns a number that depends on which way the comparison fell. The default-on
-/// frozen-replay verifier is the net there — it reports the divergence as a symptom, without
-/// naming the clock, and only when the effect exceeds its band. Measured and documented as
-/// row 8b of the message table; gating on *evaluation* instead (a per-segment "slot was
-/// loaded" flag in the RHS evaluator) is the mechanism all of this approximates, and is filed
-/// separately (#1535).
+/// integrates correctly and must not be refused. The dependence test backs that up — such a RHS
+/// reads no clock slot, so no anchor can move it, and keying the candidates on
+/// `pk_reads_model_time` alone changes no verdict (measured, #1535) — which leaves the
+/// per-spelling keys two jobs: naming the spelling, and keeping the probe off a RHS that reads
+/// neither. (The fixture that pins the `TIME` case starts from an empty compartment, so what it
+/// can see is "not `NaN`", not the value of `TIME` in the window —
+/// `adaptive_time_reading_rhs_is_not_refused_before_the_first_dose`.)
 ///
 /// **And what nothing here sees**: once any state goes non-finite the solve stops advancing
 /// *every* state, so a run that survives this function can still return frozen, finite, wrong
@@ -2784,52 +2755,28 @@ fn unanchored_dose_clock_error(
     ext_params: &[f64],
     t_start: f64,
     t_end: f64,
-    // Re-integrate this segment from `u_start` with the unanchored clock set to the supplied
-    // finite value, and return the resulting state. Called at most twice (the two stand-ins),
-    // and only when every cheaper conjunct already holds. Taking it as a closure — rather than
-    // leaving the caller to check causation after the fact — is what keeps the rule in one
-    // place: a future caller cannot obtain the message without supplying the counterfactual.
-    // `FnMut`, not `FnOnce`, precisely so the second stand-in is available.
-    mut resolve_with_finite_clock: impl FnMut(f64) -> Vec<f64>,
 ) -> Option<String> {
-    // The outcome, checked first: a finite segment is never refused, however the RHS is
-    // spelled. This is the conjunct that makes the syntactic `pk_reads_*` walk safe to use.
-    if u.iter().all(|x| x.is_finite()) {
-        return None;
-    }
-    // ... and it has to have gone non-finite HERE.
-    if !u_start.iter().all(|x| x.is_finite()) {
-        return None;
-    }
     let prog = ode.rhs_program.as_ref()?;
     // The anchors exactly as the segment received them: `integrate_segment` wrote the `TAD`
     // slot itself, and the `TAFD` slot is the one it inherited. Reading the quantities the
     // RHS was handed — rather than re-deriving "is the shadow dose-free?" — keeps the
     // diagnostic gated on its own mechanism, and costs no second fold of the dose list.
-    let tad_unanchored =
-        prog.pk_reads_tad() && ext_params[crate::types::MAX_PK_PARAMS + 1].is_nan();
-    let tafd_unanchored = prog.pk_reads_tafd() && ext_params[crate::types::MAX_PK_PARAMS].is_nan();
+    let tad_unanchored = prog.pk_reads_tad() && ext_params[TAD_ANCHOR_SLOT].is_nan();
+    let tafd_unanchored = prog.pk_reads_tafd() && ext_params[TAFD_ANCHOR_SLOT].is_nan();
     if !tad_unanchored && !tafd_unanchored {
         return None;
     }
-    // Causation, the last and only expensive conjunct: under an anchored clock, does some
-    // component that broke here come back? Per component, because a segment can have two
-    // causes; over two stand-ins, because one stand-in's `TAD` range can break the
-    // counterfactual by itself. Both traps were measured — see the doc comment.
-    let repairs_a_broken_component = |cf: &[f64]| {
-        u.iter()
-            .zip(cf.iter())
-            .any(|(real, alt)| !real.is_finite() && alt.is_finite())
-    };
-    // `t_start` gives `TAD ∈ [0, L]`, `t_end` gives `TAD ∈ [-L, 0]` — the sign the static
-    // engines use. Short-circuits on the first that repairs something.
-    if ![t_start, t_end]
-        .into_iter()
-        .any(|stand_in| repairs_a_broken_component(&resolve_with_finite_clock(stand_in)))
-    {
-        return None;
-    }
-    let slot = match (tad_unanchored, tafd_unanchored) {
+    let dependence = unanchored_clock_dependence(
+        ode,
+        ext_params,
+        tad_unanchored,
+        tafd_unanchored,
+        u_start,
+        u,
+        t_start,
+        t_end,
+    )?;
+    let slot = match (dependence.tad, dependence.tafd) {
         (true, true) => "`TAD` and `TAFD`",
         (true, false) => "`TAD`",
         _ => "`TAFD`",
@@ -2855,10 +2802,27 @@ fn unanchored_dose_clock_error(
          into every later read."
             .to_string()
     };
+    // Both conjuncts, or the non-finite opener would be false of a state that stayed finite,
+    // or would blame the clock for a divergence it did not cause (see the doc comment).
+    let opener = if dependence.nan_reached_derivative && !u.iter().all(|x| x.is_finite()) {
+        format!(
+            "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
+             non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
+             dose has been given in this run."
+        )
+    } else {
+        format!(
+            "ode_predictions_adaptive: over the segment ({t_start}, {t_end}] the [odes] RHS \
+             reads {slot}, which has no referent there: no dose has been given in this run. \
+             The derivative it computes there changes when that clock is anchored, so the \
+             trajectory depends on a dose time this run does not have. A comparison against \
+             an unanchored clock does not fail, it answers one way — `NaN < 5` is false — \
+             which is how an `if`, `min` or `max` on it picks a side without producing a \
+             `NaN`."
+        )
+    };
     Some(format!(
-        "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
-         non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
-         dose has been given in this run. {reads} Where the record contains a dose, the \
+        "{opener} {reads} Where the record contains a dose, the \
          static engines anchor such a window at the first one — a dose a reactive run has \
          not decided yet, and may never decide — so this driver refuses the window rather \
          than read one out of the future. Give the subject a pre-scheduled base regimen, or \
@@ -2866,6 +2830,174 @@ fn unanchored_dose_clock_error(
          controller that never doses leaves a model reading {slot} unanchored for the whole \
          run."
     ))
+}
+
+/// Intervals in the grid [`unanchored_clock_dependence`] evaluates a segment's RHS on:
+/// `CLOCK_PROBE_INTERVALS + 1` evenly spaced times spanning `[t_start, t_end]`, both ends
+/// included (#1535).
+const CLOCK_PROBE_INTERVALS: usize = 16;
+
+/// The `ext_params` slot the `[odes]` RHS reads the `TAFD` anchor (the first dose time) from.
+const TAFD_ANCHOR_SLOT: usize = crate::types::MAX_PK_PARAMS;
+
+/// The `ext_params` slot the `[odes]` RHS reads the `TAD` anchor (the last dose time) from.
+const TAD_ANCHOR_SLOT: usize = crate::types::MAX_PK_PARAMS + 1;
+
+/// What [`unanchored_clock_dependence`] measured on a segment whose derivative depends on an
+/// unanchored dose clock (#1535).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockDependence {
+    /// The message names `TAD`.
+    tad: bool,
+    /// The message names `TAFD`.
+    tafd: bool,
+    /// Some derivative component was non-finite under the unanchored clock and finite under an
+    /// anchored one: the clock's `NaN` reached the arithmetic, as in `(1 + KT·TAD)`, rather
+    /// than being consumed by a comparison. It selects the message's opener, never the verdict.
+    nan_reached_derivative: bool,
+}
+
+/// #1535: does the `[odes]` RHS's derivative over `[t_start, t_end]` depend on the value of an
+/// unanchored dose clock? `None` when it does not.
+///
+/// `tad` / `tafd` mark the candidate slots: `NaN` in `ext_params`, and read by the program. The
+/// raw RHS — without the dose forcings, which read no clock — is evaluated at
+/// [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning the segment, at `u_start` and
+/// at the end state `u`, each only when every component is finite: once with `ext_params`
+/// exactly as the segment ran, and once with every candidate slot anchored at `t_end`. The
+/// segment depends on the clock iff some derivative component differs. Each of these choices is
+/// pinned by a test:
+///
+/// - **One anchor: the window's end** (#1570 review, row 1). A window reaches this probe only
+///   when no dose has landed by `t_start`, so on the realized schedule the first dose — and with
+///   it the static engines' anchor — comes at `t_end` or later, and their clock is ≤ 0 across
+///   the window. A dose landing right at `t_end` is the earliest anchor a schedule can give; it
+///   puts `TAD` in `[-L, 0]` for a window of length `L`. An anchor at `t_start` would put it in
+///   `[0, L]`, where no schedule can: it refused `if (TAD > 5)` and `max(TAD, 0)`, whose
+///   unanchored arm is the arm every `TAD ≤ 0` takes, so those runs already equal `predict()`
+///   (measured bit-identical, and to 4.3e-16). The one shape only it could see — a RHS that is
+///   non-finite on all of `[-L, 0]`, such as `TAD^(-0.5)` — is non-finite in `predict()` too.
+/// - **Only states whose every component is finite** (#1570 review, row 2). `u` is probed as
+///   well as `u_start` because an empty compartment at the start can hide a comparison that the
+///   state filled during the segment makes visible. But once any component goes non-finite the
+///   solver pads every state with its last value (#1539), so the finite components of such a
+///   state are that pad, not an integrated one: `u` after this segment diverged, or `u_start`
+///   after an earlier segment did — a divergence that is not this window's clock's. Neither is
+///   probed, which also keeps the verdict the same whatever the pad holds.
+/// - **The grid, not the endpoints.** A condition can hold only inside the window — `TAD`
+///   between −8 and −6 on a 12 h one — so the ends alone would miss it.
+/// - **Compared only where the anchored derivative is finite.** A component whose derivative is
+///   non-finite under the anchor too — the anchor overflows the RHS by itself (`exp(-TAD)` at
+///   `TAD ≈ −800`), or the RHS is non-finite for every clock a schedule can give
+///   (`TAD^(-0.5)`) — is not something an anchor would fix. Then by value, with
+///   IEEE `!=`: `NaN` differs from every finite value, while `-0.0 == 0.0`, since a zero
+///   derivative is zero whatever its sign — and on an empty compartment
+///   `-k·0·(1 − 0.1·min(TAD, 24))` does flip that sign between the unanchored clock and the
+///   anchored one.
+/// - **All candidate slots take the anchor together for the verdict.** Both clocks are
+///   unanchored by the same fact, and a reactive run would anchor both at its first dose.
+///   Anchoring one while the other stays `NaN` would leave `(1 + TAD + TAFD)` non-finite under
+///   the anchor, where the comparison skips it — a false negative. The *naming* is per slot, and
+///   is worked out only once the segment is found dependent: with both unanchored, a slot is
+///   named when its `NaN` alone, the other anchored, moves the anchored derivative; when only
+///   the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
+///
+/// Its limits, stated rather than hidden — measured on #1570, filed as #1572, and left to the
+/// default-on frozen-replay verifier until then:
+///
+/// - A first dose later than `t_end` puts the clock further below zero than the anchor reaches,
+///   so a condition that switches only there is not seen: `if (TAD < -20)` over 12 h windows,
+///   with the first dose at 36, runs 23.5× off `predict()` at its worst read.
+/// - It samples 17 times and pairs the window's start and end states with each. A dependence
+///   between two sample times, or one that shows only at states inside the window, is missed;
+///   and a pairing the trajectory never reaches can be refused although the run matches
+///   `predict()` — measured with a condition on both the state and `TIME`.
+///
+/// Cost: `2 × 17 × 2` RHS evaluations on a segment with an unanchored clock the program reads,
+/// plus `2 × 17 × 3` to name the slots when both are candidates and the segment is refused.
+/// Nothing on segments with an anchored clock, and nothing on the RHS hot path.
+#[allow(clippy::too_many_arguments)]
+fn unanchored_clock_dependence(
+    ode: &OdeSpec,
+    ext_params: &[f64],
+    tad: bool,
+    tafd: bool,
+    u_start: &[f64],
+    u: &[f64],
+    t_start: f64,
+    t_end: f64,
+) -> Option<ClockDependence> {
+    // A fixed order: `alone[j]` below is indexed like this list.
+    let candidates: Vec<usize> = [(tad, TAD_ANCHOR_SLOT), (tafd, TAFD_ANCHOR_SLOT)]
+        .into_iter()
+        .filter_map(|(read, slot)| read.then_some(slot))
+        .collect();
+    // The one comparison the rule makes, per derivative component — see the doc comment.
+    let moves = |ran: f64, anchored: f64| anchored.is_finite() && ran != anchored;
+
+    let n = u_start.len();
+    let (mut du_ran, mut du_anchored) = (vec![0.0; n], vec![0.0; n]);
+    // Every candidate slot at the window's end: the earliest anchor a schedule can give.
+    let mut anchored = ext_params.to_vec();
+    for &slot in &candidates {
+        anchored[slot] = t_end;
+    }
+    let states: Vec<&[f64]> = [u_start, u]
+        .into_iter()
+        .filter(|state| state.iter().all(|x| x.is_finite()))
+        .collect();
+    let times = (0..=CLOCK_PROBE_INTERVALS)
+        .map(|k| t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64));
+    let mut depends = false;
+    let mut nan_reached_derivative = false;
+    for &state in &states {
+        for t in times.clone() {
+            (ode.rhs)(state, ext_params, t, &mut du_ran);
+            (ode.rhs)(state, &anchored, t, &mut du_anchored);
+            for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
+                if moves(ran, anch) {
+                    depends = true;
+                    nan_reached_derivative |= !ran.is_finite();
+                }
+            }
+        }
+    }
+    if !depends {
+        return None;
+    }
+    // The naming, worked out only now that the segment is refused (#1570 review, row 6): with
+    // both clocks unanchored, which one's `NaN` alone — the other anchored — moves the anchored
+    // derivative?
+    let mut alone = [false; 2];
+    if candidates.len() > 1 {
+        let mut alone_unanchored = anchored.clone();
+        for &state in &states {
+            for t in times.clone() {
+                (ode.rhs)(state, &anchored, t, &mut du_anchored);
+                for (j, &slot) in candidates.iter().enumerate() {
+                    alone_unanchored.copy_from_slice(&anchored);
+                    alone_unanchored[slot] = f64::NAN;
+                    (ode.rhs)(state, &alone_unanchored, t, &mut du_ran);
+                    alone[j] |= du_ran
+                        .iter()
+                        .zip(&du_anchored)
+                        .any(|(&ran, &anch)| moves(ran, anch));
+                }
+            }
+        }
+    }
+    // One candidate is named by the verdict itself. Two are named by what each does alone —
+    // unless only the pair moves the derivative, which names both.
+    let named = |slot: usize| match candidates.iter().position(|&s| s == slot) {
+        None => false,
+        Some(_) if candidates.len() == 1 || !alone.iter().any(|&a| a) => true,
+        Some(j) => alone[j],
+    };
+    Some(ClockDependence {
+        tad: named(TAD_ANCHOR_SLOT),
+        tafd: named(TAFD_ANCHOR_SLOT),
+        nan_reached_derivative,
+    })
 }
 
 /// Lower the reactive driver's TAFD anchor (`ext_params[MAX_PK_PARAMS]`) to `t` if `t`
@@ -3140,13 +3272,6 @@ fn integrate_segment(
     // the advanced `u` are therefore bit-identical to a `chz_times = &[]` call.
     // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
     chz_times: &[f64],
-    // #1151 / #1534 review: force the TAD anchor slot to this value instead of folding it
-    // from the dose list. The **only** caller that passes `Some` is the reactive driver's
-    // causation check, which re-runs a segment that came back non-finite with a finite clock
-    // to find out whether the unanchored clock was the cause. Every solve whose result is
-    // *kept* passes `None` and is byte-identical to before — the causation check also runs in
-    // production, but on a failing path, and it throws its state away.
-    tad_anchor_override: Option<f64>,
 ) -> Vec<Vec<f64>> {
     let opts = ode.effective_solver_opts();
 
@@ -3172,10 +3297,8 @@ fn integrate_segment(
     }
 
     // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
-    // before this segment, SS-aware (gives TAD = t - last_dose_eff). An override
-    // (#1534 review) replaces the fold; see the parameter's note.
-    ext_params[crate::types::MAX_PK_PARAMS + 1] =
-        tad_anchor_override.unwrap_or_else(|| tad_anchor(subject, dose_lagtimes, t_start));
+    // before this segment, SS-aware (gives TAD = t - last_dose_eff).
+    ext_params[TAD_ANCHOR_SLOT] = tad_anchor(subject, dose_lagtimes, t_start);
 
     // Integrate. If any infusions are active in this segment, wrap
     // the user RHS so it adds `+rate` to each infusion's compartment.
@@ -3914,7 +4037,6 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 stats.as_deref_mut(),
                 &mut auto_state,
                 &seg_chz,
-                None,
             );
             // Place each soft sample at its global `chz_times` index (NaN slots left for
             // any time no segment covered).
@@ -5444,9 +5566,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // base + dynamic injected infusion-end breaks guarantee full containment). On the
             // dose-free path this is all-zeros and `injected_f` empty, byte-identical to before.
             //
-            // The pre-segment state is kept for the #1151 causation check below: it is both
-            // the "did it go non-finite HERE?" reference and the starting point the
-            // counterfactual re-solve replays from. One `n_states` copy per segment.
+            // The pre-segment state is kept for the #1151 / #1535 dose-clock check below, which
+            // evaluates the RHS at it. One `n_states` copy per segment.
             // #936: nothing evolves before the origin (see `started`).
             if started {
                 let u_start = u.clone();
@@ -5468,77 +5589,30 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     None,
                     &mut auto_state,
                     &[],
-                    None,
                 );
 
-                // #1151: a segment whose dose clock had no referent — a window before the first
-                // realized (or base) dose on a `TAD`/`TAFD`-reading RHS — integrates `0.0 * NaN`
-                // into the *state*, not just the readout, so every later read inherits it. Refuse
-                // it here rather than leave it to the (default-on, but opt-out) frozen-replay
-                // verifier, whose message names the symptom and not the cause.
+                // #1151 / #1535: a segment whose dose clock had no referent — a window before the
+                // first realized (or base) dose on a `TAD`/`TAFD`-reading RHS — is refused when
+                // the RHS's derivative there depends on that clock's value: through arithmetic
+                // (`0.0 * NaN` reaches the *state*, so every later read inherits it) or through a
+                // comparison that silently picks a side. Refused here rather than left to the
+                // (default-on, but opt-out) frozen-replay verifier, whose message names the
+                // symptom and not the cause.
                 //
-                // Placed AFTER the solve on purpose: the cheaper pre-integration form refused on
-                // `pk_reads_tad()` alone, which is a syntactic walk and true for a `TAD` in an
-                // untaken branch or in a condition — shapes whose state stays finite. See the
-                // helper's doc comment. `ext_params` now carries the anchors this segment ran
-                // under, so the helper re-folds nothing.
-                //
-                // The closure is the causation check: the same segment, from the same starting
-                // state, with the unanchored slot(s) given a finite value. The helper calls it
-                // once per stand-in (at most twice), only when every cheaper conjunct already
-                // holds, on a segment that has already come back non-finite — and throws the state
-                // away. So the cost is at most two extra segment solves per *non-finite episode*,
-                // not per subject: the driver is reset-aware (#716), and an EVID=3/4 reset that
-                // restores a finite state re-arms this. A fresh `OdeAutoSwitchState` and a
-                // throwaway `predictions` buffer keep it from perturbing the real walk, which
-                // continues unchanged when no counterfactual repairs anything (i.e. when the clock
-                // was not a cause).
-                let refusal = {
-                    let shadow_ref = &shadow;
-                    let lagtimes_ref = &dose_lagtimes;
-                    let injected_ref = &injected_f;
-                    let u_start_ref = &u_start;
-                    unanchored_dose_clock_error(
-                        ode,
-                        shadow_ref,
-                        u_start_ref,
-                        &u,
-                        &ext_params,
-                        t_start,
-                        t_end,
-                        |finite_anchor| {
-                            let mut u_cf = u_start_ref.clone();
-                            let mut ext_cf = ext_params;
-                            if ext_cf[crate::types::MAX_PK_PARAMS].is_nan() {
-                                ext_cf[crate::types::MAX_PK_PARAMS] = finite_anchor;
-                            }
-                            let mut preds_cf = vec![f64::NAN; 0];
-                            let mut auto_cf = crate::ode::solver::OdeAutoSwitchState::default();
-                            integrate_segment(
-                                ode,
-                                &mut u_cf,
-                                t_start,
-                                t_end,
-                                shadow_ref,
-                                lagtimes_ref,
-                                injected_ref,
-                                reset_floor,
-                                &mut ext_cf,
-                                seg_pk_values,
-                                theta,
-                                seg_eta,
-                                &HashMap::new(),
-                                &mut preds_cf,
-                                None,
-                                &mut auto_cf,
-                                &[],
-                                Some(finite_anchor),
-                            );
-                            u_cf
-                        },
-                    )
-                };
-                if let Some(msg) = refusal {
+                // Placed AFTER the solve: the helper probes the RHS at the segment's end state as
+                // well as its start, and `ext_params` now carries the anchors this segment ran
+                // under, so it re-folds nothing. It evaluates the RHS directly and re-solves
+                // nothing, so when it returns `None` the walk continues exactly as it would have
+                // without it.
+                if let Some(msg) = unanchored_dose_clock_error(
+                    ode,
+                    &shadow,
+                    &u_start,
+                    &u,
+                    &ext_params,
+                    t_start,
+                    t_end,
+                ) {
                     return Err(msg);
                 }
             }
@@ -6091,7 +6165,6 @@ fn adaptive_frozen_replay_tv(
                 None,
                 &mut auto_state,
                 &[],
-                None,
             );
 
             // Advance the LOCF carry only at an actual record — the identical rule the
