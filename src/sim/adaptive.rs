@@ -199,7 +199,12 @@ pub struct ControllerCtx<'a> {
     /// Current ODE state vector (0-based compartments). The controller may
     /// compute any expression over this directly.
     pub state: &'a [f64],
-    /// Subject covariates (LOCF), as the model sees them.
+    /// Subject covariates in force at the decision, as the model sees them: the row of
+    /// the latest data record at or before `t` — a dose, EVID=2, observation or EVID=3/4
+    /// reset row; of several at the same time, the observation, then EVID=2, then dose,
+    /// then reset. Before the first record, the subject's baseline covariates. The PK
+    /// behind every monitored signal, and the `F` of a dose issued here, come from the
+    /// same record.
     pub covariates: &'a HashMap<String, f64>,
     /// Doses issued so far this simulation (the realized history).
     pub history: &'a [DoseEvent],

@@ -7241,3 +7241,368 @@ fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
         "missing selector: got: {err}"
     );
 }
+
+// ─── #1148: the record a decision reads ──────────────────────────────────────────────
+//
+// One record supplies everything a decision at `t` reads — the controller's covariates,
+// the PK behind its readouts, and the PK behind an injected dose's `F`: the latest data
+// record at or before `t` (dose / EVID=2 / obs / EVID=3-4 reset), co-timed records in the
+// dense engine's order `Reset < Dose < EVID=2 < Obs` with the last one winning; with no
+// such record, the baseline covariates and the t=0 snapshot.
+//
+// Every fixture runs `simulate_adaptive` (the reactive driver, `ode_predictions_adaptive_impl`)
+// with the default-on frozen-replay and snapshot verifiers. There is no `Dual2` / FD path on
+// the adaptive driver. The verifiers re-derive the decision covariate through the SAME
+// resolver the driver uses, so they pin plumbing, not this rule: the oracles here are the
+// captured `ctx` itself, `predict()` on the realized doses, and closed forms.
+//
+// `ODE_TV_F`: `F = 0.8·CRCL/100`, `CL`/`V` constant (k = 0.1/h), so the IPRED an injected
+// 100-unit bolus leaves behind reads back the `F` — and therefore the record — the decision
+// resolved: `100·F·e^(−0.1·Δt)`.
+
+// `ODE_TV_F` with a (numerically negligible) κ on F, so the subject routes through the IOV
+// `decision_pk` build (`run_adaptive_population`) instead of the non-IOV readout. κ ~ 1e-6
+// moves F by ~1e-6 relative, far inside every band below.
+const ODE_TV_F_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_F ~ 1e-12
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  F  = TVF * CRCL / 100.0 * exp(KAPPA_F)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+fn crcl_1148(v: f64) -> HashMap<String, f64> {
+    HashMap::from([("CRCL".to_string(), v)])
+}
+
+/// What a decision saw: `(t, ctx.covariates["CRCL"], ctx.state[0])`.
+type Seen1148 = Vec<(f64, f64, f64)>;
+
+/// Run `simulate_adaptive` with a fixed 100-unit bolus at every decision, capturing the
+/// controller's context. Default-on verifiers.
+fn run_capture_1148(
+    model: &CompiledModel,
+    s: Subject,
+    decisions: &[f64],
+) -> (AdaptiveSimulationResult, Seen1148) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen1148::new()));
+    let make = {
+        let seen = seen.clone();
+        move || {
+            let seen = seen.clone();
+            move |ctx: &ControllerCtx| {
+                let crcl = ctx.covariates.get("CRCL").copied().unwrap_or(f64::NAN);
+                seen.lock().unwrap().push((ctx.t, crcl, ctx.state[0]));
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            }
+        }
+    };
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1148),
+        decision_times: decisions.to_vec(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(model, &pop, &model.default_params, 1, make, &opts)
+        .expect("adaptive sim runs and passes the default-on verifiers");
+    let seen = seen.lock().unwrap().clone();
+    (res, seen)
+}
+
+fn ipred_at_1148(res: &AdaptiveSimulationResult, t: f64) -> f64 {
+    res.trajectories
+        .iter()
+        .find(|r| (r.time - t).abs() < 1e-9)
+        .unwrap_or_else(|| panic!("no trajectory row at t={t}"))
+        .ipred
+}
+
+fn crcl_seen_at_1148(seen: &Seen1148, t: f64) -> f64 {
+    seen.iter()
+        .find(|s| (s.0 - t).abs() < 1e-9)
+        .unwrap_or_else(|| panic!("no decision at t={t}"))
+        .1
+}
+
+/// `predict()` on the realized doses — each dose row carrying `dose_cov` — for an
+/// independent engine: the dense walk, whose reset-row rule is NONMEM-anchored by
+/// `reset_init_snapshot_J`.
+fn predict_realized_1148(
+    model: &CompiledModel,
+    mut s: Subject,
+    res: &AdaptiveSimulationResult,
+    dose_cov: Option<Vec<HashMap<String, f64>>>,
+) -> Vec<(f64, f64)> {
+    s.doses = res
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, 1, 0.0, false, 0.0))
+        .collect();
+    s.dose_occasions = vec![1; s.doses.len()];
+    if let Some(dc) = dose_cov {
+        s.dose_covariates = dc;
+    }
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    predict(model, &pop, &model.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| (p.time, p.pred))
+        .collect()
+}
+
+/// P1 / P3 fixture: baseline CRCL 90, obs@12 (90), EVID=3 reset@24 (30), obs@42 (30);
+/// decisions at 0 and 36. The reset wipes the t=0 dose, so IPRED@42 is the t=36 dose alone.
+fn reset_subject_1148() -> Subject {
+    let mut s = subj("1", vec![12.0, 42.0], vec![]);
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(30.0)];
+    s.reset_times = vec![24.0];
+    s.reset_covariates = vec![crcl_1148(30.0)];
+    s.reset_occasions = vec![1];
+    s
+}
+
+/// `100·F·e^(−0.1·Δt)` with `F = 0.8·CRCL/100`.
+fn bolus_closed_form_1148(crcl: f64, dt: f64) -> f64 {
+    100.0 * (0.8 * crcl / 100.0) * (-0.1 * dt).exp()
+}
+
+#[test]
+fn adaptive_decision_after_a_reset_reads_the_reset_row() {
+    // T1 (#1148, P1). The decision at 36 has the reset@24 as its latest record. Before the
+    // fix the covariate side scanned obs / EVID=2 only (ctx CRCL = 90) and the PK side carried
+    // the obs@12 snapshot (F = 0.72): IPRED@42 = 39.514452, 3.0× the reset row's 13.171479.
+    // Both halves are asserted, so fixing only one of them still reddens this test.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let (res, seen) = run_capture_1148(&model, reset_subject_1148(), &[0.0, 36.0]);
+
+    let want = bolus_closed_form_1148(30.0, 6.0); // 13.171479
+    let got = ipred_at_1148(&res, 42.0);
+    assert!(
+        (got - want).abs() < 1e-3,
+        "IPRED@42 = {got}: the injected dose's F must come from the reset row \
+         (F = 0.24 → {want:.6}); the stale obs@12 snapshot gives F = 0.72 → {:.6}",
+        bolus_closed_form_1148(90.0, 6.0)
+    );
+    assert_eq!(
+        crcl_seen_at_1148(&seen, 36.0),
+        30.0,
+        "ctx CRCL at the t=36 decision must be the reset row's 30 (stale: the obs@12's 90)"
+    );
+
+    let preds = predict_realized_1148(
+        &model,
+        reset_subject_1148(),
+        &res,
+        Some(vec![crcl_1148(90.0), crcl_1148(30.0)]),
+    );
+    let p42 = preds.iter().find(|p| (p.0 - 42.0).abs() < 1e-9).unwrap().1;
+    assert!(
+        (got - p42).abs() <= 1e-4 * p42.abs(),
+        "IPRED@42 {got} != predict() {p42} on the realized doses"
+    );
+}
+
+#[test]
+fn adaptive_iov_decision_after_a_reset_reads_the_reset_row() {
+    // T2 (#1148, P3): the same fixture through the IOV `decision_pk` build, which resolved
+    // the covariate with its own obs / EVID=2 scan (39.514469 before the fix).
+    let model = parse_model_string(ODE_TV_F_IOV).expect("parse TV-F IOV ODE model");
+    assert_eq!(model.n_kappa, 1);
+    let (res, seen) = run_capture_1148(&model, reset_subject_1148(), &[0.0, 36.0]);
+
+    let want = bolus_closed_form_1148(30.0, 6.0);
+    let got = ipred_at_1148(&res, 42.0);
+    assert!(
+        (got - want).abs() < 1e-3,
+        "IOV IPRED@42 = {got}, want the reset row's {want:.6} (stale: {:.6})",
+        bolus_closed_form_1148(90.0, 6.0)
+    );
+    assert_eq!(crcl_seen_at_1148(&seen, 36.0), 30.0, "IOV ctx CRCL at t=36");
+}
+
+#[test]
+fn adaptive_decision_co_timed_with_a_reset_reads_the_reset_row() {
+    // T3a (#1148, P7): the decision sits exactly on the reset@24 — no other record there. The
+    // reset is at-or-before the decision (`<=`), so it is the in-force record. obs@30 carries 30.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let mut s = subj("1", vec![12.0, 30.0], vec![]);
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(30.0)];
+    s.reset_times = vec![24.0];
+    s.reset_covariates = vec![crcl_1148(30.0)];
+    s.reset_occasions = vec![1];
+    let (res, seen) = run_capture_1148(&model, s, &[0.0, 24.0]);
+
+    let want = bolus_closed_form_1148(30.0, 6.0);
+    let got = ipred_at_1148(&res, 30.0);
+    assert!(
+        (got - want).abs() < 1e-3,
+        "IPRED@30 = {got}, want {want:.6} (stale: {:.6})",
+        bolus_closed_form_1148(90.0, 6.0)
+    );
+    assert_eq!(crcl_seen_at_1148(&seen, 24.0), 30.0, "ctx CRCL at t=24");
+}
+
+#[test]
+fn adaptive_decision_at_a_reset_and_obs_tie_reads_the_obs() {
+    // T3b (#1148): a reset and an observation share t=24 with different covariates. The dense
+    // engine processes `Reset < … < Obs`, so the observation is the LAST record at 24 and the
+    // one in force for a decision there.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let mut s = subj("1", vec![12.0, 24.0, 42.0], vec![]);
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(50.0), crcl_1148(50.0)];
+    s.reset_times = vec![24.0];
+    s.reset_covariates = vec![crcl_1148(30.0)];
+    s.reset_occasions = vec![1];
+    let (res, seen) = run_capture_1148(&model, s, &[0.0, 24.0]);
+
+    assert_eq!(
+        crcl_seen_at_1148(&seen, 24.0),
+        50.0,
+        "the obs@24 (50) wins the tie with the reset@24 (30)"
+    );
+    let want = bolus_closed_form_1148(50.0, 18.0);
+    let got = ipred_at_1148(&res, 42.0);
+    assert!(
+        (got - want).abs() < 1e-3,
+        "IPRED@42 = {got}, want the obs row's {want:.6} (reset row: {:.6})",
+        bolus_closed_form_1148(30.0, 18.0)
+    );
+}
+
+/// P2 / P4 fixture: a 50-unit BASE dose row at 24 carrying CRCL 30, no reset; obs@12 (90),
+/// obs@42 (30); decisions at 0 and 36.
+fn base_dose_subject_1148() -> Subject {
+    let mut s = subj(
+        "1",
+        vec![12.0, 42.0],
+        vec![DoseEvent::new(24.0, 50.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(30.0)];
+    s.dose_covariates = vec![crcl_1148(30.0)];
+    s
+}
+
+#[test]
+fn adaptive_decision_after_a_base_dose_row_reads_that_row() {
+    // T4 (#1148, P2 / P4): the base dose row at 24 is the decision@36's latest record. Before
+    // the fix the non-IOV PK side already read it (IPRED@42 16.234894) but the covariate side
+    // did not (ctx CRCL 90), and the IOV `decision_pk` skipped it on both (IPRED@42 42.577880):
+    // two paths, identical data, 2.6× apart.
+    let want = 72.0 * (-4.2f64).exp() // decision@0: F 0.72, 42 h
+        + 50.0 * 0.24 * (-1.8f64).exp() // base dose@24: F 0.24, 18 h
+        + bolus_closed_form_1148(30.0, 6.0); // decision@36: F 0.24, 6 h → 16.234894
+    for (label, src) in [("non-IOV", ODE_TV_F), ("IOV", ODE_TV_F_IOV)] {
+        let model = parse_model_string(src).expect("parse");
+        let (res, seen) = run_capture_1148(&model, base_dose_subject_1148(), &[0.0, 36.0]);
+        let got = ipred_at_1148(&res, 42.0);
+        assert!(
+            (got - want).abs() < 1e-3,
+            "{label}: IPRED@42 = {got}, want {want:.6} (the IOV path skipping the dose row \
+             gave 42.577880)"
+        );
+        assert_eq!(
+            crcl_seen_at_1148(&seen, 36.0),
+            30.0,
+            "{label}: ctx CRCL at t=36 must be the dose row's 30 (stale: 90)"
+        );
+    }
+}
+
+#[test]
+fn adaptive_decision_before_any_record_reads_the_baseline() {
+    // T5 (#1148, P6): a decision at 0 with no record at or before it reads the baseline
+    // covariates (CRCL 90) and the t=0 snapshot (F 0.72). Before the fix the non-IOV readout
+    // took the FIRST record ahead (obs@12, F 0.48 → IPRED@12 14.457712) — the state seed's
+    // rule, not a decision rule — while the IOV path read the baseline: a 1.5× split.
+    let want = bolus_closed_form_1148(90.0, 12.0); // 21.686568
+    for (label, src) in [("non-IOV", ODE_TV_F), ("IOV", ODE_TV_F_IOV)] {
+        let model = parse_model_string(src).expect("parse");
+        let mut s = subj("1", vec![12.0], vec![]);
+        s.covariates = crcl_1148(90.0);
+        s.obs_covariates = vec![crcl_1148(60.0)];
+        let (res, seen) = run_capture_1148(&model, s, &[0.0]);
+        assert_eq!(
+            crcl_seen_at_1148(&seen, 0.0),
+            90.0,
+            "{label}: ctx CRCL at t=0"
+        );
+        let got = ipred_at_1148(&res, 12.0);
+        assert!(
+            (got - want).abs() < 1e-3,
+            "{label}: IPRED@12 = {got}, want the baseline's {want:.6} (first record ahead: \
+             {:.6})",
+            100.0 * 0.48 * (-1.2f64).exp()
+        );
+    }
+}
+
+#[test]
+fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
+    // T6 (#1148, P9). `ODE_TV_COV`: CL = 5·CRCL/100. A decision@18 sits between obs@12 (90)
+    // and a reset@24 (30), with no record between it and the reset. The segment (12, 18] is
+    // governed by the record that terminates it (#1073) — the reset row — so the state the
+    // decision reads is 100·e^(−0.09·12)·e^(−0.03·6) = 28.365403. Skipping the reset to the
+    // next record ahead (obs@42) gave 23.693414 in the arm where obs@42 carries 60.
+    //
+    // The twin arm (obs@42 = 30) agrees under both rules: it is the control that makes the
+    // pair straddle the gate, and the straddle is asserted, so the pair cannot quietly turn
+    // tautological.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let a12 = 100.0 * (-0.09f64 * 12.0).exp();
+    let want = a12 * (-0.03f64 * 6.0).exp();
+    let skip_reset = |crcl42: f64| a12 * (-(0.1 * crcl42 / 100.0) * 6.0f64).exp();
+    assert!((skip_reset(60.0) - want).abs() > 1.0 && (skip_reset(30.0) - want).abs() < 1e-12);
+    for crcl42 in [60.0, 30.0] {
+        let mut s = subj("1", vec![12.0, 42.0], vec![]);
+        s.covariates = crcl_1148(90.0);
+        s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(crcl42)];
+        s.reset_times = vec![24.0];
+        s.reset_covariates = vec![crcl_1148(30.0)];
+        s.reset_occasions = vec![1];
+        let (res, seen) = run_capture_1148(&model, s.clone(), &[0.0, 18.0]);
+        let state18 = seen
+            .iter()
+            .find(|x| (x.0 - 18.0).abs() < 1e-9)
+            .expect("a decision at 18")
+            .2;
+        assert!(
+            (state18 - want).abs() < 1e-3,
+            "arm obs@42 = {crcl42}: ctx.state@18 = {state18}, want the reset-governed \
+             {want:.6} (skipping the reset to obs@42 gives {:.6})",
+            skip_reset(crcl42)
+        );
+
+        // No prediction moves: every IPRED still equals `predict()` on the realized doses.
+        let preds = predict_realized_1148(&model, s, &res, None);
+        assert_eq!(preds.len(), res.trajectories.len());
+        for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                (traj.ipred - p.1).abs() <= 1e-6 + 1e-4 * p.1.abs(),
+                "arm {crcl42}: IPRED {} != predict() {} at t={}",
+                traj.ipred,
+                p.1,
+                traj.time
+            );
+        }
+    }
+}
