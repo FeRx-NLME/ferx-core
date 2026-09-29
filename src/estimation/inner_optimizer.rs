@@ -976,11 +976,12 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 /// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
 /// those, so this adds no cost on the common path.)
 ///
-/// **This is the subject-static half only** — [`inner_stall_enabled_at`] is what the non-IOV
-/// inner solve calls. This entry point remains for the IOV solve, where it is already exact:
-/// `n_kappa > 0` routes *every* transit/IG subject to its twin subject-statically (#814), so
-/// `effective_for` already returns an `ode_spec`-carrying model and the parameter-dependent
-/// reroute below cannot add one.
+/// **This is the subject-static half only**, and no solve calls it any more: the non-IOV inner
+/// solve calls [`inner_stall_enabled_at`] and the IOV solve [`inner_stall_enabled_at_iov`],
+/// because since #1560 an IOV transit/IG subject is no longer on its twin subject-statically —
+/// the absorption walk serves it exactly unless its per-occasion parameters put a (dose,
+/// interval) pair in flip-flop. Kept for the tests that assert this half is blind to that.
+#[cfg(test)]
 fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
     model.effective_for(subject).ode_spec.is_some()
 }
@@ -1036,6 +1037,30 @@ fn inner_stall_enabled_at(
     eta: &[f64],
 ) -> bool {
     crate::pk::effective_model_for_eval(model, subject, theta, eta)
+        .ode_spec
+        .is_some()
+}
+
+/// [`inner_stall_enabled_at`] for the IOV inner solve, at one stacked iterate
+/// `[η_bsv, κ_g0.., κ_g1..]` (η in true space, not ψ).
+///
+/// Before #1560 this was constant for the whole solve, because `n_kappa > 0` sent every
+/// transit/IG subject to its ODE twin subject-statically (#814). The absorption walk now serves
+/// those subjects exactly, so their objective is exact and must keep the `gnorm < tol` stop —
+/// and whether the walk serves them is decided per (dose, interval) pair at the *current* κ, so
+/// a solve can cross into the twin partway through, exactly as in the non-IOV case. The IOV
+/// solve therefore latches this per iterate, like [`inner_stall_enabled_at`].
+///
+/// Identical to `effective_for` for every subject the walk cannot take
+/// (`effective_model_for_eval_iov` returns `effective_for` for them), so only a walk-eligible
+/// transit/IG subject changes behaviour.
+fn inner_stall_enabled_at_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> bool {
+    crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta)
         .ode_spec
         .is_some()
 }
@@ -1947,13 +1972,17 @@ fn find_ebe_iov(
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject);
     // ODE objectives carry the adaptive-solver gradient-noise floor; enable the objective-stall
-    // stop only for them — including a closed-form transit/IG + IOV subject, whose objective is
-    // evaluated on the ODE twin (`effective_for`, #719/#814). See `inner_stall_enabled`/`find_ebe`.
-    let enable_stall = inner_stall_enabled(model, subject);
-    // Constant for the whole solve: `n_kappa > 0` routes every transit/IG subject to its
-    // twin subject-statically (#814), so there is no boundary for an IOV iterate to cross
-    // and the latch in the cores has nothing to add here.
-    let stall_at = move |_: &[f64]| enable_stall;
+    // stop only for them — including a closed-form transit/IG + IOV subject the absorption walk
+    // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
+    // #1560). Evaluated per iterate and latched in the cores: κ moves the walk's per-pair
+    // flip-flop domain. See `inner_stall_enabled_at_iov`.
+    let stall_at = |p: &[f64]| {
+        let mut stacked_true = p.to_vec();
+        for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+            *st = p[k] - mu[k];
+        }
+        inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
+    };
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
