@@ -3302,9 +3302,12 @@ fn adaptive_rejects_malformed_absorption_fractions() {
     // dose-precondition guard (#588) that `simulate()` / `predict()` / `fit()`
     // enforce. This parallel-first-order model's pathway fractions sum to 1.2
     // (FR1 = FR2 = 0.6), not 1 — the input rate would deliver 1.2× the dose. The
-    // fraction check evaluates typical parameters (η = 0) with no dose, so it fires
-    // on the dose-free adaptive base at the chokepoint, before any decision — the
-    // same typed error the static paths raise, instead of a silent 1.2× run.
+    // fraction check evaluates typical parameters (η = 0) at each dose record, where
+    // the engine reads a pathway fraction (#1569), so it fires on the base regimen's
+    // loading dose at the chokepoint, before any decision — the same typed error the
+    // static paths raise, instead of a silent 1.2× run. (A dose-free base has no
+    // record the fraction is read at; the controller cannot dose an input-rate
+    // compartment either, so it is rejected by that guard instead.)
     const SPEC: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -3340,7 +3343,8 @@ fn adaptive_rejects_malformed_absorption_fractions() {
 "#;
     let parsed = parse_full_model(SPEC).expect("malformed-fraction model still parses");
     let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
-    let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![])]);
+    let loading = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![loading])]);
     let opts = AdaptiveSimulateOptions {
         seed: Some(1),
         ..Default::default()

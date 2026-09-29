@@ -8106,12 +8106,12 @@ fn ode_provider_880_rate_on_first_order_lag_iiv_hessian() {
 }
 
 /// #880 twin: the same rate-on onset with a **time-varying covariate crossing it**.
-/// `KA` (hence the onset value `Δr` and slope `∂R_in/∂tad`) carries a WT covariate that
-/// changes record-to-record, and `ALAG1` carries IIV — so the onset saltation runs on
-/// the TV-cov `(θ,η)`-basis walk with a per-segment PK snapshot. Guards that the δ²
-/// time-partial term is fed the right per-onset `Δr`/`∂R_in/∂tad` (and that the onset
-/// snapshot is self-consistent) under a covariate that moves across the onset — the
-/// scenario #880 flagged as the `K_ROUTE_ONSET` snapshot concern.
+/// `KA` carries a WT covariate that changes record-to-record, and `ALAG1` carries IIV — so
+/// the onset saltation runs on the TV-cov `(θ,η)`-basis walk with a per-segment PK
+/// snapshot. Guards that the δ² time-partial term is fed the right `Δr`/`∂R_in/∂tad` — the
+/// dose's own, `KA` read at the dose record (#1569) — while the post-side Jacobian moves
+/// with the covariate across the onset: the scenario #880 flagged as the `K_ROUTE_ONSET`
+/// snapshot concern.
 #[test]
 fn ode_provider_880_rate_on_first_order_lag_iiv_tvcov_hessian() {
     const M: &str = r#"
@@ -8221,8 +8221,8 @@ fn ode_provider_880_route_lag_iiv_hessian() {
 }
 
 /// #880 twin: IIV on a per-route lag with a TV covariate crossing the route onset. Guards
-/// the `K_ROUTE_ONSET` onset-segment snapshot (kernel `ka`/`frac`/post-side Jacobian read
-/// from the post-arrival record, not the pre-onset `last_params` nor the dose snapshot).
+/// the `K_ROUTE_ONSET` snapshots: the post-side Jacobian read from the enclosing record,
+/// not the pre-onset `last_params`; the kernel `ka`/`frac` read at the dose record (#1569).
 #[test]
 fn ode_provider_880_route_lag_iiv_tvcov_hessian() {
     const M: &str = r#"
@@ -11621,9 +11621,11 @@ fn ode_provider_lagged_infusion_rate_on_a_covariate_record_returns_a_one_sided_d
 /// already holds drug.
 ///
 /// Same reason as the rate-on fixture above: mutating the onset arm alone left `sens::`
-/// entirely green before this existed. This is also the arm where the single snapshot is
-/// load-bearing for more than the Jacobian — `onset_params` supplies the kernel's `ka` and
-/// pathway `frac`, so it sets the magnitude of the injected rate jump as well as its field.
+/// entirely green before this existed. The snapshot the onset reads sets the post-side
+/// Jacobian `J⁺` — the second-order half below. The magnitude of the injected rate jump,
+/// `frac·ka·dose`, is the **dose's** since #1569 (its `KA` is read at its own record), so
+/// it no longer depends on which side of the record the onset lands: the first-order half
+/// asserts exactly that, where it used to assert a straddle.
 #[test]
 fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_derivative() {
     let model = parse_model_string(ONECPT_INIT_LAG_FIRSTORDER_ODE).expect("parse");
@@ -11654,38 +11656,37 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
 
     let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
     for j in [3usize, 4, 5] {
-        // `h = 1e-4`, not the `1e-6` the other arms use, and the bound is looser to match.
-        // The backward stencil here cancels the `ka·dose` onset against the baseline decay,
-        // so its own accuracy is the limit: swept over `h` from 1e-4 to 1e-8 the backward
-        // limit is stable to ~5 digits at 1e-4 and degrades to 3 digits by 1e-7, while the
-        // forward limit is stable to 8 throughout. Realised worst miss at `h = 1e-4` is
-        // 7.6e-6 (obs3; obs4 6.5e-7, obs5 5.7e-7), so the bound below carries ~6x headroom
-        // over the measurement — and the stencil still separates the two branches with five
-        // orders of margin, since `fwd − bwd` is 0.47 at obs3.
+        // First order: no branch. The onset's rate jump is the dose's `frac·ka·dose` with
+        // `KA` read at the dose record (`WT = 70`, #1569), so shifting the onset across the
+        // record moves nothing at first order. `h = 1e-4`: the backward stencil cancels the
+        // `ka·dose` onset against the baseline decay and resolves ~5 digits, the forward one
+        // ~8. Measured: `|fwd − bwd|` ≤ 1.3e-5 relative (obs4; obs3 5.6e-6, obs5 4.0e-6) —
+        // the backward stencil's own accuracy — and the dual on the forward limit to
+        // ≤ 1.3e-8. Until #1569 the jump read the `WT = 140` segment's `KA` on one side and
+        // `WT = 70` on the other, and this assertion was a straddle (> 1 %).
         let (fwd, bwd) = one_sided_eta_limits(&model, &subject, &theta, &eta, 2, j, 1e-4);
         assert!(fwd.is_finite() && bwd.is_finite());
         assert!(
-            (fwd - bwd).abs() > 1e-2 * fwd.abs().max(bwd.abs()),
-            "obs{j}: the one-sided derivatives coincide ({fwd} vs {bwd}) — the onset no \
-             longer lands on the record and this fixture tests nothing"
+            (fwd - bwd).abs() < 5e-5 * fwd.abs().max(bwd.abs()),
+            "obs{j}: a first-order kink at the onset ({fwd} vs {bwd}) — the rate jump is \
+             reading a segment's kernel instead of the dose's own (#1569)"
         );
         approx::assert_relative_eq!(
             sens.obs[j].df_deta[2],
-            bwd,
-            max_relative = 5e-5,
-            epsilon = 1e-7
+            fwd,
+            max_relative = 1e-6,
+            epsilon = 1e-9
         );
-        // Second order, same branch (PR #1391 review). `h = 5e-3`, not the `1e-3` the
+        // Second order, backward branch (PR #1391 review): `J⁺` is the enclosing record's,
+        // so the curvature still takes the limit from below. `h = 5e-3`, not the `1e-3` the
         // bolus/rate-on arms use: the `h²` denominator amplifies the same `ka·dose`-vs-decay
-        // cancellation that already forced a larger `h` on the gradient above. Swept over
-        // `h` from 1e-2 down to 1e-4, the backward limit is best at 5e-3 and has lost every
-        // digit by 2e-4 (obs3's limit flips sign there).
+        // cancellation that forces a larger `h` on the gradient above. Swept over `h` from
+        // 1e-2 down to 1e-4, the backward limit is best at 5e-3 and has lost every digit by
+        // 2e-4.
         //
-        // Measured at `h = 5e-3`: worst relative miss 1.151e-3 (obs3, whose `∂²f/∂η²` is
-        // only −7.8e-3, so that is an absolute miss of 9.0e-6; obs4 1.297e-4, obs5
-        // 1.295e-4). The `epsilon` floor is what carries obs3; the straddle there is 0.99
-        // *relative*, i.e. 7.8e-3 absolute, so the floor still sits ~78x inside the quantity
-        // the assertion has to resolve.
+        // Measured at `h = 5e-3` (#1569): relative miss 1.09e-4 / 4.13e-5 / 5.07e-5 across
+        // obs 3/4/5, against a straddle of 7.3 % / 30.5 % / 7.0 %. The bound carries ~9x
+        // over the worst miss and sits ~70x inside the smallest straddle.
         let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 5e-3);
         let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
         assert!(f2.is_finite() && b2.is_finite());
@@ -11694,7 +11695,7 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
             "obs{j}: the one-sided SECOND derivatives coincide ({f2} vs {b2}) — the onset no \
              longer lands on the record and the curvature half tests nothing"
         );
-        approx::assert_relative_eq!(a2, b2, max_relative = 5e-3, epsilon = 1e-4);
+        approx::assert_relative_eq!(a2, b2, max_relative = 1e-3, epsilon = 1e-6);
     }
 }
 
@@ -11705,12 +11706,14 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
 /// the shared `K_DOSE` onset. It therefore has its own snapshot lookup, which the first cut
 /// of #1391 left on the pre-#1068 forward scan — so an unlagged `first_order` forcing and an
 /// otherwise identical `lag=`-carrying one reported **opposite** one-sided branches at a
-/// record coincidence. Caught in review. The gap between the branches is the fixture's own
-/// covariate contrast, not a constant of the defect: 0.53 %-1.2 % here, 2.5 % on the
-/// reviewer's geometry. The per-observation table below carries this fixture's numbers.
+/// record coincidence. Caught in review. The gap between the branches was the fixture's own
+/// covariate contrast, not a constant of the defect: 0.53 %-1.2 % on the gentle #1060 ramp,
+/// 2.5 % on the reviewer's geometry.
 ///
 /// `K_ROUTE_ONSET` = 4 sorts before `K_PKONLY` = 5 / `K_OBS` = 6, so like every other arrival
-/// it must report the limit from below.
+/// it must report the limit from below. Since #1569 the onset's rate jump reads the dose's
+/// own kernel and route lag, so the branch shows only in the post-side Jacobian `J⁺` — a
+/// second-order effect, which is why the test runs on the steep 70 → 140 weight step.
 const ONECPT_ROUTE_LAG_TVCOV_ODE: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
@@ -11745,12 +11748,16 @@ const ONECPT_ROUTE_LAG_TVCOV_ODE: &str = r#"
 #[test]
 fn ode_provider_route_lagged_onset_on_a_covariate_record_returns_a_one_sided_derivative() {
     let model = parse_model_string(ONECPT_ROUTE_LAG_TVCOV_ODE).expect("parse");
-    let mut subject = lag_crossing_subject();
+    // The steep subject, not the #1060 ramp: since #1569 only the field (`CL` via `WT`)
+    // differs between the two candidate snapshots — the kernel is the dose's — and on the
+    // 72 → 74 ramp the resulting second-order straddle is 4.6e-4, inside the stencil's
+    // resolution. `WT` steps 70 → 140 at the `t = 2` record here.
+    let mut subject = straddling_forcing_subject();
     // Two doses, because the incoming side of the *second* onset is what this tests. The
-    // first is dosed at t = 0 and its route onset (0 + 0.5 = 0.5) is an ordinary interior
-    // boundary that leaves drug in `central`; the second is dosed at t = 1 so its onset is
-    // exactly 1.5 — the record where `WT` steps 72 → 74. Both `CL` and `KA` read `WT`, so
-    // the two candidate snapshots differ in the kernel as well as in the field.
+    // first is dosed at t = 0 and its route onset (0 + 0.5 = 0.5) leaves drug in `central`;
+    // the second is dosed at t = 1 so its onset is exactly the `t = 1.5` record. The correct
+    // post side is that record (`WT = 70`); the pre-#1068 lookahead read the next one
+    // (`WT = 140`).
     subject.doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
         DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
@@ -11786,51 +11793,35 @@ fn ode_provider_route_lagged_onset_on_a_covariate_record_returns_a_one_sided_der
 
     let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
     for j in [3usize, 4, 5] {
-        // `h = 1e-4` and a 5e-5 bound, for the reason the shared-onset fixture records: the
-        // backward stencil cancels the `ka·dose` onset against the decay, so it resolves ~5
-        // digits, not the ~9 the bolus arm's stencil manages.
-        //
-        // Measured on this fixture, before and after the `:6101` fix:
-        //
-        // | obs | before      | after       | fwd limit   | bwd limit   |
-        // |-----|-------------|-------------|-------------|-------------|
-        // | t=2 | -0.59502583 | -0.59188908 | -0.59502582 | -0.59188932 |
-        // | t=4 | +0.15285989 | +0.15473657 | +0.15285990 | +0.15473582 |
-        // | t=8 | +0.11211076 | +0.11275115 | +0.11211076 | +0.11275090 |
-        //
-        // i.e. it sat exactly on the FORWARD limit — the branch a rate-off takes, not an
-        // onset — and now sits on the backward one. Worst realised miss after the fix is
-        // 4.8e-6, so the 5e-5 bound carries ~10x headroom; the two branches are 0.53 % to
-        // 1.2 % apart, so the stencil separates them with three orders to spare.
+        // First order: no branch, as at the shared onset — the rate jump is the dose's own
+        // `frac·ka·dose` (#1569). `h = 1e-4` for the reason the shared-onset fixture records.
+        // Measured: `|fwd − bwd|` ≤ 3.2e-6 relative (obs4; obs3 2.1e-6, obs5 1.2e-6), the
+        // dual on the forward limit to ≤ 1.6e-8. Until #1569 this was a 0.53 %-1.2 % straddle
+        // on the #1060 ramp, and before #1391 the dual sat on the wrong side of it.
         let (fwd, bwd) = one_sided_eta_limits(&model, &subject, &theta, &eta, 2, j, 1e-4);
         assert!(fwd.is_finite() && bwd.is_finite());
-        // Measured straddle is 0.53 %-1.2 %; require a tenth of the smallest of those, so
-        // the guard fires long before the fixture degenerates but never on stencil noise.
         assert!(
-            (fwd - bwd).abs() > 5e-4 * fwd.abs().max(bwd.abs()),
-            "obs{j}: the one-sided derivatives coincide ({fwd} vs {bwd}) — the route onset no \
-             longer lands on the record and this fixture tests nothing"
+            (fwd - bwd).abs() < 5e-5 * fwd.abs().max(bwd.abs()),
+            "obs{j}: a first-order kink at the route onset ({fwd} vs {bwd}) — the rate jump \
+             is reading a segment's kernel instead of the dose's own (#1569)"
         );
         approx::assert_relative_eq!(
             sens.obs[j].df_deta[2],
-            bwd,
-            max_relative = 5e-5,
-            epsilon = 1e-7
+            fwd,
+            max_relative = 1e-6,
+            epsilon = 1e-9
         );
-        // Second order, same branch (PR #1391 review), at `h = 5e-3` for the same
-        // cancellation reason as the shared onset above — swept 1e-2 → 1e-4, the backward
-        // limit is stable to ~4 digits at 5e-3 and is 13 % off by 1e-4.
+        // Second order, backward branch (PR #1391 review), at `h = 5e-3` for the same
+        // cancellation reason as the shared onset above.
         //
-        // Measured at `h = 5e-3`: relative miss 1.989e-4 / 4.190e-4 / 8.862e-5 across obs
-        // 3/4/5, against a `fwd − bwd` straddle of 7.1e-3 / 3.2e-2 / 1.1e-2. This is the
-        // tightest of the four arms: the bound carries ~4.8x over the measurement and sits
-        // ~3.6x inside the *smallest* gap, so do not loosen it without re-measuring — at
-        // 5e-3 it would stop separating the branches at obs3.
+        // Measured at `h = 5e-3` (#1569): relative miss 1.99e-4 / 2.19e-4 / 9.6e-6 across obs
+        // 3/4/5, against a `fwd − bwd` straddle of 5.7 % / 14.9 % / 4.4 %. The bound carries
+        // ~9x over the worst miss and sits ~22x inside the smallest straddle.
         let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 5e-3);
         let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
         assert!(f2.is_finite() && b2.is_finite());
         assert!(
-            (f2 - b2).abs() > 1e-3 * f2.abs().max(b2.abs()),
+            (f2 - b2).abs() > 1e-2 * f2.abs().max(b2.abs()),
             "obs{j}: the one-sided SECOND derivatives coincide ({f2} vs {b2}) — the route \
              onset no longer lands on the record and the curvature half tests nothing"
         );

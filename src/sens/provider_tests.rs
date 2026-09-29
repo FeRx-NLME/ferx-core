@@ -7317,6 +7317,150 @@ fn check_iov_provider_vs_fd(
     }
 }
 
+/// Closed-form transit with IOV on `CL` **and** `MTT` (#1569) — routed to its ODE twin.
+const ONECPT_TRANSIT_IOV_MTT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(3.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  kappa KAPPA_ABS ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT * exp(KAPPA_ABS)
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// The inverse-Gaussian counterpart: IOV on `CL` and `MAT`.
+const ONECPT_IG_IOV_MAT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(3.0, 0.05, 24.0)
+  theta TVCV2(0.5, 0.01, 5.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  kappa KAPPA_ABS ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT * exp(KAPPA_ABS)
+  CV2 = TVCV2
+[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// Dose 1 at `t = 0` (occasion 1) is still absorbing when occasion 2 starts: its
+/// observations at 4.5 and 6 precede dose 2 (`t = 8`, occasion 2), those at 9 and 14 follow it.
+fn absorbing_across_occasions_subject() -> Subject {
+    Subject {
+        occasions: vec![1, 1, 1, 2, 2, 2, 2],
+        dose_occasions: vec![1, 2],
+        ..subject_with_doses_and_resets(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(8.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[1.0, 2.0, 3.5, 4.5, 6.0, 9.0, 14.0],
+            Vec::new(),
+        )
+    }
+}
+
+/// #1569: a closed-form transit / IG IOV subject is served by its ODE twin, and the twin
+/// absorbs each dose through the kernel of **its own dose record**. So `∂f/∂κ` on an
+/// absorption parameter lands on the κ of the dose's occasion, never the current one.
+///
+/// Dose 1 (occasion 1) is still absorbing when occasion 2 starts, so an observation in
+/// occasion 2 that precedes dose 2 depends on the absorption κ of occasion 1 alone: its
+/// jet on occasion 2's absorption κ is **exactly** zero, and on occasion 1's it is live.
+/// After dose 2 arrives, occasion 2's κ is live too — the other side of the straddle. With
+/// the kernel re-read per segment (the pre-#1569 twin) occasion 2's κ reached dose 1's tail
+/// and the zero was a slope. The whole jet is then checked against central FD of the
+/// production `predict_iov` — value, gradient, Hessian — on the analytic twin walk, which
+/// is asserted, not assumed.
+#[test]
+fn iov_absorption_kappa_lands_on_the_dose_occasion() {
+    for (label, src, theta) in [
+        ("transit", ONECPT_TRANSIT_IOV_MTT, [5.0, 50.0, 3.0, 3.0]),
+        ("ig", ONECPT_IG_IOV_MAT, [5.0, 50.0, 3.0, 0.5]),
+    ] {
+        let model = parse_model_string(src).expect(label);
+        let subject = absorbing_across_occasions_subject();
+        let twin = model
+            .absorption_ode_equivalent
+            .as_ref()
+            .expect("closed-form transit/IG carries a twin")
+            .built();
+        assert!(
+            std::ptr::eq(model.effective_for(&subject), twin),
+            "{label}: an IOV subject must be served by the ODE twin"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(twin),
+            "{label}: the twin's IOV scope must be analytic, or the jets below are FD's"
+        );
+        // [η_V | κ_CL, κ_ABS (occasion 1) | κ_CL, κ_ABS (occasion 2)]
+        let stacked = [0.1, 0.05, 0.2, -0.1, -0.3];
+        let k_abs = model
+            .kappa_names
+            .iter()
+            .position(|n| n == "KAPPA_ABS")
+            .expect("KAPPA_ABS declared");
+        let axis = |occasion_group: usize| model.n_eta + occasion_group * model.n_kappa + k_abs;
+        let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked)
+            .expect("the twin's IOV walk is analytic");
+        for j in [3usize, 4] {
+            let o = &sens.obs[j];
+            assert_eq!(
+                o.df_deta[axis(1)],
+                0.0,
+                "{label} obs{j}: occasion 2's absorption κ reached dose 1, which was dosed in \
+                 occasion 1"
+            );
+            assert!(
+                o.df_deta[axis(0)].abs() > 1e-3 * o.f.abs(),
+                "{label} obs{j}: dose 1 must still be absorbing through occasion 1's kernel \
+                 here, or the zero above is vacuous (∂f/∂κ₁ = {}, f = {})",
+                o.df_deta[axis(0)],
+                o.f
+            );
+        }
+        for j in [5usize, 6] {
+            let o = &sens.obs[j];
+            assert!(
+                o.df_deta[axis(1)].abs() > 1e-3 * o.f.abs(),
+                "{label} obs{j}: dose 2 (occasion 2) is absorbing, so occasion 2's absorption \
+                 κ must be live (∂f/∂κ₂ = {}, f = {})",
+                o.df_deta[axis(1)],
+                o.f
+            );
+        }
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+}
+
 /// 1-cpt oral IOV: provider == FD of `predict_iov` over `[η_bsv, κ_g0, κ_g1]`.
 #[test]
 fn iov_provider_matches_fd_of_predict_iov() {
@@ -9425,8 +9569,8 @@ fn ode_iov_first_order_route_lag_tvcov_on_kernel_matches_fd() {
         crate::sens::ode_provider::ode_iov_supported(&model),
         "#877: first_order route lag + TV cov must be analytic under IOV"
     );
-    // Per-record WT so the onset kernel KA jumps across the route onset (dose record WT=70,
-    // observations 60..85) — the case the onset-segment snapshot fixes.
+    // Per-record WT (dose records 70, observations 60..85), so the post-side Jacobian moves
+    // across the route onset while the onset kernel `KA` stays the dose's own (#1569).
     let mut subject = iov_subject();
     subject.dose_covariates = vec![
         std::collections::HashMap::from([("WT".to_string(), 70.0)]),

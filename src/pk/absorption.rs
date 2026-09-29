@@ -412,10 +412,11 @@ impl InputRateForcing {
     }
 
     /// Precompute the dose-invariant constants for this forcing's parameters
-    /// (read from the flat individual-parameter vector `params`). Call **once**
-    /// per RHS evaluation, then evaluate [`PreparedInputRate::rate`] per dose —
-    /// this keeps the expensive `ln Γ` (and `KTR`, `ln KTR`) out of the per-dose
-    /// superposition loop on the ODE hot path.
+    /// (read from the flat individual-parameter vector `params`). Call **once** per
+    /// dose record — the ODE engines read every absorption parameter at the dose's
+    /// own record (#1569, `ode::predictions::PreparedForcings`) — then evaluate
+    /// [`PreparedInputRate::rate`] at every RHS call; this keeps the expensive `ln Γ`
+    /// (and `KTR`, `ln KTR`) out of the superposition loop on the ODE hot path.
     pub fn prepare(&self, params: &[f64]) -> PreparedInputRate {
         match self.kind {
             InputRateKind::Transit => {
@@ -508,7 +509,7 @@ impl InputRateForcing {
 }
 
 /// An input-rate forcing with its dose-invariant constants precomputed for the
-/// ODE hot path. Built once per RHS evaluation by [`InputRateForcing::prepare`];
+/// ODE hot path. Built once per dose record by [`InputRateForcing::prepare`];
 /// [`Self::rate`] then costs only the `tad`/`dose`-dependent arithmetic per dose.
 /// Generic over the numeric type `T`: `T = f64` for predictions, `T = Dual2<N>`
 /// for the analytic ODE sensitivity provider (#430). The default `T = f64` keeps

@@ -4728,7 +4728,6 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
     add_prepared_input_rate_forcing(
         &ode,
         &prepared,
-        &pk.values,
         std::slice::from_ref(&rate_defined),
         &lags,
         &f_bio,
@@ -4740,7 +4739,6 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
     add_prepared_input_rate_forcing(
         &ode,
         &prepared,
-        &pk.values,
         std::slice::from_ref(&dur_defined),
         &lags,
         &f_bio,
@@ -4750,9 +4748,15 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
     );
 
     // Rate-defined: mass F·amt = 60 over the *shrunk* window F·nominal = 2.4 h.
-    let want_rate = prepared[0].rate_infused(tad, f * amt, f * nominal_window);
+    let want_rate = prepared
+        .get(0, 0)
+        .prep
+        .rate_infused(tad, f * amt, f * nominal_window);
     // Duration-defined: mass F·amt = 60 over the *held* window nominal = 4 h.
-    let want_dur = prepared[0].rate_infused(tad, f * amt, nominal_window);
+    let want_dur = prepared
+        .get(0, 0)
+        .prep
+        .rate_infused(tad, f * amt, nominal_window);
     assert_relative_eq!(dy_rate[0], want_rate, max_relative = 1e-12);
     assert_relative_eq!(dy_dur[0], want_dur, max_relative = 1e-12);
     assert!(
@@ -5657,14 +5661,51 @@ fn prepare_input_rates_parallel_to_forcings_and_empty_without_them() {
     let ode = transit_accumulator_spec();
     let params = pk_transit_vec(3.0, 2.0, 1.0);
     let prepared = prepare_input_rates(&ode, &params);
-    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared.rows.len(), 1);
     // The hoisted constant must match a direct `prepare` on the same params —
     // the invariant that keeps the #7 hoist from drifting from the per-eval form.
-    assert_eq!(
-        prepared[0].rate(2.5, 100.0),
-        ode.input_rate[0].prepare(&params).rate(2.5, 100.0)
-    );
+    // One shared snapshot serves every dose index.
+    for dose in [0, 1, 7] {
+        assert_eq!(
+            prepared.get(0, dose).prep.rate(2.5, 100.0),
+            ode.input_rate[0].prepare(&params).rate(2.5, 100.0)
+        );
+    }
     assert!(prepare_input_rates(&one_cpt_ode_spec(), &params).is_empty());
+}
+
+/// Per-dose forcings (#1569): dose `k` of forcing `f` reads dose `k`'s own snapshot — its
+/// kernel, its pathway fraction and its route lag — and nothing else's.
+#[test]
+fn per_dose_forcings_read_each_dose_record() {
+    let mut ode = transit_accumulator_spec();
+    ode.input_rate[0].frac_slot = Some(20);
+    ode.input_rate[0].lag_slot = Some(21);
+    let snap = |mtt: f64, frac: f64, route_lag: f64| {
+        let mut v = pk_transit_vec(3.0, mtt, 1.0);
+        v[20] = frac;
+        v[21] = route_lag;
+        v
+    };
+    let snaps = [snap(2.0, 0.4, 0.5), snap(4.0, 0.9, 1.5)];
+    let prepared =
+        PreparedForcings::per_dose(&ode, 2, |k| &snaps[k][..], InputRateForcing::prepare);
+    assert_eq!(prepared.rows.len(), 2);
+    for (k, s) in snaps.iter().enumerate() {
+        let got = prepared.get(0, k);
+        assert_eq!(
+            got.prep.rate(2.5, 100.0),
+            ode.input_rate[0].prepare(s).rate(2.5, 100.0),
+            "dose {k}'s kernel"
+        );
+        assert_eq!(got.frac, s[20], "dose {k}'s pathway fraction");
+        assert_eq!(got.route_lag, s[21], "dose {k}'s route lag");
+    }
+    assert_ne!(
+        prepared.get(0, 0).prep.rate(2.5, 100.0),
+        prepared.get(0, 1).prep.rate(2.5, 100.0),
+        "the two snapshots must give distinguishable kernels, or the rows above could be swapped"
+    );
 }
 
 #[test]
@@ -5721,7 +5762,6 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
     add_prepared_input_rate_forcing(
         &ode,
         &prepared,
-        &params,
         &doses,
         &lags,
         &f_bio,
@@ -5729,23 +5769,13 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         t,
         &mut dy,
     );
-    let want = prepared[0].rate(t, 100.0);
+    let want = prepared.get(0, 0).prep.rate(t, 100.0);
     assert!(want > 0.0);
     assert_relative_eq!(dy[0], want, max_relative = 1e-12);
 
     // A reset_floor after the dose time turns its forcing off.
     let mut dy_off = vec![0.0];
-    add_prepared_input_rate_forcing(
-        &ode,
-        &prepared,
-        &params,
-        &doses,
-        &lags,
-        &f_bio,
-        1.0,
-        t,
-        &mut dy_off,
-    );
+    add_prepared_input_rate_forcing(&ode, &prepared, &doses, &lags, &f_bio, 1.0, t, &mut dy_off);
     assert_eq!(dy_off[0], 0.0);
 }
 
@@ -5818,7 +5848,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
     // The seam adds `FR1·R_in1 + FR2·R_in2`; because the fraction enters
     // linearly, the analytic dual derivative ∂(dy)/∂FR1 is exactly R_in1 (so
     // the FOCEI/Bayes gradient w.r.t. a pathway fraction is exact, no FD).
-    use crate::pk::absorption::{InputRateForcing, InputRateKind, PreparedInputRate};
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
     use crate::sens::dual_mixed::DualMixed;
     use crate::sens::num::PkNum;
     use crate::types::{MAX_PK_PARAMS, PK_IDX_F};
@@ -5865,13 +5895,15 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
 
     // f64: dy = FR1·R_in1 + FR2·R_in2.
     let prepared = prepare_input_rates(&ode, &params);
-    let (r1, r2) = (prepared[0].rate(tad, 100.0), prepared[1].rate(tad, 100.0));
+    let (r1, r2) = (
+        prepared.get(0, 0).prep.rate(tad, 100.0),
+        prepared.get(1, 0).prep.rate(tad, 100.0),
+    );
     assert!(r1 > 0.0 && r2 > 0.0);
     let mut dy = vec![0.0];
     add_prepared_input_rate_forcing(
         &ode,
         &prepared,
-        &params,
         &doses,
         &[0.0],
         &f_bio,
@@ -5891,17 +5923,14 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
     dp[4] = D::constant(5.0);
     dp[5] = D::constant(0.6);
     dp[PK_IDX_F] = D::constant(1.0);
-    let prepared_d: Vec<PreparedInputRate<D>> = ode
-        .input_rate
-        .iter()
-        .map(|f| f.prepare_dual::<D>(&dp).unwrap())
-        .collect();
+    let prepared_d = PreparedForcings::shared(&ode, &dp, |f: &InputRateForcing, p: &[D]| {
+        f.prepare_dual::<D>(p).unwrap()
+    });
     let f_bio_d = vec![D::constant(1.0)];
     let mut dyd = vec![D::constant(0.0)];
     add_prepared_input_rate_forcing(
         &ode,
         &prepared_d,
-        &dp,
         &doses,
         &[],
         &f_bio_d,
@@ -5919,7 +5948,7 @@ fn seam_spanning_adds_base_rhs_and_infusion() {
     // no input_rate forcing the forcing branch is skipped.
     let ode = one_cpt_ode_spec();
     let params = pk_one(1.0, 1.0).values; // ke = cl/v = 1
-    let prepared: Vec<PreparedInputRate> = Vec::new();
+    let prepared = prepare_input_rates(&ode, &params);
     let rhs = wrap_rhs_with_forcings(
         &ode,
         &[],
@@ -5939,7 +5968,7 @@ fn seam_spanning_adds_base_rhs_and_infusion() {
 fn seam_gated_infusion_active_only_inside_window() {
     let ode = one_cpt_ode_spec();
     let params = pk_one(0.0, 1.0).values; // ke = 0 ⇒ base RHS = 0
-    let prepared: Vec<PreparedInputRate> = Vec::new();
+    let prepared = prepare_input_rates(&ode, &params);
     let rhs = wrap_rhs_with_forcings(
         &ode,
         &[],
@@ -5984,7 +6013,11 @@ fn seam_applies_input_rate_forcing_on_top_of_base_rhs() {
     let t = 1.5;
     let mut dy = vec![0.0];
     rhs(&[0.0], &params, t, &mut dy);
-    assert_relative_eq!(dy[0], prepared[0].rate(t, 100.0), max_relative = 1e-12);
+    assert_relative_eq!(
+        dy[0],
+        prepared.get(0, 0).prep.rate(t, 100.0),
+        max_relative = 1e-12
+    );
 }
 
 #[test]
@@ -13211,5 +13244,423 @@ fn unanchored_dose_clock_error_is_silent_without_a_compiled_rhs_program() {
     assert!(
         unanchored_dose_clock_error(&ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0).is_none(),
         "no compiled RHS program ⇒ no dose clock to refuse"
+    );
+}
+
+// ---- #1569: a dose's absorption kernel is fixed at its own dose record ----------------------
+//
+// Every built-in absorption forcing is a *per-dose* density: dose `d` delivers
+// `F·D·frac·R_in(t − t_d − lag − lag_route)`, and `∫₀^∞ R_in = 1`. That integral is 1 only if
+// the density a dose is absorbed through is ONE density. Re-reading the kernel's parameters
+// (`n`/`mtt`, `mat`/`cv2`, `td`/`β`, `ka`), its pathway fraction or its route lag at every
+// segment splices two densities at the same time-since-dose, and the spliced integral is not 1:
+// the model creates or destroys drug. These fixtures read the absorbed mass straight off a
+// one-state accumulator (`dy = R_in`), so the reference is the closed form `F·D`, outside every
+// engine.
+
+/// One-state accumulator fed by `forcings`: `d/dt(depot) = Σ R_in`, readout = the state, so a
+/// prediction IS the mass absorbed so far.
+fn accumulator_with(forcings: Vec<InputRateForcing>) -> OdeSpec {
+    let mut ode = transit_accumulator_spec();
+    ode.input_rate = forcings;
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-12;
+    ode
+}
+
+// Individual-parameter slots for these fixtures, clear of every canonical `PK_IDX_*` (0–12).
+// Not cosmetic: the default `DoseAttrMap` reads `F` from slot 5 and the compartment lag from
+// slot 8, so a fixture value written there silently becomes a dose attribute too.
+const ARG_1: usize = 20;
+const ARG_2: usize = 21;
+const FR_1: usize = 22;
+const FR_2: usize = 23;
+const ROUTE_LAG: usize = 24;
+const _: () = assert!(ARG_1 > crate::types::PK_IDX_CV2);
+
+fn forcing(kind: InputRateKind, arg_slots: Vec<usize>) -> InputRateForcing {
+    InputRateForcing {
+        cmt: 0,
+        kind,
+        arg_slots,
+        frac_slot: None,
+        lag_slot: None,
+    }
+}
+
+/// A PK snapshot with `F = 1` and `(slot, value)` pairs written over the defaults.
+fn snapshot(values: &[(usize, f64)]) -> PkParams {
+    let mut p = PkParams::default();
+    p.values[crate::types::PK_IDX_F] = 1.0;
+    for &(slot, v) in values {
+        p.values[slot] = v;
+    }
+    p
+}
+
+/// Absorbed fraction of `doses` (all into compartment 1, `F = 1`) at the last observation, on
+/// the event-driven engine with the given per-record snapshots.
+fn absorbed_fraction(
+    ode: &OdeSpec,
+    doses: Vec<DoseEvent>,
+    pk_at_dose: &[PkParams],
+    obs_times: Vec<f64>,
+    pk_at_obs: &[PkParams],
+) -> f64 {
+    let total: f64 = doses.iter().map(|d| d.amt).sum();
+    let subject = make_subject(doses, obs_times);
+    let preds =
+        ode_predictions_event_driven(ode, &subject, &[], &[], pk_at_dose, pk_at_obs, &[], &[]);
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "the accumulator must integrate: {preds:?}"
+    );
+    preds.last().copied().unwrap() / total
+}
+
+/// **The mass ledger, per kernel kind.** One dose at `t = 0`; the kernel parameter changes at an
+/// observation record `t_s` while the dose is still absorbing (the observation at `t_s`
+/// terminates — so governs — `[0, t_s]`, the one at `t = 200` governs `(t_s, 200]`). The dose
+/// must absorb exactly its own mass.
+#[test]
+fn an_in_flight_dose_absorbs_exactly_its_mass_when_its_kernel_parameter_switches() {
+    use InputRateKind::*;
+    // (kind, arg slots, parameters at the dose, parameters after the switch, switch time)
+    let cases: [(InputRateKind, &[usize], [f64; 2], [f64; 2], f64); 6] = [
+        (Transit, &[ARG_1, ARG_2], [3.0, 4.0], [3.0, 2.5], 5.0),
+        (Transit, &[ARG_1, ARG_2], [3.0, 2.0], [3.0, 4.0], 2.0),
+        (Transit, &[ARG_1, ARG_2], [3.0, 4.0], [3.0, 2.0], 3.0),
+        (
+            InverseGaussian,
+            &[ARG_1, ARG_2],
+            [4.0, 0.5],
+            [2.0, 0.5],
+            3.0,
+        ),
+        (Weibull, &[ARG_1, ARG_2], [4.0, 2.0], [2.0, 2.0], 3.0),
+        (FirstOrder, &[ARG_1], [0.5, 0.0], [2.0, 0.0], 2.0),
+    ];
+    let mut report = Vec::new();
+    let mut worst = 0.0_f64;
+    for (kind, slots, at_dose, after, t_s) in cases {
+        let ode = accumulator_with(vec![forcing(kind, slots.to_vec())]);
+        let a = snapshot(&[(ARG_1, at_dose[0]), (ARG_2, at_dose[1])]);
+        let b = snapshot(&[(ARG_1, after[0]), (ARG_2, after[1])]);
+        let absorbed = absorbed_fraction(
+            &ode,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[a],
+            vec![t_s, 200.0],
+            &[a, b],
+        );
+        report.push(format!(
+            "{kind:?} {at_dose:?}->{after:?}@{t_s}: {absorbed:.12}"
+        ));
+        worst = worst.max((absorbed - 1.0).abs());
+    }
+    println!(
+        "#1569 mass ledger: {}; worst |1 - absorbed| = {worst:.3e}",
+        report.join("; ")
+    );
+    assert!(
+        worst < 1e-10,
+        "a dose must absorb exactly its own mass through the kernel of its own dose record; \
+         worst |1 - absorbed| = {worst:.3e} ({})",
+        report.join("; ")
+    );
+}
+
+/// The same ledger across **two overlapping doses**, with the switch arriving on the second
+/// dose's **record**: dose 2's row at `t = 3` carries `MTT = 2` and governs the interval ending
+/// there, so dose 1 (`MTT = 4`, still ~93 % unabsorbed) meets the new value on a dose record
+/// rather than an observation. Each dose must keep its own kernel: 200 of 200 absorbed. Reading
+/// the kernel per segment instead absorbs dose 1 through `MTT = 4` until the observation at
+/// `t = 1.5` and through `MTT = 2` after it, and the pair delivers ~171 of 200.
+#[test]
+fn overlapping_doses_each_keep_the_kernel_of_their_own_dose_record() {
+    let ode = accumulator_with(vec![forcing(InputRateKind::Transit, vec![ARG_1, ARG_2])]);
+    let slow = snapshot(&[(ARG_1, 3.0), (ARG_2, 4.0)]);
+    let fast = snapshot(&[(ARG_1, 3.0), (ARG_2, 2.0)]);
+    let absorbed = absorbed_fraction(
+        &ode,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(3.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[slow, fast],
+        vec![1.5, 6.0, 200.0],
+        &[slow, fast, fast],
+    );
+    println!("#1569 two-dose ledger: absorbed {absorbed:.12} of the regimen");
+    assert!(
+        (absorbed - 1.0).abs() < 1e-10,
+        "each dose must absorb exactly its own mass; absorbed {absorbed} of the regimen"
+    );
+}
+
+/// The **pathway fraction** is part of the dose's kernel too. `FR1·first_order(KA1) +
+/// FR2·first_order(KA2)` with `FR1 + FR2 = 1` at every record, the split flipping from
+/// 0.3/0.7 to 0.7/0.3 while the dose is absorbing: the fractions of the dose record must hold,
+/// or the two pathways deliver `≠ F·D` between them (~1.28 of it with a per-segment read).
+#[test]
+fn a_pathway_fraction_is_read_at_the_dose_record() {
+    let pathway = |ka_slot: usize, fr_slot: usize| InputRateForcing {
+        frac_slot: Some(fr_slot),
+        ..forcing(InputRateKind::FirstOrder, vec![ka_slot])
+    };
+    let ode = accumulator_with(vec![pathway(ARG_1, FR_1), pathway(ARG_2, FR_2)]);
+    let at_dose = snapshot(&[(ARG_1, 0.3), (ARG_2, 3.0), (FR_1, 0.3), (FR_2, 0.7)]);
+    let flipped = snapshot(&[(ARG_1, 0.3), (ARG_2, 3.0), (FR_1, 0.7), (FR_2, 0.3)]);
+    let absorbed = absorbed_fraction(
+        &ode,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[at_dose],
+        vec![1.0, 200.0],
+        &[at_dose, flipped],
+    );
+    println!("#1569 pathway-fraction ledger: absorbed {absorbed:.12}");
+    assert!(
+        (absorbed - 1.0).abs() < 1e-10,
+        "the pathway split of the dose record must hold for the whole absorption; absorbed \
+         {absorbed}"
+    );
+}
+
+/// The **per-route lag** is part of the dose's kernel too. `first_order(ka=KA, lag=LAG)` with
+/// `LAG` moving 1 → 3 after the route has switched on at `t = 1`: the onset of the dose record
+/// must hold. Re-reading the lag shifts the density mid-absorption, so the part already
+/// delivered (~39 %) is delivered again (~1.39 of the dose with a per-segment read).
+#[test]
+fn a_per_route_lag_is_read_at_the_dose_record() {
+    let ode = accumulator_with(vec![InputRateForcing {
+        lag_slot: Some(ROUTE_LAG),
+        ..forcing(InputRateKind::FirstOrder, vec![ARG_1])
+    }]);
+    let at_dose = snapshot(&[(ARG_1, 0.5), (ROUTE_LAG, 1.0)]);
+    let later = snapshot(&[(ARG_1, 0.5), (ROUTE_LAG, 3.0)]);
+    let absorbed = absorbed_fraction(
+        &ode,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[at_dose],
+        vec![2.0, 200.0],
+        &[at_dose, later],
+    );
+    println!("#1569 route-lag ledger: absorbed {absorbed:.12}");
+    assert!(
+        (absorbed - 1.0).abs() < 1e-10,
+        "the route onset of the dose record must hold for the whole absorption; absorbed \
+         {absorbed}"
+    );
+}
+
+/// **Every per-dose attribute, against a closed form.** Two `first_order` pathways into the
+/// accumulator — `FR_A·first_order(ka=KA_A, lag=LAG_A) + FR_B·first_order(ka=KA_B)` — and two
+/// doses whose records carry different `KA`s, fractions and route lag, while the observation
+/// records carry a third set the engine must never apply. First-order absorption has a
+/// closed-form cumulative, so the reference is exact and outside every engine:
+/// `A(t) = Σ_d D·[FR_A,d·(1 − e^{−KA_A,d·(t − t_d − LAG_A,d)})₊ + FR_B,d·(1 − e^{−KA_B,d·(t − t_d)})₊]`.
+///
+/// The single-dose ledgers above cannot see *which* dose a kernel, fraction or route lag is
+/// taken from: a forcing loop that reads dose 0's attributes for every dose still conserves
+/// each dose's mass. This does. And since the value path and the `Dual2` walk share that loop,
+/// no FD parity can see such a slip either.
+#[test]
+fn each_dose_absorbs_through_its_own_kernel_fraction_and_route_lag() {
+    const KA_A: usize = ARG_1;
+    const KA_B: usize = ARG_2;
+    let ode = accumulator_with(vec![
+        InputRateForcing {
+            frac_slot: Some(FR_1),
+            lag_slot: Some(ROUTE_LAG),
+            ..forcing(InputRateKind::FirstOrder, vec![KA_A])
+        },
+        InputRateForcing {
+            frac_slot: Some(FR_2),
+            ..forcing(InputRateKind::FirstOrder, vec![KA_B])
+        },
+    ]);
+    let rec = |ka_a: f64, ka_b: f64, fr_a: f64, lag_a: f64| {
+        snapshot(&[
+            (KA_A, ka_a),
+            (KA_B, ka_b),
+            (FR_1, fr_a),
+            (FR_2, 1.0 - fr_a),
+            (ROUTE_LAG, lag_a),
+        ])
+    };
+    let dose_1 = rec(0.5, 2.0, 0.3, 1.0);
+    let dose_2 = rec(1.5, 0.8, 0.6, 0.5);
+    let elsewhere = rec(5.0, 0.1, 0.9, 4.0);
+    let doses = [(0.0, dose_1), (2.0, dose_2)];
+    let obs = [1.5, 2.2, 3.0, 5.0, 8.0, 20.0];
+    let subject = make_subject(
+        doses
+            .iter()
+            .map(|&(t, _)| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect(),
+        obs.to_vec(),
+    );
+    let got = ode_predictions_event_driven(
+        &ode,
+        &subject,
+        &[],
+        &[],
+        &[dose_1, dose_2],
+        &[elsewhere; 6],
+        &[],
+        &[],
+    );
+    let cumulative = |ka: f64, t_since: f64| -> f64 {
+        if t_since > 0.0 {
+            1.0 - (-ka * t_since).exp()
+        } else {
+            0.0
+        }
+    };
+    let mut worst = 0.0_f64;
+    for (j, &t) in obs.iter().enumerate() {
+        let want: f64 = doses
+            .iter()
+            .map(|&(t_d, p)| {
+                let v = |slot: usize| p.values[slot];
+                100.0
+                    * (v(FR_1) * cumulative(v(KA_A), t - t_d - v(ROUTE_LAG))
+                        + v(FR_2) * cumulative(v(KA_B), t - t_d))
+            })
+            .sum();
+        assert!(
+            got[j].is_finite() && want > 0.0,
+            "obs {j} (t = {t}): ferx {} vs closed form {want}",
+            got[j]
+        );
+        worst = worst.max((got[j] - want).abs() / want);
+    }
+    println!("#1569 per-dose closed form: worst rel {worst:.3e}");
+    assert!(
+        worst < 1e-9,
+        "a dose must absorb through its own KA, fraction and route lag; worst rel {worst:.3e} \
+         (ferx {got:?})"
+    );
+}
+
+/// **A steady-state dose superposes its implied past pulses through its own kernel** (#1573
+/// review, finding 1). The forcing loop's `SS=1` arm sums the in-flight tails of the dose's
+/// implied pulse train (`ss_periodic_forcing`), and that sum must use the kernel of the SS
+/// dose's own record: the one `equilibrate_ss_state` seeds the trough with, from `pk_at_dose`.
+///
+/// Two `SS=1` regimens switch the kernel, as a formulation change on a new occasion would,
+/// and the observation records carry a third kernel that the engine must never apply. The
+/// second regimen's dose is **dose 1**, which is what the single-dose SS fixtures (#719)
+/// cannot provide: their only dose is dose 0, so an SS arm reading dose 0's kernel passes
+/// them. Only the second regimen is observed, because that is where dose 1's kernel is in
+/// flight. The first regimen's kernels are fast enough that its tail at `SECOND_REGIMEN` is
+/// below 1e-15 of a dose.
+///
+/// The disposition is one compartment (`ke = CL/V`), and the reference is the steady state
+/// in closed form, outside every engine: `A(τ) = D·Σ_{j≥0} g(τ + j·II)`, where `g` is the
+/// kernel convolved with first-order elimination:
+///
+/// * `first_order(ka)`: `g(t) = ka/(ka − ke)·(e^{−ke·t} − e^{−ka·t})`;
+/// * `transit(n, mtt)`, integer `n`, `ktr = (n+1)/mtt`, `x = (ktr − ke)·t`:
+///   `g(t) = (ktr/(ktr − ke))^{n+1}·e^{−ke·t}·(1 − e^{−x}·Σ_{k≤n} x^k/k!)`.
+#[test]
+fn a_steady_state_dose_superposes_its_past_pulses_through_its_own_kernel() {
+    const CL: f64 = 2.0;
+    const V: f64 = 20.0;
+    const II: f64 = 12.0;
+    const AMT: f64 = 100.0;
+    const SECOND_REGIMEN: f64 = 120.0;
+    let ke = CL / V;
+    // The steady state needs an eliminating state, which the accumulator above does not have.
+    let one_cpt_with = |kernel: InputRateForcing| {
+        let mut ode = first_order_one_cpt_spec();
+        ode.input_rate = vec![kernel];
+        ode.solver_opts.reltol = 1e-12;
+        ode.solver_opts.abstol = 1e-12;
+        ode
+    };
+    let first_order_g = |ka: f64, t: f64| ka / (ka - ke) * ((-ke * t).exp() - (-ka * t).exp());
+    let transit_g = |n: f64, mtt: f64, t: f64| {
+        let ktr = (n + 1.0) / mtt;
+        let x = (ktr - ke) * t;
+        let (mut term, mut partial) = (1.0, 1.0);
+        for k in 1..=(n as usize) {
+            term *= x / k as f64;
+            partial += term;
+        }
+        (ktr / (ktr - ke)).powf(n + 1.0) * (-ke * t).exp() * (1.0 - (-x).exp() * partial)
+    };
+    // (kind, arg slots, regimen 1's kernel, regimen 2's kernel, the observations' kernel)
+    let cases: [(InputRateKind, &[usize], [f64; 2], [f64; 2], [f64; 2]); 2] = [
+        (
+            InputRateKind::FirstOrder,
+            &[ARG_1],
+            [0.3, 0.0],
+            [0.4, 0.0],
+            [5.0, 0.0],
+        ),
+        (
+            InputRateKind::Transit,
+            &[ARG_1, ARG_2],
+            [3.0, 6.0],
+            [3.0, 2.5],
+            [3.0, 0.5],
+        ),
+    ];
+    let obs: Vec<f64> = [0.5, 2.0, 5.0, 11.5]
+        .iter()
+        .map(|o| SECOND_REGIMEN + o)
+        .collect();
+    let subject = make_subject(
+        vec![
+            DoseEvent::new(0.0, AMT, 1, 0.0, true, II),
+            DoseEvent::new(SECOND_REGIMEN, AMT, 1, 0.0, true, II),
+        ],
+        obs.clone(),
+    );
+    let mut worst = 0.0_f64;
+    for (kind, slots, regimen_1, regimen_2, elsewhere) in cases {
+        let ode = one_cpt_with(forcing(kind, slots.to_vec()));
+        let rec = |args: [f64; 2]| {
+            snapshot(&[
+                (crate::types::PK_IDX_CL, CL),
+                (crate::types::PK_IDX_V, V),
+                (ARG_1, args[0]),
+                (ARG_2, args[1]),
+            ])
+        };
+        let got = ode_predictions_event_driven(
+            &ode,
+            &subject,
+            &[],
+            &[],
+            &[rec(regimen_1), rec(regimen_2)],
+            &vec![rec(elsewhere); obs.len()],
+            &[],
+            &[],
+        );
+        let g = |t: f64| match kind {
+            InputRateKind::FirstOrder => first_order_g(regimen_2[0], t),
+            _ => transit_g(regimen_2[0], regimen_2[1], t),
+        };
+        for (j, &t) in obs.iter().enumerate() {
+            let want: f64 = AMT
+                * (0..400)
+                    .map(|p| g(t - SECOND_REGIMEN + p as f64 * II))
+                    .sum::<f64>();
+            assert!(
+                got[j].is_finite() && want > 0.0,
+                "{kind:?} obs {j} (t = {t}): ferx {} vs closed form {want}",
+                got[j]
+            );
+            worst = worst.max((got[j] - want).abs() / want);
+        }
+    }
+    // Measured: 5.4e-11 (`first_order`), 1.2e-12 (`transit`); the bound carries ~18x.
+    println!("#1573 steady-state kernel per dose: worst rel {worst:.3e}");
+    assert!(
+        worst < 1e-9,
+        "each SS dose must superpose its past pulses through its own record's kernel; worst \
+         rel {worst:.3e}"
     );
 }
