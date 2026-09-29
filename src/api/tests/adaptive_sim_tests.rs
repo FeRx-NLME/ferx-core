@@ -7241,3 +7241,110 @@ fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
         "missing selector: got: {err}"
     );
 }
+
+/// Depot → central with `ALAG1` on the depot only, for the #1588 tie fixtures.
+fn ode_depot_alag1(lag: f64) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta TVLAG({lag}, 0.0, 10.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-11
+"#
+    )
+}
+
+/// **The adaptive driver wipes a dose an `SS=1` record reset** (#1588). It shares the static
+/// walker's two passes (`reseed_prescheduled_states_at`, then the bolus pass over the growing
+/// `shadow` list), so it inherited the static walker's row-order defect: a bolus row before a
+/// co-timed `SS=1` row applied after the reset (ID 1, lag 0: +127 %), and at lag 2 a first
+/// `SS=1` dose's arrival re-loaded its own trough over a later record's seed (ID 9: −48 %).
+/// A controller dose into central at 25 (after the tie) exercises the gate's index space over the shadow
+/// list: base doses then the injected one, which is live. The frozen-replay verifier runs
+/// (`verify = true`), and the oracle is the static `predict` on the live-only twin plus the
+/// controller dose — the static walker is pinned against NONMEM separately
+/// (`tests/ss_reset_tie_nonmem_anchor.rs`).
+#[test]
+fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
+    let ss = |t: f64, amt: f64| DoseEvent::new(t, amt, 1, 0.0, true, 12.0);
+    let central = |t: f64| DoseEvent::new(t, 100.0, 2, 0.0, false, 0.0);
+    let obs = vec![11.5, 12.5, 15.0, 21.0, 26.0, 30.0];
+    // (label, lag, base regimen, live-only twin)
+    let fixtures = [
+        (
+            "ID 1: bolus central, then SS=1",
+            0.0,
+            vec![central(10.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+        ),
+        (
+            "ID 9: SS=1 100 at 10, SS=1 200 at 11",
+            2.0,
+            vec![ss(10.0, 100.0), ss(11.0, 200.0)],
+            vec![ss(11.0, 200.0)],
+        ),
+        (
+            "ID 11: SS=1 100, then SS=1 200 (co-timed)",
+            2.0,
+            vec![ss(10.0, 100.0), ss(10.0, 200.0)],
+            vec![ss(10.0, 200.0)],
+        ),
+    ];
+    let mut worst = 0.0_f64;
+    for (label, lag, base, twin) in fixtures {
+        let model = parse_full_model(&ode_depot_alag1(lag)).unwrap().model;
+        let pop = population(vec![subj("1", obs.clone(), base)]);
+        let mut opts = AdaptiveSimulateOptions::default();
+        opts.seed = Some(1);
+        opts.decision_times = vec![25.0];
+        // Into central: lagged controller dosing (the depot) is rejected at injection.
+        let central_bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 2 }];
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, central_bolus, &opts)
+            .expect("adaptive sim runs and passes the frozen-replay verifier");
+        assert_eq!(res.ledger.len(), 1, "{label}: one controller dose at 25");
+
+        let mut want_doses = twin;
+        want_doses.push(central(25.0));
+        let want_pop = population(vec![subj("1", obs.clone(), want_doses)]);
+        let want = predict(&model, &want_pop, &model.default_params).unwrap();
+        assert_eq!(res.trajectories.len(), want.len());
+        for (got, w) in res.trajectories.iter().zip(&want) {
+            assert!(got.ipred.is_finite(), "{label} t={}: non-finite", got.time);
+            let rel = (got.ipred - w.pred).abs() / w.pred.abs();
+            // Measured 1.9e-5 (1.9e-4 with `omega ~ 0.0`). That is the adaptive driver's own
+            // floor against the static walker, unattributed and not this issue (the same
+            // driver sits 3.1e-4 off NONMEM on an `SS=1`-alone subject). The bound is the
+            // one the NONMEM anchor derives from it; the smallest defect it guards is +31 % (ID 11).
+            assert!(
+                rel < 1e-3,
+                "adaptive, {label}, lag {lag}, t = {}: {} vs static live-only twin {} \
+                 (rel {rel:+.3e}) — a dose the SS=1 record wiped still arrived",
+                got.time,
+                got.ipred,
+                w.pred
+            );
+            worst = worst.max(rel);
+        }
+    }
+    println!("#1588 adaptive vs static live-only twin: worst rel {worst:.3e}");
+}

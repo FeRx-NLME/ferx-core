@@ -13902,3 +13902,220 @@ fn the_ss_equilibration_trough_is_bit_identical_under_the_reset_gate() {
         assert_eq!(got, bits, "{kind:?}: SS trough moved (values {trough:?})");
     }
 }
+
+/// Depot → central, `ALAG1` in `lag_slot` on the depot only (as NONMEM's `ALAG1`); the
+/// readout is the central amount. The fixture of the #1588 tie tests.
+fn depot_central_lag_spec(lag_slot: usize) -> OdeSpec {
+    let mut map = crate::types::DoseAttrMap::default();
+    map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            let ka = p[4];
+            dy[0] = -ka * y[0];
+            dy[1] = ka * y[0] - ke * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["depot".into(), "central".into()],
+        readout: OdeReadout::ObsCmt(1),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            reltol: 1e-11,
+            abstol: 1e-11,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: map,
+        init_fn: None,
+    }
+}
+
+/// The #1588 tie fixtures (the IDs of `nonmem_anchor/ss_reset_tie.csv`), each with the
+/// **live-only twin**: the doses left once the `SS=1` reset has wiped every dose whose
+/// record precedes it in (time, row order). After the last record the prediction must
+/// equal the twin's in the same engine; the twin carries no tie and no pending dose, so it
+/// does not exercise the convention under test. `(label, doses, twin)`.
+fn ss_tie_fixtures() -> Vec<(&'static str, Vec<DoseEvent>, Vec<DoseEvent>)> {
+    let depot = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let central = |t: f64| DoseEvent::new(t, 100.0, 2, 0.0, false, 0.0);
+    let ss = |t: f64, amt: f64| DoseEvent::new(t, amt, 1, 0.0, true, 12.0);
+    vec![
+        (
+            "ID 1: bolus central, then SS=1 (co-timed)",
+            vec![central(10.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+        ),
+        (
+            "ID 3: bolus depot, then SS=1 (co-timed)",
+            vec![depot(10.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+        ),
+        (
+            "ID 7: residual depot bolus at 0, then as ID 1",
+            vec![depot(0.0), central(10.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+        ),
+        (
+            "ID 9: SS=1 100 at 10, SS=1 200 at 11",
+            vec![ss(10.0, 100.0), ss(11.0, 200.0)],
+            vec![ss(11.0, 200.0)],
+        ),
+        (
+            "ID 10: depot bolus at 9, SS=1 at 10",
+            vec![depot(9.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+        ),
+        (
+            "ID 11: SS=1 100, then SS=1 200 (co-timed)",
+            vec![ss(10.0, 100.0), ss(10.0, 200.0)],
+            vec![ss(10.0, 200.0)],
+        ),
+    ]
+}
+
+/// Every ODE state engine on `subject`, each named. `ode_dense_solve_states` reads the
+/// central state at the observation times.
+fn ss_tie_engines(
+    ode: &OdeSpec,
+    pk: &PkParams,
+    subject: &Subject,
+) -> Vec<(&'static str, Vec<f64>)> {
+    let nd = subject.doses.len();
+    let no = subject.obs_times.len();
+    let dense = ode_dense_solve_states(ode, &pk.values, &[], &[], subject, &subject.obs_times);
+    let mut hold = |_: &ControllerCtx| vec![DoseAction::Hold];
+    let adaptive = ode_predictions_adaptive(
+        ode,
+        &pk.values,
+        &[],
+        &[],
+        subject,
+        &[25.0],
+        &[],
+        &mut hold,
+        100,
+        None,
+    )
+    .expect("adaptive driver runs")
+    .predictions;
+    vec![
+        (
+            "ode_predictions",
+            ode_predictions(ode, &pk.values, &[], &[], subject),
+        ),
+        (
+            "ode_predictions_with_states",
+            ode_predictions_with_states(ode, &pk.values, &[], &[], subject).0,
+        ),
+        (
+            "ode_predictions_event_driven",
+            ode_predictions_event_driven(
+                ode,
+                subject,
+                &[],
+                &[],
+                &vec![*pk; nd],
+                &vec![*pk; no],
+                &[],
+                &[],
+            ),
+        ),
+        (
+            "ode_predictions_event_driven_with_states",
+            ode_predictions_event_driven_with_states(
+                ode,
+                subject,
+                &[],
+                &[],
+                &vec![*pk; nd],
+                &vec![*pk; no],
+                &[],
+                &[],
+            )
+            .0,
+        ),
+        (
+            "ode_dense_solve_states",
+            dense.iter().map(|s| s[1]).collect(),
+        ),
+        ("ode_predictions_adaptive", adaptive),
+    ]
+}
+
+/// **An `SS=1` record wipes a dose whose record precedes it in (time, row order), on every
+/// ODE state engine** (#1588). A bolus row *before* a co-timed `SS=1` row, and a lagged dose
+/// still pending at an `SS=1` record, contribute nothing after it: each fixture must equal
+/// its live-only twin in the same engine. Before the fix the static walker and the adaptive
+/// driver applied the co-timed bolus after the reset (lag 0, IDs 1/3/7/11: up to +127 %),
+/// and at lag 2 every engine did, because the record-time seed sorts before every co-timed
+/// arrival. ID 9 at lag 2 is the fixture that reaches the arrival re-equilibration gate
+/// alone: the first `SS=1` dose's jump is already skipped by the bolus gate, but its arrival
+/// at 12 would re-load its own trough over the second record's seed.
+///
+/// The straddle is in the same test: ID 2 (`SS=1` row, *then* the bolus) superposes and
+/// must differ from the same twin by > 40 %. At lag 2 that leg is asserted on the
+/// event-driven engines only: the dense walks re-equilibrate at the lagged `SS=1` arrival
+/// and wipe it there (#1275), which would read as "equal to the twin" for the wrong reason.
+#[test]
+fn an_ss_record_wipes_a_preceding_co_timed_or_pending_dose_on_every_ode_engine() {
+    let lag_slot = 20usize; // an `ALAG1` slot; the bare `lagtime` slot (8) would lag the central bolus too
+    let ode = depot_central_lag_spec(lag_slot);
+    let obs = vec![11.5, 12.5, 15.0, 21.0, 30.0];
+    let mut worst = 0.0_f64;
+    for lag in [0.0, 2.0] {
+        let mut pk = pk_one(2.0, 20.0);
+        pk.values[4] = 0.15;
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        pk.values[lag_slot] = lag;
+        for (label, doses, twin) in ss_tie_fixtures() {
+            let got = ss_tie_engines(&ode, &pk, &make_subject(doses, obs.clone()));
+            let want = ss_tie_engines(&ode, &pk, &make_subject(twin, obs.clone()));
+            for ((engine, g), (_, w)) in got.iter().zip(&want) {
+                for (j, &t) in obs.iter().enumerate() {
+                    assert!(
+                        g[j].is_finite() && w[j] > 0.0,
+                        "{engine}, lag {lag}, {label}, t = {t}: {} vs twin {}",
+                        g[j],
+                        w[j]
+                    );
+                    let rel = (g[j] - w[j]).abs() / w[j];
+                    // Measured 4.3e-14 (the extra breaks a wiped dose leaves behind); the
+                    // smallest defect guarded is +9.8 %.
+                    assert!(
+                        rel < 1e-11,
+                        "{engine}, lag {lag}, {label}, t = {t}: {} vs live-only twin {} \
+                         (rel {rel:+.3e}) — a dose the SS=1 record wiped still arrived",
+                        g[j],
+                        w[j]
+                    );
+                    worst = worst.max(rel);
+                }
+            }
+        }
+        // The straddle: the bolus row *after* the `SS=1` row superposes (ID 2).
+        let central_after = vec![
+            DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(10.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let twin = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0)];
+        let got = ss_tie_engines(&ode, &pk, &make_subject(central_after, obs.clone()));
+        let want = ss_tie_engines(&ode, &pk, &make_subject(twin, obs.clone()));
+        for ((engine, g), (_, w)) in got.iter().zip(&want) {
+            if lag > 0.0 && !engine.contains("event_driven") {
+                continue; // #1275: the dense walks' arrival re-equilibration wipes it.
+            }
+            assert!(
+                (g[0] - w[0]) / w[0] > 0.4,
+                "{engine}, lag {lag}, ID 2: the bolus row after the SS=1 row must superpose \
+                 ({} vs SS=1 alone {})",
+                g[0],
+                w[0]
+            );
+        }
+    }
+    println!("#1588 tie vs live-only twin: worst rel {worst:.3e}");
+}

@@ -227,10 +227,10 @@ fn an_ode_absorption_forcing_resets_at_an_ss_record_like_nonmem() {
 }
 
 /// The control: an explicit depot state was already reset by the SS equilibration, and
-/// #1576 does not touch it. **ID 51 is excluded**: the static ODE walker applies a bolus
-/// whose row precedes a co-timed `SS=1` row on top of the steady state (+9.4 % / +44 %),
-/// a state-engine tie-order gap tracked as #1588 — remove the exclusion to test its fix.
-/// Measured 3.1e-9 on the rest, unchanged from `a1084260`; the bound carries ~3x.
+/// #1576 does not touch it. ID 51 (a bolus row before a co-timed `SS=1` row) was excluded
+/// until #1588: the static ODE walker applied that bolus on top of the steady state
+/// (+9.4 % / +44 %). It now gates the bolus on the reset, so every ID is asserted.
+/// Measured 3.1e-9, unchanged from `a1084260`; the bound carries ~3x.
 #[test]
 fn an_ode_depot_state_was_already_reset_and_still_is() {
     assert_matches(
@@ -239,7 +239,7 @@ fn an_ode_depot_state_was_already_reset_and_still_is() {
         ADVAN2_DATA,
         ADVAN2_TABLE,
         1e-8,
-        &["51"],
+        &[],
     );
 }
 
