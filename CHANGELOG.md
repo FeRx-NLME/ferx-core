@@ -77,9 +77,10 @@ section of the SDLC for the versioning policy).
   solve. Per subject the walk is 3–4× faster than the twin at default ODE tolerances
   (transit; IG 1.1–2.3×) and 12–30× faster at `ode_reltol = 1e-12`. It matches an
   independent quadrature to 1e-14 and the twin to its tolerance. A subject still goes to
-  the twin if an interval's elimination reaches the absorption rate of a dose that is
-  still open (the flip-flop regime), or if it has an SS dose, an infusion or a
-  `TIME`-dependent parameter. Two side effects, for **non-IOV** TV-covariate subjects of
+  the twin if an interval's elimination reaches the absorption rate of any dose that has
+  arrived by then, even one long since absorbed (the flip-flop regime); if it has an SS
+  dose, an infusion or a `TIME`-dependent parameter; or if the walk could not serve its
+  gradient analytically (an IOV subject with 24 or more stacked random effects). Two side effects, for **non-IOV** TV-covariate subjects of
   these models:
   - `[derived]` expressions that read `compartments[i]` now evaluate to `NaN`, as
     `W_DERIVED_CMT_TV_ANALYTICAL` already said. That is the rule for every analytical

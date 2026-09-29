@@ -1587,7 +1587,9 @@ fn iov_program_axes(model: &CompiledModel) -> usize {
 }
 
 /// True when [`subject_sensitivities_iov`] can serve this model: any analytical
-/// 1-/2-/3-cpt IOV model (`n_kappa > 0`), no ODE, no scaling/LTBS/lagtime, a usable
+/// 1-/2-/3-cpt IOV model (`n_kappa > 0`) — and, since #1560, a closed-form transit / IG
+/// model that has an ODE twin, whose IOV subjects the absorption walk serves per subject
+/// (the rest keep the twin) — no ODE, no scaling/LTBS/lagtime, a usable
 /// `[individual_parameters]` program whose axes are `(n_theta, n_eta_bsv+n_kappa)`.
 /// Time-varying covariates ARE supported (each event's PK-param derivatives are
 /// seeded at that event's covariate snapshot). Narrowly scoped on purpose —

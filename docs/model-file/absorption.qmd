@@ -298,7 +298,11 @@ serves:
 
 - a `TIME`-dependent structural parameter;
 - a **steady-state (`SS=1`) dose** or an **infusion (`RATE>0`)** (#719);
-- any subject the walk cannot factorise — the flip-flop regime, below.
+- any subject the walk cannot factorise — the flip-flop regime, below;
+- a subject whose gradient the walk cannot serve analytically, so that it keeps the twin's
+  analytic ODE sensitivities rather than falling back to finite differences: an IOV subject
+  with `n_eta + K·n_kappa ≥ 24` stacked random effects (`K` occasions), or a time-varying
+  covariate model outside the closed-form analytic-sensitivity scope.
 
 **System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are
 still rejected** with an actionable message. Use the `transit()` ODE forcing above for those.
@@ -311,9 +315,10 @@ When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
 faster disposition), the closed form is outside its convergence domain. ferx detects
 this *per evaluation* and routes the model to its exact ODE `transit()` twin, which
 is valid in both regimes. On the IOV / time-varying-covariate walk the test is per
-**(interval, open dose) pair**: every interval's `ke` must sit below the `KTR` of every
-dose that has arrived by then, each at its own dose-record kernel. So one slow dose that is
-still open when a later occasion raises `CL` sends that subject to the twin (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
+**(interval, arrived dose) pair**: every interval's `ke` must sit below the `KTR` of every
+dose that has arrived by then — even one long since absorbed — each at its own dose-record
+kernel. So one slow dose followed by a later occasion that raises `CL` past its `KTR` sends
+that subject to the twin (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
 so a flip-flop model fits and predicts correctly instead of returning a zero
 profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
 estimates. The reroute needs an ODE twin. A closed-form transit model that carries a
