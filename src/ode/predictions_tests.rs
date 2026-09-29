@@ -1473,12 +1473,88 @@ fn locf_decision_cov_carries_forward_prefers_obs_and_falls_back() {
     s.pk_only_times = vec![24.0];
     s.pk_only_covariates = vec![HashMap::from([("WT".to_string(), 999.0)])];
 
+    let records = AdaptiveRecordIndex::new(&s, s.doses.len());
+
     // Decision at t=36 → LOCF is the obs at t=24 (WT=50), not baseline 70.
-    assert_eq!(locf_decision_cov(36.0, &s, &baseline)["WT"], 50.0);
+    assert_eq!(locf_decision_cov(&records, 36.0, &s, &baseline)["WT"], 50.0);
     // At t=24 exactly, the obs record wins over the coincident pk-only row.
-    assert_eq!(locf_decision_cov(24.0, &s, &baseline)["WT"], 50.0);
+    assert_eq!(locf_decision_cov(&records, 24.0, &s, &baseline)["WT"], 50.0);
     // Before the first record (t=-1) → baseline.
-    assert_eq!(locf_decision_cov(-1.0, &s, &baseline)["WT"], 70.0);
+    assert_eq!(locf_decision_cov(&records, -1.0, &s, &baseline)["WT"], 70.0);
+}
+
+/// #1148 T7: the adaptive record index — one record set, two lookups.
+///
+/// Records: obs@0 / @24 / @48, an EVID=2 row @24 (`WT=999`, co-timed with the obs), an
+/// EVID=3 reset @30 and a base dose row @40. `in_force(t)` — what a decision at `t` reads —
+/// is the latest record at or before `t`, the LAST of a co-timed group in processing order
+/// (`Reset < Dose < EVID=2 < Obs`); `at(t)` — what governs the segment arriving at `t` — is
+/// the FIRST. Every kind appears as an answer, so dropping a kind from the set, or reranking
+/// it, moves at least one row of the table.
+#[test]
+fn the_adaptive_record_index_resolves_in_force_and_governing_records() {
+    use super::AdaptiveRecord::{Dose, Obs, PkOnly, Reset};
+
+    let mut s = make_subject(
+        vec![DoseEvent::new(40.0, 10.0, 1, 0.0, false, 0.0)],
+        vec![0.0, 24.0, 48.0],
+    );
+    s.pk_only_times = vec![24.0];
+    s.pk_only_covariates = vec![HashMap::from([("WT".to_string(), 999.0)])];
+    s.reset_times = vec![30.0];
+    let records = AdaptiveRecordIndex::new(&s, s.doses.len());
+
+    for (t, want) in [
+        (-1.0, None),
+        (0.0, Some(Obs(0))),
+        (12.0, Some(Obs(0))),
+        (24.0, Some(Obs(1))),
+        // A sub-tolerance shortfall still reaches the record (`EVENT_MATCH_TOL`).
+        (24.0 - 1e-13, Some(Obs(1))),
+        (30.0, Some(Reset(0))),
+        (36.0, Some(Reset(0))),
+        (40.0, Some(Dose(0))),
+        (44.0, Some(Dose(0))),
+        (48.0, Some(Obs(2))),
+        (60.0, Some(Obs(2))),
+    ] {
+        assert_eq!(records.in_force(t), want, "in_force({t})");
+    }
+
+    // A reset co-timed with an observation: governing takes the reset (first), in-force the
+    // observation (last). Collapsing the two lookups into one fails one of the pair.
+    let mut tie = make_subject(vec![], vec![12.0, 24.0]);
+    tie.reset_times = vec![24.0];
+    let tied = AdaptiveRecordIndex::new(&tie, 0);
+    assert_eq!(
+        tied.at(24.0),
+        Some(Reset(0)),
+        "governing: the reset is first at 24"
+    );
+    assert_eq!(
+        tied.in_force(24.0),
+        Some(Obs(1)),
+        "in force: the obs is last at 24"
+    );
+    // …and the same pair for a dose / EVID=2 tie (a dose row is processed before an EVID=2
+    // row), so every adjacent rank is exercised.
+    let mut dp = make_subject(vec![DoseEvent::new(24.0, 10.0, 1, 0.0, false, 0.0)], vec![]);
+    dp.pk_only_times = vec![24.0];
+    let dpi = AdaptiveRecordIndex::new(&dp, 1);
+    assert_eq!(dpi.at(24.0), Some(Dose(0)));
+    assert_eq!(dpi.in_force(24.0), Some(PkOnly(0)));
+    let mut rd = make_subject(vec![DoseEvent::new(24.0, 10.0, 1, 0.0, false, 0.0)], vec![]);
+    rd.reset_times = vec![24.0];
+    let rdi = AdaptiveRecordIndex::new(&rd, 1);
+    assert_eq!(rdi.at(24.0), Some(Reset(0)));
+    assert_eq!(rdi.in_force(24.0), Some(Dose(0)));
+
+    // `n_base` bounds the dose records: the frozen replay's appended controller doses are not
+    // records.
+    assert_eq!(
+        AdaptiveRecordIndex::new(&s, 0).in_force(44.0),
+        Some(Reset(0))
+    );
 }
 
 #[test]
@@ -8394,8 +8470,7 @@ fn an_infusion_end_between_records_runs_on_the_terminating_record() {
 fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
     use super::{governing_segment_occ_at, governing_segment_pk_at, AdaptiveRecordIndex};
 
-    let obs_times = [0.0_f64, 30.0];
-    let records = AdaptiveRecordIndex::new(&[], &[], &obs_times);
+    let records = AdaptiveRecordIndex::new(&make_subject(vec![], vec![0.0, 30.0]), 0);
 
     // Distinct PK per record so the resolved snapshot is identifiable, and occasions
     // that differ across them (window 0 at t=0, window 1 at t=30).
@@ -8405,13 +8480,16 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
         pk_only: vec![],
         reset: Vec::new(),
     };
-    let obs_occ = [Some(0_usize), Some(1_usize)];
+    let occ_of = super::AdaptiveRecordOcc {
+        obs: vec![Some(0_usize), Some(1_usize)],
+        ..Default::default()
+    };
     // The LOCF carry the walk holds when it reaches the t=24 break: the earlier window.
     let (last_pk, last_occ) = (pk_one(99.0, 100.0), Some(0_usize));
 
     for &t_end in &[24.0_f64, 30.0] {
         let pk = governing_segment_pk_at(t_end, &records, &event_pk, last_pk);
-        let occ = governing_segment_occ_at(t_end, &records, &[], &[], &obs_occ, last_occ);
+        let occ = governing_segment_occ_at(t_end, &records, &occ_of, last_occ);
         // Both must resolve to the t=30 record: for `t_end = 30` it is the record
         // itself, and for the non-record break at 24 it is the record that terminates
         // the interval containing it.
@@ -8431,9 +8509,40 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
 
     // Past the final record both fall back, and they must fall back together.
     let pk = governing_segment_pk_at(31.0, &records, &event_pk, last_pk);
-    let occ = governing_segment_occ_at(31.0, &records, &[], &[], &obs_occ, last_occ);
+    let occ = governing_segment_occ_at(31.0, &records, &occ_of, last_occ);
     assert_eq!(pk.values[crate::types::PK_IDX_CL], 99.0);
     assert_eq!(occ, last_occ);
+
+    // #1148 T8: an EVID=3 reset at t=27, between the t=24 break and the t=30 record, in a
+    // window (decisions 0 / 24 / 29) of its own. A reset is a record on the adaptive walk,
+    // so it now terminates — and governs — the segment ending at 24, and PK and occasion
+    // must BOTH land on it: the reset row's snapshot under window 1, not the t=30 record's
+    // window 2 nor the carry's window 0. Each side is asserted with its own message, so
+    // mutating one twin names that twin.
+    let mut with_reset = make_subject(vec![], vec![0.0, 30.0]);
+    with_reset.reset_times = vec![27.0];
+    let records = AdaptiveRecordIndex::new(&with_reset, 0);
+    let event_pk = crate::pk::EventPkParams {
+        reset: vec![pk_one(33.0, 100.0)],
+        ..event_pk
+    };
+    let occ_of = super::AdaptiveRecordOcc {
+        reset: vec![Some(1_usize)],
+        obs: vec![Some(0_usize), Some(2_usize)],
+        ..Default::default()
+    };
+    let pk = governing_segment_pk_at(24.0, &records, &event_pk, last_pk);
+    let occ = governing_segment_occ_at(24.0, &records, &occ_of, last_occ);
+    assert_eq!(
+        pk.values[crate::types::PK_IDX_CL],
+        33.0,
+        "PK twin: the segment ending at 24 must be governed by the reset@27 row"
+    );
+    assert_eq!(
+        occ,
+        Some(1),
+        "occasion twin: the segment ending at 24 must thread the reset@27 row's window"
+    );
 }
 
 #[test]

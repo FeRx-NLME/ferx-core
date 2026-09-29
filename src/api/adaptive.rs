@@ -511,6 +511,10 @@ where
                 let kappa_base =
                     crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
                 let n_occ = decision_times.len();
+                // The subject as loaded carries only its base regimen, so every dose row
+                // is a record (`n_base = doses.len()`), exactly as in the driver.
+                let records =
+                    crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
                 let mut eta_occ = Vec::with_capacity(n_occ);
                 let mut decision_pk = Vec::with_capacity(n_occ);
                 for g in 0..n_occ {
@@ -522,17 +526,16 @@ where
                     e.extend(kappa_g.iter().copied());
                     // PK at decision g under occasion g's κ, at the covariate the
                     // driver actually sees at that decision. This MUST match the
-                    // driver's live `decision_cov` (predictions.rs) exactly: the
-                    // obs-coincident snapshot on a record, else the LOCF covariate of
-                    // the most-recent record carried forward — NOT the frozen t=0
-                    // baseline. On a time-varying-covariate + IOV model whose decision
-                    // lands between records, a baseline fallback here would freeze the
-                    // decision's covariate at t=0 (the exact #700 defect) while the
-                    // driver's readout uses LOCF — and the frozen-replay verifier,
-                    // which reuses this same `decision_pk`, could not catch it. Sharing
-                    // the one `locf_decision_cov` helper the driver uses makes the two
-                    // covariate resolutions a single source of truth (#701 review).
+                    // driver's live `decision_cov` (predictions.rs) exactly: the row of
+                    // the record in force at the decision — the latest dose / EVID=2 /
+                    // obs / EVID=3-4 reset row at or before it (#1148) — else the t=0
+                    // baseline. A private scan here is how this path once skipped dose
+                    // rows while the driver read them (2.6× apart on identical data), and
+                    // the frozen-replay verifier, which reuses this same `decision_pk`,
+                    // could not catch it. Sharing the one `locf_decision_cov` resolver the
+                    // driver uses makes the two a single source of truth (#701 review).
                     let dcov = crate::ode::predictions::locf_decision_cov(
+                        &records,
                         decision_times[g],
                         subject,
                         &subject.covariates,
@@ -840,6 +843,12 @@ where
 /// are trusted primitive draws (not "built" snapshots) so — like the seed and Ω — they
 /// are consumed, not re-derived.
 ///
+/// "Independent" covers the orchestration, **not** the covariate rule: `decision_pk`'s
+/// covariate is re-derived through the same `locf_decision_cov` resolver the driver and
+/// the build loop call, so a wrong record-selection rule is mirrored on all three sides
+/// and passes here. That rule is pinned against `predict()` and closed forms instead
+/// (#1148's `adaptive_decision_*` tests).
+///
 /// Scope: the constant-path baseline `pk` (a single t=0 evaluation at the subject-static
 /// covariate) is a shared snapshot too, but a trivial one — it is left to the degenerate
 /// oracle rather than re-derived per run here; extending the check to it is a possible
@@ -880,6 +889,8 @@ pub(crate) fn verify_adaptive_snapshots(
             ));
         }
 
+        let records =
+            crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
         let mut eta_occ_check: Vec<Vec<f64>> = Vec::with_capacity(n_occ);
         for g in 0..n_occ {
             // Re-draw occasion g's κ on the dedicated substream and assemble the
@@ -902,9 +913,14 @@ pub(crate) fn verify_adaptive_snapshots(
             }
 
             // decision_pk[g] must equal pk_param_fn at the covariate the driver's live
-            // `decision_cov` uses — LOCF of the most-recent record, NOT the frozen t=0
-            // baseline (the twice-fixed #732 / #739 defect).
+            // `decision_cov` uses — the in-force record's row, NOT the frozen t=0 baseline
+            // (the twice-fixed #732 / #739 defect). This goes through the SAME resolver the
+            // driver and the build loop use, so it pins the plumbing (the right time, the
+            // right η, the right array slot), not the record-selection rule itself: that rule
+            // is pinned against `predict()` and closed forms (#1148's
+            // `adaptive_decision_*` tests).
             let dcov = crate::ode::predictions::locf_decision_cov(
+                &records,
                 decision_times[g],
                 subject,
                 &subject.covariates,

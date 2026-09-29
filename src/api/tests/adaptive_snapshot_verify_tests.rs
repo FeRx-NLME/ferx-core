@@ -115,6 +115,7 @@ fn canonical_iov(
     let omega_iov = params.omega_iov.as_ref().unwrap();
     let kappa_base = subject_kappa_base_seed(SEED, &subject.id, SIM);
     let n_occ = decision_times.len();
+    let records = crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
     let mut eta_occ = Vec::with_capacity(n_occ);
     let mut decision_pk = Vec::with_capacity(n_occ);
     for g in 0..n_occ {
@@ -125,6 +126,7 @@ fn canonical_iov(
         let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
         e.extend(kappa_g.iter().copied());
         let dcov = crate::ode::predictions::locf_decision_cov(
+            &records,
             decision_times[g],
             subject,
             &subject.covariates,
