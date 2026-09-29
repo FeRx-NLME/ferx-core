@@ -7136,3 +7136,108 @@ fn programmatic_and_spec_entry_points_return_the_same_missing_covariate_error() 
     );
     assert!(with_wt.is_ok(), "got {:?}", with_wt.err());
 }
+
+/// `ODE_1571_WT_SCALING`'s structure with a covariate-selected error model (#658):
+/// `FREE` picks the endpoint. The selector column is supplied, so every data check
+/// passes and the `Selected` reject is the one that must fire.
+const ODE_1571_SELECTED: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_TOTAL   ~ 0.04
+  sigma PROP_UNBOUND ~ 0.09
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+[covariates]
+  FREE continuous
+"#;
+
+#[test]
+fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
+    // #658 was pinned only on `reject_selected_error_for_adaptive` directly, so deleting
+    // it from `check_adaptive_model_data` (the helper both entry points now share, #1571)
+    // passed every test (review of #1585, finding 2). Held here through each public entry
+    // point, with the single-endpoint twin of the same model and data as the straddle:
+    // it must run, so the `Err` is the `Selected` reject and nothing else.
+    let want = "covariate-selected `[error_model]`";
+    let selected = parse_model_string(ODE_1571_SELECTED).expect("parse selected");
+    let single_src = ODE_1571_SELECTED.replace(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        "  DV ~ proportional(PROP_TOTAL)",
+    );
+    assert_ne!(single_src, ODE_1571_SELECTED, "the twin must differ");
+    let single = parse_model_string(&single_src).expect("parse single");
+    let pop = pop_1571(Some("FREE"));
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![12.0, 36.0],
+        ..Default::default()
+    };
+    let spec = simple_titration_spec();
+    let spec_opts = AdaptiveSimulateOptions::default();
+
+    let err = simulate_adaptive(
+        &selected,
+        &pop,
+        &selected.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("simulate_adaptive must reject a Selected error model");
+    assert!(err.contains(want), "simulate_adaptive: got: {err}");
+    let err = simulate_adaptive_from_spec(
+        &selected,
+        &pop,
+        &selected.default_params,
+        1,
+        &spec,
+        &spec_opts,
+    )
+    .expect_err("simulate_adaptive_from_spec must reject a Selected error model");
+    assert!(
+        err.contains(want),
+        "simulate_adaptive_from_spec: got: {err}"
+    );
+
+    let ok = simulate_adaptive(&single, &pop, &single.default_params, 1, fixed_bolus, &opts);
+    assert!(ok.is_ok(), "simulate_adaptive twin: {:?}", ok.err());
+    let ok =
+        simulate_adaptive_from_spec(&single, &pop, &single.default_params, 1, &spec, &spec_opts);
+    assert!(
+        ok.is_ok(),
+        "simulate_adaptive_from_spec twin: {:?}",
+        ok.err()
+    );
+
+    // The CHANGELOG's order claim: with the selector column itself missing, the data
+    // checks run first, so the programmatic path names `FREE`, not the #658 restriction.
+    let err = simulate_adaptive(
+        &selected,
+        &pop_1571(None),
+        &selected.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("a missing selector column must be rejected");
+    assert!(
+        err.contains("FREE") && err.contains("not found in data") && !err.contains(want),
+        "missing selector: got: {err}"
+    );
+}
