@@ -591,6 +591,28 @@ fn walk_domain_is_decided_per_interval_and_open_dose_pair() {
         WalkDomain::Walk,
         "dose 1 arriving after the fast interval forms no pair with it"
     );
+    // A dose arriving exactly at the start of the subject's **final** interval pairs with it:
+    // no later interval re-checks the pair, so this is the only case that decides whether
+    // the filter is `arrival ≤ start` (as it must be — the dose delivers over `[8, 12]`) or
+    // `<`. Dose 2 (slow, `KTR = 0.3`) lags to `t = 8`, the last observation is at `12`.
+    let final_interval = |ke2: f64| {
+        let doses = [dose(0.0, 3.0), dose(8.0, 0.3)];
+        let schedule =
+            EventSchedule::for_subject(&subject, model.pk_model, &subject.doses, &[0.0, 2.0]);
+        let at_dose = [disp(0.1), disp(ke2)];
+        let at_obs = [disp(0.1), disp(ke2), disp(ke2)];
+        walk_domain(model.pk_model, &schedule, &doses, &at_dose, &at_obs, &[])
+    };
+    assert_eq!(
+        final_interval(0.4),
+        WalkDomain::Twin,
+        "a dose arriving at the final interval's start × fast ke"
+    );
+    assert_eq!(
+        final_interval(0.2),
+        WalkDomain::Walk,
+        "the straddle: ke below the late dose's KTR"
+    );
     // And the walk itself honours the verdict: `None` sends the subject to the twin.
     let schedule =
         EventSchedule::for_subject(&subject, model.pk_model, &subject.doses, &[0.0, 0.0]);
