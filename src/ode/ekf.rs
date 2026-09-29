@@ -298,6 +298,20 @@ pub struct EkfObsPoint {
     pub p_obs: f64,
 }
 
+/// The EKF mean at the observed compartment, as the prediction it is reported as.
+///
+/// A negative mean is clamped to `0`, as `ode_predictions` does. A `NaN` mean is **kept**
+/// (#1539): it used to be rewritten to `0.0` here, which served a plausible zero for a state
+/// the solver never integrated — once a state diverges the solver `NaN`-pads the rest of the
+/// segment, and this was the one reader that turned that back into a finite number.
+fn ekf_ipred(v: f64) -> f64 {
+    if v < 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
 /// Propagate mean and covariance through a subject's dose+obs timeline.
 ///
 /// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the
@@ -503,7 +517,7 @@ pub fn solve_ekf(
         for i in 0..boundary_obs.len() {
             let obs_idx = boundary_obs[i];
             let v = u[obs_cmt_idx];
-            let ipred = if v.is_nan() || v < 0.0 { 0.0 } else { v };
+            let ipred = ekf_ipred(v);
             if assimilated[obs_idx] {
                 // The **covariance** must be assimilated once; the **mean** is still the
                 // post-event one. An observation exactly on this break was saved by the
@@ -627,7 +641,7 @@ pub fn solve_ekf(
                     p_mat = p_new;
                     let v = pt.u[obs_cmt_idx];
                     let point = EkfObsPoint {
-                        ipred: if v.is_nan() || v < 0.0 { 0.0 } else { v },
+                        ipred: ekf_ipred(v),
                         p_obs,
                     };
                     for &j in here {
@@ -2483,5 +2497,59 @@ mod tests {
             "the c=0 and c=0.05 covariance curves must differ materially — worst \
              separation {sep:.3e}"
         );
+    }
+
+    /// T8 (#1539): the EKF mean rides the same solver (`solve_ekf` → `solve_ode` →
+    /// `integrate_dense_g`), so a decoupled state that diverges NaN-pads the observed mean too,
+    /// rather than freezing it at its post-dose value. The EKF is a *caller* of that engine, not
+    /// an independent reference — this test pins that it inherits the pad, nothing more.
+    ///
+    /// `central` observed, `X' = 0.5·X²` from `X(0) = 1` (pole at t = 2), one bolus of 100 at
+    /// t = 12, zero diffusion. Before #1539 the mean at t = 20 and 40 was a frozen `100`; the
+    /// `0·X` control gives the closed form `100·e^{−0.1(t−12)}`.
+    ///
+    /// Mutations that redden it: revert the solver's tail pad to the last state (a frozen
+    /// `100`); rewrite a `NaN` mean to `0.0` in `ekf_ipred` again (a plausible zero).
+    #[test]
+    fn ekf_mean_is_nan_after_a_decoupled_state_diverges() {
+        let run = |x_rate: f64| {
+            let rhs = move |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+                dy[0] = -ke * y[0];
+                dy[1] = x_rate * y[1] * y[1];
+            };
+            let obs_times = [1.0, 20.0, 40.0];
+            solve_ekf(
+                &rhs,
+                2,
+                0,
+                &[0.0, 0.0],
+                &make_pk(5.0, 50.0),
+                &Default::default(),
+                &[0.0, 1.0],
+                &[DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+                &obs_times,
+                &[0.01; 3],
+                OdeSolverOptions::default(),
+            )
+            .iter()
+            .map(|p| p.ipred)
+            .collect::<Vec<f64>>()
+        };
+        let control = run(0.0);
+        let diverged = run(0.5);
+        assert_eq!(
+            diverged[0].to_bits(),
+            control[0].to_bits(),
+            "{diverged:?} {control:?}"
+        );
+        for (i, t) in [(1, 20.0), (2, 40.0)] {
+            let want = 100.0 * (-0.1f64 * (t - 12.0)).exp();
+            assert!(
+                control[i].is_finite() && (control[i] - want).abs() <= 1e-3 * want,
+                "control: {control:?}"
+            );
+            assert!(diverged[i].is_nan(), "t={t}: {diverged:?}");
+        }
     }
 }
