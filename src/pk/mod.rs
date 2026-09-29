@@ -1,4 +1,5 @@
 pub mod absorption;
+pub(crate) mod absorption_walk;
 pub mod analytical_absorption;
 pub mod event_driven;
 pub(crate) mod modified_release;
@@ -261,6 +262,15 @@ pub(crate) fn effective_model_for_eval<'a>(
     theta: &[f64],
     eta: &[f64],
 ) -> &'a CompiledModel {
+    // A TV-covariate subject of a closed-form transit/IG model (#1560): the exact
+    // absorption walk serves it unless a pair leaves the tilting domain. Decided by the
+    // walk's own `walk_domain`, on the per-event parameters the value path evaluates at
+    // these `(θ, η)`, so the prediction and the gradient take the same route.
+    if absorption_walk::walk_eligible(model, subject) {
+        let mut ev = EventPkParams::default();
+        compute_event_pk_params_into(model, subject, theta, eta, &mut ev);
+        return absorption_walk_or_twin(model, subject, &ev);
+    }
     let structural = model.effective_for(subject);
     // No twin to route to (a non-absorption model, or a transit/IG that has none — declined by
     // the desugar, or built and rejected by its own parse, #1008): nothing parameter-dependent
@@ -269,13 +279,140 @@ pub(crate) fn effective_model_for_eval<'a>(
         return structural;
     };
     // Keep the structural (closed-form) model when it has already been rerouted to an
-    // ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop regime.
-    // `||` short-circuits, so the predicate is evaluated only for closed-form
+    // ODE twin (`TIME` / SS / infusion), or when this subject is not in the flip-flop
+    // regime. `||` short-circuits, so the predicate is evaluated only for closed-form
     // transit/IG subjects — the same work as before.
     if structural.ode_spec.is_some() || !absorption_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
     twin.built()
+}
+
+/// The IOV peer of [`effective_model_for_eval`]: the model serving an IOV subject at
+/// `(θ, [η_bsv, κ₁ … κ_K])`, the stacked layout the IOV sensitivity providers and the
+/// covariance sweep carry (occasions in [`crate::stats::likelihood::iov_occasion_groups`]
+/// order). A walk-eligible transit/IG subject stays on the closed form when the absorption
+/// walk serves it at those parameters and goes to the twin otherwise — the decision
+/// [`predict_iov`] makes, from the same per-record parameters; everything else is
+/// [`CompiledModel::effective_for`] exactly as before (#1560).
+pub(crate) fn effective_model_for_eval_iov<'a>(
+    model: &'a CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> &'a CompiledModel {
+    if !absorption_walk::walk_eligible(model, subject) {
+        return model.effective_for(subject);
+    }
+    let n_eta = model.n_eta.min(stacked_eta.len());
+    let kappas: Vec<&[f64]> = if model.n_kappa == 0 {
+        Vec::new()
+    } else {
+        stacked_eta[n_eta..].chunks(model.n_kappa).collect()
+    };
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+    let combined_for = iov_occasion_eta(&occ_groups, &stacked_eta[..n_eta], &kappas, model.n_kappa);
+    let mut ev = EventPkParams::default();
+    fill_iov_record_params(
+        model,
+        subject,
+        theta,
+        &combined_for,
+        &mut ev.dose,
+        &mut ev.obs,
+        &mut ev.pk_only,
+    );
+    absorption_walk_or_twin(model, subject, &ev)
+}
+
+/// `model` when the absorption walk serves `subject` at these per-event parameters, else
+/// the twin. The caller has established [`absorption_walk::walk_eligible`], which includes
+/// a twin being present.
+fn absorption_walk_or_twin<'a>(
+    model: &'a CompiledModel,
+    subject: &Subject,
+    ev: &EventPkParams,
+) -> &'a CompiledModel {
+    if absorption_walk::walk_serves(model.pk_model, subject, &ev.dose, &ev.obs, &ev.pk_only) {
+        return model;
+    }
+    model
+        .absorption_ode_equivalent
+        .as_ref()
+        .map_or(model, |twin| twin.built())
+}
+
+/// `η` per record for an IOV subject: `[η_bsv, κ_g]` for occasion `occ` in group `g`
+/// ([`crate::stats::likelihood::iov_occasion_groups`] order), `κ = 0` for an occasion
+/// with no group — an EVID=2 row asks for `u32::MAX` and gets that.
+fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
+    occ_groups: &[(u32, Vec<usize>)],
+    eta_bsv: &'a [f64],
+    kappas: &'a [K],
+    n_kappa: usize,
+) -> impl Fn(u32) -> Vec<f64> + 'a {
+    let occ_to_k: std::collections::HashMap<u32, usize> = occ_groups
+        .iter()
+        .enumerate()
+        .map(|(k, (occ_id, _))| (*occ_id, k))
+        .collect();
+    move |occ_id: u32| -> Vec<f64> {
+        let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
+        c.extend_from_slice(eta_bsv);
+        match occ_to_k.get(&occ_id) {
+            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
+            _ => c.extend(std::iter::repeat_n(0.0, n_kappa)),
+        }
+        c
+    }
+}
+
+/// The per-record parameters of an IOV subject — each dose and observation under its own
+/// occasion's `η`, an EVID=2 row under `κ = 0` — as [`predict_iov`] evaluates them. One
+/// builder for the funnel and for [`effective_model_for_eval_iov`], so the route is decided
+/// on exactly the parameters the prediction then uses.
+fn fill_iov_record_params(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    combined_for: &dyn Fn(u32) -> Vec<f64>,
+    dose: &mut Vec<PkParams>,
+    obs: &mut Vec<PkParams>,
+    pk_only: &mut Vec<PkParams>,
+) {
+    dose.reserve_exact(subject.doses.len());
+    dose.extend((0..subject.doses.len()).map(|d| {
+        let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+        pk_params_at_time(
+            model,
+            theta,
+            &combined_for(occ),
+            subject.dose_cov(d),
+            subject.doses[d].time,
+        )
+    }));
+    obs.reserve_exact(subject.obs_times.len());
+    obs.extend((0..subject.obs_times.len()).map(|j| {
+        let occ = subject.occasions.get(j).copied().unwrap_or(0);
+        pk_params_at_time(
+            model,
+            theta,
+            &combined_for(occ),
+            subject.obs_cov(j),
+            subject.obs_times[j],
+        )
+    }));
+    let pk_only_combined = combined_for(u32::MAX);
+    pk_only.reserve_exact(subject.pk_only_times.len());
+    pk_only.extend((0..subject.pk_only_times.len()).map(|m| {
+        pk_params_at_time(
+            model,
+            theta,
+            &pk_only_combined,
+            subject.pk_only_cov(m),
+            subject.pk_only_times[m],
+        )
+    }));
 }
 
 /// Divide each prediction in-place by the scale derived from
@@ -1304,7 +1441,6 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
-    use std::collections::HashMap;
     let EventPkParams {
         dose: dose_params,
         obs: obs_params,
@@ -1326,66 +1462,38 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
         return vec![f64::NAN; subject.obs_times.len()];
     }
-    // Closed-form transit/IG IOV reroutes to its `transit()`/`igd()` ODE twin (issue #719):
-    // the per-dose superposition cannot carry drug across occasion boundaries (#104), but the
-    // twin integrates it exactly (#663). A no-op for every other model (`effective_for` returns
-    // `self`). The twin shares this model's θ/η/κ layout, so the per-occasion params below are
-    // built identically and the `ode_spec` dispatch arm serves them.
-    let model = model.effective_for(subject);
+    // Closed-form transit/IG IOV (#1560): served by the exact absorption walk
+    // (`absorption_walk`) when every (interval, open dose) pair is inside the tilting
+    // domain, else by the `transit()`/`igd()` ODE twin (#719). The twin shares this model's
+    // θ/η/κ layout. Every other shape `effective_for` reroutes (a `TIME` read, SS, an
+    // infusion) still goes to the twin, and every other model is unchanged (`effective_for`
+    // returns `self`).
+    let primary = model;
+    let walk = absorption_walk::walk_eligible(model, subject);
+    let model = if walk {
+        model
+    } else {
+        model.effective_for(subject)
+    };
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
     let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
-    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-        occ_to_k.insert(*occ_id, k);
-    }
-    let combined_for = |occ_id: u32| -> Vec<f64> {
-        let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
-        c.extend_from_slice(eta_bsv);
-        match occ_to_k.get(&occ_id) {
-            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
-            _ => c.extend(std::iter::repeat(0.0).take(n_kappa)),
-        }
-        c
-    };
+    let combined_for = iov_occasion_eta(&occ_groups, eta_bsv, kappas, n_kappa);
 
     // Exact initial reservations preserve the convenience API's old footprint
     // for short vectors; later probes keep these capacities without allocating.
-    dose_params.reserve_exact(subject.doses.len());
-    dose_params.extend((0..subject.doses.len()).map(|d| {
-        let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
-        pk_params_at_time(
-            model,
-            theta,
-            &combined_for(occ),
-            subject.dose_cov(d),
-            subject.doses[d].time,
-        )
-    }));
-    obs_params.reserve_exact(subject.obs_times.len());
-    obs_params.extend((0..subject.obs_times.len()).map(|j| {
-        let occ = subject.occasions.get(j).copied().unwrap_or(0);
-        pk_params_at_time(
-            model,
-            theta,
-            &combined_for(occ),
-            subject.obs_cov(j),
-            subject.obs_times[j],
-        )
-    }));
+    fill_iov_record_params(
+        model,
+        subject,
+        theta,
+        &combined_for,
+        dose_params,
+        obs_params,
+        pk_only_params,
+    );
     // EVID=2 rows carry no occasion label → BSV eta with zero kappa.
     let pk_only_combined = combined_for(u32::MAX);
-    pk_only_params.reserve_exact(subject.pk_only_times.len());
-    pk_only_params.extend((0..subject.pk_only_times.len()).map(|m| {
-        pk_params_at_time(
-            model,
-            theta,
-            &pk_only_combined,
-            subject.pk_only_cov(m),
-            subject.pk_only_times[m],
-        )
-    }));
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): nothing to integrate or superpose. The
@@ -1423,6 +1531,30 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             pk_only_params.as_slice(),
             reset_params.as_slice(),
         )
+    } else if walk {
+        match absorption_walk::absorption_walk_predictions(
+            model.pk_model,
+            subject,
+            dose_params.as_slice(),
+            obs_params.as_slice(),
+            pk_only_params.as_slice(),
+            None,
+        ) {
+            Some(preds) => preds,
+            // A pair outside the tilting domain (the flip-flop regime): the twin, which is
+            // valid in both regimes, serves the whole subject.
+            None => {
+                return predict_iov_with_scratch_and_schedule(
+                    primary.effective_for(subject),
+                    subject,
+                    theta,
+                    eta_bsv,
+                    kappas,
+                    &mut EventPkParams::default(),
+                    None,
+                )
+            }
+        }
     } else if event_driven::supports_event_driven(model.pk_model) {
         // Resolve modeled-`RATE` doses (#324/#394) using each dose's per-occasion
         // PK snapshot before the analytical event-driven walker — the IOV analogue
@@ -2887,6 +3019,28 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
         } else {
             let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
             crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
+        }
+    } else if absorption_walk::walk_eligible(model, subject) {
+        // A walk-eligible transit/IG subject that `effective_model_for_eval` kept on the
+        // closed form: the exact absorption walk serves it (#1560). It admitted the
+        // subject on these very parameters, so the walk is in domain; the twin arm is the
+        // defensive fallback, never the route.
+        compute_event_pk_params_into(model, subject, theta, eta, scratch);
+        match absorption_walk::absorption_walk_predictions(
+            model.pk_model,
+            subject,
+            &scratch.dose,
+            &scratch.obs,
+            &scratch.pk_only,
+            None,
+        ) {
+            Some(preds) => preds,
+            None => {
+                let twin = model.effective_for(subject);
+                return compute_predictions_with_tv_recycle_with_schedule(
+                    twin, subject, theta, eta, scratch, None, recycled,
+                );
+            }
         }
     } else if (has_tv || subject.has_resets() || uses_time)
         && event_driven::supports_event_driven(model.pk_model)

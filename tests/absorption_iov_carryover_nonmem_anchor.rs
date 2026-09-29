@@ -2,8 +2,9 @@
 //! (`ig_iov_mat`) closed-form model under IOV on `CL` **and** on the absorption parameter
 //! (`MTT` / `MAT`), with doses still absorbing when their occasion's successor begins.
 //!
-//! ferx serves both through the ODE twin, and since #1569 the twin absorbs each dose through
-//! the kernel of **its own dose record**. The control streams
+//! ferx serves both with the exact absorption walk (#1560), and a subject outside the walk
+//! with the ODE twin; since #1569 both absorb each dose through the kernel of **its own dose
+//! record**. The control streams
 //! (`nonmem_anchor/{transit_iov_mtt,ig_iov_mat}.ctl`) code the same rule in `$DES`: each dose's
 //! occasion is captured at its dose record and its `MTT`/`MAT` rebuilt from that occasion's
 //! ETA, and `$DES` superposes all four doses. The disposition is the current record's in both
@@ -20,7 +21,10 @@
 //!
 //! * **IPRED at NONMEM's EBEs** — ferx's `predict_iov` at NONMEM's POSTHOC η/κ against the
 //!   `$TABLE` IPRED, every observation. This is the direct test of the kernel rule, and it
-//!   runs on every PR.
+//!   runs on every PR, on **both engines**: the plain model runs on the walk, and a copy whose
+//!   `CL` reads `TIME` through the inert factor `(1 + 0·TIME)` runs on the twin (a `TIME` read
+//!   is outside the walk). The two legs must not be bit-identical, so neither can quietly
+//!   take the other's engine; `pk::absorption_walk::tests` pins the walk route on this data.
 //! * **FOCEI objective at NONMEM's optimum** — `fit()` with every parameter `FIX`, against
 //!   NONMEM's objective, with per-subject objective contributions against `.phi`. This one
 //!   runs nightly: see its doc comment for the measured CI cost and the per-PR tests that
@@ -155,9 +159,11 @@ fn table_ipred(name: &str) -> HashMap<String, Vec<f64>> {
     out
 }
 
-/// The ferx model at NONMEM's optimum, every parameter `FIX`.
-fn model_at(anchor: &Anchor, est: &Estimates) -> ferx_core::types::CompiledModel {
+/// The ferx model at NONMEM's optimum, every parameter `FIX`. `twin` adds the numerically
+/// inert `(1 + 0·TIME)` to `CL`, which routes every subject to the ODE twin (#1560).
+fn model_at(anchor: &Anchor, est: &Estimates, twin: bool) -> ferx_core::types::CompiledModel {
     let [tvcl, tvv, tva, tvb] = est.theta;
+    let time_read = if twin { " * (1 + 0 * TIME)" } else { "" };
     let src = format!(
         r"
 [parameters]
@@ -172,7 +178,7 @@ fn model_at(anchor: &Anchor, est: &Estimates) -> ferx_core::types::CompiledModel
   sigma PROP_ERR ~ {sd:e} (sd) FIX
 
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  CL = TVCL * exp(ETA_CL + KAPPA_CL){time_read}
   V  = TVV  * exp(ETA_V)
 {kernel}
 
@@ -213,54 +219,74 @@ fn ipred_at_nonmem_ebes_matches_nonmem() {
     let mut failures = Vec::new();
     for anchor in &ANCHORS {
         let est = estimates(anchor.name);
-        let model = model_at(anchor, &est);
         let pop = population(anchor);
         let phi = phi(anchor.name);
         let nm_ipred = table_ipred(anchor.name);
         assert_eq!(pop.subjects.len(), 24, "{}: subject count", anchor.name);
-        let mut worst = 0.0_f64;
-        let mut n_obs = 0usize;
-        for s in &pop.subjects {
-            assert!(
-                model.ode_spec.is_none() && model.effective_for(s).ode_spec.is_some(),
-                "{} subject {}: the ODE twin must serve an IOV subject",
-                anchor.name,
-                s.id
-            );
-            let (eta, _) = phi[&s.id];
-            // [η_CL, η_V]; per occasion g: [κ_CL = ETA(3+g), κ_ABS = ETA(6+g)].
-            let kappas: Vec<Vec<f64>> = (0..3).map(|g| vec![eta[2 + g], eta[5 + g]]).collect();
-            let got = ferx_core::pk::predict_iov(
-                &model,
-                s,
-                &model.default_params.theta,
-                &eta[..2],
-                &kappas,
-            );
-            let want = &nm_ipred[&s.id];
-            assert_eq!(got.len(), want.len(), "{} subject {}", anchor.name, s.id);
-            for (j, (&g, &w)) in got.iter().zip(want).enumerate() {
+        // IPRED per leg: [walk, twin].
+        let mut legs: Vec<Vec<Vec<f64>>> = Vec::new();
+        for (leg, twin) in [("walk", false), ("twin", true)] {
+            let model = model_at(anchor, &est, twin);
+            let mut worst = 0.0_f64;
+            let mut n_obs = 0usize;
+            let mut preds = Vec::new();
+            for s in &pop.subjects {
                 assert!(
-                    g.is_finite() && w.is_finite() && w > 0.0,
-                    "{} subject {} obs {j}: ferx {g}, NONMEM {w}",
+                    model.ode_spec.is_none() && model.absorption_ode_equivalent.is_some(),
+                    "{} subject {}: a closed-form model with an ODE twin",
                     anchor.name,
                     s.id
                 );
-                worst = worst.max((g - w).abs() / w);
-                n_obs += 1;
+                let (eta, _) = phi[&s.id];
+                // [η_CL, η_V]; per occasion g: [κ_CL = ETA(3+g), κ_ABS = ETA(6+g)].
+                let kappas: Vec<Vec<f64>> = (0..3).map(|g| vec![eta[2 + g], eta[5 + g]]).collect();
+                let got = ferx_core::pk::predict_iov(
+                    &model,
+                    s,
+                    &model.default_params.theta,
+                    &eta[..2],
+                    &kappas,
+                );
+                let want = &nm_ipred[&s.id];
+                assert_eq!(got.len(), want.len(), "{} subject {}", anchor.name, s.id);
+                for (j, (&g, &w)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        g.is_finite() && w.is_finite() && w > 0.0,
+                        "{} {leg} subject {} obs {j}: ferx {g}, NONMEM {w}",
+                        anchor.name,
+                        s.id
+                    );
+                    worst = worst.max((g - w).abs() / w);
+                    n_obs += 1;
+                }
+                preds.push(got);
             }
+            println!(
+                "#1569/#1560 {} ({leg}): max rel |ferx IPRED − NONMEM IPRED| at NONMEM's EBEs = \
+                 {worst:.3e} over {n_obs} observations",
+                anchor.name
+            );
+            if !(worst < IPRED_TOL) {
+                failures.push(format!(
+                    "{} ({leg}): ferx departs from NONMEM's fixed-at-dose $DES by {worst:.3e}",
+                    anchor.name
+                ));
+            }
+            legs.push(preds);
         }
-        println!(
-            "#1569 {}: max rel |ferx IPRED − NONMEM IPRED| at NONMEM's EBEs = {worst:.3e} over \
-             {n_obs} observations",
+        // Two engines, so not one bit pattern: a walk leg that took the twin (or the reverse)
+        // would make the two identical and this check vacuous for one of them.
+        let differ = legs[0]
+            .iter()
+            .flatten()
+            .zip(legs[1].iter().flatten())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differ > 0,
+            "{}: the walk and twin legs are bit-identical — one of them ran the other's engine",
             anchor.name
         );
-        if !(worst < IPRED_TOL) {
-            failures.push(format!(
-                "{}: ferx's twin departs from NONMEM's fixed-at-dose $DES by {worst:.3e}",
-                anchor.name
-            ));
-        }
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
@@ -285,7 +311,7 @@ fn objective_at_nonmem_optimum_matches_nonmem() {
     let mut failures = Vec::new();
     for anchor in &ANCHORS {
         let est = estimates(anchor.name);
-        let model = model_at(anchor, &est);
+        let model = model_at(anchor, &est, false);
         let pop = population(anchor);
         let phi = phi(anchor.name);
         let mut opts = FitOptions::default();
@@ -329,10 +355,16 @@ fn objective_at_nonmem_optimum_matches_nonmem() {
 
 // Bounds, from the measured agreement (macOS arm64, NONMEM `anchor` config):
 //
-// | anchor          | IPRED max rel | OFV gap | max |Δ per-subject OBJ| |
-// |-----------------|---------------|---------|-------------------------|
-// | transit_iov_mtt | 6.0e-12       | 1.0e-6  | 9.0e-7                  |
-// | ig_iov_mat      | 8.6e-12       | 2.2e-6  | 7.5e-7                  |
+// | anchor          | IPRED max rel (twin / walk leg) | OFV gap | max |Δ per-subject OBJ| |
+// |-----------------|---------------------------------|---------|-------------------------|
+// | transit_iov_mtt | 6.0e-12 / 7.6e-12               | 1.0e-6  | 9.0e-7                  |
+// | ig_iov_mat      | 8.6e-12 / 5.4e-12               | 2.2e-6  | 7.5e-7                  |
+//
+// (The walk leg of `ig_iov_mat` serves 13 of the 24 subjects; the other 11 are in the
+// flip-flop regime for some interval and go to the twin — pinned in
+// `pk::absorption_walk::tests::nonmem_anchor_populations_route_to_the_walk_at_nonmem_ebes`.
+// The OFV / OBJ columns were measured on the twin, #1569; the objective check now runs the
+// plain model, i.e. the walk — re-measured by the slow-tests run.)
 //
 // Each bound carries ~10x over the worse measurement. On the pre-#1569 engine — every open
 // dose on the current occasion's kernel — the same checks miss by orders of magnitude more

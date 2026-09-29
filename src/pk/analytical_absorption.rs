@@ -223,6 +223,32 @@ pub fn convolve_1cpt<T: PkNum, A: TiltedAbsorption<T>>(
     f_dose_over_v * abs.mgf(ke) * (-(ke * t)).exp() * abs.tilted_cdf(t, ke)
 }
 
+/// The **windowed** tilting term: the part of one unit dose absorbed through `abs` during
+/// the window `[t0, t1]` (elapsed times since the dose's arrival), carried to `t1` under a
+/// single disposition exponential `e^{-k(t1−u)}`:
+///
+/// ```text
+///   W(t0, t1; k) = ∫_{t0}^{t1} f(u) e^{-k(t1−u)} du = M(k) · e^{-k t1} · [G(t1; k) − G(t0; k)].
+/// ```
+///
+/// With `t0 = 0` it is the per-unit-dose [`convolve_1cpt`] amount. The window is what lets
+/// `k` change between windows (#1560): the event-driven absorption walk
+/// (`crate::pk::absorption_walk`) carries the amount already delivered across a record where
+/// the disposition changes, and adds each open dose's delivery over the next window at that
+/// window's rate. `G(t ≤ 0; k) = 0` for both kernels, so a window beginning at the arrival
+/// needs no special case — and, under `Dual2`, contributes no jet from its lower limit.
+///
+/// Same domain requirement as [`convolve_1cpt`] (`k` below `abs`'s MGF abscissa).
+#[inline]
+pub(crate) fn windowed_tilted_term<T: PkNum, A: TiltedAbsorption<T>>(
+    abs: &A,
+    t0: T,
+    t1: T,
+    k: T,
+) -> T {
+    abs.mgf(k) * (-(k * t1)).exp() * (abs.tilted_cdf(t1, k) - abs.tilted_cdf(t0, k))
+}
+
 /// Central-compartment concentration at time `t` for a single dose absorbed into a
 /// **2-cpt** disposition through `abs`, with macro-rate constants `α ≥ β` and
 /// peripheral micro-rate `k21` (all from
@@ -1071,6 +1097,194 @@ mod tests {
                 let got = convolve_2cpt_peripheral(&abs, t, alpha, beta, k12, amt / v2);
                 assert_relative_eq!(got, numeric, max_relative = 2e-4, epsilon = 1e-8);
             }
+        }
+    }
+
+    // ── Windowed tilting term (#1560) ─────────────────────────────────────────
+
+    /// Composite Simpson of `g` over `[a, b]` with `steps` (even) panels. The windows
+    /// below start strictly after the arrival, where both densities are smooth, so this
+    /// converges at `h⁴` and 20 000 panels sit far below the 1e-10 bound.
+    fn simpson(g: impl Fn(f64) -> f64, a: f64, b: f64, steps: usize) -> f64 {
+        let h = (b - a) / steps as f64;
+        let mut acc = g(a) + g(b);
+        for i in 1..steps {
+            let w = if i % 2 == 1 { 4.0 } else { 2.0 };
+            acc += w * g(a + i as f64 * h);
+        }
+        acc * h / 3.0
+    }
+
+    /// Transit `Gamma(n+1, KTR)` density, the reference for the windowed checks.
+    fn transit_density(n: f64, mtt: f64, u: f64) -> f64 {
+        if u <= 0.0 {
+            return 0.0;
+        }
+        let ktr = (n + 1.0) / mtt;
+        ((n + 1.0) * ktr.ln() - ln_gamma(n + 1.0) + n * u.ln() - ktr * u).exp()
+    }
+
+    /// T1 (#1560): the windowed term equals its defining integral
+    /// `∫_{t0}^{t1} f(u) e^{-k(t1−u)} du` on windows that start **after** the arrival, for
+    /// both kernels and a non-integer `n`. The lower limit is what the walk adds over
+    /// [`convolve_1cpt`]: a window from `t0 > 0` must not be the window from `0` — each
+    /// case asserts the two differ by more than 1 %, so dropping the `G(t0; k)` term cannot
+    /// pass. A window reaching back before the arrival (`t0 < 0`) is the whole delivery
+    /// since the arrival, i.e. `convolve_1cpt` per unit dose.
+    #[test]
+    fn windowed_tilted_term_matches_quadrature() {
+        // (t0, t1, k): a mid-absorption window, a late one, and one near the transit seam
+        // (KTR = 3.5).
+        let windows = [(1.5, 4.0, 0.12), (6.0, 9.5, 0.3), (0.4, 1.1, 0.9 * 3.5)];
+        let transit = TransitAbsorption { n: 2.5, mtt: 1.0 };
+        let ig = IgAbsorption {
+            mat: 2.0,
+            lambda: 2.0 / 0.4,
+        };
+        for &(t0, t1, k) in &windows {
+            let got_tr = windowed_tilted_term(&transit, t0, t1, k);
+            let want_tr = simpson(
+                |u| transit_density(2.5, 1.0, u) * (-k * (t1 - u)).exp(),
+                t0,
+                t1,
+                20_000,
+            );
+            assert!(got_tr.is_finite() && want_tr > 0.0);
+            assert_relative_eq!(got_tr, want_tr, max_relative = 1e-10);
+            let from_zero = convolve_1cpt(&transit, t1, k, 1.0);
+            assert!(
+                (from_zero - got_tr).abs() > 0.01 * got_tr,
+                "window [{t0}, {t1}] must differ from the window from 0 ({from_zero} vs \
+                 {got_tr}) or the lower limit is untested"
+            );
+            // IG only inside its abscissa k < λ/(2μ²) = 0.625.
+            if k < ig_abscissa(ig.mat, ig.lambda) {
+                let got_ig = windowed_tilted_term(&ig, t0, t1, k);
+                let want_ig = simpson(
+                    |u| ig_density(ig.mat, ig.lambda, u) * (-k * (t1 - u)).exp(),
+                    t0,
+                    t1,
+                    20_000,
+                );
+                assert!(got_ig.is_finite() && want_ig > 0.0);
+                assert_relative_eq!(got_ig, want_ig, max_relative = 1e-10);
+                assert!((convolve_1cpt(&ig, t1, k, 1.0) - got_ig).abs() > 0.01 * got_ig);
+            }
+        }
+        // A window that begins before the arrival is the full delivery to t1.
+        for &(t1, k) in &[(2.0, 0.1), (7.0, 0.3)] {
+            assert_relative_eq!(
+                windowed_tilted_term(&transit, -3.0, t1, k),
+                convolve_1cpt(&transit, t1, k, 1.0),
+                max_relative = 1e-15
+            );
+            assert_relative_eq!(
+                windowed_tilted_term(&ig, -3.0, t1, k),
+                convolve_1cpt(&ig, t1, k, 1.0),
+                max_relative = 1e-15
+            );
+        }
+        // Composition — the walk's step: the window [0, tm] carried to t1 at the same rate,
+        // plus the window [tm, t1], is the whole delivery to t1.
+        let (tm, t1, k) = (1.7, 5.0, 0.2);
+        let composed = windowed_tilted_term(&transit, 0.0, tm, k) * (-k * (t1 - tm)).exp()
+            + windowed_tilted_term(&transit, tm, t1, k);
+        assert_relative_eq!(
+            composed,
+            convolve_1cpt(&transit, t1, k, 1.0),
+            max_relative = 1e-13
+        );
+    }
+
+    /// T2 (#1560): the windowed term's `Dual2` jets against central differences of its
+    /// own `f64` value, in all five inputs — the two kernel parameters, the rate `k` and
+    /// **both window limits**. The limits carry a jet in the walk whenever the arrival
+    /// moves (an estimated lagtime), so a limit whose jet is dropped is a wrong `∂/∂ALAG`
+    /// that the value path cannot see.
+    #[test]
+    fn windowed_tilted_term_dual_matches_fd() {
+        type D = Dual2<5>;
+        // x = [a, b, k, t0, t1]: transit (n, mtt), IG (mat, λ).
+        let eval_tr = |x: [f64; 5]| {
+            windowed_tilted_term(&TransitAbsorption { n: x[0], mtt: x[1] }, x[3], x[4], x[2])
+        };
+        let eval_ig = |x: [f64; 5]| {
+            windowed_tilted_term(
+                &IgAbsorption {
+                    mat: x[0],
+                    lambda: x[1],
+                },
+                x[3],
+                x[4],
+                x[2],
+            )
+        };
+        let dual_tr = |x: [f64; 5]| {
+            windowed_tilted_term(
+                &TransitAbsorption {
+                    n: D::var(x[0], 0),
+                    mtt: D::var(x[1], 1),
+                },
+                D::var(x[3], 3),
+                D::var(x[4], 4),
+                D::var(x[2], 2),
+            )
+        };
+        let dual_ig = |x: [f64; 5]| {
+            windowed_tilted_term(
+                &IgAbsorption {
+                    mat: D::var(x[0], 0),
+                    lambda: D::var(x[1], 1),
+                },
+                D::var(x[3], 3),
+                D::var(x[4], 4),
+                D::var(x[2], 2),
+            )
+        };
+        let check = |name: &str,
+                     x: [f64; 5],
+                     val: &dyn Fn([f64; 5]) -> f64,
+                     dual: &dyn Fn([f64; 5]) -> D| {
+            let d = dual(x);
+            assert_relative_eq!(d.value, val(x), max_relative = 1e-14);
+            for dim in 0..5 {
+                let h = 1e-6 * x[dim].abs().max(1.0);
+                let (mut xp, mut xm) = (x, x);
+                xp[dim] += h;
+                xm[dim] -= h;
+                let fd = (val(xp) - val(xm)) / (2.0 * h);
+                assert!(fd.is_finite() && d.grad[dim].is_finite());
+                assert!(
+                    (d.grad[dim] - fd).abs() <= 1e-6 * fd.abs().max(1e-3),
+                    "{name} x={x:?} ∂/∂x{dim}: dual {} vs FD {fd}",
+                    d.grad[dim]
+                );
+                // Second order against a central difference of the exact first derivative.
+                let h2 = 1e-4 * x[dim].abs().max(1.0);
+                let (mut qp, mut qm) = (x, x);
+                qp[dim] += h2;
+                qm[dim] -= h2;
+                let (gp, gm) = (dual(qp).grad, dual(qm).grad);
+                for e in 0..5 {
+                    let fd2 = (gp[e] - gm[e]) / (2.0 * h2);
+                    assert!(
+                        (d.hess[e][dim] - fd2).abs() <= 1e-5 * fd2.abs().max(1e-2),
+                        "{name} x={x:?} ∂²/∂x{e}∂x{dim}: dual {} vs FD {fd2}",
+                        d.hess[e][dim]
+                    );
+                }
+            }
+            // Both limits are live: the window's value moves with each of them.
+            assert!(
+                d.grad[3].abs() > 1e-3 && d.grad[4].abs() > 1e-3,
+                "{name}: a window limit carries no sensitivity at {x:?}"
+            );
+        };
+        for x in [[2.5, 1.0, 0.12, 1.5, 4.0], [1.3, 2.2, 0.3, 0.6, 3.1]] {
+            check("transit", x, &eval_tr, &dual_tr);
+        }
+        for x in [[2.0, 5.0, 0.12, 1.5, 4.0], [1.2, 4.0, 0.3, 0.9, 2.6]] {
+            check("ig", x, &eval_ig, &dual_ig);
         }
     }
 }

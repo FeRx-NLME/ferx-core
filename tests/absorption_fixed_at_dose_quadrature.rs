@@ -19,13 +19,21 @@
 //! neither leg can silently drift to the other side. Measured on the pre-#1569 engine
 //! (`835044be`), the transit twin matched the `current_interval` column to 3.7e-12; it now
 //! matches `fixed_at_dose` to the same order.
+//!
+//! Since #1560 the closed-form model's IOV subjects run on the exact absorption walk, not the
+//! twin. Both engines are checked here against the same table: the plain model (the walk) and
+//! a copy whose `CL` carries the inert factor `(1 + 0·TIME)` (a `TIME` read is outside the
+//! walk, so the twin serves it). The two legs must not be bit-identical, which keeps either
+//! from quietly running the other's engine.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, Subject};
 use std::collections::HashMap;
 
 /// The model for `kernel`: its structural line and the names of its two kernel parameters.
-fn model_src(kernel: &str) -> String {
+/// `twin` multiplies `CL` by the inert `(1 + 0·TIME)`, which routes it to the ODE twin.
+fn model_src(kernel: &str, twin: bool) -> String {
+    let time_read = if twin { " * (1 + 0 * TIME)" } else { "" };
     let (thetas, params, pk) = match kernel {
         "transit" => (
             "  theta TVA(3.0, 0.0, 30.0)\n  theta TVB(2.5, 0.05, 24.0)",
@@ -56,7 +64,7 @@ fn model_src(kernel: &str) -> String {
   kappa KAPPA_F ~ 0.04
   sigma PROP_ERR ~ 0.1 (sd)
 [individual_parameters]
-  CL  = TVCL * (WT/70)^0.75 * exp(KAPPA_CL)
+  CL  = TVCL * (WT/70)^0.75 * exp(KAPPA_CL){time_read}
   V1  = TVV1 * exp(ETA_V)
   Q   = TVQ
   V2  = TVV2
@@ -166,65 +174,88 @@ fn reference() -> HashMap<String, Vec<(f64, f64, f64)>> {
 }
 
 #[test]
-fn twins_match_the_fixed_at_dose_quadrature_under_iov_and_a_tv_covariate() {
+fn walk_and_twin_match_the_fixed_at_dose_quadrature_under_iov_and_a_tv_covariate() {
     let table = reference();
     let subject = subject();
     for kernel in ["transit", "ig"] {
-        let model = parse_model_string(&model_src(kernel)).expect("the fixture model parses");
-        assert!(
-            model.ode_spec.is_none() && model.effective_for(&subject).ode_spec.is_some(),
-            "{kernel}: a closed-form IOV subject must be served by the ODE twin — the engine \
-             under test"
-        );
-        let theta = model.default_params.theta.clone();
-        for rule_set in ["full", "cl_only"] {
-            let scenario = format!("{kernel}_{rule_set}");
-            let rows = &table[&scenario];
-            assert_eq!(rows.len(), OBS.len(), "{scenario}: one row per observation");
-            let got =
-                ferx_core::pk::predict_iov(&model, &subject, &theta, &[ETA_V], &kappas(rule_set));
-            let mut worst = 0.0_f64;
-            let mut vs_current = 0.0_f64;
-            let mut split = 0.0_f64;
-            for (j, (&(t, fixed, current), &pred)) in rows.iter().zip(&got).enumerate() {
-                assert_eq!(
-                    t, OBS[j].0,
-                    "{scenario} row {j}: the table's time must be the design's"
-                );
-                assert!(
-                    pred.is_finite() && fixed.is_finite() && current.is_finite(),
-                    "{scenario} obs {j}: non-finite value (ferx {pred}, table {fixed} / \
-                     {current})"
-                );
-                worst = worst.max((pred - fixed).abs() / fixed.abs());
-                vs_current = vs_current.max((pred - current).abs() / current.abs());
-                split = split.max((fixed - current).abs() / fixed.abs());
-            }
-            println!(
-                "#1569 quadrature {scenario}: max rel |twin − fixed_at_dose| {worst:.3e} (vs \
-                 current_interval {vs_current:.3e}); rules split {split:.3e}"
-            );
-            // The straddle, on the committed file itself: the two rules must differ materially
-            // on `full` (else the fixture could not tell them apart) and coincide on `cl_only`
-            // (the arm that must be unaffected by the change).
-            if rule_set == "full" {
-                assert!(
-                    split > 0.1,
-                    "{scenario} no longer separates the two rules ({split:.3e})"
-                );
-            } else {
-                assert!(
-                    split == 0.0,
-                    "{scenario}: with IOV on CL alone the two rules must coincide exactly \
-                     ({split:.3e})"
-                );
-            }
-            // Realised ≤ 3.7e-12 (transit) at `ode_reltol = 1e-12`; the bound carries ~27x
-            // over the worst and sits nine orders inside the smallest split (15 %).
+        let mut legs: Vec<Vec<f64>> = Vec::new();
+        for (leg, twin) in [("walk", false), ("twin", true)] {
+            let model =
+                parse_model_string(&model_src(kernel, twin)).expect("the fixture model parses");
             assert!(
-                worst < 1e-10,
-                "{scenario}: the twin departs from the fixed-at-dose quadrature by {worst:.3e}"
+                model.ode_spec.is_none() && model.effective_for(&subject).ode_spec.is_some(),
+                "{kernel} {leg}: a closed-form IOV model with an ODE twin"
             );
+            let theta = model.default_params.theta.clone();
+            for rule_set in ["full", "cl_only"] {
+                let scenario = format!("{kernel}_{rule_set}");
+                let rows = &table[&scenario];
+                assert_eq!(rows.len(), OBS.len(), "{scenario}: one row per observation");
+                let got = ferx_core::pk::predict_iov(
+                    &model,
+                    &subject,
+                    &theta,
+                    &[ETA_V],
+                    &kappas(rule_set),
+                );
+                let mut worst = 0.0_f64;
+                let mut vs_current = 0.0_f64;
+                let mut split = 0.0_f64;
+                for (j, (&(t, fixed, current), &pred)) in rows.iter().zip(&got).enumerate() {
+                    assert_eq!(
+                        t, OBS[j].0,
+                        "{scenario} row {j}: the table's time must be the design's"
+                    );
+                    assert!(
+                        pred.is_finite() && fixed.is_finite() && current.is_finite(),
+                        "{scenario} {leg} obs {j}: non-finite value (ferx {pred}, table \
+                         {fixed} / {current})"
+                    );
+                    worst = worst.max((pred - fixed).abs() / fixed.abs());
+                    vs_current = vs_current.max((pred - current).abs() / current.abs());
+                    split = split.max((fixed - current).abs() / fixed.abs());
+                }
+                println!(
+                    "#1569/#1560 quadrature {scenario} ({leg}): max rel |ferx − fixed_at_dose| \
+                     {worst:.3e} (vs current_interval {vs_current:.3e}); rules split {split:.3e}"
+                );
+                // The straddle, on the committed file itself: the two rules must differ
+                // materially on `full` (else the fixture could not tell them apart) and
+                // coincide on `cl_only` (the arm that must be unaffected by the change).
+                if rule_set == "full" {
+                    assert!(
+                        split > 0.1,
+                        "{scenario} no longer separates the two rules ({split:.3e})"
+                    );
+                } else {
+                    assert!(
+                        split == 0.0,
+                        "{scenario}: with IOV on CL alone the two rules must coincide exactly \
+                         ({split:.3e})"
+                    );
+                }
+                // Realised ≤ 3.7e-12 on the twin at `ode_reltol = 1e-12` and ≤ 8.7e-16 on
+                // the walk; the bound carries ~27x over the worse and sits nine orders inside
+                // the smallest split (15 %).
+                assert!(
+                    worst < 1e-10,
+                    "{scenario} ({leg}): ferx departs from the fixed-at-dose quadrature by \
+                     {worst:.3e}"
+                );
+                legs.push(got);
+            }
         }
+        // [walk full, walk cl_only, twin full, twin cl_only]: two engines, never one bit
+        // pattern.
+        let differ = legs[0..2]
+            .iter()
+            .flatten()
+            .zip(legs[2..4].iter().flatten())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differ > 0,
+            "{kernel}: walk and twin legs are bit-identical — one ran the other's engine"
+        );
     }
 }

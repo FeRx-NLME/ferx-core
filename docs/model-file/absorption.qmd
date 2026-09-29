@@ -272,25 +272,41 @@ the flip-flop note below.
 
 This analytic model supports single and multiple
 **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
-initial amount. A model whose disposition switches mid-profile — a **time-varying
-covariate** or a `TIME`-dependent structural parameter — or that carries
-**inter-occasion variability** (IOV, `n_kappa > 0`) is transparently rerouted per subject
-to an exact ODE `transit()` twin, so it is **supported**, not rejected. (IOV needs
-cross-occasion dose carryover the closed-form superposition cannot express, so it is served
-by the twin's exact integration. The rerouted predictions match the hand-written `transit()`
-ODE forcing **bit-for-bit** at non-zero per-occasion κ, including multiple doses
-(`tests/transit_analytic_equivalence.rs`); the transit+IOV FOCEI *objective* itself sits a
-small, pre-existing ~8 OFV units from NONMEM — an ODE-path IOV marginal offset shared by every
-ODE+IOV model, orthogonal to this reroute, tracked in
-[#810](https://github.com/FeRx-NLME/ferx-core/issues/810) and guarded (not asserted-equal) by
-`tests/transit_iov_nonmem_anchor.rs`.) A **steady-state (`SS=1`) dose or an infusion
-(`RATE>0`) reroutes** to the `transit()` ODE forcing automatically (#719) — the twin
-equilibrates SS through the absorption kernel and delivers an infusion as a zero-order source
-feeding it — exactly as TV-covariate and IOV subjects do. **System resets (EVID=3/4), a
-non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with an actionable
-message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
-tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
-drop-in choice when you need a feature the closed form does not yet cover.
+initial amount.
+
+**IOV and time-varying covariates stay analytic.** A subject with inter-occasion
+variability (IOV, `n_kappa > 0`) or a time-varying covariate is served by an **exact
+event-driven walk** (#1560). A static closed form cannot carry a dose's drug across a
+record where the disposition changes, so the walk splits the model at each record:
+
+- the **disposition** (`CL`, `V`) is the current interval's;
+- each **dose** keeps the kernel, `F` and lag of its own record (see
+  [Absorption parameters are read at the dose record](#absorption-at-dose)).
+
+On an interval `[s₀, s₁]` the central amount decays at `ke` and each open dose adds its
+delivery over that window, `F·Dose · M(ke) · e^{−ke(s₁−t_d)} · [G(s₁−t_d) − G(s₀−t_d)]`.
+Every term is closed-form, so the predictions are exact and the FOCE/FOCEI gradients are
+exact `Dual2` jets.
+
+The walk matches an independent quadrature to 1e-14 and the ODE twin to its tolerance
+(`tests/data/absorption_walk_1cpt_quadrature.py`, #1569's 2-cpt table). For transit it is
+3–4× faster per subject than the twin at default ODE tolerances, and 28–30× faster at
+`ode_reltol = 1e-12`.
+
+**What still reroutes to the ODE twin.** The twin is the exact `transit()` ODE model, and it
+serves:
+
+- a `TIME`-dependent structural parameter;
+- a **steady-state (`SS=1`) dose** or an **infusion (`RATE>0`)** (#719);
+- any subject the walk cannot factorise — the flip-flop regime, below;
+- a subject whose gradient the walk cannot serve analytically, so that it keeps the twin's
+  analytic ODE sensitivities rather than falling back to finite differences: an IOV subject
+  with `n_eta + K·n_kappa ≥ 24` stacked random effects (`K` occasions), or a time-varying
+  covariate model outside the closed-form analytic-sensitivity scope.
+
+**System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are
+still rejected** with an actionable message. Use the `transit()` ODE forcing above for those.
+The two paths agree to ODE-solver tolerance (`tests/transit_analytic_equivalence.rs`).
 
 ### The flip-flop regime
 
@@ -298,7 +314,11 @@ When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
 (the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a
 faster disposition), the closed form is outside its convergence domain. ferx detects
 this *per evaluation* and routes the model to its exact ODE `transit()` twin, which
-is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
+is valid in both regimes. On the IOV / time-varying-covariate walk the test is per
+**(interval, arrived dose) pair**: every interval's `ke` must sit below the `KTR` of every
+dose that has arrived by then — even one long since absorbed — each at its own dose-record
+kernel. So one slow dose followed by a later occasion that raises `CL` past its `KTR` sends
+that subject to the twin (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
 so a flip-flop model fits and predicts correctly instead of returning a zero
 profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
 estimates. The reroute needs an ODE twin. A closed-form transit model that carries a
@@ -367,12 +387,13 @@ with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`
 **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and
 with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`.
 The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to
-`one_cpt_transit` (bolus doses into the depot, bioavailability, lag time; time-varying
-covariates, `TIME`-dependent parameters, and IOV (`n_kappa > 0`) transparently rerouted to
-an exact 2-cpt ODE `transit()` twin; the flip-flop `α ≥ KTR` regime likewise auto-rerouted to
-that twin per evaluation — exactly as for `one_cpt_transit` above; an `SS=1` dose likewise
-reroutes to the twin (#719); an infusion likewise reroutes (gap 2), while resets / non-depot
-(`CMT≠1`) doses / `depot`-init are still rejected — use an ODE transit model for those).
+`one_cpt_transit`: bolus doses into the depot, bioavailability, lag time; time-varying
+covariates and IOV (`n_kappa > 0`) served by the exact event-driven walk, whose 2-cpt step
+carries the central **and** peripheral amounts and adds each open dose's window at both
+macro-rates (#1560); `TIME`-dependent parameters, an `SS=1` dose (#719), an infusion, and the
+flip-flop regime (`α ≥ KTR`, per interval and open dose on the walk) auto-rerouted to an
+exact 2-cpt ODE `transit()` twin; resets / non-depot (`CMT≠1`) doses / `depot`-init still
+rejected — use an ODE transit model for those.
 
 [`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
 is a complete self-contained example:
@@ -415,13 +436,15 @@ with the bi-exponential 2-cpt impulse response, carrying
 
 **Scope / limits.** Identical to the analytic transit models above: single and multiple
 **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
-initial amount are supported; **time-varying covariates** and `TIME`-dependent
-parameters, and **IOV** (`n_kappa > 0`) are transparently rerouted to an exact ODE `igd()`
-twin (so they are supported, not rejected — IOV via the twin's exact cross-occasion
-carryover, #719); the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`) is likewise
-auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at the
-typical-value estimates. A **steady-state (`SS=1`) dose or an infusion (`RATE>0`) reroutes**
-to the `igd()` twin too (#719). **System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a
+initial amount are supported; **time-varying covariates** and **IOV** (`n_kappa > 0`) are
+served by the same exact event-driven walk as transit (#1560), with each dose's `MAT`/`CV²`
+fixed at its own record; `TIME`-dependent parameters are rerouted to an exact ODE `igd()`
+twin; the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`, per interval and open dose on the
+walk) is likewise auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at
+the typical-value estimates. A **steady-state (`SS=1`) dose or an infusion (`RATE>0`)
+reroutes** to the `igd()` twin too (#719). On the walk IG is never slower than its twin —
+1.1–2.3× faster per subject at default ODE tolerances, 12–20× at `ode_reltol = 1e-12` —
+unlike the static closed form below. **System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a
 `depot` initial amount are still rejected**
 with an actionable message — use the `igd()` ODE forcing below for those. A flip-flop
 model carrying a `lagtime`/`f`/user-`[odes]` mapping has no ODE twin to route to and is

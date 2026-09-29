@@ -1370,19 +1370,23 @@ fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
 }
 
 #[test]
-fn inner_stall_enabled_tracks_the_effective_model() {
-    // #814: the inner objective-stall stop (#555) must key off the *effective* model. A
-    // closed-form transit/IG + IOV subject evaluates its objective on the ODE twin
-    // (`effective_for`), so it needs the ODE gradient-noise stall even though the primary
-    // model is analytic (`ode_spec == None`) — basing it on the raw model wrongly disabled it.
+fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
+    // #814: the inner objective-stall stop (#555) must key off the *effective* model, not the
+    // raw one. #1560: a closed-form transit/IG + IOV subject is no longer on its ODE twin
+    // subject-statically — the absorption walk serves it exactly, so it must keep the exact
+    // `gnorm < tol` stop — unless κ puts a (dose, interval) pair in flip-flop, where the twin
+    // takes it and it needs the stall. Both sides are asserted here, at the same subject.
     use crate::parser::model_parser::parse_model_string;
     let subject = Subject {
         id: "1".into(),
-        doses: Vec::new(),
-        obs_times: vec![1.0, 6.0],
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 25.0, 30.0],
         obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0],
-        obs_cmts: vec![1; 2],
+        observations: vec![8.0, 6.0, 7.0, 5.0],
+        obs_cmts: vec![1; 4],
         covariates: HashMap::new(),
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
@@ -1390,34 +1394,75 @@ fn inner_stall_enabled_tracks_the_effective_model() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
-        cens: vec![0; 2],
-        occasions: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
+        dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
 
     // Plain closed-form IOV (no twin): objective is exact → no stall (bit-identical path).
-    assert!(!inner_stall_enabled(&make_iov_model(), &subject));
+    let plain = make_iov_model();
+    assert!(!inner_stall_enabled_at_iov(
+        &plain,
+        &subject,
+        &plain.default_params.theta,
+        &[0.0; 3]
+    ));
 
     // Hand-written [odes] + IOV: RK45 objective → stall (unchanged pre-existing behaviour).
     let ode_iov = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
         .expect("parse ODE IOV");
-    assert!(inner_stall_enabled(&ode_iov, &subject));
+    assert!(inner_stall_enabled_at_iov(
+        &ode_iov,
+        &subject,
+        &ode_iov.default_params.theta,
+        &[0.0; 4]
+    ));
 
-    // Closed-form transit + IOV: analytic primary, but IOV reroutes to the ODE twin → stall.
+    // Closed-form transit + IOV. Stacked layout [η_V, κ_occ1, κ_occ2].
     let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+    let theta = transit_iov.default_params.theta.clone();
     assert!(
         transit_iov.ode_spec.is_none(),
         "transit primary is analytic"
     );
+    // κ = 0: ke = 0.2/10 = 0.02 against KTR = (3+1)/1 = 4 — in domain on both occasions.
+    let in_domain = [0.0, 0.0, 0.0];
+    // κ_occ2 = 6: CL = 0.2·e⁶ = 80.7, ke = 8.07 ≥ KTR = 4 — the second dose's pair flips.
+    let flipped = [0.0, 0.0, 6.0];
+
+    // The straddle, on the routing the gate is built from.
     assert!(
-        inner_stall_enabled(&transit_iov, &subject),
-        "#814: the twin reroute must enable the inner stall for transit+IOV"
+        std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&transit_iov, &subject, &theta, &in_domain),
+            &transit_iov
+        ),
+        "fixture drift: κ = 0 must be served by the absorption walk"
+    );
+    assert!(
+        !std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&transit_iov, &subject, &theta, &flipped),
+            &transit_iov
+        ),
+        "fixture drift: κ_occ2 = 6 must send the subject to the twin"
+    );
+
+    // The subject-static half is blind to both: it still names the twin for every κ.
+    assert!(inner_stall_enabled(&transit_iov, &subject));
+
+    // Both sides of the gate under test.
+    assert!(
+        !inner_stall_enabled_at_iov(&transit_iov, &subject, &theta, &in_domain),
+        "#1560: a walk-served transit+IOV subject has an exact objective and must keep `gnorm < tol`"
+    );
+    assert!(
+        inner_stall_enabled_at_iov(&transit_iov, &subject, &theta, &flipped),
+        "#814: a twin-served transit+IOV subject integrates with RK45 and needs the stall stop"
     );
 }
 
@@ -3638,5 +3683,98 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     assert!(
         ok2,
         "an NM run that ended at the returned point certifies it"
+    );
+}
+
+/// The behavioural side of `inner_stall_enabled_at_iov_tracks_the_effective_model`: a
+/// transit + IOV subject the absorption walk serves has an **exact** objective, so its inner
+/// solve must stop on `gnorm < tol`, not on the objective-stall plateau (#555) that exists for
+/// RK45 noise. Keyed on `effective_for` — which still names the twin for every `n_kappa > 0`
+/// transit subject — the stall fired on this exact objective and reported convergence early.
+///
+/// Measured on this fixture (the analytic stacked gradient at the returned `[η, κ₁, κ₂]`):
+///
+/// | `tol` | | `converged` | max \|∂l/∂(η,κ)\| |
+/// |---|---|---|---|
+/// | 1e-8 | fix | `true` | **1.49e-9** |
+/// | 1e-8 | stall keyed on `effective_for` | `true` | **2.03e-8** (above `tol`) |
+/// | 1e-10 | fix | **`false`** | 1.49e-9 (the exact objective's floor) |
+/// | 1e-10 | stall keyed on `effective_for` | **`true`** | 2.03e-8 |
+///
+/// So at `tol = 1e-8` a converged solve must have a gradient below `tol` — 6.7× headroom over
+/// the realised 1.49e-9, and the mutation lands 2× above it — and at `tol = 1e-10`, below the
+/// floor, it must not claim convergence at all. Both are asserted; either catches the mutation.
+#[test]
+fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
+        obs_cmts: vec![1; 10],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 10],
+        occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    let solve = |tol: f64| {
+        let r = find_ebe_iov(&model, &subject, &params, 200, tol, None, None);
+        let mut stacked: Vec<f64> = r.eta.as_slice().to_vec();
+        for k in &r.kappas {
+            stacked.extend_from_slice(k.as_slice());
+        }
+        assert!(
+            std::ptr::eq(
+                crate::pk::effective_model_for_eval_iov(&model, &subject, &params.theta, &stacked),
+                &model
+            ),
+            "fixture drift: the returned EBE must be served by the absorption walk"
+        );
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            params.omega_iov.as_ref().expect("IOV model"),
+            &params.sigma.values,
+            model.n_eta,
+            model.n_kappa,
+            r.kappas.len(),
+            None,
+        )
+        .expect("the analytic IOV gradient serves a walk subject");
+        assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+        let gmax = g.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        (r.converged, gmax)
+    };
+
+    let (conv, gmax) = solve(1e-8);
+    assert!(
+        conv && gmax < 1e-8,
+        "an exact objective must stop on gnorm < tol: converged {conv}, max |g| {gmax:e}"
+    );
+    let (conv, gmax) = solve(1e-10);
+    assert!(
+        !conv,
+        "below the exact objective's floor the solve must not claim convergence on a plateau \
+         (max |g| {gmax:e})"
     );
 }

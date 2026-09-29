@@ -6440,50 +6440,60 @@ fn analytic_lagtime_generic_walk_uses_mixed_hessian() {
     MIXED_ANALYTIC_RUNS.with(|runs| assert_eq!(runs.get(), 1));
 }
 
-/// A `one_cpt_transit` subject with time-varying covariates is served by the model's ODE
-/// `transit()` equivalent (`effective_for` routes it there), NOT the closed form — the
-/// closed form assumes constant parameters over each absorption window, and the
-/// event-driven walk can't state-propagate the continuous-`N` Gamma absorption
-/// (`subject_routes_to_event_walk` omits transit for that reason). The gradient is
-/// analytic (a non-`None` `SubjectSens`, non-zero — the old silent all-zero bug is gone);
-/// its numerical agreement with the production predictor is covered end-to-end by the ODE
-/// equivalence suite (`tests/transit_analytic_equivalence.rs`). A constant-parameter
-/// transit subject keeps the fast closed form (`effective_for` returns the model itself).
+/// A `one_cpt_transit` subject with time-varying covariates is served by the exact
+/// absorption walk (#1560), not by its ODE `transit()` equivalent as before: the walk
+/// carries the delivered amount across each record where the disposition changes, with every
+/// open dose absorbing on its own dose record's kernel. `effective_for` is unchanged — it is
+/// the parameter-free reroute, and still names the twin for this subject — but the
+/// parameter-selected route every predictor and provider takes
+/// (`crate::pk::effective_model_for_eval`) keeps the closed form, `subject_routes_to_event_walk`
+/// admits it, and both gradients are analytic. A **steady-state** dose is outside the walk and
+/// stays on the twin (the control), and a constant-parameter subject keeps the static closed
+/// form. The walk's numbers are pinned against quadrature, the twin and FD in
+/// `pk::absorption_walk::tests` and `transit_walk_provider_matches_fd`.
 #[test]
-fn transit_with_tvcov_routes_to_ode_equivalent() {
+fn transit_with_tvcov_routes_to_the_absorption_walk() {
     let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
     assert_eq!(m.pk_model, PkModel::OneCptTransit);
-    assert!(
-        m.absorption_ode_equivalent.is_some(),
-        "a plain transit model carries an ODE equivalent"
-    );
+    let twin = m
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("a plain transit model carries an ODE equivalent")
+        .built();
     let theta = [5.0, 50.0, 1.0, 3.0];
     let eta = [0.1, -0.05];
+    let tv_with = |dose: DoseEvent| {
+        tvcov_subject(
+            vec![dose],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
 
-    // TV-cov subject → routed to the ODE equivalent, analytic and non-zero.
-    let tv = tvcov_subject(
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &[70.0],
-        &[1.0, 2.0, 4.0, 8.0, 24.0],
-        &[70.0, 72.0, 80.0, 85.0, 90.0],
-        Vec::new(),
-        Vec::new(),
-        &[],
-    );
+    // TV-cov subject → the absorption walk: analytic and non-zero, outer and inner.
+    let tv = tv_with(DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
     assert!(tv.has_tv_covariates());
     assert!(
-        std::ptr::eq(
-            m.effective_for(&tv),
-            m.absorption_ode_equivalent.as_ref().unwrap().built()
-        ),
-        "TV-cov transit subject must be served by the ODE equivalent"
+        std::ptr::eq(m.effective_for(&tv), twin),
+        "effective_for is the parameter-free reroute and still names the twin"
     );
     assert!(
-        !subject_routes_to_event_walk(&m, &tv),
-        "transit never routes to the closed-form event walk"
+        std::ptr::eq(
+            crate::pk::effective_model_for_eval(&m, &tv, &theta, &eta),
+            &m
+        ),
+        "the parameter-selected route keeps the closed form: the walk serves it"
+    );
+    assert!(
+        subject_routes_to_event_walk(&m, &tv),
+        "a walk-served transit subject routes to the (absorption) event walk"
     );
     let sens = subject_sensitivities(&m, &tv, &theta, &eta)
-        .expect("transit + TV-cov is analytic via the ODE equivalent (was silent zeros)");
+        .expect("transit + TV-cov is analytic on the absorption walk");
     assert!(
         sens.obs.iter().any(|o| o.f.abs() > 1e-6),
         "predictions must be non-zero"
@@ -6493,7 +6503,18 @@ fn transit_with_tvcov_routes_to_ode_equivalent() {
         "inner analytic too"
     );
 
-    // Constant-parameter subject → keeps the fast closed form (served by the model itself).
+    // Control: a steady-state dose is outside the walk → the twin, as before #1560.
+    let ss = tv_with(DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0));
+    assert!(
+        std::ptr::eq(
+            crate::pk::effective_model_for_eval(&m, &ss, &theta, &eta),
+            twin
+        ),
+        "an SS transit subject stays on the ODE twin"
+    );
+    assert!(!subject_routes_to_event_walk(&m, &ss));
+
+    // Constant-parameter subject → keeps the fast static closed form.
     let flat = subject_with_doses_and_resets(
         vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         &[1.0, 2.0, 4.0, 8.0, 24.0],
@@ -6504,6 +6525,7 @@ fn transit_with_tvcov_routes_to_ode_equivalent() {
         std::ptr::eq(m.effective_for(&flat), &m),
         "constant-parameter transit subject keeps the closed form"
     );
+    assert!(!subject_routes_to_event_walk(&m, &flat));
 }
 
 /// The TV-covariate provider's exact value/∂η/∂²η/∂θ/∂²η∂θ must match central
@@ -13305,4 +13327,275 @@ fn kink_step_bound_declines_a_corner_a_length_change_and_a_non_finite_event() {
         kink_step_bound(&[0.7], &[0.5], &[f64::NAN], &[0.485]),
         KinkStepBound::Decline
     );
+}
+
+// ── #1560: analytic sensitivities through the transit/IG absorption walk ─────────────
+//
+// The walk is one generic function (`pk::absorption_walk::absorption_walk_g`); these check
+// its `Dual2`/`Dual1` instantiations against central differences of the production `f64`
+// predictors (`compute_predictions_with_tv`, `predict_iov`), which run the same walk at
+// `T = f64` — so what they pin is the derivative, and `pk::absorption_walk::tests` pins the
+// value against quadrature and the twin. Each asserts the route through the walk's
+// `ABSORPTION_SENS_WALK_RUNS` counter: the twin's ODE provider also returns `Some`, so a
+// green parity check alone would not say which engine produced it.
+
+/// Runs `f` and returns how many times the absorption sens walk ran inside it.
+fn absorption_walk_runs<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
+    ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
+    let r = f();
+    (r, ABSORPTION_SENS_WALK_RUNS.with(|c| c.get()))
+}
+
+const ONECPT_TRANSIT_LAG_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.5, 0.05, 24.0)
+  theta TVN(2.5, 0.0, 30.0)
+  theta TVLAG(0.4, 0.0, 4.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_MTT ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^0.75 * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT * exp(ETA_MTT)
+  NTR = TVN
+  LAG = TVLAG
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+
+const TWOCPT_IG_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(30.0, 1.0, 500.0)
+  theta TVQ(3.0, 0.1, 100.0)
+  theta TVV2(60.0, 1.0, 1000.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_MAT ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^0.75 * exp(ETA_CL)
+  V1  = TVV1 * exp(ETA_V1)
+  Q   = TVQ
+  V2  = TVV2
+  MAT = TVMAT * exp(ETA_MAT)
+  CV2 = TVCV2
+[structural_model]
+  pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+
+/// T5 (#1560), TV covariates: the walk's outer `Dual2` jet (value, ∂/∂η, ∂²/∂η², ∂/∂θ,
+/// ∂²/∂η∂θ) matches central FD of `compute_predictions_with_tv`, and the inner `Dual1`
+/// η-gradient matches the outer one — on 1-cpt transit with an **estimated lagtime** (every
+/// arrival a moving boundary) and η on `MTT`, and 2-cpt IG with η on `MAT`. Two overlapping
+/// doses, so the second arrives into a live, carried state under a different `WT`.
+#[test]
+fn transit_ig_walk_tvcov_provider_matches_fd() {
+    let doses = || {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ]
+    };
+    let obs = [1.0, 3.0, 5.0, 7.0, 9.0, 14.0, 24.0];
+    let wts = [70.0, 74.0, 78.0, 82.0, 86.0, 90.0, 94.0];
+    let cases = [
+        (
+            ONECPT_TRANSIT_LAG_TVCOV,
+            vec![5.0, 50.0, 1.5, 2.5, 0.4],
+            vec![0.1, -0.05, 0.12],
+        ),
+        (
+            TWOCPT_IG_TVCOV,
+            vec![4.0, 30.0, 3.0, 60.0, 2.0, 0.4],
+            vec![0.1, -0.05, 0.12],
+        ),
+    ];
+    for (src, theta, eta) in cases {
+        let model = parse_model_string(src).expect("parse");
+        let subject = tvcov_subject(doses(), &[70.0, 72.0], &obs, &wts, vec![], vec![], &[]);
+        assert!(crate::pk::absorption_walk::walk_eligible(&model, &subject));
+        let (_, runs) = absorption_walk_runs(|| {
+            check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+        });
+        assert!(
+            runs > 0,
+            "{:?}: the outer jet must come from the walk",
+            model.pk_model
+        );
+        let (outer, runs_outer) =
+            absorption_walk_runs(|| subject_sensitivities(&model, &subject, &theta, &eta));
+        let (inner, runs_inner) =
+            absorption_walk_runs(|| subject_eta_grad(&model, &subject, &theta, &eta));
+        let (outer, inner) = (
+            outer.expect("outer analytic"),
+            inner.expect("inner analytic"),
+        );
+        assert!(runs_outer == 1 && runs_inner == 1, "both loops on the walk");
+        for (o, i) in outer.obs.iter().zip(&inner) {
+            approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-12, epsilon = 1e-14);
+            for (a, b) in o.df_deta.iter().zip(&i.df_deta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+        }
+    }
+}
+
+/// The 1-cpt transit IOV fixture of `pk::absorption_walk::tests` (its generator is
+/// `tests/data/absorption_walk_1cpt_quadrature.py`): IOV on `CL`, `n`, `MTT` and `F`, `WT` on
+/// `CL`, lag 0.5, doses at 0 / 6 / 12 in occasions 1 / 2 / 3, occasion 2 opening at the
+/// observation `t = 5` while dose 1 is still absorbing.
+const ONECPT_TRANSIT_IOV_WALK: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(25.0, 1.0, 500.0)
+  theta TVA(2.0, 0.0, 30.0)
+  theta TVB(4.0, 0.05, 24.0)
+  theta TVF(0.8, 0.01, 1.0)
+  theta TVLAG(0.5, 0.0, 5.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  kappa KAPPA_A ~ 0.04
+  kappa KAPPA_B ~ 0.04
+  kappa KAPPA_F ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^0.75 * exp(KAPPA_CL)
+  V   = TVV * exp(ETA_V)
+  NTR = TVA * exp(KAPPA_A)
+  MTT = TVB * exp(KAPPA_B)
+  FB  = TVF * exp(KAPPA_F)
+  LAG = TVLAG
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=FB, lagtime=LAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+
+fn transit_iov_walk_subject() -> Subject {
+    let doses = [(0.0, 1, 70.0), (6.0, 2, 72.0), (12.0, 3, 74.0)];
+    let obs = [
+        (1.0, 1, 70.0),
+        (2.5, 1, 70.0),
+        (4.0, 1, 71.0),
+        (5.0, 2, 72.0),
+        (5.5, 2, 72.0),
+        (7.0, 2, 73.0),
+        (9.0, 2, 73.0),
+        (13.0, 3, 74.0),
+        (18.0, 3, 78.0),
+        (36.0, 3, 82.0),
+    ];
+    let n = obs.len();
+    Subject {
+        id: "1".into(),
+        doses: doses
+            .iter()
+            .map(|&(t, _, _)| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect(),
+        obs_times: obs.iter().map(|&(t, _, _)| t).collect(),
+        obs_raw_times: vec![],
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        covariates: wt_map(70.0),
+        dose_covariates: doses.iter().map(|&(_, _, w)| wt_map(w)).collect(),
+        obs_covariates: obs.iter().map(|&(_, _, w)| wt_map(w)).collect(),
+        pk_only_times: vec![],
+        pk_only_covariates: vec![],
+        reset_times: vec![],
+        reset_covariates: vec![],
+        cens: vec![0; n],
+        occasions: obs.iter().map(|&(_, o, _)| o).collect(),
+        obs_l2: vec![],
+        dose_occasions: doses.iter().map(|&(_, o, _)| o).collect(),
+        reset_occasions: vec![],
+        fremtype: vec![],
+        obs_records: vec![],
+    }
+}
+
+/// T5 (#1560), IOV: the walk's stacked `(θ, η_bsv, κ₁..κ₃)` jet matches central FD of
+/// `predict_iov`, the inner `Dual1` matches the outer, and the κ sensitivity lands where
+/// the fixed-at-dose rule puts it. At `t = 5` and `5.5` (occasion 2, before dose 2 arrives
+/// at 6.5) only dose 1 is open: its kernel is occasion 1's, so `∂f/∂κ_MTT` is **exactly 0**
+/// on occasion 2's axis and non-zero on occasion 1's — while `∂f/∂κ_CL` is live on
+/// occasion 2's axis, the disposition being the current record's. A walk that took an open
+/// dose's kernel from the governing record would swap the two MTT entries.
+#[test]
+fn transit_walk_iov_provider_matches_fd_and_places_kappa_at_the_dose() {
+    let model = parse_model_string(ONECPT_TRANSIT_IOV_WALK).expect("parse");
+    let subject = transit_iov_walk_subject();
+    assert!(crate::pk::absorption_walk::walk_eligible(&model, &subject));
+    assert!(iov_sens_supported(&model) && iov_sens_eta_supported(&model));
+    let theta = [3.0, 25.0, 2.0, 4.0, 0.8, 0.5];
+    // [η_V, κ(occ1) = CL, A, B, F, κ(occ2), κ(occ3)].
+    let stacked = [
+        0.1, 0.10, 0.00, 0.20, 0.00, -0.15, 0.25, -0.30, -0.10, 0.20, -0.20, 0.35, 0.10,
+    ];
+    let (_, runs) = absorption_walk_runs(|| {
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    });
+    assert!(runs > 0, "the IOV jet must come from the walk");
+    let ((), runs) = absorption_walk_runs(|| {
+        check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+    });
+    assert_eq!(runs, 2, "outer and inner both on the walk");
+
+    let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("analytic");
+    // Stacked axis of occasion group g's κ number c (CL=0, A=1, B=2, F=3).
+    let axis = |g: usize, c: usize| 1 + 4 * g + c;
+    for j in [3, 4] {
+        let d = &sens.obs[j].df_deta;
+        assert!(d.iter().all(|x| x.is_finite()));
+        assert_eq!(
+            d[axis(1, 2)],
+            0.0,
+            "obs {j}: occasion 2's MTT reaches no open dose"
+        );
+        assert!(
+            d[axis(0, 2)].abs() > 1e-4,
+            "obs {j}: dose 1 absorbs on occasion 1's MTT"
+        );
+        assert!(
+            d[axis(1, 0)].abs() > 1e-4,
+            "obs {j}: occasion 2's CL is the disposition"
+        );
+        assert_eq!(
+            d[axis(1, 3)],
+            0.0,
+            "obs {j}: occasion 2's F has no dose yet"
+        );
+    }
+
+    // The covariance sweep picks its provider through the same parameter-selected route
+    // (`effective_provider_model`), so it differentiates the walk the fit ran on — and the
+    // twin once occasion 2's `κ_CL` (`ke = 0.12·e³ ≈ 2.4`) outruns dose 1's `KTR`.
+    let mut flip = stacked;
+    flip[axis(1, 0)] = 3.0;
+    let twin = model.absorption_ode_equivalent.as_ref().unwrap().built();
+    assert!(std::ptr::eq(
+        effective_provider_model(&model, &subject, &theta, &stacked, true),
+        &model
+    ));
+    assert!(std::ptr::eq(
+        effective_provider_model(&model, &subject, &theta, &flip, true),
+        twin
+    ));
 }
