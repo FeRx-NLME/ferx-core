@@ -1,4 +1,5 @@
 pub mod absorption;
+pub(crate) mod absorption_walk;
 pub mod analytical_absorption;
 pub mod event_driven;
 pub(crate) mod modified_release;
