@@ -59,6 +59,14 @@ section of the SDLC for the versioning policy).
   models with an explicit depot state were already correct. A running infusion (#1586), a
   pending lagged dose (#1587) and a co-timed state bolus on the static ODE path (#1588) are
   not yet reset.
+- **`simulate_adaptive()` now rejects a model covariate missing from the data** (#1571).
+  The programmatic (closure-controller) Rust entry point skipped the data checks every
+  other simulate entry point runs, so a covariate such as `WT` with no data column was
+  read as `0.0` and the run returned `Ok`. It now returns the same error as `simulate()`
+  and `simulate_adaptive_from_spec()`. The rest of the simulation data checks (θ levels,
+  covariate levels, endpoint routing, κ and residual weights) now apply there too, so a
+  covariate-selected error model whose selector column is missing reports that column
+  rather than the adaptive `[error_model]` restriction. R users were not affected.
 - **A diverging ODE state no longer freezes the other states at finite, wrong values**
   (#1539). When one state went non-finite (e.g. an unobserved `d/dt(X) = 0.5 * X * X` past
   its pole), the solver stopped every state and padded the rest of the segment with the

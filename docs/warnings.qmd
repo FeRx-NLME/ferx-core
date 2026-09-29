@@ -72,7 +72,7 @@ the same list on each:
 | `predict_survival()` | time-varying covariate on a hazard, dose compartment |
 | `predict_categorical()` | time-varying covariate on the linear predictor, endpoint routing |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
-| `simulate_adaptive()` | its own adaptive-dosing rejections, then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
+| `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, then the rest of its own adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
 | `predict()` | `predict_diag()`'s list, in its order. |
 | `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks. |
 

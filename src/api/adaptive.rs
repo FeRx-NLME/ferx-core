@@ -56,6 +56,19 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
+/// The model-vs-data checks both public adaptive entry points run before anything
+/// else touches the population: `check_simulation_data` (the list every other
+/// simulate entry point runs, #1083), then the `Selected` error-model reject (#658).
+///
+/// One helper, not two copies: `simulate_adaptive` once ran only the second half,
+/// so a model covariate absent from the data read as `0.0` and the run returned
+/// `Ok` — the frozen-replay verifier passed too, since it replays the same
+/// snapshots (#1571).
+fn check_adaptive_model_data(model: &CompiledModel, population: &Population) -> Result<(), String> {
+    first_error(&check_simulation_data(model, population))?;
+    reject_selected_error_for_adaptive(model)
+}
+
 /// Reject the model / data combinations the reactive driver cannot yet simulate
 /// *faithfully*. The adaptive path carries no process noise, so an SDE `[diffusion]`
 /// model would be **silently** wrong — a violation of the "never a silent wrong
@@ -200,6 +213,10 @@ pub struct AdaptiveSimulationResult {
 ///   consults the controller (a silent dose-free run) and is rejected.
 /// - **ODE model.** The reactive driver runs on the ODE engine; a model with no
 ///   `[odes]` block is rejected.
+/// - **Model covariates in the data.** The same model-vs-data checks as
+///   [`simulate`](crate::simulate) and [`simulate_adaptive_from_spec`]: a
+///   covariate the model reads but the data does not carry is an error, never a
+///   silent `0.0` (#1571).
 /// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
 ///   (a loading / maintenance regimen), which are integrated and augmented by the
 ///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
@@ -236,12 +253,14 @@ where
             .to_string()
     })?;
 
-    // The adaptive assay keys residual variance by the monitored compartment
-    // number (`residual_variance_at(cmt, …)`), but a `Selected` error model's
-    // endpoints are keyed by the covariate selector's 0-based branch index, not
-    // CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
+    // First the data checks every simulate entry point runs: a model covariate
+    // absent from the data would otherwise read as 0.0 (#1571). Then the
+    // `Selected` reject: the adaptive assay keys residual variance by the monitored
+    // compartment number (`residual_variance_at(cmt, …)`), but a `Selected` error
+    // model's endpoints are keyed by the covariate selector's 0-based branch index,
+    // not CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
     // the assay draw. Reject the combination rather than emit NaN observations (#658).
-    reject_selected_error_for_adaptive(model)?;
+    check_adaptive_model_data(model, population)?;
 
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
@@ -1146,11 +1165,10 @@ pub fn simulate_adaptive_from_spec(
     // model's selector) must be present too, not just the `observe` signal (#658) —
     // and a weighted κ / weighted residual must resolve to a positive weight before
     // it silently underflows to zero (#1083). Same list every other simulate entry
-    // point runs.
-    first_error(&check_simulation_data(model, population))?;
-    // A `Selected` error model keys endpoints by selector branch, not CMT, so the
-    // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
-    reject_selected_error_for_adaptive(model)?;
+    // point runs. Then a `Selected` error model, which keys endpoints by selector
+    // branch, not CMT, so the compartment-keyed assay would draw NaN (#658). Shared
+    // with `simulate_adaptive` (#1571).
+    check_adaptive_model_data(model, population)?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).
