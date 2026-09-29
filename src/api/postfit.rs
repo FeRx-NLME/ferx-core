@@ -2449,16 +2449,17 @@ pub(crate) fn ode_solver_diagnostics_warning(
     let unfinished_other = unfinished_kept
         .saturating_sub(aborted)
         .saturating_sub(diverged);
-    // Every damaged result is a divergence: no finite unfinished or aborted segment, no jet
-    // rejection, and every discarded escalation's explicit re-solve failed too (so none was
-    // repaired by the fallback, which is the case the `rodas5p` advice is about). Then no
-    // `ode_method` or tolerance advice is true — no stepper integrates `x → ∞` — and the
-    // clauses that carry it drop it.
-    let only_diverged = diverged > 0
-        && unfinished_other == 0
-        && aborted == 0
-        && rejected_jets == 0
-        && rejected == fallback_failed;
+    // Every damaged result is a divergence: no finite unfinished or aborted segment, and every
+    // discarded escalation's explicit re-solve failed too (so none was repaired by the
+    // fallback, which is the case the `rodas5p` advice is about). Then no `ode_method` or
+    // tolerance advice is true — no stepper integrates `x → ∞` — and the clauses that carry it
+    // drop it.
+    //
+    // A jet rejection (`rejected_jets`) is deliberately not a conjunct: its own clause already
+    // says a different `ode_method` will not help, so keeping the knob advice beside it would
+    // only restore a contradiction (#1577 review, row 1).
+    let only_diverged =
+        diverged > 0 && unfinished_other == 0 && aborted == 0 && rejected == fallback_failed;
     // Walks abandoned before a driver was ever called, because the timeline could not be
     // ordered (#1189, counted since #1234). Disjoint from every counter above by construction:
     // those all describe a segment that *started*, and here none did — which is exactly why it
@@ -2603,18 +2604,24 @@ pub(crate) fn ode_solver_diagnostics_warning(
         ));
     }
     if rejected > 0 {
-        let next = if only_diverged {
-            ""
+        // Both halves are about a segment the stiff method could not integrate but some method
+        // could. When every damaged segment diverged, neither is true: the escalation failed
+        // because the state went non-finite, which no method integrates (#1577 review, row 2).
+        let (diagnosis, next) = if only_diverged {
+            ("", "")
         } else {
-            "; naming ode_method = rodas5p (or rosenbrock23) explicitly is the next thing to try"
+            (
+                " — the stiffness probe was right that those segments are stiff and wrong \
+                 that the stiff method it picked could integrate them",
+                "; naming ode_method = rodas5p (or rosenbrock23) explicitly is the next thing \
+                 to try",
+            )
         };
         parts.push(format!(
             "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
-             discarded as unusable and re-solved with {explicit} — the stiffness probe was \
-             right that those segments are stiff and wrong that the stiff method it picked \
-             could integrate them, and {payer} paid for both solves (the {discarded} step(s) \
-             those attempts clamped are not in the count above: the guard replaced the \
-             trajectory they produced){next}",
+             discarded as unusable and re-solved with {explicit}{diagnosis}, and {payer} paid \
+             for both solves (the {discarded} step(s) those attempts clamped are not in the \
+             count above: the guard replaced the trajectory they produced){next}",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
             payer = phase.payer(),

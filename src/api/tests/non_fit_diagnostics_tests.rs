@@ -1326,9 +1326,10 @@ pub(super) const DIVERGED_CLAUSE_SENTENCES: [&str; 8] = [
 ];
 
 /// The solver advice that is false for a segment whose state went non-finite.
-pub(super) const ADVICE_A_DIVERGENCE_MUST_NOT_GET: [&str; 4] = [
+pub(super) const ADVICE_A_DIVERGENCE_MUST_NOT_GET: [&str; 5] = [
     "consider a different ode_method",
     "rodas5p",
+    "the stiffness probe was right",
     "freeze-padded with the last state",
     "stability-limited",
 ];

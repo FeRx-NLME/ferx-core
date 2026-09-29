@@ -1268,6 +1268,8 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
 // | diverged only (the issue repro)               | `…_dropped_only_when_every_…`, leg 1         |
 // | diverged + a separate finite unfinished one   | `…_dropped_only_when_every_…`, leg 2         |
 // | diverged + a rejection the fallback repaired  | `…_dropped_only_when_every_…`, leg 3         |
+// | diverged + a finite budgeted abort            | `…_dropped_only_when_every_…`, leg 4         |
+// | diverged + a jet-only rejection               | `…_dropped_only_when_every_…`, leg 5         |
 // | finite freeze-pad only                        | `a_finite_freeze_pad_message_is_unchanged…`  |
 // | diverged at segment entry (no clamps)         | `a_divergence_at_segment_entry_…`            |
 // | auto discarded, fallback also diverged        | leg 1 (its stats are exactly that shape)     |
@@ -1279,8 +1281,9 @@ use super::non_fit_diagnostics_tests::{
 
 /// The advice gate, both sides in one test so a gate stuck on either branch fails it.
 ///
-/// Mutations that redden it: drop `only_diverged` from any of the three advice sites (leg 1);
-/// make the gate unconditional — `only_diverged = diverged > 0` (legs 2 and 3); stop
+/// Mutations that redden it: drop `only_diverged` from any of the four advice sites (leg 1);
+/// make the gate unconditional — `only_diverged = diverged > 0` (legs 2, 3 and 4); drop the
+/// `aborted == 0` conjunct (leg 4); add a `rejected_jets == 0` conjunct (leg 5); stop
 /// subtracting `diverged` from the unfinished remainder (leg 2's partition); delete any
 /// sentence of the diverged clause (leg 1, every phase).
 #[test]
@@ -1384,6 +1387,52 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
     assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
     assert!(msg.contains("rodas5p"), "{msg}");
     assert!(msg.contains("consider a different ode_method"), "{msg}");
+    // The other side of leg 1's diagnosis gate (#1577 review, row 2): with a repaired rejection
+    // present, the stiffness diagnosis is true again and must still be said.
+    assert!(msg.contains("the stiffness probe was right"), "{msg}");
+
+    // Leg 4 — a divergence beside a finite segment cut short by `ode_stiff_abort_after`, with
+    // no ordinary unfinished remainder (`2 − 1 aborted − 1 diverged = 0`). The aborted segment
+    // is finite and freeze-padded, so the knob advice and the stability-limited reading are
+    // true of it and must survive (#1577 review, row 1 — the `aborted == 0` conjunct).
+    let aborted = OdeSolverStats {
+        min_step_clamped_steps: 5,
+        unfinished_segments: 2,
+        stiff_aborted_segments: 1,
+        diverged_segments: 1,
+        ..Default::default()
+    };
+    let abort_opts = FitOptions {
+        ode_stiff_abort_after: Some(3),
+        ..Default::default()
+    };
+    let (msg, _) = ode_solver_diagnostics_warning(&aborted, &abort_opts, SolverStatsPhase::Predict)
+        .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(msg.contains("1 segment(s) were abandoned early"), "{msg}");
+    assert!(!msg.contains("returned segment(s) stopped"), "{msg}");
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
+    assert!(msg.contains("stability-limited"), "{msg}");
+
+    // Leg 5 — a divergence beside a jet-only rejection from the sensitivity sweep. The jet
+    // clause itself says a different `ode_method` will not help, so the knob advice is dropped
+    // here too rather than contradicting it (#1577 review, row 1: `rejected_jets` is
+    // deliberately not a conjunct of the gate).
+    let jets = OdeSolverStats {
+        unfinished_segments: 1,
+        diverged_segments: 1,
+        auto_stiff_rejected_jets: 1,
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&jets, &FitOptions::default(), SolverStatsPhase::Predict)
+            .expect("a warning");
+    assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
+    assert!(
+        msg.contains("naming a different ode_method will not help"),
+        "{msg}"
+    );
+    assert!(!msg.contains("consider a different ode_method"), "{msg}");
 }
 
 /// A divergence that stopped a segment which *entered* non-finite takes no clamped steps worth
