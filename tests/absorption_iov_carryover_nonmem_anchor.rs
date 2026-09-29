@@ -19,9 +19,12 @@
 //! Two checks per anchor, each Tier 2 (one evaluation, no convergence loop):
 //!
 //! * **IPRED at NONMEM's EBEs** — ferx's `predict_iov` at NONMEM's POSTHOC η/κ against the
-//!   `$TABLE` IPRED, every observation. This is the direct test of the kernel rule.
+//!   `$TABLE` IPRED, every observation. This is the direct test of the kernel rule, and it
+//!   runs on every PR.
 //! * **FOCEI objective at NONMEM's optimum** — `fit()` with every parameter `FIX`, against
-//!   NONMEM's objective, with per-subject objective contributions against `.phi`.
+//!   NONMEM's objective, with per-subject objective contributions against `.phi`. This one
+//!   runs nightly: see its doc comment for the measured CI cost and the per-PR tests that
+//!   die on the same mutations.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -262,7 +265,22 @@ fn ipred_at_nonmem_ebes_matches_nonmem() {
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
+/// **Nightly** (`slow-tests`), unlike the IPRED check above. It is one evaluation, so Tier 2
+/// by contract, but it measured **~205 s** in `Tests + coverage (core)` (run 36493929213:
+/// 22:53:50 → 22:57:15, where the IPRED check in the same binary took 0.25 s), against 3.4 s
+/// for both tests under a local `--profile ci-cov`. `AGENTS.md` allows the gate on that
+/// measured cost plus a per-PR test that dies on the same mutation, and every mutation that
+/// kills this test in the #1569 sweep kills one that runs on every PR. Re-reading the kernel
+/// per segment in the value engine (M1), giving every dose dose 0's kernel (M7), or a
+/// `PreparedForcings::get` that ignores the dose (M11) reddens
+/// `ipred_at_nonmem_ebes_matches_nonmem`. A per-segment forcing on the `Dual2` walk (M2)
+/// reddens 15 `sens::` unit tests, among them `iov_absorption_kappa_lands_on_the_dose_occasion`
+/// and both `…_onset_on_a_covariate_record_returns_a_one_sided_derivative` fixtures.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: ~205 s in CI; opt in with --features slow-tests"
+)]
 fn objective_at_nonmem_optimum_matches_nonmem() {
     let mut failures = Vec::new();
     for anchor in &ANCHORS {

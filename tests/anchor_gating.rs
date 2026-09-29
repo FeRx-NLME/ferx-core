@@ -42,16 +42,19 @@ fn tests_dir() -> PathBuf {
 /// |---|---|---|
 /// | `tad_lag_nonmem_anchor` | 0.52 s, 0.59 s (CI 21 s) | `outer_maxiter: 0` in `FitOptions` |
 /// | `tvcov_lag_saltation_nonmem_anchor` | 1.22 s, 0.91 s, 0.1 s | `maxiter = 0` in the `.ferx` |
+/// | `absorption_iov_carryover_nonmem_anchor` | 0.07 s (CI 0.25 s) | `predict_iov` at fixed EBEs |
 ///
 /// Kept nightly on purpose, each with the measurement behind it: `tvcov_lag_saltation`'s
 /// single-dose A (10.04 s alone, ~35 s in CI — the binary measured 61.2 s with it and
 /// 26.2 s without; reintroducing #1060 also reddens the control D and 17 `sens::` unit
-/// tests), and `ss_lagtime_edge`'s two objective anchors (45 s in CI; the `lag >= II`
+/// tests), `ss_lagtime_edge`'s two objective anchors (45 s in CI; the `lag >= II`
 /// dual-walk defect they caught is now pinned per-PR by
-/// `ode_provider_ss_lagtime_at_or_past_the_interval_matches_production`). Add a test
-/// here only with its measured CI time. A NONMEM anchor that runs real fits
+/// `ode_provider_ss_lagtime_at_or_past_the_interval_matches_production`), and
+/// `absorption_iov_carryover`'s objective check (~205 s in CI; every mutation that kills it
+/// in the #1569 sweep also kills its IPRED sibling above or 15 `sens::` unit tests, #1573).
+/// Add a test here only with its measured CI time. A NONMEM anchor that runs real fits
 /// (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
-const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 5] = [
+const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 6] = [
     (
         "tad_lag_nonmem_anchor",
         "tad_lag_single_dose_matches_nonmem",
@@ -68,6 +71,10 @@ const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 5] = [
     (
         "tvcov_lag_saltation_nonmem_anchor",
         "a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction",
+    ),
+    (
+        "absorption_iov_carryover_nonmem_anchor",
+        "ipred_at_nonmem_ebes_matches_nonmem",
     ),
 ];
 
