@@ -2441,7 +2441,24 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // adds them up must get the number of segments, not double it. (The clamp clause counts
     // *steps*, so it cannot collide with a segment count the same way; its own segment-level
     // overlap is described in the wording below.)
-    let unfinished_other = unfinished_kept.saturating_sub(aborted);
+    // Segments that stopped because a state went non-finite (#1539). Counted by the solver on
+    // returned results only (a discarded escalation's are zeroed), disjoint from `aborted`, and a
+    // subset of `unfinished_kept` — so it comes out of the remainder too. Their tails are `NaN`,
+    // not freeze-padded, which is the whole reason they get a clause of their own.
+    let diverged = stats.diverged_segments;
+    let unfinished_other = unfinished_kept
+        .saturating_sub(aborted)
+        .saturating_sub(diverged);
+    // Every damaged result is a divergence: no finite unfinished or aborted segment, no jet
+    // rejection, and every discarded escalation's explicit re-solve failed too (so none was
+    // repaired by the fallback, which is the case the `rodas5p` advice is about). Then no
+    // `ode_method` or tolerance advice is true — no stepper integrates `x → ∞` — and the
+    // clauses that carry it drop it.
+    let only_diverged = diverged > 0
+        && unfinished_other == 0
+        && aborted == 0
+        && rejected_jets == 0
+        && rejected == fallback_failed;
     // Walks abandoned before a driver was ever called, because the timeline could not be
     // ordered (#1189, counted since #1234). Disjoint from every counter above by construction:
     // those all describe a segment that *started*, and here none did — which is exactly why it
@@ -2488,7 +2505,8 @@ pub(crate) fn ode_solver_diagnostics_warning(
         || rejected_jets > 0
         || fallback_failed > 0
         || unfinished_kept > 0
-        || aborted > 0;
+        || aborted > 0
+        || diverged > 0;
     let unclean = unclean_integration || abandoned > 0;
     if !unclean && escalated == 0 {
         return None;
@@ -2514,6 +2532,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "kept_unfinished_segments": unfinished_kept,
         "stiff_aborted_segments": aborted,
         "abandoned_non_finite_timeline": abandoned,
+        "diverged_segments": diverged,
     }));
 
     if !unclean {
@@ -2540,9 +2559,19 @@ pub(crate) fn ode_solver_diagnostics_warning(
     }
 
     let mut parts: Vec<String> = Vec::new();
-    // First, because it is the only clause here that reports predictions which are `NaN` rather
-    // than merely inaccurate: every other outcome returns a finite trajectory that was
-    // freeze-padded or re-solved, and this one returns no trajectory at all.
+    // The two clauses that report predictions which are `NaN` rather than merely inaccurate
+    // come first: every other outcome returns a finite trajectory that was freeze-padded or
+    // re-solved. A diverged segment (#1539) returns an integrated prefix and a `NaN` tail.
+    if diverged > 0 {
+        parts.push(format!(
+            "{diverged} returned segment(s) had a state become non-finite — the [odes] \
+             right-hand side diverged — so every output time after that point is NaN rather \
+             than an integrated value. The NaN covers every state of the segment, not only the \
+             one that diverged: the states are integrated together, so none of them was \
+             integrated past that point"
+        ));
+    }
+    // An abandoned walk returns no trajectory at all.
     if abandoned > 0 {
         parts.push(format!(
             "{abandoned} solver walk(s) were abandoned before integrating because the \
@@ -2558,23 +2587,34 @@ pub(crate) fn ode_solver_diagnostics_warning(
         ));
     }
     if clamped > 0 {
+        // When every damaged segment diverged, the one this clause would call freeze-padded
+        // is `NaN`-padded instead, and the "stability-limited" reading is the stepper chasing
+        // a non-finite error norm down to `min_dt` — so only the mechanism is stated.
+        let reading = if only_diverged {
+            ""
+        } else {
+            ", so those segments are stability-limited rather than accuracy-limited, and any \
+             output times left in a segment the solver could not finish are freeze-padded with \
+             the last state (finite, but not integrated)"
+        };
         parts.push(format!(
             "{clamped} step(s) clamped at the minimum step size — the local-error test failed \
-             and the step was accepted anyway because dt could not shrink further, so those \
-             segments are stability-limited rather than accuracy-limited, and any output times \
-             left in a segment the solver could not finish are freeze-padded with the last \
-             state (finite, but not integrated)"
+             and the step was accepted anyway because dt could not shrink further{reading}"
         ));
     }
     if rejected > 0 {
+        let next = if only_diverged {
+            ""
+        } else {
+            "; naming ode_method = rodas5p (or rosenbrock23) explicitly is the next thing to try"
+        };
         parts.push(format!(
             "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
              discarded as unusable and re-solved with {explicit} — the stiffness probe was \
              right that those segments are stiff and wrong that the stiff method it picked \
              could integrate them, and {payer} paid for both solves (the {discarded} step(s) \
              those attempts clamped are not in the count above: the guard replaced the \
-             trajectory they produced); naming ode_method = rodas5p (or rosenbrock23) \
-             explicitly is the next thing to try",
+             trajectory they produced){next}",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
             payer = phase.payer(),
@@ -2645,7 +2685,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
     // sentence of the message and the only one naming concrete knobs. So it is attached to
     // the counters it is true of, and an abandoned walk gets the advice that applies to it.
-    let solver_knob_advice = if unclean_integration {
+    let solver_knob_advice = if unclean_integration && !only_diverged {
         " For the segments that did integrate, consider a different ode_method, a looser \
          ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
          dynamics."
@@ -2659,10 +2699,18 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         ""
     };
+    // #1539: the one unfinished shape no solver setting repairs, so its advice is the model's.
+    let diverged_advice = if diverged > 0 {
+        " The diverged segment(s) are not an ode_method or tolerance problem — no stepper \
+         integrates past a state that has become non-finite; check the [odes] right-hand \
+         side and the parameter values that drive it."
+    } else {
+        ""
+    };
     let msg = format!(
         "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver {lead} {at} \
          (ode_method = {method}): {body}. {provenance}\
-         {solver_knob_advice}{abandoned_advice}{switched_warn_clause}",
+         {solver_knob_advice}{diverged_advice}{abandoned_advice}{switched_warn_clause}",
         at = phase.at_label(),
         method = options.ode_method.as_str(),
         body = parts.join("; "),
