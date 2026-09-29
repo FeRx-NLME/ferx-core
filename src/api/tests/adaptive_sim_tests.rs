@@ -6956,3 +6956,288 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
         );
     }
 }
+
+// ---- #1571: both entry points run `check_simulation_data` ----------------------
+//
+// The programmatic `simulate_adaptive` once skipped the data checks every other
+// simulate entry point runs, so a model covariate absent from the data read as 0.0
+// and the run returned `Ok` — with the frozen-replay verifier passing too, since it
+// replays the same snapshots. Each fixture below is the issue's measured one: a
+// 1-cpt IV ODE seeded at `init(central) = 50`, dose-free base, 100 at each decision.
+
+/// `WT` reaches the prediction only through the `[scaling]` readout. Without the
+/// check the whole trajectory read `[0, 0, 0, 0]`.
+const ODE_1571_WT_SCALING: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central * (WT / 70)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `WT` reaches the prediction only through `CL`. Without the check `CL = 0`, so
+/// there was no elimination at all: `[50, 50, 150, 250]`.
+const ODE_1571_WT_CL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT / 70)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `TAD` outside `[odes]` is an ordinary covariate, not the solver's clock. Without
+/// the check it read as 0, identical to the clock-free control.
+const ODE_1571_TAD_SCALING: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central * (1 + 0.01 * TAD)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// The issue's population, with `cov` carried as a constant data column when given.
+fn pop_1571(cov: Option<&str>) -> Population {
+    let mut s = subj("1", vec![0.0, 6.0, 20.0, 40.0], vec![]);
+    let mut pop_names = Vec::new();
+    if let Some(name) = cov {
+        s.covariates = HashMap::from([(name.to_string(), 70.0)]);
+        s.obs_covariates = vec![HashMap::from([(name.to_string(), 70.0)]); 4];
+        pop_names.push(name.to_string());
+    }
+    let mut pop = population(vec![s]);
+    pop.covariate_names = pop_names;
+    pop
+}
+
+fn run_1571(
+    src: &str,
+    cov: Option<&str>,
+    verify: bool,
+) -> Result<AdaptiveSimulationResult, String> {
+    let model = parse_model_string(src).expect("parse");
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![12.0, 36.0],
+        verify,
+        ..Default::default()
+    };
+    simulate_adaptive(
+        &model,
+        &pop_1571(cov),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+}
+
+/// Assert the straddle for one model on the programmatic entry point, under both
+/// `verify` settings: with `cov` as a data column the run is `Ok`; without it the
+/// run is the `Err` every other simulate entry point returns, naming `cov`.
+fn assert_programmatic_straddle(src: &str, cov: &str, want: &str) {
+    for verify in [false, true] {
+        let ok = run_1571(src, Some(cov), verify);
+        assert!(
+            ok.is_ok(),
+            "verify={verify}: with {cov} in the data the run must succeed, got {:?}",
+            ok.err()
+        );
+        let err = run_1571(src, None, verify).expect_err(&format!(
+            "verify={verify}: {cov} absent from the data must be an Err, not a silent 0.0"
+        ));
+        assert!(
+            err.contains(cov) && err.contains(want),
+            "verify={verify}: got: {err}"
+        );
+    }
+}
+
+#[test]
+fn programmatic_rejects_scaling_covariate_absent_from_data() {
+    assert_programmatic_straddle(ODE_1571_WT_SCALING, "WT", "not found in data");
+}
+
+#[test]
+fn programmatic_rejects_individual_parameter_covariate_absent_from_data() {
+    assert_programmatic_straddle(ODE_1571_WT_CL, "WT", "not found in data");
+}
+
+#[test]
+fn programmatic_rejects_tad_outside_odes_absent_from_data() {
+    assert_programmatic_straddle(ODE_1571_TAD_SCALING, "TAD", "solver-injected built-in");
+}
+
+#[test]
+fn programmatic_and_spec_entry_points_return_the_same_missing_covariate_error() {
+    // One helper behind both entry points (#1571): the same model and data must
+    // fail with the same message on either path, so a future edit to one entry
+    // point's checks cannot drift from the other's.
+    let model = parse_model_string(ODE_1571_WT_SCALING).expect("parse");
+    let pop = pop_1571(None);
+    let programmatic = run_1571(ODE_1571_WT_SCALING, None, true).expect_err("programmatic");
+    let spec = simulate_adaptive_from_spec(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        &simple_titration_spec(),
+        &AdaptiveSimulateOptions::default(),
+    )
+    .expect_err("from_spec");
+    assert!(
+        spec.contains("WT") && spec.contains("not found in data"),
+        "got: {spec}"
+    );
+    assert_eq!(programmatic, spec);
+    // ...and the spec path's positive side: with WT present it runs.
+    let with_wt = simulate_adaptive_from_spec(
+        &model,
+        &pop_1571(Some("WT")),
+        &model.default_params,
+        1,
+        &simple_titration_spec(),
+        &AdaptiveSimulateOptions::default(),
+    );
+    assert!(with_wt.is_ok(), "got {:?}", with_wt.err());
+}
+
+/// `ODE_1571_WT_SCALING`'s structure with a covariate-selected error model (#658):
+/// `FREE` picks the endpoint. The selector column is supplied, so every data check
+/// passes and the `Selected` reject is the one that must fire.
+const ODE_1571_SELECTED: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_TOTAL   ~ 0.04
+  sigma PROP_UNBOUND ~ 0.09
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = 50.0
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+[covariates]
+  FREE continuous
+"#;
+
+#[test]
+fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
+    // #658 was pinned only on `reject_selected_error_for_adaptive` directly, so deleting
+    // it from `check_adaptive_model_data` (the helper both entry points now share, #1571)
+    // passed every test (review of #1585, finding 2). Held here through each public entry
+    // point, with the single-endpoint twin of the same model and data as the straddle:
+    // it must run, so the `Err` is the `Selected` reject and nothing else.
+    let want = "covariate-selected `[error_model]`";
+    let selected = parse_model_string(ODE_1571_SELECTED).expect("parse selected");
+    let single_src = ODE_1571_SELECTED.replace(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        "  DV ~ proportional(PROP_TOTAL)",
+    );
+    assert_ne!(single_src, ODE_1571_SELECTED, "the twin must differ");
+    let single = parse_model_string(&single_src).expect("parse single");
+    let pop = pop_1571(Some("FREE"));
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![12.0, 36.0],
+        ..Default::default()
+    };
+    let spec = simple_titration_spec();
+    let spec_opts = AdaptiveSimulateOptions::default();
+
+    let err = simulate_adaptive(
+        &selected,
+        &pop,
+        &selected.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("simulate_adaptive must reject a Selected error model");
+    assert!(err.contains(want), "simulate_adaptive: got: {err}");
+    let err = simulate_adaptive_from_spec(
+        &selected,
+        &pop,
+        &selected.default_params,
+        1,
+        &spec,
+        &spec_opts,
+    )
+    .expect_err("simulate_adaptive_from_spec must reject a Selected error model");
+    assert!(
+        err.contains(want),
+        "simulate_adaptive_from_spec: got: {err}"
+    );
+
+    let ok = simulate_adaptive(&single, &pop, &single.default_params, 1, fixed_bolus, &opts);
+    assert!(ok.is_ok(), "simulate_adaptive twin: {:?}", ok.err());
+    let ok =
+        simulate_adaptive_from_spec(&single, &pop, &single.default_params, 1, &spec, &spec_opts);
+    assert!(
+        ok.is_ok(),
+        "simulate_adaptive_from_spec twin: {:?}",
+        ok.err()
+    );
+
+    // The CHANGELOG's order claim: with the selector column itself missing, the data
+    // checks run first, so the programmatic path names `FREE`, not the #658 restriction.
+    let err = simulate_adaptive(
+        &selected,
+        &pop_1571(None),
+        &selected.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("a missing selector column must be rejected");
+    assert!(
+        err.contains("FREE") && err.contains("not found in data") && !err.contains(want),
+        "missing selector: got: {err}"
+    );
+}
