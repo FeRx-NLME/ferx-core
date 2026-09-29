@@ -500,12 +500,13 @@ step counts, and ride along in the `ode_solver` warning's `details` payload:
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
 
-Three more counters close the guard's last ambiguity. Unlike the three above, the first two are
+Four more counters close the guard's last ambiguity. Unlike the three above, the first two are
 recorded under *every* `ode_method`, not just `auto` — an `rk45` fit that runs out of steps shows
 them too.
 
 - **unfinished segments** — attempts that stopped before their requested end and freeze-padded
-  the remaining output times with the last state.
+  the remaining output times with the last state (or `NaN`-padded them, for the diverged
+  subset below).
 - **diverged segments** — the unfinished segments that stopped because a state went non-finite.
   Their remaining output times are `NaN` in every state, not freeze-padded, including a
   decoupled observed state that would otherwise have been served frozen at a finite value

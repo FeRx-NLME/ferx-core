@@ -1232,8 +1232,8 @@ fn integrate_dense_g<T: PkNum>(
         let usable = stepper.attempt_usable();
 
         // An unusable attempt at `min_dt` is unrecoverable: the step cannot be shrunk further
-        // and there is no `u_new` to force-accept. Stop and let the tail freeze-pad, the same
-        // outcome a trajectory that diverges at `min_dt` gets.
+        // and there is no `u_new` to force-accept. Stop and let the tail pad: freeze-padded when
+        // the carried state is finite, `NaN`-padded when it has already gone non-finite (#1539).
         //
         // Recorded as a min-step *clamp*, not a plain rejection. The freeze-padded tail below
         // is finite and plausible, so the stats block is the only place this failure is
