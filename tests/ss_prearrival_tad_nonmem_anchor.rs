@@ -46,12 +46,18 @@
 //!
 //! # Which engine sees what — this is not symmetric
 //!
-//! `apply_segment_boundary` **overwrites** the flowed state with a fresh `equilibrate_ss_state`
-//! at the lagged arrival when `ss_arrival_is_trough`, so the dense states walk discards whatever
+//! When this anchor was written, `apply_segment_boundary` **overwrote** the flowed state with a
+//! fresh `equilibrate_ss_state` at the lagged arrival, so the dense states walk discarded whatever
 //! crossed the pre-arrival window. Measured at `955ccef2`: its post-arrival values were already
 //! *correct* (3e-10) while the event-driven walk's were `NaN`. So a post-arrival assertion on
-//! the dense engine is **blind** to the walk's anchor, and the tests below put the pre-arrival
+//! the dense engine was **blind** to the walk's anchor, and the tests below put the pre-arrival
 //! checks on both engines and the post-arrival ones on the event-driven walk.
+//!
+//! #1275 removed that overwrite: every walk now flows a seeded dose to its arrival
+//! (`dosing::ss_equilibrates_at_arrival`). A post-arrival dense check here would still **not**
+//! guard it — this fixture has flat covariates and no dose inside the pre-arrival window, where
+//! flowing and re-equilibrating agree to solver error. `ss_arrival_flow_nonmem_anchor` and
+//! `ss_reset_tie_nonmem_anchor` are the anchors that die on the overwrite.
 //!
 //! # Tiering
 //!

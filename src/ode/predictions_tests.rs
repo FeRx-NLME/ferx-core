@@ -9040,12 +9040,12 @@ fn ss_record_seed_declines_a_zero_lag_only() {
         "clamped, NOT wrapped to 4.0"
     );
 
-    // Complementarity of the *arrival-side* shortcut: the paths that re-equilibrate
-    // at the arrival rather than propagating there are exact only while the flowed
-    // state is the trough, which is exactly `lag <= II`.
-    assert!(ss_arrival_is_trough(&dose, 0.7));
-    assert!(ss_arrival_is_trough(&dose, 12.0));
-    assert!(!ss_arrival_is_trough(&dose, 12.001));
+    // The analytic superposition's split (`pk/mod.rs`): its collapsed `C_ss(t − t_eff)`
+    // is exact only while the flowed state is the trough, which is exactly `lag <= II`.
+    // No ODE walk reads this any more (#1275) — they read `ss_equilibrates_at_arrival`.
+    assert!(crate::dosing::ss_arrival_is_trough(&dose, 0.7));
+    assert!(crate::dosing::ss_arrival_is_trough(&dose, 12.0));
+    assert!(!crate::dosing::ss_arrival_is_trough(&dose, 12.001));
 
     // A non-SS dose is never seeded however it is lagged, and an SS record with no
     // dosing interval is not a steady state at all.
@@ -14241,9 +14241,14 @@ fn ss_tie_engines(
 /// list-order loop, at lag 2 only.
 ///
 /// The straddle is in the same test: ID 2 (`SS=1` row, *then* the bolus) superposes and
-/// must differ from the same twin by > 40 %. At lag 2 that leg is asserted on the
-/// event-driven engines only: the dense walks re-equilibrate at the lagged `SS=1` arrival
-/// and wipe it there (#1275), which would read as "equal to the twin" for the wrong reason.
+/// must exceed the same twin by > 20 % at **every** sample, on every engine, at both lags.
+/// At lag 2 the samples after the arrival (t = 12) are the ones that matter (#1275): the
+/// dense walks used to re-equilibrate there and wipe the bolus, which read as exactly
+/// "equal to the twin" (rel 0.0) from t = 12.5 on, while `obs[0] = 11.5` — pre-arrival —
+/// stayed green. Measured mutations (each alone): reverting `reseed_prescheduled_states_at`
+/// reddens `ode_predictions` and `ode_predictions_adaptive`, reverting
+/// `ode_predictions_with_states`' arrival gate reddens that engine, and reverting
+/// `apply_segment_boundary`'s reddens `ode_dense_solve_states` — its only Tier-1 kill.
 #[test]
 fn an_ss_record_wipes_a_preceding_co_timed_or_pending_dose_on_every_ode_engine() {
     let lag_slot = 20usize; // an `ALAG1` slot; the bare `lagtime` slot (8) would lag the central bolus too
@@ -14288,18 +14293,35 @@ fn an_ss_record_wipes_a_preceding_co_timed_or_pending_dose_on_every_ode_engine()
         let twin = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0)];
         let got = ss_tie_engines(&ode, &pk, &make_subject(central_after, obs.clone()));
         let want = ss_tie_engines(&ode, &pk, &make_subject(twin, obs.clone()));
+        // The straddle's own premise: samples on both sides of the lagged arrival.
+        let arrival = 10.0 + lag;
+        assert!(obs.iter().any(|&t| t > arrival + 0.1));
+        let mut least = f64::INFINITY;
         for ((engine, g), (_, w)) in got.iter().zip(&want) {
-            if lag > 0.0 && !engine.contains("event_driven") {
-                continue; // #1275: the dense walks' arrival re-equilibration wipes it.
+            for (j, &t) in obs.iter().enumerate() {
+                assert!(
+                    g[j].is_finite() && w[j] > 0.0,
+                    "{engine}, lag {lag}, t = {t}"
+                );
+                let rel = (g[j] - w[j]) / w[j];
+                // Measured least +29 % (t = 30); the defect it guards reads 0.0.
+                assert!(
+                    rel > 0.2,
+                    "{engine}, lag {lag}, ID 2, t = {t} ({}): the bolus row after the SS=1 \
+                     row must superpose ({} vs SS=1 alone {}, rel {rel:+.3e}) — #1275 if \
+                     post-arrival on a dense walk",
+                    if t > arrival {
+                        "post-arrival"
+                    } else {
+                        "pre-arrival"
+                    },
+                    g[j],
+                    w[j]
+                );
+                least = least.min(rel);
             }
-            assert!(
-                (g[0] - w[0]) / w[0] > 0.4,
-                "{engine}, lag {lag}, ID 2: the bolus row after the SS=1 row must superpose \
-                 ({} vs SS=1 alone {})",
-                g[0],
-                w[0]
-            );
         }
+        println!("#1275 straddle, lag {lag}: least rel over the twin {least:+.3e}");
     }
     println!("#1588 tie vs live-only twin: worst rel {worst:.3e}");
 }
