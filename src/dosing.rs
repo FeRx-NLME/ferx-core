@@ -913,6 +913,28 @@ pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
 }
 
+/// Whether this steady-state dose's periodic state is equilibrated at its
+/// **arrival** — the complement of [`ss_seeded_at_record`] within the `SS` doses.
+///
+/// **A lagged steady-state dose's state is loaded once, at its record; its arrival
+/// adds only the pulse** (#1275). Only an `SS` dose that was *not* seeded at its
+/// record — `lag == 0`, where record and arrival are the same instant — equilibrates
+/// here. Every value-path walk (the dense ODE walks, the ODE and closed-form
+/// event-driven walks, the dual ODE walk) reads this one spelling, so a walk
+/// cannot seed a dose at its record and then load it a second time at its arrival.
+///
+/// The dense walks used to re-equilibrate at the arrival whenever
+/// [`ss_arrival_is_trough`] held (`lag ≤ II`), on the grounds that the flowed state
+/// *is* the trough. It is — but only for the `SS` dose's own contribution. A second
+/// dose landing inside the pre-arrival window `(record, arrival)` is in the flowed
+/// state too, and re-equilibrating replaced the whole state vector with the
+/// periodic trough, erasing that dose: measured **−30 % … −53 %** against NONMEM
+/// ADVAN13 (`nonmem_anchor/ss_arrival_flow_*`, `ss_reset_tie_*`), while the
+/// event-driven walks, which already flowed, matched.
+pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record(dose, lag)
+}
+
 /// Whether this seeded steady-state dose is the **bolus** case the dual event walk
 /// serves analytically (#1311) — the subset of [`ss_seeded_at_record`] with no
 /// previous-cycle infusion rate still running across the record.

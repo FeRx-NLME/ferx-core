@@ -1045,7 +1045,7 @@ fn event_driven_predictions_with_schedule_impl(
                     .get(ev.orig_idx)
                     .copied()
                     .unwrap_or(0.0);
-                if d.ss && d.ii > 0.0 && !crate::dosing::ss_seeded_at_record(d, lag) {
+                if crate::dosing::ss_equilibrates_at_arrival(d, lag) {
                     state = equilibrate_ss_state_event_driven(pk_model, dose_pk, d);
                 }
                 if d.rate <= 0.0 {

@@ -323,8 +323,8 @@ pub(crate) fn abandon_non_finite_timeline(
 use crate::dosing::{
     is_real_infusion, note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles,
     resolve_subject_doses, resolve_subject_doses_with, ss_arrival_is_trough,
-    ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record, SsStopTracker,
-    SS_EQUILIBRATION_CYCLES,
+    ss_equilibrates_at_arrival, ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record,
+    SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -7005,7 +7005,7 @@ pub fn ode_predictions_event_driven(
                 // and flowed here (#1121) — re-equilibrating would discard that
                 // propagation and restore the defect. The two branches read the
                 // same predicate, so they cannot both fire or both skip.
-                if d.ss && d.ii > 0.0 && !ss_seeded_at_record(d, dose_lagtimes[idx]) {
+                if ss_equilibrates_at_arrival(d, dose_lagtimes[idx]) {
                     let chz_before = chz_snapshot(ode, &u);
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }

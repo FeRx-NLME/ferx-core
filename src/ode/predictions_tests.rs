@@ -9055,6 +9055,62 @@ fn ss_record_seed_declines_a_zero_lag_only() {
     assert!(!ss_seeded_at_record(&ss_no_ii, 0.7));
 }
 
+/// **Where a steady-state dose's state is loaded: at its record or at its arrival,
+/// never both and never neither (#1275).**
+///
+/// `ss_equilibrates_at_arrival` is what every value-path walk reads at a dose's
+/// arrival. The dense walks used to re-equilibrate there for every `lag ≤ II`
+/// (`ss_arrival_is_trough`), which erased a dose landing inside the pre-arrival
+/// window. The rows that pin the fix are `lag = 0.7` and `lag = 12`: seeded at the
+/// record, so the arrival must *not* re-equilibrate — both are `true` under the old
+/// predicate. `lag = 0` is the one that still equilibrates at the arrival.
+#[test]
+fn ss_arrival_equilibration_is_the_complement_of_the_record_seed() {
+    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    let plain = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 12.0);
+    let ss_no_ii = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0);
+
+    let cases: [(&DoseEvent, f64, bool, &str); 8] = [
+        (
+            &ss,
+            0.0,
+            true,
+            "SS, lag 0: record = arrival, equilibrates here",
+        ),
+        (&ss, 0.7, false, "SS, lag < II: seeded at the record, flows"),
+        (
+            &ss,
+            12.0,
+            false,
+            "SS, lag = II: seeded at the record, flows",
+        ),
+        (&ss, 20.0, false, "SS, lag > II: seeded (clamped), flows"),
+        (&plain, 0.0, false, "not SS"),
+        (&plain, 0.7, false, "not SS, lagged"),
+        (
+            &ss_no_ii,
+            0.0,
+            false,
+            "SS with II = 0 is not a steady state",
+        ),
+        (&ss_no_ii, 0.7, false, "SS with II = 0, lagged"),
+    ];
+    for (dose, lag, want, what) in cases {
+        assert_eq!(
+            crate::dosing::ss_equilibrates_at_arrival(dose, lag),
+            want,
+            "{what}"
+        );
+        // Exactly one of record / arrival loads an SS dose; a non-SS dose neither.
+        let is_ss = dose.ss && dose.ii > 0.0;
+        assert_eq!(
+            crate::dosing::ss_equilibrates_at_arrival(dose, lag),
+            is_ss && !ss_seeded_at_record(dose, lag),
+            "{what}: must be the complement of the record seed within SS doses"
+        );
+    }
+}
+
 /// **The previous cycle's infusion when it is still running at the dose record
 /// (#1121).**
 ///
