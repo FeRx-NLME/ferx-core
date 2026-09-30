@@ -228,7 +228,7 @@ stays on the lag-free fast paths.
   superposes on that flowing state, and the arrival then adds only the
   steady-state dose's own pulse, on every prediction path. Before #1275 the
   default ODE predictor re-loaded the steady state at the arrival and
-  erased such a dose (−30 … −53 % against NONMEM ADVAN13,
+  erased such a dose (up to −54 % against NONMEM,
   `nonmem_anchor/ss_arrival_flow_lag*.ctl`).
 - A `lagtime` of a **full dosing interval or longer** (`lagtime >= II`)
   on a steady-state dose is supported, and follows NONMEM: the cycle

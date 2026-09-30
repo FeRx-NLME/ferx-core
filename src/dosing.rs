@@ -929,8 +929,8 @@ pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
 /// *is* the trough. It is — but only for the `SS` dose's own contribution. A second
 /// dose landing inside the pre-arrival window `(record, arrival)` is in the flowed
 /// state too, and re-equilibrating replaced the whole state vector with the
-/// periodic trough, erasing that dose: measured **−30 % … −53 %** against NONMEM
-/// ADVAN13 (`nonmem_anchor/ss_arrival_flow_*`, `ss_reset_tie_*`), while the
+/// periodic trough, erasing that dose: measured up to **−54 %** against NONMEM
+/// (`nonmem_anchor/ss_arrival_flow_*`, ADVAN13; `ss_reset_tie_*`, ADVAN2), while the
 /// event-driven walks, which already flowed, matched.
 pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && !ss_seeded_at_record(dose, lag)
@@ -1043,7 +1043,7 @@ pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -
 /// It is **not** a licence for a state-vector walk to re-equilibrate at the
 /// arrival. The dense ODE walks used to, for every `lag ≤ II`, and that replaced
 /// the whole state — erasing any dose that landed between the record and the
-/// arrival (−30 … −53 % against NONMEM ADVAN13, #1275). Every ODE walk now reads
+/// arrival (up to −54 % against NONMEM, #1275). Every ODE walk now reads
 /// [`ss_equilibrates_at_arrival`] instead.
 pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
     lag <= dose.ii

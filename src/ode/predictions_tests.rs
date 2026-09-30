@@ -14162,6 +14162,7 @@ fn ss_tie_engines(
 ) -> Vec<(&'static str, Vec<f64>)> {
     let nd = subject.doses.len();
     let no = subject.obs_times.len();
+    let nr = subject.reset_times.len();
     let dense = ode_dense_solve_states(ode, &pk.values, &[], &[], subject, &subject.obs_times);
     let mut hold = |_: &ControllerCtx| vec![DoseAction::Hold];
     let adaptive = ode_predictions_adaptive(
@@ -14197,7 +14198,7 @@ fn ss_tie_engines(
                 &vec![*pk; nd],
                 &vec![*pk; no],
                 &[],
-                &[],
+                &vec![*pk; nr],
             ),
         ),
         (
@@ -14210,7 +14211,7 @@ fn ss_tie_engines(
                 &vec![*pk; nd],
                 &vec![*pk; no],
                 &[],
-                &[],
+                &vec![*pk; nr],
             )
             .0,
         ),
@@ -14324,4 +14325,75 @@ fn an_ss_record_wipes_a_preceding_co_timed_or_pending_dose_on_every_ode_engine()
         println!("#1275 straddle, lag {lag}: least rel over the twin {least:+.3e}");
     }
     println!("#1588 tie vs live-only twin: worst rel {worst:.3e}");
+}
+
+/// **An EVID=3 reset inside a lagged `SS=1` dose's pre-arrival window reads the same on
+/// every ODE engine** (PR #1607 review F1). The reset empties the state the record seeded;
+/// the arrival then adds only the pulse (#1275). Before #1275 the dense walks
+/// (`ode_dense_solve_states`, the adaptive driver) re-loaded the full trough at the arrival
+/// instead, reading 3.9552 at t = 22 against the event-driven walk's 0.66194 (6× off).
+///
+/// This pins agreement **between engines**, not correctness: NONMEM cancels the lagged dose
+/// at the reset outright (#1587), so every engine here is still wrong against NONMEM, and
+/// #1587's fix must move all of them together. The straddle: the same subject without the
+/// reset must read at least 1.5× higher, so "every engine lost the dose" and "no engine saw
+/// the reset" cannot both pass.
+///
+/// Measured mutations: reverting `reseed_prescheduled_states_at` reddens `ode_predictions`
+/// (and the adaptive driver behind it), reverting `apply_segment_boundary` reddens
+/// `ode_dense_solve_states`. `ode_predictions_with_states`' site cannot reach this cell.
+#[test]
+fn an_evid3_reset_in_a_lagged_ss_window_agrees_on_every_ode_engine() {
+    let lag_slot = 20usize;
+    let ode = depot_central_lag_spec(lag_slot);
+    let mut pk = pk_one(2.0, 20.0);
+    pk.values[4] = 0.15;
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    pk.values[lag_slot] = 11.0;
+    let obs = vec![22.0, 25.0, 30.0];
+    let ss = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0)];
+    let mut reset = make_subject(ss.clone(), obs.clone());
+    reset.reset_times = vec![15.0];
+    let engines = ss_tie_engines(&ode, &pk, &reset);
+    let no_reset = ss_tie_engines(&ode, &pk, &make_subject(ss, obs.clone()));
+    let (reference, want) = engines
+        .iter()
+        .find(|(e, _)| *e == "ode_predictions_event_driven")
+        .expect("the event-driven walk is one of the engines");
+    let mut worst = 0.0_f64;
+    // `ode_predictions_with_states` is excluded by its own contract: it must not be handed a
+    // reset subject (it ignores `reset_times`), and `compute_predictions_with_states` routes
+    // one to `ode_predictions_event_driven_with_states`, which is asserted here.
+    for (engine, got) in engines
+        .iter()
+        .filter(|(e, _)| *e != "ode_predictions_with_states")
+    {
+        for (j, &t) in obs.iter().enumerate() {
+            assert!(got[j].is_finite() && want[j] > 0.0, "{engine}, t = {t}");
+            let rel = (got[j] - want[j]).abs() / want[j];
+            // Measured worst 1.2e-14 (the adaptive driver included); a re-loaded trough reads +500 %.
+            assert!(
+                rel < 1e-9,
+                "{engine}, t = {t}: {} vs {reference} {} (rel {rel:.3e}) — a dense walk \
+                 re-loaded the SS trough at the arrival after the reset (#1275)",
+                got[j],
+                want[j]
+            );
+            worst = worst.max(rel);
+        }
+    }
+    // The straddle, on the reference engine. Measured least 1.84× (t = 30).
+    let (_, free) = no_reset
+        .iter()
+        .find(|(e, _)| e == reference)
+        .expect("the same engine without the reset");
+    for (j, &t) in obs.iter().enumerate() {
+        assert!(
+            free[j] > 1.5 * want[j],
+            "t = {t}: the reset must matter ({} with vs {} without)",
+            want[j],
+            free[j]
+        );
+    }
+    println!("reset in lagged SS window: worst rel across engines {worst:.3e}");
 }

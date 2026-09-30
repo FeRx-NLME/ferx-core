@@ -57,10 +57,13 @@ section of the SDLC for the versioning policy).
   compartment-state output columns, the ODE-accumulated hazard and its simulated event
   times, and the Markov endpoint) instead re-loaded the steady state at the arrival whenever
   the lag was at most `II`. That replaced the whole state and erased any dose given inside
-  the window: −30 … −53 % against NONMEM (ADVAN13) after the arrival. Every ODE predictor
-  now matches NONMEM to ≤ 9e-12 (the adaptive driver to 3e-4, its own floor;
+  the window: up to −54 % against NONMEM after the arrival. Every ODE predictor now
+  matches NONMEM to ≤ 9e-12 (the adaptive driver to 3e-4, its own floor;
   `nonmem_anchor/ss_arrival_flow_*`). Without such a window dose, results move only at
-  solver-tolerance level.
+  solver-tolerance level, with one exception: an EVID=3/4 reset inside the window no
+  longer restores the full steady state at the arrival on those paths. They now agree
+  with the event-driven walk; both still differ from NONMEM, which cancels the lagged dose
+  (#1587).
 - **An adaptive-dosing decision now reads the latest data record, including dose and
   EVID=3/4 reset rows** (#1148). On a time-varying-covariate or IOV subject, a decision's
   `ctx.covariates`, its monitored signals and the `F` of a dose it issues all come from the
