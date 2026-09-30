@@ -10,7 +10,10 @@
 //! The reference is NONMEM 7.6.0 (`nm3`, `anchor` build), `MAXEVAL=0`, all `$THETA` `FIX`,
 //! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `AMT = 100` into the depot, `ALAG1`
 //! from the `LAGC` data column: `nonmem_anchor/evid_reset_lag.{csv,ctl}` (`ADVAN2 TRANS2`).
-//! `evid_reset_lag_advan13.ctl` (`ADVAN13 TOL=12`) agrees with it to 2.8e-11, and the
+//! `evid_reset_lag_advan13.ctl` (`ADVAN13 TOL=12`) agrees with it to 2.8e-11 on every ID but
+//! 23 — a lag ≥ `II` steady state with no reset, where NONMEM's `ADVAN13` SS routine departs
+//! from its own `ADVAN2` by up to 0.20 (#1121's territory; the cancelled twin, ID 22, is 0 on
+//! both) — and the
 //! surviving cells (IDs 1, 3, 5, 6, 16) equal an independent Python Bateman sum, outside
 //! both engines, to 4.2e-15. IDs (lag 2 unless noted):
 //!
@@ -30,6 +33,7 @@
 //! | 17 | 0.25 h infusion at 9, EVID=3 10 (no reader shift) | **0** |
 //! | 18 / 19 | lag 5, 2 h infusion at 9, EVID=3 10 / no reset | **0** / live |
 //! | 20 / 21 | dose 8 arriving exactly at an EVID=3 / EVID=4 at 10 | **0** / only the EVID=4 dose |
+//! | 22 / 23 | lag 13 ≥ II 12, `SS=1` at 10, EVID=3 15 / no reset | **0** / live (re-equilibrates at its arrival) |
 //!
 //! The co-timed rows (7–10, 15) reach the engines through the reader's reset shift
 //! (`RESET_SEGMENT_GAP`): a dose row *before* a co-timed reset row ends up recorded before
@@ -49,10 +53,23 @@ use ferx_core::{
 
 const DATA: &str = "nonmem_anchor/evid_reset_lag.csv";
 const TABLE: &str = "nonmem_anchor/results/evid_reset_lag.sdtab";
+const TABLE_ADVAN13: &str = "nonmem_anchor/results/evid_reset_lag_advan13.sdtab";
+
+/// IDs judged against the `ADVAN13` table instead of `ADVAN2`. ID 23 is an `SS=1` dose whose
+/// lag is at least `II`, with no reset (the live control of ID 22): there NONMEM's two ADVANs
+/// disagree by up to 0.20, and ferx's `ALAG >= II` convention is `ADVAN13`'s (#1604, out of
+/// scope here). ID 22, the cancelled twin under test, reads 0 in both tables.
+const ADVAN13_REFERENCE: &[&str] = &["23"];
 
 /// The analytic `lagtime=` slot lags every dose record, so it cannot express NONMEM's
 /// depot-only `ALAG1` on ID 16's central dose.
 const CENTRAL_DOSE: &[&str] = &["16"];
+
+/// The analytic dual's skip list: `CENTRAL_DOSE`, plus ID 23 — an `SS=1` dose with
+/// `ALAG > II` on the static closed-form superposition, which wraps the pre-arrival tail where
+/// the value path clamps it (#1353, open, out of scope). It reads `ADVAN2`'s 4.5306 there
+/// while ferx's own value path reads 4.4741. ID 22, its cancelled twin, is asserted.
+const ANALYTIC_DUAL_SKIP: &[&str] = &["16", "23"];
 
 /// Pairs that differ in one input and straddle the gate: (with the dose cancelled, with it
 /// live). The live member carries one more dose than the cancelled one.
@@ -62,6 +79,7 @@ const STRADDLES: &[(&str, &str)] = &[
     ("7", "8"),   // dose row before vs after a co-timed EVID=3 row
     ("13", "14"), // lagged SS dose with vs without the reset
     ("18", "19"), // lagged infusion with vs without the reset
+    ("22", "23"), // SS dose with lag ≥ II with vs without the reset
 ];
 
 const MODEL_TAIL: &str = r#"
@@ -126,8 +144,29 @@ fn pop() -> Population {
 }
 
 /// `(ID, TIME, PRED)` for every observation of the committed NONMEM table.
+/// The reference: the `ADVAN2` table, with the `ADVAN13` value on `ADVAN13_REFERENCE` IDs.
 fn nonmem_obs() -> Vec<(String, f64, f64)> {
-    let text = std::fs::read_to_string(TABLE).expect("NONMEM table");
+    let (a2, a13) = (read_table(TABLE), read_table(TABLE_ADVAN13));
+    assert_eq!(
+        a2.len(),
+        a13.len(),
+        "the two NONMEM tables must cover the same rows"
+    );
+    a2.into_iter()
+        .zip(a13)
+        .map(|(r2, r13)| {
+            assert!(r2.0 == r13.0 && r2.1 == r13.1, "table rows out of step");
+            if ADVAN13_REFERENCE.contains(&r2.0.as_str()) {
+                r13
+            } else {
+                r2
+            }
+        })
+        .collect()
+}
+
+fn read_table(path: &str) -> Vec<(String, f64, f64)> {
+    let text = std::fs::read_to_string(path).expect("NONMEM table");
     text.lines()
         .skip(2)
         .map(|l| {
@@ -163,6 +202,13 @@ fn assert_matches(label: &str, got: &[(String, f64, f64)], bound: f64, skip: &[&
         }
         assert!(g.is_finite(), "{label}: ID {id} t={t} non-finite ({g})");
         let err = (g - w).abs() / (1.0 + w.abs());
+        // An `ADVAN13` reference is itself an ODE solve (`TOL=12`, measured 2.4e-12 from the
+        // closed form here), so it cannot judge the analytic engines to `ANALYTIC_BOUND`.
+        let bound = if ADVAN13_REFERENCE.contains(&id.as_str()) {
+            bound.max(ODE_BOUND)
+        } else {
+            bound
+        };
         if !(err < bound) {
             bad.push(format!(
                 "ID {id} t={t}: ferx {g} vs NONMEM {w} (err {err:.3e})"
@@ -261,9 +307,10 @@ fn via_adaptive(model: &CompiledModel) -> Vec<(String, f64, f64)> {
 }
 
 // Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): ODE predict / with-states /
-// dual 1.7e-12, analytic value and dual 2.1e-15, adaptive 7.8e-5 (the driver's own floor:
-// 4.2e-4 absolute on ID 6, which no reset cancels). The smallest defect guarded is ID 13's
-// kept pulse, 0.66 absolute — 6.6e2× the adaptive bound.
+// dual 3.7e-12 (27× under `ODE_BOUND`); analytic value and dual 2.1e-15 against `ADVAN2`
+// (48×), and 2.4e-12 on ID 23 against `ADVAN13`, which is judged to `ODE_BOUND`; adaptive
+// 2.7e-4 (the driver's own floor: 4.2e-4 absolute on ID 6, which no reset cancels). The
+// smallest defect guarded is ID 13's kept pulse, 0.66 absolute — 6.6e2× the adaptive bound.
 const ODE_BOUND: f64 = 1e-10;
 const ANALYTIC_BOUND: f64 = 1e-13;
 const ADAPTIVE_BOUND: f64 = 1e-3;
@@ -334,5 +381,5 @@ fn analytic_dual_cancels_a_dose_recorded_before_the_reset() {
     let got = via_dual(&m, |s| {
         subject_sensitivities(&m, s, &m.default_params.theta, &eta)
     });
-    assert_matches("analytic dual", &got, ANALYTIC_BOUND, CENTRAL_DOSE);
+    assert_matches("analytic dual", &got, ANALYTIC_BOUND, ANALYTIC_DUAL_SKIP);
 }

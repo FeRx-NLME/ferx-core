@@ -13,7 +13,8 @@
 //! Per form, four assertions:
 //! 1. **cancel ≡ delete** on the production value (`predict`), the with-states engine and
 //!    the dual walk's value;
-//! 2. **the derivatives agree** between the two subjects on the dual walk;
+//! 2. **the derivatives agree** between the two subjects on the dual walk — first order and
+//!    both second-order blocks;
 //! 3. **Dual2 vs FD**: the dual `∂f/∂η` of the cancelling subject against central FD of
 //!    the production predictor;
 //! 4. **the straddle**: the same subject with the reset moved *before* the dose record
@@ -27,7 +28,13 @@
 //! system — every live dose arrives later — so a leftover jump or saltation there would
 //! multiply a zero state. **Residual** removes that: a per-record lag factor `LAGF` (0.2
 //! from the reset on) makes the first post-reset dose arrive *before* the cancelled one, so
-//! drug is present when the cancelled arrival would have landed (asserted).
+//! drug is present when the cancelled arrival would have landed (asserted). **At obs** is
+//! `Residual` with `η_LAG = 0`, so the cancelled arrival lands *exactly* on the 11.0
+//! observation — the one place an observation-boundary correction for that arrival can act.
+//! A third live dose (record 11.15) arrives, in `Residual` / `At obs`, *inside* the cancelled
+//! dose's would-be absorption or infusion window, where the dual walk's saltation velocities
+//! would carry the cancelled window if it leaked — a second-order effect, which is why (2)
+//! compares the second-order blocks too.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
@@ -120,7 +127,7 @@ const FORMS: &[Form] = &[
         model: "  ALAG1 = LAG\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -CL/V*central\n[scaling]\n  y = central / V\n",
         analytic: false,
         cmt: 1,
-        rate: 200.0,
+        rate: 125.0,
     },
     Form {
         name: "analytic oral",
@@ -134,7 +141,7 @@ const FORMS: &[Form] = &[
         model: "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V, alag=LAG)\n",
         analytic: true,
         cmt: 1,
-        rate: 200.0,
+        rate: 125.0,
     },
 ];
 
@@ -146,20 +153,34 @@ fn model(form: &Form) -> CompiledModel {
 }
 
 const OBS: &[f64] = &[11.0, 11.5, 12.5, 14.0, 16.0, 20.0];
-/// The pending dose (record 9, lag ≈ 2.1 ⇒ arrival ≈ 11.1) and the two live ones.
+/// The pending dose (record 9, lag 2.1 ⇒ arrival ≈ 11.1; 2.0 ⇒ 11.0 in `At obs`) and the
+/// three live ones. An infusion is 0.8 h (`RATE = 125`), so the cancelled one's record-time
+/// window `[9, 9.8]` ends before the reset and the reader does not shift it.
 const CANCELLED: f64 = 9.0;
-const LIVE: &[f64] = &[10.5, 13.0];
+// 11.15, not 11.1: at `η_LAG = 0` a record at 11.1 arrives exactly on the 11.5 read, a kink
+// that FD cannot difference across.
+const LIVE: &[f64] = &[10.5, 11.15, 13.0];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Variant {
     Flat,
     TvWt,
     Residual,
+    AtObs,
+}
+
+/// `η = [ETA_CL, ETA_LAG]`; `At obs` zeroes `η_LAG` so the lag is exactly `TVLAG = 2`.
+fn eta(v: Variant) -> [f64; 2] {
+    if v == Variant::AtObs {
+        [0.1, 0.0]
+    } else {
+        [0.1, 0.05]
+    }
 }
 
 /// A one-subject population: doses at `doses`, one EVID=3 row at `reset`, the observations
-/// `OBS`. `TvWt` and `Residual` change `WT` on every row, so the covariate is live across
-/// each arrival; `Residual` also sets `LAGF = 0.2` on every row from t = 10 on.
+/// `OBS`. Every variant but `Flat` changes `WT` on every row, so the covariate is live across
+/// each arrival; `Residual` and `AtObs` also set `LAGF = 0.2` on every row from t = 10 on.
 fn subject(form: &Form, doses: &[f64], reset: f64, v: Variant) -> Population {
     let wt = |t: f64| {
         if v == Variant::Flat {
@@ -169,7 +190,7 @@ fn subject(form: &Form, doses: &[f64], reset: f64, v: Variant) -> Population {
         }
     };
     let lagf = |t: f64| {
-        if v == Variant::Residual && t >= 10.0 {
+        if matches!(v, Variant::Residual | Variant::AtObs) && t >= 10.0 {
             0.2
         } else {
             1.0
@@ -202,14 +223,12 @@ fn subject(form: &Form, doses: &[f64], reset: f64, v: Variant) -> Population {
     pop
 }
 
-const ETA: [f64; 2] = [0.1, 0.05];
-
-fn sens(m: &CompiledModel, form: &Form, s: &Subject) -> SubjectSens {
+fn sens(m: &CompiledModel, form: &Form, s: &Subject, eta: &[f64]) -> SubjectSens {
     let theta = &m.default_params.theta;
     let r = if form.analytic {
-        subject_sensitivities(m, s, theta, &ETA)
+        subject_sensitivities(m, s, theta, eta)
     } else {
-        ode_subject_sensitivities(m, s, theta, &ETA)
+        ode_subject_sensitivities(m, s, theta, eta)
     };
     r.unwrap_or_else(|| {
         panic!(
@@ -250,13 +269,14 @@ fn close(label: &str, a: &[f64], b: &[f64], tol: f64) -> f64 {
     worst
 }
 
-// Measured at the fix, over 8 forms × 3 variants (printed per case), err = |a−b|/(1+|b|):
+// Measured at the fix, over 8 forms × 4 variants (printed per case), err = |a−b|/(1+|b|):
 // cancel vs delete is bit-identical on `flat` / `TV WT` (the cancelled arrival lands on an
-// empty system, so the extra break integrates zeros exactly) and ≤ 1.1e-14 on values,
-// ≤ 2.4e-13 on derivatives, on `residual` (the break changes the integrator's steps).
-// SAME_TOL is 400× the worst. Dual vs FD ≤ 1.5e-9 (h = 1e-5): FD_TOL is ~70×. Straddle
-// ≥ 3.26 against a bound of 1.0. The defect guarded — a kept dose — moves f by ≥ 3.
-const SAME_TOL: f64 = 1e-10;
+// empty system, so the extra break integrates zeros exactly); on `residual` / `at obs` it is
+// ≤ 1.9e-14 on values and ≤ 1.2e-11 on derivatives (transit, a second-order block), because
+// the cancelled arrival's break changes the integrator's steps. SAME_TOL is ~85× the worst.
+// Dual vs FD ≤ 1.8e-9 (h = 1e-5): FD_TOL is ~55×. Straddle ≥ 3.26 against a bound of 1.0.
+// The defect guarded — a kept dose — moves f by ≥ 3.
+const SAME_TOL: f64 = 1e-9;
 const FD_TOL: f64 = 1e-7;
 const STRADDLE_MIN: f64 = 1.0;
 
@@ -268,8 +288,10 @@ fn check(form: &Form, v: Variant) {
             Variant::Flat => "flat",
             Variant::TvWt => "TV WT",
             Variant::Residual => "residual at the cancelled arrival",
+            Variant::AtObs => "cancelled arrival on an observation",
         }
     );
+    let e = eta(v);
     let m = model(form);
     let mut all = vec![CANCELLED];
     all.extend_from_slice(LIVE);
@@ -280,22 +302,35 @@ fn check(form: &Form, v: Variant) {
 
     // The fixture: the cancelled dose's record precedes the reset and its arrival follows it
     // (its `LAGF` is 1 in every variant: its record is before t = 10).
-    let lag = m.default_params.theta[3] * ETA[1].exp();
+    let lag = m.default_params.theta[3] * e[1].exp();
     let arrival = CANCELLED + lag;
     assert!(
         CANCELLED < 10.0 && arrival > 10.0,
         "{label}: arrival {arrival}"
     );
-    if v == Variant::Residual {
+    if v == Variant::AtObs {
+        assert_eq!(
+            arrival, OBS[0],
+            "{label}: the cancelled arrival must sit on an observation"
+        );
+    }
+    if matches!(v, Variant::Residual | Variant::AtObs) {
         // The first live dose arrives (10.5 + 0.2·lag ≈ 10.92) before the cancelled one, so
         // drug is present there: the 11.0 read, just before `arrival`, is non-zero (least:
         // transit, whose onset is smooth, 3.0e-3).
         let first_live = LIVE[0] + 0.2 * lag;
         assert!(
-            first_live < OBS[0] && OBS[0] < arrival,
+            first_live < OBS[0] && OBS[0] <= arrival,
             "{label}: {first_live} / {arrival}"
         );
-        let f = production(&m, sd, &ETA);
+        // The third live dose arrives inside the cancelled dose's window (it opens at
+        // `arrival`; the shortest, the 0.8 h infusion, closes at `arrival + 0.8`).
+        let inside = LIVE[1] + 0.2 * lag;
+        assert!(
+            arrival < inside && inside < arrival + 0.8,
+            "{label}: {inside}"
+        );
+        let f = production(&m, sd, &e);
         assert!(
             f[0] > 1e-3,
             "{label}: no residual drug at the cancelled arrival: {f:?}"
@@ -311,11 +346,11 @@ fn check(form: &Form, v: Variant) {
     );
     let w_states = close(
         &format!("{label}: with-states"),
-        &production(&m, sc, &ETA),
-        &production(&m, sd, &ETA),
+        &production(&m, sc, &e),
+        &production(&m, sd, &e),
         SAME_TOL,
     );
-    let (a, b) = (sens(&m, form, sc), sens(&m, form, sd));
+    let (a, b) = (sens(&m, form, sc, &e), sens(&m, form, sd, &e));
     let fa: Vec<f64> = a.obs.iter().map(|o| o.f).collect();
     let fb: Vec<f64> = b.obs.iter().map(|o| o.f).collect();
     let w_dual = close(&format!("{label}: dual value"), &fa, &fb, SAME_TOL);
@@ -339,6 +374,18 @@ fn check(form: &Form, v: Variant) {
             &y.df_dtheta,
             SAME_TOL,
         ));
+        w_grad = w_grad.max(close(
+            &format!("{label}: ∂²f/∂η² obs {j}"),
+            &x.d2f_deta2,
+            &y.d2f_deta2,
+            SAME_TOL,
+        ));
+        w_grad = w_grad.max(close(
+            &format!("{label}: ∂²f/∂η∂θ obs {j}"),
+            &x.d2f_deta_dtheta,
+            &y.d2f_deta_dtheta,
+            SAME_TOL,
+        ));
     }
     // The lag axis is live on the live doses, so (2) is not comparing zeros.
     assert!(
@@ -349,8 +396,8 @@ fn check(form: &Form, v: Variant) {
     // (3) Dual2 vs central FD of the production predictor, on the cancelling subject.
     let h = 1e-5;
     let mut w_fd = 0.0_f64;
-    for k in 0..ETA.len() {
-        let (mut ep, mut em) = (ETA.to_vec(), ETA.to_vec());
+    for k in 0..e.len() {
+        let (mut ep, mut em) = (e.to_vec(), e.to_vec());
         ep[k] += h;
         em[k] -= h;
         let (fp, fm) = (production(&m, sc, &ep), production(&m, sc, &em));
@@ -369,8 +416,8 @@ fn check(form: &Form, v: Variant) {
     }
 
     // (4) the straddle: the dose live (reset before its record), everything else equal.
-    let fl = production(&m, &live.subjects[0], &ETA);
-    let fdel = production(&m, sd, &ETA);
+    let fl = production(&m, &live.subjects[0], &e);
+    let fdel = production(&m, sd, &e);
     let gap = fl
         .iter()
         .zip(&fdel)
@@ -389,7 +436,12 @@ fn check(form: &Form, v: Variant) {
 #[test]
 fn a_dose_recorded_before_the_reset_is_deleted_on_every_absorption_form() {
     for form in FORMS {
-        for v in [Variant::Flat, Variant::TvWt, Variant::Residual] {
+        for v in [
+            Variant::Flat,
+            Variant::TvWt,
+            Variant::Residual,
+            Variant::AtObs,
+        ] {
             check(form, v);
         }
     }

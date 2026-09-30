@@ -14413,3 +14413,109 @@ fn an_evid3_reset_in_a_lagged_ss_window_cancels_the_dose_on_every_ode_engine() {
     }
     println!("reset in lagged SS window: worst |f| across engines {worst:.3e}");
 }
+
+/// **A dose recorded before an EVID=3 reset is cancelled on every ODE state engine, however
+/// it would arrive** (#1587): a lagged depot bolus, a lagged depot infusion, and an `SS=1`
+/// dose whose lag is at least `II` — the one kind that re-equilibrates *at its arrival*
+/// rather than being seeded at its record, so only the static walker's arrival reseed and
+/// the dense walk's arrival pass can keep it. NONMEM reads all three as `0` after the reset
+/// (`nonmem_anchor/evid_reset_lag`, IDs 2, 17, 22; `CL = 2, V = 20, KA = 0.15`).
+///
+/// This reaches the engines the public-API anchor cannot: `ode_predictions` handed a reset
+/// subject and `ode_dense_solve_states` (whose `apply_segment_boundary` registers the
+/// infusion window). Each cell has a straddle twin — the reset moved before the record, or
+/// removed — that must read live on every engine, so "zero" is not an engine that lost the
+/// dose for another reason.
+#[test]
+fn a_dose_recorded_before_an_evid3_reset_is_cancelled_on_every_ode_engine() {
+    struct Cell {
+        name: &'static str,
+        dose: DoseEvent,
+        lag: f64,
+        reset: f64,
+        live_reset: Option<f64>,
+        obs: Vec<f64>,
+    }
+    let cells = [
+        Cell {
+            name: "lagged bolus (ID 2)",
+            dose: DoseEvent::new(9.0, 100.0, 1, 0.0, false, 0.0),
+            lag: 2.0,
+            reset: 10.0,
+            live_reset: Some(8.5),
+            obs: vec![11.5, 14.0, 20.0],
+        },
+        Cell {
+            name: "lagged infusion (ID 17)",
+            dose: DoseEvent::new(9.0, 100.0, 1, 400.0, false, 0.0),
+            lag: 2.0,
+            reset: 10.0,
+            live_reset: Some(8.5),
+            obs: vec![11.5, 14.0, 20.0],
+        },
+        Cell {
+            name: "SS=1 with lag ≥ II (ID 22)",
+            dose: DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0),
+            lag: 13.0,
+            reset: 15.0,
+            live_reset: None,
+            obs: vec![16.0, 22.0, 24.0, 30.0],
+        },
+    ];
+    let lag_slot = 20usize;
+    let ode = depot_central_lag_spec(lag_slot);
+    let mut worst = 0.0_f64;
+    for c in &cells {
+        let mut pk = pk_one(2.0, 20.0);
+        pk.values[4] = 0.15;
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        pk.values[lag_slot] = c.lag;
+        assert!(
+            c.dose.time < c.reset && c.dose.time + c.lag > c.reset,
+            "{}: the record must precede the reset and the arrival follow it",
+            c.name
+        );
+        let mut cancelled = make_subject(vec![c.dose.clone()], c.obs.clone());
+        cancelled.reset_times = vec![c.reset];
+        let mut live = make_subject(vec![c.dose.clone()], c.obs.clone());
+        live.reset_times = c.live_reset.into_iter().collect();
+        let keep = |e: &&(&str, Vec<f64>)| e.0 != "ode_predictions_with_states";
+        let engines = ss_tie_engines(&ode, &pk, &cancelled);
+        let twins = ss_tie_engines(&ode, &pk, &live);
+        let asserted: Vec<_> = engines.iter().filter(keep).collect();
+        assert!(
+            asserted.len() >= 4,
+            "{}: engines {}",
+            c.name,
+            asserted.len()
+        );
+        for (engine, got) in asserted {
+            for (j, &t) in c.obs.iter().enumerate() {
+                assert!(
+                    got[j].is_finite(),
+                    "{}, {engine}, t = {t}: {}",
+                    c.name,
+                    got[j]
+                );
+                assert!(
+                    got[j].abs() < 1e-9,
+                    "{}, {engine}, t = {t}: {} — a dose recorded before the EVID=3 reset must \
+                     be cancelled, as NONMEM does (#1587)",
+                    c.name,
+                    got[j]
+                );
+                worst = worst.max(got[j].abs());
+            }
+        }
+        // The straddle, on every engine, at the last observation (every window has opened).
+        for (engine, free) in twins.iter().filter(keep) {
+            let last = *free.last().expect("observations");
+            assert!(
+                last > 0.5,
+                "{}, {engine}: with the reset before the record (or none) the dose is live ({last})",
+                c.name
+            );
+        }
+    }
+    println!("#1587 every ODE engine: worst |f| after the reset {worst:.3e}");
+}
