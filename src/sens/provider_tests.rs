@@ -13718,3 +13718,119 @@ fn transit_walk_iov_provider_matches_fd_and_places_kappa_at_the_dose() {
         twin
     ));
 }
+
+/// **The analytic event-driven walk wipes a dose an `SS=1` record reset, value and dual**
+/// (#1588). Superposition already honoured the reset (#1576's cutoff), but the event walk
+/// (`pk::event_driven`, and its dual twin `event_driven_sens_with_doses_g`) applied every
+/// `Dose` arrival, and the seed of a lagged `SS=1` record sorts before every co-timed
+/// arrival (`DoseRecord < Dose`). So at `LAGTIME = 2` a depot bolus row before a co-timed
+/// `SS=1` row arrived on top of the seeded trough (ID 3: +63 %), as did a bolus still
+/// pending at the record (ID 10). A weight that moves across the observations routes each
+/// subject to the event walk on both sides (asserted: the dual's router, and the value
+/// path's schedule-build counter); a leading `EVID=3` would not, since `SS` + a reset
+/// declines the dual to FD. The value is pinned against the live-only twin (same
+/// covariates), and `check_full_provider_vs_fd` differentiates it (∂f/∂LAGTIME included,
+/// `ETA_LAG` and `TVLAG` both live).
+///
+/// The dual leg reaches IDs 9 and 10 only. A co-timed pair of lagged doses (IDs 3, 11)
+/// arrives as two coincident moving breaks, which `moving_bounds_separable` declines to FD
+/// before the walk runs — asserted here, so the day that scope widens this test says the
+/// dual gate is now reachable on them and they join the dual leg.
+#[test]
+fn an_ss_record_wipes_a_preceding_or_pending_dose_on_the_analytic_event_walk() {
+    let m = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
+    let theta = vec![0.2, 10.0, 0.15, 2.0, 0.75];
+    let eta = vec![0.15, -0.10, 0.25, 0.12];
+    let depot = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let ss = |t: f64, amt: f64| DoseEvent::new(t, amt, 1, 0.0, true, 12.0);
+    let times = [11.5, 12.5, 15.0, 21.0, 30.0];
+    let mk = |d: Vec<DoseEvent>| {
+        let dose_wts = vec![70.0; d.len()];
+        let s = tvcov_subject(
+            d,
+            &dose_wts,
+            &times,
+            &[70.0, 72.0, 74.0, 76.0, 78.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(
+            subject_routes_to_event_walk(&m, &s),
+            "dual not on the event walk"
+        );
+        s
+    };
+    // (label, doses, live-only twin, the dual walk serves it)
+    let cases = [
+        (
+            "ID 3: depot bolus, then SS=1 (co-timed)",
+            vec![depot(10.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+            false,
+        ),
+        (
+            "ID 9: SS=1 100 at 10, SS=1 200 at 11",
+            vec![ss(10.0, 100.0), ss(11.0, 200.0)],
+            vec![ss(11.0, 200.0)],
+            true,
+        ),
+        (
+            "ID 10: depot bolus at 9 (arrives ~11), SS=1 at 10",
+            vec![depot(9.0), ss(10.0, 100.0)],
+            vec![ss(10.0, 100.0)],
+            true,
+        ),
+        (
+            "ID 11: SS=1 100, then SS=1 200 (co-timed)",
+            vec![ss(10.0, 100.0), ss(10.0, 200.0)],
+            vec![ss(10.0, 200.0)],
+            false,
+        ),
+    ];
+    let mut worst = 0.0_f64;
+    for (label, doses, twin, on_dual) in cases {
+        let subject = mk(doses);
+        crate::pk::event_driven::SCHEDULE_BUILDS.with(|n| n.set(0));
+        let prod = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+        assert!(
+            crate::pk::event_driven::SCHEDULE_BUILDS.with(|n| n.get()) > 0,
+            "{label}: production did not take the event walk"
+        );
+        let want = compute_predictions_with_tv(&m, &mk(twin), &theta, &eta);
+        let full = subject_sensitivities(&m, &subject, &theta, &eta);
+        assert_eq!(
+            full.is_some(),
+            on_dual,
+            "{label}: the dual walk's scope changed (Some = analytic, None = FD)"
+        );
+        for (j, &t) in times.iter().enumerate() {
+            assert!(
+                prod[j].is_finite() && want[j] > 0.0,
+                "{label} t = {t}: non-finite"
+            );
+            let mut engines = vec![("pk::event_driven (f64)", prod[j])];
+            if let Some(full) = &full {
+                assert!(
+                    full.obs[j].f.is_finite(),
+                    "{label} t = {t}: dual non-finite"
+                );
+                engines.push(("event_driven_sens (dual)", full.obs[j].f));
+            }
+            for (engine, got) in engines {
+                let rel = ((got - want[j]) / want[j]).abs();
+                // Measured 2.1e-16; the smallest defect guarded is +31 % (ID 11).
+                assert!(
+                    rel < 1e-12,
+                    "{engine}, {label}, t = {t}: {got} vs live-only twin {} (rel {rel:e})",
+                    want[j]
+                );
+                worst = worst.max(rel);
+            }
+        }
+        if on_dual {
+            check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+        }
+    }
+    println!("#1588 analytic event walk vs live-only twin: worst rel {worst:.3e}");
+}

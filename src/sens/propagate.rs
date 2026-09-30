@@ -1495,6 +1495,15 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
             }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
+                // The value walk's `SS=1` reset gate (#1588): a wiped dose has no arrival.
+                // Its lag needs no separate suppression here — the walk threads `∂/∂lag`
+                // through the dual sub-interval lengths on either side of the arrival, and
+                // with no jump between them the two flows compose to one fixed-length flow.
+                if !crate::ode::predictions::SsResetGate::at_segment(eff_doses, ev.time)
+                    .live(eff_doses, ev.orig_idx)
+                {
+                    continue;
+                }
                 // Dose attributes belong to the dose row, so `F` and the SS
                 // equilibration read that row's snapshot — never `pk_now`, which
                 // after #1073 is the next record's (#1073).

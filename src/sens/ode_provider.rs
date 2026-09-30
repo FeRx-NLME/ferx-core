@@ -5442,6 +5442,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
         if kind == K_DOSE {
             let d = &subject.doses[idx];
+            // #1588: a dose whose record precedes the `SS=1` record reached at this arrival,
+            // in (time, row order), was wiped by that reset — production's `f64` twin's
+            // gate (`SsResetGate::live`). The **whole** state arrival is suppressed: the SS
+            // re-equilibration, the bolus jump, and the lag saltations (bolus and forcing
+            // onset), or ∂f/∂ALAG would keep the derivative of a dose the value no longer
+            // has. The infusion rate-on is not (#1586), and the TAD anchor fold below is
+            // not: production anchors TAD on every dose, live or not.
+            let arrival_live =
+                crate::ode::predictions::SsResetGate::at_segment(&subject.doses, t_event)
+                    .live(&subject.doses, idx);
             // The anchor this arrival establishes, computed ONCE and used by every consumer in
             // this arm: the post side of the saltation below, and the segment the arrival opens.
             //
@@ -5518,7 +5528,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // *is* the trough, so the twin agreed with production while both disagreed
             // with NONMEM. `ss_seeded_at_record` is production's own predicate, shared so
             // the two cannot seed on different sets.
-            if is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx)) {
+            if arrival_live && is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx))
+            {
                 // SS into a built-in absorption compartment (#835): the dose drives the
                 // kernel `R_in`, not an instantaneous bolus, so equilibrate through the dual
                 // fixed point (linear) / pulse-train (nonlinear), carrying `∂u_ss/∂(θ,η[,κ])`.
@@ -5575,7 +5586,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // lagtime the dose's arrival is a fixed (non-dual) boundary, so
                         // no saltation is needed — the continuous forcing above already
                         // carries every other parameter's exact sensitivity.
-                        if has_lagtime {
+                        if has_lagtime && arrival_live {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
                             let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
@@ -5850,6 +5861,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 );
                             }
                         }
+                    } else if !arrival_live {
+                        // Wiped by the `SS=1` reset (#1588): no jump, so no lag saltation.
                     } else if has_lagtime {
                         // Estimated-lagtime event-time injection. The dose arrives at
                         // `τ = t_dose + lag`; the corrected post-dose state, as a function

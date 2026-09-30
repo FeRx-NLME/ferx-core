@@ -1018,6 +1018,15 @@ fn event_driven_predictions_with_schedule_impl(
             }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
+                // A dose whose record precedes the `SS=1` record reached here, in (time,
+                // row order), was wiped by that reset (#1588): no arrival at all. The seed
+                // at a lagged `SS=1` record sorts before every co-timed arrival
+                // (`DoseRecord < Dose`), so list order alone cannot express this.
+                if !crate::ode::predictions::SsResetGate::at_segment(eff_doses, ev.time)
+                    .live(eff_doses, ev.orig_idx)
+                {
+                    continue;
+                }
                 // Dose *attributes* belong to the dose row, so they read that
                 // row's own snapshot and never `pk_now`, which after #1073 is the
                 // next record's. Before the split the two were the same object.

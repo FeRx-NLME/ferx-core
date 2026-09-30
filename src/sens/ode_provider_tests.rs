@@ -11938,3 +11938,181 @@ fn ode_provider_route_lagged_onset_between_records_is_exact() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
+
+/// Depot → central with `ALAG1 = TVLAG` on the depot only (theta 4), for the #1588 tie.
+const ONECPT_DEPOT_ALAG1: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-11
+  ode_abstol = 1e-11
+"#;
+
+/// A `first_order` **forcing** into `central` whose doses carry `ALAG1`, next to an unlagged
+/// `depot2` state an `SS=1` dose can land in (`SS=1` + lag into a forcing is rejected up
+/// front, so the `SS=1` record has to sit on another compartment).
+const ONECPT_FORCING_ALAG1_PLUS_DEPOT2: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.5, 0.005, 20.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  theta TVKA2(0.15, 0.005, 20.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAG
+  KA2   = TVKA2
+[structural_model]
+  ode(obs_cmt=central, states=[central, depot2])
+[odes]
+  d/dt(central) = first_order(ka=KA) + KA2*depot2 - CL/V*central
+  d/dt(depot2)  = -KA2*depot2
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-11
+  ode_abstol = 1e-11
+"#;
+
+/// **The dual ODE walk wipes a dose an `SS=1` record reset, jump and saltation both**
+/// (#1588). `integrate_tvcov_g` applies each `K_DOSE` arrival in timeline order, and the
+/// seed of a lagged `SS=1` record sorts before every co-timed arrival, so before the fix it
+/// jumped a bolus row that precedes the `SS=1` row (ID 1 at lag 2: +125 %), re-loaded a
+/// reset `SS=1` dose's trough at its arrival (ID 9), and delivered a lagged bolus still
+/// pending at the record (ID 10: +59 %). ID 1 at lag 0 is the value/gradient seam: there
+/// the dual walk was already right and the production `f64` static walker it is paired
+/// with was not (+127 %), so the objective and its gradient came from different functions.
+///
+/// `ALAG1` is a theta, so `check_vs_production` differentiates the arrival time too
+/// (∂f/∂ALAG against central differences of the production predictor). The forcing leg
+/// reaches the rate-on saltation of a wiped lagged dose into a `first_order` forcing: the
+/// value path already skips it (#1576's forcing gate), so an onset saltation left in place
+/// would put a derivative in ∂f/∂ALAG that the value does not have. Each fixture is
+/// asserted to stay on the dual walk, and its value is pinned against the live-only twin.
+#[test]
+fn ode_provider_ss_record_wipes_a_preceding_or_pending_dose_matches_production() {
+    let depot = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let central = |t: f64| DoseEvent::new(t, 100.0, 2, 0.0, false, 0.0);
+    let ss = |t: f64, amt: f64, cmt: usize| DoseEvent::new(t, amt, cmt, 0.0, true, 12.0);
+    let depot_model = parse_model_string(ONECPT_DEPOT_ALAG1).expect("parse depot ALAG1");
+    let forcing_model =
+        parse_model_string(ONECPT_FORCING_ALAG1_PLUS_DEPOT2).expect("parse forcing ALAG1");
+    let obs = [11.5, 12.5, 15.0, 21.0, 30.0];
+    // (label, model, theta, doses, live-only twin)
+    let cases: [(
+        &str,
+        &CompiledModel,
+        Vec<f64>,
+        Vec<DoseEvent>,
+        Vec<DoseEvent>,
+    ); 6] = [
+        (
+            "ID 1, lag 0: bolus central, then SS=1 (the value/gradient seam)",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 0.0],
+            vec![central(10.0), ss(10.0, 100.0, 1)],
+            vec![ss(10.0, 100.0, 1)],
+        ),
+        (
+            "ID 1, lag 2: bolus central, then SS=1",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 2.0],
+            vec![central(10.0), ss(10.0, 100.0, 1)],
+            vec![ss(10.0, 100.0, 1)],
+        ),
+        (
+            "ID 9, lag 2: SS=1 100 at 10, SS=1 200 at 11",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 2.0],
+            vec![ss(10.0, 100.0, 1), ss(11.0, 200.0, 1)],
+            vec![ss(11.0, 200.0, 1)],
+        ),
+        (
+            "ID 10, lag 2: depot bolus at 9 (arrives 11), SS=1 at 10",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 2.0],
+            vec![depot(9.0), ss(10.0, 100.0, 1)],
+            vec![ss(10.0, 100.0, 1)],
+        ),
+        (
+            // The only shape where the SS re-equilibration gate alone matters: the wiped
+            // `SS=1` dose is unlagged (re-equilibrated at its arrival), the live one lagged
+            // (seeded at the record, not re-equilibrated), so nothing later overwrites an
+            // ungated re-equilibration. With both lagged or both unlagged, the live dose's
+            // own load erases it.
+            "ID 13, lag 2: SS=1 central 100, then SS=1 depot 200 (co-timed)",
+            &depot_model,
+            vec![2.0, 20.0, 0.15, 2.0],
+            vec![ss(10.0, 100.0, 2), ss(10.0, 200.0, 1)],
+            vec![ss(10.0, 200.0, 1)],
+        ),
+        (
+            "forcing, lag 2: bolus into the forcing at 9 (arrives 11), SS=1 depot2 at 10",
+            &forcing_model,
+            vec![2.0, 20.0, 0.5, 2.0, 0.15],
+            vec![depot(9.0), ss(10.0, 100.0, 2)],
+            vec![ss(10.0, 100.0, 2)],
+        ),
+    ];
+    let eta = vec![0.12];
+    let mut worst = 0.0_f64;
+    for (label, model, theta, doses, twin_doses) in cases {
+        let mut subj = bolus_subject(&obs);
+        subj.doses = doses;
+        assert!(
+            ode_subject_sensitivities(model, &subj, &theta, &eta).is_some(),
+            "{label}: routed to FD, the dual walk is not exercised"
+        );
+        let mut twin = subj.clone();
+        twin.doses = twin_doses;
+        let prod = compute_predictions_with_tv(model, &subj, &theta, &eta);
+        let want = compute_predictions_with_tv(model, &twin, &theta, &eta);
+        let dual = ode_subject_sensitivities(model, &subj, &theta, &eta).expect("supported");
+        for (j, &t) in obs.iter().enumerate() {
+            assert!(
+                prod[j].is_finite() && dual.obs[j].f.is_finite() && want[j] > 0.0,
+                "{label} t = {t}: non-finite"
+            );
+            for (engine, got) in [("production f64", prod[j]), ("dual walk", dual.obs[j].f)] {
+                let rel = ((got - want[j]) / want[j]).abs();
+                // Measured 1.6e-12; the smallest defect guarded is +9.8 %.
+                assert!(
+                    rel < 1e-10,
+                    "{engine}, {label}, t = {t}: {got} vs live-only twin {} (rel {rel:e})",
+                    want[j]
+                );
+                worst = worst.max(rel);
+            }
+        }
+        check_vs_production(model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(model, &subj, &theta, &eta);
+    }
+    println!("#1588 dual/production vs live-only twin: worst rel {worst:.3e}");
+}

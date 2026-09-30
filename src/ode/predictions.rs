@@ -2293,8 +2293,13 @@ impl SsResetGate {
     }
 
     /// Whether dose `k` is live: not reset by an `SS=1` record this segment has reached.
+    ///
+    /// Also the arrival gate of every state engine (#1588): a dose whose record precedes,
+    /// in (time, row order), the `SS=1` record reached at its arrival break changes nothing
+    /// there — no bolus jump, no arrival re-equilibration, and on the dual walks no lag
+    /// saltation. Infusion windows (#1586) and the EVID=3/4 floor (#1587) do not read it.
     #[inline]
-    fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
+    pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
     }
 
@@ -3830,6 +3835,9 @@ fn reseed_prescheduled_states_at(
             ));
         }
     }
+    // The `SS=1` reset reached at this break (#1588): a dose whose record precedes it in
+    // (time, row order) does not re-equilibrate at its arrival.
+    let ss_gate = SsResetGate::at_segment(doses, t_start);
     for (i, dose) in doses.iter().enumerate() {
         // The arrival is one event: this equilibration and the bolus jump in
         // `apply_prescheduled_boluses_at`. Its mask is set there (the last sub-step),
@@ -3838,6 +3846,9 @@ fn reseed_prescheduled_states_at(
             continue;
         }
         if (dose.time + dose_lagtimes[i] - t_start).abs() >= EVENT_MATCH_TOL {
+            continue;
+        }
+        if !ss_gate.live(doses, i) {
             continue;
         }
         // Re-equilibrating at the arrival is a shortcut for propagating the seed
@@ -3874,6 +3885,10 @@ fn apply_prescheduled_boluses_at(
     applied: &mut [bool],
 ) {
     debug_assert!(applied.len() >= doses.len());
+    // A bolus whose record precedes the `SS=1` record reached at this break, in (time, row
+    // order), is wiped by that reset (#1588): a co-timed row *before* the `SS=1` row, and a
+    // lagged dose still pending at it. It is still marked applied, so the arrival closes.
+    let ss_gate = SsResetGate::at_segment(doses, t_start);
     for (i, dose) in doses.iter().enumerate() {
         if applied[i] {
             continue;
@@ -3885,7 +3900,10 @@ fn apply_prescheduled_boluses_at(
         // (bolus, input-rate-suppressed, or infusion) — this is the last sub-step of
         // the arrival event, so marking it here closes the whole arrival (#1186).
         applied[i] = true;
-        if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
+        if !is_real_infusion(dose)
+            && !input_rate_consumes_cmt(ode, dose.cmt_raw())
+            && ss_gate.live(doses, i)
+        {
             // dose.cmt is 1-based; state indices are 0-based. A dose into a built-in
             // input-rate compartment (transit/etc.) is delivered as R_in over time by
             // the wrapped RHS — not as a bolus — so it's skipped to avoid double-count.
@@ -6971,6 +6989,13 @@ pub fn ode_predictions_event_driven(
                 // which after #1073 is the NEXT record's. Before the split the two
                 // were the same object and the distinction did not show.
                 let dose_pk = &pk_at_dose[idx];
+                // A dose whose record precedes the `SS=1` record reached here, in
+                // (time, row order), was wiped by that reset (#1588): no arrival at all.
+                // The seed at a lagged `SS=1` record sorts before every co-timed arrival
+                // (`DoseRecord < Dose`), so list order alone cannot express this.
+                if !SsResetGate::at_segment(&subject.doses, cur_t).live(&subject.doses, idx) {
+                    continue;
+                }
                 // Steady-state (SS=1) dose: reset state and load with the
                 // SS amount from the infinite-past pulse train before the
                 // SS dose's own pulse is applied below. See
@@ -7350,6 +7375,10 @@ pub fn ode_predictions_with_states(
         }
 
         // Apply boluses and SS doses at t_eff = dose.time + lagtime.
+        // A dose whose record precedes the `SS=1` record reached here, in (time, row
+        // order), was wiped by that reset (#1588): no equilibration, no bolus. Its
+        // infusion window is still registered (#1586).
+        let ss_gate = SsResetGate::at_segment(&subject.doses, t_start);
         for (dose_idx, dose) in subject.doses.iter().enumerate() {
             if applied[dose_idx] {
                 continue;
@@ -7360,7 +7389,12 @@ pub fn ode_predictions_with_states(
                 // arrival is one event (equilibrate + bolus + infusion push) (#1186).
                 applied[dose_idx] = true;
                 let f = dose_f_bio[dose_idx];
-                if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx]) {
+                let live = ss_gate.live(&subject.doses, dose_idx);
+                if live
+                    && dose.ss
+                    && dose.ii > 0.0
+                    && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx])
+                {
                     // Lagged arrival: pre-lag seeding was already done above;
                     // here we apply the full equilibrated state — sound only
                     // because the propagated state at the arrival is the trough
@@ -7370,7 +7404,7 @@ pub fn ode_predictions_with_states(
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts, &chz_before);
                 }
                 if !is_real_infusion(dose) {
-                    if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
+                    if live && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                         // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
                         // compartment and resolves to compartment 1, like every
                         // other dose site on both engines (#899). This used to
@@ -7725,6 +7759,10 @@ fn apply_segment_boundary(
         }
     }
 
+    // The `SS=1` reset reached here (#1588), as in `ode_predictions_with_states`: a dose
+    // whose record precedes it neither equilibrates nor jumps; its infusion window is
+    // still registered (#1586).
+    let ss_gate = SsResetGate::at_segment(&subject.doses, t_start);
     for (dose_idx, dose) in subject.doses.iter().enumerate() {
         if applied[dose_idx] {
             continue;
@@ -7734,7 +7772,12 @@ fn apply_segment_boundary(
             // One arrival event: equilibrate + bolus + infusion push (#1186).
             applied[dose_idx] = true;
             let f = dose_f_bio[dose_idx];
-            if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx]) {
+            let live = ss_gate.live(&subject.doses, dose_idx);
+            if live
+                && dose.ss
+                && dose.ii > 0.0
+                && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx])
+            {
                 // Lagged arrival: pre-lag seeding already done above. The
                 // overwrite is exact only while the flowed state is the trough
                 // (#1121); past `lag = II` the seed flows here instead.
@@ -7742,7 +7785,7 @@ fn apply_segment_boundary(
                 *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts, &chz_before);
             }
             if !is_real_infusion(dose) {
-                if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
+                if live && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                     // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
                     // compartment and resolves to compartment 1, like every
                     // other dose site on both engines (#899).
