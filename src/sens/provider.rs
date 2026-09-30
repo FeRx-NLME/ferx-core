@@ -430,9 +430,9 @@ fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
 
 /// Superpose one observation's dose contributions through the closed-form PK kernel the
 /// `flags` select: `f = Σ conc(dose, elapsed)`, restricted to the current reset segment
-/// (`dose.time + lag < reset_floor` excludes washed-out doses, keyed on the *lagged
-/// arrival* — a dose recorded before a reset but arriving after it via lagtime still
-/// contributes, exactly as the event-driven walk applies it, PR #381 #2). `elapsed`
+/// (a dose **recorded** before `reset_floor` is excluded, even one whose lagged arrival
+/// comes after the reset: NONMEM cancels it, and so does the event-driven walk, #1587 —
+/// before which both kept it, PR #381 #2). `elapsed`
 /// carries the lagtime shift and the SS pre-arrival tail wrap ([`lagged_elapsed`]).
 /// Generic over the seeded dual type, so the `Dual2` outer ([`run_obs`]) and `Dual1`
 /// inner ([`run_obs_grad`]) walkers share the byte-identical dispatch ladder.
@@ -448,7 +448,7 @@ fn superpose_doses<T: PkNum>(
     // The value path's `SS=1` reset (#1576): `crate::pk::predict_concentration`.
     let ss_cutoff = crate::dosing::ss_reset_cutoff(&subject.doses, t_obs);
     for (k, dose) in subject.doses.iter().enumerate() {
-        if dose.time + d.lag_val < reset_floor
+        if !crate::dosing::evid_reset_live(dose.time, reset_floor)
             || !crate::dosing::ss_reset_live(&subject.doses, ss_cutoff, k)
         {
             continue;
@@ -7531,7 +7531,7 @@ fn run_obs<const NA: usize, const N: usize, const PARTIAL: bool>(
             for (k, dose) in subject.doses.iter().enumerate() {
                 let elapsed = t_obs - dose.time;
                 if elapsed < 0.0
-                    || dose.time < reset_floor
+                    || !crate::dosing::evid_reset_live(dose.time, reset_floor)
                     || !crate::dosing::ss_reset_live(&subject.doses, ss_cutoff, k)
                 {
                     continue;

@@ -4807,8 +4807,8 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         std::slice::from_ref(&rate_defined),
         &lags,
         &f_bio,
-        f64::NEG_INFINITY,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // No `SS=1` record in these doses and no EVID=3/4 reset.
+        ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
         tad,
         &mut dy_rate,
     );
@@ -4819,8 +4819,8 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         std::slice::from_ref(&dur_defined),
         &lags,
         &f_bio,
-        f64::NEG_INFINITY,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // No `SS=1` record in these doses and no EVID=3/4 reset.
+        ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
         tad,
         &mut dy_dur,
     );
@@ -5515,7 +5515,7 @@ fn zero_order_window_edges_rate_and_cutoff_break() {
         DoseEvent::new(1.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → no window
     ];
     let windows = zo_windows_for(&ode, &doses, &[0.5, 0.0, 0.0], &pk);
-    assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5)]);
+    assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5, 2.0)]);
 
     let mut breaks = Vec::new();
     push_zero_order_break_times(&mut breaks, &windows);
@@ -5574,7 +5574,7 @@ fn active_zero_order_includes_only_fully_contained_segments() {
     // straddling the cutoff (right end past w_end) is excluded — the
     // full-containment rule that makes the post-cutoff mass exact. A reset_floor
     // after the window start turns it off.
-    let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5)];
+    let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5, 2.0)];
     assert_eq!(
         active_zero_order_inputs(&windows, 3.0, 5.0, f64::NEG_INFINITY),
         vec![(0, 25.0)]
@@ -5843,8 +5843,8 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &doses,
         &lags,
         &f_bio,
-        f64::NEG_INFINITY,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // No `SS=1` record in these doses and no EVID=3/4 reset.
+        ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
         t,
         &mut dy,
     );
@@ -5860,8 +5860,8 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &doses,
         &lags,
         &f_bio,
-        1.0,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // EVID=3/4 floor at 1.0; no `SS=1` record in these doses.
+        ResetGate::at_segment(&[], 1.0, f64::NEG_INFINITY),
         t,
         &mut dy_off,
     );
@@ -5996,8 +5996,8 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &doses,
         &[0.0],
         &f_bio,
-        f64::NEG_INFINITY,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // No `SS=1` record in these doses and no EVID=3/4 reset.
+        ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
         t,
         &mut dy,
     );
@@ -6024,8 +6024,8 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &doses,
         &[],
         &f_bio_d,
-        f64::NEG_INFINITY,
-        SsResetGate::at_segment(&[], f64::NEG_INFINITY), // no SS=1 record in these doses
+        // No `SS=1` record in these doses and no EVID=3/4 reset.
+        ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
         t,
         &mut dyd,
     );
@@ -14327,23 +14327,21 @@ fn an_ss_record_wipes_a_preceding_co_timed_or_pending_dose_on_every_ode_engine()
     println!("#1588 tie vs live-only twin: worst rel {worst:.3e}");
 }
 
-/// **An EVID=3 reset inside a lagged `SS=1` dose's pre-arrival window reads the same on
-/// every ODE engine** (PR #1607 review F1). The reset empties the state the record seeded;
-/// the arrival then adds only the pulse (#1275). Before #1275 the dense walks
-/// (`ode_dense_solve_states`, the adaptive driver) re-loaded the full trough at the arrival
-/// instead, reading 3.9552 at t = 22 against the event-driven walk's 0.66194 (6× off).
+/// **An EVID=3 reset inside a lagged `SS=1` dose's pre-arrival window cancels the dose, on
+/// every ODE engine** (#1587; PR #1607 review F1). The dose's record (10) precedes the reset
+/// (15) and its arrival (21) follows it; NONMEM resets at the reset record and cancels it
+/// outright, so the prediction is `0` at every later time
+/// (`nonmem_anchor/evid_reset_lag`, ID 13 — 0 at t = 16, 22, 30 on ADVAN2 and ADVAN13).
+/// Before #1587 every engine kept the dose's pulse (0.66194 at t = 22), and before #1275
+/// the dense walks (`ode_dense_solve_states`, the adaptive driver) re-loaded the full trough
+/// at the arrival instead (3.9552).
 ///
-/// This pins agreement **between engines**, not correctness: NONMEM cancels the lagged dose
-/// at the reset outright (#1587), so every engine here is still wrong against NONMEM, and
-/// #1587's fix must move all of them together. The straddle: the same subject without the
-/// reset must read at least 1.5× higher, so "every engine lost the dose" and "no engine saw
-/// the reset" cannot both pass.
-///
-/// Measured mutations: reverting `reseed_prescheduled_states_at` reddens `ode_predictions`
-/// (and the adaptive driver behind it), reverting `apply_segment_boundary` reddens
-/// `ode_dense_solve_states`. `ode_predictions_with_states`' site cannot reach this cell.
+/// Asserted **absolutely** — the reference is exactly `0`, where a relative error is
+/// undefined — on every engine, each named in its own failure. The straddle: the same
+/// subject without the reset must read above 1.5 on every engine, so "every engine lost the
+/// dose for another reason" and "no engine saw the reset" cannot both pass.
 #[test]
-fn an_evid3_reset_in_a_lagged_ss_window_agrees_on_every_ode_engine() {
+fn an_evid3_reset_in_a_lagged_ss_window_cancels_the_dose_on_every_ode_engine() {
     let lag_slot = 20usize;
     let ode = depot_central_lag_spec(lag_slot);
     let mut pk = pk_one(2.0, 20.0);
@@ -14356,44 +14354,35 @@ fn an_evid3_reset_in_a_lagged_ss_window_agrees_on_every_ode_engine() {
     reset.reset_times = vec![15.0];
     let engines = ss_tie_engines(&ode, &pk, &reset);
     let no_reset = ss_tie_engines(&ode, &pk, &make_subject(ss, obs.clone()));
-    let (reference, want) = engines
-        .iter()
-        .find(|(e, _)| *e == "ode_predictions_event_driven")
-        .expect("the event-driven walk is one of the engines");
-    let mut worst = 0.0_f64;
     // `ode_predictions_with_states` is excluded by its own contract: it must not be handed a
     // reset subject (it ignores `reset_times`), and `compute_predictions_with_states` routes
     // one to `ode_predictions_event_driven_with_states`, which is asserted here.
-    for (engine, got) in engines
-        .iter()
-        .filter(|(e, _)| *e != "ode_predictions_with_states")
-    {
+    let keep = |e: &&(&str, Vec<f64>)| e.0 != "ode_predictions_with_states";
+    let asserted: Vec<_> = engines.iter().filter(keep).collect();
+    assert!(asserted.len() >= 4, "engines asserted: {}", asserted.len());
+    let mut worst = 0.0_f64;
+    for (engine, got) in asserted {
         for (j, &t) in obs.iter().enumerate() {
-            assert!(got[j].is_finite() && want[j] > 0.0, "{engine}, t = {t}");
-            let rel = (got[j] - want[j]).abs() / want[j];
-            // Measured worst 1.2e-14 (the adaptive driver included); a re-loaded trough reads +500 %.
+            assert!(got[j].is_finite(), "{engine}, t = {t}: {}", got[j]);
+            // The defect this guards is the kept pulse, 0.66194 at t = 22.
             assert!(
-                rel < 1e-9,
-                "{engine}, t = {t}: {} vs {reference} {} (rel {rel:.3e}) — a dense walk \
-                 re-loaded the SS trough at the arrival after the reset (#1275)",
-                got[j],
-                want[j]
+                got[j].abs() < 1e-9,
+                "{engine}, t = {t}: {} — the lagged SS dose recorded before the EVID=3 reset \
+                 must be cancelled, as NONMEM does (#1587)",
+                got[j]
             );
-            worst = worst.max(rel);
+            worst = worst.max(got[j].abs());
         }
     }
-    // The straddle, on the reference engine. Measured least 1.84× (t = 30).
-    let (_, free) = no_reset
-        .iter()
-        .find(|(e, _)| e == reference)
-        .expect("the same engine without the reset");
-    for (j, &t) in obs.iter().enumerate() {
-        assert!(
-            free[j] > 1.5 * want[j],
-            "t = {t}: the reset must matter ({} with vs {} without)",
-            want[j],
-            free[j]
-        );
+    // The straddle, on every engine: without the reset the dose is live.
+    for (engine, free) in no_reset.iter().filter(keep) {
+        for (j, &t) in obs.iter().enumerate() {
+            assert!(
+                free[j] > 1.5,
+                "{engine}, t = {t}: without the reset the dose must be live ({})",
+                free[j]
+            );
+        }
     }
-    println!("reset in lagged SS window: worst rel across engines {worst:.3e}");
+    println!("reset in lagged SS window: worst |f| across engines {worst:.3e}");
 }

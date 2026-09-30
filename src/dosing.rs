@@ -1213,6 +1213,20 @@ pub(crate) fn ss_reset_live(doses: &[DoseEvent], cutoff: Option<usize>, k: usize
     }
 }
 
+/// Whether a dose recorded at `record` survives the most recent EVID=3/4 reset
+/// `reset_floor` (`NEG_INFINITY` when none has been reached) (#1587).
+///
+/// NONMEM resets the system at the reset **record** and cancels every dose recorded before
+/// it — including a lagged dose whose arrival, or a lagged infusion whose window, lies after
+/// the reset. So the test is on the record, never on `record + lag`. A dose recorded at the
+/// reset itself is live: an EVID=4 row's own dose, or a dose row following a co-timed
+/// EVID=3 row. (A dose row *preceding* a co-timed reset row reaches the engines with
+/// `record < reset`: the reader shifts such a reset past it, `RESET_SEGMENT_GAP`.)
+#[inline]
+pub(crate) fn evid_reset_live(record: f64, reset_floor: f64) -> bool {
+    record >= reset_floor
+}
+
 #[cfg(test)]
 mod governing_record_tests {
     use super::governing_record_indices;

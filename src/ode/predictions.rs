@@ -1700,9 +1700,11 @@ pub(crate) fn active_infusions(
             let (rate_eff, dur_eff) = d.bioavailable_infusion(f_bio);
             let start = d.time + lag;
             let end = start + dur_eff;
-            // Infusions started before the most recent system reset (EVID=3/4)
-            // are turned off, the same way the reset zeros the compartments.
-            if start >= reset_floor
+            // Infusions recorded before the most recent system reset (EVID=3/4)
+            // are turned off, the same way the reset zeros the compartments — keyed
+            // on the record, so a lagged window opening after the reset is off too
+            // (#1587).
+            if crate::dosing::evid_reset_live(d.time, reset_floor)
                 && start <= t_start + INFUSION_EPS
                 && end >= t_end - INFUSION_EPS
             {
@@ -1719,7 +1721,7 @@ pub(crate) fn active_infusions(
             // the record and the arrival zeros the seeded state, and a rate that
             // survived it would refill a compartment the reset just emptied.
             let residual_end = ss_residual_infusion_end(d, lag, f_bio)?;
-            (d.time >= reset_floor
+            (crate::dosing::evid_reset_live(d.time, reset_floor)
                 && d.time <= t_start + INFUSION_EPS
                 && residual_end >= t_end - INFUSION_EPS)
                 .then_some((d.cmt_idx(), rate_eff))
@@ -1727,7 +1729,7 @@ pub(crate) fn active_infusions(
         .collect()
 }
 
-/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end)`,
+/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end, record)`,
 /// the constant `rate = F·amt/dur` delivered over
 /// `[w_start, w_end] = [time+lag, time+lag+dur]`. The tuple shape mirrors
 /// [`gated_infusions`].
@@ -1742,7 +1744,7 @@ pub(crate) fn active_infusions(
 /// windows once and reuses them across segments; the dense paths re-derive them
 /// per segment, but always from that same fixed snapshot, so every segment sees
 /// byte-identical edges and rate (the cost is a small, often-empty `Vec`).
-type ZeroOrderWindow = (usize, f64, f64, f64);
+type ZeroOrderWindow = (usize, f64, f64, f64, f64);
 
 /// Build the per-dose [`ZeroOrderWindow`]s for a subject. `dur_frac_for_dose`
 /// yields the floored `dur` **and pathway fraction `frac`** for dose `k` from *its*
@@ -1782,6 +1784,7 @@ fn zero_order_windows(
             f_bio * d.amt * frac / dur,
             w_start,
             w_start + dur,
+            d.time,
         ));
     }
     out
@@ -1806,8 +1809,9 @@ fn zero_order_windows(
 /// [`active_infusions`] relies on it for infusion windows. Both edges matter and the
 /// filter is two-sided: bracketing only `w_end` leaves the segment straddling
 /// `w_start` failing containment, which drops the rate for the entire window rather
-/// than mis-resolving an edge (#1171). `reset_floor` turns off windows opened before
-/// the most recent reset (EVID=3/4).
+/// than mis-resolving an edge (#1171). `reset_floor` turns off the window of every dose
+/// **recorded** before the most recent reset (EVID=3/4), wherever its lagged window
+/// opens (#1587).
 fn active_zero_order_inputs(
     windows: &[ZeroOrderWindow],
     t_start: f64,
@@ -1816,12 +1820,12 @@ fn active_zero_order_inputs(
 ) -> Vec<(usize, f64)> {
     windows
         .iter()
-        .filter(|&&(_, _, w_start, w_end)| {
-            w_start >= reset_floor
+        .filter(|&&(_, _, w_start, w_end, record)| {
+            crate::dosing::evid_reset_live(record, reset_floor)
                 && w_start <= t_start + INFUSION_EPS
                 && w_end >= t_end - INFUSION_EPS
         })
-        .map(|&(cmt, rate, _, _)| (cmt, rate))
+        .map(|&(cmt, rate, _, _, _)| (cmt, rate))
         .collect()
 }
 
@@ -1984,7 +1988,7 @@ fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderW
     break_times.extend(
         windows
             .iter()
-            .flat_map(|&(_, _, w_start, w_end)| [w_start, w_end]),
+            .flat_map(|&(_, _, w_start, w_end, _)| [w_start, w_end]),
     );
 }
 
@@ -2274,33 +2278,52 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// comparison read the record as not reached for the whole segment — train off, earlier
 /// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] is the
 /// only constructor, so no caller can apply the gate without the tolerance.
+///
+/// It also carries the **EVID=3/4 reset** (#1587), keyed the same way: on the dose
+/// *record*, never its lagged arrival. NONMEM cancels a dose whose record precedes a reset
+/// even when `record + ALAG` lands after it (measured, `nonmem_anchor/evid_reset_lag`), so
+/// a dose is dead once the most recent EVID=3/4 reset reached by the segment is later than
+/// its record. The caller passes that reset as `reset_floor` — the floor every walker
+/// already tracks, `NEG_INFINITY` before the first reset — because only the walker knows
+/// which resets it has visited. A dose recorded *at* the floor is live: an EVID=4 row's
+/// own dose, and a dose row after a co-timed EVID=3 row (the reader shifts a reset that
+/// lands at or before an earlier dose past it, `RESET_SEGMENT_GAP`, so a dose row
+/// *before* a co-timed reset reaches the engines with `record < reset`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SsResetGate {
+pub(crate) struct ResetGate {
     cutoff: Option<usize>,
     reached: f64,
+    reset_floor: f64,
 }
 
-impl SsResetGate {
-    /// The gate for a segment starting at `t_seg` over `doses`. `NEG_INFINITY` reaches no
-    /// record (the synthetic non-SS pulse trains, which have none to reach).
+impl ResetGate {
+    /// The gate for a segment starting at `t_seg` over `doses`, under the EVID=3/4
+    /// `reset_floor` the walker has reached there. `NEG_INFINITY` for `t_seg` reaches no
+    /// `SS=1` record (the synthetic non-SS pulse trains, which have none to reach); for
+    /// `reset_floor` it means no EVID=3/4 reset.
     #[inline]
-    pub(crate) fn at_segment(doses: &[DoseEvent], t_seg: f64) -> Self {
+    pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: f64, t_seg: f64) -> Self {
         let reached = t_seg + EVENT_MATCH_TOL;
         Self {
             cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
             reached,
+            reset_floor,
         }
     }
 
-    /// Whether dose `k` is live: not reset by an `SS=1` record this segment has reached.
+    /// Whether dose `k` is live: not reset by an `SS=1` record this segment has reached,
+    /// and not recorded before the EVID=3/4 reset in force.
     ///
-    /// Also the arrival gate of every state engine (#1588): a dose whose record precedes,
-    /// in (time, row order), the `SS=1` record reached at its arrival break changes nothing
-    /// there — no bolus jump, no arrival re-equilibration, and on the dual walks no lag
-    /// saltation. Infusion windows (#1586) and the EVID=3/4 floor (#1587) do not read it.
+    /// Also the arrival gate of every state engine (#1588, #1587): a dose whose record
+    /// precedes a reset reached at its arrival break changes nothing there — no bolus
+    /// jump, no arrival re-equilibration, and on the dual walks no lag saltation. The
+    /// absorption forcing reads it per segment. Infusion windows into compartment states
+    /// key their own `reset_floor` test on the record the same way; the `SS=1` stop of
+    /// such a window is #1586.
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
+            && crate::dosing::evid_reset_live(doses[k].time, self.reset_floor)
     }
 
     /// Whether this segment has reached `d`'s record, so its implied pulse train is on.
@@ -2314,12 +2337,12 @@ impl SsResetGate {
 /// time `t`. For each forcing, sums `frac·R_in(tad)` over all doses targeting its
 /// compartment (Savic superposition), with `tad = t − (dose.time + lag + lag_route)`
 /// and dose mass `F·amt`. `R_in = 0` for `tad ≤ 0`, so future doses contribute
-/// nothing. `reset_floor` turns off doses delivered before the most recent EVID=3/4
-/// reset, mirroring [`active_infusions`]. This is the input-rate analogue of the
-/// `+rate` infusion injection in the wrapped RHS.
+/// nothing. This is the input-rate analogue of the `+rate` infusion injection in the
+/// wrapped RHS.
 ///
-/// `ss_gate` carries the `SS=1` reset (#1576) of the segment being integrated; see
-/// [`SsResetGate`].
+/// `gate` carries both resets of the segment being integrated ([`ResetGate`]): the `SS=1`
+/// record (#1576) and the EVID=3/4 floor, keyed on the dose record (#1587) — a lagged dose
+/// recorded before the reset contributes nothing even when its input would start after it.
 ///
 /// Each dose is absorbed through the kernel, fraction and route lag of **its own dose
 /// record** (`prepared.get(forcing, dose)`, see [`PreparedForcings`]), never the
@@ -2333,7 +2356,7 @@ impl SsResetGate {
 /// #4 / #451). The two dual callers each feed one branch live: the TV-cov
 /// event-driven walk (`integrate_tvcov_g`) passes the tracked dual `dose_lagtimes`
 /// for an in-scope estimated lagtime (#486), and the static walk (`integrate_g`)
-/// passes the tracked `reset_floor` for an in-scope EVID 3/4 reset (#486).
+/// passes a gate built from the tracked `reset_floor` for an in-scope EVID 3/4 reset (#486).
 /// `integrate_g` still passes `dose_lagtimes = &[]` (its gate excludes lagtime
 /// subjects, which always route to the TV-cov walk instead).
 #[inline]
@@ -2344,8 +2367,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     doses: &[DoseEvent],
     dose_lagtimes: &[T],
     dose_f_bio: &[T],
-    reset_floor: f64,
-    ss_gate: SsResetGate,
+    gate: ResetGate,
     t: f64,
     dy: &mut [T],
 ) {
@@ -2374,7 +2396,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         let common_frac = prepared.common_frac(fi);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
-            if d.cmt_idx() != forcing.cmt || !ss_gate.live(doses, k) {
+            if d.cmt_idx() != forcing.cmt || !gate.live(doses, k) {
                 continue;
             }
             let dose_rate = prepared.get(fi, k);
@@ -2394,18 +2416,13 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             // the onset discontinuity is supplied separately as the `K_ROUTE_ONSET` rate-on
             // saltation.
             let t_eff = T::from_f64(d.time) + lag + dose_rate.route_lag;
-            // Doses delivered before the most recent reset are off — the reset
-            // zeroed the compartments, same rule as `active_infusions`.
-            if t_eff.val() < reset_floor - INFUSION_EPS {
-                continue;
-            }
             let tad = T::from_f64(t) - t_eff;
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             let prep = &dose_rate.prep;
             let rate = if d.ss && d.ii > 0.0 {
                 // The implied train starts at the record: nothing before it (#1576).
-                if !ss_gate.record_reached(d) {
+                if !gate.record_reached(d) {
                     continue;
                 }
                 ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass)
@@ -2454,8 +2471,9 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
 /// two non-reset paths (`ode_predictions`, `ode_predictions_with_states`) pass
 /// `f64::NEG_INFINITY` because the dispatcher routes reset subjects to the
 /// event-driven walker; the two reset-aware paths pass a real floor. `t_seg` is the
-/// start of the segment the closure integrates, which carries the `SS=1` reset into the
-/// forcing (see [`add_prepared_input_rate_forcing`]). `prepared`
+/// start of the segment the closure integrates; with `reset_floor` it builds the segment's
+/// [`ResetGate`], which carries both resets into the forcing (see
+/// [`add_prepared_input_rate_forcing`]). `prepared`
 /// holds each dose's absorption forcing, read at its dose record ([`PreparedForcings`]).
 #[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/forcing context
 fn wrap_rhs_with_forcings<'a>(
@@ -2469,8 +2487,9 @@ fn wrap_rhs_with_forcings<'a>(
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
-    // Built once per closure: `t_seg` is fixed for the segment it integrates.
-    let ss_gate = SsResetGate::at_segment(doses, t_seg);
+    // Built once per closure: `t_seg` and `reset_floor` are fixed for the segment it
+    // integrates.
+    let gate = ResetGate::at_segment(doses, reset_floor, t_seg);
     move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
         // Zero-order absorption (#504): a constant rate per *segment*, injected the
@@ -2511,8 +2530,7 @@ fn wrap_rhs_with_forcings<'a>(
                 doses,
                 dose_lagtimes,
                 dose_f_bio,
-                reset_floor,
-                ss_gate,
+                gate,
                 t,
                 dy,
             );
@@ -3809,6 +3827,7 @@ fn reseed_prescheduled_states_at(
     dose_lagtimes: &[f64],
     pk_params_flat: &[f64],
     t_start: f64,
+    reset_floor: f64,
     opts: &OdeSolverOptions,
     seed_applied: &mut [bool],
     applied: &[bool],
@@ -3835,9 +3854,10 @@ fn reseed_prescheduled_states_at(
             ));
         }
     }
-    // The `SS=1` reset reached at this break (#1588): a dose whose record precedes it in
-    // (time, row order) does not re-equilibrate at its arrival.
-    let ss_gate = SsResetGate::at_segment(doses, t_start);
+    // The resets reached at this break (#1588, #1587): a dose whose record precedes the
+    // `SS=1` record in (time, row order), or the EVID=3/4 reset in force, does not
+    // re-equilibrate at its arrival.
+    let gate = ResetGate::at_segment(doses, reset_floor, t_start);
     for (i, dose) in doses.iter().enumerate() {
         // The arrival is one event: this equilibration and the bolus jump in
         // `apply_prescheduled_boluses_at`. Its mask is set there (the last sub-step),
@@ -3848,7 +3868,7 @@ fn reseed_prescheduled_states_at(
         if (dose.time + dose_lagtimes[i] - t_start).abs() >= EVENT_MATCH_TOL {
             continue;
         }
-        if !ss_gate.live(doses, i) {
+        if !gate.live(doses, i) {
             continue;
         }
         // A dose seeded at its record (above, #1121) has its state flowed here and adds
@@ -3883,13 +3903,16 @@ fn apply_prescheduled_boluses_at(
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
     t_start: f64,
+    reset_floor: f64,
     applied: &mut [bool],
 ) {
     debug_assert!(applied.len() >= doses.len());
     // A bolus whose record precedes the `SS=1` record reached at this break, in (time, row
     // order), is wiped by that reset (#1588): a co-timed row *before* the `SS=1` row, and a
-    // lagged dose still pending at it. It is still marked applied, so the arrival closes.
-    let ss_gate = SsResetGate::at_segment(doses, t_start);
+    // lagged dose still pending at it. So is one recorded before the EVID=3/4 reset in force
+    // (#1587), however late its lagged arrival. It is still marked applied, so the arrival
+    // closes.
+    let gate = ResetGate::at_segment(doses, reset_floor, t_start);
     for (i, dose) in doses.iter().enumerate() {
         if applied[i] {
             continue;
@@ -3903,7 +3926,7 @@ fn apply_prescheduled_boluses_at(
         applied[i] = true;
         if !is_real_infusion(dose)
             && !input_rate_consumes_cmt(ode, dose.cmt_raw())
-            && ss_gate.live(doses, i)
+            && gate.live(doses, i)
         {
             // dose.cmt is 1-based; state indices are 0-based. A dose into a built-in
             // input-rate compartment (transit/etc.) is delivered as R_in over time by
@@ -3940,6 +3963,7 @@ fn apply_prescheduled_doses_at(
     dose_f_bio: &[f64],
     pk_params_flat: &[f64],
     t_start: f64,
+    reset_floor: f64,
     opts: &OdeSolverOptions,
     // Apply-once masks (#1186), owned by the walk and threaded through both halves.
     seed_applied: &mut [bool],
@@ -3952,11 +3976,21 @@ fn apply_prescheduled_doses_at(
         dose_lagtimes,
         pk_params_flat,
         t_start,
+        reset_floor,
         opts,
         seed_applied,
         applied,
     );
-    apply_prescheduled_boluses_at(u, ode, doses, dose_lagtimes, dose_f_bio, t_start, applied);
+    apply_prescheduled_boluses_at(
+        u,
+        ode,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        t_start,
+        reset_floor,
+        applied,
+    );
 }
 
 fn ode_predictions_with_extra_breaks_and_stats(
@@ -4146,6 +4180,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &dose_f_bio,
             pk_params_flat,
             t_start,
+            reset_floor,
             &opts,
             &mut seed_applied,
             &mut applied,
@@ -5348,6 +5383,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
+                reset_floor,
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
                 &applied[..n_base],
@@ -5664,6 +5700,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &dose_lagtimes,
             &injected_f,
             t_start,
+            reset_floor,
             &mut applied,
         );
 
@@ -6993,8 +7030,13 @@ pub fn ode_predictions_event_driven(
                 // A dose whose record precedes the `SS=1` record reached here, in
                 // (time, row order), was wiped by that reset (#1588): no arrival at all.
                 // The seed at a lagged `SS=1` record sorts before every co-timed arrival
-                // (`DoseRecord < Dose`), so list order alone cannot express this.
-                if !SsResetGate::at_segment(&subject.doses, cur_t).live(&subject.doses, idx) {
+                // (`DoseRecord < Dose`), so list order alone cannot express this. Nor
+                // does a dose recorded before the EVID=3/4 reset in force arrive
+                // (#1587); `Reset < Dose` has already raised `reset_floor` for a
+                // co-timed reset.
+                if !ResetGate::at_segment(&subject.doses, reset_floor, cur_t)
+                    .live(&subject.doses, idx)
+                {
                     continue;
                 }
                 // Steady-state (SS=1) dose: reset state and load with the
@@ -7378,8 +7420,10 @@ pub fn ode_predictions_with_states(
         // Apply boluses and SS doses at t_eff = dose.time + lagtime.
         // A dose whose record precedes the `SS=1` record reached here, in (time, row
         // order), was wiped by that reset (#1588): no equilibration, no bolus. Its
-        // infusion window is still registered (#1586).
-        let ss_gate = SsResetGate::at_segment(&subject.doses, t_start);
+        // infusion window is still registered (#1586). No EVID=3/4 floor: this walk is
+        // never handed a reset subject (`compute_predictions_with_states` routes one to
+        // `ode_predictions_event_driven_with_states`).
+        let gate = ResetGate::at_segment(&subject.doses, f64::NEG_INFINITY, t_start);
         for (dose_idx, dose) in subject.doses.iter().enumerate() {
             if applied[dose_idx] {
                 continue;
@@ -7390,7 +7434,7 @@ pub fn ode_predictions_with_states(
                 // arrival is one event (equilibrate + bolus + infusion push) (#1186).
                 applied[dose_idx] = true;
                 let f = dose_f_bio[dose_idx];
-                let live = ss_gate.live(&subject.doses, dose_idx);
+                let live = gate.live(&subject.doses, dose_idx);
                 if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
                     // Only an unseeded (`lag = 0`) SS dose equilibrates at its
                     // arrival. A lagged one was seeded at its record above and has
@@ -7755,10 +7799,20 @@ fn apply_segment_boundary(
         }
     }
 
-    // The `SS=1` reset reached here (#1588), as in `ode_predictions_with_states`: a dose
-    // whose record precedes it neither equilibrates nor jumps; its infusion window is
-    // still registered (#1586).
-    let ss_gate = SsResetGate::at_segment(&subject.doses, t_start);
+    // The most recent EVID=3/4 reset at or before this segment (the one just applied
+    // above, if any).
+    let reset_floor = subject
+        .reset_times
+        .iter()
+        .cloned()
+        .filter(|&rt| rt <= t_start + 1e-12)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // The resets reached here (#1588, #1587), as in `ode_predictions_event_driven`: a dose
+    // whose record precedes the `SS=1` record or the EVID=3/4 floor neither equilibrates
+    // nor jumps. Its infusion window is not registered when the EVID=3/4 reset is what
+    // cancelled it; one stopped only by an `SS=1` record still is (#1586).
+    let gate = ResetGate::at_segment(&subject.doses, reset_floor, t_start);
     for (dose_idx, dose) in subject.doses.iter().enumerate() {
         if applied[dose_idx] {
             continue;
@@ -7768,7 +7822,7 @@ fn apply_segment_boundary(
             // One arrival event: equilibrate + bolus + infusion push (#1186).
             applied[dose_idx] = true;
             let f = dose_f_bio[dose_idx];
-            let live = ss_gate.live(&subject.doses, dose_idx);
+            let live = gate.live(&subject.doses, dose_idx);
             if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
                 // Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival;
                 // a lagged one was seeded at its record above and flows here, so a
@@ -7789,7 +7843,7 @@ fn apply_segment_boundary(
                 // else: the dose feeds a built-in input-rate function
                 // (transit/etc.) and is delivered as R_in over time by the
                 // wrapped RHS below — no bolus here (would double-count).
-            } else {
+            } else if crate::dosing::evid_reset_live(dose.time, reset_floor) {
                 // F-scaled infusion end (#419), matching the break-time list.
                 let (_, dur_eff) = dose.bioavailable_infusion(f);
                 let end_t = t_eff + dur_eff;
@@ -7814,15 +7868,8 @@ fn apply_segment_boundary(
         n,
     );
 
-    // Doses delivered before the most recent reset (EVID=3/4) at or before this
-    // segment are off for the input-rate forcing — mirroring how the reset clears
-    // `active_infusions` and re-seeds `u` above.
-    let reset_floor = subject
-        .reset_times
-        .iter()
-        .cloned()
-        .filter(|&rt| rt <= t_start + 1e-12)
-        .fold(f64::NEG_INFINITY, f64::max);
+    // `reset_floor` (above) also turns off, for the input-rate forcing, every dose recorded
+    // before the reset — mirroring how the reset clears `active_infusions` and re-seeds `u`.
 
     // Zero-order absorption windows covering this segment (#504): constant
     // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened

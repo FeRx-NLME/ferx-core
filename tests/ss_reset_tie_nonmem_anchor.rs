@@ -8,7 +8,7 @@
 //! bolus *after* the reset whatever its row, and once the `SS=1` dose carries a lag every
 //! state engine did the same — the record-time seed is its own event and sorts before
 //! every co-timed arrival (`DoseRecord < Dose`). The fix gates each arrival on
-//! `SsResetGate::live`, #1576's record-keyed predicate.
+//! `ResetGate::live` (then `SsResetGate`), #1576's record-keyed predicate.
 //!
 //! The reference is NONMEM 7.6.0 (`nm3`, `anchor` build), `ADVAN2 TRANS2`, `MAXEVAL=0`,
 //! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `II = 12`, `AMT = 100`:
@@ -32,7 +32,7 @@
 //! | 12 | depot bolus at 8, `SS=1` at 10 | lag 2: the bolus arrives **exactly at** the record, and is wiped |
 //! | 13 | `SS=1` 100 central (unlagged), then `SS=1` 200 depot, co-timed | the second wins |
 //!
-//! ID 12 pins the edge of "reached" (`SsResetGate` adds `EVENT_MATCH_TOL` to the break):
+//! ID 12 pins the edge of "reached" (`ResetGate` adds `EVENT_MATCH_TOL` to the break):
 //! an arrival that lands on the record's own time. ID 13 is the one shape where only the
 //! arrival re-equilibration gate decides the answer at lag 2: the wiped `SS=1` dose is
 //! unlagged, the live one is seeded at its record, so nothing later overwrites a wrong

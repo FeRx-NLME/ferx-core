@@ -11054,36 +11054,28 @@ fn ode_provider_cmt_zero_infusion_does_not_contaminate_another_doses_saltation()
     }
 }
 
-/// **#1129: an `EVID=3` reset strictly between a lagged infusion's dose record and its
-/// arrival must not touch the gradient.** The reset lands on an already-empty system, so
-/// it is a physical no-op — prediction *and* every derivative must be identical with and
-/// without it.
+/// **#1587 (formerly the #1129 pin): an `EVID=3` reset strictly between a lagged infusion's
+/// dose record and its arrival cancels the infusion — value *and* every derivative.**
 ///
-/// This geometry was uncovered when #1129 was filed. The nearest existing tests miss it in
-/// two different ways: `ode_provider_lagtime_reset_hessian_matches_fd_of_grad` uses a
-/// **bolus** and places the reset *at* the second dose's record time, and
-/// `ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production` is
-/// deliberately a bolus too. The uncovered cell is a reset landing strictly inside
-/// `(dose record, lagged **infusion** arrival)`, where `reset_floor` turns finite while a
-/// pending infusion window is still ahead of it — and both the `K_DOSE` rate-on branch and
-/// the `K_INF_END` rate-off branch take `reset_floor` as an argument.
+/// #1129 read this reset as a physical no-op (the system is empty when it lands) and pinned
+/// "prediction and gradient identical with and without it". NONMEM disagrees: it resets at
+/// the reset *record* and cancels every dose recorded before it, including a lagged infusion
+/// whose window opens after it — measured on ADVAN2 and ADVAN13
+/// (`nonmem_anchor/evid_reset_lag`, IDs 11, 17, 18: 0 after the reset). So with the reset
+/// the drug never enters: `f = 0` and every derivative is exactly `0`, because no jet is
+/// ever seeded. The dual walk has to agree on the *derivative* as well as the value: a
+/// rate-on or rate-off saltation still keyed on the arrival would put a lag jet on a dose
+/// the value no longer has — which is the `K_DOSE` / `K_INF_END` pair #1129 suspected.
 ///
-/// The issue reported `∂f/∂η_LAG` **flipping sign**, `+7.14133` → `−12.53131`, against an
-/// FD reference of `+7.14133`, with `f` and `∂f/∂η_CL` untouched — invisible in any
-/// prediction and reaching FOCEI only through the inner EBE search and the `h` matrix. At
-/// this SHA both arms give `+7.141334` and match FD, so this is a regression pin rather
-/// than a fix; it is here because nothing else asserts it.
-///
-/// Three teeth, since "the two arms agree" is satisfiable by a fixture where neither arm
-/// does anything:
-///   1. both arms are also checked against central FD of the production predictor, so a
-///      change that corrupts *both* identically still fails;
-///   2. the reset must sit strictly between the record and the arrival, asserted from the
+/// Teeth:
+///   1. both arms against central FD of the production predictor, so a change that
+///      corrupts both identically still fails;
+///   2. the reset sits strictly between the record and the arrival, asserted from the
 ///      realised lag rather than assumed from the θ;
-///   3. `∂f/∂η_LAG` must be large — it is the axis that flipped, and the issue's own
-///      numbers put the defect at ~20 units on it.
+///   3. the no-reset arm is live — `f > 0` and a large `∂f/∂η_LAG` — so "the reset arm
+///      is zero" is a straddle, not a fixture where nothing ever happens.
 #[test]
-fn ode_provider_reset_before_a_lagged_infusion_arrival_leaves_the_gradient_alone() {
+fn ode_provider_reset_before_a_lagged_infusion_arrival_cancels_it_value_and_gradient() {
     let model = parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse lag+inf ODE");
     // `T_inf = AMT/RATE = 4`, arrival ≈ 8.410, window end ≈ 12.410; the sample at 13 is
     // past the end, so it sees the whole delivered mass and both boundaries.
@@ -11167,20 +11159,31 @@ fn ode_provider_reset_before_a_lagged_infusion_arrival_leaves_the_gradient_alone
         }
     }
 
-    // The reset is a physical no-op, so the two arms must agree — on the value and on
-    // every derivative block, not just the one that flipped.
-    assert_eq!(a.obs[0].f, b.obs[0].f, "the reset moved the prediction");
-    assert_eq!(
-        a.obs[0].df_deta, b.obs[0].df_deta,
-        "an EVID=3 reset of an already-empty system moved ∂f/∂η (#1129)"
+    // (3) The straddle: without the reset the infusion is delivered, with it nothing is —
+    // on the value and on every derivative block, not just the lag axis #1129 watched.
+    assert!(
+        a.obs[0].f > 0.1,
+        "the no-reset arm must see drug: {}",
+        a.obs[0].f
     );
     assert_eq!(
-        a.obs[0].df_dtheta, b.obs[0].df_dtheta,
-        "an EVID=3 reset of an already-empty system moved ∂f/∂θ (#1129)"
+        b.obs[0].f, 0.0,
+        "a reset after the record cancels the lagged infusion (#1587)"
     );
-    assert_eq!(
-        a.obs[0].d2f_deta2, b.obs[0].d2f_deta2,
-        "an EVID=3 reset of an already-empty system moved ∂²f/∂η² (#1129)"
+    assert!(
+        b.obs[0].df_deta.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂f/∂η (#1587): {:?}",
+        b.obs[0].df_deta
+    );
+    assert!(
+        b.obs[0].df_dtheta.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂f/∂θ (#1587): {:?}",
+        b.obs[0].df_dtheta
+    );
+    assert!(
+        b.obs[0].d2f_deta2.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂²f/∂η² (#1587): {:?}",
+        b.obs[0].d2f_deta2
     );
 }
 
