@@ -897,10 +897,11 @@ fn event_driven_predictions_with_schedule_impl(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
-    // Most-recent system-reset time. Infusions whose window started before
-    // this are no longer active (a reset turns off ongoing infusions, the
-    // same way it zeros the compartments). `NEG_INFINITY` until the first
-    // reset means every infusion is eligible.
+    // Most-recent system-reset time. Infusions recorded before this are no
+    // longer active, even a lagged one whose window opens after it (#1587): a
+    // reset turns off ongoing and pending infusions, the same way it zeros the
+    // compartments. `NEG_INFINITY` until the first reset means every infusion
+    // is eligible.
     let mut reset_floor = f64::NEG_INFINITY;
 
     // Per-walk eigendata memo: for a subject without time-varying covariates the

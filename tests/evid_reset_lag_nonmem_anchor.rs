@@ -25,7 +25,7 @@
 //! | 5 / 6 | dose 9, EVID=4 10 / EVID=4 8.5, dose 9 | first dose cancelled / both live |
 //! | 7 / 8 | dose row then EVID=3 row, both at 10 / reversed | wiped / live |
 //! | 9 / 10 | as 7 / 8 at lag 0 | wiped / live |
-//! | 11 | 2 h infusion at 9, EVID=3 10 | 0 |
+//! | 11 | 2 h infusion at 9, EVID=3 10 | 0 — but not a discriminating cell: its unlagged window ends at 11, so the reader shifts the reset to 12 (`RESET_SEGMENT_GAP`), past the lagged arrival at 11, and the old arrival rule gave 0 too. IDs 17 and 18 carry this cell |
 //! | 12 | unlagged 4 h infusion at 9, EVID=3 10 | 0 after the reset |
 //! | 13 / 14 | lag 11, `SS=1` at 10 (II 12), EVID=3 15 / no reset | **0** / live |
 //! | 15 | dose row then EVID=4 row, both at 10 | only the EVID=4 dose |

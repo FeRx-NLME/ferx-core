@@ -29,7 +29,7 @@ section of the SDLC for the versioning policy).
   `zero_order`, `transit`, per-route `lag=`, lagged infusions). A dose recorded at the
   reset itself (an `EVID=4` row's own dose, or a dose row after a co-timed `EVID=3` row)
   is kept. Validated against NONMEM `ADVAN2` and `ADVAN13`
-  (`nonmem_anchor/evid_reset_lag`, 21 subjects). Only subjects with a reset between a lagged
+  (`nonmem_anchor/evid_reset_lag`, 23 subjects). Only subjects with a reset between a lagged
   dose's record and its arrival change.
 - **A dose now keeps the absorption parameters of its own dose record for its whole
   absorption** (#1569). Every built-in absorption forcing (`transit`, `igd`, `weibull`,
