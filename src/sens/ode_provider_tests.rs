@@ -8999,23 +8999,18 @@ fn ode_provider_ss_lagtime_infusion_tvcov_matches_production() {
 }
 
 /// An **EVID=3 reset between a seeded SS dose's record and its lagged arrival**
-/// (#1121 review).
+/// (#1121 review; #1587).
 ///
-/// With the arrival-side re-equilibration gone, a reset inside the pre-arrival
-/// window is newly observable: it zeroes the seeded steady-state load, and the
-/// arrival then applies only `F·AMT` where it used to restore a full trough. That
-/// reading is the one consistent with the convention — the steady state is loaded
-/// at the record, so a later reset wipes it exactly as it wipes any other state —
-/// but it is a behaviour change, and nothing covered it.
+/// The steady state is loaded at the record (#1121), so the reset wipes it. Since #1587 the
+/// reset also **cancels the dose's arrival**: its record precedes the reset, and NONMEM
+/// cancels such a dose outright (`nonmem_anchor/evid_reset_lag`, ID 13). Before #1587 the
+/// arrival still applied `F·AMT`. With that dose alone the subject would be identically zero
+/// after the reset, and a parity check between two zeros tests nothing — so a plain oral dose
+/// recorded *after* the reset keeps the post-reset trajectory live, and the test asserts the
+/// cancelled SS dose leaves exactly what deleting it leaves.
 ///
-/// Deliberately an oral **bolus**, not the infusion fixture above. The infusion
-/// form of this geometry trips a *separate*, pre-existing defect in the twin: an
-/// `EVID=3` reset placed before a lagged infusion's arrival changes `∂f/∂η_LAG`
-/// even when the reset is a physical no-op (the state is already zero). Measured
-/// at `−12.53` against an FD reference of `+7.14`, with flat covariates and a
-/// non-steady-state dose, so it is neither this issue's nor time-varying
-/// covariates'; tracked separately. Using a bolus here keeps this test measuring
-/// the thing it was written for instead of inheriting that failure.
+/// Deliberately an oral **bolus**, not the infusion fixture above; the infusion form of this
+/// cell is `ode_provider_reset_before_a_lagged_infusion_arrival_cancels_it_value_and_gradient`.
 #[test]
 fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production() {
     let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
@@ -9025,9 +9020,13 @@ fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_productio
     let eta = [0.12_f64, 0.05];
 
     let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 11.0]);
-    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+        // Recorded after the reset: live, arriving ≈ 1.03, residual present at 4 and 11.
+        DoseEvent::new(0.5, 100.0, 1, 0.0, false, 0.0),
+    ];
     subject.reset_times = vec![0.35];
-    subject.dose_covariates = vec![wt(70.0)];
+    subject.dose_covariates = vec![wt(70.0), wt(90.0)];
     subject.obs_covariates = vec![wt(70.0), wt(140.0), wt(150.0), wt(75.0)];
 
     let lag = theta[3] * eta[1].exp();
@@ -9043,6 +9042,32 @@ fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_productio
     assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
     assert!(subject.has_tv_covariates());
     assert!(ode_tvcov_supported(&model, &subject));
+
+    // Cancelled ≡ deleted after the reset (#1587); the post-reset reads are live.
+    let mut deleted = subject.clone();
+    deleted.doses.remove(0);
+    deleted.dose_covariates.remove(0);
+    let (with_ss, without) = (
+        compute_predictions_with_tv(&model, &subject, &theta, &eta),
+        compute_predictions_with_tv(&model, &deleted, &theta, &eta),
+    );
+    assert!(
+        with_ss[0] > 1.0,
+        "the seeded SS state is read before the reset: {with_ss:?}"
+    );
+    // Obs 1 (t = 1) precedes the live dose's arrival and reads 0 either way; 4 and 11 carry
+    // it (and would carry the cancelled SS dose's pulse, were it kept).
+    assert!(without[2] > 0.1 && without[3] > 0.1, "{without:?}");
+    for j in 1..with_ss.len() {
+        assert!(with_ss[j].is_finite(), "obs {j}: {with_ss:?}");
+        assert!(
+            (with_ss[j] - without[j]).abs() <= 1e-10 * (1.0 + without[j].abs()),
+            "obs {j}: the SS dose recorded before the reset must be cancelled (#1587): \
+             {} vs {} without it",
+            with_ss[j],
+            without[j]
+        );
+    }
 
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
@@ -11054,36 +11079,28 @@ fn ode_provider_cmt_zero_infusion_does_not_contaminate_another_doses_saltation()
     }
 }
 
-/// **#1129: an `EVID=3` reset strictly between a lagged infusion's dose record and its
-/// arrival must not touch the gradient.** The reset lands on an already-empty system, so
-/// it is a physical no-op — prediction *and* every derivative must be identical with and
-/// without it.
+/// **#1587 (formerly the #1129 pin): an `EVID=3` reset strictly between a lagged infusion's
+/// dose record and its arrival cancels the infusion — value *and* every derivative.**
 ///
-/// This geometry was uncovered when #1129 was filed. The nearest existing tests miss it in
-/// two different ways: `ode_provider_lagtime_reset_hessian_matches_fd_of_grad` uses a
-/// **bolus** and places the reset *at* the second dose's record time, and
-/// `ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production` is
-/// deliberately a bolus too. The uncovered cell is a reset landing strictly inside
-/// `(dose record, lagged **infusion** arrival)`, where `reset_floor` turns finite while a
-/// pending infusion window is still ahead of it — and both the `K_DOSE` rate-on branch and
-/// the `K_INF_END` rate-off branch take `reset_floor` as an argument.
+/// #1129 read this reset as a physical no-op (the system is empty when it lands) and pinned
+/// "prediction and gradient identical with and without it". NONMEM disagrees: it resets at
+/// the reset *record* and cancels every dose recorded before it, including a lagged infusion
+/// whose window opens after it — measured on ADVAN2 and ADVAN13
+/// (`nonmem_anchor/evid_reset_lag`, IDs 11, 17, 18: 0 after the reset). So with the reset
+/// the drug never enters: `f = 0` and every derivative is exactly `0`, because no jet is
+/// ever seeded. The dual walk has to agree on the *derivative* as well as the value: a
+/// rate-on or rate-off saltation still keyed on the arrival would put a lag jet on a dose
+/// the value no longer has — which is the `K_DOSE` / `K_INF_END` pair #1129 suspected.
 ///
-/// The issue reported `∂f/∂η_LAG` **flipping sign**, `+7.14133` → `−12.53131`, against an
-/// FD reference of `+7.14133`, with `f` and `∂f/∂η_CL` untouched — invisible in any
-/// prediction and reaching FOCEI only through the inner EBE search and the `h` matrix. At
-/// this SHA both arms give `+7.141334` and match FD, so this is a regression pin rather
-/// than a fix; it is here because nothing else asserts it.
-///
-/// Three teeth, since "the two arms agree" is satisfiable by a fixture where neither arm
-/// does anything:
-///   1. both arms are also checked against central FD of the production predictor, so a
-///      change that corrupts *both* identically still fails;
-///   2. the reset must sit strictly between the record and the arrival, asserted from the
+/// Teeth:
+///   1. both arms against central FD of the production predictor, so a change that
+///      corrupts both identically still fails;
+///   2. the reset sits strictly between the record and the arrival, asserted from the
 ///      realised lag rather than assumed from the θ;
-///   3. `∂f/∂η_LAG` must be large — it is the axis that flipped, and the issue's own
-///      numbers put the defect at ~20 units on it.
+///   3. the no-reset arm is live — `f > 0` and a large `∂f/∂η_LAG` — so "the reset arm
+///      is zero" is a straddle, not a fixture where nothing ever happens.
 #[test]
-fn ode_provider_reset_before_a_lagged_infusion_arrival_leaves_the_gradient_alone() {
+fn ode_provider_reset_before_a_lagged_infusion_arrival_cancels_it_value_and_gradient() {
     let model = parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse lag+inf ODE");
     // `T_inf = AMT/RATE = 4`, arrival ≈ 8.410, window end ≈ 12.410; the sample at 13 is
     // past the end, so it sees the whole delivered mass and both boundaries.
@@ -11167,20 +11184,31 @@ fn ode_provider_reset_before_a_lagged_infusion_arrival_leaves_the_gradient_alone
         }
     }
 
-    // The reset is a physical no-op, so the two arms must agree — on the value and on
-    // every derivative block, not just the one that flipped.
-    assert_eq!(a.obs[0].f, b.obs[0].f, "the reset moved the prediction");
-    assert_eq!(
-        a.obs[0].df_deta, b.obs[0].df_deta,
-        "an EVID=3 reset of an already-empty system moved ∂f/∂η (#1129)"
+    // (3) The straddle: without the reset the infusion is delivered, with it nothing is —
+    // on the value and on every derivative block, not just the lag axis #1129 watched.
+    assert!(
+        a.obs[0].f > 0.1,
+        "the no-reset arm must see drug: {}",
+        a.obs[0].f
     );
     assert_eq!(
-        a.obs[0].df_dtheta, b.obs[0].df_dtheta,
-        "an EVID=3 reset of an already-empty system moved ∂f/∂θ (#1129)"
+        b.obs[0].f, 0.0,
+        "a reset after the record cancels the lagged infusion (#1587)"
     );
-    assert_eq!(
-        a.obs[0].d2f_deta2, b.obs[0].d2f_deta2,
-        "an EVID=3 reset of an already-empty system moved ∂²f/∂η² (#1129)"
+    assert!(
+        b.obs[0].df_deta.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂f/∂η (#1587): {:?}",
+        b.obs[0].df_deta
+    );
+    assert!(
+        b.obs[0].df_dtheta.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂f/∂θ (#1587): {:?}",
+        b.obs[0].df_dtheta
+    );
+    assert!(
+        b.obs[0].d2f_deta2.iter().all(|&g| g == 0.0),
+        "a cancelled infusion carries no ∂²f/∂η² (#1587): {:?}",
+        b.obs[0].d2f_deta2
     );
 }
 

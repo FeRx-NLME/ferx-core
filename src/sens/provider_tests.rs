@@ -5507,27 +5507,53 @@ fn closed_form_event_walk_ss_bolus_lag_matches_production() {
     );
 }
 
-/// Reset + lagtime: a dose recorded *before* a reset but *arriving after* it
-/// (via lagtime) must contribute to the post-reset segment, exactly as the
-/// production event-driven walk applies it. The reset exclusion keys on the
-/// lagged arrival `dose.time + lag`, not the record time (PR #381 review #2).
-/// Dose at t=4 with lag≈0.75 arrives ≈4.75, past the reset at t=4.5; the
-/// earlier t=0 dose (arrives ≈0.75) is correctly washed out. Validated against
-/// `compute_predictions_with_tv` via `check_full_provider_vs_fd` (value 1e-9).
+/// Reset + lagtime: a dose recorded *before* a reset but *arriving after* it (via lagtime)
+/// is **cancelled** (#1587). NONMEM resets at the reset record and cancels every dose
+/// recorded before it (`nonmem_anchor/evid_reset_lag`), so the superposition's reset
+/// exclusion keys on the record `dose.time`, not the lagged arrival — before #1587 it keyed
+/// on the arrival and kept the dose (PR #381 review #2 had chosen that to match the
+/// event-driven walk, which was wrong the same way). Dose at t=4 with lag≈0.75 would arrive
+/// ≈4.75, past the reset at t=4.5; two doses recorded after the reset (4.6, 6) keep the
+/// post-reset segment live, the second landing on the first's residual. The cancelled dose
+/// must leave exactly what deleting it leaves, and the whole `SubjectSens` must match FD of
+/// `compute_predictions_with_tv` (`check_full_provider_vs_fd`).
 #[test]
-fn provider_reset_with_lagged_post_reset_dose_matches_production() {
+fn provider_reset_cancels_a_lagged_dose_recorded_before_it_matches_production() {
     let m = parse_model_string(ONECPT_ORAL_LAG).expect("parse 1cpt oral lag");
-    let s = subject_with_doses_and_resets(
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        &[5.0, 6.0, 8.0, 12.0],
-        vec![4.5],
-    );
-    // eta_lag = 0 → LAGTIME = TVLAG = 0.75; arrival of the t=4 dose is 4.75 > 4.5.
+    let times = [5.0, 6.0, 8.0, 12.0];
+    let live = [
+        DoseEvent::new(4.6, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    doses.extend(live.iter().cloned());
+    let s = subject_with_doses_and_resets(doses, &times, vec![4.5]);
+    let deleted = subject_with_doses_and_resets(live.to_vec(), &times, vec![4.5]);
+    // eta_lag = 0 → LAGTIME = TVLAG = 0.75; the t=4 dose would arrive 4.75 > 4.5.
     let theta = vec![0.2, 10.0, 1.5, 0.75];
     let eta = vec![0.1, -0.05, 0.2, 0.0];
+    assert!(4.0 < 4.5 && 4.0 + theta[3] > 4.5);
+
+    let (with, without) = (
+        compute_predictions_with_tv(&m, &s, &theta, &eta),
+        compute_predictions_with_tv(&m, &deleted, &theta, &eta),
+    );
+    assert!(
+        without[2] > 1.0 && without[3] > 1.0,
+        "post-reset reads are live: {without:?}"
+    );
+    for j in 0..times.len() {
+        assert!(with[j].is_finite(), "obs {j}: {with:?}");
+        assert!(
+            (with[j] - without[j]).abs() <= 1e-12 * (1.0 + without[j].abs()),
+            "obs {j}: a dose recorded before the reset must be cancelled (#1587): {} vs {}",
+            with[j],
+            without[j]
+        );
+    }
     check_full_provider_vs_fd(&m, &s, &theta, &eta);
 }
 

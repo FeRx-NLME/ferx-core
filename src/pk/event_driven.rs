@@ -897,10 +897,11 @@ fn event_driven_predictions_with_schedule_impl(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
-    // Most-recent system-reset time. Infusions whose window started before
-    // this are no longer active (a reset turns off ongoing infusions, the
-    // same way it zeros the compartments). `NEG_INFINITY` until the first
-    // reset means every infusion is eligible.
+    // Most-recent system-reset time. Infusions recorded before this are no
+    // longer active, even a lagged one whose window opens after it (#1587): a
+    // reset turns off ongoing and pending infusions, the same way it zeros the
+    // compartments. `NEG_INFINITY` until the first reset means every infusion
+    // is eligible.
     let mut reset_floor = f64::NEG_INFINITY;
 
     // Per-walk eigendata memo: for a subject without time-varying covariates the
@@ -1021,8 +1022,10 @@ fn event_driven_predictions_with_schedule_impl(
                 // A dose whose record precedes the `SS=1` record reached here, in (time,
                 // row order), was wiped by that reset (#1588): no arrival at all. The seed
                 // at a lagged `SS=1` record sorts before every co-timed arrival
-                // (`DoseRecord < Dose`), so list order alone cannot express this.
-                if !crate::ode::predictions::SsResetGate::at_segment(eff_doses, ev.time)
+                // (`DoseRecord < Dose`), so list order alone cannot express this. Nor
+                // does a dose recorded before the EVID=3/4 reset in force arrive (#1587);
+                // `Reset < Dose` has already raised `reset_floor` for a co-timed reset.
+                if !crate::ode::predictions::ResetGate::at_segment(eff_doses, reset_floor, ev.time)
                     .live(eff_doses, ev.orig_idx)
                 {
                     continue;
@@ -1156,8 +1159,8 @@ fn pk_for<'a>(
 /// `d.rate`/`d.duration` already carry `F` (#419): the rate is injected as-is and
 /// the window `[t_start, t_start + d.duration]` is the `F`-reshaped one. A dur->0
 /// infusion still limits to the `F·AMT` bolus. `dose_lagtimes[k]` shifts dose `k`'s
-/// window; `reset_floor` turns off infusions that started before the last
-/// EVID=3/4 reset. The depot channel (`cmt 1`, #400) is a zero-order release into
+/// window; `reset_floor` turns off infusions recorded before the last EVID=3/4
+/// reset, even a lagged one whose window opens after it (#1587). The depot channel (`cmt 1`, #400) is a zero-order release into
 /// the oral depot followed by first-order `ka` absorption — distinct from the
 /// central channel (cmt 2, depot bypass).
 fn active_rates_at(
@@ -1183,9 +1186,11 @@ fn active_rates_at(
         // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
         // a rate that survived it would refill what the reset just emptied.
         let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
-            .is_some_and(|end| d.time >= reset_floor && d.time <= mid && end >= mid);
-        // Infusions that started before the last reset are turned off.
-        if t_start < reset_floor && !residual {
+            .is_some_and(|end| d.time <= mid && end >= mid);
+        // Infusions recorded before the last reset are turned off — keyed on the record,
+        // so a lagged window opening after the reset is off too (#1587). This also covers
+        // the seeded residual above, whose own floor is the record.
+        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
             continue;
         }
         if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
@@ -2009,17 +2014,25 @@ mod tests {
     /// 21 h observation diverges (a zero-lag SS dose cannot see that one — its
     /// `ss_seeded_at_record` is false and the 100 comes from the ordinary arrival
     /// window, PR #1482 review).
+    ///
+    /// Since #1587 the 20.6 h reset also **cancels** the SS dose's own lagged arrival
+    /// window `[31, 33]`: its record (20 h) precedes the reset, as NONMEM measures it
+    /// (`nonmem_anchor/evid_reset_lag`). A fourth dose recorded after the reset (25 h,
+    /// lag 6) lands on the same window, so the lagged-arrival branch stays live on the
+    /// precomputed side, and the 32 h interval reads 100 — not 200, which is what a
+    /// precompute keyed on the arrival instead of the record would give.
     #[test]
     fn precomputed_interval_rates_match_the_per_call_scan_bit_for_bit() {
         let doses = vec![
             DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0),
             DoseEvent::new(2.0, 200.0, 1, 50.0, false, 0.0),
             DoseEvent::new(20.0, 200.0, 1, 100.0, true, 12.0),
+            DoseEvent::new(25.0, 200.0, 1, 100.0, false, 0.0),
         ];
         let obs_times = vec![1.0, 2.7, 3.0, 5.0, 7.0, 10.0, 20.3, 21.0, 23.0, 30.0, 32.0];
         let mut subj = make_subject(doses, obs_times.clone());
         subj.reset_times = vec![4.0, 20.6];
-        let lag = vec![0.0, 0.5, 11.0];
+        let lag = vec![0.0, 0.5, 11.0, 6.0];
         let pk = pk_two(10.0, 50.0, 5.0, 100.0);
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
@@ -2078,10 +2091,12 @@ mod tests {
             "interval ending at 21 h must be quiet after the 20.6 h reset: {:?}",
             interval_ending_at_obs(21.0)
         );
-        // The dose's own lagged arrival window is live too.
+        // A lagged arrival window is live too — the post-reset dose's, alone: the SS
+        // dose's window on the same `[31, 33]` was cancelled by the 20.6 h reset its
+        // record precedes (#1587), so 100, not 200.
         assert!(
             interval_ending_at_obs(32.0).iter().all(|r| r[0] == 100.0),
-            "interval ending at 32 h must carry the arrival-window 100: {:?}",
+            "interval ending at 32 h must carry only the post-reset dose's 100: {:?}",
             interval_ending_at_obs(32.0)
         );
 

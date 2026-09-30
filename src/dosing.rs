@@ -1213,6 +1213,20 @@ pub(crate) fn ss_reset_live(doses: &[DoseEvent], cutoff: Option<usize>, k: usize
     }
 }
 
+/// Whether a dose recorded at `record` survives the most recent EVID=3/4 reset
+/// `reset_floor` (`NEG_INFINITY` when none has been reached) (#1587).
+///
+/// NONMEM resets the system at the reset **record** and cancels every dose recorded before
+/// it — including a lagged dose whose arrival, or a lagged infusion whose window, lies after
+/// the reset. So the test is on the record, never on `record + lag`. A dose recorded at the
+/// reset itself is live: an EVID=4 row's own dose, or a dose row following a co-timed
+/// EVID=3 row. (A dose row *preceding* a co-timed reset row reaches the engines with
+/// `record < reset`: the reader shifts such a reset past it, `RESET_SEGMENT_GAP`.)
+#[inline]
+pub(crate) fn evid_reset_live(record: f64, reset_floor: f64) -> bool {
+    record >= reset_floor
+}
+
 #[cfg(test)]
 mod governing_record_tests {
     use super::governing_record_indices;
@@ -1696,5 +1710,25 @@ mod ss_reset_tests {
         assert_eq!(live(&doses, 40.0), vec![1, 2, 3]);
         assert_eq!(ss_reset_cutoff(&doses, 60.0), Some(1));
         assert_eq!(live(&doses, 60.0), vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod evid_reset_tests {
+    use super::evid_reset_live;
+
+    /// #1587: the EVID=3/4 reset test is on the dose **record**. The arrival is not an
+    /// argument at all, so a lagged dose recorded before the reset cannot survive it — the
+    /// pair `(9, 10)` is the issue's case (a lag-2 arrival at 11). Both sides of the gate,
+    /// and its edge: a dose recorded at the reset (an EVID=4 row's own dose) is live.
+    #[test]
+    fn a_dose_is_live_iff_recorded_at_or_after_the_reset() {
+        assert!(evid_reset_live(9.0, f64::NEG_INFINITY), "no reset reached");
+        assert!(!evid_reset_live(9.0, 10.0), "recorded before the reset");
+        assert!(
+            evid_reset_live(10.0, 10.0),
+            "recorded at the reset (EVID=4)"
+        );
+        assert!(evid_reset_live(10.001, 10.0), "recorded after the reset");
     }
 }

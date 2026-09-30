@@ -838,10 +838,11 @@ fn propagate_bounds_g<T: PkNum>(
     };
     // Every break whose dual position is not simply its f64 value: each post-reset dose
     // contributes its arrival `τ_k`, and an infusing dose additionally contributes its
-    // window end `τ_k + D` (the modeled `D`'s jet on top of the arrival's). Doses starting
+    // window end `τ_k + D` (the modeled `D`'s jet on top of the arrival's). Doses recorded
     // before a reset are skipped exactly as the rate-accumulation loop below skips them
-    // (`t_start < reset_floor`), so a boundary coinciding with a reset break does not thread
-    // a spurious jet into the post-reset window (#486 review #3).
+    // (`dosing::evid_reset_live`, keyed on the record since #1587), so a boundary coinciding
+    // with a reset break does not thread a spurious jet into the post-reset window (#486
+    // review #3), and a cancelled lagged dose's arrival moves nothing.
     //
     // The provider declines to FD any subject whose moving boundaries are not *separable* —
     // two breaks coinciding in `f64` while carrying different jets (`moving_bounds_separable`)
@@ -855,7 +856,7 @@ fn propagate_bounds_g<T: PkNum>(
     let mut moving_bounds: Vec<(f64, T)> = Vec::new();
     for (k, d) in doses.iter().enumerate() {
         let (t_start, dual_start) = dose_start(k, d);
-        if t_start < reset_floor {
+        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
             continue;
         }
         // The arrival moves only under a lagtime.
@@ -939,7 +940,8 @@ fn active_rates_g<T: PkNum>(
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         let t_end = t_start + d.duration;
-        if t_start < reset_floor {
+        // Recorded before the reset: off, however late its lagged window opens (#1587).
+        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
             continue;
         }
         let started = if strict_start {
@@ -1095,7 +1097,7 @@ fn obs_boundary_correction<T: PkNum>(
     for (k, d) in doses.iter().enumerate() {
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
-        if t_start < reset_floor {
+        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
             continue;
         }
         let dual_start = match dose_lag_dual.get(k) {
@@ -1495,11 +1497,12 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
             }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
-                // The value walk's `SS=1` reset gate (#1588): a wiped dose has no arrival.
-                // Its lag needs no separate suppression here — the walk threads `∂/∂lag`
+                // The value walk's reset gate (#1588, #1587): a dose wiped by an `SS=1`
+                // record or recorded before the EVID=3/4 reset in force has no arrival. Its
+                // lag needs no separate suppression here — the walk threads `∂/∂lag`
                 // through the dual sub-interval lengths on either side of the arrival, and
                 // with no jump between them the two flows compose to one fixed-length flow.
-                if !crate::ode::predictions::SsResetGate::at_segment(eff_doses, ev.time)
+                if !crate::ode::predictions::ResetGate::at_segment(eff_doses, reset_floor, ev.time)
                     .live(eff_doses, ev.orig_idx)
                 {
                     continue;

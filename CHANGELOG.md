@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **An EVID=3/4 reset now cancels every dose recorded before it, including a lagged dose
+  that has not yet arrived** (#1587). A lagged bolus whose arrival, or a lagged infusion or
+  absorption window whose start, falls after the reset contributes nothing after it,
+  as in NONMEM. Previously ferx applied such a dose, reading up to +270 % against NONMEM
+  after the reset. This holds on every engine (ODE and analytic, predictions and
+  gradients, the adaptive driver) and for every absorption form (depot, `first_order`,
+  `zero_order`, `transit`, per-route `lag=`, lagged infusions). A dose recorded at the
+  reset itself (an `EVID=4` row's own dose, or a dose row after a co-timed `EVID=3` row)
+  is kept. Validated against NONMEM `ADVAN2` and `ADVAN13`
+  (`nonmem_anchor/evid_reset_lag`, 23 subjects). Only subjects with a reset between a lagged
+  dose's record and its arrival change.
 - **A dose now keeps the absorption parameters of its own dose record for its whole
   absorption** (#1569). Every built-in absorption forcing (`transit`, `igd`, `weibull`,
   `first_order`) reads its kernel parameters, its pathway fraction `FR` and its per-route
@@ -62,8 +73,8 @@ section of the SDLC for the versioning policy).
   `nonmem_anchor/ss_arrival_flow_*`). Without such a window dose, results move only at
   solver-tolerance level, with one exception: an EVID=3/4 reset inside the window no
   longer restores the full steady state at the arrival on those paths. They now agree
-  with the event-driven walk; both still differ from NONMEM, which cancels the lagged dose
-  (#1587).
+  with the event-driven walk. Since #1587 every engine also cancels the lagged dose at
+  that reset, as NONMEM does.
 - **An adaptive-dosing decision now reads the latest data record, including dose and
   EVID=3/4 reset rows** (#1148). On a time-varying-covariate or IOV subject, a decision's
   `ctx.covariates`, its monitored signals and the `F` of a dose it issues all come from the
