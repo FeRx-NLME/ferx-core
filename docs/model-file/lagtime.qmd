@@ -224,6 +224,12 @@ stays on the lag-free fast paths.
   interval — matching NONMEM. It does not compute the trough *at* the
   arrival; doing so was worth 7.67 OFV on the committed anchor (#1121).
   See [the FAQ](../faq.qmd) for the worked timing rule.
+- Another dose that lands **between** the record and the lagged arrival
+  superposes on that flowing state, and the arrival then adds only the
+  steady-state dose's own pulse, on every prediction path. Before #1275 the
+  default ODE predictor re-loaded the steady state at the arrival and
+  erased such a dose (−30 … −53 % against NONMEM ADVAN13,
+  `nonmem_anchor/ss_arrival_flow_lag*.ctl`).
 - A `lagtime` of a **full dosing interval or longer** (`lagtime >= II`)
   on a steady-state dose is supported, and follows NONMEM: the cycle
   phase at the record is **clamped** to zero rather than wrapped into

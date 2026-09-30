@@ -96,11 +96,6 @@ These cases are not yet covered:
 - An EVID=3/4 reset does not cancel a lagged dose whose record precedes
   it but whose arrival follows it
   ([#1587](https://github.com/FeRx-NLME/ferx-core/issues/1587)).
-- When the `SS=1` dose has a lagtime, a dose that lands between its
-  record and its arrival is wiped at the arrival on the
-  non-event-driven ODE paths
-  ([#1275](https://github.com/FeRx-NLME/ferx-core/issues/1275)). NONMEM
-  superposes it, and so do the event-driven paths.
 - An analytic `init()` baseline is still superposed on an `SS=1` dose,
   as the `W_STEADY_STATE_INIT` warning says.
 
