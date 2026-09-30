@@ -1,4 +1,4 @@
-Wed Sep 30 08:08:07 AM UTC 2026
+Wed Sep 30 09:12:22 AM UTC 2026
 $PROBLEM ferx #1275: dose in a lagged SS=1 pre-arrival window, ADVAN13, ALAG1=12
 $DATA ss_arrival_flow.csv IGNORE=@
 $INPUT ID TIME DV EVID AMT CMT MDV II SS RATE
@@ -9,6 +9,11 @@ $PK
   V  = THETA(2)
   KA = THETA(3)
   ALAG1 = 12
+  ALAG2 = 0
+  IF (ID.EQ.6) THEN
+    ALAG1 = 0
+    ALAG2 = 12
+  ENDIF
   S2 = V
 $DES
   DADT(1) = -KA*A(1)
@@ -48,7 +53,7 @@ Days until program expires : 319
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
  CREATE/ADD TO FDATA.csv:        YES
- NO. OF DATA RECS IN DATA SET:       60
+ NO. OF DATA RECS IN DATA SET:       72
  NO. OF DATA ITEMS IN DATA SET:  10
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -60,8 +65,8 @@ Days until program expires : 319
 0FORMAT FOR DATA:
  (10E5.0)
 
- TOT. NO. OF OBS RECS:       50
- TOT. NO. OF INDIVIDUALS:        5
+ TOT. NO. OF OBS RECS:       60
+ TOT. NO. OF INDIVIDUALS:        6
 0LENGTH OF THETA:   3
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -123,7 +128,7 @@ Days until program expires : 319
               SCALE      BIOAVAIL.   ZERO-ORDER  ZERO-ORDER  ABSORB
                          FRACTION    RATE        DURATION    LAG
     1            *           *           *           *           4
-    2            5           *           *           *           *
+    2            6           *           *           *           5
     3            *           -           -           -           -
              - PARAMETER IS NOT ALLOWED FOR THIS MODEL
              * PARAMETER IS NOT SUPPLIED BY PK SUBROUTINE;
@@ -202,7 +207,7 @@ Days until program expires : 319
  IPRD=NIPRED
  IRS=NIRES
 
- Elapsed evaluation time in seconds:     0.01
+ Elapsed evaluation time in seconds:     0.02
  Elapsed postprocess time in seconds:     0.02
 1
  
@@ -237,7 +242,7 @@ Days until program expires : 319
 
 
 
- #OBJV:********************************************          4926.614       *********************************************
+ #OBJV:********************************************          5914.513       *********************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -297,6 +302,6 @@ Days until program expires : 319
 +        1.00E-01
  
  Elapsed finaloutput time in seconds:     0.00
- #CPUT: Total CPU Time in Seconds,        0.057
+ #CPUT: Total CPU Time in Seconds,        0.059
 Stop Time:
-Wed Sep 30 08:08:11 AM UTC 2026
+Wed Sep 30 09:12:26 AM UTC 2026

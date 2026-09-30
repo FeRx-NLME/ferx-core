@@ -8,6 +8,11 @@ $PK
   V  = THETA(2)
   KA = THETA(3)
   ALAG1 = 11
+  ALAG2 = 0
+  IF (ID.EQ.6) THEN
+    ALAG1 = 0
+    ALAG2 = 11
+  ENDIF
   S2 = V
 $DES
   DADT(1) = -KA*A(1)

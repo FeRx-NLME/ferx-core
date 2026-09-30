@@ -3,10 +3,12 @@
 1-cpt oral, CL=2, V=20, KA=0.15; SS=1 depot dose AMT 100 at t=10, II=12, ALAG1=L on the
 depot only. The pre-record periodic train is placed under the #1121 clamp: its last pulse
 lands at 10 - max(II - L, 0). ID 4's depot dose at 0 is wiped by the SS=1 reset.
-ID 5's SS dose is a depot INFUSION, RATE 50 (T_inf = 2 h).
+ID 5's SS dose is a depot INFUSION, RATE 50 (T_inf = 2 h). ID 6's SS dose is a CENTRAL
+bolus lagged by ALAG2 (ALAG1 = 0 for ID 6), with an unlagged depot bolus at 11 whose mass
+enters central -- the SS dose's own compartment -- inside the pre-arrival window.
 
 Run from the repo root: python3 nonmem_anchor/ss_arrival_flow_closed_form.py
-Measured: NONMEM ADVAN13 TOL=12 matches this to <= 7.1e-12 on every cell except ID 5 at
+Measured: NONMEM ADVAN13 TOL=12 matches this to <= 7.1e-12 on every cell (ID 6: 5.5e-12) except ID 5 at
 lag 13, where NONMEM infuses the record-time cycle for T_inf + (lag - II) = 3 h (matches
 that reading to 4.0e-12) -- the documented lag > II infusion divergence, not #1275.
 """
@@ -38,7 +40,12 @@ def iv(t, a):
 def conc(i, t, L):
     rec = 10.0
     p = max(II - L, 0.0)
-    pulse = (lambda s: oral_inf(s, 50.0, 2.0)) if i == 5 else (lambda s: oral(s, 100.0))
+    if i == 5:
+        pulse = lambda s: oral_inf(s, 50.0, 2.0)
+    elif i == 6:
+        pulse = lambda s: iv(s, 100.0)  # SS dose into CENTRAL, lagged by ALAG2
+    else:
+        pulse = lambda s: oral(s, 100.0)
     c = 0.0
     for n in range(0, 4000):
         c += pulse(t - (rec - p - n * II))
@@ -49,10 +56,16 @@ def conc(i, t, L):
         c += iv(t - 15, 50)
     if i == 5:
         c += iv(t - 14, 100)
+    if i == 6:
+        c += oral(t - 11, 100)  # unlagged depot bolus, flowing into central in the window
     return c
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--predict":
+        for L in (11, 12, 13):
+            print(f"lag {L} ID 6:", [(t, round(conc(6, t, L), 10)) for t in (10.5, 11.5, 16, 22.5, 25, 40)])
+        sys.exit(0)
     root = sys.argv[1] if len(sys.argv) > 1 else "nonmem_anchor"
     for L in (11, 12, 13):
         worst = {}

@@ -10,8 +10,9 @@
 //! landed inside the pre-arrival window. The event-driven walks already flowed, and were right.
 //!
 //! The reference is NONMEM 7.6.0 (`nm3`, `anchor` build), **`ADVAN13 TOL=12`**, `MAXEVAL=0`,
-//! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `II = 12`, `AMT = 100`, `ALAG1` on the
-//! depot only and the one input varied across `nonmem_anchor/ss_arrival_flow_lag{11,12,13}.ctl`.
+//! `FORMAT=s1PE23.16`, `CL = 2, V = 20, KA = 0.15`, `II = 12`, `AMT = 100`, the lag (`ALAG1` on
+//! the depot; `ALAG2` on central for ID 6 only) the one input varied across
+//! `nonmem_anchor/ss_arrival_flow_lag{11,12,13}.ctl`.
 //! NONMEM equals an independent closed form (`nonmem_anchor/ss_arrival_flow_closed_form.py`,
 //! a Python pulse-train sum under the #1121 clamp) to **≤ 7.1e-12** on every asserted cell.
 //! ADVAN13, not ADVAN2: at `ALAG1 = 13` ADVAN2 is 17 % off both ADVAN13 and the closed form
@@ -24,6 +25,14 @@
 //! | 3 | `SS=1` depot at 10; central bolus 50 at 15 | a later window dose |
 //! | 4 | depot bolus at 0 (wiped by the `SS=1` record), then as ID 1 | |
 //! | 5 | `SS=1` depot **infusion** (`RATE = 50`, 2 h) at 10; central bolus 100 at 14 | at lags 11 and 12 the previous cycle's infusion is still running at the record |
+//! | 6 | `SS=1` **central** bolus at 10, lagged by `ALAG2`; unlagged depot bolus 100 at 11 | window mass flows **into the `SS` dose's own compartment** |
+//!
+//! ID 6 answers PR #1607's review F2. In IDs 1–5 the `SS` dose goes to the depot and every
+//! window dose to central, downstream of it, so a half-fix that re-equilibrated only the
+//! `SS` dose's *own* compartment at the arrival passed every one of them. ID 6 puts the
+//! window mass there: that half-fix erases the depot bolus's central amount at the arrival
+//! (≥ 40 mg of 100 at every lag, asserted from the closed form below). ID 6 runs on its own
+//! ODE model (`ALAG2 = TVLAG`, no `ALAG1`), which is how NONMEM's `IF (ID.EQ.6)` reads.
 //!
 //! **The lags straddle the old gate.** At 11 and 12 (`lag ≤ II`) the dense walks overwrote
 //! the arrival — measured before the fix at **−32 %** (lag 11) and **−30 %** (lag 12). At 13
@@ -65,11 +74,15 @@ const LAGS: [f64; 3] = [11.0, 12.0, 13.0];
 const ODE_BOUND: f64 = 1e-10;
 /// Measured 5.8e-12: NONMEM's ADVAN13 solver error, **not** the 1e-13 the ADVAN2 anchors use.
 const ANALYTIC_BOUND: f64 = 1e-10;
-/// Measured 2.9e-4: the adaptive driver's own floor (#1603).
+/// Measured 3.6e-4 (ID 6; 2.9e-4 on IDs 1–5): the adaptive driver's own floor (#1603).
 const ADAPTIVE_BOUND: f64 = 1e-3;
 
 /// IDs other than 2, which the analytic single `lagtime` slot cannot express.
-const NOT_ANALYTIC: &[&str] = &["1", "3", "4", "5"];
+const NOT_ANALYTIC: &[&str] = &["1", "3", "4", "5", "6"];
+/// The subject that runs on `ode_central` (see the module doc); every other ID runs on
+/// `ode_depot`.
+const CENTRAL_ID: &str = "6";
+const DEPOT_IDS: &[&str] = &["1", "2", "3", "4", "5"];
 
 fn table(lag: f64) -> String {
     format!(
@@ -89,6 +102,15 @@ fn lag_skip(lag: f64) -> &'static [&'static str] {
 }
 
 fn ode_depot(lag: f64) -> CompiledModel {
+    ode_lagged(lag, "ALAG1")
+}
+
+/// ID 6's model: the lag is on central (`ALAG2`), the depot is unlagged.
+fn ode_central(lag: f64) -> CompiledModel {
+    ode_lagged(lag, "ALAG2")
+}
+
+fn ode_lagged(lag: f64, slot: &str) -> CompiledModel {
     let src = format!(
         r#"
 [parameters]
@@ -102,7 +124,7 @@ fn ode_depot(lag: f64) -> CompiledModel {
   CL = TVCL * exp(ETA_CL)
   V  = TVV
   KA = TVKA
-  ALAG1 = TVLAG
+  {slot} = TVLAG
 [structural_model]
   ode(obs_cmt=central, states=[depot, central])
 [odes]
@@ -358,6 +380,34 @@ fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f6
         .collect()
 }
 
+type OdeCase = (&'static str, CompiledModel, Population, Vec<&'static str>);
+
+/// Each ODE model with the subjects it serves: IDs 1–5 on `ode_depot`, ID 6 on
+/// `ode_central`. The population is restricted, and the rest named in `skip`, so a skip list
+/// never hides a subject that ran.
+fn ode_cases(lag: f64, pop: Population) -> Vec<OdeCase> {
+    let only = |keep: &dyn Fn(&str) -> bool| {
+        let mut p = pop.clone();
+        p.subjects.retain(|s| keep(&s.id));
+        assert!(!p.subjects.is_empty());
+        p
+    };
+    vec![
+        (
+            "",
+            ode_depot(lag),
+            only(&|id| id != CENTRAL_ID),
+            skip_plus(lag, &[CENTRAL_ID]),
+        ),
+        (
+            " [ID 6, central SS]",
+            ode_central(lag),
+            only(&|id| id == CENTRAL_ID),
+            DEPOT_IDS.to_vec(),
+        ),
+    ]
+}
+
 fn skip_plus(lag: f64, extra: &[&'static str]) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = lag_skip(lag).to_vec();
     for e in extra {
@@ -394,6 +444,17 @@ fn the_window_dose_is_live_after_the_arrival_in_nonmem() {
             let rel = at("1", t) / at("2", t) - 1.0;
             assert!(rel > 0.1, "lag {lag}, t={t}: ID 1 vs ID 2 only {rel:+.3e}");
         }
+        // ID 6: the depot bolus at 11 has put this much into central — the `SS` dose's own
+        // compartment — by the arrival at 10 + lag (closed form, 1-cpt oral amount). Measured
+        // 43.4 / 42.2 / 40.8 mg of the 100 mg pulse at lags 11 / 12 / 13.
+        let (ka, k) = (0.15_f64, 0.1_f64);
+        let tau = 10.0 + lag - 11.0;
+        let in_central = 100.0 * ka / (ka - k) * ((-k * tau).exp() - (-ka * tau).exp());
+        assert!(
+            in_central > 40.0,
+            "lag {lag}: only {in_central:.1} mg of window mass in central at the arrival"
+        );
+        assert!(rows.iter().any(|(i, _, _)| i == CENTRAL_ID));
     }
 }
 
@@ -403,15 +464,14 @@ fn the_window_dose_is_live_after_the_arrival_in_nonmem() {
 #[test]
 fn ode_static_walker_flows_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let got = via_predict(&ode_depot(lag), &static_pop());
-        let label = format!("ODE static, lag {lag}");
-        vec![check_matches(
-            &label,
-            &got,
-            &table(lag),
-            ODE_BOUND,
-            lag_skip(lag),
-        )]
+        ode_cases(lag, static_pop())
+            .into_iter()
+            .map(|(tag, m, pop, skip)| {
+                let got = via_predict(&m, &pop);
+                let label = format!("ODE static{tag}, lag {lag}");
+                check_matches(&label, &got, &table(lag), ODE_BOUND, &skip)
+            })
+            .collect()
     });
 }
 
@@ -419,15 +479,14 @@ fn ode_static_walker_flows_a_lagged_ss_dose_to_its_arrival() {
 #[test]
 fn adaptive_driver_flows_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let got = via_adaptive(&ode_depot(lag), &static_pop());
-        let label = format!("adaptive, lag {lag}");
-        vec![check_matches(
-            &label,
-            &got,
-            &table(lag),
-            ADAPTIVE_BOUND,
-            lag_skip(lag),
-        )]
+        ode_cases(lag, static_pop())
+            .into_iter()
+            .map(|(tag, m, pop, skip)| {
+                let got = via_adaptive(&m, &pop);
+                let label = format!("adaptive{tag}, lag {lag}");
+                check_matches(&label, &got, &table(lag), ADAPTIVE_BOUND, &skip)
+            })
+            .collect()
     });
 }
 
@@ -435,15 +494,14 @@ fn adaptive_driver_flows_a_lagged_ss_dose_to_its_arrival() {
 #[test]
 fn ode_with_states_flows_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let got = via_with_states(&ode_depot(lag), &static_pop());
-        let label = format!("ODE with_states, lag {lag}");
-        vec![check_matches(
-            &label,
-            &got,
-            &table(lag),
-            ODE_BOUND,
-            lag_skip(lag),
-        )]
+        ode_cases(lag, static_pop())
+            .into_iter()
+            .map(|(tag, m, pop, skip)| {
+                let got = via_with_states(&m, &pop);
+                let label = format!("ODE with_states{tag}, lag {lag}");
+                check_matches(&label, &got, &table(lag), ODE_BOUND, &skip)
+            })
+            .collect()
     });
 }
 
@@ -451,15 +509,14 @@ fn ode_with_states_flows_a_lagged_ss_dose_to_its_arrival() {
 #[test]
 fn ode_dense_solve_states_flows_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let got = via_dense_states(&ode_depot(lag), &static_pop());
-        let label = format!("ode_dense_solve_states, lag {lag}");
-        vec![check_matches(
-            &label,
-            &got,
-            &table(lag),
-            ODE_BOUND,
-            lag_skip(lag),
-        )]
+        ode_cases(lag, static_pop())
+            .into_iter()
+            .map(|(tag, m, pop, skip)| {
+                let got = via_dense_states(&m, &pop);
+                let label = format!("ode_dense_solve_states{tag}, lag {lag}");
+                check_matches(&label, &got, &table(lag), ODE_BOUND, &skip)
+            })
+            .collect()
     });
 }
 
@@ -468,29 +525,34 @@ fn ode_dense_solve_states_flows_a_lagged_ss_dose_to_its_arrival() {
 #[test]
 fn ode_event_driven_walks_flow_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let m = ode_depot(lag);
-        let got = via_predict(&m, &event_driven_pop());
-        let label = format!("ODE event-driven, lag {lag}");
-        let walk = check_matches(&label, &got, &table(lag), ODE_BOUND, lag_skip(lag));
-        let got = via_with_states(&m, &event_driven_pop());
-        let label = format!("ODE event-driven with_states, lag {lag}");
-        let states = check_matches(&label, &got, &table(lag), ODE_BOUND, lag_skip(lag));
-        vec![walk, states]
+        let mut out = Vec::new();
+        for (tag, m, pop, skip) in ode_cases(lag, event_driven_pop()) {
+            let got = via_predict(&m, &pop);
+            let label = format!("ODE event-driven{tag}, lag {lag}");
+            out.push(check_matches(&label, &got, &table(lag), ODE_BOUND, &skip));
+            let got = via_with_states(&m, &pop);
+            let label = format!("ODE event-driven with_states{tag}, lag {lag}");
+            out.push(check_matches(&label, &got, &table(lag), ODE_BOUND, &skip));
+        }
+        out
     });
 }
 
 #[test]
 fn dual_ode_walk_value_flows_a_lagged_ss_dose_to_its_arrival() {
     every_lag(|lag| {
-        let m = ode_depot(lag);
-        let skip = skip_plus(lag, &["5"]);
-        let got = via_dual(&m, &static_pop());
-        let label = format!("dual ODE (static subjects), lag {lag}");
-        let stat = check_matches(&label, &got, &table(lag), ODE_BOUND, &skip);
-        let got = via_dual(&m, &event_driven_pop());
-        let label = format!("dual ODE (EVID=3 subjects), lag {lag}");
-        let reset = check_matches(&label, &got, &table(lag), ODE_BOUND, &skip);
-        vec![stat, reset]
+        let mut out = Vec::new();
+        for (kind, pop) in [("static", static_pop()), ("EVID=3", event_driven_pop())] {
+            for (tag, m, pop, mut skip) in ode_cases(lag, pop) {
+                if !skip.contains(&"5") {
+                    skip.push("5"); // `via_dual` leaves ID 5 out (#1128)
+                }
+                let got = via_dual(&m, &pop);
+                let label = format!("dual ODE ({kind} subjects){tag}, lag {lag}");
+                out.push(check_matches(&label, &got, &table(lag), ODE_BOUND, &skip));
+            }
+        }
+        out
     });
 }
 
