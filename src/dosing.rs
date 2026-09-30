@@ -902,15 +902,38 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
 /// existing non-lagged SS result by solver error, for no gain.
 ///
-/// Every call site reads this predicate rather than re-deriving the condition, so
-/// the seed and the arrival-side equilibration cannot drift into overlapping
-/// (double-load) or disjoint (no-load) coverage — and the analytic twin
+/// Every call site reads this predicate rather than re-deriving the condition, and
+/// the arrival side reads its complement [`ss_equilibrates_at_arrival`], so the seed
+/// and the arrival-side equilibration cannot drift into overlapping (double-load,
+/// #1275) or disjoint (no-load) coverage — and the analytic twin
 /// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
 /// timeline break fires on exactly the doses production seeds. A twin that seeded
 /// on a wider or narrower set would disagree with production in *value*, which is
 /// the one thing the `check_vs_production` parity tests cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
+}
+
+/// Whether this steady-state dose's periodic state is equilibrated at its
+/// **arrival** — the complement of [`ss_seeded_at_record`] within the `SS` doses.
+///
+/// **A lagged steady-state dose's state is loaded once, at its record; its arrival
+/// adds only the pulse** (#1275). Only an `SS` dose that was *not* seeded at its
+/// record — `lag == 0`, where record and arrival are the same instant — equilibrates
+/// here. Every value-path walk (the dense ODE walks, the ODE and closed-form
+/// event-driven walks, the dual ODE walk) reads this one spelling, so a walk
+/// cannot seed a dose at its record and then load it a second time at its arrival.
+///
+/// The dense walks used to re-equilibrate at the arrival whenever
+/// [`ss_arrival_is_trough`] held (`lag ≤ II`), on the grounds that the flowed state
+/// *is* the trough. It is — but only for the `SS` dose's own contribution. A second
+/// dose landing inside the pre-arrival window `(record, arrival)` is in the flowed
+/// state too, and re-equilibrating replaced the whole state vector with the
+/// periodic trough, erasing that dose: measured up to **−54 %** against NONMEM
+/// (`nonmem_anchor/ss_arrival_flow_*`, ADVAN13; `ss_reset_tie_*`, ADVAN2), while the
+/// event-driven walks, which already flowed, matched.
+pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record(dose, lag)
 }
 
 /// Whether this seeded steady-state dose is the **bolus** case the dual event walk
@@ -999,22 +1022,29 @@ pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -
 }
 
 /// Whether flowing a seeded steady-state dose from its record to its lagged
-/// arrival lands back on the periodic **trough** — so a path that re-equilibrates
-/// at the arrival instead of propagating there gets the same number.
+/// arrival lands the dose's **own** contribution back on the periodic trough — so
+/// a path that writes the trough at the arrival instead of propagating there gets
+/// the same number for that dose.
 ///
 /// The seed sits at phase [`ss_seed_phase`] and the arrival is `lag` later, so
 /// the flowed phase is `(II − lag) + lag = II ≡ 0⁻`, the trough, for every
 /// `lag ≤ II`. Past that the clamp pins the seed at phase 0 and the arrival lands
 /// at phase `lag > II` — strictly further down the same decay than the trough —
-/// so re-equilibrating there silently *raises* the state back to a full cycle's
+/// so taking the trough there silently *raises* the state back to a full cycle's
 /// accumulation. Measured at **+4.3 %** on an `ALAG1 = 15`, `II = 12` bolus at
-/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`), on the two paths that take
-/// the shortcut: the dense ODE predictor and the analytical superposition. Both
-/// event-driven walks propagate and were already right.
+/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`).
 ///
-/// The paths that re-equilibrate keep doing so while this holds, deliberately:
-/// integrating a full extra cycle instead would move every existing SS+lagtime
-/// result by solver error for no gain.
+/// Its one reader is the analytic superposition (`pk/mod.rs`), which splits a
+/// lagged SS dose into tail + arrival past `lag = II` and otherwise keeps the
+/// collapsed `C_ss(t − t_eff)`. That is sound there because superposition is
+/// **additive**: every other dose is its own term, so nothing in the pre-arrival
+/// window is replaced.
+///
+/// It is **not** a licence for a state-vector walk to re-equilibrate at the
+/// arrival. The dense ODE walks used to, for every `lag ≤ II`, and that replaced
+/// the whole state — erasing any dose that landed between the record and the
+/// arrival (up to −54 % against NONMEM, #1275). Every ODE walk now reads
+/// [`ss_equilibrates_at_arrival`] instead.
 pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
     lag <= dose.ii
 }

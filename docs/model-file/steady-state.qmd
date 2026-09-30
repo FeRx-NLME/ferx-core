@@ -96,11 +96,6 @@ These cases are not yet covered:
 - An EVID=3/4 reset does not cancel a lagged dose whose record precedes
   it but whose arrival follows it
   ([#1587](https://github.com/FeRx-NLME/ferx-core/issues/1587)).
-- When the `SS=1` dose has a lagtime, a dose that lands between its
-  record and its arrival is wiped at the arrival on the
-  non-event-driven ODE paths
-  ([#1275](https://github.com/FeRx-NLME/ferx-core/issues/1275)). NONMEM
-  superposes it, and so do the event-driven paths.
 - An analytic `init()` baseline is still superposed on an `SS=1` dose,
   as the `W_STEADY_STATE_INIT` warning says.
 
@@ -392,10 +387,12 @@ the ODE solver), and the result is validated against NONMEM `ALAG1` +
 `SS=1` to 5 significant figures (see *Validation* below). Declaring
 `LAGTIME` on a steady-state model is fully supported.
 
-> Edge case for SS **infusions**: the previous-interval tail assumes the
-> prior infusion has finished by the record time, i.e. `L ≤ II − T_inf`.
-> This holds for any realistic lagtime; overlapping infusions
-> (`T_inf > II`) are rejected as described under *Limitations*.
+> SS **infusions** whose previous-cycle infusion is still running at the
+> record (`L > II − T_inf`) are supported too: the residual rate flows past
+> the record exactly as in NONMEM. See [Lag time](lagtime.qmd) and the
+> anchors `nonmem_anchor/ss_lag_infusion.ctl` and
+> `nonmem_anchor/ss_arrival_flow_lag{11,12}.ctl` (ID 5). Overlapping
+> infusions (`T_inf > II`) are rejected as described under *Limitations*.
 
 ## Steady state with a `TAD`-reading RHS
 

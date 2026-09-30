@@ -37,10 +37,10 @@
 //! arrival re-equilibration gate decides the answer at lag 2: the wiped `SS=1` dose is
 //! unlagged, the live one is seeded at its record, so nothing later overwrites a wrong
 //! re-equilibration (PR #1601 review finding 1).
-//! **Skipped, by name: IDs 2, 5, 8 at lag 2 on the dense ODE walks** (static, with-states,
-//! adaptive) — #1275. Where `ss_arrival_is_trough`, those walks re-equilibrate at the
-//! lagged `SS=1` arrival (t = 12) and wipe a dose that landed between the record and the
-//! arrival (−51 … −54 %). The event-driven walks do not, and are asserted on them.
+//! **IDs 2, 5, 8 at lag 2 are the #1275 rows**: a dose lands between the lagged `SS=1`
+//! record and its arrival (t = 12). The dense ODE walks (static, with-states, adaptive) used
+//! to re-equilibrate at that arrival and wipe it (−51 … −54 %); they now flow the record's
+//! seed to the arrival (`dosing::ss_equilibrates_at_arrival`) and are asserted on every ID.
 //!
 //! **Analytic at lag 2 is asserted on the depot-only IDs** (3, 4, 6, 9, 10, 11, 12): the
 //! analytic `lagtime=` slot lags every dose record, so it cannot express NONMEM's
@@ -65,9 +65,6 @@ const DATA: &str = "nonmem_anchor/ss_reset_tie.csv";
 const TABLE_LAG0: &str = "nonmem_anchor/results/ss_reset_tie.sdtab";
 const TABLE_LAG2: &str = "nonmem_anchor/results/ss_reset_tie_lag.sdtab";
 
-/// #1275: a dose between a lagged `SS=1` record and its arrival, wiped by the dense walks'
-/// arrival re-equilibration. Skipped on those walks at lag 2 only.
-const M2_1275: &[&str] = &["2", "5", "8"];
 /// IDs with a central (CMT 2) dose, which the analytic single `lagtime` slot would lag.
 const CENTRAL_DOSE: &[&str] = &["1", "2", "5", "7", "8", "13"];
 
@@ -137,7 +134,7 @@ fn static_pop() -> Population {
 }
 
 /// The committed dataset with an `EVID=3` row at t = 0 ahead of each subject, which routes
-/// it to the event-driven walk and changes nothing else. Written to a per-process temp file.
+/// it to the event-driven walk and changes nothing else. Written to a per-call temp file.
 fn event_driven_pop() -> Population {
     let text = std::fs::read_to_string(DATA).expect("csv");
     let mut out = String::new();
@@ -153,9 +150,13 @@ fn event_driven_pop() -> Population {
         out.push_str(line);
         out.push('\n');
     }
+    // Unique per call, not just per process: the tests run on concurrent threads, and a
+    // shared path let one test's `remove_file` race another's read.
+    static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "ferx_1588_ss_reset_tie_evid3_{}.csv",
-        std::process::id()
+        "ferx_1588_ss_reset_tie_evid3_{}_{}.csv",
+        std::process::id(),
+        CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&path, out).expect("write temp csv");
     let pop = load(&path);
@@ -307,7 +308,7 @@ fn ode_static_walker_resets_a_co_timed_dose_by_row_order_lag0() {
 #[test]
 fn ode_static_walker_resets_a_co_timed_dose_by_row_order_lag2() {
     let got = via_predict(&ode_depot(2.0), &static_pop());
-    assert_matches("ODE static, lag 2", &got, TABLE_LAG2, ODE_BOUND, M2_1275);
+    assert_matches("ODE static, lag 2", &got, TABLE_LAG2, ODE_BOUND, &[]);
 }
 
 // ---- ODE event-driven walker (`ode_predictions_event_driven`): S5 ----
@@ -328,7 +329,7 @@ fn ode_event_driven_walker_resets_a_co_timed_dose_by_row_order_lag2() {
 
 #[test]
 fn ode_with_states_resets_a_co_timed_dose_by_row_order() {
-    for (lag, table, skip) in [(0.0, TABLE_LAG0, &[][..]), (2.0, TABLE_LAG2, M2_1275)] {
+    for (lag, table) in [(0.0, TABLE_LAG0), (2.0, TABLE_LAG2)] {
         let m = ode_depot(lag);
         let got = via_with_states(&m, &static_pop());
         assert_matches(
@@ -336,7 +337,7 @@ fn ode_with_states_resets_a_co_timed_dose_by_row_order() {
             &got,
             table,
             ODE_BOUND,
-            skip,
+            &[],
         );
         let got = via_with_states(&m, &event_driven_pop());
         assert_matches(
@@ -353,14 +354,14 @@ fn ode_with_states_resets_a_co_timed_dose_by_row_order() {
 
 #[test]
 fn adaptive_driver_resets_a_co_timed_dose_by_row_order() {
-    for (lag, table, skip) in [(0.0, TABLE_LAG0, &[][..]), (2.0, TABLE_LAG2, M2_1275)] {
+    for (lag, table) in [(0.0, TABLE_LAG0), (2.0, TABLE_LAG2)] {
         let got = via_adaptive(&ode_depot(lag), &static_pop());
         assert_matches(
             &format!("adaptive, lag {lag}"),
             &got,
             table,
             ADAPTIVE_BOUND,
-            skip,
+            &[],
         );
     }
 }

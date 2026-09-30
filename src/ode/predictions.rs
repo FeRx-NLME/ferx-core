@@ -322,7 +322,7 @@ pub(crate) fn abandon_non_finite_timeline(
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
     is_real_infusion, note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles,
-    resolve_subject_doses, resolve_subject_doses_with, ss_arrival_is_trough,
+    resolve_subject_doses, resolve_subject_doses_with, ss_equilibrates_at_arrival,
     ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record, SsStopTracker,
     SS_EQUILIBRATION_CYCLES,
 };
@@ -3851,10 +3851,11 @@ fn reseed_prescheduled_states_at(
         if !ss_gate.live(doses, i) {
             continue;
         }
-        // Re-equilibrating at the arrival is a shortcut for propagating the seed
-        // there, and it is exact only while the flowed state IS the trough
-        // (#1121). Past `lag = II` it is not, and the shortcut reads ~4 % high.
-        if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[i]) {
+        // A dose seeded at its record (above, #1121) has its state flowed here and adds
+        // only the pulse: re-equilibrating would replace the whole state with the
+        // periodic trough and erase any dose that landed inside the pre-arrival window
+        // (#1275). Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival.
+        if ss_equilibrates_at_arrival(dose, dose_lagtimes[i]) {
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&equilibrate_ss_state(
                 ode,
@@ -7005,7 +7006,7 @@ pub fn ode_predictions_event_driven(
                 // and flowed here (#1121) — re-equilibrating would discard that
                 // propagation and restore the defect. The two branches read the
                 // same predicate, so they cannot both fire or both skip.
-                if d.ss && d.ii > 0.0 && !ss_seeded_at_record(d, dose_lagtimes[idx]) {
+                if ss_equilibrates_at_arrival(d, dose_lagtimes[idx]) {
                     let chz_before = chz_snapshot(ode, &u);
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }
@@ -7390,16 +7391,11 @@ pub fn ode_predictions_with_states(
                 applied[dose_idx] = true;
                 let f = dose_f_bio[dose_idx];
                 let live = ss_gate.live(&subject.doses, dose_idx);
-                if live
-                    && dose.ss
-                    && dose.ii > 0.0
-                    && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx])
-                {
-                    // Lagged arrival: pre-lag seeding was already done above;
-                    // here we apply the full equilibrated state — sound only
-                    // because the propagated state at the arrival is the trough
-                    // (#1121). Past `lag = II` it is not, so the seed flows here
-                    // instead of being overwritten.
+                if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
+                    // Only an unseeded (`lag = 0`) SS dose equilibrates at its
+                    // arrival. A lagged one was seeded at its record above and has
+                    // flowed here; overwriting it would erase a dose that landed
+                    // inside the pre-arrival window (#1275).
                     let chz_before = chz_snapshot(ode, &u);
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts, &chz_before);
                 }
@@ -7773,14 +7769,10 @@ fn apply_segment_boundary(
             applied[dose_idx] = true;
             let f = dose_f_bio[dose_idx];
             let live = ss_gate.live(&subject.doses, dose_idx);
-            if live
-                && dose.ss
-                && dose.ii > 0.0
-                && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx])
-            {
-                // Lagged arrival: pre-lag seeding already done above. The
-                // overwrite is exact only while the flowed state is the trough
-                // (#1121); past `lag = II` the seed flows here instead.
+            if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
+                // Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival;
+                // a lagged one was seeded at its record above and flows here, so a
+                // dose inside the pre-arrival window survives (#1275).
                 let chz_before = chz_snapshot(ode, u);
                 *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts, &chz_before);
             }

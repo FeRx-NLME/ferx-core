@@ -50,6 +50,20 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A dose that lands between a lagged `SS=1` dose's record and its arrival is no longer
+  erased** (#1275). A lagged steady-state dose loads its periodic state at its dose record
+  and carries it to the lagged arrival, which then adds only the new pulse. The ODE paths
+  that do not use the event-driven walk (the default ODE predictor, the adaptive driver,
+  compartment-state output columns, the ODE-accumulated hazard and its simulated event
+  times, and the Markov endpoint) instead re-loaded the steady state at the arrival whenever
+  the lag was at most `II`. That replaced the whole state and erased any dose given inside
+  the window: up to −54 % against NONMEM after the arrival. Every ODE predictor now
+  matches NONMEM to ≤ 9e-12 (the adaptive driver to 3e-4, its own floor;
+  `nonmem_anchor/ss_arrival_flow_*`). Without such a window dose, results move only at
+  solver-tolerance level, with one exception: an EVID=3/4 reset inside the window no
+  longer restores the full steady state at the arrival on those paths. They now agree
+  with the event-driven walk; both still differ from NONMEM, which cancels the lagged dose
+  (#1587).
 - **An adaptive-dosing decision now reads the latest data record, including dose and
   EVID=3/4 reset rows** (#1148). On a time-varying-covariate or IOV subject, a decision's
   `ctx.covariates`, its monitored signals and the `F` of a dose it issues all come from the
@@ -81,9 +95,7 @@ section of the SDLC for the versioning policy).
   analytic gradients (FOCE/FOCEI) of both. A lagged dose whose record precedes an `SS=1`
   record but whose arrival follows it is now cancelled too (the `SS=1` half of #1587). At lag
   0 the gradient walk was already right while the prediction was not, so the objective and
-  its gradient disagreed; they now agree. Still open: with a lagged `SS=1` dose, a dose
-  landing between its record and its arrival is wiped on the non-event-driven ODE paths
-  (#1275).
+  its gradient disagreed; they now agree.
 - **`simulate_adaptive()` now rejects a model covariate missing from the data** (#1571).
   The programmatic (closure-controller) Rust entry point skipped the data checks every
   other simulate entry point runs, so a covariate such as `WT` with no data column was

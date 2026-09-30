@@ -4810,10 +4810,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             .collect()
     };
 
-    // Whether dose `k` is a periodic steady-state dose (`SS=1`, `II>0`) — single source of
-    // truth for the walk, mirroring `Subject::has_periodic_ss_dose`'s per-dose predicate.
-    let is_ss_dose = |d: &crate::types::DoseEvent| -> bool { d.ss && d.ii > 0.0 };
-
     // The SS-equilibration infusion jet for dose `idx`: `Some(inf_eff[idx])` for an infusion,
     // `None` for a bolus. One shared source for both SS call sites (`K_DOSE` and `K_SS_SEED`),
     // so their infusion-jet handling can't desync (#642 review #5). `inf_eff[idx]` is only read
@@ -5526,10 +5522,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // production, and which this walk carried identically. It was invisible
             // because both engines did it: under flat covariates the propagated state
             // *is* the trough, so the twin agreed with production while both disagreed
-            // with NONMEM. `ss_seeded_at_record` is production's own predicate, shared so
+            // with NONMEM. `ss_equilibrates_at_arrival` is production's own predicate, shared so
             // the two cannot seed on different sets.
-            if arrival_live && is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx))
-            {
+            if arrival_live && crate::dosing::ss_equilibrates_at_arrival(d, lag_val(idx)) {
                 // SS into a built-in absorption compartment (#835): the dose drives the
                 // kernel `R_in`, not an instantaneous bolus, so equilibrate through the dual
                 // fixed point (linear) / pulse-train (nonlinear), carrying `∂u_ss/∂(θ,η[,κ])`.
@@ -5690,8 +5685,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         if has_lagtime {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
-                            if is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx))
-                            {
+                            if crate::dosing::ss_equilibrates_at_arrival(d, lag_val(idx)) {
                                 let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                                     eval_rhs_anchored::<T>(
                                         program,
@@ -5972,7 +5966,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // from both sides.
                         let u_minus = u.clone();
                         let trough_loaded_here =
-                            is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx));
+                            crate::dosing::ss_equilibrates_at_arrival(d, lag_val(idx));
                         let g_minus = if trough_loaded_here {
                             vec![T::from_f64(0.0); n_states]
                         } else {
