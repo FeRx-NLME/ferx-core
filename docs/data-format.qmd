@@ -325,6 +325,31 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 1,25,9.4,0,.,.,0
 ```
 
+### A reset cancels every dose recorded before it
+
+A reset is placed at its **record**, and so is a dose. A dose whose record comes before
+the reset contributes nothing after it, even when its lagtime (`ALAG`, or a per-route
+`lag=`) would deliver it after the reset: a lagged bolus that has not yet arrived, and a
+lagged infusion or absorption window that has not yet opened, are both cancelled. This is
+what NONMEM does (#1587, measured against `ADVAN2` and `ADVAN13`,
+`nonmem_anchor/evid_reset_lag`). With `ALAG1 = 2`:
+
+```csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,9,.,1,100,1,1
+1,10,.,3,.,.,1
+1,12,.,0,.,.,0
+```
+
+The dose recorded at 9 would arrive at 11, after the reset at 10, and it is cancelled:
+the prediction at 12 is 0. With the reset at 8.5 instead, the dose is recorded after the
+reset and arrives at 11 as usual.
+
+A dose recorded **at** the reset's time is kept when its row comes after the reset row,
+including an `EVID=4` row's own dose. A dose row that comes before a reset row at the
+same `TIME` is cancelled, which follows row order as NONMEM does. Before #1587 ferx
+applied a lagged dose recorded before a reset whenever its arrival came after the reset.
+
 ### Stacked occasions with a restarting clock
 
 A common NONMEM idiom is to stack several independent dosing episodes under one

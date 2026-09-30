@@ -5822,6 +5822,33 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
     );
 }
 
+/// `ResetGate::live` is the conjunction of its two resets (#1587): a dose is dead if EITHER
+/// the `SS=1` record or the EVID=3/4 floor precedes it, each side alone. The EVID side is
+/// keyed on the record: the dose at 9 is dead at a segment starting at 12 (where a lag-3
+/// arrival would land) under a reset at 10, and live with no reset.
+#[test]
+fn reset_gate_is_dead_under_either_reset_alone() {
+    let live = |doses: &[DoseEvent], floor: f64, t: f64| -> Vec<bool> {
+        let g = ResetGate::at_segment(doses, floor, t);
+        (0..doses.len()).map(|k| g.live(doses, k)).collect()
+    };
+    let boluses = [
+        DoseEvent::new(9.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(11.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    assert_eq!(live(&boluses, f64::NEG_INFINITY, 12.0), [true, true]);
+    assert_eq!(live(&boluses, 10.0, 12.0), [false, true], "EVID=3/4 alone");
+    let with_ss = [
+        DoseEvent::new(9.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0),
+    ];
+    assert_eq!(
+        live(&with_ss, f64::NEG_INFINITY, 12.0),
+        [false, true],
+        "SS=1 alone"
+    );
+}
+
 #[test]
 fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
     let ode = transit_accumulator_spec(); // forcing on state 0 ≡ CMT 1

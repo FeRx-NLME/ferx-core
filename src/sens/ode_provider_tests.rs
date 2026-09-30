@@ -8999,23 +8999,18 @@ fn ode_provider_ss_lagtime_infusion_tvcov_matches_production() {
 }
 
 /// An **EVID=3 reset between a seeded SS dose's record and its lagged arrival**
-/// (#1121 review).
+/// (#1121 review; #1587).
 ///
-/// With the arrival-side re-equilibration gone, a reset inside the pre-arrival
-/// window is newly observable: it zeroes the seeded steady-state load, and the
-/// arrival then applies only `F·AMT` where it used to restore a full trough. That
-/// reading is the one consistent with the convention — the steady state is loaded
-/// at the record, so a later reset wipes it exactly as it wipes any other state —
-/// but it is a behaviour change, and nothing covered it.
+/// The steady state is loaded at the record (#1121), so the reset wipes it. Since #1587 the
+/// reset also **cancels the dose's arrival**: its record precedes the reset, and NONMEM
+/// cancels such a dose outright (`nonmem_anchor/evid_reset_lag`, ID 13). Before #1587 the
+/// arrival still applied `F·AMT`. With that dose alone the subject would be identically zero
+/// after the reset, and a parity check between two zeros tests nothing — so a plain oral dose
+/// recorded *after* the reset keeps the post-reset trajectory live, and the test asserts the
+/// cancelled SS dose leaves exactly what deleting it leaves.
 ///
-/// Deliberately an oral **bolus**, not the infusion fixture above. The infusion
-/// form of this geometry trips a *separate*, pre-existing defect in the twin: an
-/// `EVID=3` reset placed before a lagged infusion's arrival changes `∂f/∂η_LAG`
-/// even when the reset is a physical no-op (the state is already zero). Measured
-/// at `−12.53` against an FD reference of `+7.14`, with flat covariates and a
-/// non-steady-state dose, so it is neither this issue's nor time-varying
-/// covariates'; tracked separately. Using a bolus here keeps this test measuring
-/// the thing it was written for instead of inheriting that failure.
+/// Deliberately an oral **bolus**, not the infusion fixture above; the infusion form of this
+/// cell is `ode_provider_reset_before_a_lagged_infusion_arrival_cancels_it_value_and_gradient`.
 #[test]
 fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production() {
     let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
@@ -9025,9 +9020,13 @@ fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_productio
     let eta = [0.12_f64, 0.05];
 
     let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 11.0]);
-    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+        // Recorded after the reset: live, arriving ≈ 1.03, residual present at 4 and 11.
+        DoseEvent::new(0.5, 100.0, 1, 0.0, false, 0.0),
+    ];
     subject.reset_times = vec![0.35];
-    subject.dose_covariates = vec![wt(70.0)];
+    subject.dose_covariates = vec![wt(70.0), wt(90.0)];
     subject.obs_covariates = vec![wt(70.0), wt(140.0), wt(150.0), wt(75.0)];
 
     let lag = theta[3] * eta[1].exp();
@@ -9043,6 +9042,32 @@ fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_productio
     assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
     assert!(subject.has_tv_covariates());
     assert!(ode_tvcov_supported(&model, &subject));
+
+    // Cancelled ≡ deleted after the reset (#1587); the post-reset reads are live.
+    let mut deleted = subject.clone();
+    deleted.doses.remove(0);
+    deleted.dose_covariates.remove(0);
+    let (with_ss, without) = (
+        compute_predictions_with_tv(&model, &subject, &theta, &eta),
+        compute_predictions_with_tv(&model, &deleted, &theta, &eta),
+    );
+    assert!(
+        with_ss[0] > 1.0,
+        "the seeded SS state is read before the reset: {with_ss:?}"
+    );
+    // Obs 1 (t = 1) precedes the live dose's arrival and reads 0 either way; 4 and 11 carry
+    // it (and would carry the cancelled SS dose's pulse, were it kept).
+    assert!(without[2] > 0.1 && without[3] > 0.1, "{without:?}");
+    for j in 1..with_ss.len() {
+        assert!(with_ss[j].is_finite(), "obs {j}: {with_ss:?}");
+        assert!(
+            (with_ss[j] - without[j]).abs() <= 1e-10 * (1.0 + without[j].abs()),
+            "obs {j}: the SS dose recorded before the reset must be cancelled (#1587): \
+             {} vs {} without it",
+            with_ss[j],
+            without[j]
+        );
+    }
 
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
