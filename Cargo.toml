@@ -71,6 +71,7 @@ exclude = [
   "SDLC.md",
   "VI_VALIDATION.md",
   "codecov.yml",
+  ".serena/*",
 ]
 
 [features]
