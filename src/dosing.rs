@@ -1185,9 +1185,9 @@ pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 
 /// still running at it, as NONMEM does. The ODE absorption forcing skips non-live doses
 /// too, so it stops an infusion into the forcing compartment; it only ever sees record =
 /// arrival (`SS=1` + lag into a forcing is rejected up front). The state-propagating
-/// engines (the ODE walkers' compartment states, the analytic event-driven walk) do not
-/// consult this for infusions or pending lagged doses yet: #1586, #1587. O(n), no
-/// allocation.
+/// engines (the ODE walkers, the analytic event-driven walk, and their dual twins) read it
+/// through `ResetGate` at every arrival (#1588) and for every infusion and zero-order
+/// window's membership (#1586). O(n), no allocation.
 #[inline]
 pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
     let mut best: Option<usize> = None;

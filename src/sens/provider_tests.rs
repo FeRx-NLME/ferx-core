@@ -13860,3 +13860,113 @@ fn an_ss_record_wipes_a_preceding_or_pending_dose_on_the_analytic_event_walk() {
     }
     println!("#1588 analytic event walk vs live-only twin: worst rel {worst:.3e}");
 }
+
+/// **T6 (analytic leg), #1586.** `Dual2`-vs-FD parity, with a moving window edge, of a
+/// central infusion an `SS=1` record stops. The analytic walk's single `lagtime` slot
+/// would lag the depot `SS=1` dose too, so the moving edge here is a modeled duration
+/// (`RATE=-2` → `D2 = TVD2·exp(η_D2)`): the window end moves with `η_D2`.
+///
+/// * running across the record — infused at 4 h, `D2 ≈ 10.4`, `SS=1` depot bolus at 10 h
+///   (`nonmem_anchor/ss_infusion_stop` ID 3's shape): stopped at 10 h, so from the record
+///   on value and gradient equal the infusion-free twin's — the window's moving end at
+///   14.4 h is gone with it;
+/// * a modeled infusion row before a co-timed `SS=1` row (ID 4's): never runs;
+/// * the same row after it (ID 5's, the live control): runs, with a live `∂f/∂η_D2`.
+///
+/// One observation sits **exactly on** the stopped window's moving end (4 + D2). Away from
+/// such a coincidence a dead boundary's jet is harmless: the `±∂D2` it threads into the two
+/// sub-intervals either side of it compose back to a fixed-length flow when no rate changes
+/// there. On the sample it is not: the observation's own break picks up the jet.
+///
+/// Mutations (each measured): a reset gate dropped from `active_rates_g` keeps the rate on
+/// past the record (value and gradient vs FD of the production walk, and vs the twin);
+/// dropped from `obs_boundary_correction`, the on-boundary sample is stepped back over
+/// `Δ = bound(p) − t`, adding `−ẋ·∂D2/∂η` to a derivative that is 0; dropped from
+/// `moving_bounds`, the sample's break carries the dead end's jet.
+#[test]
+fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta TVD2(10.0, 0.1, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D2 ~ 0.04
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  D2 = TVD2 * exp(ETA_D2)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#,
+    )
+    .expect("parse");
+    let theta = vec![2.0, 20.0, 0.15, 10.0];
+    let eta = vec![0.05, 0.04];
+    const ETA_D2: usize = 1;
+    let d2 = theta[3] * f64::exp(eta[ETA_D2]);
+    // 4 + D2 ≈ 14.4: the across-the-record window's (stopped) moving end, sampled exactly.
+    let times = [6.0, 9.0, 11.0, 4.0 + d2, 16.0, 21.0];
+    let inf = |t: f64| {
+        DoseEvent::modeled(
+            t,
+            100.0,
+            2,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        )
+    };
+    let ss = DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0);
+    let across = subject_with_doses_and_resets(vec![inf(4.0), ss.clone()], &times, vec![]);
+    let before = subject_with_doses_and_resets(vec![inf(10.0), ss.clone()], &times, vec![]);
+    let after = subject_with_doses_and_resets(vec![ss.clone(), inf(10.0)], &times, vec![]);
+    let none = subject_with_doses_and_resets(vec![ss], &times, vec![]);
+    assert!(4.0 + d2 > 10.0, "the window runs across the record");
+
+    for s in [&across, &before, &after, &none] {
+        check_full_provider_vs_fd(&model, s, &theta, &eta);
+    }
+    let sens = |s: &Subject| subject_sensitivities(&model, s, &theta, &eta).expect("analytic");
+    let (a, b, c, z) = (sens(&across), sens(&before), sens(&after), sens(&none));
+    // Live before the record (9 h, inside the running window: the duration-defined rate
+    // `amt/D2` moves with η_D2) and in the control.
+    assert!(
+        a.obs[1].df_deta[ETA_D2].abs() > 1e-3 && a.obs[1].f > z.obs[1].f + 0.1,
+        "the window must be live before the record: f {} vs {}, ∂f/∂η_D2 {}",
+        a.obs[1].f,
+        z.obs[1].f,
+        a.obs[1].df_deta[ETA_D2]
+    );
+    assert!(
+        c.obs[4].df_deta[ETA_D2].abs() > 1e-3,
+        "the control's window end moved with η_D2: {}",
+        c.obs[4].df_deta[ETA_D2]
+    );
+    // From the record on, a stopped or never-run window leaves nothing behind.
+    for (j, t) in times.iter().enumerate().skip(2) {
+        for (name, x) in [("across", &a), ("before", &b)] {
+            approx::assert_relative_eq!(x.obs[j].f, z.obs[j].f, max_relative = 1e-12);
+            for k in 0..model.n_eta {
+                assert!(
+                    (x.obs[j].df_deta[k] - z.obs[j].df_deta[k]).abs() < 1e-12,
+                    "{name} t={t}: ∂f/∂η[{k}] {} vs the infusion-free {}",
+                    x.obs[j].df_deta[k],
+                    z.obs[j].df_deta[k]
+                );
+            }
+        }
+        assert!(
+            (c.obs[j].f - z.obs[j].f).abs() > 0.1,
+            "the row after the record runs: {} vs {}",
+            c.obs[j].f,
+            z.obs[j].f
+        );
+    }
+}

@@ -12144,3 +12144,209 @@ fn ode_provider_ss_record_wipes_a_preceding_or_pending_dose_matches_production()
     }
     println!("#1588 dual/production vs live-only twin: worst rel {worst:.3e}");
 }
+
+// ---------------------------------------------------------------------------
+// #1586 — an `SS=1` record stops a lagged infusion window recorded before it, on the dual
+// walk too: value, gradient and Hessian, with the window's onset a moving boundary.
+// ---------------------------------------------------------------------------
+
+/// `nonmem_anchor/ss_infusion_stop`'s model with an estimated central lag: `ALAG2` carries
+/// `η_LAG`, so a central infusion's window start (and end) moves with it.
+const ORAL_CENTRAL_LAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(2.0,  0.01, 50.0)
+  theta TVV(20.0,  0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta TVLAG(4.0, 0.01, 20.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_LAG ~ 0.04
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG2 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// **T6 (ODE leg).** `Dual2`-vs-FD parity of the production predictor, with a moving window
+/// edge, on the two shapes of `nonmem_anchor/ss_infusion_stop`:
+///
+/// * **ID 13** — a central infusion recorded at 4 h (window ≈ `[8.3, 18.3]` under
+///   `ALAG2 = 4·e^0.08`) running across an `SS=1` depot bolus at 10 h. NONMEM stops it at
+///   the record, so from 10 h the state is the record's own steady state and `∂f/∂η_LAG` is
+///   **0**, while before the record (9 h, inside the window) it is live.
+/// * **ID 12** — the same infusion recorded at 8 h (window ≈ `[12.3, 22.3]`, opening after
+///   the record its record precedes): cancelled outright, so every number equals the
+///   infusion-free twin's.
+///
+/// Mutations this must die on: an infusion-end saltation (`K_INF_END`) not gated by the
+/// `SS=1` record (ID 13 keeps a `rate·δlag` jet from 18.3 h, read at 21 h), and a lagged
+/// rate-on saltation (`K_DOSE`) not gated by it (ID 12 gains a jet at 12.3 h for a rate
+/// that never turns on). Both are checked against central FD of
+/// `compute_predictions_with_tv` — the production value path — *and* against the
+/// infusion-free twin, so a defect the dual shared with its own value path still fails.
+#[test]
+fn ode_provider_ss_record_stops_a_lagged_infusion_window_value_gradient_and_hessian() {
+    let model = parse_model_string(ORAL_CENTRAL_LAG_ODE).expect("parse");
+    let theta = vec![2.0, 20.0, 0.15, 4.0];
+    let eta = vec![0.05, 0.08];
+    const ETA_LAG: usize = 1;
+    let times = [9.0, 11.0, 15.0, 21.0, 30.0];
+    let mk = |inf_record: Option<f64>| {
+        let mut s = bolus_subject(&times);
+        s.obs_cmts = vec![2; times.len()];
+        s.doses = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0)];
+        if let Some(t) = inf_record {
+            s.doses
+                .insert(0, DoseEvent::new(t, 100.0, 2, 10.0, false, 0.0));
+        }
+        s
+    };
+    let id13 = mk(Some(4.0));
+    let id12 = mk(Some(8.0));
+    let none = mk(None);
+    // The realised windows straddle the record as the cells need.
+    let lag = theta[3] * f64::exp(eta[ETA_LAG]);
+    assert!(
+        4.0 + lag < 10.0 && 4.0 + lag + 10.0 > 10.0,
+        "ID 13 runs across the record"
+    );
+    assert!(8.0 + lag > 10.0, "ID 12 opens after the record");
+    assert!(
+        4.0 + lag + 10.0 < times[3] && 8.0 + lag < times[2],
+        "the ends and onsets this guards are upstream of an observation"
+    );
+
+    for s in [&id13, &id12, &none] {
+        check_vs_production(&model, s, &theta, &eta);
+        check_hessian_vs_production_fd(&model, s, &theta, &eta);
+    }
+
+    let a = ode_subject_sensitivities(&model, &id13, &theta, &eta).expect("supported");
+    let b = ode_subject_sensitivities(&model, &id12, &theta, &eta).expect("supported");
+    let c = ode_subject_sensitivities(&model, &none, &theta, &eta).expect("supported");
+    // Live before the record: 9 h is inside ID 13's window, whose onset moved with η_LAG.
+    assert!(
+        a.obs[0].df_deta[ETA_LAG].abs() > 1e-2,
+        "ID 13's lag axis must be live before the record: {}",
+        a.obs[0].df_deta[ETA_LAG]
+    );
+    // From the record on, nothing of either infusion survives, in value or derivative: the
+    // same numbers as the infusion-free twin.
+    for (j, t) in times.iter().enumerate().skip(1) {
+        for (name, x) in [("ID 13", &a), ("ID 12", &b)] {
+            approx::assert_relative_eq!(x.obs[j].f, c.obs[j].f, max_relative = 1e-9);
+            for k in 0..model.n_eta {
+                assert!(
+                    (x.obs[j].df_deta[k] - c.obs[j].df_deta[k]).abs() < 1e-9,
+                    "{name} t={t}: a window the `SS=1` record stopped moved ∂f/∂η[{k}]: \
+                     {} vs {}",
+                    x.obs[j].df_deta[k],
+                    c.obs[j].df_deta[k]
+                );
+            }
+        }
+    }
+}
+
+/// **T6 (ODE leg, zero-order), #1586.** The zero-order twin of
+/// `ode_provider_ss_record_stops_a_lagged_infusion_window_value_gradient_and_hessian`, with
+/// the moving edge an estimated duration (`DUR = TVDUR·exp(η_DUR)`): a `zero_order` window
+/// into the depot opened at 5 h (`nonmem_anchor/ss_infusion_stop` ID 20's shape) runs across
+/// an `SS=1` bolus into central at 10 h, which stops it. Its end at `5 + DUR ≈ 13.3` h is
+/// then a boundary nothing turns off, so from the record on value and gradient equal the
+/// window-free twin's. Mutation this dies on: the zero-order end cohort (`K_ZO_END`) not
+/// gated by the record injects a `rate·δdur` saltation at 13.3 h for a rate that is no
+/// longer on — the anchor's fixed `D1 = 8` carries no `δdur` and cannot see it.
+#[test]
+fn ode_provider_ss_record_stops_a_zero_order_window_with_a_moving_end() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(2.0,  0.01, 50.0)
+  theta TVV(20.0,  0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta TVDUR(8.0, 0.1, 50.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_DUR ~ 0.04
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#,
+    )
+    .expect("parse");
+    let theta = vec![2.0, 20.0, 0.15, 8.0];
+    let eta = vec![0.05, 0.1];
+    const ETA_DUR: usize = 1;
+    let times = [9.0, 11.0, 15.0, 21.0];
+    let mk = |zo: bool| {
+        let mut s = bolus_subject(&times);
+        s.obs_cmts = vec![2; times.len()];
+        s.doses = vec![DoseEvent::new(10.0, 50.0, 2, 0.0, true, 12.0)];
+        if zo {
+            s.doses
+                .insert(0, DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
+        }
+        s
+    };
+    let (with_zo, none) = (mk(true), mk(false));
+    let w_end = 5.0 + theta[3] * f64::exp(eta[ETA_DUR]);
+    assert!(
+        w_end > 10.0 && w_end < times[2],
+        "the window runs across the record and ends before an observation: {w_end}"
+    );
+
+    for s in [&with_zo, &none] {
+        check_vs_production(&model, s, &theta, &eta);
+        check_hessian_vs_production_fd(&model, s, &theta, &eta);
+    }
+    let a = ode_subject_sensitivities(&model, &with_zo, &theta, &eta).expect("supported");
+    let z = ode_subject_sensitivities(&model, &none, &theta, &eta).expect("supported");
+    // Live before the record: 9 h is inside the window, whose rate `amt/DUR` moves with η.
+    assert!(
+        a.obs[0].df_deta[ETA_DUR].abs() > 1e-3,
+        "the window's η_DUR axis must be live before the record: {}",
+        a.obs[0].df_deta[ETA_DUR]
+    );
+    for (j, t) in times.iter().enumerate().skip(1) {
+        approx::assert_relative_eq!(a.obs[j].f, z.obs[j].f, max_relative = 1e-9);
+        for k in 0..model.n_eta {
+            assert!(
+                (a.obs[j].df_deta[k] - z.obs[j].df_deta[k]).abs() < 1e-9,
+                "t={t}: a zero-order window the `SS=1` record stopped moved ∂f/∂η[{k}]: \
+                 {} vs {}",
+                a.obs[j].df_deta[k],
+                z.obs[j].df_deta[k]
+            );
+        }
+    }
+}

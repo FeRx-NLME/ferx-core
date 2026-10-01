@@ -839,8 +839,9 @@ fn propagate_bounds_g<T: PkNum>(
     // Every break whose dual position is not simply its f64 value: each post-reset dose
     // contributes its arrival `τ_k`, and an infusing dose additionally contributes its
     // window end `τ_k + D` (the modeled `D`'s jet on top of the arrival's). Doses recorded
-    // before a reset are skipped exactly as the rate-accumulation loop below skips them
-    // (`dosing::evid_reset_live`, keyed on the record since #1587), so a boundary coinciding
+    // before a reset — EVID=3/4 (#1587) or an `SS=1` record this interval has reached
+    // (#1586) — are skipped exactly as the rate-accumulation loop below skips them (one
+    // `ResetGate`, keyed on the record, built at the interval start), so a boundary coinciding
     // with a reset break does not thread a spurious jet into the post-reset window (#486
     // review #3), and a cancelled lagged dose's arrival moves nothing.
     //
@@ -854,9 +855,14 @@ fn propagate_bounds_g<T: PkNum>(
     // was pre-#486 — the ordinary fixed-dose subject (the hot path) pays nothing.
     let has_lag = !dose_lag_dual.is_empty();
     let mut moving_bounds: Vec<(f64, T)> = Vec::new();
+    let gate = crate::ode::predictions::ResetGate::at_segment(
+        doses,
+        reset_floor,
+        bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
+    );
     for (k, d) in doses.iter().enumerate() {
         let (t_start, dual_start) = dose_start(k, d);
-        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
+        if !gate.live(doses, k) {
             continue;
         }
         // The arrival moves only under a lagtime.
@@ -936,12 +942,20 @@ fn active_rates_g<T: PkNum>(
     let mut rate_periph1 = T::from_f64(0.0);
     let mut rate_periph2 = T::from_f64(0.0);
     let mut rate_depot = T::from_f64(0.0);
+    // The value walk's gate (`pk::event_driven::active_rates_at`), built the same way: once
+    // per call, at `mid`. (`propagate_bounds_g`'s `moving_bounds` builds its own at the
+    // interval start instead. No `SS=1` record lies inside an interval — every dose record is
+    // an event — so the two can differ only on a sliver interval that ends on a record and
+    // starts just over `EVENT_MATCH_TOL` below it, whose telescoping jet error is O(its
+    // width).)
+    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
     for (k, d) in doses.iter().enumerate() {
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         let t_end = t_start + d.duration;
-        // Recorded before the reset: off, however late its lagged window opens (#1587).
-        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
+        // Recorded before a reset — EVID=3/4 (#1587) or a reached `SS=1` record (#1586):
+        // off, however late its lagged window opens.
+        if !gate.live(doses, k) {
             continue;
         }
         let started = if strict_start {
@@ -1094,10 +1108,13 @@ fn obs_boundary_correction<T: PkNum>(
     t: f64,
 ) -> Option<(T, bool)> {
     let has_lag = !dose_lag_dual.is_empty();
+    // A window stopped by a reset — EVID=3/4 or an `SS=1` record reached at `t` (#1586) — has
+    // no moving boundary to correct.
+    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, t);
     for (k, d) in doses.iter().enumerate() {
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
-        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
+        if !gate.live(doses, k) {
             continue;
         }
         let dual_start = match dose_lag_dual.get(k) {

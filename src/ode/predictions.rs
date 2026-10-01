@@ -1684,6 +1684,10 @@ pub(crate) fn active_infusions(
     reset_floor: f64,
     n_states: usize,
 ) -> Vec<(usize, f64)> {
+    // Both resets reached by this segment, built once (#1586): an infusion recorded before
+    // an `SS=1` record or an EVID=3/4 reset is off, whether its window is running across the
+    // record, pending behind a lag, or the #1121 residual of an earlier `SS=1` infusion.
+    let gate = ResetGate::at_segment(doses, reset_floor, t_start);
     doses
         .iter()
         .enumerate()
@@ -1700,14 +1704,12 @@ pub(crate) fn active_infusions(
             let (rate_eff, dur_eff) = d.bioavailable_infusion(f_bio);
             let start = d.time + lag;
             let end = start + dur_eff;
-            // Infusions recorded before the most recent system reset (EVID=3/4)
-            // are turned off, the same way the reset zeros the compartments — keyed
-            // on the record, so a lagged window opening after the reset is off too
-            // (#1587).
-            if crate::dosing::evid_reset_live(d.time, reset_floor)
-                && start <= t_start + INFUSION_EPS
-                && end >= t_end - INFUSION_EPS
-            {
+            // Infusions recorded before the most recent reset — EVID=3/4 (#1587) or a
+            // reached `SS=1` record (#1586) — are turned off, the same way the reset zeros
+            // the compartments. Keyed on the record, so a lagged window opening after the
+            // reset is off too.
+            let live = gate.live(doses, k);
+            if live && start <= t_start + INFUSION_EPS && end >= t_end - INFUSION_EPS {
                 return Some((d.cmt_idx(), rate_eff));
             }
             // A seeded steady-state infusion (#1121) whose *previous* cycle is
@@ -1719,17 +1721,18 @@ pub(crate) fn active_infusions(
             // only knows about the dose's own arrival. Reset-aware on the record
             // time for the same reason the real window is: an EVID=3/4 between
             // the record and the arrival zeros the seeded state, and a rate that
-            // survived it would refill a compartment the reset just emptied.
+            // survived it would refill a compartment the reset just emptied — and a later
+            // `SS=1` record stops it the same way (#1586).
             let residual_end = ss_residual_infusion_end(d, lag, f_bio)?;
-            (crate::dosing::evid_reset_live(d.time, reset_floor)
-                && d.time <= t_start + INFUSION_EPS
-                && residual_end >= t_end - INFUSION_EPS)
+            (live && d.time <= t_start + INFUSION_EPS && residual_end >= t_end - INFUSION_EPS)
                 .then_some((d.cmt_idx(), rate_eff))
         })
         .collect()
 }
 
-/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end, record)`,
+/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end, k)`, `k` the
+/// dose's index in the subject's dose list (the reset gate needs the row, not just the
+/// record time: a ZO row before a co-timed `SS=1` row is reset, one after it is not, #1586),
 /// the constant `rate = F·amt/dur` delivered over
 /// `[w_start, w_end] = [time+lag, time+lag+dur]`. The tuple shape mirrors
 /// [`gated_infusions`].
@@ -1744,7 +1747,7 @@ pub(crate) fn active_infusions(
 /// windows once and reuses them across segments; the dense paths re-derive them
 /// per segment, but always from that same fixed snapshot, so every segment sees
 /// byte-identical edges and rate (the cost is a small, often-empty `Vec`).
-type ZeroOrderWindow = (usize, f64, f64, f64, f64);
+type ZeroOrderWindow = (usize, f64, f64, f64, usize);
 
 /// Build the per-dose [`ZeroOrderWindow`]s for a subject. `dur_frac_for_dose`
 /// yields the floored `dur` **and pathway fraction `frac`** for dose `k` from *its*
@@ -1784,7 +1787,7 @@ fn zero_order_windows(
             f_bio * d.amt * frac / dur,
             w_start,
             w_start + dur,
-            d.time,
+            k,
         ));
     }
     out
@@ -1809,19 +1812,26 @@ fn zero_order_windows(
 /// [`active_infusions`] relies on it for infusion windows. Both edges matter and the
 /// filter is two-sided: bracketing only `w_end` leaves the segment straddling
 /// `w_start` failing containment, which drops the rate for the entire window rather
-/// than mis-resolving an edge (#1171). `reset_floor` turns off the window of every dose
-/// **recorded** before the most recent reset (EVID=3/4), wherever its lagged window
-/// opens (#1587).
+/// than mis-resolving an edge (#1171). The segment's [`ResetGate`] over `doses` turns off
+/// the window of every dose **recorded** before the most recent reset — EVID=3/4 at
+/// `reset_floor` (#1587) or an `SS=1` record the segment has reached (#1586) — wherever its
+/// lagged window opens.
 fn active_zero_order_inputs(
     windows: &[ZeroOrderWindow],
+    doses: &[DoseEvent],
     t_start: f64,
     t_end: f64,
     reset_floor: f64,
 ) -> Vec<(usize, f64)> {
+    // Most subjects have no zero-order window: skip the gate's O(n) cutoff scan for them.
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    let gate = ResetGate::at_segment(doses, reset_floor, t_start);
     windows
         .iter()
-        .filter(|&&(_, _, w_start, w_end, record)| {
-            crate::dosing::evid_reset_live(record, reset_floor)
+        .filter(|&&(_, _, w_start, w_end, k)| {
+            gate.live(doses, k)
                 && w_start <= t_start + INFUSION_EPS
                 && w_end >= t_end - INFUSION_EPS
         })
@@ -2064,16 +2074,27 @@ enum InfusionInput {
 /// true: a caller that applies no forcing passes `&[]` and keeps its plain `+rate`, as
 /// [`active_infusions`]' EKF caller does, and hard-wiring the spec would suppress a rate
 /// nothing replaces.
+///
+/// `gate` is the segment's [`ResetGate`], and it is this list's **one** reset test
+/// (#1586): a window whose dose record precedes an `SS=1` record or an EVID=3/4 reset the
+/// segment has reached is dropped here, whether it was registered before the reset,
+/// co-timed in an earlier row, or behind a lag. The walkers register every arrival's
+/// window unconditionally and never clear the list at a reset, so there is no second gate
+/// for this one to disagree with.
 fn gated_infusions(
     input_rate: &[crate::pk::absorption::InputRateForcing],
     active: &[(usize, f64, f64)],
     doses: &[DoseEvent],
     dose_f_bio: &[f64],
     n_states: usize,
+    gate: &ResetGate,
 ) -> Vec<(usize, f64, f64, f64)> {
     active
         .iter()
         .filter_map(|&(di, t_start_inf, t_end_inf)| {
+            if !gate.live(doses, di) {
+                return None;
+            }
             let dose = &doses[di];
             // The one membership rule, shared with `active_infusions` (#1196 step 3):
             // real infusion, in-range compartment (`CMT=0` and `cmt > n_states` are
@@ -2317,9 +2338,9 @@ impl ResetGate {
     /// Also the arrival gate of every state engine (#1588, #1587): a dose whose record
     /// precedes a reset reached at its arrival break changes nothing there — no bolus
     /// jump, no arrival re-equilibration, and on the dual walks no lag saltation. The
-    /// absorption forcing reads it per segment. Infusion windows into compartment states
-    /// key their own `reset_floor` test on the record the same way; the `SS=1` stop of
-    /// such a window is #1586.
+    /// absorption forcing reads it per segment, and every infusion and zero-order window's
+    /// membership reads it too (#1586): a window recorded before a reached reset is off,
+    /// running, pending behind a lag, or the #1121 residual of an earlier `SS=1` infusion.
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
@@ -3530,7 +3551,8 @@ fn integrate_segment(
     let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, reset_floor);
+    let zero_order =
+        active_zero_order_inputs(&zo_windows, &subject.doses, t_start, t_end, reset_floor);
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
@@ -6954,7 +6976,8 @@ pub fn ode_predictions_event_driven(
             // so the window edge and the containment boundary can't drift apart,
             // and the constant rate is fixed at dose time (mass-exact under
             // time-varying covariates).
-            let zero_order = active_zero_order_inputs(&zo_windows, cur_t, t_event, reset_floor);
+            let zero_order =
+                active_zero_order_inputs(&zo_windows, &subject.doses, cur_t, t_event, reset_floor);
             let wrapped_rhs = wrap_rhs_with_forcings(
                 ode,
                 &subject.doses,
@@ -7419,8 +7442,8 @@ pub fn ode_predictions_with_states(
 
         // Apply boluses and SS doses at t_eff = dose.time + lagtime.
         // A dose whose record precedes the `SS=1` record reached here, in (time, row
-        // order), was wiped by that reset (#1588): no equilibration, no bolus. Its
-        // infusion window is still registered (#1586). No EVID=3/4 floor: this walk is
+        // order), was wiped by that reset (#1588): no equilibration, no bolus, and its
+        // infusion window is off (#1586, `gated_infusions`). No EVID=3/4 floor: this walk is
         // never handed a reset subject (`compute_predictions_with_states` routes one to
         // `ode_predictions_event_driven_with_states`).
         let gate = ResetGate::at_segment(&subject.doses, f64::NEG_INFINITY, t_start);
@@ -7527,10 +7550,17 @@ pub fn ode_predictions_with_states(
             &subject.doses,
             &dose_f_bio,
             n,
+            &gate,
         );
         // Zero-order absorption windows covering this segment (#504): constant
         // `F·amt/dur` injected alongside the gated infusions (empty otherwise).
-        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
+        let zero_order = active_zero_order_inputs(
+            &zo_windows,
+            &subject.doses,
+            t_start,
+            t_end,
+            f64::NEG_INFINITY,
+        );
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
@@ -7764,7 +7794,6 @@ fn apply_segment_boundary(
     for &rt in &subject.reset_times {
         if (rt - t_start).abs() < EVENT_MATCH_TOL {
             *u = ode.initial_state(pk_params_flat);
-            active_infusions.clear();
             break;
         }
     }
@@ -7810,8 +7839,8 @@ fn apply_segment_boundary(
 
     // The resets reached here (#1588, #1587), as in `ode_predictions_event_driven`: a dose
     // whose record precedes the `SS=1` record or the EVID=3/4 floor neither equilibrates
-    // nor jumps. Its infusion window is not registered when the EVID=3/4 reset is what
-    // cancelled it; one stopped only by an `SS=1` record still is (#1586).
+    // nor jumps, and its infusion window is off from this segment on (#1586) — dropped by
+    // `gated_infusions` under this same gate.
     let gate = ResetGate::at_segment(&subject.doses, reset_floor, t_start);
     for (dose_idx, dose) in subject.doses.iter().enumerate() {
         if applied[dose_idx] {
@@ -7843,8 +7872,9 @@ fn apply_segment_boundary(
                 // else: the dose feeds a built-in input-rate function
                 // (transit/etc.) and is delivered as R_in over time by the
                 // wrapped RHS below — no bolus here (would double-count).
-            } else if crate::dosing::evid_reset_live(dose.time, reset_floor) {
-                // F-scaled infusion end (#419), matching the break-time list.
+            } else {
+                // F-scaled infusion end (#419), matching the break-time list. Registered
+                // live or not: `gated_infusions` drops a reset window per segment (#1586).
                 let (_, dur_eff) = dose.bioavailable_infusion(f);
                 let end_t = t_eff + dur_eff;
                 active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
@@ -7866,6 +7896,7 @@ fn apply_segment_boundary(
         &subject.doses,
         dose_f_bio,
         n,
+        &gate,
     );
 
     // `reset_floor` (above) also turns off, for the input-rate forcing, every dose recorded
@@ -7874,7 +7905,8 @@ fn apply_segment_boundary(
     // Zero-order absorption windows covering this segment (#504): constant
     // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened
     // pre-reset is off), injected alongside the gated infusions.
-    let zero_order = active_zero_order_inputs(zo_windows, t_start, t_end, reset_floor);
+    let zero_order =
+        active_zero_order_inputs(zo_windows, &subject.doses, t_start, t_end, reset_floor);
     // Hoist the input-rate constants once per segment (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
 

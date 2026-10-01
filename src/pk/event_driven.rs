@@ -1159,8 +1159,10 @@ fn pk_for<'a>(
 /// `d.rate`/`d.duration` already carry `F` (#419): the rate is injected as-is and
 /// the window `[t_start, t_start + d.duration]` is the `F`-reshaped one. A dur->0
 /// infusion still limits to the `F·AMT` bolus. `dose_lagtimes[k]` shifts dose `k`'s
-/// window; `reset_floor` turns off infusions recorded before the last EVID=3/4
-/// reset, even a lagged one whose window opens after it (#1587). The depot channel (`cmt 1`, #400) is a zero-order release into
+/// window. An infusion recorded before a reset reached at `mid` is off — the last EVID=3/4
+/// reset `reset_floor` (#1587) or an `SS=1` record (#1586), through one
+/// `ResetGate` built once per call — even a lagged one whose
+/// window opens after it. The depot channel (`cmt 1`, #400) is a zero-order release into
 /// the oral depot followed by first-order `ka` absorption — distinct from the
 /// central channel (cmt 2, depot bypass).
 fn active_rates_at(
@@ -1174,6 +1176,7 @@ fn active_rates_at(
     let mut rate_periph1 = 0.0;
     let mut rate_periph2 = 0.0;
     let mut rate_depot = 0.0;
+    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
     for (k, d) in doses.iter().enumerate() {
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
@@ -1187,10 +1190,11 @@ fn active_rates_at(
         // a rate that survived it would refill what the reset just emptied.
         let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
             .is_some_and(|end| d.time <= mid && end >= mid);
-        // Infusions recorded before the last reset are turned off — keyed on the record,
-        // so a lagged window opening after the reset is off too (#1587). This also covers
-        // the seeded residual above, whose own floor is the record.
-        if !crate::dosing::evid_reset_live(d.time, reset_floor) {
+        // Infusions recorded before the last reset — EVID=3/4 (#1587) or `SS=1` (#1586) —
+        // are turned off, keyed on the record, so a lagged window opening after the reset
+        // is off too. This also covers the seeded residual above, whose own floor is the
+        // record: a later `SS=1` record stops it.
+        if !gate.live(doses, k) {
             continue;
         }
         if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
@@ -2140,6 +2144,97 @@ mod tests {
             fast[6] > 0.0 && fast[7] == 0.0 && fast[10] > 0.0,
             "{fast:?}"
         );
+    }
+
+    /// #1586: an `SS=1` record stops an infusion running across it, on **both** sides of
+    /// the #1477 schedule cache. The fixture is `nonmem_anchor/ss_infusion_stop`'s ID 2: a
+    /// depot infusion over 0–20 h and an `SS=1` depot bolus at 10 h, under which NONMEM
+    /// stops the infusion at the record. The precomputed rates read the depot rate 10
+    /// before the record and 0 after it; the per-call scan agrees bit for bit; and both
+    /// equal NONMEM's `ADVAN2` `PRED` (`nonmem_anchor/results/ss_infusion_stop.sdtab`, ID
+    /// 2, which the closed form of the rule reproduces to 4.4e-15). (Superposition is no
+    /// oracle here: a depot infusion is the event walk's alone.) So a gate dropped from
+    /// `active_rates_at` reddens the rate and value assertions, and a gate applied to only
+    /// one of the two paths reddens the bit-identity.
+    #[test]
+    fn an_ss_record_stops_a_running_infusion_in_the_cached_and_the_scanned_rates() {
+        let mut pk = pk_one(2.0, 20.0);
+        pk.values[crate::types::PK_IDX_KA] = 0.15;
+        let doses = vec![
+            DoseEvent::new(0.0, 200.0, 1, 10.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        let obs_times = vec![5.0, 9.5, 10.5, 15.0, 21.0, 24.0];
+        let nonmem = [
+            6.2570563172064453E-01,
+            1.6039692802659027E+00,
+            3.7463032710843924E+00,
+            4.5306314936372178E+00,
+            3.6939077991145917E+00,
+            3.0926472497801702E+00,
+        ];
+        let subj = make_subject(doses, obs_times.clone());
+        let lag = vec![0.0; subj.doses.len()];
+        let sched = EventSchedule::for_subject(&subj, PkModel::OneCptOral, &subj.doses, &lag);
+        assert!(sched.rates_valid_for(&subj.doses));
+        let depot_rate_ending_at = |t: f64| -> Vec<f64> {
+            let (i, _) = sched
+                .events
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.kind == EventKind::Obs && e.time == t)
+                .unwrap_or_else(|| panic!("obs at {t} h"));
+            sched.rates_per_interval[i - 1]
+                .iter()
+                .map(|r| r[3])
+                .collect()
+        };
+        assert!(
+            depot_rate_ending_at(9.5).iter().all(|&r| r == 10.0),
+            "before the record the infusion runs: {:?}",
+            depot_rate_ending_at(9.5)
+        );
+        for t in [10.5, 15.0] {
+            assert!(
+                depot_rate_ending_at(t).iter().all(|&r| r == 0.0),
+                "after the `SS=1` record at 10 h the infusion is stopped (t = {t}): {:?}",
+                depot_rate_ending_at(t)
+            );
+        }
+
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+        let fast = event_driven_predictions_with_schedule(
+            PkModel::OneCptOral,
+            &subj,
+            &sched,
+            &pk_dose,
+            &pk_obs,
+            &[],
+        );
+        let mut scan = sched.clone();
+        scan.rates_dose_key.clear();
+        assert!(!scan.rates_valid_for(&subj.doses));
+        let slow = event_driven_predictions_with_schedule(
+            PkModel::OneCptOral,
+            &subj,
+            &scan,
+            &pk_dose,
+            &pk_obs,
+            &[],
+        );
+        assert_eq!(fast.len(), nonmem.len());
+        for (j, (want, (a, b))) in nonmem.iter().zip(fast.iter().zip(&slow)).enumerate() {
+            assert!(a.is_finite(), "obs {j} non-finite: {a}");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "obs {j}: precomputed {a} vs scanned {b}"
+            );
+            // Measured ≤ 1.1e-15 relative at the fix (91× headroom); the defect is +14 % at
+            // 15 h.
+            assert_relative_eq!(*a, *want, max_relative = 1e-13);
+        }
     }
 
     /// A dose whose `(rate, duration)` no longer matches what the schedule was built

@@ -4984,13 +4984,27 @@ fn gated_infusions_suppresses_infusion_into_input_rate_cmt() {
 
     // No forcing applied → both plain `+rate` injections are kept.
     assert_eq!(
-        gated_infusions(&[], &active, &doses, &f_bio, 2),
+        gated_infusions(
+            &[],
+            &active,
+            &doses,
+            &f_bio,
+            2,
+            &ResetGate::at_segment(&doses, f64::NEG_INFINITY, f64::NEG_INFINITY)
+        ),
         vec![(0usize, 4.0, 1.0, 3.0), (1usize, 7.0, 1.0, 3.0)]
     );
     // Forcing on state 0 → only the CMT-2 infusion survives; the CMT-1 mass arrives
     // through `R_in_inf` instead.
     assert_eq!(
-        gated_infusions(&forcing, &active, &doses, &f_bio, 2),
+        gated_infusions(
+            &forcing,
+            &active,
+            &doses,
+            &f_bio,
+            2,
+            &ResetGate::at_segment(&doses, f64::NEG_INFINITY, f64::NEG_INFINITY)
+        ),
         vec![(1usize, 7.0, 1.0, 3.0)]
     );
 }
@@ -5515,7 +5529,7 @@ fn zero_order_window_edges_rate_and_cutoff_break() {
         DoseEvent::new(1.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → no window
     ];
     let windows = zo_windows_for(&ode, &doses, &[0.5, 0.0, 0.0], &pk);
-    assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5, 2.0)]);
+    assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5, 0)]);
 
     let mut breaks = Vec::new();
     push_zero_order_break_times(&mut breaks, &windows);
@@ -5574,17 +5588,100 @@ fn active_zero_order_includes_only_fully_contained_segments() {
     // straddling the cutoff (right end past w_end) is excluded — the
     // full-containment rule that makes the post-cutoff mass exact. A reset_floor
     // after the window start turns it off.
-    let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5, 2.0)];
+    let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5, 0)];
+    let doses = vec![DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0)];
     assert_eq!(
-        active_zero_order_inputs(&windows, 3.0, 5.0, f64::NEG_INFINITY),
+        active_zero_order_inputs(&windows, &doses, 3.0, 5.0, f64::NEG_INFINITY),
         vec![(0, 25.0)]
     );
     // [5, 7] ends past w_end=6.5 ⇒ not fully contained ⇒ excluded.
-    assert!(active_zero_order_inputs(&windows, 5.0, 7.0, f64::NEG_INFINITY).is_empty());
+    assert!(active_zero_order_inputs(&windows, &doses, 5.0, 7.0, f64::NEG_INFINITY).is_empty());
     // [1, 2] precedes the window start ⇒ excluded.
-    assert!(active_zero_order_inputs(&windows, 1.0, 2.0, f64::NEG_INFINITY).is_empty());
+    assert!(active_zero_order_inputs(&windows, &doses, 1.0, 2.0, f64::NEG_INFINITY).is_empty());
     // reset_floor past the window start (e.g. 3.0) turns the window off.
-    assert!(active_zero_order_inputs(&windows, 3.0, 5.0, 3.0).is_empty());
+    assert!(active_zero_order_inputs(&windows, &doses, 3.0, 5.0, 3.0).is_empty());
+}
+
+/// #1586: an `SS=1` record stops an infusion running across it, on both infusion
+/// resolvers (`active_infusions` for the spanning engines, `gated_infusions` for the
+/// with-states walks), and the stop reads the record as **reached within
+/// `EVENT_MATCH_TOL`** (`ResetGate::at_segment`), not by an exact comparison.
+///
+/// The record sits at `0.8` and the infusion runs over `[0, 2]`. A segment ending at the
+/// record keeps the infusion (the record has not been reached); one starting at it drops
+/// it; and one starting at `0.1 + 0.7 = 0.7999999999999999` — the 1-ulp-low break an
+/// infusion end merged into the record produces (PR #1589 review finding 1) — drops it
+/// too. An exact `t_start >= record` test keeps it there, which on #1589 read −51 %.
+#[test]
+fn an_ss_record_stops_a_running_infusion_from_the_segment_that_reaches_it() {
+    let t_s = 0.8;
+    let below = 0.1 + 0.7;
+    assert!(
+        below < t_s,
+        "the 1-ulp-low break must actually be below the record"
+    );
+    // dose 0: infusion into CMT 2, 20 / 10 ⇒ window [0, 2]; dose 1: the `SS=1` record.
+    let doses = vec![
+        DoseEvent::new(0.0, 20.0, 2, 10.0, false, 0.0),
+        DoseEvent::new(t_s, 100.0, 1, 0.0, true, 12.0),
+    ];
+    let f_bio = vec![1.0; doses.len()];
+    let spanning =
+        |t0: f64, t1: f64| active_infusions(&[], &doses, t0, t1, &[], &f_bio, f64::NEG_INFINITY, 2);
+    let gated = |t0: f64| {
+        let gate = ResetGate::at_segment(&doses, f64::NEG_INFINITY, t0);
+        gated_infusions(&[], &[(0, 0.0, 2.0)], &doses, &f_bio, 2, &gate)
+    };
+    // Before the record: running, on both resolvers.
+    assert_eq!(spanning(0.5, t_s), vec![(1, 10.0)]);
+    assert_eq!(gated(0.5), vec![(1, 10.0, 0.0, 2.0)]);
+    // From the record on — including from 1 ulp below it — stopped, on both.
+    for t0 in [t_s, below] {
+        assert!(
+            spanning(t0, 1.0).is_empty(),
+            "spanning, segment from {t0:e}"
+        );
+        assert!(gated(t0).is_empty(), "gated, segment from {t0:e}");
+    }
+}
+
+/// #1586: an infusion **row** co-timed with an `SS=1` row is reset by it when it comes
+/// first and runs when it comes after — row order, NONMEM-measured
+/// (`nonmem_anchor/ss_infusion_stop` IDs 4 / 5). The zero-order twin is
+/// `a_zero_order_row_before_a_co_timed_ss_row_never_runs`.
+#[test]
+fn an_infusion_row_before_a_co_timed_ss_row_never_runs() {
+    let inf = DoseEvent::new(10.0, 100.0, 2, 10.0, false, 0.0);
+    let ss = DoseEvent::new(10.0, 100.0, 1, 0.0, true, 12.0);
+    let f_bio = [1.0, 1.0];
+    let run = |doses: &[DoseEvent]| {
+        active_infusions(&[], doses, 10.0, 12.0, &[], &f_bio, f64::NEG_INFINITY, 2)
+    };
+    assert!(run(&[inf.clone(), ss.clone()]).is_empty(), "before: reset");
+    assert_eq!(run(&[ss, inf]), vec![(1, 10.0)], "after: runs");
+}
+
+/// #1586: a zero-order window whose row precedes a co-timed `SS=1` row never runs, and
+/// one whose row follows it does (`nonmem_anchor/ss_infusion_stop` IDs 22 / 23). The
+/// window carries its dose **index**, not its record time: keyed on the time, the two
+/// twins below are indistinguishable and agree, whichever way.
+#[test]
+fn a_zero_order_row_before_a_co_timed_ss_row_never_runs() {
+    let zo = DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0);
+    let ss = DoseEvent::new(10.0, 50.0, 2, 0.0, true, 12.0);
+    // The same window, `F·amt/dur = 100/8` over [10, 18] into CMT 1, keyed on its row.
+    let window = |k: usize| -> Vec<ZeroOrderWindow> { vec![(0, 12.5, 10.0, 18.0, k)] };
+    let before = [zo.clone(), ss.clone()];
+    let after = [ss, zo];
+    assert!(
+        active_zero_order_inputs(&window(0), &before, 10.0, 12.0, f64::NEG_INFINITY).is_empty(),
+        "a ZO row before the `SS=1` row is reset"
+    );
+    assert_eq!(
+        active_zero_order_inputs(&window(1), &after, 10.0, 12.0, f64::NEG_INFINITY),
+        vec![(0, 12.5)],
+        "a ZO row after the `SS=1` row runs"
+    );
 }
 
 #[test]
@@ -5815,7 +5912,14 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
         (2, 1.0, 3.0),
         (3, 1.0, 3.0),
     ];
-    let gated = gated_infusions(&[], &active, &doses, &f_bio, 1);
+    let gated = gated_infusions(
+        &[],
+        &active,
+        &doses,
+        &f_bio,
+        1,
+        &ResetGate::at_segment(&doses, f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
     assert_eq!(
         gated,
         vec![(0usize, 4.0, 1.0, 3.0), (0usize, 4.0 * 0.5, 1.0, 3.0)]
@@ -10622,7 +10726,10 @@ mod break_collision_1186 {
         // returns `(cmt_idx, rate, t_start, t_end)`; feed it one dose at a time for the
         // same reason.
         let gated: std::collections::BTreeSet<usize> = (0..ds.len())
-            .filter(|&k| !gated_infusions(&ir, &[(k, 0.0, 1.0)], &ds, &f, n_states).is_empty())
+            .filter(|&k| {
+                let gate = ResetGate::at_segment(&ds, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                !gated_infusions(&ir, &[(k, 0.0, 1.0)], &ds, &f, n_states, &gate).is_empty()
+            })
             .collect();
 
         assert_eq!(
