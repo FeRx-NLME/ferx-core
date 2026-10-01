@@ -7342,7 +7342,8 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
             assert!(
                 rel < 1e-10,
                 "adaptive, {label}, lag {lag}, t = {}: {} vs static live-only twin {} \
-                 (rel {rel:+.3e}) — a dose the SS=1 record wiped still arrived",
+                 (rel {rel:.3e}) — adaptive drifted from the static twin: a wiped dose still \
+                 arriving peaks at ≥ 31 % per fixture; a smaller drift points at η or the solver",
                 got.time,
                 got.ipred,
                 w.pred
