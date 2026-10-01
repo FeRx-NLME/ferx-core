@@ -7319,7 +7319,12 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
         opts.decision_times = vec![25.0];
         // Into central: lagged controller dosing (the depot) is rejected at injection.
         let central_bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 2 }];
-        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, central_bolus, &opts)
+        // η = 0 exactly, as the static `pred` oracle: `omega ~ 0.0` is PD-regularised to
+        // Ω = 1e-8, which would draw η with sd 1e-4 (#1603).
+        let mut params = model.default_params.clone();
+        params.omega.chol.fill(0.0);
+        params.omega.matrix.fill(0.0);
+        let res = simulate_adaptive(&model, &pop, &params, 1, central_bolus, &opts)
             .expect("adaptive sim runs and passes the frozen-replay verifier");
         assert_eq!(res.ledger.len(), 1, "{label}: one controller dose at 25");
 
@@ -7331,12 +7336,11 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
         for (got, w) in res.trajectories.iter().zip(&want) {
             assert!(got.ipred.is_finite(), "{label} t={}: non-finite", got.time);
             let rel = (got.ipred - w.pred).abs() / w.pred.abs();
-            // Measured 1.9e-5 (1.9e-4 with `omega ~ 0.0`). That is the adaptive driver's own
-            // floor against the static walker, unattributed and not this issue (the same
-            // driver sits 3.1e-4 off NONMEM on an `SS=1`-alone subject). The bound is the
-            // one the NONMEM anchor derives from it; the smallest defect it guards is +31 % (ID 11).
+            // Measured 4.1e-14 at η = 0 (1.9e-5 while η was drawn from the regularised Ω,
+            // #1603); the bound is the ODE engines' 1e-10, and the smallest defect it guards
+            // is +31 % (ID 11).
             assert!(
-                rel < 1e-3,
+                rel < 1e-10,
                 "adaptive, {label}, lag {lag}, t = {}: {} vs static live-only twin {} \
                  (rel {rel:+.3e}) — a dose the SS=1 record wiped still arrived",
                 got.time,

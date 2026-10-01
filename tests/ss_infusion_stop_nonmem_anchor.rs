@@ -285,14 +285,21 @@ fn via_analytic_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f6
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on.
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
+/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
+/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
+/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![50.0];
+    let mut params = model.default_params.clone();
+    params.omega.chol.fill(0.0);
+    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         pop,
-        &model.default_params,
+        &params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,
@@ -328,12 +335,12 @@ fn via_ekf(pop: &Population) -> Vec<(String, f64, f64)> {
 
 // Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): ODE predict / with-states
 // 2.6e-12, ODE dual 2.5e-12, EKF 2.3e-12 (38× under `ODE_BOUND`); analytic value 8.6e-16 and
-// dual 9.8e-16 (100× under `ANALYTIC_BOUND`); adaptive 3.1e-4 (the driver's own floor, #1603;
-// 3×). The defects guarded are +14 % (ID 2) to +175 % (ID 22) by t = 15 / 21, i.e. err of
-// order 0.1, two orders above the loosest bound.
+// dual 9.8e-16 (100× under `ANALYTIC_BOUND`); adaptive at η = 0 2.5e-12 / 2.6e-12
+// (infusion / zero-order IDs, equal to ODE predict to four figures — the 3.1e-4 it showed
+// before was its η draw from the regularised `omega ~ 0.0`, #1603). The defects guarded are
+// +14 % (ID 2) to +175 % (ID 22) by t = 15 / 21, i.e. err of order 0.1.
 const ODE_BOUND: f64 = 1e-10;
 const ANALYTIC_BOUND: f64 = 1e-13;
-const ADAPTIVE_BOUND: f64 = 1e-3;
 
 /// The fixture straddles the gate: each pair differs in one input, NONMEM stops the window
 /// in the first member and runs it in the second, and from t = 12 (after both records) the
@@ -405,7 +412,7 @@ fn adaptive_driver_stops_a_window_recorded_before_the_ss_record() {
             &format!("adaptive (zero_order {zo})"),
             &via_adaptive(&m, &pop(&ids)),
             &ids,
-            ADAPTIVE_BOUND,
+            ODE_BOUND,
         );
     }
 }

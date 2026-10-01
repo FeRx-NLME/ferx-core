@@ -286,14 +286,21 @@ fn via_dual(
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on.
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
+/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
+/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
+/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![25.0];
+    let mut params = model.default_params.clone();
+    params.omega.chol.fill(0.0);
+    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         &pop(),
-        &model.default_params,
+        &params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,
@@ -309,11 +316,11 @@ fn via_adaptive(model: &CompiledModel) -> Vec<(String, f64, f64)> {
 // Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): ODE predict / with-states /
 // dual 3.7e-12 (27× under `ODE_BOUND`); analytic value and dual 2.1e-15 against `ADVAN2`
 // (48×), and 2.4e-12 on ID 23 against `ADVAN13`, which is judged to `ODE_BOUND`; adaptive
-// 2.7e-4 (the driver's own floor: 4.2e-4 absolute on ID 6, which no reset cancels). The
-// smallest defect guarded is ID 13's kept pulse, 0.66 absolute — 6.6e2× the adaptive bound.
+// at η = 0 3.7e-12, equal to ODE predict to four figures (the 2.7e-4 it showed before was its
+// η draw from the regularised `omega ~ 0.0`, #1603). The smallest defect guarded is ID 13's
+// kept pulse, 0.66 absolute.
 const ODE_BOUND: f64 = 1e-10;
 const ANALYTIC_BOUND: f64 = 1e-13;
-const ADAPTIVE_BOUND: f64 = 1e-3;
 
 /// The fixture straddles the gate: each pair differs in one input, and NONMEM reads the
 /// dose cancelled in the first member and live in the second, so the second reads higher by
@@ -361,7 +368,7 @@ fn ode_dual_walk_value_cancels_a_dose_recorded_before_the_reset() {
 
 #[test]
 fn adaptive_driver_cancels_a_dose_recorded_before_the_reset() {
-    assert_matches("adaptive", &via_adaptive(&ode()), ADAPTIVE_BOUND, &[]);
+    assert_matches("adaptive", &via_adaptive(&ode()), ODE_BOUND, &[]);
 }
 
 #[test]
