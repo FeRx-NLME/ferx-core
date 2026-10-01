@@ -13873,11 +13873,16 @@ fn an_ss_record_wipes_a_preceding_or_pending_dose_on_the_analytic_event_walk() {
 /// * a modeled infusion row before a co-timed `SS=1` row (ID 4's): never runs;
 /// * the same row after it (ID 5's, the live control): runs, with a live `∂f/∂η_D2`.
 ///
-/// Mutations: a reset gate dropped from `active_rates_g` keeps the rate on past the record
-/// (value and gradient vs FD of the production walk, and vs the twin); dropped from
-/// `moving_bounds` it threads `±∂D2` into the two sub-intervals either side of 14.4 h,
-/// which compose back to a fixed-length flow when no rate changes there — **equivalent**,
-/// by the same argument as the cancelled-arrival note in `propagate_bounds_g`.
+/// One observation sits **exactly on** the stopped window's moving end (4 + D2). Away from
+/// such a coincidence a dead boundary's jet is harmless: the `±∂D2` it threads into the two
+/// sub-intervals either side of it compose back to a fixed-length flow when no rate changes
+/// there. On the sample it is not: the observation's own break picks up the jet.
+///
+/// Mutations (each measured): a reset gate dropped from `active_rates_g` keeps the rate on
+/// past the record (value and gradient vs FD of the production walk, and vs the twin);
+/// dropped from `obs_boundary_correction`, the on-boundary sample is stepped back over
+/// `Δ = bound(p) − t`, adding `−ẋ·∂D2/∂η` to a derivative that is 0; dropped from
+/// `moving_bounds`, the sample's break carries the dead end's jet.
 #[test]
 fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
     let model = parse_model_string(
@@ -13905,7 +13910,9 @@ fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
     let theta = vec![2.0, 20.0, 0.15, 10.0];
     let eta = vec![0.05, 0.04];
     const ETA_D2: usize = 1;
-    let times = [6.0, 9.0, 11.0, 16.0, 21.0];
+    let d2 = theta[3] * f64::exp(eta[ETA_D2]);
+    // 4 + D2 ≈ 14.4: the across-the-record window's (stopped) moving end, sampled exactly.
+    let times = [6.0, 9.0, 11.0, 4.0 + d2, 16.0, 21.0];
     let inf = |t: f64| {
         DoseEvent::modeled(
             t,
@@ -13921,11 +13928,7 @@ fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
     let before = subject_with_doses_and_resets(vec![inf(10.0), ss.clone()], &times, vec![]);
     let after = subject_with_doses_and_resets(vec![ss.clone(), inf(10.0)], &times, vec![]);
     let none = subject_with_doses_and_resets(vec![ss], &times, vec![]);
-    let d2 = theta[3] * f64::exp(eta[ETA_D2]);
-    assert!(
-        4.0 + d2 > 10.0 && 4.0 + d2 < times[3],
-        "the window runs across the record"
-    );
+    assert!(4.0 + d2 > 10.0, "the window runs across the record");
 
     for s in [&across, &before, &after, &none] {
         check_full_provider_vs_fd(&model, s, &theta, &eta);
@@ -13942,9 +13945,9 @@ fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
         a.obs[1].df_deta[ETA_D2]
     );
     assert!(
-        c.obs[3].df_deta[ETA_D2].abs() > 1e-3,
+        c.obs[4].df_deta[ETA_D2].abs() > 1e-3,
         "the control's window end moved with η_D2: {}",
-        c.obs[3].df_deta[ETA_D2]
+        c.obs[4].df_deta[ETA_D2]
     );
     // From the record on, a stopped or never-run window leaves nothing behind.
     for (j, t) in times.iter().enumerate().skip(2) {

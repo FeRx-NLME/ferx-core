@@ -61,6 +61,17 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **An `SS=1` record now stops every infusion and zero-order window recorded before it, on
+  every engine** (#1586). NONMEM stops an infusion still running at a mid-timeline `SS=1`
+  record, never starts one whose row precedes a co-timed `SS=1` row or whose lagged window
+  opens after the record, and stops the running tail of an earlier `SS=1` infusion. The ODE
+  engines (default, event-driven, compartment-state output, adaptive, EKF) and the analytic
+  event-driven walk kept every such window running (+14 % to +175 % against NONMEM), and so
+  did `zero_order(...)` windows on the ODE engines. On analytic models the gradient was
+  wrong even where the prediction was right: a central infusion's value came from
+  superposition (fixed in #1576) while FOCE/FOCEI differentiated the event walk, which still
+  ran it (43–93 % off). Every engine and its gradient now match NONMEM to ≤ 2.6e-12 (the
+  adaptive driver to 3e-4, its own floor; `nonmem_anchor/ss_infusion_stop`).
 - **A dose that lands between a lagged `SS=1` dose's record and its arrival is no longer
   erased** (#1275). A lagged steady-state dose loads its periodic state at its dose record
   and carries it to the lagged arrival, which then adds only the new pulse. The ODE paths
@@ -95,8 +106,8 @@ section of the SDLC for the versioning policy).
   models with an explicit depot state were already correct. Because the reset is keyed on
   the dose record, analytic superposition also stops an infusion into central and cancels a
   pending lagged dose at the record, and the ODE forcing stops an infusion into the forcing
-  compartment. On the ODE engines and the analytic event-driven path, an infusion into a
-  compartment state is not yet reset (#1586); a co-timed or pending lagged dose now is (#1588).
+  compartment. Since #1588 and #1586 every engine also resets a co-timed or pending lagged
+  dose and stops an infusion or zero-order window recorded before the record.
 - **An `SS=1` record now wipes a co-timed dose in an earlier row, and a pending lagged dose,
   on every state engine** (#1588). NONMEM resets at an `SS=1` record in row order: a dose row
   *before* a co-timed `SS=1` row contributes nothing, one *after* it superposes. The static

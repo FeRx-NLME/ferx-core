@@ -14,9 +14,9 @@
 //! `FORMAT=s1PE23.16`: `nonmem_anchor/ss_infusion_stop.{csv,ctl}` (`ADVAN2 TRANS2`), one
 //! compartment with first-order absorption, `CL = 2, V = 20, KA = 0.15`, the `SS=1` record
 //! q12h `AMT = 100` into the depot at t = 10 unless noted, `ALAG2` from the `LAG2` column.
-//! `ss_infusion_stop_advan13.ctl` (`ADVAN13 TOL=12`) agrees with it to 2.6e-11, and both
-//! equal a pure-Python closed form of the rule (exact two-state propagation, 800-cycle `SS`
-//! run-in, outside both engines) to 4.4e-15 (`ADVAN2`) on all 36 IDs.
+//! `ADVAN2` equals a pure-Python closed form of the rule (exact two-state propagation,
+//! 800-cycle `SS` run-in, outside both engines) to 4.4e-15 on all 36 IDs, and
+//! `ss_infusion_stop_advan13.ctl` (`ADVAN13 TOL=12`) agrees with it to 3.2e-11.
 //!
 //! | ID | rows | NONMEM |
 //! |---|---|---|
@@ -326,7 +326,11 @@ fn via_ekf(pop: &Population) -> Vec<(String, f64, f64)> {
     with_raw(&ode_model(false, true), pop, out)
 }
 
-// Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): see each bound's use.
+// Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): ODE predict / with-states
+// 2.6e-12, ODE dual 2.5e-12, EKF 2.3e-12 (38× under `ODE_BOUND`); analytic value 8.6e-16 and
+// dual 9.8e-16 (100× under `ANALYTIC_BOUND`); adaptive 3.1e-4 (the driver's own floor, #1603;
+// 3×). The defects guarded are +14 % (ID 2) to +175 % (ID 22) by t = 15 / 21, i.e. err of
+// order 0.1, two orders above the loosest bound.
 const ODE_BOUND: f64 = 1e-10;
 const ANALYTIC_BOUND: f64 = 1e-13;
 const ADAPTIVE_BOUND: f64 = 1e-3;

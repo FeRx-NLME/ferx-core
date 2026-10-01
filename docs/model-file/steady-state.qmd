@@ -73,31 +73,28 @@ two engines did not reset:
 An ODE model with an explicit depot state was already correct, because
 the steady-state solve replaces the compartment state at the record.
 
-The reset is keyed on the dose **record**. So a lagged dose whose record
-precedes the `SS=1` record but whose arrival follows it is cancelled, on
-every engine. On analytic superposition (1-/2-/3-cpt models without
-time-varying covariates or resets), an infusion into central that is
-still running at the record also stops there, and so does an infusion
-into an ODE absorption forcing. NONMEM does all of these.
+The reset is keyed on the dose **record**, and the row-order rule holds
+on every engine, with or without a lagtime
+([#1588](https://github.com/FeRx-NLME/ferx-core/issues/1588)). So every
+input whose record precedes the `SS=1` record stops there, as NONMEM
+does:
 
-For boluses and `SS=1` loads, the row-order rule holds on every engine
-([#1588](https://github.com/FeRx-NLME/ferx-core/issues/1588)), with or
-without a lagtime on the `SS=1` dose. The exceptions are listed below.
+- a lagged dose whose arrival follows the record is cancelled;
+- an infusion still running at the record stops, into the depot or into
+  central, and so does a `zero_order(...)` window
+  ([#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586));
+- a lagged infusion whose window opens after the record never starts;
+- an infusion or `zero_order(...)` row before a co-timed `SS=1` row never
+  runs, and one after it does;
+- the tail of an earlier `SS=1` infusion that was still running at its
+  own record stops at a later `SS=1` record.
 
-These cases are not yet covered:
+This holds on the ODE engines, analytic superposition, the analytic
+event-driven path, and the gradients each of them feeds to FOCE/FOCEI
+(`nonmem_anchor/ss_infusion_stop`, ≤ 2.6e-12 against NONMEM).
 
-- An infusion into a compartment **state** that is still running at the
-  record is not stopped
-  ([#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586)). This
-  applies to the ODE engines and to the analytic event-driven path. That
-  path serves subjects with time-varying covariates or EVID=3/4 resets,
-  and any infusion into the depot. A lagged infusion whose record
-  precedes the `SS=1` record is not cancelled either.
-- An EVID=3/4 reset does not cancel a lagged dose whose record precedes
-  it but whose arrival follows it
-  ([#1587](https://github.com/FeRx-NLME/ferx-core/issues/1587)).
-- An analytic `init()` baseline is still superposed on an `SS=1` dose,
-  as the `W_STEADY_STATE_INIT` warning says.
+One case is not yet covered: an analytic `init()` baseline is still
+superposed on an `SS=1` dose, as the `W_STEADY_STATE_INIT` warning says.
 
 `SS=1` combined with a lagtime into an absorption forcing is still
 rejected.

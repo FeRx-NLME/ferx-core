@@ -4484,8 +4484,9 @@ mod tests {
 
     /// A central infusion running across an `SS=1` record into the depot contributes nothing
     /// after the record on the superposition path (#1586's "infusion into central" row: +110 %
-    /// before). An infusion superposition cannot express (into the depot) routes to the
-    /// event-driven walk, which does not stop it yet (#1586).
+    /// before #1576). An infusion superposition cannot express (into the depot) routes to the
+    /// event-driven walk, which stops it the same way since #1586
+    /// (`an_ss_record_stops_a_running_infusion_in_the_cached_and_the_scanned_rates`).
     #[test]
     fn a_central_infusion_running_across_an_ss_record_stops_in_superposition() {
         let (cl, _, _, _, _) = SS_RESET_P;

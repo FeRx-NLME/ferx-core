@@ -2334,9 +2334,9 @@ impl ResetGate {
     /// Also the arrival gate of every state engine (#1588, #1587): a dose whose record
     /// precedes a reset reached at its arrival break changes nothing there — no bolus
     /// jump, no arrival re-equilibration, and on the dual walks no lag saltation. The
-    /// absorption forcing reads it per segment. Infusion windows into compartment states
-    /// key their own `reset_floor` test on the record the same way; the `SS=1` stop of
-    /// such a window is #1586.
+    /// absorption forcing reads it per segment, and every infusion and zero-order window's
+    /// membership reads it too (#1586): a window recorded before a reached reset is off,
+    /// running, pending behind a lag, or the #1121 residual of an earlier `SS=1` infusion.
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
