@@ -549,25 +549,24 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     true
 }
 
-/// True when an infusion recorded at `record`, with (lagged) window start `start` and length
-/// `duration`, fully spans the integration segment `[seg_start, seg_end]` and has not been
-/// turned off by an intervening EVID 3/4 reset. The reset test is on the **record**
-/// (`dosing::evid_reset_live`, #1587): a lagged window opening after the reset is off too. The
-/// boolean predicate shared by both analytic-sensitivity walks (`integrate_tvcov_g`,
-/// `integrate_g`) so the `reset_floor` guard and the production `INFUSION_EPS` window
-/// tolerance stay single-sourced (#472 review [7]).
+/// True when dose `k`'s infusion, with (lagged) window start `start` and length `duration`,
+/// fully spans the integration segment `[seg_start, seg_end]` and has not been turned off by
+/// a reset the segment's `gate` has reached — an EVID=3/4 reset (#1587) or an `SS=1` record
+/// (#1586). The reset test is on the dose **record** (`ResetGate::live`): a lagged window
+/// opening after the reset is off too. The boolean predicate shared by both
+/// analytic-sensitivity walks (`integrate_tvcov_g`, `integrate_g`) so the reset guard and the
+/// production `INFUSION_EPS` window tolerance stay single-sourced (#472 review [7]).
 fn infusion_spans_segment(
-    record: f64,
+    gate: &crate::ode::predictions::ResetGate,
+    doses: &[crate::types::DoseEvent],
+    k: usize,
     start: f64,
     duration: f64,
     seg_start: f64,
     seg_end: f64,
-    reset_floor: f64,
 ) -> bool {
     let eps = crate::ode::predictions::INFUSION_EPS;
-    crate::dosing::evid_reset_live(record, reset_floor)
-        && start <= seg_start + eps
-        && start + duration >= seg_end - eps
+    gate.live(doses, k) && start <= seg_start + eps && start + duration >= seg_end - eps
 }
 
 /// The per-route absorption lag (`zero_order(..., lag=L)`, #859) of the single zero-order
@@ -4719,12 +4718,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // #1121: the previous cycle's infusion of a seeded SS dose runs `[d.time, d.time +
     // (T_inf − phase)]` — a window belonging to no `DoseEvent`, so the ordinary
     // `infusion_spans_segment` test (which starts at the *arrival*) cannot see it. Its reset
-    // floor is the dose RECORD, since that is where the seeded state is loaded.
+    // gate is keyed on the dose RECORD, since that is where the seeded state is loaded, so a
+    // later `SS=1` record stops it (#1586).
     let ss_residual_spans_segment = |k: usize,
                                      d: &crate::types::DoseEvent,
                                      seg_start: f64,
                                      seg_end: f64,
-                                     reset_floor: f64|
+                                     gate: &crate::ode::predictions::ResetGate|
      -> bool {
         if !crate::dosing::ss_seeded_at_record(d, lag_val(k)) {
             return false;
@@ -4732,12 +4732,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         let phase = crate::dosing::ss_seed_phase(d, lag_val(k));
         phase < inf_window_len(k)
             && infusion_spans_segment(
-                d.time,
+                gate,
+                &subject.doses,
+                k,
                 d.time,
                 inf_window_len(k) - phase,
                 seg_start,
                 seg_end,
-                reset_floor,
             )
     };
 
@@ -5092,6 +5093,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
+        // The reset gate at the boundary itself, read by every input below. Its `SS=1` half
+        // (#1576, #1586) only changes at an `SS=1` record, where the post-record state is the
+        // equilibrated trough (independent of the pre-record state), so a window the record
+        // stopped carries no boundary velocity into it; its EVID=3/4 half (#1587) is this
+        // side's `r_floor`.
+        let gate = crate::ode::predictions::ResetGate::at_segment(&subject.doses, r_floor, t_ev);
         // Window membership for this side (see the helper doc): inclusive counts a window
         // touching `t_ev`, strict only one that straddles it.
         let spans = |w_start: f64, w_end: f64| -> bool {
@@ -5104,10 +5111,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // Zero-order windows this side sees (their rate jet is fixed from the dose's own
         // snapshot, so it is identical on both sides — see the helper doc).
         for &(zc, zr, zws, zwe, _, zk) in &zero_windows {
-            if zc < n_states
-                && crate::dosing::evid_reset_live(subject.doses[zk].time, r_floor)
-                && spans(zws, zwe)
-            {
+            if zc < n_states && gate.live(&subject.doses, zk) && spans(zws, zwe) {
                 v[zc] = v[zc] + zr;
             }
         }
@@ -5126,10 +5130,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 let iws = d.time + lag_val(k);
                 let iwe = iws + inf_window_len(k);
                 let ci = d.cmt_idx();
-                if ci < n_states
-                    && crate::dosing::evid_reset_live(d.time, r_floor)
-                    && spans(iws, iwe)
-                {
+                if ci < n_states && gate.live(&subject.doses, k) && spans(iws, iwe) {
                     v[ci] = v[ci] + inf_eff[k].0;
                 }
             }
@@ -5145,12 +5146,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 &subject.doses,
                 &dose_lagtimes_dual,
                 f_bio_at_dose,
-                // The reset gate at the boundary itself. Its `SS=1` half (#1576) only changes
-                // at an `SS=1` record, where the post-record state is the equilibrated trough
-                // (independent of the pre-record state) and no moving boundary lands, since
-                // `SS=1` + lag into a forcing is rejected. Its EVID=3/4 half (#1587) is this
-                // side's `r_floor`. So both sides see the same set.
-                crate::ode::predictions::ResetGate::at_segment(&subject.doses, r_floor, t_ev),
+                // The boundary's `gate` (above): no moving boundary lands on an `SS=1` record
+                // here, since `SS=1` + lag into a forcing is rejected, so both sides see the
+                // same set.
+                gate,
                 t_ev,
                 &mut v,
             );
@@ -5317,6 +5316,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             _ => next_record_params[p].map(&params_at).unwrap_or(last_params),
         };
         if t_event > cur_t {
+            // The segment start: its `f64` twin's reset gate (#1576, #1587, #1586), once per
+            // segment — read by the infusion and zero-order windows and the forcing below.
+            let gate =
+                crate::ode::predictions::ResetGate::at_segment(&subject.doses, reset_floor, cur_t);
             // Infusions whose (lagged) window fully spans this segment add a constant
             // forcing `F·rate` to their compartment (the timeline breaks at every window
             // start/end, so a segment is fully inside or outside each window). `F` carries
@@ -5346,13 +5349,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // The window LENGTH is the bioavailable `inf_window_len` (mode-aware
                         // `F`-scaling, #419), not the raw duration.
                         infusion_spans_segment(
-                            d.time,
+                            &gate,
+                            &subject.doses,
+                            *k,
                             d.time + lag_val(*k),
                             inf_window_len(*k),
                             cur_t,
                             t_event,
-                            reset_floor,
-                        ) || ss_residual_spans_segment(*k, d, cur_t, t_event, reset_floor)
+                        ) || ss_residual_spans_segment(*k, d, cur_t, t_event, &gate)
                     })
                     // Effective forcing `inf_eff[k].0` (mode-aware: `F·rate` for a
                     // duration-defined infusion, held `rate` for a rate-defined one) (#419).
@@ -5364,8 +5368,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // `active_zero_order_inputs` uses (`w_start ≤ cur_t`, `w_end ≥ t_event`), made
             // artifact-free by the `w_end` timeline break above (every segment is wholly
             // inside or outside each window). Reset-aware: the window of a dose recorded
-            // before the most recent EVID 3/4 reset is off, wherever its lagged window opens
-            // (#1587), matching the infusion rule and the static walk. The post-cutoff segment (right end past `w_end`) is
+            // before the most recent EVID 3/4 reset (#1587) or a reached `SS=1` record (#1586)
+            // is off, wherever its lagged window opens, matching the infusion rule and the
+            // static walk. The post-cutoff segment (right end past `w_end`) is
             // excluded here — the rate turns off there, its boundary derivative supplied by
             // the rate-off saltation at `K_ZO_END`.
             let active_zero: Vec<(usize, T)> = if !has_zero_order {
@@ -5374,16 +5379,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 zero_windows
                     .iter()
                     .filter(|&&(_, _, w_start, w_end, _, k)| {
-                        crate::dosing::evid_reset_live(subject.doses[k].time, reset_floor)
+                        gate.live(&subject.doses, k)
                             && w_start <= cur_t + crate::ode::predictions::INFUSION_EPS
                             && w_end >= t_event - crate::ode::predictions::INFUSION_EPS
                     })
                     .map(|&(cmt, rate, _, _, _, _)| (cmt, rate))
                     .collect()
             };
-            // The segment start: its `f64` twin's reset gate (#1576, #1587), once per segment.
-            let gate =
-                crate::ode::predictions::ResetGate::at_segment(&subject.doses, reset_floor, cur_t);
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -5450,11 +5452,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // arrival, in (time, row order), or the EVID=3/4 reset in force, was wiped by that
             // reset — production's `f64` twin's gate (`ResetGate::live`). The **whole** state
             // arrival is suppressed: the SS re-equilibration, the bolus jump, and the lag
-            // saltations (bolus and forcing onset), or ∂f/∂ALAG would keep the derivative of
-            // a dose the value no longer has. The infusion rate-on is suppressed by its own
-            // record-keyed `reset_floor` test for an EVID=3/4 reset, not for an `SS=1` one
-            // (#1586); the TAD anchor fold below is not: production anchors TAD on every
-            // dose, live or not.
+            // saltations (bolus, forcing onset and infusion rate-on, #1586), or ∂f/∂ALAG would
+            // keep the derivative of a dose the value no longer has. The TAD anchor fold below
+            // is not: production anchors TAD on every dose, live or not.
             let arrival_live = crate::ode::predictions::ResetGate::at_segment(
                 &subject.doses,
                 reset_floor,
@@ -5696,10 +5696,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // are which; `ode_provider_ss_lagtime_infusion_matches_production`, with
                         // its flat-covariate Hessian-vs-FD check, is red on either mistake.
                         //
-                        // An infusion recorded before the EVID=3/4 reset in force never turns
-                        // on (#1587): the segment forcing skips it on the same record-keyed
-                        // test, so there is no rate boundary here to differentiate.
-                        if has_lagtime && crate::dosing::evid_reset_live(d.time, reset_floor) {
+                        // An infusion recorded before a reset reached here — the EVID=3/4 reset
+                        // in force (#1587) or an `SS=1` record (#1586) — never turns on: the
+                        // segment forcing skips it on the same gate, so there is no rate
+                        // boundary here to differentiate.
+                        if has_lagtime && arrival_live {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
                             if crate::dosing::ss_equilibrates_at_arrival(d, lag_val(idx)) {
@@ -6281,13 +6282,20 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // `0.0`. #899 removed a `d.cmt >= 1` gate here on the premise that the walk
             // delivered such an infusion; it does not, so the gate belongs — but as the one
             // predicate every other site asks, not as a fifth local spelling of it.
-            // The reset test compares the dose record for both kinds (#1587; `K_SS_INF_END`
-            // closes the *previous* cycle's window, which opened at the record, #1121). The
+            // The reset test is the `ResetGate` at this boundary, keyed on the dose record for
+            // both kinds (#1587; `K_SS_INF_END` closes the *previous* cycle's window, which
+            // opened at the record, #1121): a window an `SS=1` record stopped has no rate to
+            // turn off here (#1586), and neither has one an EVID=3/4 reset cancelled. The
             // shift `δ` is the same either way: the residual end is `d.time + T_inf − II +
             // lag`, so it moves with `lag` and with the window length exactly as the real end
             // at `d.time + lag + T_inf` does.
             if (has_lagtime || is_rate_defined || is_modeled)
-                && crate::dosing::evid_reset_live(d.time, reset_floor)
+                && crate::ode::predictions::ResetGate::at_segment(
+                    &subject.doses,
+                    reset_floor,
+                    t_event,
+                )
+                .live(&subject.doses, idx)
                 && crate::dosing::infusion_has_rate_channel(d)
                 && d.cmt_idx() < n_states
             {
@@ -6396,15 +6404,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             if !zo_end_done[idx] {
                 let ceps = crate::ode::predictions::INFUSION_EPS;
                 // Active windows sharing this boundary instant (the cohort); mark them (and this
-                // `idx`, even if reset-cut) done so their own later events are no-ops.
+                // `idx`, even if reset-cut) done so their own later events are no-ops. A window
+                // a reset reached here cut — EVID=3/4 (#1587) or an `SS=1` record (#1586) — has
+                // no rate to turn off.
+                let gate = crate::ode::predictions::ResetGate::at_segment(
+                    &subject.doses,
+                    reset_floor,
+                    t_event,
+                );
                 let cohort: Vec<usize> = (0..zero_windows.len())
                     .filter(|&j| {
                         !zo_end_done[j]
                             && zero_windows[j].0 < n_states
-                            && crate::dosing::evid_reset_live(
-                                subject.doses[zero_windows[j].5].time,
-                                reset_floor,
-                            )
+                            && gate.live(&subject.doses, zero_windows[j].5)
                             && (zero_windows[j].3 - t_event).abs() <= ceps
                     })
                     .collect();
@@ -6665,8 +6677,9 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // The constant rate jet carries the smooth magnitude term (`∂/∂dur` of `F·amt·frac/dur`);
     // the boundary term is the rate-off saltation injected at `w_end` below. Mirrors the f64
     // `zero_order_windows` / `active_zero_order_inputs` (lagtime is gated off this static walk,
-    // so `w_start = dose.time`). Stored as `(cmt, rate_jet, w_start, dur_jet)` (#530).
-    let zero_windows: Vec<(usize, T, f64, T)> = if ode
+    // so `w_start = dose.time`). Stored as `(cmt, rate_jet, w_start, dur_jet, dose_idx)` (#530):
+    // the reset gate needs the dose's row, not just its record time (#1586).
+    let zero_windows: Vec<(usize, T, f64, T, usize)> = if ode
         .input_rate
         .iter()
         .any(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
@@ -6686,7 +6699,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 let (f, dur) = zero_order_forcing_for_dose(ode, d, params_dual)?;
                 let frac = f.frac::<T>(params_dual);
                 let rate = dose_f_bio[k] * T::from_f64(d.amt) * frac / dur;
-                Some((d.cmt_idx(), rate, d.time, dur))
+                Some((d.cmt_idx(), rate, d.time, dur, k))
             })
             .collect()
     } else {
@@ -6713,7 +6726,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // #530: break at each zero-order window end `w_start + dur` so every segment is fully
     // inside or outside the window (the full-containment filter below relies on this), and
     // the rate-off saltation lands on an exact break.
-    for &(_, _, w_start, dur) in &zero_windows {
+    for &(_, _, w_start, dur, _) in &zero_windows {
         break_times.push(w_start + dur.val());
     }
     // EVID 3/4 reset times also break the timeline so the state can be zeroed
@@ -6850,6 +6863,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             u.copy_from_slice(init_state);
             reset_floor = t_start;
         }
+        // Uniformity with the `f64` twin (#1576, #1586): one gate per break, read by the
+        // zero-order saltation, the infusion and zero-order windows and the forcing below.
+        // Periodic SS is declined upstream of this walk (`ode_subject_supported`), so no
+        // `SS=1` record gates; the EVID=3/4 half reads the tracked `reset_floor`.
+        let gate =
+            crate::ode::predictions::ResetGate::at_segment(&subject.doses, reset_floor, t_start);
 
         // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based, and
         // `CMT=0` is NONMEM's default dose compartment — state index 0 — on both engines
@@ -6904,15 +6923,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // sensitivity (`s = +1`, the sign-mirror of the lagtime dose-start saltation). Fired
         // *after* recording an obs at `w_end` (so an obs at the boundary reads the rate still
         // on, matching the closed `(0, dur]` window) and only for a window not turned off by an
-        // intervening EVID 3/4 reset (its record, `w_start` on this lag-free walk, is at or
-        // after `reset_floor`). The state value is continuous
-        // — only its `∂/∂dur` jet changes.
+        // intervening reset (`gate`). The state value is continuous — only its `∂/∂dur` jet
+        // changes.
         if has_zero_order {
-            for &(cmt, rate, w_start, dur) in &zero_windows {
+            for &(cmt, rate, w_start, dur, k) in &zero_windows {
                 let w_end = w_start + dur.val();
-                if crate::dosing::evid_reset_live(w_start, reset_floor)
-                    && (w_end - t_start).abs() < 1e-9
-                {
+                if gate.live(&subject.doses, k) && (w_end - t_start).abs() < 1e-9 {
                     let ddur = dur - T::from_f64(dur.val());
                     inject_rate_saltation::<T>(
                         &mut u,
@@ -6982,8 +6998,16 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 .iter()
                 .enumerate()
                 .filter(|(_, d)| d.is_infusion() && crate::dosing::infusion_has_rate_channel(d))
-                .filter(|(_, d)| {
-                    infusion_spans_segment(d.time, d.time, d.duration, t_start, t_end, reset_floor)
+                .filter(|(k, d)| {
+                    infusion_spans_segment(
+                        &gate,
+                        &subject.doses,
+                        *k,
+                        d.time,
+                        d.duration,
+                        t_start,
+                        t_end,
+                    )
                 })
                 .map(|(k, d)| (d.cmt_idx(), dose_f_bio[k] * T::from_f64(d.rate)))
                 .collect()
@@ -7000,23 +7024,18 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         } else {
             zero_windows
                 .iter()
-                .filter(|&&(_, _, w_start, dur)| {
+                .filter(|&&(_, _, w_start, dur, k)| {
                     let w_end = w_start + dur.val();
-                    // `w_start` is the dose record on this lag-free walk.
-                    crate::dosing::evid_reset_live(w_start, reset_floor)
+                    gate.live(&subject.doses, k)
                         && w_start <= t_start + crate::ode::predictions::INFUSION_EPS
                         && w_end >= t_end - crate::ode::predictions::INFUSION_EPS
                 })
-                .map(|&(cmt, rate, _, _)| (cmt, rate))
+                .map(|&(cmt, rate, _, _, _)| (cmt, rate))
                 .collect()
         };
 
-        // (`last_dose_eff`, the TAD anchor, was computed once above the saltation block.)
-        // Uniformity with the `f64` twin (#1576): periodic SS is declined upstream of this
-        // walk (`ode_subject_supported`), so no `SS=1` record gates; the EVID=3/4 half reads
-        // the tracked `reset_floor`.
-        let gate =
-            crate::ode::predictions::ResetGate::at_segment(&subject.doses, reset_floor, t_start);
+        // (`last_dose_eff`, the TAD anchor, was computed once above the saltation block; the
+        // segment's `gate` at the top of the break.)
         let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
             eval_rhs_anchored::<T>(
                 program,
