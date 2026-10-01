@@ -7279,6 +7279,9 @@ fn ode_depot_alag1(lag: f64) -> String {
 /// `shadow` list), so it inherited the static walker's row-order defect: a bolus row before a
 /// co-timed `SS=1` row applied after the reset (ID 1, lag 0: +127 %), and at lag 2 a first
 /// `SS=1` dose's arrival re-loaded its own trough over a later record's seed (ID 9: −48 %).
+/// Those figures are from #1588's tree. Since #1275 (`e00ba374`) only the bolus pass's gate
+/// is load-bearing here; removing it measures a peak |rel| of 104 % / 26.1 % / 27.2 % on
+/// IDs 1 / 9 / 11 (at `d36f944e`), and removing the reseed gate alone moves nothing.
 /// A controller dose into central at 25 (after the tie) exercises the gate's index space over the shadow
 /// list: base doses then the injected one, which is live. The frozen-replay verifier runs
 /// (`verify = true`), and the oracle is the static `predict` on the live-only twin plus the
@@ -7338,12 +7341,12 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
             let rel = (got.ipred - w.pred).abs() / w.pred.abs();
             // Measured 4.1e-14 at η = 0 (1.9e-5 while η was drawn from the regularised Ω,
             // #1603); the bound is the ODE engines' 1e-10, and the smallest defect it guards
-            // is +31 % (ID 11).
+            // peaks at 26.1 % (ID 9; bolus-gate mutation, measured at `d36f944e`).
             assert!(
                 rel < 1e-10,
                 "adaptive, {label}, lag {lag}, t = {}: {} vs static live-only twin {} \
                  (rel {rel:.3e}) — adaptive drifted from the static twin: a wiped dose still \
-                 arriving peaks at ≥ 31 % per fixture; a smaller drift points at η or the solver",
+                 arriving peaks at ≥ 26 % per fixture; a smaller drift points at η or the solver",
                 got.time,
                 got.ipred,
                 w.pred
