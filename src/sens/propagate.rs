@@ -943,7 +943,11 @@ fn active_rates_g<T: PkNum>(
     let mut rate_periph2 = T::from_f64(0.0);
     let mut rate_depot = T::from_f64(0.0);
     // The value walk's gate (`pk::event_driven::active_rates_at`), built the same way: once
-    // per call, at `mid`.
+    // per call, at `mid`. (`propagate_bounds_g`'s `moving_bounds` builds its own at the
+    // interval start instead. No `SS=1` record lies inside an interval — every dose record is
+    // an event — so the two can differ only on a sliver interval that ends on a record and
+    // starts just over `EVENT_MATCH_TOL` below it, whose telescoping jet error is O(its
+    // width).)
     let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
     for (k, d) in doses.iter().enumerate() {
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);

@@ -89,9 +89,12 @@ does:
 - the tail of an earlier `SS=1` infusion that was still running at its
   own record stops at a later `SS=1` record.
 
-This holds on the ODE engines, analytic superposition, the analytic
-event-driven path, and the gradients each of them feeds to FOCE/FOCEI
-(`nonmem_anchor/ss_infusion_stop`, ≤ 2.6e-12 against NONMEM).
+The predictions of the ODE engines, analytic superposition and the
+analytic event-driven path match NONMEM to ≤ 2.6e-12 on these cases
+(`nonmem_anchor/ss_infusion_stop`); the adaptive driver matches to its
+own 3e-4 floor. The gradients FOCE/FOCEI use describe
+the same dosing history: each gradient walk's value equals the
+prediction, and its derivatives match finite differences of it.
 
 One case is not yet covered: an analytic `init()` baseline is still
 superposed on an `SS=1` dose, as the `W_STEADY_STATE_INIT` warning says.

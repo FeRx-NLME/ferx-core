@@ -1823,6 +1823,10 @@ fn active_zero_order_inputs(
     t_end: f64,
     reset_floor: f64,
 ) -> Vec<(usize, f64)> {
+    // Most subjects have no zero-order window: skip the gate's O(n) cutoff scan for them.
+    if windows.is_empty() {
+        return Vec::new();
+    }
     let gate = ResetGate::at_segment(doses, reset_floor, t_start);
     windows
         .iter()

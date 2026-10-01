@@ -5446,6 +5446,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             }
             cur_t = t_event;
         }
+        // The reset gate at this event, one spelling for every arm below that asks it (the
+        // arrival, the route onset, the infusion end and the zero-order end cohort). Built
+        // lazily, since most events ask nothing. `reset_floor` is raised only at the end of the
+        // iteration (the `K_RESET` arm), so every arm reads the floor in force here.
+        let event_reset_floor = reset_floor;
+        let event_gate = || {
+            crate::ode::predictions::ResetGate::at_segment(
+                &subject.doses,
+                event_reset_floor,
+                t_event,
+            )
+        };
         if kind == K_DOSE {
             let d = &subject.doses[idx];
             // #1588 / #1587: a dose whose record precedes the `SS=1` record reached at this
@@ -5455,12 +5467,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // saltations (bolus, forcing onset and infusion rate-on, #1586), or ∂f/∂ALAG would
             // keep the derivative of a dose the value no longer has. The TAD anchor fold below
             // is not: production anchors TAD on every dose, live or not.
-            let arrival_live = crate::ode::predictions::ResetGate::at_segment(
-                &subject.doses,
-                reset_floor,
-                t_event,
-            )
-            .live(&subject.doses, idx);
+            let arrival_live = event_gate().live(&subject.doses, idx);
             // The anchor this arrival establishes, computed ONCE and used by every consumer in
             // this arm: the post side of the saltation below, and the segment the arrival opens.
             //
@@ -6098,12 +6105,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // onset jet here would be the derivative of a boundary the trajectory never had
             // (#1587: a dose recorded before an EVID=3/4 reset, whose route onset lands after
             // it).
-            let onset_live = crate::ode::predictions::ResetGate::at_segment(
-                &subject.doses,
-                reset_floor,
-                t_event,
-            )
-            .live(&subject.doses, dose_idx);
+            let onset_live = event_gate().live(&subject.doses, dose_idx);
             if cmt_idx < n_states && onset_live {
                 let f = &ode.input_rate[fi];
                 // The onset jump is this dose's own `frac·R_in(0⁺)` — kernel (`ka`/shape),
@@ -6290,12 +6292,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // lag`, so it moves with `lag` and with the window length exactly as the real end
             // at `d.time + lag + T_inf` does.
             if (has_lagtime || is_rate_defined || is_modeled)
-                && crate::ode::predictions::ResetGate::at_segment(
-                    &subject.doses,
-                    reset_floor,
-                    t_event,
-                )
-                .live(&subject.doses, idx)
+                && event_gate().live(&subject.doses, idx)
                 && crate::dosing::infusion_has_rate_channel(d)
                 && d.cmt_idx() < n_states
             {
@@ -6407,11 +6404,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // `idx`, even if reset-cut) done so their own later events are no-ops. A window
                 // a reset reached here cut — EVID=3/4 (#1587) or an `SS=1` record (#1586) — has
                 // no rate to turn off.
-                let gate = crate::ode::predictions::ResetGate::at_segment(
-                    &subject.doses,
-                    reset_floor,
-                    t_event,
-                );
+                let gate = event_gate();
                 let cohort: Vec<usize> = (0..zero_windows.len())
                     .filter(|&j| {
                         !zo_end_done[j]

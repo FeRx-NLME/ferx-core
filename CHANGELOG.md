@@ -70,8 +70,11 @@ section of the SDLC for the versioning policy).
   did `zero_order(...)` windows on the ODE engines. On analytic models the gradient was
   wrong even where the prediction was right: a central infusion's value came from
   superposition (fixed in #1576) while FOCE/FOCEI differentiated the event walk, which still
-  ran it (43–93 % off). Every engine and its gradient now match NONMEM to ≤ 2.6e-12 (the
-  adaptive driver to 3e-4, its own floor; `nonmem_anchor/ss_infusion_stop`).
+  ran it (43–93 % off). Every listed engine's prediction now matches NONMEM to ≤ 2.6e-12
+  (the adaptive driver to 3e-4, its own floor; the EKF on infusion cells only, since it
+  applies no `zero_order(...)` or other input-rate forcing at all;
+  `nonmem_anchor/ss_infusion_stop`). Each gradient walk's value equals its prediction, and
+  its derivatives match finite differences of the prediction.
 - **A dose that lands between a lagged `SS=1` dose's record and its arrival is no longer
   erased** (#1275). A lagged steady-state dose loads its periodic state at its dose record
   and carries it to the lagged arrival, which then adds only the new pulse. The ODE paths
