@@ -270,14 +270,21 @@ fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> 
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on. One decision after the tie.
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
+/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
+/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
+/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![25.0];
+    let mut params = model.default_params.clone();
+    params.omega.chol.fill(0.0);
+    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         pop,
-        &model.default_params,
+        &params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,
@@ -291,11 +298,11 @@ fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f6
 }
 
 // ODE f64 and dual: measured worst 2.2e-12 (probe at fc1d1404 on untouched IDs; see the
-// printed worst below). Analytic: 1.6e-15. Adaptive: 3.1e-4 on IDs no mechanism touches
-// (unattributed, not this issue); the smallest defect it guards is +9.8 %, 98x above.
+// printed worst below). Analytic: 1.6e-15. Adaptive at η = 0: 1.95e-12 (lag 0) / 2.20e-12
+// (lag 2) — the 3.1e-4 it showed before was its η draw from the regularised `omega ~ 0.0`
+// (#1603), not the driver. The smallest defect it guards is +9.8 %.
 const ODE_BOUND: f64 = 1e-10;
 const ANALYTIC_BOUND: f64 = 1e-13;
-const ADAPTIVE_BOUND: f64 = 1e-3;
 
 // ---- ODE static walker (`ode_predictions`): S1 + S2 ----
 
@@ -356,13 +363,7 @@ fn ode_with_states_resets_a_co_timed_dose_by_row_order() {
 fn adaptive_driver_resets_a_co_timed_dose_by_row_order() {
     for (lag, table) in [(0.0, TABLE_LAG0), (2.0, TABLE_LAG2)] {
         let got = via_adaptive(&ode_depot(lag), &static_pop());
-        assert_matches(
-            &format!("adaptive, lag {lag}"),
-            &got,
-            table,
-            ADAPTIVE_BOUND,
-            &[],
-        );
+        assert_matches(&format!("adaptive, lag {lag}"), &got, table, ODE_BOUND, &[]);
     }
 }
 

@@ -7279,6 +7279,9 @@ fn ode_depot_alag1(lag: f64) -> String {
 /// `shadow` list), so it inherited the static walker's row-order defect: a bolus row before a
 /// co-timed `SS=1` row applied after the reset (ID 1, lag 0: +127 %), and at lag 2 a first
 /// `SS=1` dose's arrival re-loaded its own trough over a later record's seed (ID 9: −48 %).
+/// Those figures are from #1588's tree. Since #1275 (`e00ba374`) only the bolus pass's gate
+/// is load-bearing here; removing it measures a peak |rel| of 104 % / 26.1 % / 27.2 % on
+/// IDs 1 / 9 / 11 (at `d36f944e`), and removing the reseed gate alone moves nothing.
 /// A controller dose into central at 25 (after the tie) exercises the gate's index space over the shadow
 /// list: base doses then the injected one, which is live. The frozen-replay verifier runs
 /// (`verify = true`), and the oracle is the static `predict` on the live-only twin plus the
@@ -7319,7 +7322,12 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
         opts.decision_times = vec![25.0];
         // Into central: lagged controller dosing (the depot) is rejected at injection.
         let central_bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 2 }];
-        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, central_bolus, &opts)
+        // η = 0 exactly, as the static `pred` oracle: `omega ~ 0.0` is PD-regularised to
+        // Ω = 1e-8, which would draw η with sd 1e-4 (#1603).
+        let mut params = model.default_params.clone();
+        params.omega.chol.fill(0.0);
+        params.omega.matrix.fill(0.0);
+        let res = simulate_adaptive(&model, &pop, &params, 1, central_bolus, &opts)
             .expect("adaptive sim runs and passes the frozen-replay verifier");
         assert_eq!(res.ledger.len(), 1, "{label}: one controller dose at 25");
 
@@ -7331,14 +7339,14 @@ fn adaptive_driver_wipes_a_dose_an_ss_record_reset() {
         for (got, w) in res.trajectories.iter().zip(&want) {
             assert!(got.ipred.is_finite(), "{label} t={}: non-finite", got.time);
             let rel = (got.ipred - w.pred).abs() / w.pred.abs();
-            // Measured 1.9e-5 (1.9e-4 with `omega ~ 0.0`). That is the adaptive driver's own
-            // floor against the static walker, unattributed and not this issue (the same
-            // driver sits 3.1e-4 off NONMEM on an `SS=1`-alone subject). The bound is the
-            // one the NONMEM anchor derives from it; the smallest defect it guards is +31 % (ID 11).
+            // Measured 4.1e-14 at η = 0 (1.9e-5 while η was drawn from the regularised Ω,
+            // #1603); the bound is the ODE engines' 1e-10, and the smallest defect it guards
+            // peaks at 26.1 % (ID 9; bolus-gate mutation, measured at `d36f944e`).
             assert!(
-                rel < 1e-3,
+                rel < 1e-10,
                 "adaptive, {label}, lag {lag}, t = {}: {} vs static live-only twin {} \
-                 (rel {rel:+.3e}) — a dose the SS=1 record wiped still arrived",
+                 (rel {rel:.3e}) — adaptive drifted from the static twin: a wiped dose still \
+                 arriving peaks at ≥ 26 % per fixture; a smaller drift points at η or the solver",
                 got.time,
                 got.ipred,
                 w.pred

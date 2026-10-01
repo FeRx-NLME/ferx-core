@@ -70,12 +70,12 @@ use ferx_core::{
 const DATA: &str = "nonmem_anchor/ss_arrival_flow.csv";
 const LAGS: [f64; 3] = [11.0, 12.0, 13.0];
 
-/// Measured worst 8.8e-12 (ODE, dual) against ADVAN13's own `TOL=12` floor.
+/// Measured worst 8.8e-12 (ODE, dual, and the adaptive driver at η = 0, which equals the
+/// static walker to four figures) against ADVAN13's own `TOL=12` floor. The adaptive leg sat
+/// at 3.6e-4 only while it drew η from the regularised `omega ~ 0.0` (#1603).
 const ODE_BOUND: f64 = 1e-10;
 /// Measured 5.8e-12: NONMEM's ADVAN13 solver error, **not** the 1e-13 the ADVAN2 anchors use.
 const ANALYTIC_BOUND: f64 = 1e-10;
-/// Measured 3.6e-4 (ID 6; 2.9e-4 on IDs 1–5): the adaptive driver's own floor (#1603).
-const ADAPTIVE_BOUND: f64 = 1e-3;
 
 /// IDs other than 2, which the analytic single `lagtime` slot cannot express.
 const NOT_ANALYTIC: &[&str] = &["1", "3", "4", "5", "6"];
@@ -360,14 +360,21 @@ fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> 
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on.
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
+/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
+/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
+/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![25.0];
+    let mut params = model.default_params.clone();
+    params.omega.chol.fill(0.0);
+    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         pop,
-        &model.default_params,
+        &params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,
@@ -484,7 +491,7 @@ fn adaptive_driver_flows_a_lagged_ss_dose_to_its_arrival() {
             .map(|(tag, m, pop, skip)| {
                 let got = via_adaptive(&m, &pop);
                 let label = format!("adaptive{tag}, lag {lag}");
-                check_matches(&label, &got, &table(lag), ADAPTIVE_BOUND, &skip)
+                check_matches(&label, &got, &table(lag), ODE_BOUND, &skip)
             })
             .collect()
     });
