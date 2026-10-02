@@ -1273,6 +1273,46 @@ mod from_fit {
         assert!(!err.contains("level block"), "{err}");
         assert!(!err.contains("level bindings"), "{err}");
     }
+
+    /// T9. The unseen-level refusal's second action works, not only its wording:
+    /// on a design the refusal rejects, binding the design on its own levels and
+    /// simulating from the model's initial estimates succeeds. The refused design
+    /// is the one rebound, so a refusal that left it half-written would show here.
+    /// From Rust the action is `bind_theta_levels` + `default_params`, as the
+    /// `bind_theta_levels_from_fit` rustdoc says.
+    ///
+    /// Mutations — re-parse in `bind_theta_levels` but keep the unbound model's
+    /// `default_params` (the initial estimates no longer fit the design's layout),
+    /// or drop the rebound model: the simulation is refused and this dies.
+    #[test]
+    fn the_refusals_second_action_simulates_the_design_on_its_own_levels() {
+        let text = no_eta_model();
+        let fit = bind_fit(&text, &mut population(2, 2));
+        let mut design = population(3, 4);
+        let err = bind_design(&text, &mut design, &fit.bindings.levels)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("the design has 8 level(s) the fit estimated no theta for")
+                && err.contains("simulate the design without the fit's theta"),
+            "the refusal under test offers the action: {err}"
+        );
+
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut design)
+            .expect("the design binds on its own levels");
+        let model = &parsed.model;
+        assert_eq!(model.n_theta, 13, "TVCL, TVV, 12 levels - 1 (sum_to_zero)");
+        assert_eq!(model.default_params.theta.len(), 13);
+        let rows = simulate_with_seed(model, &design, &model.default_params, 2, 7)
+            .expect("the design simulates from the model's initial estimates");
+        assert_eq!(rows.len(), 24, "2 sims x 3 subjects x 4 observations");
+        assert!(
+            rows.iter().all(|r| r.ipred.is_finite()),
+            "every ipred finite: {:?}",
+            rows.iter().map(|r| r.ipred).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// `theta_level_values` (#1623): every level's value, free and dependent, read through
@@ -1484,9 +1524,9 @@ mod level_values {
     /// T4. Only bound level blocks are reported: an unbound one and a counted
     /// `theta NAME[N]` block give an empty map. T1 is the bound side of this gate.
     ///
-    /// Mutations — drop the unbound-block filter (the unbound block then has no
-    /// gather and errs), or walk every gather instead of the level blocks (the
-    /// counted block appears): either way these die.
+    /// Mutations — drop the unbound-block filter (an unbound block still has its
+    /// gather, so the map becomes `Ok({"PLACEBO": []})`), or walk every gather
+    /// instead of the level blocks (the counted block appears): either way these die.
     #[test]
     fn unbound_and_counted_blocks_are_not_reported() {
         let unbound = parse_full_model(&no_eta_model()).unwrap().model;
@@ -1542,5 +1582,51 @@ mod level_values {
             vec![("PLACEBO".to_string(), 1..21)],
             "20 levels, 20 free coefficients"
         );
+    }
+
+    /// T8. The report is what the model applies, read off the model's own
+    /// `pk_param_fn` rather than off any closed form: with `CL = TVCL + PLACEBO`
+    /// and η = 0, each level's `CL` is `TVCL + value`, bit for bit, under every
+    /// contrast that has a dependent level. T1 pins the values against closed
+    /// forms, which agree with the gather by construction while the report calls
+    /// it; this test does not depend on how the report computes them.
+    ///
+    /// Mutation — re-derive the value locally (`Free(k) => theta[k]`,
+    /// `NegSum(a, b) => -theta[a..b].sum()`) and flip `NegSum`'s sign in
+    /// `eval_gather`: T1–T5 stay green, and this dies on the first dependent level.
+    #[test]
+    fn every_reported_value_is_what_the_model_applies_at_that_level() {
+        for contrast in ["sum_to_zero", "ref", "sum_to_zero_within"] {
+            let mut pop = population(2, 3);
+            let text = no_eta_model().replace(
+                "[STUDY, TIME]",
+                &format!("[STUDY, TIME, contrast = {contrast}]"),
+            );
+            let model = bind(&text, &mut pop).unwrap();
+            let mut t = distinct_theta(model.n_theta);
+            t[0] = 2.0; // TVCL, so CL does not collapse onto the level's value
+            let values = placebo_values(&model, &t);
+            assert_eq!(values.len(), 6, "{contrast}: 2 studies x 3 times");
+            assert!(
+                values.iter().any(|v| v.theta_index.is_none()),
+                "{contrast}: has a dependent level, so the gather's NegSum arm is read"
+            );
+            let eta = vec![0.0; model.n_eta];
+            for (i, v) in values.iter().enumerate() {
+                let mut covs = HashMap::new();
+                covs.insert("STUDY".to_string(), if i < 3 { 1.0 } else { 2.0 });
+                covs.insert("__level_PLACEBO".to_string(), (i + 1) as f64);
+                let cl = (model.pk_param_fn)(&t, &eta, &covs, 0.0).values[crate::types::PK_IDX_CL];
+                assert_eq!(
+                    cl.to_bits(),
+                    (t[0] + v.value).to_bits(),
+                    "{contrast}, level {} (`{}`): the model applies CL = {cl}, the report \
+                     says TVCL + {}",
+                    i + 1,
+                    v.label,
+                    v.value
+                );
+            }
+        }
     }
 }
