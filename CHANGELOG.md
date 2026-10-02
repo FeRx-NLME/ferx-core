@@ -61,6 +61,18 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **An unbound `theta NAME[COL, ...]` level block now names the public binder** (#1384). The
+  `fit()` refusal and the simulate paths' `E_THETA_LEVELS_UNBOUND` said only a file entry
+  point could bind the block. A caller that reads the data itself can call
+  `bind_theta_levels` between `read_population_for` and `fit`, and both messages now say so.
+  The docs' composable example and the API quick-start called `build_fit_inputs`, which
+  does not exist. They now bind the model and take inits and options from the parsed model.
+  The parameters page no longer says the data-driven form needs a file entry point.
+- **The docs name R functions that exist** (#1367): `ferx_apply_selection()` (not
+  `ferx_selection()`), `ferx_fit(ignore =, accept =, ignore_ids =)` (not
+  `ferx_fit(settings = ...)`) and `ferx_search_space()` (not `ferx_search()`).
+  `ferx_mbma_data()` is marked as planned.
+
 - **An `SS=1` record now stops every infusion and zero-order window recorded before it, on
   every engine** (#1586). NONMEM stops an infusion still running at a mid-timeline `SS=1`
   record, never starts one whose row precedes a co-timed `SS=1` row or whose lagged window

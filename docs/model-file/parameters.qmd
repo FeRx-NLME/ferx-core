@@ -74,8 +74,8 @@ sharing the one `(init, lower, upper)` triple — and `FIX`, if given.
   at runtime; an out-of-range literal is a parse error.
 - A **bare** `PLACEBO` is an error — there is nothing to gather on. Index it.
 
-The R package's `ferx_mbma_data()` is the natural place to build the index
-column for this form.
+A helper in the R package that builds the index column for this form is planned
+([FeRx-NLME/ferx-r#370](https://github.com/FeRx-NLME/ferx-r/issues/370)).
 
 ### Data-driven form: `theta NAME[COL, ...]`
 
@@ -104,12 +104,16 @@ count, anything else is a column list.
 Only combinations the data actually shows become parameters — an unbalanced
 design does not acquire cells nobody measured.
 
-Because the level count is a property of the *dataset*, this form must be run
-through a file entry point (the CLI, `run_model_with_data`, `fit_from_files`, or
-`--simulate`), which reads the data and binds the block. A model handed to the
-in-memory `fit()` without that step is refused rather than silently predicting
-`NaN`; if you need the in-memory path, use the counted `theta NAME[N]` form with
-your own index column.
+Because the level count is a property of the *dataset*, the block has to be
+bound to the data before it can be fitted or simulated. The file entry points
+(the CLI, `run_model_with_data`, `fit_from_files`, `prepare_run`, and
+`--simulate`) read the data and bind the block for you. A caller that reads the
+data itself, through the Rust API, calls `bind_theta_levels` between reading
+the population and `fit`. See
+[Assembling the inputs yourself](../api/fitting.qmd#assembling-the-inputs-yourself).
+A model that reaches `fit()` unbound is refused, naming the block, rather than
+silently predicting `NaN`. The simulate paths report the same problem as
+`E_THETA_LEVELS_UNBOUND`.
 
 ### Identifiability
 

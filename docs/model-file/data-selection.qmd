@@ -235,9 +235,10 @@ different shapes:
   [#1495](https://github.com/FeRx-NLME/ferx-core/issues/1495).
 
 What it cannot see is conditions supplied by a **caller** rather than written in
-the model file: `ferx check` takes no fit options, so `ferx_selection()` passed
-through `ferx_fit(settings = ...)`, or a `FitOptions` handed to `fit_from_files`,
-are invisible to it. Those are merged into the fit's own read (see *Merging with
+the model file: `ferx check` takes no fit options, so conditions passed to
+`ferx_fit(ignore =, accept =, ignore_ids =)`, carried by a
+`ferx_apply_selection()` result passed as `data`, or held in a `FitOptions`
+handed to `fit_from_files`, are invisible to it. Those are merged into the fit's own read (see *Merging with
 R call conditions* below) and a check of the file alone is silent about them.
 
 Before [#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465) the check read
@@ -283,12 +284,13 @@ uncovered compartment that a clause deletes, with a non-zero exit code.
 
 ## Merging with R call conditions
 
-When you also supply `ignore` or `accept` conditions via the R function
-`ferx_selection()`, the model-file conditions and the R-call conditions are
+When you also supply conditions from R, through the `ignore`, `accept` or
+`ignore_ids` arguments of `ferx_fit()` or through a `ferx_apply_selection()`
+result passed as `data`, the model-file conditions and the R-call conditions are
 **merged** (not replaced).  Exact-duplicate expressions are deduplicated
 automatically; a condition specified in both places is only evaluated once.
 
-See the ferx-r documentation for `ferx_selection()` and `ferx_fit()`.
+See the ferx-r documentation for `ferx_apply_selection()` and `ferx_fit()`.
 
 ---
 

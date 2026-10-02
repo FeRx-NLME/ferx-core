@@ -17,22 +17,24 @@ ferx-core = { path = "../ferx-core" }
 ## Quick Example
 
 ```rust
-use ferx_core::api::read_population_for;
+use ferx_core::api::{bind_covariate_stats, read_population_for};
 use ferx_core::*;
 use std::path::Path;
 
 fn main() -> Result<(), String> {
     // Parse model and data
-    let parsed = parse_full_model_file(Path::new("model.ferx"))?;
-    let (population, _) = read_population_for(
-        &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+    let model_text = std::fs::read_to_string("model.ferx").map_err(|e| e.to_string())?;
+    let mut parsed = parse_full_model_file(Path::new("model.ferx"))?;
+    let (mut population, _) = read_population_for(
+        &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &parsed.column_map,
     )?;
 
-    // Build initial parameters and options
-    let (init_params, options) = build_fit_inputs(&parsed)?;
+    // Bind data-driven declarations (no-ops for a model without them)
+    bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    bind_covariate_stats(&mut parsed, &model_text, &population)?;
 
-    // Run estimation
-    let result = fit(&parsed.model, &population, &init_params, &options)?;
+    // Run estimation from the model's own initial estimates and options
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 
     // Access results
     println!("OFV: {}", result.ofv);
@@ -43,6 +45,9 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 ```
+
+Why the bind step is there, and when it matters, is in
+[Assembling the inputs yourself](fitting.qmd#assembling-the-inputs-yourself).
 
 ## API Sections
 

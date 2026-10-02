@@ -134,6 +134,58 @@ fn an_unbound_level_block_declares_no_thetas_and_refuses_to_fit() {
 }
 
 #[test]
+fn the_simulate_paths_report_an_unbound_level_block_and_name_the_binder() {
+    // `E_THETA_LEVELS_UNBOUND` is what every `simulate()` meets through
+    // `check_simulation_data` (#1384). Both sides of the gate in one test: the
+    // unbound model reports it, the same model bound reports nothing.
+    let parsed = parse_full_model(&no_eta_model()).unwrap();
+    let diags = crate::api::validation::check_simulation_data(&parsed.model, &population(2, 2));
+    let unbound: Vec<_> = diags
+        .iter()
+        .filter(|d| d.code == "E_THETA_LEVELS_UNBOUND")
+        .collect();
+    assert_eq!(unbound.len(), 1, "{diags:?}");
+    let d = unbound[0];
+    assert_eq!(d.block.as_deref(), Some("parameters"));
+    // One assertion per sentence of the message and the suggestion.
+    assert!(
+        d.message
+            .contains("`theta PLACEBO[...]` was never bound to data, so it has no levels"),
+        "{}",
+        d.message
+    );
+    assert!(
+        d.message.contains("every value gathered from it is NaN"),
+        "{}",
+        d.message
+    );
+    let s = d.suggestion.as_deref().expect("a suggestion");
+    assert!(
+        s.contains("`bind_theta_levels(&mut parsed, &model_text, &mut population)`")
+            && s.contains("(`read_population_for_simulation`) before simulating"),
+        "the public binder, and when to call it: {s}"
+    );
+    assert!(
+        s.contains(
+            "The file entry points bind for you, against the dataset or the [simulation] design"
+        ),
+        "the entry points that bind on their own: {s}"
+    );
+    assert!(
+        s.contains("`theta PLACEBO[N](...)` and index it with your own column"),
+        "the counted-form alternative: {s}"
+    );
+
+    let mut pop = population(2, 2);
+    let bound = bind(&no_eta_model(), &mut pop).unwrap();
+    let diags = crate::api::validation::check_simulation_data(&bound, &pop);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_THETA_LEVELS_UNBOUND"),
+        "a bound model must not report it: {diags:?}"
+    );
+}
+
+#[test]
 fn binding_expands_to_one_theta_per_observed_combination() {
     let mut pop = population(3, 4);
     let model = bind(&no_eta_model(), &mut pop).unwrap();

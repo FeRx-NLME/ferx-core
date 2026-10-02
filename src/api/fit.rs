@@ -456,12 +456,15 @@ pub fn fit(
         crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
-    // predict NaN everywhere; refuse, and name the two ways out.
+    // predict NaN everywhere; refuse, and name the ways out — first the public
+    // binder, since a caller that reached `fit()` assembled the inputs itself (#1384).
     if !model.theta_blocks().unbound_level_blocks().is_empty() {
         return Err(format!(
-            "`theta {}[...]` was never bound to data, so it has no levels. Fit \
-             through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
-             CLI), which binds level blocks against the dataset — or declare the block \
+            "`theta {}[...]` was never bound to data, so it has no levels. Call \
+             `bind_theta_levels(&mut parsed, &model_text, &mut population)` after \
+             reading the population (`read_population_for`) and before `fit`. \
+             `prepare_run` and the file entry points (`fit_from_files`, \
+             `run_model_with_data`, the CLI) bind for you. Or declare the block \
              explicitly as `theta {}[N](...)` and index it with your own column.",
             model
                 .theta_blocks()
