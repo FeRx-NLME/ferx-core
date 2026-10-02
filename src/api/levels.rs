@@ -63,7 +63,12 @@ pub fn bind_theta_levels(
         let levels = discover_levels(decl, population)?;
         let contrast = resolve_contrast(decl, &levels, population)?;
         let groups = assign_groups(decl, &levels, contrast);
-        write_index_column(decl, &levels, population)?;
+        let table: Vec<(Level, usize)> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.clone(), i + 1))
+            .collect();
+        write_index_column(decl, &table, population)?;
         bindings.insert(
             decl.name().to_string(),
             LevelBinding {
@@ -84,6 +89,137 @@ pub fn bind_theta_levels(
     parsed.model = rebound.model;
     parsed.model.name = model_name;
     Ok(())
+}
+
+/// Bind a simulation design against a **fit's** level bindings (#1614), so the
+/// fit's θ vector can drive it.
+///
+/// `fitted` is the [`LevelBindings`] the fit was bound with — `parsed.bindings.levels`
+/// right after [`bind_theta_levels`] ran on the fit data. Each design record gets the
+/// index of its level *in the fit*, and the model is re-parsed with the fit's labels,
+/// groups and resolved contrast, so the θ layout is the fit's by construction.
+/// [`bind_theta_levels`] cannot be used for this: it re-discovers the levels from the
+/// design, so a design whose combinations differ from the fit's — a subset, a
+/// different time grid, a study the fit never saw, or only more subjects per study,
+/// which can re-resolve the contrast — silently reads the fitted values at the wrong
+/// positions.
+///
+/// A design level the fit never observed is refused, naming the block and every such
+/// label: no θ was estimated for it, and any stand-in (zero, a group mean) would be a
+/// modelling decision taken silently. On a block keyed on `TIME` that means the design
+/// can only be simulated at the fit's observation times. Levels are matched by their
+/// label (`STUDY=7,TIME=4`), so a design value differing from the fit's in its last
+/// digit is a different level.
+///
+/// Also refused: `fitted` lacking a block the model declares, or carrying one it does
+/// not. Nothing is written to `population` unless every block binds.
+pub fn bind_theta_levels_from_fit(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &mut Population,
+    fitted: &LevelBindings,
+) -> Result<(), String> {
+    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
+    let mut extra: Vec<&str> = fitted
+        .keys()
+        .filter(|name| !decls.iter().any(|d| d.name() == name.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !extra.is_empty() {
+        extra.sort_unstable();
+        return Err(format!(
+            "the fit's level bindings carry the block(s) {}, which this model does not \
+             declare: the bindings belong to a different model",
+            extra
+                .iter()
+                .map(|b| format!("`{b}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if decls.is_empty() {
+        return Ok(());
+    }
+
+    let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
+    for decl in &decls {
+        let binding = fitted.get(decl.name()).ok_or_else(|| {
+            format!(
+                "theta {}[{}]: the fit's level bindings carry no `{}`, so there is no fitted \
+                 layout to bind the design against (was the model edited since the fit?)",
+                decl.name(),
+                decl.columns().join(", "),
+                decl.name()
+            )
+        })?;
+        if binding.groups.len() != binding.labels.len() {
+            return Err(format!(
+                "theta {}[{}]: the fit's level binding has {} labels but {} groups; \
+                 they must be parallel",
+                decl.name(),
+                decl.columns().join(", "),
+                binding.labels.len(),
+                binding.groups.len()
+            ));
+        }
+        let mut table = Vec::new();
+        let mut unseen = Vec::new();
+        for level in discover_levels(decl, population)? {
+            let label = level.label(decl.columns());
+            match binding.labels.iter().position(|l| *l == label) {
+                Some(i) => table.push((level, i + 1)),
+                None => unseen.push(label),
+            }
+        }
+        if !unseen.is_empty() {
+            return Err(unseen_levels_message(decl, &unseen));
+        }
+        tables.push(table);
+    }
+
+    for (decl, table) in decls.iter().zip(&tables) {
+        write_index_column(decl, table, population)?;
+    }
+    let model_name = parsed.model.name.clone();
+    parsed.bindings.levels = fitted.clone();
+    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    parsed.model = rebound.model;
+    parsed.model.name = model_name;
+    Ok(())
+}
+
+/// The refusal for design levels the fit never observed. Every label is listed — a
+/// caller (the R wrapper) passes the text through verbatim, and a list cut short would
+/// leave the user guessing which records to drop.
+fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
+    let mut message = format!(
+        "theta {}[{}]: the design has {} level(s) the fit estimated no theta for: {}. \
+         A level's theta exists only for a combination the fit's data observed.",
+        decl.name(),
+        decl.columns().join(", "),
+        unseen.len(),
+        unseen
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if decl
+        .columns()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(TIME_COLUMN))
+    {
+        message.push_str(&format!(
+            " `{TIME_COLUMN}` is a level column of this block, so the design can only be \
+             simulated at the fit's observation times; a denser or different time grid has \
+             no fitted theta."
+        ));
+    }
+    message.push_str(
+        " Either simulate only the fit's levels, or bind the design with `bind_theta_levels` \
+         and supply theta for the design's own levels.",
+    );
+    message
 }
 
 /// A level: the tuple of column values that defines it.
@@ -322,6 +458,11 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 
 /// Write the synthesized 1-based level index onto every subject.
 ///
+/// `table` pairs each level with its index: the level's own position for
+/// [`bind_theta_levels`], its position in the fit for [`bind_theta_levels_from_fit`].
+/// Both binders share this one writer, so the dose, EVID=2 and reset handling below
+/// cannot drift between them.
+///
 /// When the index is constant within a subject it goes into the subject-level
 /// covariate map only — no time-varying machinery is engaged, so the model
 /// keeps whatever fast path it had. When it varies (the unstructured-placebo
@@ -329,15 +470,15 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 /// materialised, which is exactly what a genuinely per-record parameter needs.
 fn write_index_column(
     decl: &LevelBlockDecl,
-    levels: &[Level],
+    table: &[(Level, usize)],
     population: &mut Population,
 ) -> Result<(), String> {
     let column = level_index_column(decl.name());
     let index_of = |values: &[f64]| -> Option<f64> {
-        levels
+        table
             .iter()
-            .position(|l| l.values == values)
-            .map(|i| (i + 1) as f64)
+            .find(|(l, _)| l.values == values)
+            .map(|&(_, i)| i as f64)
     };
 
     for subject in population.subjects.iter_mut() {

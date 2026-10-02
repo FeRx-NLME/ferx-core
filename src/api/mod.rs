@@ -48,7 +48,7 @@ pub use adaptive::{
 };
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
-pub use levels::{bind_theta_levels, level_map as theta_level_map};
+pub use levels::{bind_theta_levels, bind_theta_levels_from_fit, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{

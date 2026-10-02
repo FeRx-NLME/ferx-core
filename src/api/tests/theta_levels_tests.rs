@@ -923,3 +923,329 @@ mod binder_helpers {
         assert_eq!(named.len(), 3, "but only three carry a θ: {named:?}");
     }
 }
+
+/// `bind_theta_levels_from_fit` (#1614): a simulation design bound against the fit's
+/// level bindings. Analytic one-compartment IV throughout; no gradient path.
+mod from_fit {
+    use super::*;
+    use crate::api::{bind_theta_levels_from_fit, simulate_with_seed};
+    use crate::parser::model_parser::{LevelBindings, LevelContrast};
+    use crate::types::{ModelParameters, ParsedModel};
+
+    /// Bind `text` against the fit data `pop` and return the parsed model, whose
+    /// `bindings.levels` is what a caller keeps after the fit.
+    fn bind_fit(text: &str, pop: &mut Population) -> ParsedModel {
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, pop).expect("bind the fit data");
+        parsed
+    }
+
+    fn bind_design(
+        text: &str,
+        design: &mut Population,
+        fitted: &LevelBindings,
+    ) -> Result<ParsedModel, String> {
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, text, design, fitted)?;
+        Ok(parsed)
+    }
+
+    /// [`population`] with every subject replicated `reps` times under fresh ids —
+    /// more subjects per study than the fit had, the shape of a VPC design.
+    fn replicated(n_studies: usize, n_times: usize, reps: usize) -> Population {
+        let mut pop = population(n_studies, n_times);
+        let base = pop.subjects.clone();
+        pop.subjects = (0..reps)
+            .flat_map(|r| {
+                base.iter().map(move |s| Subject {
+                    id: format!("{}-{r}", s.id),
+                    ..s.clone()
+                })
+            })
+            .collect();
+        pop
+    }
+
+    /// The fit's θ (its own initial estimates) as parameters for `model`.
+    fn fit_theta_params(model: &CompiledModel, fit_theta: &[f64]) -> ModelParameters {
+        let mut params = model.default_params.clone();
+        params.theta = fit_theta.to_vec();
+        params
+    }
+
+    /// T5. The contrast travels from the fit. One subject per study makes the
+    /// fit's `STUDY` identify subjects, so the η-sharing block resolves to
+    /// `sum_to_zero_within` (6 θ). A design with two subjects per study would
+    /// resolve to global sum-to-zero (7 θ) if the contrast were re-resolved on it
+    /// — measured on `a1cd1b5b`: every ipred 0.
+    ///
+    /// Mutation — call `resolve_contrast` / `assign_groups` on the design instead
+    /// of taking `fitted` verbatim: `n_theta` goes to 7 and this dies on it.
+    #[test]
+    fn the_contrast_travels_from_the_fit_not_the_design() {
+        let text = mbma_model("");
+        let mut fit_pop = population(2, 3);
+        let fit = bind_fit(&text, &mut fit_pop);
+        assert_eq!(fit.model.n_theta, 6, "TVCL, TVV, 2 studies x (3 - 1)");
+        assert_eq!(
+            fit.bindings.levels["PLACEBO"].contrast,
+            LevelContrast::SumToZeroWithin
+        );
+
+        // The control: the design re-bound on its own does re-resolve.
+        let mut own = replicated(2, 3, 2);
+        let rebound = bind(&text, &mut own).unwrap();
+        assert_eq!(rebound.n_theta, 7, "the design alone resolves globally");
+
+        let mut design = replicated(2, 3, 2);
+        let parsed = bind_design(&text, &mut design, &fit.bindings.levels).expect("bind");
+        assert_eq!(parsed.model.n_theta, 6);
+        assert_eq!(parsed.model.theta_names, fit.model.theta_names);
+        let b = &parsed.bindings.levels["PLACEBO"];
+        assert_eq!(b.contrast, LevelContrast::SumToZeroWithin);
+        assert_eq!(b.groups, fit.bindings.levels["PLACEBO"].groups);
+
+        let mut theta = fit.model.default_params.theta.clone();
+        for (i, t) in theta.iter_mut().enumerate().skip(1).take(4) {
+            *t = 0.05 * i as f64;
+        }
+        let params = fit_theta_params(&parsed.model, &theta);
+        let rows = simulate_with_seed(&parsed.model, &design, &params, 1, 3).expect("simulate");
+        assert_eq!(rows.len(), 12);
+        assert!(
+            rows.iter().all(|r| r.ipred.is_finite() && r.ipred > 0.0),
+            "{:?}",
+            rows.iter().map(|r| r.ipred).collect::<Vec<_>>()
+        );
+    }
+
+    /// Every synthesized index snapshot on `pop`, flattened in a fixed order.
+    fn index_snapshots(pop: &Population) -> Vec<(String, &'static str, f64)> {
+        let col = "__level_PLACEBO";
+        let mut out = Vec::new();
+        for s in &pop.subjects {
+            out.push((s.id.clone(), "subject", s.covariates[col]));
+            for (kind, maps) in [
+                ("obs", &s.obs_covariates),
+                ("dose", &s.dose_covariates),
+                ("pk_only", &s.pk_only_covariates),
+                ("reset", &s.reset_covariates),
+            ] {
+                for m in maps.iter() {
+                    out.push((s.id.clone(), kind, m[col]));
+                }
+            }
+        }
+        out
+    }
+
+    /// T8, the other side of the gate: when the design *is* the fit data, the
+    /// from-fit binder is `bind_theta_levels` — every index snapshot, the θ layout,
+    /// and the simulated rows bit for bit. Both conventions: global sum-to-zero and
+    /// `sum_to_zero_within`. The fixture carries an EVID=2 row and a reset row, so
+    /// the shared writer's LOCF arms are on the compared path.
+    ///
+    /// Mutation — the from-fit table written 0-based (`(level, i)` for
+    /// `(level, i + 1)`) dies here on the first index snapshot. A change inside the
+    /// shared writer moves both sides alike and is the Tier-2 `PLA_IDX` tests' job.
+    #[test]
+    fn on_the_fit_data_it_is_bind_theta_levels_bit_for_bit() {
+        for text in [no_eta_model(), mbma_model("")] {
+            let mut data = population(2, 3);
+            data.subjects[0].pk_only_times = vec![2.5];
+            data.subjects[0].reset_times = vec![3.5];
+            let mut fit_pop = data.clone();
+            let fit = bind_fit(&text, &mut fit_pop);
+            let mut design = data.clone();
+            let parsed = bind_design(&text, &mut design, &fit.bindings.levels).expect("bind");
+
+            assert_eq!(parsed.model.n_theta, fit.model.n_theta);
+            assert_eq!(parsed.model.theta_names, fit.model.theta_names);
+            let (a, b) = (index_snapshots(&fit_pop), index_snapshots(&design));
+            assert!(a.iter().any(|(_, k, _)| *k == "pk_only"));
+            assert!(a.iter().any(|(_, k, _)| *k == "reset"));
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.0, y.0);
+                assert_eq!(x.1, y.1);
+                assert_eq!(x.2.to_bits(), y.2.to_bits(), "{} {}", x.0, x.1);
+            }
+            assert_eq!(fit_pop.covariate_names, design.covariate_names);
+
+            let mut theta = fit.model.default_params.theta.clone();
+            for (i, t) in theta.iter_mut().enumerate().skip(1) {
+                if fit.model.theta_names[i].starts_with("PLACEBO[") {
+                    *t = 0.03 * i as f64;
+                }
+            }
+            let pa = fit_theta_params(&fit.model, &theta);
+            let pb = fit_theta_params(&parsed.model, &theta);
+            let ra = simulate_with_seed(&fit.model, &fit_pop, &pa, 2, 21).expect("fit side");
+            let rb = simulate_with_seed(&parsed.model, &design, &pb, 2, 21).expect("design side");
+            assert_eq!(ra.len(), 12);
+            assert_eq!(ra.len(), rb.len());
+            for (x, y) in ra.iter().zip(&rb) {
+                assert!(x.ipred.is_finite() && x.ipred > 0.0, "{}", x.ipred);
+                assert_eq!(x.ipred.to_bits(), y.ipred.to_bits());
+            }
+        }
+    }
+
+    /// The fit's bindings must describe this model's blocks: one it lacks is
+    /// refused naming the block, one it has extra is refused naming that one, and
+    /// a binding whose groups are not parallel to its labels is refused. A model
+    /// with no level block and empty bindings is a no-op.
+    ///
+    /// Mutations — drop the extra-block check and the second arm goes `Ok`; drop
+    /// the length check and the third binds a malformed layout.
+    #[test]
+    fn bindings_that_do_not_match_the_model_are_refused_by_name() {
+        let text = no_eta_model();
+        let mut fit_pop = population(2, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+
+        let err = bind_design(&text, &mut population(2, 2), &LevelBindings::new())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("theta PLACEBO[STUDY, TIME]")
+                && err.contains("the fit's level bindings carry no `PLACEBO`")
+                && err.contains("was the model edited since the fit?"),
+            "{err}"
+        );
+
+        let mut extra = fit.bindings.levels.clone();
+        extra.insert("OTHER".to_string(), extra["PLACEBO"].clone());
+        let err = bind_design(&text, &mut population(2, 2), &extra)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("carry the block(s) `OTHER`, which this model does not declare")
+                && err.contains("belong to a different model"),
+            "{err}"
+        );
+        // A model with no level block at all still refuses bindings it cannot use.
+        let plain = no_eta_model()
+            .replace("theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", "")
+            .replace(" + PLACEBO", "");
+        let err = bind_design(&plain, &mut population(2, 2), &fit.bindings.levels)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("`PLACEBO`, which this model does not declare"),
+            "{err}"
+        );
+        let mut untouched = population(2, 2);
+        let before = untouched.covariate_names.clone();
+        bind_design(&plain, &mut untouched, &LevelBindings::new()).expect("no-op");
+        assert_eq!(untouched.covariate_names, before);
+
+        let mut skewed = fit.bindings.levels.clone();
+        skewed.get_mut("PLACEBO").unwrap().groups.pop();
+        let err = bind_design(&text, &mut population(2, 2), &skewed)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("has 4 labels but 3 groups; they must be parallel"),
+            "{err}"
+        );
+    }
+
+    /// The TIME-grid sentence is conditional on the block being keyed on `TIME`;
+    /// both sides in one test so a gate stuck on either branch dies. Both
+    /// refusals leave the design untouched — no index column is written unless
+    /// every block binds.
+    ///
+    /// Mutations — drop the TIME sentence and the first arm dies; emit it
+    /// unconditionally and the second does; write the index before checking for
+    /// unseen labels and the untouched-population assertions die.
+    #[test]
+    fn the_time_grid_sentence_appears_only_for_a_time_keyed_block() {
+        // A denser grid than the fit's: TIME 3 and 4 were never fitted.
+        let text = no_eta_model();
+        let fit = bind_fit(&text, &mut population(2, 2));
+        let mut design = population(2, 4);
+        let err = bind_design(&text, &mut design, &fit.bindings.levels)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("the design has 4 level(s) the fit estimated no theta for")
+                && err.contains(
+                    "`STUDY=1,TIME=3`, `STUDY=1,TIME=4`, `STUDY=2,TIME=3`, `STUDY=2,TIME=4`"
+                ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "`TIME` is a level column of this block, so the design can only be simulated \
+                 at the fit's observation times"
+            ),
+            "{err}"
+        );
+        assert!(!design
+            .covariate_names
+            .iter()
+            .any(|c| c == "__level_PLACEBO"));
+        assert!(design.subjects[0].obs_covariates.is_empty());
+
+        // A block keyed on STUDY alone: a new study is refused, with no TIME claim.
+        let by_study = no_eta_model().replace("[STUDY, TIME]", "[STUDY]");
+        let fit = bind_fit(&by_study, &mut population(2, 2));
+        let mut design = population(3, 2);
+        let err = bind_design(&by_study, &mut design, &fit.bindings.levels)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("theta PLACEBO[STUDY]: the design has 1 level(s)")
+                && err.contains("`STUDY=3`"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("TIME"),
+            "no TIME-grid claim for a STUDY block: {err}"
+        );
+        assert!(!design
+            .covariate_names
+            .iter()
+            .any(|c| c == "__level_PLACEBO"));
+    }
+
+    /// The θ-length gate's level-block hint, both sides of its gate in one test:
+    /// a bound level-block model names the block and `bind_theta_levels_from_fit`;
+    /// the same model without its block does not.
+    ///
+    /// Mutations — drop the hint and the first arm dies; emit it unconditionally
+    /// and the second does.
+    #[test]
+    fn the_theta_length_gate_names_the_from_fit_binder_only_for_a_level_block() {
+        let text = no_eta_model();
+        let mut pop = population(2, 2);
+        let model = bind(&text, &mut pop).unwrap();
+        let mut params = model.default_params.clone();
+        params.theta.pop();
+        let err = simulate_with_seed(&model, &pop, &params, 1, 1).unwrap_err();
+        assert!(
+            err.contains("the supplied theta has 4 values but this model has 5"),
+            "{err}"
+        );
+        assert!(
+            err.contains("declares the theta level block(s) `PLACEBO`")
+                && err.contains("bind the design with `bind_theta_levels_from_fit`"),
+            "{err}"
+        );
+
+        let plain = no_eta_model()
+            .replace("theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", "")
+            .replace(" + PLACEBO", "");
+        let model = parse_full_model(&plain).unwrap().model;
+        let mut params = model.default_params.clone();
+        params.theta.pop();
+        let err = simulate_with_seed(&model, &population(2, 2), &params, 1, 1).unwrap_err();
+        assert!(
+            err.contains("the supplied theta has 1 values but this model has 2"),
+            "{err}"
+        );
+        assert!(!err.contains("level block"), "{err}");
+        assert!(!err.contains("bind_theta_levels_from_fit"), "{err}");
+    }
+}
