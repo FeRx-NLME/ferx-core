@@ -327,10 +327,11 @@ let result = fit(&parsed.model, &population, &parsed.model.default_params, &pars
 Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths report the same
-problem as `E_THETA_LEVELS_UNBOUND`. Bind a simulation dataset the same way,
-on the population from `read_population_for_simulation`. The binder discovers
-the levels from *that* population, so fitted θ only carry over to a design
-showing the same level combinations as the fit data.
+problem as `E_THETA_LEVELS_UNBOUND`. To simulate with the model's own initial
+estimates, bind a design the same way, on the population from
+`read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
+the fit instead, as described in
+[the next section](#simulate-with-fit-theta).
 
 The other three steps are what the file entry points do besides binding. The
 `[data_selection]` filter and the IOV column go to the reader. The gradient
@@ -342,6 +343,51 @@ to the bit. The test suite pins that on a level-block model, alone, with
 `gradient = fd` and with a `[data_selection]` block. A caller that has a model *path* can use
 `prepare_run(model_path, data_path)` instead, which does all of this and
 returns the inputs without fitting.
+
+### Simulating with a fit's θ: `bind_theta_levels_from_fit` {#simulate-with-fit-theta}
+
+A level block's θ vector is laid out by the levels of the data it was bound
+against. `bind_theta_levels` on a simulation design re-discovers the levels from
+the design, so a design whose combinations differ from the fit's (a subset, a
+new time grid, another study, or only more subjects per study, which can change
+the resolved contrast) would read the fitted values at the wrong positions.
+Nothing refuses this when the design has as many levels as the fit: the θ
+vector then has the right length, so the length check below cannot see it.
+Bind the design against the fit's own bindings instead. They are
+`parsed.bindings.levels` right after `bind_theta_levels` ran on the fit data, so
+keep them with the fit:
+
+```rust
+use ferx_core::api::read_population_for_simulation;
+use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
+
+// Continuing the example above: keep the fit's bindings with `result`.
+let fitted_levels = parsed.bindings.levels.clone();
+
+let mut design_parsed = parse_full_model_file(Path::new("model.ferx"))?;
+let (mut design, _) = read_population_for_simulation(
+    &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
+    None, None, &design_parsed.column_map,
+)?;
+bind_theta_levels_from_fit(&mut design_parsed, &model_text, &mut design, &fitted_levels)?;
+let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
+let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
+```
+
+Each design record gets its level's index in the fit, and the model is re-parsed
+with the fit's labels, groups and contrast, so its θ layout is the fit's. A
+design level the fit never observed is refused, naming the block and every such
+label: no θ was estimated for it, and any stand-in would be a modelling choice
+made silently. On a block keyed on `TIME`, such as `PLACEBO[STUDY, TIME]`, this
+means the design can only be simulated at the fit's observation times. A denser
+VPC grid is refused, and so is a study the fit did not include. Levels match by
+their label (`STUDY=7,TIME=4`), so a value differing from the fit's in its last
+digit is a different level.
+
+Every `simulate*` entry point also refuses a θ vector whose length is not the
+model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
+from zeros past its end, and a long one dropped its tail
+([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)).
 
 ### Level labels: `theta_level_map`
 

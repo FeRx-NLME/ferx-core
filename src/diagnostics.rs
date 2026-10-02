@@ -75,6 +75,7 @@
 //! | `W_CMT_DEFAULTED`         | dose / observation rows assigned compartment 1 because the dataset has no `CMT` column, or the cell is missing or unparseable; reported when `CMT` selects something — more than one compartment a dose can reach (multi-state `[odes]`, or an analytical model whose `CMT=2` is a real target), a per-CMT scaling / error model / readout on either engine, an endpoint the row routes to, or a `[data_selection]` clause comparing `CMT` (the scope is the `CmtConsumer` enumeration in `api::validation`) |
 //! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |
 //! | `W_COVSTAT_UNBOUND`       | the same, reported without a `--data` file — the model is fine, it just cannot be built until a dataset is supplied |
+//! | `E_THETA_LENGTH`          | a `simulate*` entry point was handed a θ vector whose length is not the model's; refused rather than read by position (a short vector read `0.0` past its end). Raised by the simulate paths only, never by `ferx check`, which has no parameter vector. On a level-block model the message names `bind_theta_levels_from_fit` (#1614) |
 
 use serde::Serialize;
 

@@ -671,3 +671,357 @@ fn the_composable_path_writes_the_level_index_the_data_encodes() {
     }
     assert_eq!(n_records, 6);
 }
+
+// ── #1614: simulating a design with a fit's θ ────────────────────────────────
+//
+// A fit's θ vector is laid out by the levels of the *fit* data. Re-binding a
+// simulation design with `bind_theta_levels` re-discovers the levels from the
+// design, so any design whose combinations differ from the fit's reads the
+// fitted values at the wrong positions — measured on `a1cd1b5b`: silently
+// remapped at the same level count, all-zero predictions at a different one.
+// `bind_theta_levels_from_fit` binds the design against the fit's own
+// bindings instead. Every fixture here is the analytic one-compartment IV
+// model of `level_block_model()`; no gradient path is reached.
+
+/// [`DATA`] with study 2's subject listed first — the same cells, the same
+/// count, a different listing order.
+const DESIGN_REORDERED: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY,PLA_IDX
+2,0,.,1,100,1,0,1,2,4
+2,1,.,0,.,1,0,0,2,4
+2,4,.,0,.,1,0,0,2,5
+2,12,.,0,.,1,0,0,2,6
+1,0,.,1,100,1,0,1,1,1
+1,1,.,0,.,1,0,0,1,1
+1,4,.,0,.,1,0,0,1,2
+1,12,.,0,.,1,0,0,1,3
+";
+
+/// Study 2 only: a subset whose every label the fit saw, at positions 4, 5, 6
+/// of the fit (`PLA_IDX`), not 1, 2, 3 as the design alone would number them.
+/// Level 6 (`STUDY=2,TIME=12`) is the fit's dependent sum-to-zero level.
+const DESIGN_STUDY2: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY,PLA_IDX
+2,0,.,1,100,1,0,1,2,4
+2,1,.,0,.,1,0,0,2,4
+2,4,.,0,.,1,0,0,2,5
+2,12,.,0,.,1,0,0,2,6
+";
+
+/// Case (a): TIME 12 → 24 on both studies. Same level count, two labels the
+/// fit never saw.
+const DESIGN_TIME24: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY
+1,0,.,1,100,1,0,1,1
+1,1,.,0,.,1,0,0,1
+1,4,.,0,.,1,0,0,1
+1,24,.,0,.,1,0,0,1
+2,0,.,1,100,1,0,1,2
+2,1,.,0,.,1,0,0,2
+2,4,.,0,.,1,0,0,2
+2,24,.,0,.,1,0,0,2
+";
+
+/// Case (g): only study 2's last time moves — only the fit's *dependent* level
+/// is unseen, and the θ names of a re-bound design would be identical.
+const DESIGN_DEPENDENT_ONLY: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY
+1,0,.,1,100,1,0,1,1
+1,1,.,0,.,1,0,0,1
+1,4,.,0,.,1,0,0,1
+1,12,.,0,.,1,0,0,1
+2,0,.,1,100,1,0,1,2
+2,1,.,0,.,1,0,0,2
+2,4,.,0,.,1,0,0,2
+2,24,.,0,.,1,0,0,2
+";
+
+/// Case (b): [`DATA`]'s cells plus a third study.
+const DESIGN_STUDY3: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY
+1,0,.,1,100,1,0,1,1
+1,1,.,0,.,1,0,0,1
+1,4,.,0,.,1,0,0,1
+1,12,.,0,.,1,0,0,1
+2,0,.,1,100,1,0,1,2
+2,1,.,0,.,1,0,0,2
+2,4,.,0,.,1,0,0,2
+2,12,.,0,.,1,0,0,2
+3,0,.,1,100,1,0,1,3
+3,1,.,0,.,1,0,0,3
+3,4,.,0,.,1,0,0,3
+3,12,.,0,.,1,0,0,3
+";
+
+/// Read `design` as a simulation design for the model at `model_path` and bind
+/// it against `fitted` — the documented simulate-after-fit sequence.
+fn bind_design_from_fit(
+    model_path: &std::path::Path,
+    design: &str,
+    fitted: &ferx_core::parser::model_parser::LevelBindings,
+) -> Result<(ferx_core::ParsedModel, ferx_core::Population), String> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let design_path = dir.path().join("design.csv");
+    write!(std::fs::File::create(&design_path).unwrap(), "{design}").unwrap();
+    let model_text = std::fs::read_to_string(model_path).unwrap();
+    let mut parsed = ferx_core::parse_full_model_file(model_path).expect("parse");
+    let (mut population, _) = ferx_core::api::read_population_for_simulation(
+        &parsed.model,
+        &parsed.covariate_decls,
+        design_path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &parsed.column_map,
+    )
+    .expect("read design");
+    ferx_core::bind_theta_levels_from_fit(&mut parsed, &model_text, &mut population, fitted)?;
+    Ok((parsed, population))
+}
+
+/// Bind the fit data with `bind_theta_levels` and return the fit's model and
+/// level bindings — what a caller keeps after the fit.
+fn fit_bindings() -> (
+    tempfile::TempDir,
+    PathBuf,
+    ferx_core::CompiledModel,
+    ferx_core::parser::model_parser::LevelBindings,
+) {
+    let (dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let (parsed, _population) = read_composable(&model_path, &data_path, true);
+    let levels = parsed.bindings.levels.clone();
+    (dir, model_path, parsed.model, levels)
+}
+
+/// Every observation record's synthesized index against the `PLA_IDX` the
+/// design carries — the dataset's own encoding of the fit's positions, a
+/// reference outside the binder. Returns the number of records checked.
+fn assert_index_is_pla_idx(population: &ferx_core::Population, case: &str) -> usize {
+    let mut n = 0;
+    for s in &population.subjects {
+        for j in 0..s.obs_times.len() {
+            assert_eq!(
+                s.obs_cov(j)["__level_PLACEBO"],
+                s.obs_cov(j)["PLA_IDX"],
+                "{case}: subject {} record {j} (TIME {})",
+                s.id,
+                s.obs_times[j]
+            );
+            n += 1;
+        }
+    }
+    n
+}
+
+/// T1. Same cells, same count, study 2 listed first: each record carries its
+/// fit position, and the design model has the fit's θ layout.
+///
+/// Mutation — index by the design's own first-seen order (the from-fit lookup
+/// replaced by the design's position, with `discover_levels`' sort dropped):
+/// study 2's records become 1, 2, 3 and this dies on the first record.
+#[test]
+fn a_reordered_design_binds_at_the_fits_positions() {
+    let (_dir, model_path, fit_model, fitted) = fit_bindings();
+    let (parsed, population) =
+        bind_design_from_fit(&model_path, DESIGN_REORDERED, &fitted).expect("bind");
+    assert_eq!(
+        population.subjects[0].id, "2",
+        "fixture lists study 2 first"
+    );
+    assert_eq!(assert_index_is_pla_idx(&population, "reordered"), 6);
+    assert_eq!(parsed.model.n_theta, fit_model.n_theta);
+    assert_eq!(parsed.model.theta_names, fit_model.theta_names);
+}
+
+/// T2. A subset design (study 2 only, every label seen by the fit) is indexed
+/// 4, 5, 6 — its fit positions — and keeps the fit's θ count of 7, not the 4
+/// (TVCL, TVV, two free levels) a re-bind of the design alone would produce.
+///
+/// Mutations — index by the design's own sorted position (today's
+/// `bind_theta_levels` behaviour → 1, 2, 3) dies on the index; re-parse with
+/// bindings derived from the design instead of `fitted` dies on `n_theta`.
+#[test]
+fn a_subset_design_binds_at_the_fits_positions_and_keeps_its_layout() {
+    let (_dir, model_path, fit_model, fitted) = fit_bindings();
+    assert_eq!(
+        fit_model.n_theta, 7,
+        "2 studies x 3 times, sum-to-zero, + TVCL, TVV"
+    );
+    let (parsed, population) =
+        bind_design_from_fit(&model_path, DESIGN_STUDY2, &fitted).expect("bind");
+    assert_eq!(assert_index_is_pla_idx(&population, "study 2 only"), 3);
+    assert_eq!(parsed.model.n_theta, fit_model.n_theta);
+    assert_eq!(parsed.model.theta_names, fit_model.theta_names);
+    // The fit's bindings, verbatim (`LevelBinding` has no `PartialEq`).
+    let (got, want) = (&parsed.bindings.levels["PLACEBO"], &fitted["PLACEBO"]);
+    assert_eq!(parsed.bindings.levels.len(), 1);
+    assert_eq!(got.labels, want.labels);
+    assert_eq!(got.groups, want.groups);
+    assert_eq!(
+        format!("{:?}", got.contrast),
+        format!("{:?}", want.contrast)
+    );
+}
+
+/// The refusal for each unseen-label case, held to the message contract: the
+/// block, every unseen label, "the fit estimated no theta", the TIME-grid
+/// consequence (this block is keyed on TIME), both options — and not the
+/// level-count claim, which is false at the same count.
+fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
+    assert!(
+        err.contains("theta PLACEBO[STUDY, TIME]"),
+        "{case}: block not named: {err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "the design has {} level(s) the fit estimated no theta for",
+            labels.len()
+        )),
+        "{case}: count / reason missing: {err}"
+    );
+    assert!(
+        err.contains("A level's theta exists only for a combination the fit's data observed."),
+        "{case}: why an unseen level has no theta, missing: {err}"
+    );
+    for l in labels {
+        assert!(
+            err.contains(&format!("`{l}`")),
+            "{case}: label {l} not named: {err}"
+        );
+    }
+    assert!(
+        err.contains(
+            "can only be simulated at the fit's observation times; a denser or different \
+             time grid has no fitted theta."
+        ),
+        "{case}: TIME-grid consequence missing: {err}"
+    );
+    assert!(
+        err.contains("simulate only the fit's levels")
+            && err.contains("bind the design with `bind_theta_levels`"),
+        "{case}: options missing: {err}"
+    );
+    assert!(
+        !err.contains("number of levels"),
+        "{case}: a level-count claim in: {err}"
+    );
+}
+
+/// T3. Same level count, unseen labels: refused, naming every one. The
+/// dependent-only variant (case g) is the one a θ-name comparison cannot see.
+///
+/// Mutations — skip unseen labels, or map them to index 1, or to the dependent
+/// level: each turns the `Err` into an `Ok` (or the writer's internal "data
+/// changed between passes" text) and these die on the expected message.
+#[test]
+fn a_same_count_design_with_unseen_levels_is_refused_by_label() {
+    let (_dir, model_path, _fit_model, fitted) = fit_bindings();
+    let err = bind_design_from_fit(&model_path, DESIGN_TIME24, &fitted)
+        .map(|_| ())
+        .expect_err("TIME 24 was never fitted");
+    assert_unseen_refusal(
+        &err,
+        &["STUDY=1,TIME=24", "STUDY=2,TIME=24"],
+        "TIME 12 -> 24",
+    );
+
+    let err = bind_design_from_fit(&model_path, DESIGN_DEPENDENT_ONLY, &fitted)
+        .map(|_| ())
+        .expect_err("STUDY=2,TIME=24 was never fitted");
+    assert_unseen_refusal(&err, &["STUDY=2,TIME=24"], "dependent level only");
+    assert!(
+        !err.contains("STUDY=1,TIME="),
+        "only the unseen label may be named: {err}"
+    );
+}
+
+/// T4. A study the fit never saw: refused, naming all three of its labels.
+/// Today's re-bind instead returned `Ok` with every ipred exactly 0.
+#[test]
+fn a_design_with_an_unseen_study_is_refused_by_label() {
+    let (_dir, model_path, _fit_model, fitted) = fit_bindings();
+    let err = bind_design_from_fit(&model_path, DESIGN_STUDY3, &fitted)
+        .map(|_| ())
+        .expect_err("STUDY 3 was never fitted");
+    assert_unseen_refusal(
+        &err,
+        &["STUDY=3,TIME=1", "STUDY=3,TIME=4", "STUDY=3,TIME=12"],
+        "STUDY 3",
+    );
+}
+
+/// T6. The simulated prediction against the closed form, outside every engine:
+/// a 100 mg bolus into one compartment with a clearance that moves with the
+/// level, `C(t_j) = 100/V · exp(−Σ_{k≤j} (TVCL + P_k)/V · (t_k − t_{k−1}))`,
+/// with `P_k` read from a hand-written table keyed by `PLA_IDX`. The fitted θ are
+/// distinct per level, and the design (study 2 only) includes the fit's
+/// dependent level, whose value is `−Σ` of the five free ones.
+///
+/// Ω is zeroed in the parameters handed to `simulate_with_seed`, so η = 0
+/// exactly and `ipred` is the typical prediction.
+///
+/// Mutations — a design-position index reads levels 1, 2, 3 (P = 0.1, 0.2, 0.3
+/// instead of 0.4, 0.5, −1.5): every record is off by more than 1e-6. A wrong
+/// dependent value (`+Σ` for `−Σ`) moves the TIME 12 record by orders of
+/// magnitude.
+#[test]
+fn a_subset_design_simulates_the_closed_form_with_the_fits_theta() {
+    let (_dir, model_path, fit_model, fitted) = fit_bindings();
+    let (parsed, population) =
+        bind_design_from_fit(&model_path, DESIGN_STUDY2, &fitted).expect("bind");
+
+    // θ layout: TVCL, PLACEBO[STUDY=1,TIME=1 .. STUDY=2,TIME=4], TVV.
+    let (tvcl, tvv) = (2.0, 10.0);
+    let free = [0.1, 0.2, 0.3, 0.4, 0.5];
+    assert_eq!(fit_model.theta_names[1], "PLACEBO[STUDY=1,TIME=1]");
+    assert_eq!(fit_model.theta_names[5], "PLACEBO[STUDY=2,TIME=4]");
+    let mut params = parsed.model.default_params.clone();
+    params.theta = vec![tvcl, free[0], free[1], free[2], free[3], free[4], tvv];
+    // The draw reads the cached Cholesky factor, so both go to zero.
+    params.omega.matrix.fill(0.0);
+    params.omega.chol.fill(0.0);
+
+    // PLA_IDX → P, written out by hand. 6 is the dependent level: −(0.1+…+0.5).
+    let p_of = |idx: f64| -> f64 {
+        match idx as i64 {
+            1 => 0.1,
+            2 => 0.2,
+            3 => 0.3,
+            4 => 0.4,
+            5 => 0.5,
+            6 => -1.5,
+            other => panic!("no PLA_IDX {other} in the fit"),
+        }
+    };
+
+    let rows = ferx_core::simulate_with_seed(&parsed.model, &population, &params, 1, 17)
+        .expect("simulate");
+    assert_eq!(rows.len(), 3);
+    let s = &population.subjects[0];
+    let mut worst = 0.0f64;
+    // CL moves with the level, record by record, and each record's value drives the
+    // interval that ends at it (the bolus is at 0): the exponent accumulates
+    // Σ (TVCL + P_k)/V · (t_k − t_{k−1}).
+    let mut exponent = 0.0;
+    let mut t_prev = 0.0;
+    for (j, row) in rows.iter().enumerate() {
+        let t = s.obs_times[j];
+        assert_eq!(row.time, t);
+        let p = p_of(s.obs_cov(j)["PLA_IDX"]);
+        exponent += (tvcl + p) / tvv * (t - t_prev);
+        t_prev = t;
+        let want = 100.0 / tvv * (-exponent).exp();
+        assert!(row.ipred.is_finite(), "TIME {t}: ipred {}", row.ipred);
+        // Measured worst: 1.8e-16 (one ULP-scale rounding of the same exponentials).
+        // The bound leaves four orders of headroom and is still ~1e10 below the
+        // smallest wrong-position error (P 0.4 → 0.1 at TIME 1: rel 3e-2).
+        let rel = (row.ipred - want).abs() / want;
+        assert!(
+            rel <= 1e-12,
+            "TIME {t}: ipred {} vs closed form {want} (rel {rel:e})",
+            row.ipred
+        );
+        worst = worst.max(rel);
+    }
+    eprintln!("closed-form worst rel error: {worst:e}");
+}
