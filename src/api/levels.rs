@@ -112,7 +112,7 @@ pub fn bind_theta_levels(
 /// digit is a different level. The refusal names actions, not functions, since a
 /// wrapper passes it through verbatim; from Rust, the second action it offers —
 /// simulating the design on its own levels — is [`bind_theta_levels`] on the design,
-/// with θ for the levels that discovers (the model's `default_params`, for example).
+/// with θ for the levels it discovers (the model's `default_params`, for example).
 ///
 /// Also refused: `fitted` lacking a block the model declares, or carrying one it does
 /// not. Nothing is written to `population` unless every block binds.
@@ -652,6 +652,9 @@ pub fn theta_level_values(
         if decl.labels().is_empty() {
             continue;
         }
+        // Unreachable by construction: the parser pushes a gather for every declared
+        // level block, and its rules are built from the same binding as the labels, one
+        // per label. Kept as an `Err` rather than a panic since this is a library entry.
         let gather = blocks
             .decls
             .iter()
@@ -662,6 +665,7 @@ pub fn theta_level_values(
                     decl.name()
                 )
             })?;
+        debug_assert_eq!(decl.labels().len(), gather.spec.levels.len());
         let values = decl
             .labels()
             .iter()

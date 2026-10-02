@@ -415,8 +415,8 @@ fitted with (or one rebound with `bind_theta_levels_from_fit`). A θ of the wron
 length is refused. Unbound blocks and counted `theta NAME[N]` blocks are left
 out.
 
-A block of 20 or more free coefficients is reported as a compact summary rather
-than one row per level, by every fit writer. The rule is public as
+A block of 20 or more free coefficients is reported in its own compact section
+instead of one entry per θ in the main table, by every fit writer. The rule is public as
 `ferx_core::io::output::compact_theta_blocks(&result.theta_names)`, which
 returns each such block's name and θ index range; the threshold is
 `THETA_BLOCK_COMPACT_MIN`. It counts free coefficients, not levels: a 21-level
