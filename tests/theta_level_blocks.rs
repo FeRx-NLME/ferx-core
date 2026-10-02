@@ -450,32 +450,51 @@ fn a_level_block_binds_against_a_simulation_design() {
 }
 
 /// Parse `model_path` and read `data_path` the way an API caller (the R glue,
-/// a tool) does it — `parse_full_model_file` → `read_population_for` — then
-/// `bind_theta_levels` unless `bind` is false (#1384).
+/// a tool) does it — `parse_full_model_file` → `read_population_for` with the
+/// file's IOV column and `[data_selection]` filter — then `bind_theta_levels`
+/// unless `bind` is false (#1384), then the file's `gradient = ...` stamped onto
+/// the model. Statement for statement the documented example
+/// (`docs/api/fitting.qmd`, `docs/api/index.qmd`), imports included.
 fn read_composable(
     model_path: &std::path::Path,
     data_path: &std::path::Path,
     bind: bool,
 ) -> (ferx_core::ParsedModel, ferx_core::Population) {
+    use ferx_core::io::datareader::SelectionFilter;
+    use ferx_core::GradientMethod;
+
     let mut parsed = ferx_core::parse_full_model_file(model_path).expect("parse");
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(
+        &opts.ignore_exprs,
+        &opts.accept_exprs,
+        &opts.ignore_subjects,
+    )
+    .expect("selection filter");
     let (mut population, _) = ferx_core::api::read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
         data_path.to_str().unwrap(),
         None,
-        None,
-        None,
+        opts.iov_column.as_deref(),
+        Some(&filter),
         &parsed.column_map,
     )
     .expect("read");
     if bind {
         let model_text = std::fs::read_to_string(model_path).unwrap();
         ferx_core::bind_theta_levels(&mut parsed, &model_text, &mut population).expect("bind");
-        // A no-op on this model; called so the helper is the documented example
-        // (`docs/api/fitting.qmd`), imports included.
+        // A no-op on this model; called so the helper is the documented example.
         ferx_core::api::bind_covariate_stats(&mut parsed, &model_text, &population)
             .expect("bind covariate stats");
     }
+    // `fit` reads the gradient method off the model, not the options, and an
+    // SDE model is always FD. After the binds, which re-parse the model.
+    parsed.model.gradient_method = if parsed.model.is_sde() {
+        GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
     (parsed, population)
 }
 
@@ -530,6 +549,68 @@ fn the_composable_path_binds_exactly_like_the_file_entry_point() {
         .filter(|l| !composable.theta_names.contains(&format!("PLACEBO[{l}]")))
         .collect();
     assert_eq!(dependent.len(), 1, "one dependent level: {labels:?}");
+}
+
+/// Fit `model` on [`DATA`] through `run_model_with_data` and through the
+/// composable path, and return `(file, composable)` OFV and parameter count.
+fn file_and_composable(model: &str) -> ((f64, usize), (f64, usize)) {
+    let (_dir, model_path, data_path) = write_case(model, DATA);
+    let (file, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("file fit");
+    let (composable, _model) = fit_composable(&model_path, &data_path, true).expect("composable");
+    (
+        (file.ofv, file.n_parameters),
+        (composable.ofv, composable.n_parameters),
+    )
+}
+
+#[test]
+fn the_composable_path_honours_the_files_gradient_setting() {
+    // `fit` reads `gradient` off the model, which only the file entry points
+    // stamp, so the documented path has to stamp it too. Before it did, the
+    // composable fit here was bit-identical to the run *without* `gradient = fd`.
+    let fd_model =
+        level_block_model().replace("covariance = false", "covariance = false\n  gradient = fd");
+    assert_ne!(fd_model, level_block_model(), "the replace must take");
+    let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&fd_model);
+    let ((base_ofv, _), _) = file_and_composable(&level_block_model());
+    // The straddle: `gradient = fd` must move the file path's objective, or the
+    // equality below holds whether the composable path stamps it or not.
+    assert!(file_ofv.is_finite() && base_ofv.is_finite());
+    assert_ne!(
+        file_ofv.to_bits(),
+        base_ofv.to_bits(),
+        "gradient = fd must change the file-path objective on this fixture"
+    );
+    assert_eq!(comp_n, file_n);
+    assert_eq!(
+        comp_ofv.to_bits(),
+        file_ofv.to_bits(),
+        "gradient = fd: composable OFV {comp_ofv:.17e} vs file OFV {file_ofv:.17e}"
+    );
+}
+
+#[test]
+fn the_composable_path_applies_the_files_data_selection() {
+    // `ignore = TIME > 10` drops both 12 h records, so 4 observed combinations
+    // remain: 3 free levels + TVCL + TVV + ω + σ = 7 parameters, against 9 on
+    // the full data. The file path filters; the composable path must too.
+    let model = format!(
+        "{}\n[data_selection]\n  ignore = TIME > 10\n",
+        level_block_model()
+    );
+    let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&model);
+    assert_eq!(file_n, 7, "the file path must apply [data_selection]");
+    assert_eq!(comp_n, file_n, "composable parameter count vs file");
+    assert!(file_ofv.is_finite());
+    assert_eq!(
+        comp_ofv.to_bits(),
+        file_ofv.to_bits(),
+        "[data_selection]: composable OFV {comp_ofv:.17e} vs file OFV {file_ofv:.17e}"
+    );
 }
 
 #[test]

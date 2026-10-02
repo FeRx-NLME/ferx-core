@@ -67,6 +67,9 @@ section of the SDLC for the versioning policy).
   `bind_theta_levels` between `read_population_for` and `fit`, and both messages now say so.
   The docs' composable example and the API quick-start called `build_fit_inputs`, which
   does not exist. They now bind the model and take inits and options from the parsed model.
+  They also pass the file's `[data_selection]` filter and IOV column to the reader, and
+  stamp its `gradient = ...` onto the model, without which `gradient = fd` was silently
+  ignored.
   The parameters page no longer says the data-driven form needs a file entry point.
 - **The docs name R functions that exist** (#1367): `ferx_apply_selection()` (not
   `ferx_selection()`), `ferx_fit(ignore =, accept =, ignore_ids =)` (not

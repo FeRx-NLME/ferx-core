@@ -298,32 +298,50 @@ model:
 
 ```rust
 use ferx_core::api::{bind_covariate_stats, read_population_for};
+use ferx_core::io::datareader::SelectionFilter;
 use ferx_core::*;
 use std::path::Path;
 
 let model_text = std::fs::read_to_string("model.ferx").map_err(|e| e.to_string())?;
 let mut parsed = parse_full_model_file(Path::new("model.ferx"))?;
+let opts = &parsed.fit_options;
+let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)?;
 let (mut population, _) = read_population_for(
-    &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &parsed.column_map,
+    &parsed.model, &parsed.covariate_decls, "data.csv", None,
+    opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
 )?;
 
 bind_theta_levels(&mut parsed, &model_text, &mut population)?;
 bind_covariate_stats(&mut parsed, &model_text, &population)?;
 
+// `fit` reads the gradient method off the model, not the options.
+parsed.model.gradient_method = if parsed.model.is_sde() {
+    GradientMethod::Fd
+} else {
+    parsed.fit_options.gradient_method
+};
+
 let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 ```
 
-Both are no-ops for a model that declares neither, so calling them
+Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths report the same
 problem as `E_THETA_LEVELS_UNBOUND`. Bind a simulation dataset the same way,
-on the population from `read_population_for_simulation`.
+on the population from `read_population_for_simulation`. The binder discovers
+the levels from *that* population, so fitted θ only carry over to a design
+showing the same level combinations as the fit data.
 
-This path is the file path. On a level-block model it gives the same parameter
-vector and the same objective, equal to the bit, as `run_model_with_data`. A
-caller that has a model *path* can use `prepare_run(model_path, data_path)`
-instead, which reads, filters by `[data_selection]`, binds both kinds and
-returns the result without fitting.
+The other three steps are what the file entry points do besides binding. The
+`[data_selection]` filter and the IOV column go to the reader. The gradient
+stamp makes a file's `gradient = fd` take effect, and forces finite
+differences on an SDE model. Leave any of them out and the fit runs without
+that setting, and nothing warns you. With all three, the example gives the
+same parameter vector and the same objective as `run_model_with_data`, equal
+to the bit. The test suite pins that on a level-block model, alone, with
+`gradient = fd` and with a `[data_selection]` block. A caller that has a model *path* can use
+`prepare_run(model_path, data_path)` instead, which does all of this and
+returns the inputs without fitting.
 
 ### Level labels: `theta_level_map`
 
