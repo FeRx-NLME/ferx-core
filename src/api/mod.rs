@@ -308,6 +308,11 @@ mod simulate_with_uncertainty_tests;
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
 
+// #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
+#[cfg(test)]
+#[path = "tests/theta_length_gate_tests.rs"]
+mod theta_length_gate_tests;
+
 // ── SDE end-to-end integration ───────────────────────────────────────────────
 
 #[cfg(test)]

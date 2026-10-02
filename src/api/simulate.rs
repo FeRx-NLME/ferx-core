@@ -325,6 +325,49 @@ pub(crate) fn validate_iov_simulatable(
     Ok(())
 }
 
+/// Refuse a θ vector whose length is not the model's (#1614), as `E_THETA_LENGTH`.
+///
+/// Nothing downstream can: the compiled closures read θ by position, a θ past the end
+/// reads `0.0` and a level θ past the end `NaN`, so a short vector simulates finite,
+/// plausible-looking rows and a long one silently drops its tail. Every `simulate*`
+/// entry runs this — the static ones through `check_simulate_preconditions`, the two
+/// adaptive ones directly, since they do not run that list.
+///
+/// The usual way to get here is a level-block model: its θ count is set by the data
+/// it was bound against, so a fit's θ only fits a design bound with the *fit's*
+/// level bindings. The message says so whenever the model declares a level block.
+pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result<(), String> {
+    let expected = model.default_params.theta.len();
+    if theta.len() == expected {
+        return Ok(());
+    }
+    let mut message = format!(
+        "the supplied theta has {} values but this model has {expected}; simulation reads \
+         theta by position, so these values would be read against the wrong parameters",
+        theta.len()
+    );
+    let blocks: Vec<&str> = model
+        .theta_blocks()
+        .level_blocks()
+        .iter()
+        .map(|d| d.name())
+        .collect();
+    if !blocks.is_empty() {
+        message.push_str(&format!(
+            ". The model declares the theta level block(s) {}, whose theta count is set by \
+             the data the model was bound against. To simulate with a fit's theta, bind the \
+             design with `bind_theta_levels_from_fit` and the fit's level bindings, so the \
+             design carries the fit's theta layout",
+            blocks
+                .iter()
+                .map(|b| format!("`{b}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
+}
+
 /// The model/data preconditions shared by `simulate`, `simulate_with_seed`,
 /// `simulate_with_options{,_diag}` and `simulate_with_uncertainty`, as an `Err` carrying the
 /// bare check message — the text `fit()` gives for that precondition (#898).
@@ -345,6 +388,7 @@ fn check_simulate_preconditions(
     population: &Population,
     theta: &[f64],
 ) -> Result<(), String> {
+    check_theta_length(model, theta)?;
     first_error(&check_modeled_dose_rates(model, population))?;
     first_error(&check_dose_compartments(model, population))?;
     check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
@@ -1106,6 +1150,11 @@ pub fn simulate_with_uncertainty(
     opts: &SimulateUncertaintyOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // The fit's θ against this model's layout (#1614), before anything is drawn around
+    // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
+    // would first be handed to the draw machinery, and a zero-draw run never reaches it.
+    check_theta_length(model, &fit_result.theta)?;
 
     // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
     // uncertainty path does not yet expose — validate once here rather than per

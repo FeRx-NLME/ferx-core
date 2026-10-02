@@ -261,6 +261,9 @@ where
     // not CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
     // the assay draw. Reject the combination rather than emit NaN observations (#658).
     check_adaptive_model_data(model, population)?;
+    // θ against the model's layout (#1614): this path does not run
+    // `check_simulate_preconditions`, so the shared gate is called here directly.
+    super::simulate::check_theta_length(model, &params.theta)?;
 
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
@@ -1185,6 +1188,8 @@ pub fn simulate_adaptive_from_spec(
     // branch, not CMT, so the compartment-keyed assay would draw NaN (#658). Shared
     // with `simulate_adaptive` (#1571).
     check_adaptive_model_data(model, population)?;
+    // θ against the model's layout (#1614), as in `simulate_adaptive`.
+    super::simulate::check_theta_length(model, &params.theta)?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).

@@ -7867,3 +7867,57 @@ fn adaptive_carry_past_the_final_instant_takes_the_last_co_timed_record() {
         );
     }
 }
+
+// ── #1614: the θ-length gate on both adaptive entries ────────────────────────
+
+/// Both adaptive entries refuse a θ vector whose length is not the model's. They do not run
+/// `check_simulate_preconditions`, so each calls the shared gate itself.
+///
+/// Mutation — delete the `check_theta_length` call in `simulate_adaptive` and its arm goes `Ok`
+/// (θ len 1: a TVV read as `0.0`, a run that simulates; len 3: the tail dropped); delete the one
+/// in `simulate_adaptive_from_spec` and that arm does. Each arm names its entry. A correct-length
+/// θ through both is the other side of the gate and must stay `Ok`.
+#[test]
+fn both_adaptive_entries_refuse_a_theta_of_the_wrong_length() {
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block");
+    let spec_opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    for n in [1usize, 3] {
+        let params = super::theta_length_gate_tests::with_theta_len(&model.default_params, n);
+        let want = format!("the supplied theta has {n} values but this model has 2");
+        match simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts) {
+            Err(e) => assert!(e.contains(&want), "simulate_adaptive, θ len {n}: {e}"),
+            Ok(_) => panic!("simulate_adaptive accepted a θ of length {n}"),
+        }
+        let params =
+            super::theta_length_gate_tests::with_theta_len(&parsed.model.default_params, n);
+        match simulate_adaptive_from_spec(&parsed.model, &pop, &params, 1, spec, &spec_opts) {
+            Err(e) => assert!(
+                e.contains(&want),
+                "simulate_adaptive_from_spec, θ len {n}: {e}"
+            ),
+            Ok(_) => panic!("simulate_adaptive_from_spec accepted a θ of length {n}"),
+        }
+    }
+    simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("simulate_adaptive, correct θ length");
+    simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &spec_opts,
+    )
+    .expect("simulate_adaptive_from_spec, correct θ length");
+}
