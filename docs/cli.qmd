@@ -239,8 +239,8 @@ that author model files programmatically.
   clause empties is not reported as uncovered, and a finding that names the
   observed compartments names the ones that survive the filter. **The model
   file's clauses and only those** — `ferx check` takes no fit options, so
-  conditions a caller merges in (`fit_from_files`, or `ferx_fit(settings = ...)`
-  from R) are invisible to it, and a check cannot speak for them
+  conditions a caller merges in (`fit_from_files`, or
+  `ferx_fit(ignore =, accept =, ignore_ids =)` from R) are invisible to it, and a check cannot speak for them
   ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)).
 - `--json` emits a structured [check report](file-formats/check-report.qmd) to
   stdout instead of the human-readable summary.
