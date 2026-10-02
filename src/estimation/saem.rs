@@ -768,19 +768,6 @@ fn recentre_eta_draws(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, delta: f64) {
     }
 }
 
-/// [`recentre_eta_draws`] with a per-subject shift, for the covariate
-/// mu-reference groups of #619 whose mu depends on each subject's covariates.
-fn recentre_eta_draws_per_subject(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, delta: &[f64]) {
-    for d in draws.iter_mut() {
-        for (i, e) in d.iter_mut().enumerate() {
-            match (delta.get(i), e.get_mut(eta_idx)) {
-                (Some(&dv), Some(ev)) if dv.is_finite() => *ev -= dv,
-                _ => {}
-            }
-        }
-    }
-}
-
 /// What the `mstep_solver` / `mstep_draws` options resolve to for this fit, and
 /// what to say about it (#1458).
 ///
@@ -4058,7 +4045,10 @@ pub fn run_saem(
     for n in &cov_mu_notes {
         warnings.push(format!("SAEM: {n}"));
     }
-    let cov_group_etas: Vec<usize> = cov_mu_groups.iter().map(|g| g.eta_idx).collect();
+    // Every member's eta: a joint group (#1620) supersedes the single-anchor
+    // pair of each eta it re-centres, not only its first one.
+    let cov_group_etas: Vec<usize> =
+        crate::estimation::covariate_mu_ref::group_etas(&cov_mu_groups);
     let cov_group_thetas: Vec<usize> = cov_mu_groups
         .iter()
         .flat_map(|g| g.theta_idx.iter().copied())
@@ -5300,7 +5290,6 @@ pub fn run_saem(
                     let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
                     for (gi, group) in cov_mu_groups.iter().enumerate() {
                         let theta_now = unpack_all(&log_theta);
-                        let mu_old = group.mus(&theta_now, population);
                         let solved = {
                             let input = GroupStepInput {
                                 theta: &theta_now,
@@ -5312,17 +5301,14 @@ pub fn run_saem(
                                 etas: &state.etas,
                             };
                             if group.needs_data_term {
-                                let k = group.eta_idx;
                                 let etas_now = &state.etas;
-                                let data = |th: &[f64], shift: &[f64]| -> f64 {
+                                let data = |th: &[f64], shifts: &[Vec<f64>]| -> f64 {
                                     let shifted: Vec<Vec<f64>> = etas_now
                                         .iter()
-                                        .zip(shift.iter())
-                                        .map(|(e, s)| {
+                                        .enumerate()
+                                        .map(|(i, e)| {
                                             let mut e2 = e.clone();
-                                            if k < e2.len() {
-                                                e2[k] += s;
-                                            }
+                                            group.shift_eta(&mut e2, shifts, i);
                                             e2
                                         })
                                         .collect();
@@ -5360,24 +5346,18 @@ pub fn run_saem(
                             temp_theta_upper[t] = log_theta[t];
                             n_pinned += 1;
                         }
+                        // Every member's eta (#1620): `recentre_eta` holds each
+                        // member's φ fixed across the step, in the chain state
+                        // and in every extra draw.
                         let theta_new = unpack_all(&log_theta);
-                        let mu_new = group.mus(&theta_new, population);
-                        let mu_delta: Vec<f64> = mu_new
-                            .iter()
-                            .zip(mu_old.iter())
-                            .map(|(n, o)| n - o)
-                            .collect();
-                        for (i, e) in state.etas.iter_mut().enumerate() {
-                            let d = mu_delta[i];
-                            if d.is_finite() && group.eta_idx < e.len() {
-                                e[group.eta_idx] -= d;
+                        let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
+                        for draw in
+                            std::iter::once(&mut state.etas).chain(extra_eta_draws.iter_mut())
+                        {
+                            for (i, e) in draw.iter_mut().enumerate() {
+                                group.recentre_eta(e, &deltas, i);
                             }
                         }
-                        recentre_eta_draws_per_subject(
-                            &mut extra_eta_draws,
-                            group.eta_idx,
-                            &mu_delta,
-                        );
                     }
                 }
                 // Each pinned mu-ref dim avoids 2 obs_nll_sum calls per NLopt
@@ -6003,11 +5983,7 @@ pub fn run_saem(
              current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
              fell back to the numerical M-step on those iterations, which is the channel #619 \
              exists to avoid; consider bounding the covariate slope.",
-            model
-                .eta_names
-                .get(group.eta_idx)
-                .map(String::as_str)
-                .unwrap_or("?"),
+            group.eta_names(),
             skipped,
             n_iter,
             names.join(", ")
@@ -7208,6 +7184,79 @@ mod tests {
             slope > 0.02,
             "TH_CRCL must move from its 0.02 start: {slope}"
         );
+    }
+
+    /// Two additive typical values sharing the renal slope `TH_X` (#1620).
+    /// Neither matches a single-anchor pattern, so `V` is mu-referenced *only*
+    /// through the joint group.
+    const COVMUREF_SHARED_THETA_MODEL: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TH_X(0.02, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_X) * exp(ETA_CL)
+  V  = (TVV + (CRCL - 90.0) * TH_X) * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    const SHARED_THETA_NOTE: &str = "covariate mu-references on ETA_CL (reads TVCL, TH_X) and \
+                                     ETA_V (reads TVV, TH_X) share TH_X and take one joint \
+                                     M-step that re-centres both (#1620).";
+
+    /// T9 (fit half), #1620 cell A through `fit()`, under SAEM and IMP: the
+    /// joint-step note reaches `FitResult.warnings` once, nothing says the
+    /// second mu-reference "is not used", and the #621 advisory does not name
+    /// `V` — it would if the active-group list held only each group's first
+    /// eta, and it did before #1620, when the second mu-reference was declined.
+    #[test]
+    fn a_shared_theta_takes_one_joint_group_through_fit() {
+        let model = crate::parser::model_parser::parse_model_string(COVMUREF_SHARED_THETA_MODEL)
+            .expect("parses");
+        assert_eq!(model.covariate_mu_refs.len(), 2);
+        assert!(model.mu_refs.is_empty(), "premise: no single-anchor pair");
+        let pop = covmuref_pop(true);
+        let mut saem = FitOptions::default();
+        saem.method = crate::types::EstimationMethod::Saem;
+        saem.saem_n_exploration = 4;
+        saem.saem_n_convergence = 2;
+        saem.saem_seed = Some(1620);
+        saem.run_covariance_step = false;
+        let mut imp = FitOptions::default();
+        imp.method = crate::types::EstimationMethod::Imp;
+        imp.imp_iterations = 3;
+        imp.imp_samples = 50;
+        imp.imp_auto = false;
+        imp.imp_seed = Some(1620);
+        imp.run_covariance_step = false;
+        for (label, opts) in [("SAEM", &saem), ("IMP", &imp)] {
+            let res = crate::api::fit(&model, &pop, &model.default_params, opts).expect("fit runs");
+            let notes: Vec<&String> = res
+                .warnings
+                .iter()
+                .filter(|w| w.contains("covariate mu-reference"))
+                .collect();
+            assert_eq!(notes.len(), 1, "[{label}] {:?}", res.warnings);
+            assert!(
+                notes[0].ends_with(SHARED_THETA_NOTE),
+                "[{label}] {}",
+                notes[0]
+            );
+            assert!(
+                !res.warnings.iter().any(|w| w.contains("not mu-referenced")),
+                "[{label}] V is mu-referenced through the joint group: {:?}",
+                res.warnings
+            );
+        }
     }
 
     /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is

@@ -1,0 +1,58 @@
+# Shared allometric exponent under SAEM — ferx side of the #1620 NONMEM anchor.
+#
+# examples/two_cpt_oral_cov.ferx with SAEM fit options. CL and V1 both read
+# THETA_WT, so their two covariate mu-references share a free theta. Before #1620
+# ferx declined the second one and the first one's M-step moved THETA_WT with
+# ETA_V1 left free to absorb the change: SAEM put THETA_WT at 0.0101 (seed 1,
+# 150/250). They now take one joint M-step that re-centres both etas.
+#
+# NONMEM side: covmuref_shared_saem.ctl (METHOD=SAEM) and
+# covmuref_shared_impmap.ctl (METHOD=IMPMAP), on covmuref_shared.csv — the
+# bundled data/two_cpt_oral_cov.csv with the observation rows on CMT=2.
+# Pinned by tests/saem_covariate_mu_ref.rs (slow-gated).
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta THETA_WT(0.6, 0.01, 5.0)
+  theta THETA_CRCL(0.3, 0.01, 5.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^THETA_WT * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+# Declares which dataset columns are covariates and their type. Optional. When
+# present, declared columns are validated (must exist in the data and be
+# numerically coded) and echoed in the covariate table. A covariate used above
+# but not declared here still works, but emits a warning recommending you
+# declare it so its type is recorded.
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = saem
+  n_exploration = 150
+  n_convergence = 250
+  seed          = 1
+  covariance    = false

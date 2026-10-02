@@ -6351,6 +6351,43 @@ fn covariate_mu_ref_reports_a_theta_another_block_reads() {
     );
 }
 
+/// Two groups reading one theta (`CL` and `V1` both carry `TH_WT`) each read it
+/// outside the *other* — `shared_thetas` lists it for both — but nothing outside
+/// the groups reads it, so a joint step that freezes both `φ_i` leaves the data
+/// constant in it: `read_outside_groups` is empty (#1620). A third reader that
+/// is not a group (`F1`) is outside every group and must be listed. One test,
+/// both sides: a walk that ignores the extra owners fails the first half, one
+/// that stops at every assignment fails the second.
+#[test]
+fn covariate_mu_ref_read_outside_groups_stops_at_every_group_owner() {
+    let tn = ["TVCL", "TVV1", "TH_WT"];
+    let en = ["ETA_CL", "ETA_V1"];
+    let pair = "CL = TVCL * (WT / 70.0) ^ TH_WT * exp(ETA_CL)\n\
+                V1 = TVV1 * (WT / 70.0) ^ TH_WT * exp(ETA_V1)";
+    let g = detect_groups_outside(pair, &tn, &en, &["CL", "V1"]);
+    assert_eq!(g.len(), 2);
+    for grp in &g {
+        assert_eq!(grp.shared_thetas, vec!["TH_WT"], "{}", grp.eta_name);
+        assert!(
+            grp.read_outside_groups.is_empty(),
+            "{}: {:?}",
+            grp.eta_name,
+            grp.read_outside_groups
+        );
+    }
+
+    let with_f1 = format!("{pair}\nF1 = TH_WT * 0.01");
+    let g = detect_groups_outside(&with_f1, &tn, &en, &["CL", "V1", "F1"]);
+    assert_eq!(g.len(), 2);
+    for grp in &g {
+        assert_eq!(grp.read_outside_groups, vec!["TH_WT"], "{}", grp.eta_name);
+    }
+
+    // The theta named in another block directly is outside every group too.
+    let g = detect_groups_outside(pair, &tn, &en, &["CL", "V1", "TH_WT"]);
+    assert_eq!(g[0].read_outside_groups, vec!["TH_WT"]);
+}
+
 #[test]
 fn covariate_mu_ref_reaches_the_compiled_model() {
     let src = r"

@@ -76,8 +76,8 @@ fn planted_etas(
     start: &[f64],
     truth: &[f64],
 ) -> Vec<Vec<f64>> {
-    let mu_s = g.mus(start, pop);
-    let mu_t = g.mus(truth, pop);
+    let mu_s = g.members[0].mus(start, pop);
+    let mu_t = g.members[0].mus(truth, pop);
     (0..pop.subjects.len())
         .map(|i| vec![mu_t[i] - mu_s[i], 0.0])
         .collect()
@@ -162,7 +162,7 @@ fn additive_group_is_detected_and_time_constant() {
 
     let pop = pop_with_crcl(&CRCL_GRID);
     let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
-    assert_eq!(g.eta_idx, 0);
+    assert_eq!(g.members[0].eta_idx, 0);
     assert_eq!(g.theta_idx, vec![0, 1]);
     assert!(!g.needs_data_term);
 }
@@ -173,11 +173,13 @@ fn mu_is_log_of_the_typical_value_per_subject() {
     let pop = pop_with_crcl(&[40.0, 140.0]);
     let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
     let theta = [120.0, 1.4, 10.0];
-    let mus = g.mus(&theta, &pop);
+    let mus = g.members[0].mus(&theta, &pop);
     assert!((mus[0] - (120.0 + (40.0 - 90.0) * 1.4f64).ln()).abs() < 1e-12);
     assert!((mus[1] - (120.0 + (140.0 - 90.0) * 1.4f64).ln()).abs() < 1e-12);
     // A non-positive lognormal typical value is inadmissible, not log(1e-30).
-    assert!(g.mu(&[10.0, 2.0, 10.0], &pop.subjects[0]).is_nan());
+    assert!(g.members[0]
+        .mu(&[10.0, 2.0, 10.0], &pop.subjects[0])
+        .is_nan());
 }
 
 #[test]
@@ -308,8 +310,8 @@ fn exact_solver_folds_the_block_omega_cross_term() {
     );
     let start = [150.0, 2.0, 10.0];
     let truth = [120.0, 1.4, 10.0];
-    let mu_s = g.mus(&start, &pop);
-    let mu_t = g.mus(&truth, &pop);
+    let mu_s = g.members[0].mus(&start, &pop);
+    let mu_t = g.members[0].mus(&truth, &pop);
     let etas: Vec<Vec<f64>> = (0..pop.subjects.len())
         .map(|i| {
             let eta_v = 0.3 * ((i as f64) - 5.5); // a V residual with non-zero mean structure
@@ -392,20 +394,30 @@ fn numerical_solver_passes_the_phi_preserving_shift_to_the_data_term() {
         omega: &omega,
         etas: &etas,
     };
-    let mu_old = g.mus(&start, &pop);
+    let mu_old = g.members[0].mus(&start, &pop);
     let seen = std::cell::Cell::new(false);
+    // Recorded, not asserted, inside the callback: it runs under NLopt's C
+    // frame, where a panic cannot unwind and aborts the whole test binary.
+    let wrong: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
     let pop_ref = &pop;
     let g_ref = &g;
-    let data = |theta: &[f64], shift: &[f64]| -> f64 {
-        let mu_new = g_ref.mus(theta, pop_ref);
-        for i in 0..shift.len() {
-            assert!((shift[i] - (mu_old[i] - mu_new[i])).abs() < 1e-12);
+    let data = |theta: &[f64], shifts: &[Vec<f64>]| -> f64 {
+        let mu_new = g_ref.members[0].mus(theta, pop_ref);
+        if shifts.len() != 1 {
+            wrong.replace(Some(format!("{} shifts for one member", shifts.len())));
+        } else {
+            for i in 0..shifts[0].len() {
+                if (shifts[0][i] - (mu_old[i] - mu_new[i])).abs() >= 1e-12 {
+                    wrong.replace(Some(format!("subject {i}: shift {}", shifts[0][i])));
+                }
+            }
         }
         seen.set(true);
         0.0
     };
     g.solve_numerical(&pop, &input, 5, &data).expect("solvable");
     assert!(seen.get(), "the data term must have been evaluated");
+    assert_eq!(wrong.into_inner(), None);
 }
 
 #[test]
@@ -508,8 +520,8 @@ fn logit_group_mu_is_the_typical_value_itself() {
     assert_eq!(m.covariate_mu_refs[0].transform, MuTransform::Logit);
     let pop = pop_with_crcl(&[1.0]);
     let g = only_group(&m, &pop, &diag_omega(&[0.09, 0.04]));
-    assert_eq!(g.eta_idx, 1);
-    let mu = g.mu(&[1.0, 0.4, 0.5], &pop.subjects[0]);
+    assert_eq!(g.members[0].eta_idx, 1);
+    let mu = g.members[0].mu(&[1.0, 0.4, 0.5], &pop.subjects[0]);
     assert!(
         (mu - 0.9).abs() < 1e-12,
         "logit-scale mu = LOGIT_F + TH_SEX·CRCL: {mu}"
@@ -602,7 +614,7 @@ fn can_step_agrees_with_both_engines_returning_none() {
     // is NaN for that subject and the lognormal link has nothing to take a log
     // of. Every other subject is fine — one bad subject is enough.
     let bad = [150.0, 4.0, 10.0];
-    let mus_bad = g.mus(&bad, &pop);
+    let mus_bad = g.members[0].mus(&bad, &pop);
     assert!(
         mus_bad.iter().any(|m| !m.is_finite()),
         "premise: the fixture actually produces a non-finite mu, got {mus_bad:?}"
@@ -678,7 +690,7 @@ fn numerical_solver_returns_the_best_evaluated_point() {
     // A deceptive objective: lowest far from the start, so the answer is not
     // trivially θ_old, and rugged enough that BOBYQA's last trial point is not
     // its best one.
-    let data = |theta: &[f64], _shift: &[f64]| -> f64 {
+    let data = |theta: &[f64], _shifts: &[Vec<f64>]| -> f64 {
         seen_ref.borrow_mut().push(theta.to_vec());
         1e3 * ((theta[1] - 1.2) * (theta[1] - 1.2) + 0.001 * (theta[0] - 120.0).abs())
     };
@@ -718,4 +730,498 @@ fn numerical_solver_returns_the_best_evaluated_point() {
         out_data <= best_data + 1e-6,
         "returned a point worse than one already evaluated: {out_data} vs {best_data}"
     );
+}
+
+// ── typical values sharing a free theta: one joint group (#1620) ─────────────
+
+/// One subject per `(WT, CRCL)` pair: a dose at 0 and one observation at 1 h.
+fn pop_with_wt_crcl(rows: &[(f64, f64)]) -> Population {
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT,CRCL\n");
+    for (i, (wt, crcl)) in rows.iter().enumerate() {
+        let id = i + 1;
+        csv.push_str(&format!(
+            "{id},0,0,100,1,1,{wt},{crcl}\n{id},1,5.0,0,0,1,{wt},{crcl}\n"
+        ));
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::io::datareader::read_nonmem_csv(f.path(), Some(&["WT", "CRCL"]), None).unwrap()
+}
+
+fn wt_crcl_grid() -> Vec<(f64, f64)> {
+    [
+        50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 110.0,
+    ]
+    .iter()
+    .zip(CRCL_GRID.iter())
+    .map(|(&w, &c)| (w, c))
+    .collect()
+}
+
+/// The `[individual_parameters]` of `examples/two_cpt_oral_cov.ferx` on a
+/// one-compartment shell: `CL` and `V1` both read `TH_WT`. `{extra}` is spliced
+/// into `[individual_parameters]` and `{f}` into the `pk` call.
+fn shared_wt_model(extra: &str, f: &str) -> CompiledModel {
+    model(&format!(
+        r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TH_WT(0.6, 0.01, 5.0)
+  theta TH_CRCL(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^TH_WT * (CRCL / 100)^TH_CRCL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^TH_WT * exp(ETA_V1)
+{extra}
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V1, ka=1.0{f})
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    ))
+}
+
+const NOTE_A: &str = "covariate mu-references on ETA_CL (reads TVCL, TH_WT, TH_CRCL) and \
+                      ETA_V1 (reads TVV1, TH_WT) share TH_WT and take one joint M-step that \
+                      re-centres both (#1620).";
+
+/// T1 + T2, cells A and B of the message table — one test, both sides of the
+/// `read_outside_groups` gate.
+///
+/// A: `CL` and `V1` share the free `TH_WT` and nothing else reads it. They are
+/// one group with both etas, and because freezing both `φ_i` leaves the data
+/// constant in every group theta, the **exact** engine. Before #1620 the second
+/// mu-reference was declined ("already belongs") and the first kept the data
+/// term, which is the drift.
+///
+/// B: the same plus `FR = TH_WT * 0.01` feeding bioavailability — a reader
+/// outside every group — so the joint group keeps the data term. A resolver
+/// computing `needs_data_term` from member overlap alone passes A and fails B;
+/// one that keeps the old per-group `shared_thetas` passes B and fails A.
+#[test]
+fn groups_sharing_a_free_theta_merge_into_one() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let omega = diag_omega(&[0.15, 0.15]);
+    let free = [false; 4];
+
+    let m = shared_wt_model("", "");
+    let (groups, notes) = resolve_covariate_mu_groups(&m, &pop, &[], &free, &omega);
+    assert_eq!(groups.len(), 1, "one joint group, got {notes:?}");
+    let g = &groups[0];
+    assert_eq!(g.eta_indices(), vec![0, 1]);
+    assert_eq!(g.theta_idx, vec![0, 1, 2, 3]);
+    assert!(!g.needs_data_term, "cell A takes the exact engine");
+    assert_eq!(notes, vec![NOTE_A.to_string()]);
+
+    let m = shared_wt_model("  FR = TH_WT * 0.01", ", f=FR");
+    let (groups, notes) = resolve_covariate_mu_groups(&m, &pop, &[], &free, &omega);
+    assert_eq!(groups.len(), 1, "one joint group, got {notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![0, 1]);
+    assert!(groups[0].needs_data_term, "cell B keeps the data term");
+    assert_eq!(
+        notes,
+        vec![
+            NOTE_A.to_string(),
+            "covariate mu-references on ETA_CL and ETA_V1 keep the observation term in their \
+             joint M-step: TH_WT also reach(es) the data outside these typical values, so \
+             freezing the individual parameters does not make the data independent of it \
+             (#1620)."
+                .to_string(),
+        ]
+    );
+}
+
+/// T3, cell C. `ETA_V1`'s variance is negligible, so its mu-reference is
+/// dropped and `CL` is a group of one. `read_outside_groups` is empty — the
+/// parser stopped the taint at `V1`, a recorded owner — but `V1` is no longer
+/// held by any `φ_i` the step freezes, so `TH_WT` is still live in the data and
+/// the group must keep the term. A resolver that counted every recorded
+/// mu-reference as a member would send `CL` to the exact engine.
+#[test]
+fn a_dropped_groups_read_keeps_the_data_term() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let m = shared_wt_model("", "");
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 1e-4]));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].eta_indices(), vec![0]);
+    assert!(groups[0].needs_data_term);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].contains("negligible variance"), "{}", notes[0]);
+    assert_eq!(
+        notes[1],
+        "covariate mu-reference on ETA_CL (reads TVCL, TH_WT, TH_CRCL) keeps the observation \
+         term in its M-step: TH_WT is also read by the typical value of ETA_V1, whose covariate \
+         mu-reference is not used (#1620)."
+    );
+}
+
+/// T4, cell D. A shared `FIX`ed theta links nothing — no step moves it, so it
+/// cannot drift — and the second mu-reference is no longer declined either.
+#[test]
+fn a_fixed_shared_theta_does_not_link() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let m = shared_wt_model("", "");
+    let fixed = [false, false, true, false];
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &fixed, &diag_omega(&[0.15, 0.15]));
+    assert_eq!(groups.len(), 2, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![0]);
+    assert_eq!(groups[1].eta_indices(), vec![1]);
+    assert!(groups.iter().all(|g| !g.needs_data_term));
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+/// T5, cell F. `A{T1}`, `B{T2}`, `C{T1, T2}`: `A` and `B` share nothing, but
+/// `C` bridges them, so all three are one group. Merging each mu-reference
+/// into the first group it shares with (no union-find) leaves `B` alone.
+#[test]
+fn a_group_bridging_two_groups_merges_all_three() {
+    let m = model(
+        r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta T1(0.6, 0.01, 5.0)
+  theta T2(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V ~ 0.15
+  omega ETA_KA ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^T1 * exp(ETA_CL)
+  V  = TVV * (CRCL / 100)^T2 * exp(ETA_V)
+  KA = TVKA * (WT / 70)^T1 * (CRCL / 100)^T2 * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 5], &diag_omega(&[0.15, 0.15, 0.15]));
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![0, 1, 2]);
+    assert_eq!(groups[0].theta_idx, vec![0, 1, 2, 3, 4]);
+    assert!(!groups[0].needs_data_term);
+    assert_eq!(
+        notes,
+        vec![
+            "covariate mu-references on ETA_CL (reads TVCL, T1), ETA_V (reads TVV, T2) and ETA_KA \
+             (reads TVKA, T1, T2) share T1, T2 and take one joint M-step that re-centres all 3 \
+             of them (#1620)."
+                .to_string()
+        ]
+    );
+}
+
+/// Cell G. A member whose eta a second typical value reads keeps its own
+/// #918 note, and the joint group the data term; the share note is unchanged.
+#[test]
+fn a_joint_member_with_a_shared_eta_keeps_its_note() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let m = shared_wt_model("  KA = 1.0 * exp(0.5 * ETA_V1)", "");
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15]));
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].needs_data_term);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(notes[0], NOTE_A);
+    assert!(
+        notes[1].starts_with("covariate mu-reference on ETA_V1 (reads TVV1, TH_WT) keeps")
+            && notes[1].contains("ETA_V1 is also read by another individual parameter"),
+        "{}",
+        notes[1]
+    );
+}
+
+/// T9 (helper half). The estimators drop the single-anchor pair of every eta
+/// in this list; a list of first members only would leave `(TVV1, ETA_V1)` —
+/// the power form's own anchor — shifting `TVV1` in closed form on top of the
+/// joint step that re-centres `ETA_V1`.
+#[test]
+fn group_etas_lists_every_member() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let m = shared_wt_model("", "");
+    assert!(
+        m.mu_refs.contains_key("ETA_V1"),
+        "premise: V1 also has a single-anchor pair"
+    );
+    let (groups, _) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15]));
+    assert_eq!(group_etas(&groups), vec![0, 1]);
+}
+
+/// A model whose two group mu's are **linear** in `β = (log TVCL, log TVV1,
+/// TH_WT)`: `mu_CL = log TVCL + TH_WT·w`, `mu_V1 = log TVV1 + TH_WT·w`,
+/// `w = log(WT/70)`. `KA` is a plain mu-reference — a non-member eta that a
+/// block Ω couples to `ETA_CL`.
+const LINEAR_SHARED_MODEL: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TH_WT(0.6, -5.0, 5.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_KA ~ 0.2
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^TH_WT * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^TH_WT * exp(ETA_V1)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V1, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// Deterministic, non-centred etas: the M-step has somewhere to go.
+fn spread_etas(n: usize) -> Vec<Vec<f64>> {
+    (0..n)
+        .map(|i| {
+            let x = i as f64;
+            vec![
+                0.3 * (x + 1.0).sin() + 0.1,
+                0.25 * (2.0 * x + 1.0).cos() - 0.05,
+                0.2 * (3.0 * x + 2.0).sin(),
+            ]
+        })
+        .collect()
+}
+
+/// The generalised-least-squares optimum of the joint prior term, computed here
+/// from the normal equations — a third computation, outside the engine:
+/// `Σ X_iᵀ W_mm X_i β = Σ X_iᵀ (W_mm φ_i + W_mc c_i)`, with `φ_i` the members'
+/// individual values at the start, `c_i = η_i,KA` the non-member eta and
+/// `W = Ω⁻¹`.
+fn gls_beta(pop: &Population, start: &[f64], etas: &[Vec<f64>], omega: &DMatrix<f64>) -> [f64; 3] {
+    let w = omega.clone().try_inverse().unwrap();
+    let wmm = w.view((0, 0), (2, 2)).into_owned();
+    let wmc = w.view((0, 2), (2, 1)).into_owned();
+    let mut a = DMatrix::<f64>::zeros(3, 3);
+    let mut b = nalgebra::DVector::<f64>::zeros(3);
+    for (s, eta) in pop.subjects.iter().zip(etas) {
+        let wl = (s.covariates["WT"] / 70.0).ln();
+        let x = DMatrix::from_row_slice(2, 3, &[1.0, 0.0, wl, 0.0, 1.0, wl]);
+        let mu0 = nalgebra::DVector::from_vec(vec![
+            start[0].ln() + start[2] * wl,
+            start[1].ln() + start[2] * wl,
+        ]);
+        let phi = mu0 + nalgebra::DVector::from_vec(vec![eta[0], eta[1]]);
+        a += x.transpose() * &wmm * &x;
+        b += x.transpose() * (&wmm * &phi + &wmc * eta[2]);
+    }
+    let beta = a.cholesky().unwrap().solve(&b);
+    [beta[0], beta[1], beta[2]]
+}
+
+/// T6. The joint exact engine against the closed-form GLS optimum, on a
+/// diagonal Ω and on a block Ω coupling `ETA_CL` to both the other member and
+/// the non-member `ETA_KA`. Dropping the second member's residual moves
+/// `TH_WT`; weighting by the diagonal of Ω⁻¹ alone fails the block leg.
+#[test]
+fn exact_multi_matches_the_closed_form_gls() {
+    let m = model(LINEAR_SHARED_MODEL);
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let start = [4.0, 40.0, 0.6, 1.0];
+    let etas = spread_etas(pop.subjects.len());
+    let fixed = [false; 4];
+    let diag = diag_omega(&[0.15, 0.15, 0.2]);
+    let block = DMatrix::from_row_slice(3, 3, &[0.15, 0.06, 0.04, 0.06, 0.15, 0.0, 0.04, 0.0, 0.2]);
+    for (label, omega) in [("diagonal", &diag), ("block", &block)] {
+        let (groups, notes) = resolve_covariate_mu_groups(&m, &pop, &[], &fixed, omega);
+        assert_eq!(groups.len(), 1, "{notes:?}");
+        let g = &groups[0];
+        assert_eq!(g.eta_indices(), vec![0, 1]);
+        assert!(!g.needs_data_term);
+        let input = GroupStepInput {
+            theta: &start,
+            theta_lower: &m.default_params.theta_lower,
+            theta_upper: &m.default_params.theta_upper,
+            theta_fixed: &fixed,
+            theta_packs_log: &[true, true, false, true],
+            omega,
+            etas: &etas,
+        };
+        let out = g.solve_exact(&pop, &input).expect("solvable");
+        let beta = gls_beta(&pop, &start, &etas, omega);
+        let want = [beta[0].exp(), beta[1].exp(), beta[2], start[3]];
+        assert!(
+            (want[2] - start[2]).abs() > 0.05,
+            "[{label}] premise: the optimum is away from the start ({} vs {})",
+            want[2],
+            start[2]
+        );
+        for (j, name) in ["TVCL", "TVV1", "TH_WT", "TVKA"].iter().enumerate() {
+            let rel = (out[j] - want[j]).abs() / want[j].abs().max(1.0);
+            assert!(
+                rel < 1e-7,
+                "[{label}] {name}: engine {} vs GLS {} (rel {rel:.2e})",
+                out[j],
+                want[j]
+            );
+        }
+    }
+}
+
+/// BOBYQA (`ftol_rel = 1e-5`) against the exact optimum on T6's diagonal leg.
+/// Measured worst relative gap 1.9e-5 (`TH_WT`; TVCL 6.1e-6, TVV1 3.6e-6), so
+/// 1e-4 is ~5x headroom.
+const NUMERICAL_VS_EXACT_REL: f64 = 1e-4;
+
+/// T7. The numerical engine hands the data term one shift per member, each
+/// the amount that holds that member's `φ_i`; and with a constant data term it
+/// lands where the exact engine does (the T6 optimum).
+#[test]
+fn numerical_multi_passes_every_members_shift() {
+    let m = model(LINEAR_SHARED_MODEL);
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let start = [4.0, 40.0, 0.6, 1.0];
+    let etas = spread_etas(pop.subjects.len());
+    let fixed = [false; 4];
+    let omega = diag_omega(&[0.15, 0.15, 0.2]);
+    let (groups, _) = resolve_covariate_mu_groups(&m, &pop, &[], &fixed, &omega);
+    let g = &groups[0];
+    let input = GroupStepInput {
+        theta: &start,
+        theta_lower: &m.default_params.theta_lower,
+        theta_upper: &m.default_params.theta_upper,
+        theta_fixed: &fixed,
+        theta_packs_log: &[true, true, false, true],
+        omega: &omega,
+        etas: &etas,
+    };
+    let mu_old = g.mus(&start, &pop);
+    let calls = std::cell::Cell::new(0usize);
+    let moved = std::cell::Cell::new(false);
+    // Recorded, not asserted, inside the callback: it runs under NLopt's C
+    // frame, where a panic cannot unwind and aborts the whole test binary.
+    let wrong: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let data = |theta: &[f64], shifts: &[Vec<f64>]| -> f64 {
+        let mu_new = g.mus(theta, &pop);
+        if shifts.len() != 2 {
+            wrong.replace(Some(format!("{} shifts for two members", shifts.len())));
+        }
+        for (m, shift) in shifts.iter().enumerate().take(2) {
+            for i in 0..pop.subjects.len() {
+                let want = mu_old[m][i] - mu_new[m][i];
+                let got = shift.get(i).copied().unwrap_or(f64::NAN);
+                if !((got - want).abs() < 1e-12) {
+                    wrong.replace(Some(format!(
+                        "member {m}, subject {i}: shift {got} vs {want}"
+                    )));
+                }
+                moved.set(moved.get() || want.abs() > 1e-3);
+            }
+        }
+        calls.set(calls.get() + 1);
+        0.0
+    };
+    let out = g
+        .solve_numerical(&pop, &input, 200, &data)
+        .expect("solvable");
+    assert!(calls.get() > 2, "the data term must have been evaluated");
+    assert_eq!(wrong.into_inner(), None);
+    assert!(moved.get(), "premise: the search left the start");
+    let exact = g.solve_exact(&pop, &input).expect("solvable");
+    for (j, name) in ["TVCL", "TVV1", "TH_WT"].iter().enumerate() {
+        let rel = (out[j] - exact[j]).abs() / exact[j].abs().max(1.0);
+        assert!(
+            rel < NUMERICAL_VS_EXACT_REL,
+            "{name}: numerical {} vs exact {} (rel {rel:.2e})",
+            out[j],
+            exact[j]
+        );
+    }
+}
+
+/// T8. After a step, every member's `φ_i = g(A_i(θ)) + η_i` is where it was —
+/// the bookkeeping that makes the joint step a step in φ-coordinates, through
+/// the same two helpers SAEM and IMP call. Either one covering only the first
+/// member leaves `φ_V1` moved by `V1`'s half of the `TH_WT` change. (No fit-level
+/// fixture observes this: with the second member's re-centring removed from
+/// either estimator the NONMEM anchors of `tests/saem_covariate_mu_ref.rs` stay
+/// green, because the joint prior term alone already holds `THETA_WT`. This test
+/// is what pins it.)
+#[test]
+fn recentre_preserves_every_members_phi() {
+    let m = shared_wt_model("", "");
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, _) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15]));
+    let g = &groups[0];
+    let old = [4.0, 40.0, 0.6, 0.3];
+    let new = [5.0, 45.0, 0.8, 0.4];
+    let etas = spread_etas(pop.subjects.len());
+    let deltas = g.recentre_deltas(&old, &new, &pop);
+    assert_eq!(deltas.len(), 2, "one delta per member");
+    let mut after = etas.clone();
+    for (i, e) in after.iter_mut().enumerate() {
+        assert!(g.recentre_eta(e, &deltas, i), "subject {i} must move");
+    }
+    let mu_old = g.mus(&old, &pop);
+    let mu_new = g.mus(&new, &pop);
+    for (mi, member) in g.members.iter().enumerate() {
+        let k = member.eta_idx;
+        for i in 0..pop.subjects.len() {
+            let phi_old = mu_old[mi][i] + etas[i][k];
+            let phi_new = mu_new[mi][i] + after[i][k];
+            assert!(
+                (phi_old - phi_new).abs() < 1e-12,
+                "member {mi} subject {i}: φ {phi_old} → {phi_new}"
+            );
+            if mi == 1 {
+                assert!(
+                    (mu_new[mi][i] - mu_old[mi][i]).abs() > 1e-3,
+                    "premise: V1's mu moved for subject {i}"
+                );
+            }
+        }
+    }
+}
+
+/// The data-term shift every numerical-engine caller applies: each member's
+/// coordinate moves by its own shift, the non-member coordinate not at all.
+#[test]
+fn shift_eta_moves_every_member() {
+    let m = model(LINEAR_SHARED_MODEL);
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, _) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15, 0.2]));
+    let g = &groups[0];
+    let shifts = vec![vec![0.0, 0.25], vec![0.0, -0.5]];
+    let mut eta = vec![0.1, 0.2, 0.3];
+    g.shift_eta(&mut eta, &shifts, 1);
+    assert_eq!(eta, vec![0.35, -0.3, 0.3]);
+}
+
+/// A non-finite delta leaves that member's coordinate alone and does not count
+/// as a move — IMP skips the second-moment update on exactly that answer.
+#[test]
+fn recentre_eta_skips_a_non_finite_delta() {
+    let m = model(LINEAR_SHARED_MODEL);
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, _) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15, 0.2]));
+    let g = &groups[0];
+    let mut eta = vec![0.1, 0.2, 0.3];
+    assert!(!g.recentre_eta(&mut eta, &[vec![f64::NAN], vec![f64::INFINITY]], 0));
+    assert_eq!(eta, vec![0.1, 0.2, 0.3]);
+    assert!(g.recentre_eta(&mut eta, &[vec![f64::NAN], vec![0.5]], 0));
+    assert_eq!(eta, vec![0.1, -0.3, 0.3]);
 }

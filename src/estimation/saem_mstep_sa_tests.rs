@@ -668,17 +668,6 @@ fn stored_draws_follow_the_mu_reference_shift() {
     assert_eq!(draws, before);
 }
 
-#[test]
-fn stored_draws_follow_a_per_subject_mu_reference_shift() {
-    let mut draws = vec![vec![vec![0.10f64], vec![-0.20], vec![0.40]]];
-    recentre_eta_draws_per_subject(&mut draws, 0, &[0.05, -0.10, f64::NAN]);
-    assert_eq!(draws[0][0][0], 0.10 - 0.05);
-    assert_eq!(draws[0][1][0], -0.20 + 0.10);
-    // A non-finite shift is skipped rather than poisoning the stored draw —
-    // the same rule the live η re-centring uses.
-    assert_eq!(draws[0][2][0], 0.40);
-}
-
 /// Every early return from `MstepScoreSa::step` must be **counted**, or a run
 /// can lose its numerical M-step on every iteration and report nothing — the
 /// objective is fine and the parameters simply stop being estimated, which is

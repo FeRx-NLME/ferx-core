@@ -1056,6 +1056,11 @@ fn detect_covariate_mu_refs(
             _ => {}
         }
     }
+    // Every recorded group's own parameter: the taint behind
+    // `read_outside_groups` stops at all of them, so a theta two groups share
+    // is not "outside" either of them (#1620).
+    let all_owners: Vec<String> = found.iter().map(|(_, owner, _)| owner.clone()).collect();
+    let all_owners: Vec<&str> = all_owners.iter().map(String::as_str).collect();
     found
         .into_iter()
         .map(|(eta_idx, owner, mut entry)| {
@@ -1063,7 +1068,14 @@ fn detect_covariate_mu_refs(
                 stmts,
                 theta_names,
                 outside_idents,
-                &owner,
+                &[owner.as_str()],
+                &entry.theta_names,
+            );
+            entry.read_outside_groups = thetas_read_outside_the_group(
+                stmts,
+                theta_names,
+                outside_idents,
+                &all_owners,
                 &entry.theta_names,
             );
             entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
@@ -1144,10 +1156,13 @@ fn retire_superseded_groups_in(
 ///
 /// - a name is **tainted** by θ when its right-hand side reads θ or reads an
 ///   already-tainted name — statement order, `if` bodies included;
-/// - the taint **stops at the group's own parameter**. That is the whole point
-///   of mu-referencing: `CL` is held fixed by the preserved `φ_i`, so `Q = CL/2`
-///   is fixed too, and the local `TVCL = …` that exists only to build `CL`
-///   carries the thetas nowhere else;
+/// - the taint **stops at the group's own parameter** (`owners`). That is the
+///   whole point of mu-referencing: `CL` is held fixed by the preserved `φ_i`,
+///   so `Q = CL/2` is fixed too, and the local `TVCL = …` that exists only to
+///   build `CL` carries the thetas nowhere else. Called with every recorded
+///   group's parameter in `owners`, it answers the same question for a joint
+///   M-step that freezes all of their `φ_i` at once
+///   ([`CovariateMuRef::read_outside_groups`], #1620);
 /// - θ is shared when another block names θ itself or names any tainted name.
 ///   `[structural_model]`, `[odes]`, `[derived]`, `[scaling]`, `[error_model]`
 ///   are where an individual parameter becomes a prediction, so a taint that
@@ -1161,7 +1176,7 @@ fn thetas_read_outside_the_group(
     stmts: &[Statement],
     theta_names: &[String],
     outside_idents: &HashSet<String>,
-    owner: &str,
+    owners: &[&str],
     group_thetas: &[String],
 ) -> Vec<String> {
     group_thetas
@@ -1174,7 +1189,7 @@ fn thetas_read_outside_the_group(
                 return false;
             };
             let mut tainted: HashSet<String> = HashSet::new();
-            spread_theta_taint(stmts, theta_idx, owner, &mut tainted);
+            spread_theta_taint(stmts, theta_idx, owners, &mut tainted);
             tainted.iter().any(|n| outside_idents.contains(n))
         })
         .cloned()
@@ -1237,18 +1252,18 @@ fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) 
 }
 
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments
-/// in statement order and stopping at `owner`. See
+/// in statement order and stopping at every name in `owners`. See
 /// [`thetas_read_outside_the_group`] for why the taint stops there.
 fn spread_theta_taint(
     stmts: &[Statement],
     theta_idx: usize,
-    owner: &str,
+    owners: &[&str],
     tainted: &mut HashSet<String>,
 ) {
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => {
-                if name == owner {
+                if owners.contains(&name.as_str()) {
                     continue;
                 }
                 let mut reads = false;
@@ -1268,10 +1283,10 @@ fn spread_theta_taint(
                 else_body,
             } => {
                 for (_, body) in branches {
-                    spread_theta_taint(body, theta_idx, owner, tainted);
+                    spread_theta_taint(body, theta_idx, owners, tainted);
                 }
                 if let Some(eb) = else_body {
-                    spread_theta_taint(eb, theta_idx, owner, tainted);
+                    spread_theta_taint(eb, theta_idx, owners, tainted);
                 }
             }
             _ => {}
@@ -1331,10 +1346,11 @@ fn classify_covariate_mu_ref(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names,
-            // Both filled by `detect_covariate_mu_refs` once the whole block
+            // All three filled by `detect_covariate_mu_refs` once the whole block
             // (and the other blocks' identifiers) are in view; a single
             // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
+            read_outside_groups: Vec::new(),
             eta_shared: false,
             typical,
         },

@@ -3538,6 +3538,19 @@ pub struct CovariateMuRef {
     /// estimated by the group — it just forces the prior-plus-data engine, which
     /// keeps the term it is live in.
     pub shared_thetas: Vec<String>,
+    /// The subset of [`Self::theta_names`] that reaches the likelihood through
+    /// something **other than a recorded covariate mu-reference** — the same
+    /// reachability walk as [`Self::shared_thetas`], with the taint stopped at
+    /// *every* group's own parameter instead of only this one's.
+    ///
+    /// Two groups sharing a theta (`CL` and `V1` both reading `TH_WT`) list it
+    /// in `shared_thetas` — each reads it outside the other — but not here.
+    /// That distinction is what lets the estimator merge them into one joint
+    /// M-step and still take the exact engine: once every member's `φ_i` is
+    /// frozen, a theta read only by the members no longer reaches the data
+    /// (#1620). A theta listed here keeps the observation term whatever the
+    /// grouping.
+    pub(crate) read_outside_groups: Vec<String>,
     /// Whether a right-hand side other than this group's own typical value also
     /// reads [`Self::eta_name`].
     ///
