@@ -726,8 +726,8 @@ pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnosti
             .with_suggestion(format!(
                 "call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on \
                  the simulation population (`read_population_for_simulation`) before \
-                 simulating. The file entry points bind for you, against the dataset or \
-                 the [simulation] design. Or declare the block explicitly as \
+                 simulating. `run_model_simulate` (`ferx --simulate`) binds for you, \
+                 against the [simulation] design. Or declare the block explicitly as \
                  `theta {name}[N](...)` and index it with your own column"
             ))
         })

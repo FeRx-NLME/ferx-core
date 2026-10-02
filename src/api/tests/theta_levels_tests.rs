@@ -167,9 +167,9 @@ fn the_simulate_paths_report_an_unbound_level_block_and_name_the_binder() {
     );
     assert!(
         s.contains(
-            "The file entry points bind for you, against the dataset or the [simulation] design"
+            "`run_model_simulate` (`ferx --simulate`) binds for you, against the [simulation] design"
         ),
-        "the entry points that bind on their own: {s}"
+        "the one simulating entry point that binds on its own: {s}"
     );
     assert!(
         s.contains("`theta PLACEBO[N](...)` and index it with your own column"),
