@@ -1233,6 +1233,16 @@ mod from_fit {
                 && err.contains("bind the design with `bind_theta_levels_from_fit`"),
             "{err}"
         );
+        assert!(
+            err.contains("whose theta count is set by the data the model was bound against."),
+            "why the count moves: {err}"
+        );
+        assert!(
+            err.contains(
+                "and the fit's level bindings, so the design carries the fit's theta layout"
+            ),
+            "what the from-fit binder buys: {err}"
+        );
 
         let plain = no_eta_model()
             .replace("theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", "")

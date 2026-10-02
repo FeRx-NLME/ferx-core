@@ -84,6 +84,13 @@ fn assert_counts_message(msg: &str, got: usize, entry: &str) {
         )),
         "{entry}, θ len {got}: counts not named: {msg}"
     );
+    assert!(
+        msg.contains(
+            "; simulation reads theta by position, so these values would be read against the \
+             wrong parameters"
+        ),
+        "{entry}, θ len {got}: why a length mismatch is refused, missing: {msg}"
+    );
     for banned in ["missing", "data", "bind_theta_levels_from_fit"] {
         assert!(
             !msg.contains(banned),

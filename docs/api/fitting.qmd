@@ -351,6 +351,8 @@ against. `bind_theta_levels` on a simulation design re-discovers the levels from
 the design, so a design whose combinations differ from the fit's (a subset, a
 new time grid, another study, or only more subjects per study, which can change
 the resolved contrast) would read the fitted values at the wrong positions.
+Nothing refuses this when the design has as many levels as the fit: the θ
+vector then has the right length, so the length check below cannot see it.
 Bind the design against the fit's own bindings instead. They are
 `parsed.bindings.levels` right after `bind_theta_levels` ran on the fit data, so
 keep them with the fit:

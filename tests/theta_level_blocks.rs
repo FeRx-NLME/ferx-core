@@ -879,6 +879,10 @@ fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
         )),
         "{case}: count / reason missing: {err}"
     );
+    assert!(
+        err.contains("A level's theta exists only for a combination the fit's data observed."),
+        "{case}: why an unseen level has no theta, missing: {err}"
+    );
     for l in labels {
         assert!(
             err.contains(&format!("`{l}`")),
@@ -886,7 +890,10 @@ fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
         );
     }
     assert!(
-        err.contains("can only be simulated at the fit's observation times"),
+        err.contains(
+            "can only be simulated at the fit's observation times; a denser or different \
+             time grid has no fitted theta."
+        ),
         "{case}: TIME-grid consequence missing: {err}"
     );
     assert!(

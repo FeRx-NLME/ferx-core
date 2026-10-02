@@ -78,8 +78,10 @@ section of the SDLC for the versioning policy).
   silently dropped its tail. This covers `simulate`, `simulate_with_seed`,
   `simulate_with_options(_diag)`, `simulate_with_uncertainty` and both adaptive entries.
   For a level-block model, re-binding a design with `bind_theta_levels` and simulating it
-  with the fit's θ read the fitted values at the wrong positions, silently when the level
-  count matched. Use `bind_theta_levels_from_fit` (above).
+  with the fit's θ reads the fitted values at the wrong positions. When the level count
+  differs, the θ-length check now refuses it. When the count matches, nothing refuses it:
+  the θ vector has the right length, so the result is still silently wrong. Use
+  `bind_theta_levels_from_fit` (above), the only safe binder for a fit's θ.
 
 - **An unbound `theta NAME[COL, ...]` level block now names the public binder** (#1384). The
   `fit()` refusal and the simulate paths' `E_THETA_LEVELS_UNBOUND` said only a file entry
