@@ -17,22 +17,35 @@ ferx-core = { path = "../ferx-core" }
 ## Quick Example
 
 ```rust
-use ferx_core::api::read_population_for;
+use ferx_core::api::{bind_covariate_stats, read_population_for};
+use ferx_core::io::datareader::SelectionFilter;
 use ferx_core::*;
 use std::path::Path;
 
 fn main() -> Result<(), String> {
-    // Parse model and data
-    let parsed = parse_full_model_file(Path::new("model.ferx"))?;
-    let (population, _) = read_population_for(
-        &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+    // Parse model and data, applying the file's [data_selection] and IOV column
+    let model_text = std::fs::read_to_string("model.ferx").map_err(|e| e.to_string())?;
+    let mut parsed = parse_full_model_file(Path::new("model.ferx"))?;
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)?;
+    let (mut population, _) = read_population_for(
+        &parsed.model, &parsed.covariate_decls, "data.csv", None,
+        opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
     )?;
 
-    // Build initial parameters and options
-    let (init_params, options) = build_fit_inputs(&parsed)?;
+    // Bind data-driven declarations (no-ops for a model without them)
+    bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    bind_covariate_stats(&mut parsed, &model_text, &population)?;
 
-    // Run estimation
-    let result = fit(&parsed.model, &population, &init_params, &options)?;
+    // `fit` reads the gradient method off the model: stamp the file's `gradient = ...`
+    parsed.model.gradient_method = if parsed.model.is_sde() {
+        GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
+
+    // Run estimation from the model's own initial estimates and options
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 
     // Access results
     println!("OFV: {}", result.ofv);
@@ -43,6 +56,9 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 ```
+
+Why the bind, filter and gradient steps are there, and when they matter, is in
+[Assembling the inputs yourself](fitting.qmd#assembling-the-inputs-yourself).
 
 ## API Sections
 

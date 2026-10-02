@@ -223,9 +223,60 @@ fn a_level_block_model_cannot_be_fit_without_binding() {
         &ferx_core::FitOptions::default(),
     )
     .expect_err("an unbound level block must not fit");
+    // One assertion per sentence of the message (#1384): each one dies when
+    // its sentence is deleted.
     assert!(
-        err.contains("never bound to data") && err.contains("PLACEBO"),
-        "unexpected error: {err}"
+        err.contains("`theta PLACEBO[...]` was never bound to data"),
+        "the block and the cause: {err}"
+    );
+    assert!(
+        err.contains("`bind_theta_levels(&mut parsed, &model_text, &mut population)`")
+            && err.contains("(`read_population_for`) and before `fit`"),
+        "the public binder, and when to call it: {err}"
+    );
+    assert!(
+        err.contains("`prepare_run` and the file entry points") && err.contains("bind for you"),
+        "the entry points that bind on their own: {err}"
+    );
+    assert!(
+        err.contains("`theta PLACEBO[N](...)` and index it with your own column"),
+        "the counted-form alternative: {err}"
+    );
+}
+
+#[test]
+fn the_unbound_refusal_names_every_unbound_block() {
+    // Two level blocks: the message must name both, and its counted-form
+    // example uses the first.
+    let model = level_block_model()
+        .replace(
+            "theta TVV(10.0, 0.1, 500.0)",
+            "theta TVV(10.0, 0.1, 500.0)\n  theta DRUG[STUDY](0.0, -5.0, 5.0)",
+        )
+        .replace("V  = TVV * exp(ETA_V)", "V  = TVV * exp(ETA_V) + DRUG");
+    let parsed = ferx_core::parser::model_parser::parse_full_model(&model).expect("parse");
+    assert_eq!(
+        parsed.model.theta_blocks().unbound_level_blocks().len(),
+        2,
+        "the fixture must declare two unbound blocks"
+    );
+    let population =
+        ferx_core::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+            .expect("read warfarin");
+    let err = ferx_core::fit(
+        &parsed.model,
+        &population,
+        &parsed.model.default_params,
+        &ferx_core::FitOptions::default(),
+    )
+    .expect_err("unbound level blocks must not fit");
+    assert!(
+        err.contains("`theta PLACEBO`, `theta DRUG[...]` was never bound to data"),
+        "both block names: {err}"
+    );
+    assert!(
+        err.contains("`theta PLACEBO[N](...)`"),
+        "the counted example uses the first block: {err}"
     );
 }
 
@@ -396,4 +447,227 @@ fn a_level_block_binds_against_a_simulation_design() {
             "a bound level block must simulate finite observations"
         );
     }
+}
+
+/// Parse `model_path` and read `data_path` the way an API caller (the R glue,
+/// a tool) does it — `parse_full_model_file` → `read_population_for` with the
+/// file's IOV column and `[data_selection]` filter — then `bind_theta_levels`
+/// unless `bind` is false (#1384), then the file's `gradient = ...` stamped onto
+/// the model. Statement for statement the documented example
+/// (`docs/api/fitting.qmd`, `docs/api/index.qmd`), imports included.
+fn read_composable(
+    model_path: &std::path::Path,
+    data_path: &std::path::Path,
+    bind: bool,
+) -> (ferx_core::ParsedModel, ferx_core::Population) {
+    use ferx_core::io::datareader::SelectionFilter;
+    use ferx_core::GradientMethod;
+
+    let mut parsed = ferx_core::parse_full_model_file(model_path).expect("parse");
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(
+        &opts.ignore_exprs,
+        &opts.accept_exprs,
+        &opts.ignore_subjects,
+    )
+    .expect("selection filter");
+    let (mut population, _) = ferx_core::api::read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data_path.to_str().unwrap(),
+        None,
+        opts.iov_column.as_deref(),
+        Some(&filter),
+        &parsed.column_map,
+    )
+    .expect("read");
+    if bind {
+        let model_text = std::fs::read_to_string(model_path).unwrap();
+        ferx_core::bind_theta_levels(&mut parsed, &model_text, &mut population).expect("bind");
+        // A no-op on this model; called so the helper is the documented example.
+        ferx_core::api::bind_covariate_stats(&mut parsed, &model_text, &population)
+            .expect("bind covariate stats");
+    }
+    // `fit` reads the gradient method off the model, not the options, and an
+    // SDE model is always FD. After the binds, which re-parse the model.
+    parsed.model.gradient_method = if parsed.model.is_sde() {
+        GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
+    (parsed, population)
+}
+
+/// [`read_composable`], then `fit` with the parsed model's own inits and options.
+fn fit_composable(
+    model_path: &std::path::Path,
+    data_path: &std::path::Path,
+    bind: bool,
+) -> Result<(ferx_core::FitResult, ferx_core::CompiledModel), String> {
+    let (parsed, population) = read_composable(model_path, data_path, bind);
+    let result = ferx_core::fit(
+        &parsed.model,
+        &population,
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    )?;
+    Ok((result, parsed.model))
+}
+
+#[test]
+fn the_composable_path_binds_exactly_like_the_file_entry_point() {
+    // #1384: `bind_theta_levels` is public, so a caller that reads the data
+    // itself can fit a level-block model without a file entry point. The file
+    // path is the oracle: the same parameter vector, and an OFV equal to the bit.
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let (file, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("file fit");
+    let (composable, model) = fit_composable(&model_path, &data_path, true).expect("composable");
+
+    assert_eq!(composable.theta_names, file.theta_names);
+    assert_eq!(composable.n_parameters, file.n_parameters);
+    assert_eq!(composable.n_parameters, 9, "{:?}", composable.theta_names);
+    assert!(file.ofv.is_finite(), "file-path OFV must be finite");
+    assert_eq!(
+        composable.ofv.to_bits(),
+        file.ofv.to_bits(),
+        "composable OFV {:.17e} vs file OFV {:.17e}",
+        composable.ofv,
+        file.ofv
+    );
+    // `theta_names` omits the dependent level under sum-to-zero; the level map
+    // does not — all 6 observed combinations.
+    let map = ferx_core::theta_level_map(&model);
+    let labels = map.get("PLACEBO").expect("PLACEBO in the level map");
+    assert_eq!(labels.len(), 6, "{labels:?}");
+    assert_eq!(labels[0], "STUDY=1,TIME=1");
+    let dependent: Vec<_> = labels
+        .iter()
+        .filter(|l| !composable.theta_names.contains(&format!("PLACEBO[{l}]")))
+        .collect();
+    assert_eq!(dependent.len(), 1, "one dependent level: {labels:?}");
+}
+
+/// Fit `model` on [`DATA`] through `run_model_with_data` and through the
+/// composable path, and return `(file, composable)` OFV and parameter count.
+fn file_and_composable(model: &str) -> ((f64, usize), (f64, usize)) {
+    let (_dir, model_path, data_path) = write_case(model, DATA);
+    let (file, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("file fit");
+    let (composable, _model) = fit_composable(&model_path, &data_path, true).expect("composable");
+    (
+        (file.ofv, file.n_parameters),
+        (composable.ofv, composable.n_parameters),
+    )
+}
+
+#[test]
+fn the_composable_path_honours_the_files_gradient_setting() {
+    // `fit` reads `gradient` off the model, which only the file entry points
+    // stamp, so the documented path has to stamp it too. Before it did, the
+    // composable fit here was bit-identical to the run *without* `gradient = fd`.
+    let fd_model =
+        level_block_model().replace("covariance = false", "covariance = false\n  gradient = fd");
+    assert_ne!(fd_model, level_block_model(), "the replace must take");
+    let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&fd_model);
+    let ((base_ofv, _), _) = file_and_composable(&level_block_model());
+    // The straddle: `gradient = fd` must move the file path's objective, or the
+    // equality below holds whether the composable path stamps it or not.
+    assert!(file_ofv.is_finite() && base_ofv.is_finite());
+    assert_ne!(
+        file_ofv.to_bits(),
+        base_ofv.to_bits(),
+        "gradient = fd must change the file-path objective on this fixture"
+    );
+    assert_eq!(comp_n, file_n);
+    assert_eq!(
+        comp_ofv.to_bits(),
+        file_ofv.to_bits(),
+        "gradient = fd: composable OFV {comp_ofv:.17e} vs file OFV {file_ofv:.17e}"
+    );
+}
+
+#[test]
+fn the_composable_path_applies_the_files_data_selection() {
+    // `ignore = TIME > 10` drops both 12 h records, so 4 observed combinations
+    // remain: 3 free levels + TVCL + TVV + ω + σ = 7 parameters, against 9 on
+    // the full data. The file path filters; the composable path must too.
+    let model = format!(
+        "{}\n[data_selection]\n  ignore = TIME > 10\n",
+        level_block_model()
+    );
+    let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&model);
+    assert_eq!(file_n, 7, "the file path must apply [data_selection]");
+    assert_eq!(comp_n, file_n, "composable parameter count vs file");
+    assert!(file_ofv.is_finite());
+    assert_eq!(
+        comp_ofv.to_bits(),
+        file_ofv.to_bits(),
+        "[data_selection]: composable OFV {comp_ofv:.17e} vs file OFV {file_ofv:.17e}"
+    );
+}
+
+#[test]
+fn the_composable_path_without_binding_is_refused_by_name() {
+    // The other side of the gate above: the same path minus the bind call.
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let err = fit_composable(&model_path, &data_path, false)
+        .map(|_| ())
+        .expect_err("an unbound level block must not fit");
+    assert!(
+        err.contains("never bound to data") && err.contains("bind_theta_levels"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn the_composable_path_writes_the_level_index_the_data_encodes() {
+    // Every PLACEBO init is 0.0, so at the initial estimates any permutation of
+    // the level index predicts identically and the OFV equality above cannot
+    // see a wrong index. Check the synthesized column itself, record by record,
+    // against `PLA_IDX` — the dataset's own hand-written encoding of the same
+    // design, in the binder's (STUDY, TIME) sort order — a reference outside the
+    // binder. `prepare_run` is compared too, but it shares the binder's index
+    // writer, so that leg pins routing, not the index.
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let prepared = ferx_core::prepare_run(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("prepare_run");
+    let (_parsed, population) = read_composable(&model_path, &data_path, true);
+
+    assert_eq!(population.subjects.len(), 2);
+    assert_eq!(prepared.population.subjects.len(), 2);
+    let mut n_records = 0;
+    for (c, p) in population
+        .subjects
+        .iter()
+        .zip(&prepared.population.subjects)
+    {
+        assert_eq!(c.id, p.id);
+        for j in 0..c.obs_times.len() {
+            let got = c.obs_cov(j)["__level_PLACEBO"];
+            assert_eq!(
+                got,
+                c.obs_cov(j)["PLA_IDX"],
+                "subject {} record {j}: composable index vs PLA_IDX",
+                c.id
+            );
+            assert_eq!(
+                p.obs_cov(j)["__level_PLACEBO"],
+                got,
+                "subject {} record {j}: prepare_run vs composable",
+                c.id
+            );
+            n_records += 1;
+        }
+    }
+    assert_eq!(n_records, 6);
 }

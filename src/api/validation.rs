@@ -724,8 +724,10 @@ pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnosti
             )
             .with_block("parameters")
             .with_suggestion(format!(
-                "run through a file entry point, which binds level blocks against the \
-                 dataset or the [simulation] design — or declare the block explicitly as \
+                "call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on \
+                 the simulation population (`read_population_for_simulation`) before \
+                 simulating. `run_model_simulate` (`ferx --simulate`) binds for you, \
+                 against the [simulation] design. Or declare the block explicitly as \
                  `theta {name}[N](...)` and index it with your own column"
             ))
         })
@@ -6788,7 +6790,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //
     //    The filter is the model file's own clauses and only those: this function
     //    takes no `FitOptions`, so clauses a *caller* merges in (`fit_from_files`,
-    //    ferx-r's `ferx_fit(settings = ferx_selection(...))`) are invisible here
+    //    ferx-r's `ferx_fit(ignore =, accept =, ignore_ids =)`) are invisible here
     //    and a check cannot speak for them (#1465).
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();

@@ -37,6 +37,10 @@ let result = fit(&model, &population, &model.default_params, &options)?;
 println!("OFV: {:.4}", result.ofv);
 ```
 
+A model with a data-driven level block (`theta NAME[COL, ...]`) or a symbolic
+`[covariate_model]` statistic needs one more step between reading and fitting.
+See [Assembling the inputs yourself](#assembling-the-inputs-yourself).
+
 ## `fit_from_files()`
 
 Convenience wrapper that handles parsing and data reading. `data_path` is
@@ -276,23 +280,74 @@ The predicates are also available on their own — `estimate_near_boundary`,
 `stalled_at_init`, `max_abs_correlation` — for a report that prints the numbers
 rather than the verdict.
 
-## `build_fit_inputs()`
+## Assembling the inputs yourself
 
-Extract initial parameters and fit options from a parsed model, separating parsing from estimation for timing purposes.
+A caller that parses the model and reads the data itself (the R package, a
+tool) has to do one step the file entry points do for it: **bind the model to
+the data**. Two kinds of declaration have no value until the dataset is known:
+
+- a data-driven level block, `theta NAME[COL, ...]`, whose level count is the
+  set of combinations the data shows ([parameters](../model-file/parameters.qmd#data-driven-form-theta-namecol-...));
+- a symbolic `[covariate_model]` statistic, such as `center = median`,
+  `ref = mode` or `levels = auto`.
+
+`bind_theta_levels` and `bind_covariate_stats` resolve them against the
+population, after it is read and before `fit`. Both re-parse the model, so keep
+the model text, and take the initial estimates and options from the re-parsed
+model:
 
 ```rust
-pub fn build_fit_inputs(
-    parsed: &ParsedModel,
-) -> Result<(ModelParameters, FitOptions), String>
-```
+use ferx_core::api::{bind_covariate_stats, read_population_for};
+use ferx_core::io::datareader::SelectionFilter;
+use ferx_core::*;
+use std::path::Path;
 
-**Example:**
-```rust
-let parsed = parse_full_model_file(Path::new("model.ferx"))?;
-let (init_params, options) = build_fit_inputs(&parsed)?;
-
-let (population, _) = read_population_for(
-    &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+let model_text = std::fs::read_to_string("model.ferx").map_err(|e| e.to_string())?;
+let mut parsed = parse_full_model_file(Path::new("model.ferx"))?;
+let opts = &parsed.fit_options;
+let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)?;
+let (mut population, _) = read_population_for(
+    &parsed.model, &parsed.covariate_decls, "data.csv", None,
+    opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
 )?;
-let result = fit(&parsed.model, &population, &init_params, &options)?;
+
+bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+bind_covariate_stats(&mut parsed, &model_text, &population)?;
+
+// `fit` reads the gradient method off the model, not the options.
+parsed.model.gradient_method = if parsed.model.is_sde() {
+    GradientMethod::Fd
+} else {
+    parsed.fit_options.gradient_method
+};
+
+let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 ```
+
+Both binders are no-ops for a model that declares neither, so calling them
+unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
+`fit()` refuses it, naming the block. The simulate paths report the same
+problem as `E_THETA_LEVELS_UNBOUND`. Bind a simulation dataset the same way,
+on the population from `read_population_for_simulation`. The binder discovers
+the levels from *that* population, so fitted θ only carry over to a design
+showing the same level combinations as the fit data.
+
+The other three steps are what the file entry points do besides binding. The
+`[data_selection]` filter and the IOV column go to the reader. The gradient
+stamp makes a file's `gradient = fd` take effect, and forces finite
+differences on an SDE model. Leave any of them out and the fit runs without
+that setting, and nothing warns you. With all three, the example gives the
+same parameter vector and the same objective as `run_model_with_data`, equal
+to the bit. The test suite pins that on a level-block model, alone, with
+`gradient = fd` and with a `[data_selection]` block. A caller that has a model *path* can use
+`prepare_run(model_path, data_path)` instead, which does all of this and
+returns the inputs without fitting.
+
+### Level labels: `theta_level_map`
+
+A bound level block's estimates are named after their combination, such as
+`PLACEBO[STUDY=7,TIME=4]`. Under a sum-to-zero constraint one level is not a
+free parameter, so it is absent from `FitResult::theta_names`.
+`theta_level_map(&parsed.model)` returns every level, the dependent one
+included, keyed by block name. Each label is the combination without the
+block name (`STUDY=7,TIME=4`), in index order.
