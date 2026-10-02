@@ -866,7 +866,8 @@ fn a_subset_design_binds_at_the_fits_positions_and_keeps_its_layout() {
 /// The refusal for each unseen-label case, held to the message contract: the
 /// block, every unseen label, "the fit estimated no theta", the TIME-grid
 /// consequence (this block is keyed on TIME), both options — and not the
-/// level-count claim, which is false at the same count.
+/// level-count claim, which is false at the same count, nor a Rust function name,
+/// since the R wrapper passes the text through verbatim (#1623).
 fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
     assert!(
         err.contains("theta PLACEBO[STUDY, TIME]"),
@@ -897,9 +898,19 @@ fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
         "{case}: TIME-grid consequence missing: {err}"
     );
     assert!(
-        err.contains("simulate only the fit's levels")
-            && err.contains("bind the design with `bind_theta_levels`"),
-        "{case}: options missing: {err}"
+        err.contains("Either simulate only the fit's levels,"),
+        "{case}: first option missing: {err}"
+    );
+    assert!(
+        err.contains(
+            "or simulate the design without the fit's theta, from a theta vector for the \
+             design's own levels (the model's initial estimates, for example)."
+        ),
+        "{case}: second option missing: {err}"
+    );
+    assert!(
+        !err.contains("bind_theta_levels"),
+        "{case}: a Rust function in a message the R wrapper passes through (#1623): {err}"
     );
     assert!(
         !err.contains("number of levels"),
@@ -1024,4 +1035,48 @@ fn a_subset_design_simulates_the_closed_form_with_the_fits_theta() {
         worst = worst.max(rel);
     }
     eprintln!("closed-form worst rel error: {worst:e}");
+}
+
+/// T7 (#1623). The level-reporting surface is reachable as an **external** crate —
+/// how ferx-r consumes it: `theta_level_values` at the crate root, the fields of
+/// `api::ThetaLevelValue`, and `io::output::{compact_theta_blocks,
+/// THETA_BLOCK_COMPACT_MIN}`. On the file path's own binding of the 2 × 3 design
+/// (global sum-to-zero, so the last level is dependent), at the model's inits.
+///
+/// Mutation — make any of them `pub(crate)`: this file stops compiling.
+#[test]
+fn the_level_reporting_surface_is_reachable_from_outside_the_crate() {
+    use ferx_core::api::ThetaLevelValue;
+    use ferx_core::io::output::{compact_theta_blocks, THETA_BLOCK_COMPACT_MIN};
+
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let (parsed, _population) = read_composable(&model_path, &data_path, true);
+    let model = &parsed.model;
+    let theta: Vec<f64> = (0..model.n_theta).map(|k| 0.1 * (k + 1) as f64).collect();
+
+    let map = ferx_core::theta_level_values(model, &theta).expect("level values");
+    let levels: &Vec<ThetaLevelValue> = &map["PLACEBO"];
+    let labels: Vec<&str> = levels.iter().map(|l| l.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "STUDY=1,TIME=1",
+            "STUDY=1,TIME=4",
+            "STUDY=1,TIME=12",
+            "STUDY=2,TIME=1",
+            "STUDY=2,TIME=4",
+            "STUDY=2,TIME=12",
+        ]
+    );
+    for (i, l) in levels[..5].iter().enumerate() {
+        assert_eq!((l.value, l.theta_index), (theta[i + 1], Some(i + 1)));
+    }
+    let free: f64 = theta[1..6].iter().sum();
+    assert_eq!((levels[5].value, levels[5].theta_index), (-free, None));
+
+    assert_eq!(THETA_BLOCK_COMPACT_MIN, 20);
+    assert!(
+        compact_theta_blocks(&model.theta_names).is_empty(),
+        "five free coefficients stay inline"
+    );
 }

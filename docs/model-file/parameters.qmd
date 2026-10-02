@@ -197,10 +197,12 @@ this engine is, and switch automatically once a block makes the problem large:
   to the score cross-product (`covariance_method = s`, one pass) with a warning.
   Setting `covariance_method = r` explicitly forces it, and says what it costs.
 
-A block of more than 20 free coefficients also leaves the main estimate table
+A block of 20 or more free coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console. The
 fit YAML writes every independently estimated coefficient under
 `theta_blocks:`; constrained dependent levels are derived values, not estimates.
+To read a dependent level's value, use `theta_level_values`
+([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
 Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
 the dual-number path — so a *small* level block keeps the analytic gradient.

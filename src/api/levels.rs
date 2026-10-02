@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    level_index_column, parse_full_model_with, LevelBinding, LevelBindings, LevelBlockDecl,
-    LevelContrast,
+    eval_gather, level_index_column, parse_full_model_with, LevelBinding, LevelBindings,
+    LevelBlockDecl, LevelContrast, LevelRule,
 };
 use crate::types::{ParsedModel, Population, Subject};
 
@@ -109,7 +109,10 @@ pub fn bind_theta_levels(
 /// modelling decision taken silently. On a block keyed on `TIME` that means the design
 /// can only be simulated at the fit's observation times. Levels are matched by their
 /// label (`STUDY=7,TIME=4`), so a design value differing from the fit's in its last
-/// digit is a different level.
+/// digit is a different level. The refusal names actions, not functions, since a
+/// wrapper passes it through verbatim; from Rust, the second action it offers —
+/// simulating the design on its own levels — is [`bind_theta_levels`] on the design,
+/// with θ for the levels that discovers (the model's `default_params`, for example).
 ///
 /// Also refused: `fitted` lacking a block the model declares, or carrying one it does
 /// not. Nothing is written to `population` unless every block binds.
@@ -216,8 +219,9 @@ fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
         ));
     }
     message.push_str(
-        " Either simulate only the fit's levels, or bind the design with `bind_theta_levels` \
-         and supply theta for the design's own levels.",
+        " Either simulate only the fit's levels, or simulate the design without the fit's \
+         theta, from a theta vector for the design's own levels (the model's initial \
+         estimates, for example).",
     );
     message
 }
@@ -595,6 +599,86 @@ pub fn level_map(model: &crate::types::CompiledModel) -> HashMap<String, Vec<Str
         }
     }
     out
+}
+
+/// One level of a bound θ level block, as reported by [`theta_level_values`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThetaLevelValue {
+    /// The level's label (`STUDY=7,TIME=4`), as [`theta_level_map`](crate::theta_level_map)
+    /// lists it.
+    pub label: String,
+    /// The value the model uses for this level at the supplied θ. A free level is its
+    /// own θ; a dependent level is derived from the free ones — the negated sum of
+    /// its group's free θ under `sum_to_zero` / `sum_to_zero_within`, and `0` for a
+    /// `ref` reference level or a level whose group has no free θ.
+    pub value: f64,
+    /// `Some(k)` when the level is estimated directly, `k` being its position in the
+    /// θ vector (and in `theta_names` and the θ standard errors); `None` for a
+    /// dependent level, which has no θ of its own.
+    pub theta_index: Option<usize>,
+}
+
+/// Every level's value, free and dependent, of each bound level block, keyed by
+/// block name and in [`theta_level_map`](crate::theta_level_map) order (#1623).
+///
+/// The value is what the model's own evaluator reads for that level at `theta` — the
+/// one every prediction and objective uses — so a dependent level is reported exactly
+/// as the model applies it, never re-derived here. `theta_index` places each free
+/// level in the θ vector, so standard errors can be joined to it.
+///
+/// `theta` must be laid out for this bound model: the θ of a fit of `model`, or of a
+/// model rebound with [`bind_theta_levels_from_fit`]. A θ whose length is not the
+/// model's is refused; one of the right length but from a different binding cannot be
+/// detected, and is read at the wrong positions.
+///
+/// Unbound level blocks and counted `theta NAME[N]` blocks are omitted, as in
+/// [`theta_level_map`](crate::theta_level_map); a model with neither gives an empty map.
+pub fn theta_level_values(
+    model: &crate::types::CompiledModel,
+    theta: &[f64],
+) -> Result<HashMap<String, Vec<ThetaLevelValue>>, String> {
+    let expected = model.default_params.theta.len();
+    if theta.len() != expected {
+        return Err(format!(
+            "the supplied theta has {} values but this model has {expected}; level values \
+             are read from theta by position",
+            theta.len()
+        ));
+    }
+    let blocks = model.theta_blocks();
+    let mut out = HashMap::new();
+    for decl in blocks.level_blocks() {
+        if decl.labels().is_empty() {
+            continue;
+        }
+        let gather = blocks
+            .decls
+            .iter()
+            .find(|d| d.name == decl.name())
+            .ok_or_else(|| {
+                format!(
+                    "theta {}: the level block is bound but has no level-to-theta map",
+                    decl.name()
+                )
+            })?;
+        let values = decl
+            .labels()
+            .iter()
+            .zip(&gather.spec.levels)
+            .enumerate()
+            .map(|(i, (label, rule))| ThetaLevelValue {
+                label: label.clone(),
+                value: eval_gather(&gather.spec, theta, (i + 1) as f64),
+                theta_index: match *rule {
+                    LevelRule::Free(k) => Some(k as usize),
+                    LevelRule::NegSum(..) => None,
+                },
+            })
+            .collect();
+        out.insert(decl.name().to_string(), values);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

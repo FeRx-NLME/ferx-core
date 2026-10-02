@@ -18701,7 +18701,7 @@ impl GatherSpec {
 /// check lives in `api::validation::check_theta_gather_indices`, which walks the
 /// data before the fit starts; this is defence in depth behind it.
 #[inline]
-fn eval_gather(spec: &GatherSpec, theta: &[f64], raw: f64) -> f64 {
+pub(crate) fn eval_gather(spec: &GatherSpec, theta: &[f64], raw: f64) -> f64 {
     if !raw.is_finite() {
         return f64::NAN;
     }

@@ -335,7 +335,10 @@ pub(crate) fn validate_iov_simulatable(
 ///
 /// The usual way to get here is a level-block model: its θ count is set by the data
 /// it was bound against, so a fit's θ only fits a design bound with the *fit's*
-/// level bindings. The message says so whenever the model declares a level block.
+/// level bindings. The message says so whenever the model declares a level block. It
+/// names no function, since a wrapper reaches it too; from Rust, the binder is
+/// [`bind_theta_levels_from_fit`](crate::bind_theta_levels_from_fit) with the fit's
+/// `parsed.bindings.levels`.
 pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result<(), String> {
     let expected = model.default_params.theta.len();
     if theta.len() == expected {
@@ -355,9 +358,8 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
     if !blocks.is_empty() {
         message.push_str(&format!(
             ". The model declares the theta level block(s) {}, whose theta count is set by \
-             the data the model was bound against. To simulate with a fit's theta, bind the \
-             design with `bind_theta_levels_from_fit` and the fit's level bindings, so the \
-             design carries the fit's theta layout",
+             the data the model was bound against. A fit's theta fits only a design bound \
+             against that fit's level bindings, which give the design the fit's theta layout",
             blocks
                 .iter()
                 .map(|b| format!("`{b}`"))
