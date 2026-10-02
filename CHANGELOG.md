@@ -59,7 +59,27 @@ section of the SDLC for the versioning policy).
   Validated against NONMEM 7.6.0 (`nonmem_anchor/transit_iov_mtt`, `ig_iov_mat`: `$DES`
   with a per-dose kernel).
 
+### Added
+
+- **`bind_theta_levels_from_fit` binds a simulation design against a fit's level bindings**
+  (#1614), so a `theta NAME[COL, ...]` model can be simulated with its fitted θ. Pass the
+  `parsed.bindings.levels` kept from binding the fit data. Each design record gets its
+  level's position in the fit, and the fit's contrast is kept, so the θ layout is the
+  fit's. A design level the fit never observed is refused, naming the block and every
+  such label. For a block keyed on `TIME` the design can therefore only be simulated at
+  the fit's observation times. See
+  [Simulating with a fit's θ](docs/api/fitting.qmd#simulate-with-fit-theta).
+
 ### Fixed
+
+- **Every `simulate*` entry point now refuses a θ vector whose length is not the model's**
+  (#1614, `E_THETA_LENGTH`). A short vector used to simulate `Ok` rows from zeros past its
+  end (every prediction `0.0` on a plain two-θ model given one value), and a long one
+  silently dropped its tail. This covers `simulate`, `simulate_with_seed`,
+  `simulate_with_options(_diag)`, `simulate_with_uncertainty` and both adaptive entries.
+  For a level-block model, re-binding a design with `bind_theta_levels` and simulating it
+  with the fit's θ read the fitted values at the wrong positions, silently when the level
+  count matched. Use `bind_theta_levels_from_fit` (above).
 
 - **An unbound `theta NAME[COL, ...]` level block now names the public binder** (#1384). The
   `fit()` refusal and the simulate paths' `E_THETA_LEVELS_UNBOUND` said only a file entry
