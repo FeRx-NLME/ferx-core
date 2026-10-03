@@ -205,16 +205,48 @@ fn levels(result: &FitResult) -> Vec<(usize, f64)> {
 
 const SHORT_FIT: &str = "  maxiter = 3\n  inner_maxiter = 20";
 
+/// The token of `outer_fd_fallback_warning`: some subjects' outer gradient was
+/// not the exact analytic one at run time. The same phrase that
+/// `tests/outer_gradient_fd_fallback_warning.rs` matches, where
+/// `out_of_scope_subject_warns_while_the_report_still_says_analytic` produces
+/// the warning in a real fit, so a wording change reddens that test rather than
+/// silently emptying the check below.
+///
+/// No positive control here: on this model the provider declines nothing. A
+/// block past the 24-axis dual ladder is not a trigger either (measured: 26
+/// levels, one read per subject, ran analytic through the column-chunked jet),
+/// and `reconverge_gradient_interval` forces FD without logging a decline.
+const OUTER_FD_FALLBACK: &str = "could not be given the exact analytic outer gradient";
+
+/// The analytic outer gradient actually ran on every subject.
+///
+/// `gradient_method_outer` alone cannot say so: it is the *model-level* route
+/// (`build_info::gradient_method_outer` says it "must not be used as a gate for
+/// 'did the analytic outer gradient run'"), and a subject moved onto FD at run
+/// time leaves it reading "analytic". The runtime truth is the fallback warning,
+/// so require the label *and* its absence.
+fn assert_analytic_ran(result: &FitResult, case: &str) {
+    assert!(
+        result.gradient_method_outer.starts_with("analytic"),
+        "{case}: the model-level route must be the analytic gradient under test, got {}",
+        result.gradient_method_outer
+    );
+    let fallback: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains(OUTER_FD_FALLBACK))
+        .collect();
+    assert!(
+        fallback.is_empty(),
+        "{case}: subjects fell back off the analytic outer gradient: {fallback:?}"
+    );
+}
+
 #[test]
 fn a_gathered_theta_leaves_its_init_on_the_analytic_gradient() {
     for form in &FORMS {
         let result = fit(&model(form, form.gather_line, SHORT_FIT));
-        assert!(
-            result.gradient_method_outer.starts_with("analytic"),
-            "{}: the default route must be the analytic gradient under test, got {}",
-            form.name,
-            result.gradient_method_outer
-        );
+        assert_analytic_ran(&result, form.name);
         for (i, v) in levels(&result) {
             assert!(
                 v.is_finite(),
@@ -376,12 +408,9 @@ fn a_gathered_theta_converges_to_the_finite_difference_optimum() {
             form.gather_line,
             &format!("{CONVERGE}\n  gradient = fd"),
         ));
-        assert!(
-            analytic.gradient_method_outer.starts_with("analytic"),
-            "{}: {}",
-            form.name,
-            analytic.gradient_method_outer
-        );
+        // Without the runtime half of this check, a fit whose subjects all fell
+        // back to FD would make this an FD-vs-FD comparison and pass.
+        assert_analytic_ran(&analytic, form.name);
         assert!(
             !fd.gradient_method_outer.starts_with("analytic"),
             "{}: {}",
