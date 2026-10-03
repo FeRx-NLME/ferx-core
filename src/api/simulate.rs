@@ -633,9 +633,9 @@ pub fn simulate_with_options_diag(
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
     // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
-    // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty` calls
-    // once per draw, and a scope there would be entered per draw to feed a return type that
-    // has no warnings channel to put it in.
+    // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty_diag`
+    // calls once per draw, and that caller opens one scope around all of its draws (with its
+    // own phase) — a scope in the chokepoint would nest inside it, once per draw.
     let (results, stats) = super::with_solver_stats(model, || {
         simulate_inner_with_draw(
             model,

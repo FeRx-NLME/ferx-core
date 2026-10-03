@@ -2170,9 +2170,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `W_CMT_DEFAULTED` channel that lives on the options rather than on the model — a
 ///    `[data_selection]` clause comparing `CMT` — and these entry points have none, so it is
 ///    passed a default. See the call site. On `simulate_adaptive` alone `W_NO_DOSES` is
-///    withheld as well (#1645): its controller supplies the regimen, so a dose-free dataset is
-///    the normal input there and the finding's claim is false of the run, not merely oddly
-///    worded.
+///    withheld as well (#1645). Its observation — zero dose events parsed although scored
+///    observations are present — is true there, but its advice (check the dataset for an
+///    `AMT` column with dose rows) is not: the controller supplies the regimen, so a dose-free
+///    dataset is the expected input on that entry point.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
 ///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
 ///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
@@ -2202,10 +2203,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 /// `the_bundle_excludes_the_findings_that_are_about_a_fit` pins the exclusions, so this comment
 /// cannot quietly stop matching the code.
 ///
-/// Within what it carries the list is **not** filtered per entry point — the one exception,
-/// `W_NO_DOSES` on `simulate_adaptive` (item 2), is a finding that is false of that run, which
-/// is a different test from reading oddly. Dropping a code because
-/// it reads oddly outside a fit is the special-case-on-shared-infrastructure arrangement that
+/// Within what it carries the list is **not** filtered per entry point. The one exception,
+/// `W_NO_DOSES` on `simulate_adaptive` (item 2), is a finding whose advice is wrong on that
+/// entry point's expected input, which is a different test from reading oddly. Dropping a code
+/// because it reads oddly outside a fit is the special-case-on-shared-infrastructure arrangement that
 /// produced the "which entry point sees which finding" confusion #1280 was filed about. Two
 /// members are phrased for a fit (`W_ADDITIVE_INIT_SCALE` advises on optimizer basins;
 /// `W_MODELED_*_NONPOSITIVE` calls its values "initial estimates"), and they are still true of
@@ -2238,9 +2239,11 @@ pub(crate) fn non_fit_diagnostics(
             .iter()
             .filter(|w| !crate::api::validation::reader_warning_suppressed(model, &no_selection, w))
             // The adaptive driver's controller supplies the whole regimen, so a dataset that
-            // carries only an observation grid is its normal input and `W_NO_DOSES` — "no dose
-            // was parsed, so a PK model has nothing to act on" — is false of this run (#1645).
-            // Every other caller's regimen can only come from the data.
+            // carries only an observation grid is its expected input. `W_NO_DOSES` says that
+            // zero dose events were parsed, which is true, and then advises checking the dataset
+            // for an `AMT` column with dose rows, which is wrong here (#1645). Every other caller's regimen
+            // can only come from the data. A controller that never doses is not this warning's
+            // to report: it never described the run, and the empty dose ledger is visible.
             .filter(|w| {
                 !(phase == SolverStatsPhase::SimulateAdaptive && w.starts_with("W_NO_DOSES"))
             })

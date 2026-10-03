@@ -33,7 +33,10 @@ when empty.
 
 `fit()` is not the only door. Every model/data finding and every ODE-solver
 diagnostic is reported by each entry point that has a channel to carry it, and
-the list is the same one on all of them — there is no per-entry-point filter.
+the list is the same one on all of them, with one exception. `simulate_adaptive()`
+does not report `W_NO_DOSES`: its controller supplies the regimen, so a dataset
+with no dose records is the expected input there, and the warning's advice (check
+for an `AMT` column with dose rows) does not apply.
 
 | Entry point | Channel | Carries |
 |---|---|---|
@@ -41,8 +44,8 @@ the list is the same one on all of them — there is no per-entry-point filter.
 | `ferx check` | the check report | everything below except the solver diagnostics (nothing has been integrated yet), plus the option warnings |
 | `predict_diag()` | `PredictionOutput::warnings` | the non-fit bundle (below) |
 | `simulate_with_options_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics |
-| `simulate_adaptive()` | `AdaptiveSimulationResult::warnings` | the same |
-| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics and each parameter draw skipped in the flip-flop regime |
+| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus each parameter draw skipped in the flip-flop regime |
+| `simulate_adaptive()` | `AdaptiveSimulationResult::warnings` | the non-fit bundle, except `W_NO_DOSES` |
 | `predict()`, `simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` | — | nothing; each is a thin wrapper over its `_diag` form above |
 | `predict_survival()`, `predict_categorical()` | — | nothing yet |
 
