@@ -5977,13 +5977,13 @@ pub fn run_saem(
             .iter()
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
             .collect();
+        let (what, typical_was) = group.skipped_step_phrases();
         warnings.push(format!(
-            "SAEM: the covariate mu-reference on {} had no admissible step on {} of {} \
-             iteration(s) — its typical value was not finite for at least one subject at the \
-             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
-             fell back to the numerical M-step on those iterations, which is the channel #619 \
-             exists to avoid; consider bounding the covariate slope.",
-            group.eta_names(),
+            "SAEM: the {what} had no admissible step on {} of {} iteration(s) — {typical_was} \
+             not finite for at least one subject at the current θ (an additive typical value \
+             can go ≤ 0 for a low-covariate subject). {} fell back to the numerical M-step on \
+             those iterations, which is the channel #619 exists to avoid; consider bounding the \
+             covariate slope.",
             skipped,
             n_iter,
             names.join(", ")
@@ -7255,6 +7255,48 @@ mod tests {
                 !res.warnings.iter().any(|w| w.contains("not mu-referenced")),
                 "[{label}] V is mu-referenced through the joint group: {:?}",
                 res.warnings
+            );
+        }
+    }
+
+    /// The #918 "no admissible step" report for a **joint** group (#1632 review):
+    /// [`COVMUREF_SHARED_THETA_MODEL`] started at `TH_X = 0.2`, where
+    /// `TVCL + (40 − 90)·0.2 < 0` for the lowest-CRCL subject, so the joint step
+    /// never runs. Under SAEM and IMP the report names both etas in the plural
+    /// and says one of their typical values was not finite; the single-member
+    /// wording stays pinned by `saem_reports_a_covariate_group_that_never_stepped`.
+    #[test]
+    fn a_joint_group_that_never_stepped_is_reported_in_the_plural() {
+        let src =
+            COVMUREF_SHARED_THETA_MODEL.replace("TH_X(0.02, 0.0, 1.0)", "TH_X(0.2, 0.0, 1.0)");
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parses");
+        let pop = covmuref_pop(true);
+        let mut saem = FitOptions::default();
+        saem.method = crate::types::EstimationMethod::Saem;
+        saem.saem_n_exploration = 4;
+        saem.saem_n_convergence = 2;
+        saem.saem_seed = Some(1620);
+        saem.run_covariance_step = false;
+        let mut imp = FitOptions::default();
+        imp.method = crate::types::EstimationMethod::Imp;
+        imp.imp_iterations = 3;
+        imp.imp_samples = 50;
+        imp.imp_auto = false;
+        imp.imp_seed = Some(1620);
+        imp.run_covariance_step = false;
+        for (label, opts) in [("SAEM", &saem), ("IMP", &imp)] {
+            let res = crate::api::fit(&model, &pop, &model.default_params, opts).expect("fit runs");
+            let hit = res
+                .warnings
+                .iter()
+                .find(|w| w.contains("had no admissible step"))
+                .unwrap_or_else(|| panic!("[{label}] expected the report, got {:?}", res.warnings));
+            assert!(
+                hit.contains(
+                    "the covariate mu-references on ETA_CL and ETA_V (one joint group) had no \
+                     admissible step on "
+                ) && hit.contains("iteration(s) — one of their typical values was not finite"),
+                "[{label}] {hit}"
             );
         }
     }

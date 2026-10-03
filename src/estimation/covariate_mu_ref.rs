@@ -646,6 +646,26 @@ impl CovariateMuGroup<'_> {
         join_names(self.members.iter().map(|m| m.spec.eta_name.as_str()))
     }
 
+    /// How the "no admissible step" warnings of SAEM and IMP/IMPMAP name the
+    /// group and its typical values: `("covariate mu-reference on ETA_CL",
+    /// "its typical value was")` for one member, the plural for a joint group.
+    pub fn skipped_step_phrases(&self) -> (String, &'static str) {
+        if self.members.len() == 1 {
+            (
+                format!("covariate mu-reference on {}", self.eta_names()),
+                "its typical value was",
+            )
+        } else {
+            (
+                format!(
+                    "covariate mu-references on {} (one joint group)",
+                    self.eta_names()
+                ),
+                "one of their typical values was",
+            )
+        }
+    }
+
     /// [`GroupMember::mus`] for every member: `mus[m][i]`.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<Vec<f64>> {
         self.members

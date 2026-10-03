@@ -1225,3 +1225,44 @@ fn recentre_eta_skips_a_non_finite_delta() {
     assert!(g.recentre_eta(&mut eta, &[vec![f64::NAN], vec![0.5]], 0));
     assert_eq!(eta, vec![0.1, -0.3, 0.3]);
 }
+
+/// Cell (a) of the parser's
+/// `covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name`, end to
+/// end through the resolver (the #1632 review's probe). `V` is assigned from
+/// `TH_X` and read by `Q` before it becomes the `ETA_V` group, so `TH_X` reaches
+/// the data by a route no frozen `φ` pins and the `CL` group must keep the data
+/// term. At `a1bbf83a` it took the exact engine.
+#[test]
+fn an_earlier_assignment_to_another_groups_name_keeps_the_data_term() {
+    let m = model(
+        r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TH_X(0.01, -1.0, 1.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TH_VWT(0.1, 0.0, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  V = 40.0 + TH_X * 100.0
+  Q = V * 0.5
+  CL = (TVCL + (CRCL - 90.0) * TH_X) * exp(ETA_CL)
+  V = (TVV + (WT - 70.0) * TH_VWT) * exp(ETA_V)
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=50.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15]));
+    assert_eq!(groups.len(), 2, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![0]);
+    assert!(groups[0].needs_data_term, "{notes:?}");
+    assert!(!groups[1].needs_data_term, "{notes:?}");
+}

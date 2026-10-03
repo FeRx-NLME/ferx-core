@@ -909,7 +909,8 @@ Models whose mu-references share no theta are bit-identical to before. ferx IMPM
 variance components on this model sit away from NONMEM's whether or not a theta is
 shared ([#1629](https://github.com/FeRx-NLME/ferx-core/issues/1629)), so the table
 compares the joint group's own coordinates. `tests/saem_covariate_mu_ref.rs`
-(slow-gated) pins all of these.
+(slow-gated) pins the table's two "after" columns and the `score_sa` and 300/700
+runs against NONMEM; seeds 2 and 3 are reported here, not tested.
 
 ## Inter-Occasion Variability (IOV)
 

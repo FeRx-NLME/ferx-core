@@ -1594,13 +1594,13 @@ fn run_mcem(
             .iter()
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
             .collect();
+        let (what, typical_was) = group.skipped_step_phrases();
         warnings.push(format!(
-            "{label}: the covariate mu-reference on {} had no admissible step on {} of {} \
-             iteration(s) — its typical value was not finite for at least one subject at the \
-             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
-             were then moved by the importance-weighted M-step alone, or not at all; check them \
-             against a FOCEI fit and consider bounding the covariate slope (#619).",
-            group.eta_names(),
+            "{label}: the {what} had no admissible step on {} of {} iteration(s) — \
+             {typical_was} not finite for at least one subject at the current θ (an additive \
+             typical value can go ≤ 0 for a low-covariate subject). {} were then moved by the \
+             importance-weighted M-step alone, or not at all; check them against a FOCEI fit \
+             and consider bounding the covariate slope (#619).",
             skipped,
             n_iter,
             names.join(", ")
