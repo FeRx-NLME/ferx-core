@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **`contrast = auto` on a level block now sees the `y` readout, and a random effect reached
+  through a variable** ([#1642](https://github.com/FeRx-NLME/ferx-core/issues/1642)). A block
+  read in the readout next to a parameter carrying an η (`E0 = TVE0 + ETA_E0`,
+  `y = E0 + PLACEBO + ...`), or in an individual parameter built from one (`E1 = E0 + PLACEBO`),
+  now takes within-study sum-to-zero by default, as the single-line spelling always did — 15
+  free θ instead of 17 on 3 studies × 6 times. Explicit global contrasts on these spellings are
+  refused, naming the expression that reads the block. Refit to pick the new layout up; a fit
+  bound before the change still rebinds its own layout through `bind_theta_levels_from_fit`.
 - **`simulate_adaptive` no longer reports `W_NO_DOSES`** (#1645). On that entry point the
   controller supplies the regimen, so a dataset carrying only an observation grid is the
   expected input, and the warning's advice (check for an `AMT` column with dose rows) does
@@ -100,6 +108,11 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **A level block that would estimate no θ is refused under every contrast** (#1624). A single
+  level under `ref` or `sum_to_zero_within`, or groups of one level each under
+  `sum_to_zero_within`, used to bind silently with nothing to estimate; only `sum_to_zero` was
+  refused. When a random effect already carries each group's value, the message says to remove
+  the block.
 
 - **A `theta NAME[COL, ...]` block's internal `__level_NAME` column no longer shows up in
   the undeclared-covariate warning or in column lists** (#1644). The "not declared in

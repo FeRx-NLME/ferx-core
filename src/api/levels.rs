@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, LevelBinding, LevelBindings,
-    LevelBlockDecl, LevelContrast, LevelRule,
+    LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
 };
 use crate::types::{ParsedModel, Population, Subject};
 
@@ -50,8 +50,7 @@ pub fn bind_theta_levels(
     let mut bindings = LevelBindings::new();
     for decl in &decls {
         let levels = discover_levels(decl, population)?;
-        let contrast = resolve_contrast(decl, &levels, population)?;
-        let groups = assign_groups(decl, &levels, contrast);
+        let (contrast, groups) = resolve_contrast(decl, &levels, population)?;
         let table: Vec<(Level, usize)> = levels
             .iter()
             .enumerate()
@@ -354,17 +353,23 @@ fn leading_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -
     true
 }
 
-/// Resolve [`LevelContrast::Auto`], and reject the configurations that are
-/// still rank-deficient once resolved.
+/// Resolve [`LevelContrast::Auto`], group the levels under it, and reject the
+/// configurations that are still rank-deficient once resolved.
+///
+/// Two refusals, in this order: a contrast that leaves a group mean free
+/// against a random effect carrying the same mean (#1064, #1642), then a block
+/// left with no free θ at all (#1624) — whatever the contrast, since a block
+/// that estimates nothing cannot be told apart from not declaring it.
 fn resolve_contrast(
     decl: &LevelBlockDecl,
     levels: &[Level],
     population: &Population,
-) -> Result<LevelContrast, String> {
+) -> Result<(LevelContrast, Vec<usize>), String> {
     let nested = leading_identifies_subjects(decl, population);
+    let share = decl.scale_share.as_ref().filter(|_| nested);
     let resolved = match decl.contrast() {
         LevelContrast::Auto => {
-            if decl.shares_scale_with_eta() && nested {
+            if share.is_some() {
                 LevelContrast::SumToZeroWithin
             } else {
                 LevelContrast::SumToZero
@@ -372,6 +377,7 @@ fn resolve_contrast(
         }
         other => other,
     };
+    let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
 
     // The configuration the feature exists to serve — an unstructured placebo
     // effect per study × timepoint under between-study variability — is
@@ -379,38 +385,92 @@ fn resolve_contrast(
     // free: that study's η *is* the mean of its own levels. A check that only
     // looked for a fixed intercept would wave it through, which is precisely
     // the silent flat direction this codebase treats as a bug.
-    if decl.shares_scale_with_eta()
-        && nested
-        && matches!(
+    if let Some(share) = share {
+        if matches!(
             resolved,
             LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
-        )
-    {
-        let leading = decl.columns()[..decl.columns().len() - 1].join(", ");
-        return Err(format!(
-            "theta {}[{}]: `contrast = {}` leaves each {leading} group's mean free, \
-             but the individual parameter that reads this block also carries a random effect \
-             at that grouping — the two are the same quantity, so the model is not identified. \
-             Use `contrast = sum_to_zero_within` (the default for this shape), or drop the \
-             random effect.",
-            decl.name(),
-            decl.columns().join(", "),
-            contrast_token(resolved),
-        ));
+        ) {
+            let leading = decl.columns()[..decl.columns().len() - 1].join(", ");
+            // When every group is a single level the within-group contrast
+            // would leave nothing to estimate, so it is not the advice (#1624).
+            let within = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
+            let fix = if free_count(&within, LevelContrast::SumToZeroWithin) == 0 {
+                format!(
+                    " Every {leading} group has a single level, so the random effect already \
+                     carries each group's value: remove the block, or drop the random effect."
+                )
+            } else {
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or drop \
+                 the random effect."
+                    .to_string()
+            };
+            return Err(format!(
+                "{block}: `contrast = {}` leaves each {leading} group's mean free, but {} at \
+                 that grouping — the two are the same quantity, so the model is not \
+                 identified.{fix}",
+                contrast_token(resolved),
+                share_site(share),
+            ));
+        }
     }
 
-    if levels.len() == 1 && matches!(resolved, LevelContrast::SumToZero) {
-        // A one-level block under sum-to-zero has no free θ at all: the single
-        // level is pinned at 0. That is a degenerate model, not a normalization.
-        return Err(format!(
-            "theta {}[{}]: the data carries a single level, which sum-to-zero pins \
-             at 0. Use `contrast = none` if a single constant is what you meant.",
-            decl.name(),
-            decl.columns().join(", ")
-        ));
+    let groups = assign_groups(decl, levels, resolved);
+    if free_count(&groups, resolved) == 0 {
+        let leading = decl.columns()[..decl.columns().len().saturating_sub(1)].join(", ");
+        let single = "the data carries a single level";
+        let none = "Use `contrast = none` if a single constant is what you meant.";
+        return Err(match (resolved, share) {
+            (_, Some(share)) => format!(
+                "{block}: every {leading} group has a single level, and {} — the random \
+                 effect already carries each group's value, so the block estimates nothing. \
+                 Remove the block.",
+                share_site(share),
+            ),
+            (LevelContrast::Ref, None) => {
+                format!("{block}: {single}, which is the reference level, held at 0. {none}")
+            }
+            (LevelContrast::SumToZeroWithin, None) if levels.len() > 1 => format!(
+                "{block}: every {leading} group has a single level, which the within-group \
+                 sum-to-zero pins at 0, so the block estimates nothing. Use \
+                 `contrast = sum_to_zero` to estimate the levels around their common mean, \
+                 or `contrast = none`."
+            ),
+            (LevelContrast::SumToZeroWithin, None) => {
+                format!("{block}: {single}, which the within-group sum-to-zero pins at 0. {none}")
+            }
+            _ => format!("{block}: {single}, which sum-to-zero pins at 0. {none}"),
+        });
     }
 
-    Ok(resolved)
+    Ok((resolved, groups))
+}
+
+/// The free θ a contrast leaves over `groups`: every level under `none`, one
+/// fewer per group otherwise (the group's dependent or reference level).
+fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
+    if matches!(contrast, LevelContrast::Unconstrained) {
+        return groups.len();
+    }
+    let mut ids = groups.to_vec();
+    ids.dedup();
+    groups.len() - ids.len()
+}
+
+/// The expression where a block meets a random effect, as a diagnostic clause.
+fn share_site(share: &ScaleShare) -> String {
+    let via = share
+        .eta_via
+        .as_ref()
+        .map(|v| format!(" (through `{v}`)"))
+        .unwrap_or_default();
+    match &share.param {
+        Some(p) => {
+            format!(
+                "the individual parameter `{p}` reads this block and carries a random effect{via}"
+            )
+        }
+        None => format!("the `y` readout reads this block and a random effect{via}"),
+    }
 }
 
 /// The `contrast = ...` token for a resolved convention, for diagnostics.

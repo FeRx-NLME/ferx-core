@@ -3295,8 +3295,17 @@ pub fn parse_full_model_with(
     // question now that every `[individual_parameters]` statement has parsed —
     // the binder reads it back off `theta_blocks` to resolve
     // `LevelContrast::Auto`.
-    for decl in level_block_decls.iter_mut() {
-        decl.shares_scale_with_eta = block_shares_scale_with_eta(&indiv_stmts, &decl.name);
+    // The `y` readout counts too (#1642), read from its source text so the
+    // #486 desugaring above cannot hide the block from it.
+    if !level_block_decls.is_empty() {
+        let readout = match blocks.get("scaling") {
+            Some(lines) => readout_level_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
+                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
+            None => Vec::new(),
+        };
+        for decl in level_block_decls.iter_mut() {
+            decl.scale_share = block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name);
+        }
     }
 
     let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
@@ -14936,7 +14945,7 @@ fn parse_parameters(
                                 columns,
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
-                                shares_scale_with_eta: false,
+                                scale_share: None,
                                 index_covariate: index_covariate.clone(),
                             });
                             (levels, theta_names, Some(index_covariate))
@@ -18947,11 +18956,13 @@ pub struct LevelBlockDecl {
     pub(crate) contrast: LevelContrast,
     /// Resolved labels in gather order. Empty until the data-bound reparse.
     pub(crate) labels: Vec<String>,
-    /// Set by the parse: some `[individual_parameters]` statement reads this
-    /// block *and* a random effect. [`LevelContrast::Auto`] consumes it — it
-    /// is the "is there an η at a grouping coarser than or equal to the
-    /// block's" question, answered on the model side.
-    pub(crate) shares_scale_with_eta: bool,
+    /// Set by the parse: some expression — an `[individual_parameters]`
+    /// assignment or the `y` readout — reads this block *and* a random effect,
+    /// directly or through a variable (#1642). [`LevelContrast::Auto`] consumes
+    /// it — it is the "is there an η at a grouping coarser than or equal to the
+    /// block's" question, answered on the model side — and the binder's
+    /// refusals name the site from it.
+    pub(crate) scale_share: Option<ScaleShare>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
 }
@@ -18970,11 +18981,23 @@ impl LevelBlockDecl {
         &self.labels
     }
     pub fn shares_scale_with_eta(&self) -> bool {
-        self.shares_scale_with_eta
+        self.scale_share.is_some()
     }
     pub fn index_covariate(&self) -> &str {
         &self.index_covariate
     }
+}
+
+/// Where a level block and a random effect meet (#1642): the expression that
+/// reads both, for the binder's diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScaleShare {
+    /// The `[individual_parameters]` assignment that reads both, or `None` for
+    /// the `y` readout.
+    pub(crate) param: Option<String>,
+    /// The variable that carried the random effect into that expression, when
+    /// the expression does not read the η itself.
+    pub(crate) eta_via: Option<String>,
 }
 
 /// The observed levels of one level block, as discovered from the data.
@@ -19538,8 +19561,8 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// conditions + bodies of `if` blocks (see `visit_expr_nodes`). Bytecode
 /// variants carry no tree to walk (they only appear after
 /// `resolve_variable_indices`).
-/// Whether some `[individual_parameters]` assignment combines a read of the
-/// level block `block` with a random effect (#1064).
+/// Whether some expression combines a read of the level block `block` with a
+/// random effect (#1064, #1642), and if so where.
 ///
 /// This is the model-side half of "is there an η at a grouping coarser than or
 /// equal to the block's" — the question @TeunP raised on #1063, and the one a
@@ -19547,48 +19570,40 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// side (do the block's leading columns partition the subjects?) is answered
 /// by the binder; [`LevelContrast::Auto`] needs both.
 ///
-/// Taint propagates through intermediate assignments, so the idiomatic
+/// The expressions are every `[individual_parameters]` assignment (`stmts`,
+/// `if`-branches included) and the `y` readouts (`readout`, from
+/// [`readout_level_exprs`]). Two taints propagate through assignments: "reads
+/// the block" and "carries an η". So the idiomatic
 ///
 /// ```text
 ///   TVPL = BASE + PLACEBO
 ///   PL   = TVPL * exp(ETA_PL)
 /// ```
 ///
-/// is recognised as sharing a scale, not just the single-line form. Nested
-/// `if`-branch assignments are walked too. The propagation is a fixpoint over
-/// assignment order, so a forward reference (not legal in this DSL anyway)
-/// cannot be missed by a single pass.
-fn block_shares_scale_with_eta(stmts: &[Statement], block: &str) -> bool {
-    fn reads_block(e: &Expression, block: &str) -> bool {
-        let mut hit = false;
-        visit_expr_nodes(e, &mut |n| {
-            if let Expression::ThetaGather { spec, .. } = n {
-                hit |= spec.name == block;
-            }
-        });
-        hit
-    }
-    fn reads_eta(e: &Expression) -> bool {
-        let mut hit = false;
-        visit_expr_nodes(e, &mut |n| {
-            hit |= matches!(n, Expression::Eta(_));
-        });
-        hit
-    }
-    fn reads_tainted(e: &Expression, tainted: &[String]) -> bool {
-        let mut hit = false;
-        visit_expr_nodes(e, &mut |n| {
-            if let Expression::Variable(v) = n {
-                hit |= tainted.iter().any(|t| t == v);
-            }
-        });
-        hit
-    }
+/// shares a scale, and so do the η-first spelling (`E0 = TVE0 + ETA_E0`,
+/// `E1 = E0 + PLACEBO`) and a block read in the readout next to a parameter
+/// carrying an η (`y = E0 + PLACEBO + ...`). Before #1642 only the first taint
+/// existed and the readout was not looked at, so the last two silently resolved
+/// to global sum-to-zero. States are not tainted: an η that reaches `y` only
+/// through the ODE/PK state does not count, in either block.
+///
+/// Statements the #486 desugaring appended (`__ferx_ro_*`, `__ferx_pktime_*`)
+/// are skipped — they are not user expressions, and the readout is read from
+/// its source text instead. The propagation is a fixpoint over assignment
+/// order, so a forward reference (not legal in this DSL anyway) cannot be
+/// missed by a single pass.
+fn block_shares_scale_with_eta(
+    stmts: &[Statement],
+    readout: &[Expression],
+    block: &str,
+) -> Option<ScaleShare> {
     /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
-    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
         for s in stmts {
             match s {
-                Statement::Assign(n, e) => out.push((n.as_str(), e)),
+                Statement::Assign(n, e) if !is_synthetic_readout_param(n) => {
+                    out.push((Some(n.as_str()), e))
+                }
                 Statement::If {
                     branches,
                     else_body,
@@ -19607,24 +19622,87 @@ fn block_shares_scale_with_eta(stmts: &[Statement], block: &str) -> bool {
 
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
-    let mut tainted: Vec<String> = Vec::new();
+    // `None` is the readout: it is read, never assigned to.
+    assigns.extend(readout.iter().map(|e| (None, e)));
+    let mut block_tainted: Vec<&str> = Vec::new();
+    let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
-        let before = tainted.len();
+        let before = (block_tainted.len(), eta_tainted.len());
         for (lhs, rhs) in &assigns {
-            let touches_block = reads_block(rhs, block) || reads_tainted(rhs, &tainted);
-            if touches_block {
-                if reads_eta(rhs) {
-                    return true;
+            let mut reads_block = false;
+            let mut reads_eta = false;
+            let mut eta_via: Option<&str> = None;
+            visit_expr_nodes(rhs, &mut |n| match n {
+                Expression::ThetaGather { spec, .. } => reads_block |= spec.name == block,
+                Expression::Eta(_) => reads_eta = true,
+                Expression::Variable(v) => {
+                    reads_block |= block_tainted.contains(&v.as_str());
+                    if eta_via.is_none() {
+                        eta_via = eta_tainted.iter().find(|t| **t == v.as_str()).copied();
+                    }
                 }
-                if !tainted.iter().any(|t| t == lhs) {
-                    tainted.push((*lhs).to_string());
+                _ => {}
+            });
+            if reads_block && (reads_eta || eta_via.is_some()) {
+                return Some(ScaleShare {
+                    param: lhs.map(str::to_string),
+                    eta_via: if reads_eta {
+                        None
+                    } else {
+                        eta_via.map(str::to_string)
+                    },
+                });
+            }
+            if let Some(lhs) = lhs {
+                if reads_block && !block_tainted.contains(lhs) {
+                    block_tainted.push(lhs);
+                }
+                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(lhs) {
+                    eta_tainted.push(lhs);
                 }
             }
         }
-        if tainted.len() == before {
-            return false;
+        if (block_tainted.len(), eta_tainted.len()) == before {
+            return None;
         }
     }
+}
+
+/// The `y` readouts of a `[scaling]` block (`y`, `y[CMT=n]`, and a
+/// compartment-free model's `y =`, which the extractor moved here), parsed from
+/// the **source text** with named intermediates inlined, for
+/// [`block_shares_scale_with_eta`] (#1642).
+///
+/// Parsed the way [`collect_readout_theta_eta_synth`] pre-scans, plus the
+/// individual-parameter names so they resolve to `Variable` and can carry a
+/// taint. Reading the source rather than the compiled readout keeps the
+/// decision independent of the #486/#1636 desugaring, which rewrites the
+/// parsed readout's θ/η into `__ferx_ro_*` variables.
+fn readout_level_exprs(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+) -> Result<Vec<Expression>, String> {
+    let intermediates = scaling_intermediates(scaling_lines)?;
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let mut out = Vec::new();
+    for line in scaling_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        if base != "y" {
+            continue;
+        }
+        let mut expr =
+            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
+        out.push(expr);
+    }
+    Ok(out)
 }
 
 fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {

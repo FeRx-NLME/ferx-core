@@ -1600,7 +1600,7 @@ mod level_values {
     }
 
     /// T2. The degenerate groups: a study observed at one time only, under the
-    /// within-group contrast, and one-level blocks. A group with no free θ reads 0.
+    /// within-group contrast, reads 0; a one-level `none` block reads its θ.
     ///
     /// Mutations — as T1's sign / skip mutations; and a `NegSum(a, a)` that reads
     /// `theta[a]` instead of the empty sum: the singleton then reports the next θ
@@ -1628,24 +1628,8 @@ mod level_values {
             ]
         );
 
-        for contrast in ["ref", "sum_to_zero_within"] {
-            let mut pop = population(1, 1);
-            let text = no_eta_model().replace(
-                "[STUDY, TIME]",
-                &format!("[STUDY, TIME, contrast = {contrast}]"),
-            );
-            let model = bind(&text, &mut pop).unwrap();
-            assert_eq!(
-                model.n_theta, 2,
-                "{contrast}: a one-level block has no free θ"
-            );
-            let t = distinct_theta(model.n_theta);
-            assert_eq!(
-                pairs(&placebo_values(&model, &t)),
-                vec![(0.0, None)],
-                "{contrast}"
-            );
-        }
+        // A one-level block under `ref` / `sum_to_zero_within` used to bind here
+        // with no free θ; it is now refused (#1624, `contrast_refusals`).
 
         let mut pop = population(1, 1);
         let model = bind(
@@ -1789,5 +1773,558 @@ mod level_values {
                 );
             }
         }
+    }
+}
+
+// ── #1642: `contrast = auto` sees the readout, and an η through a variable ──
+//
+// No NONMEM spelling exists for an automatic contrast choice, so the oracles are
+// the twin (auto ≡ explicit `sum_to_zero_within`, bit for bit), the closed-form
+// count `L − G` (18 − 3 = 15) against `L − 1` (17), and the exact group sums.
+mod readout_share {
+    use super::*;
+    use crate::api::{theta_level_values, ThetaLevelValue};
+    use crate::parser::model_parser::LevelContrast;
+    use crate::types::ParsedModel;
+
+    /// `n_studies × per_study` subjects on the time grid `times`; `STUDY` is
+    /// the subject's block of `per_study`.
+    pub(super) fn cf_pop(n_studies: usize, per_study: usize, times: &[f64]) -> Population {
+        let mut pop = population(n_studies * per_study, times.len());
+        for (k, s) in pop.subjects.iter_mut().enumerate() {
+            s.covariates
+                .insert("STUDY".into(), (k / per_study + 1) as f64);
+            s.obs_times = times.to_vec();
+            s.observations = vec![1.0; times.len()];
+            s.obs_cmts = vec![1; times.len()];
+            s.cens = vec![0; times.len()];
+        }
+        pop
+    }
+
+    /// A compartment-free placebo/Emax model: `ip` is the
+    /// `[individual_parameters]` body, `y` the readout.
+    pub(super) fn cf_model(contrast: &str, columns: &str, ip: &str, y: &str) -> String {
+        let modifier = if contrast.is_empty() {
+            String::new()
+        } else {
+            format!(", contrast = {contrast}")
+        };
+        format!(
+            r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[{columns}{modifier}](0.0, -10.0, 10.0)
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+{ip}
+[structural_model]
+  y = {y}
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    pub(super) const T6: [f64; 6] = [0.0, 1.0, 2.0, 4.0, 8.0, 12.0];
+    pub(super) const EMAXY: &str = "EMAX * TIME / (TIME + ET50)";
+    pub(super) const BASE: &str = "  EMAX = TVEMAX\n  ET50 = TVET50\n";
+
+    /// H2: the η sits on `E0`, the block is read only in the readout.
+    pub(super) fn h2(contrast: &str) -> String {
+        cf_model(
+            contrast,
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + ETA_E0"),
+            &format!("E0 + PLACEBO + {EMAXY}"),
+        )
+    }
+
+    /// H7 (control): the η sits on a parameter `y` never reads.
+    fn h7(contrast: &str) -> String {
+        cf_model(
+            contrast,
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + PLACEBO + {EMAXY}"),
+        )
+    }
+
+    pub(super) fn bind_parsed(text: &str, pop: &mut Population) -> ParsedModel {
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, pop).expect("bind");
+        parsed
+    }
+
+    /// The resolved contrast and the block's free-θ count on 3 studies × `T6`,
+    /// `per_study` subjects each.
+    fn layout(text: &str, per_study: usize) -> (LevelContrast, usize) {
+        let mut pop = cf_pop(3, per_study, &T6);
+        let parsed = bind_parsed(text, &mut pop);
+        let free = parsed
+            .model
+            .theta_names
+            .iter()
+            .filter(|n| n.starts_with("PLACEBO["))
+            .count();
+        (parsed.bindings.levels["PLACEBO"].contrast, free)
+    }
+
+    const WITHIN: (LevelContrast, usize) = (LevelContrast::SumToZeroWithin, 15);
+    const GLOBAL: (LevelContrast, usize) = (LevelContrast::SumToZero, 17);
+
+    /// T1, the twin. On H2, `auto` must be explicit `sum_to_zero_within` bit
+    /// for bit: names, binding, and every level's value at a distinct θ. In the
+    /// same test, H7's auto must *differ* from its explicit within, so the twin
+    /// straddles the gate and cannot become a tautology.
+    ///
+    /// Mutation — pass an empty readout to the predicate (the pre-#1642 code):
+    /// H2's auto binds 17 free θ against within's 15, and the names differ.
+    #[test]
+    fn auto_on_a_readout_block_is_bit_identical_to_explicit_within() {
+        let mut pa = cf_pop(3, 1, &T6);
+        let auto = bind_parsed(&h2(""), &mut pa);
+        let mut pw = cf_pop(3, 1, &T6);
+        let within = bind_parsed(&h2("sum_to_zero_within"), &mut pw);
+
+        assert_eq!(auto.model.n_theta, 3 + 15, "18 levels − 3 studies");
+        assert_eq!(auto.model.theta_names, within.model.theta_names);
+        let (a, w) = (
+            &auto.bindings.levels["PLACEBO"],
+            &within.bindings.levels["PLACEBO"],
+        );
+        assert_eq!(a.labels, w.labels);
+        assert_eq!(a.groups, w.groups);
+        assert_eq!(a.contrast, w.contrast);
+        assert_eq!(a.contrast, LevelContrast::SumToZeroWithin);
+
+        let theta: Vec<f64> = (0..auto.model.n_theta)
+            .map(|k| 0.1 * k as f64 + 0.013 * (k * k) as f64)
+            .collect();
+        let va = theta_level_values(&auto.model, &theta).unwrap();
+        let vw = theta_level_values(&within.model, &theta).unwrap();
+        let bits = |v: &ThetaLevelValue| (v.label.clone(), v.value.to_bits(), v.theta_index);
+        assert_eq!(
+            va["PLACEBO"].iter().map(bits).collect::<Vec<_>>(),
+            vw["PLACEBO"].iter().map(bits).collect::<Vec<_>>()
+        );
+        // The exact group sums: each study's six levels sum to 0.
+        for g in 0..3 {
+            let sum: f64 = va["PLACEBO"][6 * g..6 * g + 6]
+                .iter()
+                .map(|v| v.value)
+                .sum();
+            assert!(sum.abs() < 1e-12, "study {} sums to {sum}", g + 1);
+        }
+
+        // The straddle: H7's η never reaches `y`, so auto stays global and
+        // differs from its explicit within.
+        assert_eq!(layout(&h7(""), 1), GLOBAL);
+        assert_eq!(layout(&h7("sum_to_zero_within"), 1), WITHIN);
+    }
+
+    /// T2. The η reaches the block's expression through a variable, inside
+    /// `[individual_parameters]` alone (H3), next to the single-line form (H1).
+    ///
+    /// Mutation — the one-colour taint (track "reads the block" only): H3 → 17.
+    #[test]
+    fn eta_reaches_the_block_through_a_variable() {
+        let h1 = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0"),
+            &format!("E0 + {EMAXY}"),
+        );
+        let h3 = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + ETA_E0\n  E1 = E0 + PLACEBO"),
+            &format!("E1 + {EMAXY}"),
+        );
+        assert_eq!(layout(&h1, 1), WITHIN, "H1");
+        assert_eq!(layout(&h3, 1), WITHIN, "H3");
+    }
+
+    pub(super) fn scaling_model(ip: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+{ip}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + E0 + PLACEBO
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    /// T3. The readout spellings that share a scale (H4 bare η in `y`, H5
+    /// multiplicative, H6 η only on `EMAX`, S1 η on `V` read by a PK readout)
+    /// against the two that do not (S2 η reaching `y` only through the state,
+    /// H7 η `y` never reads) — both sides of the gate in one test.
+    ///
+    /// Mutations — η taint ignores `Variable` (H6, S1 red); the readout taints
+    /// the state `central` (S2 red); return `Some` unconditionally (H7 red).
+    #[test]
+    fn readout_spellings_share_a_scale() {
+        let cases = [
+            (
+                "H4",
+                cf_model(
+                    "",
+                    "STUDY, TIME",
+                    &format!("{BASE}  E0 = TVE0"),
+                    &format!("E0 + ETA_E0 + PLACEBO + {EMAXY}"),
+                ),
+                WITHIN,
+            ),
+            (
+                "H5",
+                cf_model(
+                    "",
+                    "STUDY, TIME",
+                    &format!("{BASE}  E0 = TVE0 * exp(ETA_E0)"),
+                    &format!("E0 * exp(PLACEBO) + {EMAXY}"),
+                ),
+                WITHIN,
+            ),
+            (
+                "H6",
+                cf_model(
+                    "",
+                    "STUDY, TIME",
+                    "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0",
+                    &format!("E0 + PLACEBO + {EMAXY}"),
+                ),
+                WITHIN,
+            ),
+            (
+                "S1",
+                scaling_model("  CL = TVEMAX\n  V = TVET50 * exp(ETA_E0)\n  E0 = TVE0"),
+                WITHIN,
+            ),
+            (
+                "S2",
+                scaling_model("  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0"),
+                GLOBAL,
+            ),
+            ("H7", h7(""), GLOBAL),
+        ];
+        for (tag, text, want) in cases {
+            assert_eq!(layout(&text, 1), want, "{tag}");
+        }
+    }
+
+    /// T4. A named intermediate carries the block into `y`: a `[scaling]`
+    /// intermediate, and the compartment-free `[structural_model]` one.
+    ///
+    /// Mutation — skip `inline_scaling_intermediates` in `readout_level_exprs`:
+    /// `BASE` / `EFF` are then unknown names and both bind 17.
+    #[test]
+    fn a_named_intermediate_carries_the_block_into_y() {
+        let scaling = scaling_model("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0").replace(
+            "  y = central / V + E0 + PLACEBO",
+            "  BASE = E0 + PLACEBO\n  y = central / V + BASE",
+        );
+        assert_eq!(layout(&scaling, 1), WITHIN, "[scaling] intermediate");
+        let cf = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + ETA_E0"),
+            &format!("EFF + {EMAXY}"),
+        )
+        .replace("  y = EFF", "  EFF = E0 + PLACEBO\n  y = EFF");
+        assert_eq!(layout(&cf, 1), WITHIN, "compartment-free intermediate");
+    }
+
+    /// T5. Four subjects per study: `STUDY` no longer identifies a subject, so
+    /// no subject's η can carry a study's mean and both spellings stay global.
+    ///
+    /// Mutation — drop `&& nested` from `Auto`: both go to 15.
+    #[test]
+    fn four_subjects_per_study_stay_global() {
+        let h1 = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0"),
+            &format!("E0 + {EMAXY}"),
+        );
+        assert_eq!(layout(&h1, 4), GLOBAL, "H1");
+        assert_eq!(layout(&h2(""), 4), GLOBAL, "H2");
+    }
+}
+
+// ── #1642 / #1624: the binder's refusals, enumerated per cell ───────────────
+//
+// Each refusal's sentences are asserted one by one, so deleting any of them
+// reddens a test here (the PR's message table names which).
+mod contrast_refusals {
+    use super::readout_share::{bind_parsed, cf_model, cf_pop, h2, BASE, EMAXY, T6};
+    use super::*;
+    use crate::api::{bind_theta_levels_from_fit, theta_level_values};
+    use crate::parser::model_parser::{LevelBinding, LevelBindings, LevelContrast};
+
+    fn refusal(text: &str, mut pop: Population) -> String {
+        bind(text, &mut pop).expect_err("must be refused")
+    }
+
+    fn has(err: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(err.contains(p), "missing {p:?} in: {err}");
+        }
+    }
+
+    fn lacks(err: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(!err.contains(p), "must not say {p:?}: {err}");
+        }
+    }
+
+    const NOT_IDENTIFIED: &str = "the two are the same quantity, so the model is not identified.";
+    const USE_WITHIN: &str = "Use `contrast = sum_to_zero_within` (the default for this shape), \
+                              or drop the random effect.";
+
+    /// T6 (M1, M2). A block read in the readout next to an η on `E0` is
+    /// refused under every global contrast, naming the readout and `E0`; the
+    /// η-first `[individual_parameters]` spelling names `E1`.
+    ///
+    /// Mutation — revert to the IP-only predicate: H2 binds under all three.
+    #[test]
+    fn explicit_global_contrasts_on_a_readout_block_are_refused() {
+        for c in ["sum_to_zero", "ref", "none"] {
+            let err = refusal(&h2(c), cf_pop(3, 1, &T6));
+            has(
+                &err,
+                &[
+                    "theta PLACEBO[STUDY, TIME]: ",
+                    &format!("`contrast = {c}` leaves each STUDY group's mean free"),
+                    "but the `y` readout reads this block and a random effect (through `E0`) at \
+                     that grouping",
+                    NOT_IDENTIFIED,
+                    USE_WITHIN,
+                ],
+            );
+            lacks(&err, &["individual parameter", "remove the block"]);
+        }
+
+        // M1: the share is an individual parameter, the η read through `E0`.
+        let h3 = cf_model(
+            "sum_to_zero",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + ETA_E0\n  E1 = E0 + PLACEBO"),
+            &format!("E1 + {EMAXY}"),
+        );
+        let err = refusal(&h3, cf_pop(3, 1, &T6));
+        has(
+            &err,
+            &[
+                "but the individual parameter `E1` reads this block and carries a random effect \
+                 (through `E0`) at that grouping",
+                NOT_IDENTIFIED,
+                USE_WITHIN,
+            ],
+        );
+        lacks(&err, &["readout"]);
+
+        // M1, direct: the parameter reads the η itself, so no `through`.
+        let err = refusal(&mbma_model("ref"), population(2, 3));
+        has(
+            &err,
+            &["but the individual parameter `CL` reads this block and carries a random effect at"],
+        );
+        lacks(&err, &["through"]);
+    }
+
+    /// M7. The η refusal on a block whose groups are all single levels must
+    /// not recommend `sum_to_zero_within`, which would leave nothing to
+    /// estimate; it says to remove the block.
+    ///
+    /// Mutation — always give the within advice: this dies on `lacks`.
+    #[test]
+    fn the_eta_refusal_on_singleton_groups_says_remove_the_block() {
+        let err = refusal(&h2("sum_to_zero"), cf_pop(3, 1, &[1.0]));
+        has(
+            &err,
+            &[
+                "`contrast = sum_to_zero` leaves each STUDY group's mean free",
+                NOT_IDENTIFIED,
+                "Every STUDY group has a single level, so the random effect already carries each \
+                 group's value: remove the block, or drop the random effect.",
+            ],
+        );
+        lacks(&err, &["sum_to_zero_within"]);
+    }
+
+    /// T8 (#1624). A block left with no free θ is refused under every
+    /// contrast, with or without an η; a block with *some* free θ binds even
+    /// when one of its groups has none. Both sides of the gate in one test.
+    ///
+    /// Mutations — restore the old `levels.len() == 1 && SumToZero` check (the
+    /// `ref` / within cells bind); count free θ per group instead of per block
+    /// (the partial-singleton control is refused); run the zero-free check
+    /// ahead of the η refusal (the one-level η + `sum_to_zero` cell gets M6's
+    /// text instead of the η refusal's).
+    #[test]
+    fn a_block_with_no_free_theta_is_refused_whatever_the_contrast() {
+        let one_level = |c: &str| {
+            no_eta_model().replace("[STUDY, TIME]", &format!("[STUDY, TIME, contrast = {c}]"))
+        };
+        let none = "Use `contrast = none` if a single constant is what you meant.";
+
+        // M3: one level, global sum-to-zero (auto and explicit).
+        for text in [no_eta_model(), one_level("sum_to_zero")] {
+            let err = refusal(&text, population(1, 1));
+            has(
+                &err,
+                &[
+                    "theta PLACEBO[STUDY, TIME]: the data carries a single level, which \
+                     sum-to-zero pins at 0. ",
+                    none,
+                ],
+            );
+            lacks(&err, &["random effect"]);
+        }
+
+        // M4: one level, within-group sum-to-zero, no η.
+        let err = refusal(&one_level("sum_to_zero_within"), population(1, 1));
+        has(
+            &err,
+            &[
+                "the data carries a single level, which the within-group sum-to-zero pins at 0. ",
+                none,
+            ],
+        );
+        lacks(&err, &["`contrast = sum_to_zero`", "random effect"]);
+
+        // M4b: three studies at one time each, within, no η.
+        let err = refusal(&one_level("sum_to_zero_within"), population(3, 1));
+        has(
+            &err,
+            &[
+                "every STUDY group has a single level, which the within-group sum-to-zero pins \
+                 at 0, so the block estimates nothing.",
+                "Use `contrast = sum_to_zero` to estimate the levels around their common mean, \
+                 or `contrast = none`.",
+            ],
+        );
+        lacks(&err, &["sum_to_zero_within", "random effect"]);
+
+        // M5: one level, reference.
+        let err = refusal(&one_level("ref"), population(1, 1));
+        has(
+            &err,
+            &[
+                "the data carries a single level, which is the reference level, held at 0. ",
+                none,
+            ],
+        );
+        lacks(&err, &["sum-to-zero", "random effect"]);
+
+        // M6: one level carried by an η — auto and explicit within.
+        for text in [mbma_model(""), mbma_model("sum_to_zero_within"), h2("")] {
+            let err = refusal(&text, population(1, 1));
+            has(
+                &err,
+                &[
+                    "every STUDY group has a single level, and ",
+                    " reads this block and ",
+                    " — the random effect already carries each group's value, so the block \
+                     estimates nothing. Remove the block.",
+                ],
+            );
+            lacks(
+                &err,
+                &[
+                    "`contrast = none`",
+                    "`contrast = sum_to_zero",
+                    "`contrast = ref`",
+                ],
+            );
+        }
+        // M6 on all-singleton groups, the readout site named.
+        let err = refusal(&h2(""), cf_pop(3, 1, &[1.0]));
+        has(
+            &err,
+            &["every STUDY group has a single level, and the `y` readout reads this block"],
+        );
+
+        // The η refusal runs first: one level, η, `sum_to_zero` is the η cell.
+        let err = refusal(&mbma_model("sum_to_zero"), population(1, 1));
+        has(
+            &err,
+            &["leaves each STUDY group's mean free", NOT_IDENTIFIED],
+        );
+
+        // Controls. `none` on one level binds with its one θ.
+        let mut pop = population(1, 1);
+        let model = bind(&one_level("none"), &mut pop).unwrap();
+        assert_eq!(model.n_theta, 3);
+        // One study observed once, next to one observed three times: the block
+        // keeps study 1's two free θ, and the singleton reads exactly 0.
+        let mut pop = population(2, 3);
+        let s2 = &mut pop.subjects[1];
+        s2.obs_times.truncate(1);
+        s2.observations.truncate(1);
+        s2.obs_cmts.truncate(1);
+        s2.cens.truncate(1);
+        let model = bind(&mbma_model(""), &mut pop).unwrap();
+        assert_eq!(model.n_theta, 4, "TVCL, TVV, study 1's two free levels");
+        let theta = [2.0, 0.3, -0.7, 10.0];
+        let values = theta_level_values(&model, &theta).unwrap();
+        assert_eq!(values["PLACEBO"][3].label, "STUDY=2,TIME=1");
+        assert_eq!(values["PLACEBO"][3].value.to_bits(), 0.0f64.to_bits());
+    }
+
+    /// T7. A fit bound before #1642 (H2 under global sum-to-zero, 17 free θ)
+    /// still drives a design: `bind_theta_levels_from_fit` takes the stored
+    /// contrast, never re-resolving it, so the old layout survives.
+    ///
+    /// Mutation — re-resolve the contrast in `bind_theta_levels_from_fit`:
+    /// `n_theta` goes to 18.
+    #[test]
+    fn a_fit_bound_before_1642_rebinds_its_own_layout() {
+        let text = h2("");
+        let mut pop = cf_pop(3, 1, &T6);
+        let today = bind_parsed(&text, &mut pop);
+        assert_eq!(today.model.n_theta, 18, "today's layout: within, 15 free");
+        let labels = today.bindings.levels["PLACEBO"].labels.clone();
+        assert_eq!(labels.len(), 18);
+        let mut old = LevelBindings::new();
+        old.insert(
+            "PLACEBO".to_string(),
+            LevelBinding {
+                labels,
+                groups: vec![0; 18],
+                contrast: LevelContrast::SumToZero,
+            },
+        );
+
+        let mut design = cf_pop(3, 1, &T6);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &text, &mut design, &old).expect("rebind");
+        assert_eq!(
+            parsed.model.n_theta, 20,
+            "TVE0, TVEMAX, TVET50 and 17 free levels"
+        );
+        let theta: Vec<f64> = (0..20).map(|k| 0.05 * k as f64 + 0.01).collect();
+        let values = theta_level_values(&parsed.model, &theta).unwrap();
+        let v = &values["PLACEBO"];
+        for (k, level) in v.iter().take(17).enumerate() {
+            assert_eq!(level.value.to_bits(), theta[k + 1].to_bits(), "level {k}");
+        }
+        let neg_sum = -theta[1..18].iter().fold(0.0, |a, t| a + t);
+        assert_eq!(v[17].value.to_bits(), neg_sum.to_bits());
     }
 }

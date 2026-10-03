@@ -129,7 +129,7 @@ and it is chosen by looking at both the model and the data:
 
 | Situation | Default |
 |---|---|
-| The parameter reading the block also carries a random effect, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
+| An expression that reads the block (an individual parameter or the `y` readout) also carries a random effect, directly or through a variable, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -173,6 +173,19 @@ Two limits on `ref` as it stands:
 
 A contrast that would leave a nested group's mean free while a random effect
 also carries it is a hard error, not a warning.
+
+"Reads the block" follows assignments: `E0 = TVE0 + ETA_E0` followed by
+`y = E0 + PLACEBO + ...` shares a scale, and so does `E1 = E0 + PLACEBO`. A
+random effect that reaches `y` only through a compartment state (`ETA_CL` on
+`CL`, read as `central / V`) does not count.
+
+A block must estimate at least one θ. One left with none after its contrast is
+applied — a single level, or groups of one level each under
+`sum_to_zero_within` — is refused under every contrast, and the message names a
+contrast that would estimate something. When a random effect already carries each group's
+value, the advice is to remove the block. A *single* group of one level inside
+a block that has others still binds: within-group sum-to-zero pins it at 0, and
+a random effect at that grouping carries the group's value.
 
 Both conventions are implemented as contrast coding, so the optimizer needs no
 constraint machinery: a group of *L* levels estimates *L − 1* thetas and the
