@@ -1868,20 +1868,7 @@ fn classify_theta_eta_linked(
                 }
             }
             Expression::ThetaGather { spec, .. } => {
-                for rule in &spec.levels {
-                    match *rule {
-                        LevelRule::Free(i) => {
-                            d.thetas.insert(i as usize);
-                        }
-                        // Half-open `θ[a..b]`, as the rule's doc and every
-                        // other consumer read it: `b` is already one past
-                        // the group, and `..=` would drag the next block's
-                        // first θ into this parameter's class.
-                        LevelRule::NegSum(a, b) => {
-                            d.thetas.extend((a as usize)..(b as usize));
-                        }
-                    }
-                }
+                d.thetas.extend(spec.theta_indices());
             }
             Expression::Eta(_) => d.has_eta = true,
             Expression::Variable(v) => {
@@ -18702,6 +18689,20 @@ pub(crate) struct GatherSpec {
 }
 
 impl GatherSpec {
+    /// Every absolute θ index some level of this block reads: each `Free`
+    /// level's own θ and each `NegSum` level's range. A gather can reach any
+    /// level at run time, so this is the θ set a site reading the block uses.
+    ///
+    /// `NegSum(a, b)` is half-open, as the rule's doc and every other consumer
+    /// read it: `b` is already one past the group, and `..=` would drag the
+    /// next block's first θ in.
+    pub(crate) fn theta_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.levels.iter().flat_map(|rule| match *rule {
+            LevelRule::Free(i) => (i as usize)..(i as usize + 1),
+            LevelRule::NegSum(a, b) => (a as usize)..(b as usize),
+        })
+    }
+
     /// Reverse map for [`differentiate`]: for absolute θ index `k`, the level
     /// that reads it directly and the level that reads it through a `NegSum`.
     /// Both are 1-based level numbers; either may be absent.
@@ -19994,6 +19995,28 @@ fn collect_forward_refs(stmts: &[Statement], in_block: &HashSet<String>) -> Vec<
     out
 }
 
+/// The θ/η indices one expression node reads, for the two collectors below.
+///
+/// A gather (`PLACEBO[PLA_IDX]`, or a level block's implicit index) reads every
+/// θ of its block, since the index is data and any level is reachable. Without
+/// that arm each level was reported "not referenced" (#1628).
+fn note_theta_eta(
+    e: &Expression,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    match e {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::ThetaGather { spec, .. } => thetas.extend(spec.theta_indices()),
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        _ => {}
+    }
+}
+
 /// Accumulate the theta and eta indices referenced in an expression. Only the
 /// statement-level variant is used outside the `survival` feature, so this
 /// expression-level entry is gated to its sole caller (`parse_event_model_block`).
@@ -20003,15 +20026,7 @@ fn collect_theta_eta(
     thetas: &mut std::collections::HashSet<usize>,
     etas: &mut std::collections::HashSet<usize>,
 ) {
-    visit_expr_nodes(expr, &mut |e: &Expression| match e {
-        Expression::Theta(i) => {
-            thetas.insert(*i);
-        }
-        Expression::Eta(i) => {
-            etas.insert(*i);
-        }
-        _ => {}
-    });
+    visit_expr_nodes(expr, &mut |e: &Expression| note_theta_eta(e, thetas, etas));
 }
 
 /// Accumulate the theta and eta indices referenced across a statement list.
@@ -20020,15 +20035,7 @@ fn collect_theta_eta_in_stmts(
     thetas: &mut std::collections::HashSet<usize>,
     etas: &mut std::collections::HashSet<usize>,
 ) {
-    visit_stmt_nodes(stmts, &mut |e: &Expression| match e {
-        Expression::Theta(i) => {
-            thetas.insert(*i);
-        }
-        Expression::Eta(i) => {
-            etas.insert(*i);
-        }
-        _ => {}
-    });
+    visit_stmt_nodes(stmts, &mut |e: &Expression| note_theta_eta(e, thetas, etas));
 }
 
 /// Reserved name prefix for the individual parameters the parser synthesizes when a
@@ -23377,15 +23384,53 @@ impl OdeRhsProgram {
 /// non-zero `∂/∂θ_fixed` column that folding to a constant would silently zero.
 /// Restricting the fold to genuinely θ-free slots keeps it bit-identical to the
 /// unfolded walk on all axes.
+///
+/// A `PushThetaGather` reads θ like a `PushTheta` does, only at an index chosen
+/// at run time, so it is dynamic too. It used to fall through a `_ => false`
+/// arm: `CL = PLACEBO[PLA_IDX]` folded to a dual constant, every gathered θ got
+/// a zero analytic gradient and never left its initial value (#1628).
+///
+/// **Listed one by one on purpose — no `_` arm** (as in `ip_deps_bytecode`): a
+/// new `Op` that reads θ, η or any other differentiated input must not be able
+/// to fold to a constant by silently matching a wildcard.
 fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
     bc.ops.iter().any(|op| match op {
         Op::PushEta(_)
         | Op::PushTheta(_)
+        | Op::PushThetaGather(_)
         | Op::PushTime
         | Op::PushMixNum
         | Op::PushNnOutput(_, _) => true,
         Op::PushVar(i) => dyn_vars.get(*i as usize).copied().unwrap_or(false),
-        _ => false,
+        Op::PushConst(_)
+        | Op::PushCov(_)
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Pow
+        | Op::Exp
+        | Op::Ln
+        | Op::Sqrt
+        | Op::Abs
+        | Op::InvLogit
+        | Op::Logit
+        | Op::CmpLt
+        | Op::CmpLe
+        | Op::CmpGt
+        | Op::CmpGe
+        | Op::CmpEq
+        | Op::CmpNe
+        | Op::LogicAnd
+        | Op::LogicOr
+        | Op::LogicNot
+        | Op::IsPresent
+        | Op::JumpIfFalse(_)
+        | Op::Jump(_)
+        | Op::Mod
+        | Op::Floor
+        | Op::Ceil
+        | Op::Round => false,
     })
 }
 

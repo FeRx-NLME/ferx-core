@@ -90,6 +90,13 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A θ read through a gather is now estimated on the default (analytic) gradient** (#1628).
+  When an individual parameter read θ only through a gather (`CL = PLACEBO[PLA_IDX]`, a level
+  block's bare `PLACEBO`, or an intermediate such as `PL = PLACEBO`), its analytic gradient in
+  every gathered θ was zero. The fit then returned the whole block at its initial values, while
+  `gradient = fd` estimated it. Fits of such models now move the block and land at the
+  finite-difference optimum. The same models also no longer warn that every level is "declared
+  in `[parameters]` but not referenced".
 - **SAEM and IMP/IMPMAP no longer drive a covariate theta shared by two typical values to its
   bound** (#1620). When two covariate mu-referenced typical values read the same estimated
   theta — `CL = TVCL*(WT/70)^THETA_WT*…*exp(ETA_CL)` next to

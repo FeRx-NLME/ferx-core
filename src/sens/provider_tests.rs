@@ -12344,6 +12344,65 @@ mod theta_gather_sens {
         check_full_provider_vs_fd(&m, &s, &[10.0, 0.8, 1.3, 0.7, 50.0], &[0.10, -0.05]);
     }
 
+    /// #1628: the fixtures above all write `TVCL * exp(ETA_CL) * PLACEBO[..]`,
+    /// whose `PushTheta`/`PushEta` make the slot dynamic on their own, so they
+    /// cannot see a gather that is the slot's *only* θ read. These two can: one
+    /// reads the gather directly, one through an intermediate. Before the fix
+    /// both slots folded to a dual constant and `∂f/∂PLACEBO[k]` came out `0`.
+    fn gather_only_model(cl_lines: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(10.0, 0.001, 100.0)
+  theta PLACEBO[3](1.0, -10.0, 10.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+{cl_lines}
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        )
+    }
+
+    const GATHER_ONLY_FORMS: [(&str, &str); 2] = [
+        ("direct", "  CL = PLACEBO[PLA_IDX]"),
+        (
+            "intermediate",
+            "  TVPL = PLACEBO[PLA_IDX]\n  CL = TVCL * TVPL",
+        ),
+    ];
+
+    #[test]
+    fn a_gather_only_slot_dual_matches_fd() {
+        for (form, lines) in GATHER_ONLY_FORMS {
+            let m = parse_model_string(&gather_only_model(lines)).expect("parse");
+            assert!(sens_supported(&m), "{form}: inside the analytic scope");
+            let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+            let eta = [-0.05];
+            // A subject-constant index, then one that moves per observation.
+            let mut s = subject_with_dose(
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                &[0.5, 2.0, 6.0, 12.0, 24.0],
+            );
+            s.covariates.insert("PLA_IDX".to_string(), 2.0);
+            check_full_provider_vs_fd(&m, &s, &theta, &eta);
+            let s = subject_with_levels(&[0.5, 2.0, 6.0, 12.0, 24.0], &[1.0, 2.0, 3.0, 1.0, 2.0]);
+            check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+            // The parity above is only worth something if the gathered column is
+            // live: assert it, so a fixture that never reaches the level cannot
+            // pass by comparing two zeros.
+            let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+            let live = sens.obs.iter().any(|o| o.df_dtheta[1].abs() > 1e-6);
+            assert!(live, "{form}: ∂f/∂PLACEBO[1] must be non-zero somewhere");
+        }
+    }
+
     #[test]
     fn a_gather_is_exactly_sparse_in_the_individual_parameter() {
         // `∂p/∂θ_k` is 1 on the level the row selects and 0 on every other — the
