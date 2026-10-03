@@ -1276,10 +1276,9 @@ mod from_fit {
 
     /// T9. The unseen-level refusal's second action works, not only its wording:
     /// on a design the refusal rejects, binding the design on its own levels and
-    /// simulating from the model's initial estimates succeeds. The refused design
-    /// is the one rebound, so a refusal that left it half-written would show here.
-    /// From Rust the action is `bind_theta_levels` + `default_params`, as the
-    /// `bind_theta_levels_from_fit` rustdoc says.
+    /// simulating from the model's initial estimates succeeds. From Rust the action
+    /// is `bind_theta_levels` + `default_params`, as the `bind_theta_levels_from_fit`
+    /// rustdoc says.
     ///
     /// Mutations — re-parse in `bind_theta_levels` but keep the unbound model's
     /// `default_params` (the initial estimates no longer fit the design's layout),

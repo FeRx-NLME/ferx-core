@@ -97,8 +97,8 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 pub const THETA_BLOCK_COMPACT_MIN: usize = 20;
 
 /// The θ index ranges of the vector / level blocks in `names` that carry
-/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients — the blocks every fit writer
-/// (console, summary, YAML, estimates table) reports as a compact summary.
+/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients — the blocks that `print_results`,
+/// `format_summary` and the fit YAML report in their own compact section.
 ///
 /// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
 /// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket, and
