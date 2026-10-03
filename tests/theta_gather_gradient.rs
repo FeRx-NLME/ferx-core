@@ -543,3 +543,453 @@ fn a_gathered_theta_converges_to_the_finite_difference_optimum() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+// ── #1636: the same block read in a Form-C readout ──────────────────────────
+//
+// `y = central / V * SCALE[STUDY]` (ODE or closed form) and a compartment-free
+// `y = PLACEBO[STUDY] + …` read the block in the readout, not in
+// `[individual_parameters]`. The readout's `Dual2` walk had no reader for the
+// gather, so every subject's analytic gradient came back NaN and fell back to FD
+// while `optimizer = auto` stayed on L-BFGS: B1 (ODE) stopped at OFV −56.99 and
+// F1 (closed form) at −59.07, against −108.28 for the same model with the gather
+// written in `[individual_parameters]` (#1636 plan §0). The parser now lifts the
+// readout gather into a synthetic individual parameter, so the two spellings run
+// one individual-parameter program; the hand-lifted spelling is the oracle.
+
+/// Three studies × four subjects × six times, compartment-free, drawn once from
+/// `y = PL[STUDY] + EMAX·t/(t+2)` with `PL = (1, 2, 3)`, `EMAX = 4·exp(η)`,
+/// ω = 0.04 and an additive residual SD of 0.3 (Python `random.seed(1636)`).
+const CF_DATA: &str = "\
+ID,TIME,DV,MDV,STUDY,ARM,NARM
+1,0,0.7696,0,1,1,20
+1,1,3.0163,0,1,1,20
+1,2,3.0393,0,1,1,20
+1,4,4.2464,0,1,1,20
+1,8,4.8811,0,1,1,20
+1,12,4.5333,0,1,1,20
+2,0,1.4394,0,1,2,30
+2,1,2.2587,0,1,2,30
+2,2,2.9528,0,1,2,30
+2,4,3.1951,0,1,2,30
+2,8,3.9133,0,1,2,30
+2,12,4.1039,0,1,2,30
+3,0,0.8225,0,1,1,40
+3,1,2.6367,0,1,1,40
+3,2,3.8186,0,1,1,40
+3,4,3.4628,0,1,1,40
+3,8,4.2179,0,1,1,40
+3,12,5.2294,0,1,1,40
+4,0,0.8663,0,1,2,50
+4,1,2.2287,0,1,2,50
+4,2,3.0410,0,1,2,50
+4,4,3.5308,0,1,2,50
+4,8,3.5488,0,1,2,50
+4,12,4.4198,0,1,2,50
+5,0,1.5308,0,2,1,20
+5,1,4.1405,0,2,1,20
+5,2,5.1515,0,2,1,20
+5,4,5.7832,0,2,1,20
+5,8,6.3899,0,2,1,20
+5,12,7.2902,0,2,1,20
+6,0,1.6006,0,2,2,30
+6,1,3.1121,0,2,2,30
+6,2,3.4515,0,2,2,30
+6,4,4.3426,0,2,2,30
+6,8,4.8627,0,2,2,30
+6,12,4.9546,0,2,2,30
+7,0,1.8507,0,2,1,40
+7,1,3.0570,0,2,1,40
+7,2,3.3000,0,2,1,40
+7,4,4.5229,0,2,1,40
+7,8,4.5731,0,2,1,40
+7,12,4.8838,0,2,1,40
+8,0,2.3240,0,2,2,50
+8,1,3.9706,0,2,2,50
+8,2,5.0714,0,2,2,50
+8,4,5.5275,0,2,2,50
+8,8,6.5195,0,2,2,50
+8,12,6.3334,0,2,2,50
+9,0,2.6015,0,3,1,20
+9,1,4.4499,0,3,1,20
+9,2,5.1670,0,3,1,20
+9,4,6.0853,0,3,1,20
+9,8,6.4819,0,3,1,20
+9,12,7.0542,0,3,1,20
+10,0,2.9125,0,3,2,30
+10,1,4.3693,0,3,2,30
+10,2,5.0397,0,3,2,30
+10,4,5.9698,0,3,2,30
+10,8,5.9623,0,3,2,30
+10,12,6.6390,0,3,2,30
+11,0,3.3501,0,3,1,40
+11,1,3.6714,0,3,1,40
+11,2,4.8126,0,3,1,40
+11,4,4.7174,0,3,1,40
+11,8,4.7759,0,3,1,40
+11,12,5.6959,0,3,1,40
+12,0,2.8934,0,3,2,50
+12,1,4.9183,0,3,2,50
+12,2,5.4106,0,3,2,50
+12,4,6.3672,0,3,2,50
+12,8,7.2298,0,3,2,50
+12,12,7.2235,0,3,2,50
+";
+
+/// One engine's readout fixture: the model with the gather in `y`, and its
+/// hand-lifted twin with the gather in `[individual_parameters]`.
+struct Readout {
+    engine: &'static str,
+    data: &'static str,
+    in_y: fn(&str, &str) -> String,
+    lifted: fn(&str, &str) -> String,
+}
+
+fn pk_readout_model(structural: &str, theta: &str, ip: &str, y: &str, fo: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta TVV(8.0, 0.1, 500.0)
+  {theta}
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL
+  V = TVV * exp(ETA_V)
+  {ip}
+
+[structural_model]
+{structural}
+
+[scaling]
+  y = {y}
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  covariance = false
+{fo}
+"#
+    )
+}
+
+const ODE_STRUCTURAL: &str =
+    "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central";
+const CLOSED_STRUCTURAL: &str = "  pk one_cpt_iv(cl=CL, v=V)";
+
+fn cf_readout_model(theta: &str, ip: &str, y: &str, fo: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  {theta}
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_EMAX ~ 0.04
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  EMAX = TVEMAX * exp(ETA_EMAX)
+  ET50 = TVET50
+  {ip}
+
+[structural_model]
+  y = {y}
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = focei
+  covariance = false
+{fo}
+"#
+    )
+}
+
+const CF_EFFECT: &str = "EMAX * TIME / (TIME + ET50)";
+
+/// The three engines behind `eval_output_g`, each with the counted block
+/// indexed by `STUDY`. `theta` is the block's declaration line.
+const READOUTS: [Readout; 3] = [
+    Readout {
+        engine: "ODE Form-C (sens/ode_provider.rs)",
+        data: DATA,
+        in_y: |theta, fo| {
+            pk_readout_model(ODE_STRUCTURAL, theta, "", "central / V * SCALE[STUDY]", fo)
+        },
+        lifted: |theta, fo| {
+            pk_readout_model(
+                ODE_STRUCTURAL,
+                theta,
+                "S = SCALE[STUDY]",
+                "central / V * S",
+                fo,
+            )
+        },
+    },
+    Readout {
+        engine: "closed-form Form-C (sens/provider.rs)",
+        data: DATA,
+        in_y: |theta, fo| {
+            pk_readout_model(
+                CLOSED_STRUCTURAL,
+                theta,
+                "",
+                "central / V * SCALE[STUDY]",
+                fo,
+            )
+        },
+        lifted: |theta, fo| {
+            pk_readout_model(
+                CLOSED_STRUCTURAL,
+                theta,
+                "S = SCALE[STUDY]",
+                "central / V * S",
+                fo,
+            )
+        },
+    },
+    Readout {
+        engine: "compartment-free (sens/algebraic.rs)",
+        data: CF_DATA,
+        in_y: |theta, fo| {
+            cf_readout_model(
+                &theta.replace("SCALE", "PLACEBO"),
+                "",
+                &format!("PLACEBO[STUDY] + {CF_EFFECT}"),
+                fo,
+            )
+        },
+        lifted: |theta, fo| {
+            cf_readout_model(
+                &theta.replace("SCALE", "PLACEBO"),
+                "E0 = PLACEBO[STUDY]",
+                &format!("E0 + {CF_EFFECT}"),
+                fo,
+            )
+        },
+    },
+];
+
+const READOUT_BLOCK: &str = "theta SCALE[3](1.5, 0.1, 10.0)";
+const READOUT_INIT: f64 = 1.5;
+
+/// Every estimated level of the readout's block (`SCALE` or `PLACEBO`).
+fn readout_levels(result: &FitResult) -> Vec<(String, f64)> {
+    let out: Vec<(String, f64)> = result
+        .theta_names
+        .iter()
+        .zip(&result.theta)
+        .filter(|(n, _)| n.starts_with("SCALE[") || n.starts_with("PLACEBO["))
+        .map(|(n, v)| (n.clone(), *v))
+        .collect();
+    assert_eq!(out.len(), 3, "three levels in {:?}", result.theta_names);
+    out
+}
+
+/// T4 + T6, per engine: the gather in `y` runs on the analytic gradient with no
+/// subject falling back, moves the block, names no level "not referenced", and
+/// fits exactly like the hand-lifted twin. The pair straddles the fix: before it,
+/// the in-`y` side fell back on 12/12 subjects (and `assert_analytic_ran` fails)
+/// while the lifted side did not.
+#[test]
+fn a_readout_gather_fits_exactly_like_its_lifted_twin() {
+    for r in &READOUTS {
+        let in_y = fit_on(&(r.in_y)(READOUT_BLOCK, SHORT_FIT), r.data);
+        let lifted = fit_on(&(r.lifted)(READOUT_BLOCK, SHORT_FIT), r.data);
+        assert_analytic_ran(&in_y, r.engine);
+        assert_analytic_ran(&lifted, r.engine);
+        let unreferenced: Vec<&String> = in_y
+            .warnings
+            .iter()
+            .filter(|w| w.contains("but not referenced"))
+            .collect();
+        assert!(
+            unreferenced.is_empty(),
+            "{}: a level read in the readout reported unreferenced: {unreferenced:?}",
+            r.engine
+        );
+        for (name, v) in readout_levels(&in_y) {
+            assert!(
+                v.is_finite() && (v - READOUT_INIT).abs() > 1e-3,
+                "{}: {name} = {v} did not leave its init",
+                r.engine
+            );
+        }
+        assert!(in_y.ofv.is_finite(), "{}: OFV {}", r.engine, in_y.ofv);
+        assert_eq!(
+            in_y.ofv.to_bits(),
+            lifted.ofv.to_bits(),
+            "{}: OFV {:.17e} vs lifted {:.17e}",
+            r.engine,
+            in_y.ofv,
+            lifted.ofv
+        );
+        assert_eq!(in_y.theta_names, lifted.theta_names, "{}", r.engine);
+        for (a, b) in in_y.theta.iter().zip(&lifted.theta) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{}: θ {:?} vs lifted {:?}",
+                r.engine,
+                in_y.theta,
+                lifted.theta
+            );
+        }
+    }
+}
+
+/// Population predictions of `model` on `data` at `theta_of(name, default)`,
+/// as `(id, time, pred)` per observation.
+fn level_preds(model: &str, data: &str) -> Vec<(String, f64, f64)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_path = dir.path().join("d.csv");
+    write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
+    let mut parsed = ferx_core::parser::model_parser::parse_full_model(model).expect("parse");
+    let mut pop = ferx_core::read_nonmem_csv(&data_path, None, None).expect("data");
+    ferx_core::bind_theta_levels(&mut parsed, model, &mut pop).expect("bind");
+    let mut params = parsed.model.default_params.clone();
+    // A distinct value per level, so a synth that read the wrong level (or one
+    // level for every row) cannot agree with the twin by coincidence.
+    for (i, n) in parsed.model.theta_names.iter().enumerate() {
+        if let Some(at) = n.find('[') {
+            let h: u32 = n[at..].bytes().map(u32::from).sum();
+            params.theta[i] = 1.0 + f64::from(h % 17) / 10.0;
+        }
+    }
+    let rows = ferx_core::predict(&parsed.model, &pop, &params).expect("predict");
+    rows.iter()
+        .map(|r| (r.id.clone(), r.time, r.pred))
+        .collect()
+}
+
+/// T5: `predict()` is bit-identical between the gather in `y` and the gather
+/// lifted by hand, on every engine and on an index that varies per observation
+/// (`[STUDY, TIME]`), so the synth is evaluated with each observation's
+/// covariates, not the subject's first row.
+#[test]
+fn a_readout_gather_predicts_exactly_like_its_lifted_twin() {
+    let named = [
+        "theta SCALE[STUDY, contrast = none](1.0, 0.1, 10.0)",
+        "theta SCALE[STUDY, TIME, contrast = none](1.0, 0.1, 10.0)",
+        "theta SCALE[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)",
+    ];
+    let mut cases: Vec<(String, String, String, &str)> = Vec::new();
+    for theta in named {
+        for (engine, structural) in [("ODE", ODE_STRUCTURAL), ("closed form", CLOSED_STRUCTURAL)] {
+            cases.push((
+                format!("{engine}, {theta}"),
+                pk_readout_model(structural, theta, "", "central / V * exp(SCALE)", ""),
+                pk_readout_model(structural, theta, "S = SCALE", "central / V * exp(S)", ""),
+                DATA,
+            ));
+        }
+        let theta = theta.replace("SCALE", "PLACEBO");
+        cases.push((
+            format!("compartment-free, {theta}"),
+            cf_readout_model(&theta, "", &format!("PLACEBO + {CF_EFFECT}"), ""),
+            cf_readout_model(&theta, "E0 = PLACEBO", &format!("E0 + {CF_EFFECT}"), ""),
+            CF_DATA,
+        ));
+    }
+    // An index read through an individual parameter.
+    cases.push((
+        "ODE, SCALE[K] with K = STUDY".into(),
+        pk_readout_model(
+            ODE_STRUCTURAL,
+            "theta SCALE[3](1.0, 0.1, 10.0)",
+            "K = STUDY",
+            "central / V * SCALE[K]",
+            "",
+        ),
+        pk_readout_model(
+            ODE_STRUCTURAL,
+            "theta SCALE[3](1.0, 0.1, 10.0)",
+            "K = STUDY\n  S = SCALE[K]",
+            "central / V * S",
+            "",
+        ),
+        DATA,
+    ));
+    for (tag, in_y, lifted, data) in &cases {
+        let (a, b) = (level_preds(in_y, data), level_preds(lifted, data));
+        assert_eq!(a.len(), b.len(), "{tag}");
+        assert!(a.len() >= 60, "{tag}: {} rows", a.len());
+        let distinct: std::collections::BTreeSet<u64> = a.iter().map(|r| r.2.to_bits()).collect();
+        assert!(distinct.len() > 3, "{tag}: the predictions must vary");
+        for (x, y) in a.iter().zip(&b) {
+            assert!(x.2.is_finite() && y.2.is_finite(), "{tag}: {x:?} / {y:?}");
+            assert_eq!((&x.0, x.1), (&y.0, y.1), "{tag}: row order");
+            assert_eq!(x.2.to_bits(), y.2.to_bits(), "{tag}: {x:?} vs lifted {y:?}");
+        }
+    }
+}
+
+/// The exit criterion of #1636: on the default gradient a readout gather reaches
+/// the optimum of its hand-lifted twin, where before it stopped 49–51 OFV above
+/// it on L-BFGS over FD gradients. A fit to convergence, hence gated.
+///
+/// **The primary oracle is FD-free:** the in-`y` and the hand-lifted spellings run
+/// one individual-parameter program, so their converged OFVs must agree to the bit.
+/// Measured at `4643eef7` + this change (macOS), bit-identical on all three engines:
+/// ODE −108.2821614347, closed form −108.2777960837, compartment-free −78.0925575386.
+///
+/// **FD is secondary and one-sided** (the #1628 lesson: FD's stopping point moves by
+/// platform). FD stops *above* the analytic optimum on every engine (analytic − FD:
+/// ODE −7.4e-1, closed form −8.1e-3, compartment-free −5.6e-3), so the analytic OFV
+/// may not sit above FD's by more than `FD_OFV_SLACK = 1e-2`. Before the fix the
+/// in-`y` side sat +47.8 (ODE) and +49.2 (closed form) above FD, and +3.4e-2 on
+/// the compartment-free engine (#1636 plan §0, B1/F1/A1), so the slack still kills
+/// all three.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_readout_gather_converges_to_the_lifted_optimum() {
+    const CONVERGE: &str = "  maxiter = 500";
+    const FD_OFV_SLACK: f64 = 1e-2;
+    let mut failures: Vec<String> = Vec::new();
+    for r in &READOUTS {
+        let in_y = fit_on(&(r.in_y)(READOUT_BLOCK, CONVERGE), r.data);
+        let lifted = fit_on(&(r.lifted)(READOUT_BLOCK, CONVERGE), r.data);
+        let fd = fit_on(
+            &(r.in_y)(READOUT_BLOCK, &format!("{CONVERGE}\n  gradient = fd")),
+            r.data,
+        );
+        assert_analytic_ran(&in_y, r.engine);
+        assert!(
+            in_y.ofv.is_finite() && lifted.ofv.is_finite() && fd.ofv.is_finite(),
+            "{}: OFV {} / {} / {}",
+            r.engine,
+            in_y.ofv,
+            lifted.ofv,
+            fd.ofv
+        );
+        let d_fd = in_y.ofv - fd.ofv;
+        eprintln!(
+            "{}: OFV in y {:.10}, lifted {:.10}, fd {:.10} (in y − fd {d_fd:.3e}); levels {:?}",
+            r.engine,
+            in_y.ofv,
+            lifted.ofv,
+            fd.ofv,
+            readout_levels(&in_y)
+        );
+        if in_y.ofv.to_bits() != lifted.ofv.to_bits() {
+            failures.push(format!(
+                "{}: OFV {} vs lifted {}",
+                r.engine, in_y.ofv, lifted.ofv
+            ));
+        }
+        if d_fd >= FD_OFV_SLACK {
+            failures.push(format!(
+                "{}: the analytic OFV {} sits {d_fd:.3e} above FD's {}",
+                r.engine, in_y.ofv, fd.ofv
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
