@@ -1032,9 +1032,9 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
         &init_params.theta_fixed,
         &init_params.omega.matrix,
     );
-    groups
-        .iter()
-        .filter_map(|g| model.eta_names.get(g.eta_idx).map(String::as_str))
+    crate::estimation::covariate_mu_ref::group_etas(&groups)
+        .into_iter()
+        .filter_map(|k| model.eta_names.get(k).map(String::as_str))
         .collect()
 }
 

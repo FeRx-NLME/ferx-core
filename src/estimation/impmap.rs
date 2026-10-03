@@ -751,7 +751,9 @@ fn run_mcem(
     for n in &cov_mu_notes {
         warnings.push(format!("{label}: {n}"));
     }
-    let cov_group_etas: Vec<usize> = cov_mu_groups.iter().map(|g| g.eta_idx).collect();
+    // Every member's eta (#1620): see the SAEM twin in `run_saem`.
+    let cov_group_etas: Vec<usize> =
+        crate::estimation::covariate_mu_ref::group_etas(&cov_mu_groups);
     let cov_group_thetas: Vec<usize> = cov_mu_groups
         .iter()
         .flat_map(|g| g.theta_idx.iter().copied())
@@ -1383,8 +1385,7 @@ fn run_mcem(
                     etas: &eta_means,
                 };
                 let solved = if group.needs_data_term {
-                    let k = group.eta_idx;
-                    let data = |th: &[f64], shift: &[f64]| -> f64 {
+                    let data = |th: &[f64], shifts: &[Vec<f64>]| -> f64 {
                         let per_subj: Vec<f64> = population
                             .subjects
                             .par_iter()
@@ -1397,9 +1398,7 @@ fn run_mcem(
                                         continue;
                                     }
                                     let mut e2 = eta.clone();
-                                    if k < e2.len() {
-                                        e2[k] += shift[i];
-                                    }
+                                    group.shift_eta(&mut e2, shifts, i);
                                     s += w * obs_nll_subject_into(
                                         model,
                                         subject,
@@ -1446,19 +1445,16 @@ fn run_mcem(
                 // collapsed to its bound). Shifting the mean by −Δ_i is the exact
                 // φ-space bookkeeping; the second moment follows so the proposal
                 // covariance `S − m mᵀ` is unchanged. This is the per-subject twin
-                // of SAEM's `e[eta_idx] -= delta` re-centring.
+                // of SAEM's `e[eta_idx] -= delta` re-centring, and like it covers
+                // every member's eta of a joint group (#1620).
                 if recenter == ProposalRecenter::SampleMoments {
                     let theta_new = unpack_all(&log_theta);
-                    let mu_old = group.mus(&theta_now, population);
-                    let mu_new = group.mus(&theta_new, population);
-                    let k_eta = group.eta_idx;
+                    let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
                     for (i, d) in draws.iter_mut().enumerate() {
-                        let delta = mu_new[i] - mu_old[i];
-                        if !delta.is_finite() || k_eta >= d.mean.len() {
+                        let m_old = DVector::from_column_slice(&d.mean);
+                        if !group.recentre_eta(&mut d.mean, &deltas, i) {
                             continue;
                         }
-                        let m_old = DVector::from_column_slice(&d.mean);
-                        d.mean[k_eta] -= delta;
                         let m_new = DVector::from_column_slice(&d.mean);
                         d.second_moment = &d.second_moment - &m_old * m_old.transpose()
                             + &m_new * m_new.transpose();
@@ -1598,17 +1594,13 @@ fn run_mcem(
             .iter()
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
             .collect();
+        let (what, typical_was) = group.skipped_step_phrases();
         warnings.push(format!(
-            "{label}: the covariate mu-reference on {} had no admissible step on {} of {} \
-             iteration(s) — its typical value was not finite for at least one subject at the \
-             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
-             were then moved by the importance-weighted M-step alone, or not at all; check them \
-             against a FOCEI fit and consider bounding the covariate slope (#619).",
-            model
-                .eta_names
-                .get(group.eta_idx)
-                .map(String::as_str)
-                .unwrap_or("?"),
+            "{label}: the {what} had no admissible step on {} of {} iteration(s) — \
+             {typical_was} not finite for at least one subject at the current θ (an additive \
+             typical value can go ≤ 0 for a low-covariate subject). {} were then moved by the \
+             importance-weighted M-step alone, or not at all; check them against a FOCEI fit \
+             and consider bounding the covariate slope (#619).",
             skipped,
             n_iter,
             names.join(", ")

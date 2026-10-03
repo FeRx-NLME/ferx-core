@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **The unseen-level refusal and `E_THETA_LENGTH` now name the action, not a Rust
+  function** (#1623). Simulating a design with a level the fit never observed is still
+  refused; its advice is now to simulate only the fit's levels, or to simulate the design
+  on its own levels without the fit's θ. A θ of the wrong length on a level-block model now
+  says a fit's θ fits only a design bound against that fit's level bindings. Neither names
+  `bind_theta_levels` or `bind_theta_levels_from_fit` any longer, since the R wrapper
+  passes these messages through; the Rust routes are in the functions' documentation.
 - **An EVID=3/4 reset now cancels every dose recorded before it, including a lagged dose
   that has not yet arrived** (#1587). A lagged bolus whose arrival, or a lagged infusion or
   absorption window whose start, falls after the reset contributes nothing after it,
@@ -69,6 +76,17 @@ section of the SDLC for the versioning policy).
   such label. For a block keyed on `TIME` the design can therefore only be simulated at
   the fit's observation times. See
   [Simulating with a fit's θ](docs/api/fitting.qmd#simulate-with-fit-theta).
+- **`theta_level_values` reports every level of a bound level block with its value**
+  (#1623), the dependent levels included. Each `ThetaLevelValue` carries the `label`, the
+  `value` the model applies at that θ, and a `theta_index` that is `Some(k)` for a free
+  level (its position in `theta`, so its SE can be joined) and `None` for a dependent one,
+  whose value is the negated sum of its group's free θ, or `0` for a `ref` level. A θ of
+  the wrong length is refused. See
+  [Level labels and values](docs/api/fitting.qmd#level-labels-values).
+- **The compact-summary rule for large θ blocks is public** (#1623):
+  `io::output::compact_theta_blocks` and `THETA_BLOCK_COMPACT_MIN`, so a wrapper reports the
+  same blocks compactly as the fit writers. The rule is **20 or more free coefficients**;
+  the docs said "more than 20", which was off by one.
 
 ### Fixed
 
@@ -79,6 +97,18 @@ section of the SDLC for the versioning policy).
   `gradient = fd` estimated it. Fits of such models now move the block and land at the
   finite-difference optimum. The same models also no longer warn that every level is "declared
   in `[parameters]` but not referenced".
+- **SAEM and IMP/IMPMAP no longer drive a covariate theta shared by two typical values to its
+  bound** (#1620). When two covariate mu-referenced typical values read the same estimated
+  theta — `CL = TVCL*(WT/70)^THETA_WT*…*exp(ETA_CL)` next to
+  `V1 = TVV1*(WT/70)^THETA_WT*exp(ETA_V1)`,
+  as in `examples/two_cpt_oral_cov.ferx` — the second one used to be declined, and the first
+  one's M-step moved `THETA_WT` with `ETA_V1` left free to absorb the change: SAEM put `THETA_WT` at
+  0.0101 against NONMEM SAEM's 0.6618, and IMPMAP pulled `THETA_CRCL` to 0.358 (NONMEM IMPMAP 0.5630).
+  Typical values that share a free theta now take one joint M-step that fits all of their
+  thetas and re-centres every one of their etas, and the fit says so in a warning naming the
+  etas and the shared theta. Validated against NONMEM 7.6.0 `METHOD=SAEM` and `METHOD=IMPMAP`
+  (`nonmem_anchor/covmuref_shared_{saem,impmap}.ctl`). Models whose covariate mu-references share
+  no theta give bit-identical results.
 - **Every `simulate*` entry point now refuses a θ vector whose length is not the model's**
   (#1614, `E_THETA_LENGTH`). A short vector used to simulate `Ok` rows from zeros past its
   end (every prediction `0.0` on a plain two-θ model given one value), and a long one

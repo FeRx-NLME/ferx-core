@@ -221,6 +221,8 @@ $$
 
 with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. The new estimate is blended with the same SA step $\gamma_k$ as the single-anchor shift, and each η is re-centred by the change in its own mu so $\phi_i$ is unchanged. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
 
+Covariate mu-references that **share an estimated theta** are one group ([#1620](https://github.com/FeRx-NLME/ferx-core/issues/1620)). In `examples/two_cpt_oral_cov.ferx`, `CL` and `V1` both read `THETA_WT`. Stepping them one at a time cannot work: a step over CL's thetas alone holds $\eta_{V1}$ as drawn — the η-frozen coordinates #619 removed for a single typical value — so $\phi_{V1}$ absorbs V1's half of every move of `THETA_WT`, and the exponent drifts to its bound (SAEM put it at 0.0101 against NONMEM's 0.662). The joint step fits the union of the thetas to every member's $\phi_i$ under the full $\Omega^{-1}$ form and re-centres every member's eta. A theta read only by the members is not "read elsewhere", so such a group still takes the exact engine; one also read outside every group, or by a mu-reference that was itself declined, keeps the data term. A fit warning names the etas and the shared theta. A shared `FIX`ed theta links nothing.
+
 A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which then stay on the numerical M-step as before — when one of its thetas is also another eta's single anchor, when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
 
 #### Scalar residual-error update
@@ -883,6 +885,32 @@ constant within a subject). On the fluconazole model that motivated #619
 2.0) to 1.18 and `TVCL_NR` from 153.9 (start 150) to 109.0, against NONMEM FOCE's 1.41
 and 122; the remaining distance to NONMEM's OFV on that dataset predates this change
 and is tracked with the FOCEI comparison of the same model.
+
+### Validation of the joint M-step for a shared theta (#1620)
+
+`examples/two_cpt_oral_cov.ferx` on its bundled data, where `CL` and `V1` both read
+`THETA_WT`. The NONMEM side writes both mu's linear in the shared `THETA(6)`
+(`nonmem_anchor/covmuref_shared_{saem,impmap}.ctl`, NONMEM 7.6.0); both engines start
+from the bundled model's values. SAEM is seed 1 at 150/250 iterations.
+
+| Quantity | ferx SAEM (before #1620) | ferx SAEM | NONMEM SAEM | ferx IMPMAP (before) | ferx IMPMAP | NONMEM IMPMAP |
+|---|---:|---:|---:|---:|---:|---:|
+| `THETA_WT` | **0.0101** | 0.6479 | 0.6618 | 0.5684 | 0.6725 | 0.6621 |
+| `THETA_CRCL` | 0.6454 | 0.5663 | 0.5645 | **0.3581** | 0.5622 | 0.5630 |
+| `TVCL` | 4.972 | 4.940 | 4.940 | **4.744** | 4.939 | 4.940 |
+
+Before #1620 the second mu-reference was declined and the first one's M-step moved
+`THETA_WT` with `ETA_V1` left as drawn, so `φ_V1` absorbed V1's half of every move:
+SAEM drove the exponent to its 0.01 lower bound at seed 1, under `score_sa` and at
+300/700 (seeds 2 and 3 stopped at 0.096 and 0.239), and IMPMAP pulled the renal
+exponent down with it. Seeds 2 and 3 now give `THETA_WT`
+0.627 and 0.662, the 300/700 schedule 0.672 and `mstep_solver = score_sa` 0.648.
+Models whose mu-references share no theta are bit-identical to before. ferx IMPMAP's
+variance components on this model sit away from NONMEM's whether or not a theta is
+shared ([#1629](https://github.com/FeRx-NLME/ferx-core/issues/1629)), so the table
+compares the joint group's own coordinates. `tests/saem_covariate_mu_ref.rs`
+(slow-gated) pins the table's two "after" columns and the `score_sa` and 300/700
+runs against NONMEM; seeds 2 and 3 are reported here, not tested.
 
 ## Inter-Occasion Variability (IOV)
 

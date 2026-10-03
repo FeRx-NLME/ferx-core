@@ -6351,6 +6351,101 @@ fn covariate_mu_ref_reports_a_theta_another_block_reads() {
     );
 }
 
+/// Two groups reading one theta (`CL` and `V1` both carry `TH_WT`) each read it
+/// outside the *other* — `shared_thetas` lists it for both — but nothing outside
+/// the groups reads it, so a joint step that freezes both `φ_i` leaves the data
+/// constant in it: `read_outside_groups` is empty (#1620). A third reader that
+/// is not a group (`F1`) is outside every group and must be listed. One test,
+/// both sides: a walk that ignores the extra owners fails the first half, one
+/// that stops at every assignment fails the second.
+#[test]
+fn covariate_mu_ref_read_outside_groups_stops_at_every_group_owner() {
+    let tn = ["TVCL", "TVV1", "TH_WT"];
+    let en = ["ETA_CL", "ETA_V1"];
+    let pair = "CL = TVCL * (WT / 70.0) ^ TH_WT * exp(ETA_CL)\n\
+                V1 = TVV1 * (WT / 70.0) ^ TH_WT * exp(ETA_V1)";
+    let g = detect_groups_outside(pair, &tn, &en, &["CL", "V1"]);
+    assert_eq!(g.len(), 2);
+    for grp in &g {
+        assert_eq!(grp.shared_thetas, vec!["TH_WT"], "{}", grp.eta_name);
+        assert!(
+            grp.read_outside_groups.is_empty(),
+            "{}: {:?}",
+            grp.eta_name,
+            grp.read_outside_groups
+        );
+    }
+
+    let with_f1 = format!("{pair}\nF1 = TH_WT * 0.01");
+    let g = detect_groups_outside(&with_f1, &tn, &en, &["CL", "V1", "F1"]);
+    assert_eq!(g.len(), 2);
+    for grp in &g {
+        assert_eq!(grp.read_outside_groups, vec!["TH_WT"], "{}", grp.eta_name);
+    }
+
+    // The theta named in another block directly is outside every group too.
+    let g = detect_groups_outside(pair, &tn, &en, &["CL", "V1", "TH_WT"]);
+    assert_eq!(g[0].read_outside_groups, vec!["TH_WT"]);
+}
+
+/// The taint stops at the statement that **defines** a group, not at every
+/// assignment to its name (#1632 review). Three cells, one test:
+///
+/// - (a) another group's name assigned earlier and read in between —
+///   `V = 40 + TH_X*100; Q = V*0.5` before `V` becomes the `ETA_V` group — is a
+///   live route for `TH_X` that no frozen `φ` pins. Stopping at the name hid it
+///   from `read_outside_groups`, and the `CL` group took the exact engine;
+/// - (b) the same with the group's *own* name (`CL = TH_X*2; Q = CL*0.5` before
+///   `CL` is redefined), which `shared_thetas` already missed before #1620;
+/// - (c) the control: an earlier assignment that nothing reads before the
+///   defining statement overwrites it. The defining statement clears the name,
+///   so this stays exclusive — without the clear, the stale taint on `CL` would
+///   reach the structural model and every such model would lose the exact
+///   engine.
+#[test]
+fn covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name() {
+    let tn = ["TVCL", "TH_X", "TVV", "TH_VWT"];
+    let en = ["ETA_CL", "ETA_V"];
+    let group = "CL = (TVCL + (CRCL - 90.0) * TH_X) * exp(ETA_CL)";
+
+    let other_owner = format!(
+        "V = 40.0 + TH_X * 100.0\nQ = V * 0.5\n{group}\nV = (TVV + (WT - 70.0) * TH_VWT) * exp(ETA_V)"
+    );
+    let g = detect_groups_outside(&other_owner, &tn, &en, &["CL", "V", "Q"]);
+    assert_eq!(g.len(), 2);
+    assert_eq!(g[0].eta_name, "ETA_CL");
+    assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(a) shared_thetas");
+    assert_eq!(
+        g[0].read_outside_groups,
+        vec!["TH_X"],
+        "(a) read_outside_groups"
+    );
+
+    let own_owner = format!("CL = TH_X * 2.0\nQ = CL * 0.5\n{group}");
+    let g = detect_groups_outside(&own_owner, &tn, &en, &["CL", "Q"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(b) shared_thetas");
+    assert_eq!(
+        g[0].read_outside_groups,
+        vec!["TH_X"],
+        "(b) read_outside_groups"
+    );
+
+    let dead = format!("CL = TH_X * 2.0\n{group}");
+    let g = detect_groups_outside(&dead, &tn, &en, &["CL"]);
+    assert_eq!(g.len(), 1);
+    assert!(
+        g[0].shared_thetas.is_empty(),
+        "(c) {:?}",
+        g[0].shared_thetas
+    );
+    assert!(
+        g[0].read_outside_groups.is_empty(),
+        "(c) {:?}",
+        g[0].read_outside_groups
+    );
+}
+
 #[test]
 fn covariate_mu_ref_reaches_the_compiled_model() {
     let src = r"

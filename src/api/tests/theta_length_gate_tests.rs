@@ -14,7 +14,8 @@
 //! | short (1), long (3), empty (0) | both counts, "theta" | that the data is wrong, "missing" |
 //! | correct (2) | nothing — rows bit-identical to the model's own θ | — |
 //!
-//! The level-block half of the message (naming `bind_theta_levels_from_fit`) is pinned in
+//! The level-block half of the message (naming the fit's level bindings, and no function since
+//! #1623) is pinned in
 //! `theta_levels_tests.rs`, next to the fixtures that bind a block; this file's plain model is
 //! the side of that gate on which the hint must be absent. The two adaptive entries are pinned
 //! in `adaptive_sim_tests.rs`, which owns their fixtures.

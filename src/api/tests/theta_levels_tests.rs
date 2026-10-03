@@ -1204,6 +1204,16 @@ mod from_fit {
             !err.contains("TIME"),
             "no TIME-grid claim for a STUDY block: {err}"
         );
+        // The advice names actions, not a Rust function (#1623).
+        assert!(
+            err.ends_with(
+                " Either simulate only the fit's levels, or simulate the design without the \
+                 fit's theta, from a theta vector for the design's own levels (the model's \
+                 initial estimates, for example)."
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("bind_theta_levels"), "{err}");
         assert!(!design
             .covariate_names
             .iter()
@@ -1211,13 +1221,14 @@ mod from_fit {
     }
 
     /// The θ-length gate's level-block hint, both sides of its gate in one test:
-    /// a bound level-block model names the block and `bind_theta_levels_from_fit`;
-    /// the same model without its block does not.
+    /// a bound level-block model names the block and the fit's level bindings; the
+    /// same model without its block does not. Neither names a Rust function: the R
+    /// wrapper reaches this message too (#1623).
     ///
     /// Mutations — drop the hint and the first arm dies; emit it unconditionally
-    /// and the second does.
+    /// and the second does; put a binder's name back and the negative assertion dies.
     #[test]
-    fn the_theta_length_gate_names_the_from_fit_binder_only_for_a_level_block() {
+    fn the_theta_length_gate_names_the_fit_bindings_only_for_a_level_block() {
         let text = no_eta_model();
         let mut pop = population(2, 2);
         let model = bind(&text, &mut pop).unwrap();
@@ -1229,8 +1240,7 @@ mod from_fit {
             "{err}"
         );
         assert!(
-            err.contains("declares the theta level block(s) `PLACEBO`")
-                && err.contains("bind the design with `bind_theta_levels_from_fit`"),
+            err.contains("declares the theta level block(s) `PLACEBO`"),
             "{err}"
         );
         assert!(
@@ -1239,9 +1249,14 @@ mod from_fit {
         );
         assert!(
             err.contains(
-                "and the fit's level bindings, so the design carries the fit's theta layout"
+                "A fit's theta fits only a design bound against that fit's level bindings, \
+                 which give the design the fit's theta layout"
             ),
-            "what the from-fit binder buys: {err}"
+            "what a fit's theta needs: {err}"
+        );
+        assert!(
+            !err.contains("bind_theta_levels"),
+            "no Rust function in a message a wrapper reaches: {err}"
         );
 
         let plain = no_eta_model()
@@ -1256,6 +1271,361 @@ mod from_fit {
             "{err}"
         );
         assert!(!err.contains("level block"), "{err}");
-        assert!(!err.contains("bind_theta_levels_from_fit"), "{err}");
+        assert!(!err.contains("level bindings"), "{err}");
+    }
+
+    /// T9. The unseen-level refusal's second action works, not only its wording:
+    /// on a design the refusal rejects, binding the design on its own levels and
+    /// simulating from the model's initial estimates succeeds. From Rust the action
+    /// is `bind_theta_levels` + `default_params`, as the `bind_theta_levels_from_fit`
+    /// rustdoc says.
+    ///
+    /// Mutations — re-parse in `bind_theta_levels` but keep the unbound model's
+    /// `default_params` (the initial estimates no longer fit the design's layout),
+    /// or drop the rebound model: the simulation is refused and this dies.
+    #[test]
+    fn the_refusals_second_action_simulates_the_design_on_its_own_levels() {
+        let text = no_eta_model();
+        let fit = bind_fit(&text, &mut population(2, 2));
+        let mut design = population(3, 4);
+        let err = bind_design(&text, &mut design, &fit.bindings.levels)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("the design has 8 level(s) the fit estimated no theta for")
+                && err.contains("simulate the design without the fit's theta"),
+            "the refusal under test offers the action: {err}"
+        );
+
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut design)
+            .expect("the design binds on its own levels");
+        let model = &parsed.model;
+        assert_eq!(model.n_theta, 13, "TVCL, TVV, 12 levels - 1 (sum_to_zero)");
+        assert_eq!(model.default_params.theta.len(), 13);
+        let rows = simulate_with_seed(model, &design, &model.default_params, 2, 7)
+            .expect("the design simulates from the model's initial estimates");
+        assert_eq!(rows.len(), 24, "2 sims x 3 subjects x 4 observations");
+        assert!(
+            rows.iter().all(|r| r.ipred.is_finite()),
+            "every ipred finite: {:?}",
+            rows.iter().map(|r| r.ipred).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `theta_level_values` (#1623): every level's value, free and dependent, read through
+/// the engine's own gather. The fixtures' θ are distinct and non-cancelling
+/// (`θₖ = 0.1k + 0.01k²`), and every expected value is written as its closed form
+/// over those θ, never by calling the gather.
+mod level_values {
+    use super::*;
+    use crate::api::{theta_level_map, theta_level_values, ThetaLevelValue};
+
+    fn distinct_theta(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|k| 0.1 * k as f64 + 0.01 * (k * k) as f64)
+            .collect()
+    }
+
+    /// The values of `PLACEBO`, after checking the labels are `theta_level_map`'s
+    /// and every free level's θ name is `PLACEBO[label]` at its index.
+    fn placebo_values(model: &CompiledModel, theta: &[f64]) -> Vec<ThetaLevelValue> {
+        let map = theta_level_values(model, theta).expect("a bound model and its own theta");
+        assert_eq!(map.len(), 1, "only PLACEBO is a level block: {map:?}");
+        let values = map["PLACEBO"].clone();
+        let labels: Vec<String> = values.iter().map(|v| v.label.clone()).collect();
+        assert_eq!(labels, theta_level_map(model)["PLACEBO"]);
+        for v in &values {
+            if let Some(k) = v.theta_index {
+                assert_eq!(model.theta_names[k], format!("PLACEBO[{}]", v.label));
+            }
+        }
+        values
+    }
+
+    /// `(value, theta_index)` per level, for a compact comparison against the
+    /// closed form. Values compare with `==` on purpose: the gather sums the group
+    /// left to right, exactly as the closed forms below are written.
+    fn pairs(values: &[ThetaLevelValue]) -> Vec<(f64, Option<usize>)> {
+        values.iter().map(|v| (v.value, v.theta_index)).collect()
+    }
+
+    /// T1. Each contrast on a 2 study × 3 time design: the dependent levels are the
+    /// negated sum of their group's free θ (or 0 for `ref`), the free levels their
+    /// own θ, and `theta_index` is set exactly for the free ones.
+    ///
+    /// Mutations — flip `NegSum`'s sign in `eval_gather`; take `theta_index` from the
+    /// label's position instead of the level's rule; evaluate level `i` instead of
+    /// `i + 1`; read the k-th label as `theta[k]` (wrong under `ref` and the
+    /// within-group contrast, where positions shift); skip dependent levels. Each
+    /// changes one of the vectors below.
+    #[test]
+    fn every_contrast_reports_the_closed_form_of_each_level() {
+        // sum_to_zero (no η shares the study scale): one group, L6 dependent.
+        let mut pop = population(2, 3);
+        let model = bind(&no_eta_model(), &mut pop).unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(model.n_theta, 7);
+        assert_eq!(
+            pairs(&placebo_values(&model, &t)),
+            vec![
+                (t[1], Some(1)),
+                (t[2], Some(2)),
+                (t[3], Some(3)),
+                (t[4], Some(4)),
+                (t[5], Some(5)),
+                (-((((t[1] + t[2]) + t[3]) + t[4]) + t[5]), None),
+            ],
+            "sum_to_zero"
+        );
+
+        // sum_to_zero_within (η on the study): one dependent level per study.
+        let mut pop = population(2, 3);
+        let model = bind(&mbma_model(""), &mut pop).unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(model.n_theta, 6);
+        let within = pairs(&placebo_values(&model, &t));
+        assert_eq!(
+            within,
+            vec![
+                (t[1], Some(1)),
+                (t[2], Some(2)),
+                (-(t[1] + t[2]), None),
+                (t[3], Some(3)),
+                (t[4], Some(4)),
+                (-(t[3] + t[4]), None),
+            ],
+            "sum_to_zero_within"
+        );
+        // The planning probe's numbers, so a fixture change cannot quietly move them.
+        assert!((within[2].0 + 0.35).abs() < 1e-12 && (within[5].0 + 0.95).abs() < 1e-12);
+
+        // ref: the first level is the reference, pinned at 0.
+        let mut pop = population(2, 3);
+        let model = bind(
+            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = ref]"),
+            &mut pop,
+        )
+        .unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(
+            pairs(&placebo_values(&model, &t)),
+            vec![
+                (0.0, None),
+                (t[1], Some(1)),
+                (t[2], Some(2)),
+                (t[3], Some(3)),
+                (t[4], Some(4)),
+                (t[5], Some(5)),
+            ],
+            "ref"
+        );
+
+        // none: every level is its own θ.
+        let mut pop = population(2, 3);
+        let model = bind(
+            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
+            &mut pop,
+        )
+        .unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(
+            pairs(&placebo_values(&model, &t)),
+            (1..=6).map(|k| (t[k], Some(k))).collect::<Vec<_>>(),
+            "none"
+        );
+    }
+
+    /// T2. The degenerate groups: a study observed at one time only, under the
+    /// within-group contrast, and one-level blocks. A group with no free θ reads 0.
+    ///
+    /// Mutations — as T1's sign / skip mutations; and a `NegSum(a, a)` that reads
+    /// `theta[a]` instead of the empty sum: the singleton then reports the next θ
+    /// (here `TVV`), not 0.
+    #[test]
+    fn a_group_with_no_free_theta_reports_zero() {
+        let mut pop = population(2, 3);
+        let s2 = &mut pop.subjects[1];
+        s2.obs_times.truncate(1);
+        s2.observations.truncate(1);
+        s2.obs_cmts.truncate(1);
+        s2.cens.truncate(1);
+        let model = bind(&mbma_model(""), &mut pop).unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(model.n_theta, 4, "TVCL, TVV, study 1's two free levels");
+        let values = placebo_values(&model, &t);
+        assert_eq!(values[3].label, "STUDY=2,TIME=1");
+        assert_eq!(
+            pairs(&values),
+            vec![
+                (t[1], Some(1)),
+                (t[2], Some(2)),
+                (-(t[1] + t[2]), None),
+                (0.0, None),
+            ]
+        );
+
+        for contrast in ["ref", "sum_to_zero_within"] {
+            let mut pop = population(1, 1);
+            let text = no_eta_model().replace(
+                "[STUDY, TIME]",
+                &format!("[STUDY, TIME, contrast = {contrast}]"),
+            );
+            let model = bind(&text, &mut pop).unwrap();
+            assert_eq!(
+                model.n_theta, 2,
+                "{contrast}: a one-level block has no free θ"
+            );
+            let t = distinct_theta(model.n_theta);
+            assert_eq!(
+                pairs(&placebo_values(&model, &t)),
+                vec![(0.0, None)],
+                "{contrast}"
+            );
+        }
+
+        let mut pop = population(1, 1);
+        let model = bind(
+            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
+            &mut pop,
+        )
+        .unwrap();
+        let t = distinct_theta(model.n_theta);
+        assert_eq!(pairs(&placebo_values(&model, &t)), vec![(t[1], Some(1))]);
+    }
+
+    /// T3. A θ of the wrong length is refused, naming both counts; the model's own
+    /// length is accepted.
+    ///
+    /// Mutation — delete the length check: the short θ returns `Ok` (its last free
+    /// level reading `NaN`) and the first assertion dies.
+    #[test]
+    fn a_theta_of_the_wrong_length_is_refused() {
+        let mut pop = population(2, 3);
+        let model = bind(&no_eta_model(), &mut pop).unwrap();
+        let t = distinct_theta(model.n_theta);
+        let err = theta_level_values(&model, &t[..6]).unwrap_err();
+        assert!(
+            err.contains("the supplied theta has 6 values but this model has 7"),
+            "{err}"
+        );
+        let mut long = t.clone();
+        long.push(1.0);
+        let err = theta_level_values(&model, &long).unwrap_err();
+        assert!(
+            err.contains("the supplied theta has 8 values but this model has 7"),
+            "{err}"
+        );
+        assert!(theta_level_values(&model, &t).is_ok());
+    }
+
+    /// T4. Only bound level blocks are reported: an unbound one and a counted
+    /// `theta NAME[N]` block give an empty map. T1 is the bound side of this gate.
+    ///
+    /// Mutations — drop the unbound-block filter (an unbound block still has its
+    /// gather, so the map becomes `Ok({"PLACEBO": []})`), or walk every gather
+    /// instead of the level blocks (the counted block appears): either way these die.
+    #[test]
+    fn unbound_and_counted_blocks_are_not_reported() {
+        let unbound = parse_full_model(&no_eta_model()).unwrap().model;
+        let t = distinct_theta(unbound.n_theta);
+        assert_eq!(theta_level_values(&unbound, &t), Ok(HashMap::new()));
+
+        let counted = parse_full_model(
+            &no_eta_model()
+                .replace("PLACEBO[STUDY, TIME]", "PLACEBO[4]")
+                .replace("TVCL + PLACEBO", "TVCL + PLACEBO[STUDY]"),
+        )
+        .unwrap()
+        .model;
+        assert_eq!(counted.n_theta, 6, "TVCL, TVV and four counted levels");
+        let t = distinct_theta(counted.n_theta);
+        assert_eq!(theta_level_values(&counted, &t), Ok(HashMap::new()));
+    }
+
+    /// T5. The compact rule counts **free** coefficients, on a real binding: a
+    /// 21-level `sum_to_zero` block (20 free θ) is compacted, a 20-level one (19
+    /// free) is not, and a 20-level `none` block (20 free) is.
+    ///
+    /// Mutations — `>=` to `>`, or the threshold 20 to 21: the 21-level case goes
+    /// empty and this dies.
+    #[test]
+    fn the_compact_rule_counts_free_coefficients_not_levels() {
+        use crate::io::output::{compact_theta_blocks, THETA_BLOCK_COMPACT_MIN};
+        assert_eq!(THETA_BLOCK_COMPACT_MIN, 20);
+
+        let mut pop = population(1, 21);
+        let model = bind(&no_eta_model(), &mut pop).unwrap();
+        assert_eq!(
+            compact_theta_blocks(&model.theta_names),
+            vec![("PLACEBO".to_string(), 1..21)],
+            "21 levels, 20 free coefficients"
+        );
+
+        let mut pop = population(1, 20);
+        let model = bind(&no_eta_model(), &mut pop).unwrap();
+        assert!(
+            compact_theta_blocks(&model.theta_names).is_empty(),
+            "20 levels, 19 free coefficients"
+        );
+
+        let mut pop = population(1, 20);
+        let model = bind(
+            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
+            &mut pop,
+        )
+        .unwrap();
+        assert_eq!(
+            compact_theta_blocks(&model.theta_names),
+            vec![("PLACEBO".to_string(), 1..21)],
+            "20 levels, 20 free coefficients"
+        );
+    }
+
+    /// T8. The report is what the model applies, read off the model's own
+    /// `pk_param_fn` rather than off any closed form: with `CL = TVCL + PLACEBO`
+    /// and η = 0, each level's `CL` is `TVCL + value`, bit for bit, under every
+    /// contrast that has a dependent level. T1 pins the values against closed
+    /// forms, which agree with the gather by construction while the report calls
+    /// it; this test does not depend on how the report computes them.
+    ///
+    /// Mutation — re-derive the value locally (`Free(k) => theta[k]`,
+    /// `NegSum(a, b) => -theta[a..b].sum()`) and flip `NegSum`'s sign in
+    /// `eval_gather`: T1–T5 stay green, and this dies on the first dependent level.
+    #[test]
+    fn every_reported_value_is_what_the_model_applies_at_that_level() {
+        for contrast in ["sum_to_zero", "ref", "sum_to_zero_within"] {
+            let mut pop = population(2, 3);
+            let text = no_eta_model().replace(
+                "[STUDY, TIME]",
+                &format!("[STUDY, TIME, contrast = {contrast}]"),
+            );
+            let model = bind(&text, &mut pop).unwrap();
+            let mut t = distinct_theta(model.n_theta);
+            t[0] = 2.0; // TVCL, so CL does not collapse onto the level's value
+            let values = placebo_values(&model, &t);
+            assert_eq!(values.len(), 6, "{contrast}: 2 studies x 3 times");
+            assert!(
+                values.iter().any(|v| v.theta_index.is_none()),
+                "{contrast}: has a dependent level, so the gather's NegSum arm is read"
+            );
+            let eta = vec![0.0; model.n_eta];
+            for (i, v) in values.iter().enumerate() {
+                let mut covs = HashMap::new();
+                covs.insert("STUDY".to_string(), if i < 3 { 1.0 } else { 2.0 });
+                covs.insert("__level_PLACEBO".to_string(), (i + 1) as f64);
+                let cl = (model.pk_param_fn)(&t, &eta, &covs, 0.0).values[crate::types::PK_IDX_CL];
+                assert_eq!(
+                    cl.to_bits(),
+                    (t[0] + v.value).to_bits(),
+                    "{contrast}, level {} (`{}`): the model applies CL = {cl}, the report \
+                     says TVCL + {}",
+                    i + 1,
+                    v.label,
+                    v.value
+                );
+            }
+        }
     }
 }

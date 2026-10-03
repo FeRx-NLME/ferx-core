@@ -81,21 +81,31 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
     (mn, mx, mean, var.sqrt())
 }
 
-/// Print NONMEM-style results to stderr
-/// Level count above which a θ level block (#1064) is reported as its
-/// own compact section instead of one entry per level in the θ table.
+/// Number of **free** coefficients at or above which a θ vector or level block
+/// (#1064) is reported as its own compact section instead of one entry per θ in
+/// the θ table.
+///
+/// The count is of the block's entries in `theta_names` — its estimated θ — not of
+/// its levels: a `sum_to_zero` block's dependent level has no θ, so a 21-level
+/// block (20 free coefficients) is compacted and a 20-level one (19) is not.
+/// [`compact_theta_blocks`] applies the rule; call it rather than comparing against
+/// this constant, so a caller cannot drift from the writers (#1623).
 ///
 /// A four-level block reads better inline, exactly as it did before the
 /// feature existed; an unstructured placebo effect with 800 levels would bury
 /// the structural parameters it exists to protect.
-pub(crate) const THETA_BLOCK_COMPACT_MIN: usize = 20;
+pub const THETA_BLOCK_COMPACT_MIN: usize = 20;
 
-/// The θ index ranges of the large vector / level blocks in `names`.
+/// The θ index ranges of the vector / level blocks in `names` that carry
+/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients — the blocks that `print_results`,
+/// `format_summary` and the fit YAML report in their own compact section.
 ///
 /// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
-/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket.
-/// Levels of a block are contiguous by construction.
-pub(crate) fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
+/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket, and
+/// neural-network weights are named without one. So any run of `NAME[…]` names is
+/// a block — a counted `theta NAME[N]` block as well as a level block. Levels of a
+/// block are contiguous by construction.
+pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
     let block_of = |n: &String| -> Option<String> {
         n.strip_suffix(']')
             .and_then(|r| r.split_once('['))
@@ -212,6 +222,7 @@ fn standard_error_source_note(result: &FitResult) -> Option<String> {
     })
 }
 
+/// Print NONMEM-style results to stderr
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
