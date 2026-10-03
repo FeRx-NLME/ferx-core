@@ -101,6 +101,15 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A θ level block read directly in the prediction keeps the analytic gradient**
+  (#1636). This covers `y = central / V * SCALE[STUDY]` in `[scaling]` and
+  `y = PLACEBO[STUDY] + ...` in a compartment-free model. Before, every subject fell back
+  to finite-difference gradients while `optimizer = auto` stayed on L-BFGS. On a 12-subject
+  ODE example the fit stopped at OFV −56.99, 51 points above the −108.28 that the same
+  model reaches with the read written in `[individual_parameters]`. The closed-form
+  engine stopped at −59.07. Both spellings now fit identically. Such a fit may now
+  converge to different (better) estimates than before. The levels are no longer reported
+  as "declared in [parameters] but not referenced".
 - **A `theta NAME[COL, ...]` block's internal `__level_NAME` column no longer shows up in
   the undeclared-covariate warning or in column lists** (#1644). The "not declared in
   [covariates]" warning no longer lists it; the block's own columns, such as `STUDY`, are
