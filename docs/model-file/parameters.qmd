@@ -149,6 +149,23 @@ cannot serve. An index that does not read a compartment amount can instead be
 computed in `[individual_parameters]` (`K = ...`, then `SCALE[K]`), which keeps
 the analytic gradient.
 
+A block is readable exactly where a θ written by name is. Besides the two places
+above, that is a residual-error magnitude
+(`DV ~ proportional(PROP_ERR * ERRSCALE[STUDY])`) and `[derived]`. A kappa
+`weight` may read a block only if it is `FIX`, as it may a θ.
+
+Four places cannot read a θ, so they refuse a level block when the model is
+parsed:
+
+- the `[odes]` right-hand side,
+- `init(...)`,
+- an ODE-accumulated `[event_model] hazard`,
+- an error-model selector condition, `if (...)`.
+
+For the first three, assign the block in `[individual_parameters]`
+(`KM_I = KM[K]`) and use `KM_I`. A selector condition reads per-row data
+columns only, so put the grouping in a data column and select on that.
+
 ### Identifiability
 
 `PLACEBO[STUDY, TIME]` alongside an intercept is rank-deficient — the levels sum
