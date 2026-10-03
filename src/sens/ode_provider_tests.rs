@@ -12350,3 +12350,117 @@ fn ode_provider_ss_record_stops_a_zero_order_window_with_a_moving_end() {
         }
     }
 }
+
+// ── θ level gathers on the ODE engine (#1636, #1641) ─────────────────────────
+//
+// `sens/ode_provider.rs` reads a gather two ways: through an individual-parameter
+// slot (`CL = PLACEBO[PLA_IDX]`, #1628's fold) and, since #1636, through a readout
+// gather lifted into the synthetic slot `__ferx_ro_g0`. Each is checked `Dual2`-vs-FD
+// of the production predictor with a subject-constant index and with one that moves
+// per observation, and each asserts the gathered column is live, so the parity cannot
+// pass by comparing two zeros.
+
+fn ode_gather_model(cl_line: &str, readout: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta PLACEBO[3](1.0, -10.0, 10.0)
+  theta TVV(12.0, 0.1, 500.0)
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  {cl_line}
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL / V * central
+[scaling]
+  y = {readout}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    )
+}
+
+/// `[constant index 2, index moving per observation]` subjects.
+fn ode_gather_subjects() -> [Subject; 2] {
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+    let mut constant = bolus_subject(&times);
+    constant.covariates.insert("PLA_IDX".to_string(), 2.0);
+    let levels = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+    let mut moving = bolus_subject(&times);
+    moving.covariates.insert("PLA_IDX".to_string(), levels[0]);
+    moving.obs_covariates = levels
+        .iter()
+        .map(|&l| HashMap::from([("PLA_IDX".to_string(), l)]))
+        .collect();
+    moving.dose_covariates = vec![HashMap::from([("PLA_IDX".to_string(), levels[0])])];
+    assert!(moving.has_tv_covariates());
+    [constant, moving]
+}
+
+/// θ = [TVCL, PLACEBO[1..3], TVV], with distinct levels.
+const ODE_GATHER_THETA: [f64; 5] = [4.0, 0.8, 1.3, 0.7, 12.0];
+
+fn check_ode_gather_case(label: &str, model: &CompiledModel) {
+    assert!(
+        ode_analytical_supported(model),
+        "{label}: must be served by the ODE dual path, not routed to FD"
+    );
+    let eta = [0.1];
+    for (s, index) in ode_gather_subjects()
+        .iter()
+        .zip(["constant", "per-observation"])
+    {
+        check_vs_production(model, s, &ODE_GATHER_THETA, &eta);
+        let sens = ode_subject_sensitivities(model, s, &ODE_GATHER_THETA, &eta).expect("supported");
+        // Levels sit at θ indices 1..=3. The constant subject reads level 2 only.
+        let live: Vec<usize> = (1..=3)
+            .filter(|&k| {
+                sens.obs.iter().any(|o| {
+                    assert!(
+                        o.df_dtheta[k].is_finite(),
+                        "{label}, {index}: ∂f/∂θ{k} not finite"
+                    );
+                    o.df_dtheta[k].abs() > 1e-6
+                })
+            })
+            .collect();
+        let want: &[usize] = if index == "constant" {
+            &[2]
+        } else {
+            &[1, 2, 3]
+        };
+        assert_eq!(
+            live, want,
+            "{label}, {index} index: the live gathered columns, so the parity above is not \
+             a comparison of zeros"
+        );
+    }
+}
+
+/// #1641: a slot whose only θ read is a gather, on the ODE engine.
+#[test]
+fn ode_gather_only_individual_parameter_slot_dual_matches_fd() {
+    let m = parse_model_string(&ode_gather_model("CL = PLACEBO[PLA_IDX]", "central / V"))
+        .expect("parse");
+    check_ode_gather_case("ODE, CL = PLACEBO[PLA_IDX]", &m);
+}
+
+/// #1636: a gather read in the Form-C readout, lifted into `__ferx_ro_g0`.
+#[test]
+fn ode_readout_gather_dual_matches_fd() {
+    let m = parse_model_string(&ode_gather_model(
+        "CL = TVCL",
+        "central / V * PLACEBO[PLA_IDX]",
+    ))
+    .expect("parse");
+    assert!(
+        m.indiv_param_names.iter().any(|n| n == "__ferx_ro_g0"),
+        "premise: the readout gather was lifted: {:?}",
+        m.indiv_param_names
+    );
+    check_ode_gather_case("ODE, y = central / V * PLACEBO[PLA_IDX]", &m);
+}

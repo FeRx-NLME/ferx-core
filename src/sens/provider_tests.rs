@@ -12493,6 +12493,52 @@ mod theta_gather_sens {
             "past the axis ladder the provider must decline, not truncate"
         );
     }
+
+    /// #1636: a gather read in the closed-form Form-C readout
+    /// (`y = central / V * PLACEBO[PLA_IDX]`), lifted into `__ferx_ro_g0`, checked
+    /// on the closed-form provider with a constant index and on the event-walk
+    /// provider with a per-observation one. In both, `∂f/∂PLACEBO[k]` is the
+    /// readout's own `central / V` on the rows that select level `k` and zero on the
+    /// rest, so the live set is pinned exactly.
+    #[test]
+    fn a_readout_gather_dual_matches_fd() {
+        let src = gather_only_model("  CL = TVCL").replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V * PLACEBO[PLA_IDX]\n[error_model]",
+        );
+        let m = parse_model_string(&src).expect("parse");
+        assert!(
+            m.indiv_param_names.iter().any(|n| n == "__ferx_ro_g0"),
+            "premise: the readout gather was lifted: {:?}",
+            m.indiv_param_names
+        );
+        assert!(
+            sens_supported(&m) && readout_tvcov_supported(&m),
+            "closed-form engine: a lifted readout gather must stay analytic"
+        );
+        let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+        let eta = [-0.05];
+        let mut constant = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0, 24.0],
+        );
+        constant.covariates.insert("PLA_IDX".to_string(), 2.0);
+        let moving = subject_with_levels(&[0.5, 2.0, 6.0, 12.0, 24.0], &[1.0, 2.0, 3.0, 1.0, 2.0]);
+        for (index, s, want) in [
+            ("constant", &constant, vec![2]),
+            ("per-observation", &moving, vec![1, 2, 3]),
+        ] {
+            check_full_provider_vs_fd(&m, s, &theta, &eta);
+            let sens = subject_sensitivities(&m, s, &theta, &eta).expect("supported");
+            let live: Vec<usize> = (1..=3)
+                .filter(|&k| sens.obs.iter().any(|o| o.df_dtheta[k].abs() > 1e-6))
+                .collect();
+            assert_eq!(
+                live, want,
+                "closed-form engine, {index} index: the live gathered columns"
+            );
+        }
+    }
 }
 
 /// `MR_MIXED_1CPT` with a `TAD` factor on the elimination term — the shape the
