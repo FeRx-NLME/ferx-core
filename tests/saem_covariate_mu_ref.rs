@@ -797,3 +797,176 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
         );
     }
 }
+
+// ── #1620: two covariate mu-references sharing a free theta ──────────────────
+
+/// NONMEM 7.6.0 `METHOD=SAEM` finals on the shared-exponent model,
+/// `nonmem_anchor/results/covmuref_shared_saem.ext` (the `-1000000000` row).
+const NM_SHARED_SAEM_TVCL: f64 = 4.940_45;
+const NM_SHARED_SAEM_TH_WT: f64 = 0.661_832;
+const NM_SHARED_SAEM_TH_CRCL: f64 = 0.564_521;
+
+/// NONMEM 7.6.0 `METHOD=IMPMAP` finals on the same model and data,
+/// `nonmem_anchor/results/covmuref_shared_impmap.ext`.
+const NM_SHARED_IMPMAP_TVCL: f64 = 4.940_34;
+const NM_SHARED_IMPMAP_TH_WT: f64 = 0.662_081;
+const NM_SHARED_IMPMAP_TH_CRCL: f64 = 0.562_988;
+
+/// Where ferx landed before #1620 on the same fixture, options and seed
+/// (`9423e333`, `ci-test`, aarch64): SAEM drove the shared exponent to its
+/// lower bound, IMPMAP dragged the renal exponent and `TVCL` down with it.
+const BEFORE_SHARED_SAEM_TH_WT: f64 = 0.010_075;
+const BEFORE_SHARED_IMPMAP_TH_CRCL: f64 = 0.358_114;
+const BEFORE_SHARED_IMPMAP_TVCL: f64 = 4.744_483;
+
+/// Bounds against the NONMEM anchors, from the realised errors on aarch64
+/// (`ci-test`) at the time of writing:
+///
+/// | arm | `THETA_WT` | `THETA_CRCL` | `TVCL` |
+/// |---|---:|---:|---:|
+/// | SAEM, seed 1, 150/250 | 0.0140 | 0.0018 | 0.0008 |
+/// | SAEM, seed 1, 300/700 | 0.0106 | 0.0015 | 0.0012 |
+/// | SAEM, `score_sa`, 150/250 | 0.0143 | 0.0048 | 0.0043 |
+/// | IMPMAP, seed 1 | 0.0104 | 0.0008 | 0.0011 |
+///
+/// `THETA_WT` is the noisiest coordinate: seeds 2 and 3 of the 150/250 arm land
+/// at 0.6269 and 0.6620 (|Δ| 0.035 and 0.0002), so 0.04 holds a different
+/// Monte Carlo path, not only this one, with 2.8× headroom on the realised
+/// 0.0143. `THETA_CRCL` and `TVCL` take 0.015, ≥3× their worst. All three are
+/// far inside the defects they exist to catch: the pre-#1620 `THETA_WT` of
+/// 0.0101 (|Δ| 0.65), and the "drop both groups" alternative, which freed
+/// `THETA_WT` but put `THETA_CRCL` at 0.025 (|Δ| 0.54).
+const SHARED_TH_WT_TOL: f64 = 0.04;
+const SHARED_TH_CRCL_TOL: f64 = 0.015;
+const SHARED_TVCL_TOL: f64 = 0.015;
+
+/// The joint-step note the fit must carry: the defect was a *silent* decline,
+/// so the note is part of what is pinned.
+const SHARED_NOTE: &str = "covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) \
+                           and ETA_V1 (reads TVV1, THETA_WT) share THETA_WT and take one joint \
+                           M-step that re-centres both (#1620).";
+
+/// `nonmem_anchor/covmuref_shared_saem_fit.ferx` on the bundled data, through
+/// the same file entry point the CLI uses, with the twin's own `[fit_options]`
+/// edited by `edit`.
+fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
+    let model = Path::new("nonmem_anchor").join("covmuref_shared_saem_fit.ferx");
+    let src = std::fs::read_to_string(&model).expect("anchor model file");
+    let mut opts = parse_full_model(&src)
+        .expect("anchor model parses")
+        .fit_options;
+    edit(&mut opts);
+    let result = ferx_core::fit_from_files(
+        model.to_str().unwrap(),
+        Some("data/two_cpt_oral_cov.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("the fit must run");
+    let notes: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("covariate mu-reference"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", result.warnings);
+    assert!(notes[0].ends_with(SHARED_NOTE), "{}", notes[0]);
+    result
+}
+
+/// The SAEM arms share one body, so an arm cannot drift onto weaker
+/// assertions than its siblings.
+fn assert_saem_shared_arm(name: &str, result: &FitResult) {
+    let th_wt = theta(result, "THETA_WT");
+    assert_finite_close(
+        &format!("{name}: THETA_WT"),
+        th_wt,
+        NM_SHARED_SAEM_TH_WT,
+        SHARED_TH_WT_TOL,
+    );
+    assert!(
+        (th_wt - BEFORE_SHARED_SAEM_TH_WT).abs() > 0.5,
+        "{name}: THETA_WT = {th_wt:.4} must be clear of the pre-#1620 bound at \
+         {BEFORE_SHARED_SAEM_TH_WT}"
+    );
+    assert_finite_close(
+        &format!("{name}: THETA_CRCL"),
+        theta(result, "THETA_CRCL"),
+        NM_SHARED_SAEM_TH_CRCL,
+        SHARED_TH_CRCL_TOL,
+    );
+    assert_finite_close(
+        &format!("{name}: TVCL"),
+        theta(result, "TVCL"),
+        NM_SHARED_SAEM_TVCL,
+        SHARED_TVCL_TOL,
+    );
+}
+
+/// Tier-3, #1620 (T10). `examples/two_cpt_oral_cov.ferx` reads `THETA_WT` in
+/// both `CL` and `V1`. Before #1620 the second covariate mu-reference was
+/// declined and the first one's M-step moved `THETA_WT` with `ETA_V1` left free
+/// to absorb it: SAEM put the exponent at 0.0101 against NONMEM SAEM's 0.6618.
+/// The two now take one joint M-step that re-centres both etas.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
+)]
+fn saem_recovers_a_shared_allometric_exponent() {
+    let result = fit_shared(|_| {});
+    assert_saem_shared_arm("SAEM 150/250", &result);
+}
+
+/// Tier-3, #1620 (T11). The same anchor through `score_sa` and through the
+/// longer 300/700 schedule: both sat at the 0.0100 bound before the fix, so the
+/// defect was not a schedule or solver artefact, and neither is the fix.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
+)]
+fn saem_recovers_a_shared_allometric_exponent_on_every_mstep_arm() {
+    let sa = fit_shared(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
+    assert_saem_shared_arm("SAEM score_sa 150/250", &sa);
+    let long = fit_shared(|o| {
+        o.saem_n_exploration = 300;
+        o.saem_n_convergence = 700;
+    });
+    assert_saem_shared_arm("SAEM 300/700", &long);
+}
+
+/// Tier-3, #1620 (T12). IMPMAP had the same defect in a milder form: the
+/// shared exponent survived, but `THETA_CRCL` fell to 0.358 and `TVCL` to 4.744
+/// against NONMEM IMPMAP's 0.5630 and 4.9403. Only the coordinates of the
+/// joint group are asserted: ferx IMPMAP sits ~21 objective units above FOCEI
+/// and NONMEM IMPMAP on this model whether or not a theta is shared, with
+/// `ω²(ETA_V1)` and `ω²(ETA_KA)` carrying most of it — that is #1629, not this.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
+)]
+fn imp_recovers_the_shared_exponent_coordinates() {
+    let result = fit_shared(|o| o.method = EstimationMethod::Impmap);
+    let th_crcl = theta(&result, "THETA_CRCL");
+    let tvcl = theta(&result, "TVCL");
+    assert_finite_close(
+        "IMPMAP: THETA_WT",
+        theta(&result, "THETA_WT"),
+        NM_SHARED_IMPMAP_TH_WT,
+        SHARED_TH_WT_TOL,
+    );
+    assert_finite_close(
+        "IMPMAP: THETA_CRCL",
+        th_crcl,
+        NM_SHARED_IMPMAP_TH_CRCL,
+        SHARED_TH_CRCL_TOL,
+    );
+    assert_finite_close("IMPMAP: TVCL", tvcl, NM_SHARED_IMPMAP_TVCL, SHARED_TVCL_TOL);
+    assert!(
+        (th_crcl - BEFORE_SHARED_IMPMAP_TH_CRCL).abs() > 0.15
+            && (tvcl - BEFORE_SHARED_IMPMAP_TVCL).abs() > 0.15,
+        "IMPMAP: THETA_CRCL {th_crcl:.4} / TVCL {tvcl:.4} must be clear of the pre-#1620 \
+         {BEFORE_SHARED_IMPMAP_TH_CRCL} / {BEFORE_SHARED_IMPMAP_TVCL}"
+    );
+}

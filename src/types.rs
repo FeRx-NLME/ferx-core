@@ -3529,22 +3529,38 @@ pub struct CovariateMuRef {
     pub transform: MuTransform,
     /// Data covariates the typical value reads (names as written).
     pub covariate_names: Vec<String>,
-    /// The subset of [`Self::theta_names`] the rest of the model also reads.
+    /// The subset of [`Self::theta_names`] the rest of the model also reads:
+    /// every theta that reaches the likelihood by a route other than this
+    /// typical value, including through another covariate mu-reference.
     ///
-    /// Empty is the ordinary case and the precondition for the exact M-step
-    /// engine: freezing `φ_i` freezes the individual parameter, so the data term
-    /// is constant in the group's thetas *only* when those thetas reach the
-    /// likelihood through this typical value alone. A theta listed here is still
-    /// estimated by the group — it just forces the prior-plus-data engine, which
-    /// keeps the term it is live in.
+    /// Empty is the ordinary case. This is a description of the model, not the
+    /// engine decision: two typical values sharing a theta (`CL` and `V1` both
+    /// reading `TH_WT`) each list it here, yet SAEM and IMP/IMPMAP merge them
+    /// into one group whose M-step can still drop the data term (#1620). What
+    /// decides that is the crate-internal `read_outside_groups` — the same walk
+    /// with every group's defining statement excluded — together with the
+    /// mu-references the estimator left out of the group.
     pub shared_thetas: Vec<String>,
+    /// The subset of [`Self::theta_names`] that reaches the likelihood through
+    /// something **other than a recorded covariate mu-reference** — the same
+    /// reachability walk as [`Self::shared_thetas`], with the taint stopped at
+    /// *every* group's defining statement instead of only this one's.
+    ///
+    /// Two groups sharing a theta (`CL` and `V1` both reading `TH_WT`) list it
+    /// in `shared_thetas` — each reads it outside the other — but not here.
+    /// That distinction is what lets the estimator merge them into one joint
+    /// M-step and still take the exact engine: once every member's `φ_i` is
+    /// frozen, a theta read only by the members no longer reaches the data
+    /// (#1620). A theta listed here keeps the observation term whatever the
+    /// grouping.
+    pub(crate) read_outside_groups: Vec<String>,
     /// Whether a right-hand side other than this group's own typical value also
     /// reads [`Self::eta_name`].
     ///
-    /// The eta-side twin of [`Self::shared_thetas`], and the second reason the
+    /// The eta-side twin of `read_outside_groups`, and the second reason the
     /// exact engine can be inadmissible: the group step re-centres `η_ik` to
     /// hold `φ_i` fixed, which only leaves the data alone when this typical
-    /// value is the eta's *only* consumer. Like a shared theta it does not drop
+    /// value is the eta's *only* consumer. Like such a theta it does not drop
     /// the group — it forces the prior-plus-data engine, which evaluates the
     /// observation term with the shift applied.
     pub(crate) eta_shared: bool,

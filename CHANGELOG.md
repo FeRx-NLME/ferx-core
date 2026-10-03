@@ -90,6 +90,18 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **SAEM and IMP/IMPMAP no longer drive a covariate theta shared by two typical values to its
+  bound** (#1620). When two covariate mu-referenced typical values read the same estimated
+  theta — `CL = TVCL*(WT/70)^THETA_WT*…*exp(ETA_CL)` next to
+  `V1 = TVV1*(WT/70)^THETA_WT*exp(ETA_V1)`,
+  as in `examples/two_cpt_oral_cov.ferx` — the second one used to be declined, and the first
+  one's M-step moved `THETA_WT` with `ETA_V1` left free to absorb the change: SAEM put `THETA_WT` at
+  0.0101 against NONMEM SAEM's 0.6618, and IMPMAP pulled `THETA_CRCL` to 0.358 (NONMEM IMPMAP 0.5630).
+  Typical values that share a free theta now take one joint M-step that fits all of their
+  thetas and re-centres every one of their etas, and the fit says so in a warning naming the
+  etas and the shared theta. Validated against NONMEM 7.6.0 `METHOD=SAEM` and `METHOD=IMPMAP`
+  (`nonmem_anchor/covmuref_shared_{saem,impmap}.ctl`). Models whose covariate mu-references share
+  no theta give bit-identical results.
 - **Every `simulate*` entry point now refuses a θ vector whose length is not the model's**
   (#1614, `E_THETA_LENGTH`). A short vector used to simulate `Ok` rows from zeros past its
   end (every prediction `0.0` on a plain two-θ model given one value), and a long one
