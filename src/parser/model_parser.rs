@@ -2666,15 +2666,26 @@ pub fn parse_full_model_with(
             // start and crosses zero mid-fit divides an individual parameter by
             // zero with no diagnostic. A FIXed theta is a known constant, so it
             // is as safe as a covariate column and stays allowed.
-            let mut estimated: Vec<&str> = Vec::new();
+            // Each entry is how the read is named in the refusal: a scalar θ by its
+            // name, a θ level block by the block (#1639) — the block is what the
+            // user wrote, and one estimated level is enough to move the weight.
+            let mut estimated: Vec<String> = Vec::new();
             visit_expr_nodes(&expr, &mut |e: &Expression| {
-                if let Expression::Theta(ti) = e {
-                    if thetas.get(*ti).is_some_and(|t| !t.fixed) {
-                        let tn = thetas[*ti].name.as_str();
-                        if !estimated.contains(&tn) {
-                            estimated.push(tn);
-                        }
+                let entry = match e {
+                    Expression::Theta(ti) if thetas.get(*ti).is_some_and(|t| !t.fixed) => {
+                        format!("`{}`", thetas[*ti].name)
                     }
+                    Expression::ThetaGather { spec, .. }
+                        if spec
+                            .theta_indices()
+                            .any(|ti| thetas.get(ti).is_some_and(|t| !t.fixed)) =>
+                    {
+                        format!("`{}` (a θ level block with an estimated level)", spec.name)
+                    }
+                    _ => return,
+                };
+                if !estimated.contains(&entry) {
+                    estimated.push(entry);
                 }
             });
             if !estimated.is_empty() {
@@ -2685,11 +2696,7 @@ pub fn parse_full_model_with(
                      the fit, so the up-front check that it stays strictly positive cannot certify \
                      it, and a weight that crosses zero divides an individual parameter by zero. \
                      Declare the constant `FIX`, or move it into a covariate column.",
-                    estimated
-                        .iter()
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    estimated.join(", "),
                 ));
             }
             out.push(Some(expr));
@@ -2948,6 +2955,14 @@ pub fn parse_full_model_with(
                     "[odes]: state `{state}` collides with the cumulative-hazard accumulator \
                      the parser appends for the [event_model] CMT={cmt} hazard (joint PK-TTE) \
                      — rename the ODE state (`__chz_*` names are reserved)."
+                ));
+            }
+            // #1637: the hazard compiles as an `[odes]` line, so the level-block gate
+            // would refuse it there, naming a `d/dt(__chz_*)` line the user never wrote.
+            // Refuse it here instead, naming the hazard as written.
+            if let Some(why) = ode_level_block_read(&hazard_expr)? {
+                return Err(format!(
+                    "[event_model] CMT={cmt} `hazard = {hazard_expr}`: {why}"
                 ));
             }
             ode_lines.push(format!("d/dt({state}) = {hazard_expr}"));
@@ -5761,6 +5776,8 @@ fn parse_derived_block(
             fallback_covariate: false,
             nn_specs: &[],
             ode_state_names,
+            // `[derived]` reads θ by name (documented), so it reads a block too.
+            level_blocks: LevelBlockScope::Readable,
         };
 
         // ── Tokenize ──────────────────────────────────────────────────────────
@@ -16831,6 +16848,7 @@ fn parse_selected_error_model(
         fallback_covariate: true,
         nn_specs: &no_nn,
         ode_state_names: &no_names,
+        level_blocks: LevelBlockScope::SelectorCondition,
     };
 
     let bytes = s.as_bytes();
@@ -17678,7 +17696,11 @@ fn validate_ruv_expr(
                          the sigma are allowed)",
                         name
                     ));
-                } else if !name.eq_ignore_ascii_case("TIME") {
+                } else if !name.eq_ignore_ascii_case("TIME") && !is_level_index_column(name) {
+                    // A level block's synthesized index column (`__level_NAME`, the
+                    // implicit index of a bare `NAME`) is engine plumbing the user
+                    // cannot declare; the binder fills it in every row (#1638).
+                    //
                     // An undeclared covariate silently evaluates to 0.0 at every
                     // observation, collapsing the magnitude to a constant — so
                     // require declaration whether or not a [covariates] block
@@ -17822,18 +17844,22 @@ fn build_ruv_magnitude(
             fallback_covariate: true,
             nn_specs: &[],
             ode_state_names: &[],
+            // A residual magnitude reads θ by name (#484), so it reads a block too.
+            level_blocks: LevelBlockScope::Readable,
         };
         let expr = parse_scalar_expression(src, ctx)
             .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref())?;
-        visit_expr_nodes(&expr, &mut |e: &Expression| match e {
-            Expression::Theta(i) => {
-                used_thetas.insert(*i);
-            }
-            Expression::Variable(name) if name.eq_ignore_ascii_case("TAD") => {
+        // `note_theta_eta` counts a gather as every θ of its block (#1638): a
+        // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
+        // magnitude-aware fallback, and the levels are not "unreferenced". η is
+        // already refused by `validate_ruv_expr`, so `_etas` stays empty.
+        let mut _etas = std::collections::HashSet::new();
+        visit_expr_nodes(&expr, &mut |e: &Expression| {
+            note_theta_eta(e, &mut used_thetas, &mut _etas);
+            if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
                 uses_tad = true;
             }
-            _ => {}
         });
         collect_covariates(&expr, &mut used_covs);
         let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
@@ -18895,6 +18921,94 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The refusal for a θ level block read where θ is not in scope (#1637). One
+/// builder for every caller, so the `[odes]`, `init(...)` and `hazard =` refusals
+/// cannot word the same condition differently. `spelling` is the read as written
+/// (`KM[K]`, `KM`), echoed into the remedy. `place` names the ODE-side context
+/// (`[odes]`, or the hazard, which compiles as an `[odes]` line but is written in
+/// `[event_model]`); the selector wording does not use it.
+fn level_block_unreadable_message(
+    name: &str,
+    spelling: &str,
+    scope: LevelBlockScope,
+    place: &str,
+) -> String {
+    match scope {
+        LevelBlockScope::SelectorCondition => format!(
+            "[error_model]: `{name}` is a θ level block. An error-model selector condition \
+             reads per-row data columns only, so it cannot read a θ. Put the grouping in a \
+             data column and select on that column."
+        ),
+        _ => format!(
+            "`{name}` is a θ level block, and {place} cannot read a θ directly. Assign it \
+             in [individual_parameters] (e.g. `{name}_I = {spelling}`) and use `{name}_I` \
+             instead."
+        ),
+    }
+}
+
+/// The `[odes]`-scope refusal for the first θ level block `src` reads, if any (#1637).
+/// For an expression that compiles as an ODE line but is written elsewhere (the
+/// joint PK-TTE `hazard =`), so its caller can name the line the user wrote.
+#[cfg(feature = "survival")]
+fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
+    let tokens = tokenize(src)?;
+    for (pos, t) in tokens.iter().enumerate() {
+        let Token::Ident(name) = t else { continue };
+        // `NAME.OUTPUT` is an NN output access, not a block read.
+        if pos > 0 && tokens[pos - 1] == Token::Dot {
+            continue;
+        }
+        if lookup_vector_theta(name).is_some() {
+            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket) {
+                format!("{name}[{}]", render_index_tokens(&tokens, pos + 2))
+            } else {
+                name.clone()
+            };
+            return Ok(Some(level_block_unreadable_message(
+                name,
+                &spelling,
+                LevelBlockScope::Ode,
+                "an ODE-accumulated `hazard`",
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// The source text of a level-block index, from the token after `[` up to its
+/// matching `]`, for echoing the read back in a diagnostic (#1637).
+fn render_index_tokens(tokens: &[Token], start: usize) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for t in tokens.iter().skip(start) {
+        let piece = match t {
+            Token::RBracket if depth == 0 => break,
+            Token::LBracket => {
+                depth += 1;
+                "[".to_string()
+            }
+            Token::RBracket => {
+                depth -= 1;
+                "]".to_string()
+            }
+            Token::Number(v) => format!("{v}"),
+            Token::Ident(s) => s.clone(),
+            Token::LParen => "(".into(),
+            Token::RParen => ")".into(),
+            Token::Plus => " + ".into(),
+            Token::Minus => " - ".into(),
+            Token::Star => " * ".into(),
+            Token::Slash => " / ".into(),
+            Token::Caret => "^".into(),
+            Token::Comma => ", ".into(),
+            _ => "…".into(),
+        };
+        out.push_str(&piece);
+    }
+    out
+}
+
 /// Look up a declared θ level block by name.
 fn lookup_vector_theta(name: &str) -> Option<VectorThetaDecl> {
     VECTOR_THETAS.with(|c| c.borrow().iter().find(|d| d.name == name).cloned())
@@ -19461,6 +19575,26 @@ struct ParseCtx<'a> {
     /// ODE state variable names for detecting compartment references in
     /// integral integrands (`uses_compartments` flag). Empty for analytical models.
     ode_state_names: &'a [String],
+    /// Whether a θ level block may be read here (#1637). A field every context sets
+    /// on purpose, not a proxy: `theta_names.is_empty()` would refuse a model whose
+    /// only θ form a block with no free level, and "every `theta_indices()` in range"
+    /// passes such a block everywhere (`all` over an empty set is true).
+    level_blocks: LevelBlockScope,
+}
+
+/// Where a parse context sits, for the θ level-block gate in `parse_atom` (#1637).
+/// A level block is readable exactly where a scalar θ is (#1636 plan §1). The two
+/// refusing scopes word their refusal differently, because their remedies differ.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LevelBlockScope {
+    /// θ is in scope: `[individual_parameters]`, `[scaling]`, the residual magnitude,
+    /// `[derived]`, `[mixture]`.
+    Readable,
+    /// The `[odes]` right-hand side and `init(...)`, which read states and individual
+    /// parameters only. An injected `hazard =` line compiles here too.
+    Ode,
+    /// An error-model selector `if (...)`, which reads per-row data columns only.
+    SelectorCondition,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -19474,6 +19608,7 @@ impl<'a> ParseCtx<'a> {
             fallback_covariate: true,
             nn_specs: EMPTY_NN,
             ode_state_names: EMPTY,
+            level_blocks: LevelBlockScope::Readable,
         }
     }
 
@@ -19487,6 +19622,7 @@ impl<'a> ParseCtx<'a> {
             fallback_covariate: false,
             nn_specs: EMPTY_NN,
             ode_state_names: EMPTY,
+            level_blocks: LevelBlockScope::Ode,
         }
     }
 
@@ -26262,6 +26398,23 @@ fn parse_atom(
             // silently-zero covariate read.
             if let Some(decl) = lookup_vector_theta(name) {
                 let subscripted = tokens.get(pos + 1) == Some(&Token::LBracket);
+                // #1637: refuse before anything resolves the read — above the literal
+                // fold below, which would otherwise turn `KM[2]` into a plain
+                // `Theta(t)` read against the empty θ slice these contexts evaluate
+                // with (a silent 0, or an index-out-of-bounds panic).
+                if ctx.level_blocks != LevelBlockScope::Readable {
+                    let spelling = if subscripted {
+                        format!("{name}[{}]", render_index_tokens(tokens, pos + 2))
+                    } else {
+                        name.to_string()
+                    };
+                    return Err(level_block_unreadable_message(
+                        name,
+                        &spelling,
+                        ctx.level_blocks,
+                        "[odes]",
+                    ));
+                }
                 if subscripted {
                     let (idx_expr, p) = parse_add_sub(tokens, pos + 2, ctx)?;
                     if tokens.get(p) != Some(&Token::RBracket) {
