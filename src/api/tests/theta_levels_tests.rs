@@ -876,7 +876,7 @@ mod theta_gather_index_check {
 
 // ── #1064: binder helpers, branch by branch ────────────────────────────────
 mod binder_helpers {
-    use super::super::{cmp_levels, contrast_token, format_level_value, Level};
+    use super::super::{cmp_levels, contrast_token, format_level_value, free_count, Level};
     use super::*;
 
     #[test]
@@ -931,6 +931,27 @@ mod binder_helpers {
         assert_eq!(cmp_levels(&nan, &nan), Ordering::Equal);
         assert_ne!(cmp_levels(&nan, &one), Ordering::Equal);
         assert_eq!(cmp_levels(&nan, &one), cmp_levels(&nan, &one));
+    }
+
+    /// The free-θ count does not depend on `assign_groups` handing group ids out
+    /// contiguously (#1654 review). Ids `[0, 1, 0]` are two groups of sizes 2
+    /// and 1, so one free θ under a group-wise contrast; `none` frees all three.
+    ///
+    /// Mutation — drop the sort before `dedup`: the non-adjacent repeat of id 0
+    /// survives, three ids are counted, and the count drops to 0, a false
+    /// "estimates nothing".
+    #[test]
+    fn the_free_count_does_not_assume_contiguous_group_ids() {
+        use crate::parser::model_parser::LevelContrast;
+        for c in [
+            LevelContrast::SumToZero,
+            LevelContrast::SumToZeroWithin,
+            LevelContrast::Ref,
+        ] {
+            assert_eq!(free_count(&[0, 1, 0], c), 1, "{c:?}");
+            assert_eq!(free_count(&[0, 0, 1], c), 1, "{c:?} contiguous control");
+        }
+        assert_eq!(free_count(&[0, 1, 0], LevelContrast::Unconstrained), 3);
     }
 
     #[test]
