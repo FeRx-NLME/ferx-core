@@ -2030,7 +2030,7 @@ mod readout_share {
     /// T4. A named intermediate carries the block into `y`: a `[scaling]`
     /// intermediate, and the compartment-free `[structural_model]` one.
     ///
-    /// Mutation — skip `inline_scaling_intermediates` in `readout_level_exprs`:
+    /// Mutation — skip `inline_scaling_intermediates` in `readout_y_exprs`:
     /// `BASE` / `EFF` are then unknown names and both bind 17.
     #[test]
     fn a_named_intermediate_carries_the_block_into_y() {
@@ -2063,6 +2063,85 @@ mod readout_share {
         );
         assert_eq!(layout(&h1, 4), GLOBAL, "H1");
         assert_eq!(layout(&h2(""), 4), GLOBAL, "H2");
+    }
+
+    /// T10 (#1636 interplay). Since #1636 the parsed readout no longer carries
+    /// the gather: it is lifted into the synthetic parameter `__ferx_ro_g0`, and
+    /// the readout reads that variable. On every engine, the block read in `y`
+    /// next to an η on `E0` must still take within-study sum-to-zero, bit for
+    /// bit the explicit contrast's names. The control on the same engine moves
+    /// the η to `CL`, which reaches `y` only through the state, so the gather is
+    /// lifted on both sides of the gate and only the η path differs.
+    ///
+    /// Each case first asserts that the desugar really ran (`__ferx_ro_g0` is an
+    /// individual parameter). Without it, this would test the pre-#1636 readout.
+    ///
+    /// Mutation — run the predicate on the desugared readout
+    /// (`rewrite_readout_synth` over the source expressions): `y` then reads
+    /// `__ferx_ro_g0`, a skipped statement, so the block is invisible and every
+    /// sharing case binds 17.
+    #[test]
+    fn a_block_lifted_out_of_the_readout_still_shares_a_scale() {
+        const ODE: &str = "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central";
+        let share_ip = "  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0";
+        let state_ip = "  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0";
+        let engine = |name: &str, ip: &str, contrast: &str| -> String {
+            let analytic = scaling_model(ip);
+            let text = match name {
+                "analytical" => analytic,
+                "ode" => analytic.replace("  pk one_cpt_iv(cl=CL, v=V)", ODE),
+                _ => unreachable!(),
+            };
+            if contrast.is_empty() {
+                text
+            } else {
+                text.replace(
+                    "PLACEBO[STUDY, TIME]",
+                    &format!("PLACEBO[STUDY, TIME, contrast = {contrast}]"),
+                )
+            }
+        };
+        let mut cases: Vec<(String, String, String, (LevelContrast, usize))> = Vec::new();
+        for name in ["analytical", "ode"] {
+            cases.push((
+                format!("{name} share"),
+                engine(name, share_ip, ""),
+                engine(name, share_ip, "sum_to_zero_within"),
+                WITHIN,
+            ));
+            cases.push((
+                format!("{name} state-only control"),
+                engine(name, state_ip, ""),
+                engine(name, state_ip, "sum_to_zero"),
+                GLOBAL,
+            ));
+        }
+        cases.push((
+            "compartment-free share".into(),
+            h2(""),
+            h2("sum_to_zero_within"),
+            WITHIN,
+        ));
+
+        for (tag, auto, explicit, want) in cases {
+            let mut pa = cf_pop(3, 1, &T6);
+            let a = bind_parsed(&auto, &mut pa);
+            assert!(
+                a.model
+                    .indiv_param_names
+                    .iter()
+                    .any(|n| n == "__ferx_ro_g0"),
+                "[{tag}] the readout gather was not lifted: {:?}",
+                a.model.indiv_param_names
+            );
+            assert_eq!(layout(&auto, 1), want, "[{tag}] auto");
+            let mut pe = cf_pop(3, 1, &T6);
+            let e = bind_parsed(&explicit, &mut pe);
+            assert_eq!(
+                a.model.theta_names, e.model.theta_names,
+                "[{tag}] auto ≡ explicit"
+            );
+        }
     }
 }
 

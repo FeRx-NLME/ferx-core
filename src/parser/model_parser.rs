@@ -3302,11 +3302,13 @@ pub fn parse_full_model_with(
     // question now that every `[individual_parameters]` statement has parsed —
     // the binder reads it back off `theta_blocks` to resolve
     // `LevelContrast::Auto`.
-    // The `y` readout counts too (#1642), read from its source text so the
-    // #486 desugaring above cannot hide the block from it.
+    // The `y` readout counts too (#1642). It is re-read from its source text,
+    // with the individual parameters in scope so they can carry a taint: the
+    // parsed readout has its θ/η and liftable gathers rewritten into
+    // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
     if !level_block_decls.is_empty() {
         let readout = match blocks.get("scaling") {
-            Some(lines) => readout_level_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
+            Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
                 .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
             None => Vec::new(),
         };
@@ -19622,7 +19624,7 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 ///
 /// The expressions are every `[individual_parameters]` assignment (`stmts`,
 /// `if`-branches included) and the `y` readouts (`readout`, from
-/// [`readout_level_exprs`]). Two taints propagate through assignments: "reads
+/// `readout_y_exprs`: `y`, `y[CMT=n]` and a compartment-free `y =`). Two taints propagate through assignments: "reads
 /// the block" and "carries an η". So the idiomatic
 ///
 /// ```text
@@ -19637,9 +19639,10 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// to global sum-to-zero. States are not tainted: an η that reaches `y` only
 /// through the ODE/PK state does not count, in either block.
 ///
-/// Statements the #486 desugaring appended (`__ferx_ro_*`, `__ferx_pktime_*`)
-/// are skipped — they are not user expressions, and the readout is read from
-/// its source text instead. The propagation is a fixpoint over assignment
+/// Statements the #486/#1636 desugaring appended (`__ferx_ro_*`,
+/// `__ferx_pktime_*`) are skipped — they are not user expressions, and the
+/// readout is read from its source text instead, where a block lifted into
+/// `__ferx_ro_g{n}` is still the gather it is. The propagation is a fixpoint over assignment
 /// order, so a forward reference (not legal in this DSL anyway) cannot be
 /// missed by a single pass.
 fn block_shares_scale_with_eta(
@@ -19716,43 +19719,6 @@ fn block_shares_scale_with_eta(
             return None;
         }
     }
-}
-
-/// The `y` readouts of a `[scaling]` block (`y`, `y[CMT=n]`, and a
-/// compartment-free model's `y =`, which the extractor moved here), parsed from
-/// the **source text** with named intermediates inlined, for
-/// [`block_shares_scale_with_eta`] (#1642).
-///
-/// Parsed the way [`collect_readout_theta_eta_synth`] pre-scans, plus the
-/// individual-parameter names so they resolve to `Variable` and can carry a
-/// taint. Reading the source rather than the compiled readout keeps the
-/// decision independent of the #486/#1636 desugaring, which rewrites the
-/// parsed readout's θ/η into `__ferx_ro_*` variables.
-fn readout_level_exprs(
-    scaling_lines: &[String],
-    theta_names: &[String],
-    eta_names: &[String],
-    indiv_var_names: &[String],
-) -> Result<Vec<Expression>, String> {
-    let intermediates = scaling_intermediates(scaling_lines)?;
-    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-    let mut out = Vec::new();
-    for line in scaling_lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (key, value) = split_scaling_entry(trimmed)?;
-        let (base, _cmt) = parse_scaling_key(key)?;
-        if base != "y" {
-            continue;
-        }
-        let mut expr =
-            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
-        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
-        out.push(expr);
-    }
-    Ok(out)
 }
 
 fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
