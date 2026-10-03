@@ -382,14 +382,18 @@ made silently. On a block keyed on `TIME`, such as `PLACEBO[STUDY, TIME]`, this
 means the design can only be simulated at the fit's observation times. A denser
 VPC grid is refused, and so is a study the fit did not include. Levels match by
 their label (`STUDY=7,TIME=4`), so a value differing from the fit's in its last
-digit is a different level.
+digit is a different level. The refusal names actions rather than functions,
+because the R wrapper passes it through verbatim: simulate only the fit's
+levels, or simulate the design on its own levels without the fit's θ. From
+Rust, the second is `bind_theta_levels` on the design, with a θ for the levels
+it discovers (the model's `default_params`, for example).
 
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
 from zeros past its end, and a long one dropped its tail
 ([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)).
 
-### Level labels: `theta_level_map`
+### Level labels and values: `theta_level_map`, `theta_level_values` {#level-labels-values}
 
 A bound level block's estimates are named after their combination, such as
 `PLACEBO[STUDY=7,TIME=4]`. Under a sum-to-zero constraint one level is not a
@@ -397,3 +401,27 @@ free parameter, so it is absent from `FitResult::theta_names`.
 `theta_level_map(&parsed.model)` returns every level, the dependent one
 included, keyed by block name. Each label is the combination without the
 block name (`STUDY=7,TIME=4`), in index order.
+
+`theta_level_values(&parsed.model, &result.theta)` adds each level's value at
+that θ, in the same order. Each `ThetaLevelValue` carries the `label`, the
+`value`, and a `theta_index`. A free level's `theta_index` is `Some(k)`, its
+position in `theta`, `theta_names` and the θ standard errors, so SEs can be
+joined to it. A dependent level's is `None`. Its value is what the model
+applies: the negated sum of its group's free θ under `sum_to_zero` and
+`sum_to_zero_within`, and `0` for a `ref` reference level. The value is read
+through the same evaluator the predictions use, never re-derived. The θ must be
+laid out for that bound model, so pass the fit's own θ with the model it was
+fitted with (or one rebound with `bind_theta_levels_from_fit`). A θ of the wrong
+length is refused. Unbound blocks and counted `theta NAME[N]` blocks are left
+out.
+
+A block of 20 or more free coefficients is reported in its own compact section
+instead of one entry per θ in the main table, by the console report,
+`format_summary` and the fit YAML. `parameter_table`, `format_comparison`, the
+CLI's post-fit θ list and the JSON result list every θ. The rule is public as
+`ferx_core::io::output::compact_theta_blocks(&result.theta_names)`, which
+returns each such block's name and θ index range; the threshold is
+`THETA_BLOCK_COMPACT_MIN`. It counts free coefficients, not levels: a 21-level
+`sum_to_zero` block (20 free) is compacted and a 20-level one (19 free) is not.
+Call the function rather than comparing against the constant, so a wrapper
+cannot drift from the writers.

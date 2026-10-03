@@ -35,10 +35,10 @@ pub use api::{
     run_model_simulate, run_model_simulate_with_overrides, run_model_with_data,
     run_model_with_data_inits, run_model_with_overrides, simulate, simulate_adaptive,
     simulate_adaptive_from_spec, simulate_with_options, simulate_with_options_diag,
-    simulate_with_seed, simulate_with_uncertainty, theta_level_map, validate_model_file,
-    AdaptiveSimulateOptions, AdaptiveSimulationResult, PoolPlan, PredictionOutput,
-    PredictionResult, PreparedRun, RunOverrides, SimulateOptions, SimulateUncertaintyOptions,
-    SimulationOutput, SimulationResult, FIT_RAYON_STACK_SIZE,
+    simulate_with_seed, simulate_with_uncertainty, theta_level_map, theta_level_values,
+    validate_model_file, AdaptiveSimulateOptions, AdaptiveSimulationResult, PoolPlan,
+    PredictionOutput, PredictionResult, PreparedRun, RunOverrides, SimulateOptions,
+    SimulateUncertaintyOptions, SimulationOutput, SimulationResult, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};
