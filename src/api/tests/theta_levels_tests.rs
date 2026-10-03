@@ -2076,10 +2076,12 @@ mod readout_share {
     /// Each case first asserts that the desugar really ran (`__ferx_ro_g0` is an
     /// individual parameter). Without it, this would test the pre-#1636 readout.
     ///
-    /// Mutation — run the predicate on the desugared readout
-    /// (`rewrite_readout_synth` over the source expressions): `y` then reads
-    /// `__ferx_ro_g0`, a skipped statement, so the block is invisible and every
-    /// sharing case binds 17.
+    /// Mutations — drop the readout on the ODE engine only: the ODE share case
+    /// binds 17, and no other test here runs an ODE model. Feed the predicate
+    /// the desugared readout *and* skip the appended `__ferx_ro_*` statements:
+    /// the block becomes invisible and the share cases bind 17 (T1–T8 die too).
+    /// Feeding the desugared readout alone is equivalent, since the appended
+    /// `__ferx_ro_g0 = PLACEBO` statement carries the block's taint to it.
     #[test]
     fn a_block_lifted_out_of_the_readout_still_shares_a_scale() {
         const ODE: &str = "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central";

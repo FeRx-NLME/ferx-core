@@ -19639,12 +19639,13 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// to global sum-to-zero. States are not tainted: an η that reaches `y` only
 /// through the ODE/PK state does not count, in either block.
 ///
-/// Statements the #486/#1636 desugaring appended (`__ferx_ro_*`,
-/// `__ferx_pktime_*`) are skipped — they are not user expressions, and the
-/// readout is read from its source text instead, where a block lifted into
-/// `__ferx_ro_g{n}` is still the gather it is. The propagation is a fixpoint over assignment
-/// order, so a forward reference (not legal in this DSL anyway) cannot be
-/// missed by a single pass.
+/// The readout is read from its source text, where a block lifted into
+/// `__ferx_ro_g{n}` by the #1636 desugaring is still the gather it is. The
+/// statements that desugaring appends to `stmts` are walked like any other:
+/// they only re-state a readout read, so they cannot add a share the source
+/// readout does not already have. The propagation is a fixpoint over
+/// assignment order, so a forward reference (not legal in this DSL anyway)
+/// cannot be missed by a single pass.
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
@@ -19654,9 +19655,7 @@ fn block_shares_scale_with_eta(
     fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
         for s in stmts {
             match s {
-                Statement::Assign(n, e) if !is_synthetic_readout_param(n) => {
-                    out.push((Some(n.as_str()), e))
-                }
+                Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
                 Statement::If {
                     branches,
                     else_body,
