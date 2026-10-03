@@ -728,11 +728,19 @@ pub(crate) fn check_unbound_theta_levels(
                      against the [simulation] design. Or declare the block explicitly as \
                      `theta {name}[N](...)` and index it with your own column"
                 ),
+                // `predict` is normally called with a fit's θ, so the binder to name is
+                // the one that lays θ out as the fit did. `bind_theta_levels` re-discovers
+                // the levels from the population at hand, and on new data reads a fit's θ
+                // at the wrong positions (#1644 review, row 1).
                 UnboundLevelsEntry::Predict => format!(
-                    "call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on \
-                     the population you pass to `predict`, and predict with the model it \
-                     re-parses into `parsed`. Or declare the block explicitly as \
-                     `theta {name}[N](...)` and index it with your own column"
+                    "with a fit's θ, call `bind_theta_levels_from_fit(&mut parsed, \
+                     &model_text, &mut population, &fitted_levels)` on the population you \
+                     pass to `predict`, where `fitted_levels` is the `parsed.bindings.levels` \
+                     kept from binding the fit data, and predict with the model it re-parses \
+                     into `parsed`. `bind_theta_levels` on that population fits only a θ laid \
+                     out for the levels it discovers, such as the model's own \
+                     `default_params`. Or declare the block explicitly as `theta {name}[N](...)` \
+                     and index it with your own column"
                 ),
             };
             Diagnostic::error(

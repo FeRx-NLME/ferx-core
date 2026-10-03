@@ -204,16 +204,32 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
         ),
         "the shared E_THETA_LEVELS_UNBOUND message: {err}"
     );
+    // That the advice is also *true* — following it reproduces the fit's predictions on
+    // new data — is `from_fit::following_the_unbound_predict_refusal_gives_the_fits_predictions`.
     assert!(
         err.contains(
-            "Call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on the \
-             population you pass to `predict`"
+            "With a fit's θ, call `bind_theta_levels_from_fit(&mut parsed, &model_text, &mut \
+             population, &fitted_levels)` on the population you pass to `predict`"
         ),
-        "the public binder, on the population predict reads: {err}"
+        "the from-fit binder, on the population predict reads: {err}"
+    );
+    assert!(
+        err.contains(
+            ", where `fitted_levels` is the `parsed.bindings.levels` kept from binding the fit \
+             data"
+        ),
+        "where the fit's bindings come from: {err}"
     );
     assert!(
         err.contains(", and predict with the model it re-parses into `parsed`."),
         "the bound model is a re-parse, not the one in hand: {err}"
+    );
+    assert!(
+        err.contains(
+            "`bind_theta_levels` on that population fits only a θ laid out for the levels it \
+             discovers, such as the model's own `default_params`."
+        ),
+        "when the other binder is the right one: {err}"
     );
     assert!(
         err.ends_with(
@@ -1399,6 +1415,64 @@ mod from_fit {
             "every ipred finite: {:?}",
             rows.iter().map(|r| r.ipred).collect::<Vec<_>>()
         );
+    }
+
+    /// #1644 review round 1, row 1: the unbound-predict refusal's advice must be *true*,
+    /// not only present. A caller predicting new data (here: two of the fit's three
+    /// studies) with a fit's θ follows the binder the refusal names and must get the
+    /// fit's own predictions for those subjects, bit for bit.
+    ///
+    /// The first wording named `bind_theta_levels` on the predict population. That
+    /// re-discovers the levels (5 θ here, against the fit's 7), and `predict_diag` has no
+    /// θ-length guard (#1615), so the fit's θ came back `Ok` read at the wrong positions —
+    /// measured on this fixture at `74078e0c`: subject 3 at t = 1 predicted 2.455468 against
+    /// the fit's 7.557837, subject 2 at t = 2 0.182376 against 6.250023.
+    #[test]
+    fn following_the_unbound_predict_refusal_gives_the_fits_predictions() {
+        let text = no_eta_model();
+        let mut fit_pop = population(3, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+        assert_eq!(
+            fit.model.n_theta, 7,
+            "TVCL, TVV, 3 x 2 levels - 1 (sum_to_zero)"
+        );
+        // Distinct, non-cancelling level effects, so a misplaced read moves a prediction.
+        let mut theta = fit.model.default_params.theta.clone();
+        for (i, t) in theta.iter_mut().enumerate().skip(1).take(5) {
+            *t = 0.3 * i as f64 - 0.7;
+        }
+        let rows = |model: &CompiledModel, pop: &Population| -> Vec<(String, u64, u64)> {
+            crate::api::predict_diag(model, pop, &fit_theta_params(model, &theta))
+                .expect("predict")
+                .results
+                .into_iter()
+                .filter(|r| r.id != "1")
+                .map(|r| (r.id, r.time.to_bits(), r.pred.to_bits()))
+                .collect()
+        };
+        let want = rows(&fit.model, &fit_pop);
+        assert_eq!(want.len(), 4, "studies 2 and 3, two times each");
+
+        let mut new_data = population(3, 2);
+        new_data.subjects.remove(0);
+        let unbound = parse_full_model(&text).unwrap();
+        let err =
+            crate::api::predict_diag(&unbound.model, &new_data, &unbound.model.default_params)
+                .err()
+                .expect("an unbound model must not predict");
+        assert!(
+            err.contains("`bind_theta_levels_from_fit("),
+            "the refusal names the binder this test follows: {err}"
+        );
+
+        let mut followed = new_data.clone();
+        let parsed = bind_design(&text, &mut followed, &fit.bindings.levels).expect("bind");
+        assert_eq!(rows(&parsed.model, &followed), want);
+
+        // Why the advice cannot be `bind_theta_levels`: on this population it lays θ out
+        // for the levels it discovers, which is not the fit's layout.
+        let mut own = new_data.clone();
+        assert_eq!(bind(&text, &mut own).unwrap().n_theta, 5);
     }
 }
 
