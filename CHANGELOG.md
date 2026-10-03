@@ -114,6 +114,25 @@ section of the SDLC for the versioning policy).
   refused. When a random effect already carries each group's value, the message says to remove
   the block.
 
+- **A θ level block read where a θ cannot be read is now refused when the model is
+  parsed** (#1637). The four places are the `[odes]` right-hand side, `init(...)`, an
+  ODE-accumulated `[event_model] hazard`, and an error-model selector condition
+  `if (...)`. Before, `KM[2]` in `[odes]` silently read 0. `init(central) = KM[2]`
+  crashed. `KM[K]` drove every subject's objective to the failure value. A selector
+  `if (SCALE[STUDY] > 1.5)` took the `else` branch for every row without a warning.
+  The refusal names the block and gives the remedy: assign it in
+  `[individual_parameters]` for the ODE contexts, or use a data column for a selector.
+  A bare named block in `[odes]` was already refused, but its message named the
+  internal `__level_` column; it now gets the same message.
+- **A θ level block in a residual-error magnitude is estimated under `method = gn`**
+  (#1638). With `DV ~ proportional(PROP_ERR * ERRSCALE[STUDY])`, Gauss-Newton left every
+  level at its initial value; it now estimates them, matching `gradient = fd`. A bare
+  named block (`ERRSCALE` for `theta ERRSCALE[STUDY, ...]`) is now accepted in a
+  magnitude instead of being refused as an undeclared covariate. The levels are no
+  longer reported as "declared in [parameters] but not referenced".
+- **A kappa `weight` that reads an estimated θ level block is refused** (#1639), as one
+  reading an estimated θ already was: an estimated weight can cross zero during the fit.
+  A `FIX` block is still accepted.
 - **A θ level block read directly in the prediction keeps the analytic gradient**
   (#1636). This covers `y = central / V * SCALE[STUDY]` in `[scaling]` and
   `y = PLACEBO[STUDY] + ...` in a compartment-free model. Before, every subject fell back
