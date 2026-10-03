@@ -946,3 +946,62 @@ fn algebraic_outer_jet_matches_fd_on_the_weighted_mbma_objective() {
         .collect();
     check_outer_vs_fd(&model, &subject(vec![("WPSE", 0.11)], per_obs));
 }
+
+/// #1636: a θ level block read in the equation itself (`y = … + PL[PLA_IDX]`) is
+/// lifted into a synthetic individual parameter, so the compartment-free walk serves
+/// it. Checked with a subject-constant index and with one that moves per
+/// observation, at distinct level values, and the gathered columns must be live.
+#[test]
+fn algebraic_outer_jet_matches_fd_through_a_readout_gather() {
+    let mut model = compile(&model_src(
+        "  theta PL[3](1.0, -10.0, 10.0)\n",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME) + PL[PLA_IDX]\n",
+    ));
+    assert!(
+        model.indiv_param_names.iter().any(|n| n == "__ferx_ro_g0"),
+        "premise: the readout gather was lifted: {:?}",
+        model.indiv_param_names
+    );
+    assert!(
+        supported(&model),
+        "compartment-free engine: a lifted readout gather must stay analytic"
+    );
+    let levels: Vec<usize> = (0..model.theta_names.len())
+        .filter(|&i| model.theta_names[i].starts_with("PL["))
+        .collect();
+    assert_eq!(levels.len(), 3);
+    for (k, &i) in levels.iter().enumerate() {
+        model.default_params.theta[i] = [0.8, 1.3, 0.7][k];
+    }
+    let per_obs: Vec<Vec<(&str, f64)>> = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+        .iter()
+        .map(|&l| vec![("PLA_IDX", l)])
+        .collect();
+    for (index, subj, want) in [
+        (
+            "constant",
+            subject(vec![("PLA_IDX", 2.0)], vec![]),
+            vec![levels[1]],
+        ),
+        (
+            "per-observation",
+            subject(vec![("PLA_IDX", 1.0)], per_obs),
+            levels.clone(),
+        ),
+    ] {
+        check_outer_vs_fd(&model, &subj);
+        let theta = model.default_params.theta.clone();
+        let sens = subject_sensitivities(&model, &subj, &theta, &vec![0.3; model.n_eta])
+            .expect("in scope");
+        let live: Vec<usize> = levels
+            .iter()
+            .copied()
+            .filter(|&i| sens.obs.iter().any(|o| o.df_dtheta[i].abs() > 1e-6))
+            .collect();
+        assert_eq!(
+            live, want,
+            "compartment-free engine, {index} index: the live gathered columns"
+        );
+    }
+}

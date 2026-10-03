@@ -2816,8 +2816,14 @@ pub fn parse_full_model_with(
     // `pk_model` nor `pk_param_map` exists yet at this point — so the analytical append is
     // deferred to that allocator (still before `build_pk_param_fn`, the real constraint).
     let mut readout_synth_params: Vec<ReadoutSynthParam> = match blocks.get("scaling") {
-        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)
-            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
+        Some(lines) => collect_readout_theta_eta_synth(
+            lines,
+            &theta_names,
+            &eta_names,
+            &indiv_var_names,
+            &readout_compartment_names(struct_lines, blocks.get("odes")),
+        )
+        .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
         None => Vec::new(),
     };
     // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
@@ -2859,6 +2865,7 @@ pub fn parse_full_model_with(
                 readout_fd_fallback_note = Some(readout_synth_fd_note(
                     readout_synth_params.len() - free,
                     crate::types::MAX_PK_PARAMS,
+                    &readout_synth_params,
                 ));
                 readout_synth_params.clear();
             }
@@ -4446,7 +4453,7 @@ pub fn parse_full_model_with(
                     };
                     model.parse_warnings.push(format!(
                         "{block} y: this readout (a per-CMT readout, a \
-                         direct THETA/ETA reference, a neural-network output, or a model with \
+                         direct THETA/ETA or θ level-block reference, a neural-network output, or a model with \
                          [initial_conditions]) falls back to finite-difference gradients. The \
                          prediction is exact; only the analytic-gradient speedup is lost. Use \
                          individual-parameter / covariate references in the readout to keep it \
@@ -4997,6 +5004,15 @@ pub fn parse_full_model_with(
     // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
     // now carries its direct-θ channel), just never seen by `indiv_stmts`.
     event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // Every θ/η a Form-C `y` readout reads directly (#1636). The #486/#1636 desugaring
+    // moves most of them into `indiv_stmts` already; this covers the ones it leaves in
+    // the readout (a state-indexed gather, or a synth set that overflowed the slot
+    // layout), which are just as estimated — on finite differences.
+    if let Some(lines) = blocks.get("scaling") {
+        let (th, et) = readout_used_theta_eta(lines, &model.theta_names, &model.eta_names)?;
+        event_model_used_thetas.extend(th);
+        event_model_used_etas.extend(et);
+    }
     // A θ that meets its η only in an endpoint block is random-class for the
     // mixed BIC (#1177): re-run the classification over the individual
     // parameters plus the endpoint expressions, which may reference them.
@@ -10082,6 +10098,9 @@ pub(crate) fn build_y_output_fn(
     declared_covariates: &[String],
     intermediates: &[(String, String)],
     parse_warnings: &mut Vec<String>,
+    // Out: every synthetic readout parameter this line now reads (#1636), so the caller
+    // can check that each lifted gather was matched by some `y` line.
+    synth_reads: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -10156,6 +10175,13 @@ pub(crate) fn build_y_output_fn(
     // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
+    visit_expr_nodes(&expr, &mut |e| {
+        if let Expression::Variable(n) = e {
+            if readout_synth.iter().any(|s| s.name == *n) && !synth_reads.contains(n) {
+                synth_reads.push(n.clone());
+            }
+        }
+    });
 
     // Reject KAPPA_* (IOV) references in a Form C output expression: the `[scaling]`
     // eta scope is BSV-only, so a kappa name parses as an unresolved identifier and
@@ -10242,12 +10268,15 @@ pub(crate) fn build_y_output_fn(
     // the parser clears `readout_synth_params` and leaves the bare θ/η ops in the
     // bytecode (the documented FD fallback). Those arms are what keep `dual_evaluable`
     // `false` on that path; dropping them would wrongly route a slot-overflowed
-    // direct-θ/η readout onto the analytic walk. `PushNnOutput` is the other
-    // disqualifier (an NN output is never desugared).
+    // direct-θ/η readout onto the analytic walk. `PushThetaGather` is the same arm
+    // for a θ level block (#1636): a gather is lifted like a bare θ, and one that was
+    // not (state-read index, or slot overflow) has no `Dual2` reader in the readout
+    // program, so it must reach FD here rather than through the per-subject NaN guard.
+    // `PushNnOutput` is the other disqualifier (an NN output is never desugared).
     let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
-            Op::PushTheta(_) | Op::PushEta(_) | Op::PushNnOutput(_, _)
+            Op::PushTheta(_) | Op::PushEta(_) | Op::PushThetaGather(_) | Op::PushNnOutput(_, _)
         )
     });
     let output_program = OdeOutputProgram {
@@ -10409,6 +10438,8 @@ fn parse_scaling_block(
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
     let mut scaling_covariates: Vec<String> = Vec::new();
+    // Synthetic readout parameters the `y` lines read after the #486/#1636 rewrite.
+    let mut synth_reads: Vec<String> = Vec::new();
 
     // Named intermediates (#1030): every non-`obs_scale`/`y` key. Collected up
     // front — this is the one place with the full name scope in hand, so it owns
@@ -10541,6 +10572,7 @@ fn parse_scaling_block(
                     declared_covariates,
                     &intermediates,
                     parse_warnings,
+                    &mut synth_reads,
                 )?;
                 for cov in cov_names {
                     if !scaling_covariates.contains(&cov) {
@@ -10583,6 +10615,24 @@ fn parse_scaling_block(
             // and inlined into the entries that reference it — nothing left to do
             // on its own line.
             _ => {}
+        }
+    }
+
+    // #1636: a gather the pre-scan lifted must be the one the readout now reads. The
+    // pre-scan and `build_y_output_fn` parse the line separately and match by
+    // `readout_gather_key`, so a gap between the two parses (an identifier one of them
+    // resolves differently) leaves the gather in the readout on FD and the synth an
+    // unread individual parameter holding a slot. That costs speed, not correctness,
+    // so it is a debug-build check rather than a parse error.
+    for s in readout_synth {
+        if matches!(s.source, ReadoutSynthSource::Gather { .. }) {
+            debug_assert!(
+                synth_reads.contains(&s.name),
+                "#1636: readout gather synth `{}` was lifted but no `y` line reads it — \
+                 the pre-scan and the readout parse disagree on {:?}",
+                s.name,
+                s.source
+            );
         }
     }
 
@@ -20080,14 +20130,25 @@ pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
 }
 
 /// A θ/η reference desugared out of a Form-C readout into a synthetic individual
-/// parameter (issue #486). `is_eta` selects the source axis (`Theta(idx)` when
-/// false, `Eta(idx)` when true); `name` is the `READOUT_SYNTH_PREFIX`-prefixed
-/// individual-parameter name that mirrors it.
+/// parameter (issue #486). `source` is what it mirrors; `name` is the
+/// `READOUT_SYNTH_PREFIX`-prefixed individual-parameter name that stands in for it.
 #[derive(Debug, Clone)]
 pub(crate) struct ReadoutSynthParam {
     name: String,
-    is_eta: bool,
-    idx: usize,
+    source: ReadoutSynthSource,
+}
+
+/// What a [`ReadoutSynthParam`] mirrors.
+#[derive(Debug, Clone)]
+enum ReadoutSynthSource {
+    /// A bare `THETA(i)` (`__ferx_ro_th{i}`).
+    Theta(usize),
+    /// A bare `ETA(k)` (`__ferx_ro_eta{k}`).
+    Eta(usize),
+    /// A θ level-block read `PLACEBO[STUDY]` (`__ferx_ro_g{n}`, #1636). `expr` is the
+    /// whole `ThetaGather` node; `key` is [`readout_gather_key`] of it, which is how the
+    /// readout rewrite finds the node again in its own parse of the line.
+    Gather { key: String, expr: Expression },
 }
 
 /// Split a `[scaling]` line `key = value` at the first `=` that lies OUTSIDE any
@@ -20522,6 +20583,7 @@ fn allocate_readout_extra_slots(
         fd_note = Some(readout_synth_fd_note(
             synth_params.len() - remaining.len(),
             layout_slots,
+            synth_params,
         ));
     } else {
         for (s, slot) in synth_params.iter().zip(remaining) {
@@ -20547,9 +20609,38 @@ fn allocate_readout_extra_slots(
 /// form consumes — at most 11, typically 4–7. It is a parameter rather than a hard-coded
 /// constant because quoting the ODE figure in a warning the analytical allocator emitted told
 /// the user to free slots out of a layout their model never used (PR #950 review #5).
-fn readout_synth_fd_note(short: usize, layout_slots: usize) -> String {
+///
+/// `synths` is every synthetic the readout asked for (all of them are dropped). A θ level
+/// block among them is named (#1636): "a direct THETA/ETA reference" would not describe a
+/// readout whose only direct read is `SCALE[STUDY]`.
+fn readout_synth_fd_note(
+    short: usize,
+    layout_slots: usize,
+    synths: &[ReadoutSynthParam],
+) -> String {
+    let mut blocks: Vec<&str> = Vec::new();
+    for s in synths {
+        if let ReadoutSynthSource::Gather {
+            expr: Expression::ThetaGather { spec, .. },
+            ..
+        } = &s.source
+        {
+            if !blocks.contains(&spec.name.as_str()) {
+                blocks.push(spec.name.as_str());
+            }
+        }
+    }
+    let what = if blocks.is_empty() {
+        "a direct THETA/ETA reference".to_string()
+    } else {
+        let names: Vec<String> = blocks.iter().map(|b| format!("`{b}`")).collect();
+        format!(
+            "a direct THETA/ETA or θ level-block ({}) reference",
+            names.join(", ")
+        )
+    };
     format!(
-        "[scaling] y: a direct THETA/ETA reference in the readout needs {short} more PK \
+        "[scaling] y: {what} in the readout needs {short} more PK \
          slot(s) than the {layout_slots}-slot layout has free; the readout falls back to \
          finite-difference sensitivities. For analytic sensitivities, free up {short} \
          individual-parameter slot(s)."
@@ -20566,48 +20657,113 @@ fn append_readout_synth_param(
     indiv_stmts: &mut Vec<Statement>,
 ) {
     indiv_var_names.push(s.name.clone());
-    let rhs = if s.is_eta {
-        Expression::Eta(s.idx)
-    } else {
-        Expression::Theta(s.idx)
+    let rhs = match &s.source {
+        ReadoutSynthSource::Theta(i) => Expression::Theta(*i),
+        ReadoutSynthSource::Eta(k) => Expression::Eta(*k),
+        ReadoutSynthSource::Gather { expr, .. } => expr.clone(),
     };
     indiv_stmts.push(Statement::Assign(s.name.clone(), rhs));
+}
+
+/// Identity of a readout gather for the #1636 desugaring: the block name plus the
+/// index tree. The pre-scan and the readout parse each parse the line on their own,
+/// so the rewrite cannot match by node identity; it matches by this key instead.
+/// `Expression` has no `PartialEq`, and its `Debug` form spells every node of the
+/// index (literals included) exactly, so it serves as one.
+fn readout_gather_key(spec: &GatherSpec, idx: &Expression) -> String {
+    format!("{}[{idx:?}]", spec.name)
+}
+
+/// Whether a readout gather's index can move into the individual-parameter program
+/// (#1636). The synth statement is evaluated there, so the index may read only what
+/// that program reads the same way the readout does: literals, data columns and
+/// individual parameters. Anything else stays in the readout, where
+/// `output_dual_evaluable` routes it to finite differences:
+///
+/// - a compartment amount. The pre-scan parses with only the individual parameters
+///   in scope, so a state name arrives here as a `Covariate`; lifting it would
+///   turn the state into a required data column.
+/// - the `T` / `t` time alias, which the readout folds to `TIME` after this scan
+///   (`rewrite_scaling_time_alias`), so its two parses would no longer match;
+/// - `TIME`, θ, η, a nested gather, a conditional, an NN output.
+fn readout_gather_liftable(
+    idx: &Expression,
+    indiv: &std::collections::HashSet<&str>,
+    compartments: &[String],
+) -> bool {
+    match idx {
+        Expression::Literal(_) => true,
+        Expression::Covariate(c) => {
+            !is_time_alias(c)
+                && !c.starts_with("__cmt_")
+                && !compartments.iter().any(|n| n.eq_ignore_ascii_case(c))
+        }
+        Expression::Variable(v) => indiv.contains(v.as_str()),
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            readout_gather_liftable(l, indiv, compartments)
+                && readout_gather_liftable(r, indiv, compartments)
+        }
+        Expression::UnaryFn(_, a) => readout_gather_liftable(a, indiv, compartments),
+        _ => false,
+    }
+}
+
+/// Every compartment name a `[scaling]` readout can read, known before the model's
+/// structure is built: the `[odes]` states (`ode_template` has already written
+/// them by the time the pre-scan runs), the `ode(states=[...])` list, and the
+/// canonical closed-form names. Used only to keep a state-indexed gather out of
+/// the #1636 desugaring, so over-including a name costs a finite-difference
+/// readout, never a wrong one.
+fn readout_compartment_names(
+    struct_lines: &[String],
+    odes_lines: Option<&Vec<String>>,
+) -> Vec<String> {
+    let mut out = algebraic_forbidden_state_names();
+    for line in odes_lines.into_iter().flatten() {
+        if let Some(s) = diffeq_state(line) {
+            out.push(s);
+        }
+    }
+    for line in struct_lines {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some(rest) = compact.split("states=[").nth(1) {
+            if let Some(list) = rest.split(']').next() {
+                out.extend(
+                    list.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Scan a `[scaling]` block's `y = ...` readout entries for bare `THETA(i)` / `ETA(k)`
 /// references and synthesize one individual parameter per distinct reference (#486).
 /// Only `y` (Form-C readout) entries are scanned — `obs_scale` θ/η is differentiated
-/// separately by `ScaleDerivProgram`. Identifiers other than θ/η (states, individual
-/// parameters) parse as permissive covariate references here and are ignored; we only
-/// collect the θ/η axes. Returns the synthetic descriptors in a stable
-/// (θ-then-η, ascending index) order.
+/// separately by `ScaleDerivProgram`. Each distinct θ level-block read whose index
+/// passes [`readout_gather_liftable`] is synthesized too (#1636), so a block read in the
+/// readout rides the same chain as a block read in `[individual_parameters]`. Returns
+/// the synthetic descriptors in a stable order: θ then η by ascending index, then the
+/// gathers by first appearance.
 fn collect_readout_theta_eta_synth(
     scaling_lines: &[String],
     theta_names: &[String],
     eta_names: &[String],
+    indiv_var_names: &[String],
+    compartments: &[String],
 ) -> Result<Vec<ReadoutSynthParam>, String> {
     let mut thetas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut etas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
-    // inline them here too, or the desugaring would miss it and drop an otherwise
-    // analytic readout to the FD fallback.
-    let intermediates = scaling_intermediates(scaling_lines)?;
-    for line in scaling_lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (key, value) = split_scaling_entry(trimmed)?;
-        let (base, _cmt) = parse_scaling_key(key)?;
-        if base != "y" {
-            continue;
-        }
-        // θ/η names resolve to `Theta`/`Eta`; every other identifier falls back to a
-        // covariate (no `defined` set needed) since we only collect the θ/η axes.
-        let ctx = ParseCtx::new(theta_names, eta_names, &[]);
-        let mut expr =
-            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
-        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
+    // #1636: θ level-block reads, in first-appearance order, deduplicated by key.
+    let mut gathers: Vec<(String, Expression)> = Vec::new();
+    let indiv: std::collections::HashSet<&str> =
+        indiv_var_names.iter().map(String::as_str).collect();
+    // θ/η names resolve to `Theta`/`Eta`, and individual parameters to `Variable`
+    // (a gather index may read one, #1636); every other identifier — a state
+    // included — falls back to a covariate.
+    for expr in readout_y_exprs(scaling_lines, theta_names, eta_names, indiv_var_names)? {
         visit_expr_nodes(&expr, &mut |e: &Expression| match e {
             Expression::Theta(i) => {
                 thetas.insert(*i);
@@ -20615,23 +20771,90 @@ fn collect_readout_theta_eta_synth(
             Expression::Eta(i) => {
                 etas.insert(*i);
             }
+            Expression::ThetaGather { spec, idx }
+                if readout_gather_liftable(idx, &indiv, compartments) =>
+            {
+                let key = readout_gather_key(spec, idx);
+                if !gathers.iter().any(|(k, _)| *k == key) {
+                    gathers.push((key, e.clone()));
+                }
+            }
             _ => {}
         });
     }
-    let mut out = Vec::with_capacity(thetas.len() + etas.len());
+    let mut out = Vec::with_capacity(thetas.len() + etas.len() + gathers.len());
     for i in thetas {
         out.push(ReadoutSynthParam {
             name: format!("{READOUT_SYNTH_PREFIX}th{i}"),
-            is_eta: false,
-            idx: i,
+            source: ReadoutSynthSource::Theta(i),
         });
     }
     for k in etas {
         out.push(ReadoutSynthParam {
             name: format!("{READOUT_SYNTH_PREFIX}eta{k}"),
-            is_eta: true,
-            idx: k,
+            source: ReadoutSynthSource::Eta(k),
         });
+    }
+    // After the θ/η synths, so their names and order are unchanged by #1636.
+    for (n, (key, expr)) in gathers.into_iter().enumerate() {
+        out.push(ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}g{n}"),
+            source: ReadoutSynthSource::Gather { key, expr },
+        });
+    }
+    Ok(out)
+}
+
+/// Every θ and η index the `[scaling]` `y` readouts read, as written (before the
+/// #486/#1636 desugaring rewrites them), for the declared-but-unused check. A gather
+/// counts every θ of its block ([`note_theta_eta`]).
+fn readout_used_theta_eta(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+) -> Result<
+    (
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    let mut thetas = std::collections::HashSet::new();
+    let mut etas = std::collections::HashSet::new();
+    for expr in readout_y_exprs(scaling_lines, theta_names, eta_names, &[])? {
+        visit_expr_nodes(&expr, &mut |e| note_theta_eta(e, &mut thetas, &mut etas));
+    }
+    Ok((thetas, etas))
+}
+
+/// Every `[scaling]` `y` / `y[CMT=N]` readout, parsed with θ, η and `defined` in scope
+/// and its named intermediates inlined (#1030). Shared by the #486/#1636 pre-scan and
+/// the unused-parameter union, so the two read the same expressions.
+fn readout_y_exprs(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    defined: &[String],
+) -> Result<Vec<Expression>, String> {
+    // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
+    // inline them here too, or the desugaring would miss it and drop an otherwise
+    // analytic readout to the FD fallback.
+    let intermediates = scaling_intermediates(scaling_lines)?;
+    let mut out = Vec::new();
+    for line in scaling_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        if parse_scaling_key(key)?.0 != "y" {
+            continue;
+        }
+        let ctx = ParseCtx::new(theta_names, eta_names, defined);
+        let mut expr =
+            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
+        out.push(expr);
     }
     Ok(out)
 }
@@ -20644,18 +20867,34 @@ fn collect_readout_theta_eta_synth(
 fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
     match expr {
         Expression::Theta(i) => {
-            if let Some(s) = synth.iter().find(|s| !s.is_eta && s.idx == *i) {
+            if let Some(s) = synth
+                .iter()
+                .find(|s| matches!(s.source, ReadoutSynthSource::Theta(j) if j == *i))
+            {
                 *expr = Expression::Variable(s.name.clone());
             }
         }
         Expression::Eta(i) => {
-            if let Some(s) = synth.iter().find(|s| s.is_eta && s.idx == *i) {
+            if let Some(s) = synth
+                .iter()
+                .find(|s| matches!(s.source, ReadoutSynthSource::Eta(j) if j == *i))
+            {
                 *expr = Expression::Variable(s.name.clone());
             }
         }
-        // The gathered θ block itself has no synthetic stand-in (#486 desugars
-        // scalar `THETA(i)` only), so only the index expression is rewritten.
-        Expression::ThetaGather { idx, .. } => rewrite_readout_synth(idx, synth),
+        // A lifted gather (#1636) is replaced whole. One that was not lifted (its index
+        // reads a state, or its synth overflowed the slot layout) keeps its
+        // `PushThetaGather`, which `output_dual_evaluable` routes to FD; only its index
+        // is rewritten.
+        Expression::ThetaGather { spec, idx } => {
+            let key = readout_gather_key(spec, idx);
+            match synth.iter().find(
+                |s| matches!(&s.source, ReadoutSynthSource::Gather { key: k, .. } if *k == key),
+            ) {
+                Some(s) => *expr = Expression::Variable(s.name.clone()),
+                None => rewrite_readout_synth(idx, synth),
+            }
+        }
         Expression::BinOp(l, _, r) => {
             rewrite_readout_synth(l, synth);
             rewrite_readout_synth(r, synth);

@@ -286,6 +286,8 @@ pub(crate) fn compile_observe(
         // `observe` expression is its own one-line readout with nothing to inline.
         &[],
         &mut observe_warnings,
+        // No synthetics were passed in, so none can be read.
+        &mut Vec::new(),
     )?;
     Ok((out_fn, cov_names))
 }
