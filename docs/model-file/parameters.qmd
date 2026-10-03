@@ -210,11 +210,11 @@ also carries it is a hard error, not a warning.
 random effect that reaches `y` only through a compartment state (`ETA_CL` on
 `CL`, read as `central / V`) does not count.
 
-A block must estimate at least one θ. One left with none after its contrast is
-applied — a single level, or groups of one level each under
-`sum_to_zero_within` — is refused under every contrast, and the message names a
-contrast that would estimate something. When a random effect already carries each group's
-value, the advice is to remove the block. A *single* group of one level inside
+A block must estimate at least one θ, whatever its contrast. One left with none
+after its contrast is applied — a single level under any contrast but `none`, or
+groups of one level each under `sum_to_zero_within` — is refused, and the
+message names a contrast that would estimate something. When a random effect
+already carries each group's value, the advice is to remove the block. A *single* group of one level inside
 a block that has others still binds: within-group sum-to-zero pins it at 0, and
 a random effect at that grouping carries the group's value.
 

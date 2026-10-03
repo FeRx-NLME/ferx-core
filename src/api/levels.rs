@@ -451,7 +451,10 @@ fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
     if matches!(contrast, LevelContrast::Unconstrained) {
         return groups.len();
     }
+    // Sort first: `dedup` only collapses adjacent ids, and the count must not
+    // depend on `assign_groups` handing them out contiguously.
     let mut ids = groups.to_vec();
+    ids.sort_unstable();
     ids.dedup();
     groups.len() - ids.len()
 }
