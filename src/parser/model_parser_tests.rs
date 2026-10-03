@@ -26996,3 +26996,298 @@ fn the_level_index_producer_and_predicate_share_one_prefix() {
     assert!(!is_level_index_column("LEVEL_PLACEBO"));
     assert!(!is_level_index_column("STUDY"));
 }
+
+// ── #1636: a θ level block read in a Form-C readout ───────────────────────────
+//
+// A level block read in `[scaling] y` (or a compartment-free `y`) is lifted into a
+// synthetic individual parameter `__ferx_ro_g{n} = <gather>`, exactly as #486 lifts
+// a bare θ. Before, the gather stayed in the readout bytecode, the readout's `Dual2`
+// walk had no reader for it, every subject's gradient came back NaN and fell back to
+// FD, and `optimizer = auto` ran L-BFGS on FD gradients (#1636 plan §0, B1/F1).
+// The synth's *value* is pinned against the hand-lifted twin by `predict()` in
+// `tests/theta_gather_gradient.rs`; these pin the parse.
+
+/// A readout model on one of the three engines behind `eval_output_g`, with
+/// `readout` as the `y` line and `extra_theta` / `extra_ip` spliced in.
+fn gather_readout_model(engine: &str, extra_theta: &str, extra_ip: &str, readout: &str) -> String {
+    let (structural, scaling) = match engine {
+        "ode" => (
+            "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central\n".to_string(),
+            format!("[scaling]\n  y = {readout}\n"),
+        ),
+        "analytical" => (
+            "  pk one_cpt_iv(cl=CL, v=V)\n".to_string(),
+            format!("[scaling]\n  y = {readout}\n"),
+        ),
+        "compartment-free" => (format!("  y = {readout}\n"), String::new()),
+        other => panic!("unknown engine {other}"),
+    };
+    format!(
+        "[parameters]\n  theta TVCL(2.0, 0.01, 20.0)\n  theta TVV(8.0, 0.1, 500.0)\n  {extra_theta}\n  \
+         omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02\n\n\
+         [individual_parameters]\n  CL = TVCL\n  V = TVV * exp(ETA_V)\n  {extra_ip}\n\n\
+         [structural_model]\n{structural}\n{scaling}\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+const GATHER_READOUT_ENGINES: [(&str, &str); 3] = [
+    ("ode", "central / V * SCALE[STUDY]"),
+    ("analytical", "central / V * SCALE[STUDY]"),
+    ("compartment-free", "V + SCALE[STUDY]"),
+];
+
+/// The readout's sensitivity program, whichever engine holds it.
+fn gather_readout_program(m: &CompiledModel) -> &OdeOutputProgram {
+    m.ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .or_else(|| m.analytic_readout.as_ref().and_then(|a| a.program.as_ref()))
+        .expect("a uniform Form-C readout has a sensitivity program")
+}
+
+fn readout_has_gather_op(m: &CompiledModel) -> bool {
+    gather_readout_program(m)
+        .bc
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::PushThetaGather(_)))
+}
+
+fn readout_synth_names(m: &CompiledModel) -> Vec<&str> {
+    m.indiv_param_names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_synthetic_readout_param(n))
+        .collect()
+}
+
+/// T1: on each engine, the readout gather becomes `__ferx_ro_g0`, leaves no
+/// `PushThetaGather` behind, and the readout is dual-evaluable.
+#[test]
+fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
+    for (engine, readout) in GATHER_READOUT_ENGINES {
+        let m = parse_model_string(&gather_readout_model(
+            engine,
+            "theta SCALE[3](1.0, 0.1, 10.0)",
+            "",
+            readout,
+        ))
+        .unwrap_or_else(|e| panic!("[{engine}] parse: {e}"));
+        assert_eq!(
+            readout_synth_names(&m),
+            ["__ferx_ro_g0"],
+            "[{engine}] one gather synth"
+        );
+        assert_eq!(
+            m.indiv_param_names.len(),
+            m.pk_indices.len(),
+            "[{engine}] the synth has a slot"
+        );
+        assert!(
+            !readout_has_gather_op(&m),
+            "[{engine}] the lifted gather must leave the readout bytecode"
+        );
+        assert!(
+            gather_readout_program(&m).is_dual_evaluable(),
+            "[{engine}] the readout must be dual-evaluable once the gather is lifted"
+        );
+        assert!(
+            !m.parse_warnings
+                .iter()
+                .any(|w| w.contains("finite-difference") || w.contains("but not referenced")),
+            "[{engine}] no FD note and no unreferenced level: {:?}",
+            m.parse_warnings
+        );
+    }
+}
+
+/// The synth names: θ then η keep their #486 names and order, gathers follow, a
+/// repeated gather is lifted once and two indices of one block are two synths.
+/// Pins the names `provider_tests.rs` / `ode_provider_tests.rs` grep.
+#[test]
+fn readout_gather_synths_follow_the_theta_eta_synths() {
+    let m = parse_model_string(&gather_readout_model(
+        "compartment-free",
+        "theta SLOPE(0.5, -5.0, 5.0)\n  theta SCALE[3](1.0, 0.1, 10.0)",
+        "",
+        "SCALE[ARM] + SLOPE * TIME + SCALE[STUDY] + ETA_V + 0.5 * SCALE[ARM]",
+    ))
+    .expect("parse");
+    let slope = m.theta_names.iter().position(|n| n == "SLOPE").unwrap();
+    assert_eq!(
+        readout_synth_names(&m),
+        [
+            format!("__ferx_ro_th{slope}").as_str(),
+            "__ferx_ro_eta0",
+            "__ferx_ro_g0",
+            "__ferx_ro_g1",
+        ],
+    );
+    assert!(!readout_has_gather_op(&m));
+    assert!(gather_readout_program(&m).is_dual_evaluable());
+}
+
+/// An index that reads an individual parameter is lifted (its value is pinned by
+/// the `predict()` twin in `tests/theta_gather_gradient.rs`).
+#[test]
+fn a_readout_gather_indexed_by_an_individual_parameter_is_lifted() {
+    let m = parse_model_string(&gather_readout_model(
+        "ode",
+        "theta SCALE[3](1.0, 0.1, 10.0)",
+        "K = STUDY",
+        "central / V * SCALE[K]",
+    ))
+    .expect("parse");
+    assert_eq!(readout_synth_names(&m), ["__ferx_ro_g0"]);
+    assert!(!readout_has_gather_op(&m));
+    assert!(gather_readout_program(&m).is_dual_evaluable());
+}
+
+/// T2, unliftable index: a gather indexed by a compartment amount stays in the
+/// readout (the individual-parameter program has no state), and the readout
+/// routes to FD through `output_dual_evaluable` rather than the NaN guard. It
+/// must not turn the state into a required data column either.
+#[test]
+fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
+    let m = parse_model_string(&gather_readout_model(
+        "ode",
+        "theta SCALE[3](1.0, 0.1, 10.0)",
+        "",
+        "central / V * SCALE[central]",
+    ))
+    .expect("parse");
+    assert!(
+        readout_synth_names(&m).is_empty(),
+        "a state-indexed gather must not be lifted: {:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        readout_has_gather_op(&m),
+        "premise: the gather is still in the readout"
+    );
+    assert!(
+        !gather_readout_program(&m)
+            .bc
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
+        "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
+    );
+    assert!(
+        !gather_readout_program(&m).is_dual_evaluable(),
+        "a gather left in the readout must route to FD"
+    );
+    assert!(
+        !m.referenced_covariates.iter().any(|c| c == "central"),
+        "the state must not become a data column: {:?}",
+        m.referenced_covariates
+    );
+    assert!(
+        !m.parse_warnings
+            .iter()
+            .any(|w| w.contains("but not referenced")),
+        "a block read only in the readout is still referenced: {:?}",
+        m.parse_warnings
+    );
+}
+
+/// T2, slot overflow on the analytical engine: three gathers into a 2-slot spare
+/// pool. Every synth is dropped, the gathers stay in the bytecode, the readout is
+/// not dual-evaluable, and the sizing note names the blocks.
+#[test]
+fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 10.0)
+  theta TVV3(30.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF(0.9, 0.01, 1.0)
+  theta SCALE[3](1.0, 0.1, 10.0)
+  theta OFF[3](0.1, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA
+  F  = TVF
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA, f=F)
+[scaling]
+  y = central / V * SCALE[STUDY] + OFF[STUDY] + OFF[ARM]
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(src).expect("parse");
+    assert!(
+        readout_synth_names(&m).is_empty(),
+        "an overflowing synth set is dropped whole: {:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        readout_has_gather_op(&m),
+        "premise: the gathers stay in the readout"
+    );
+    assert!(
+        !gather_readout_program(&m)
+            .bc
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
+        "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
+    );
+    assert!(
+        !gather_readout_program(&m).is_dual_evaluable(),
+        "a gather left in the readout must make it non-dual-evaluable"
+    );
+    let note = m
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("more PK slot(s)"))
+        .expect("the sizing note");
+    assert!(
+        note.contains("a direct THETA/ETA or θ level-block (`SCALE`, `OFF`) reference")
+            && note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
+        "the note must name the blocks and the analytical pool; got: {note}"
+    );
+    assert!(
+        m.parse_warnings
+            .iter()
+            .any(|w| w.contains("direct THETA/ETA or θ level-block reference, a neural")),
+        "the readout-shape note must list a level block among its causes: {:?}",
+        m.parse_warnings
+    );
+    assert!(
+        !m.parse_warnings
+            .iter()
+            .any(|w| w.contains("but not referenced")),
+        "levels read only by an unlifted readout gather are still referenced: {:?}",
+        m.parse_warnings
+    );
+}
+
+/// The θ/η-only note is worded as before when no gather was dropped.
+#[test]
+fn the_readout_sizing_note_names_no_block_when_none_was_dropped() {
+    let note = readout_synth_fd_note(
+        1,
+        2,
+        &[ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}th0"),
+            source: ReadoutSynthSource::Theta(0),
+        }],
+    );
+    assert!(
+        note.starts_with("[scaling] y: a direct THETA/ETA reference in the readout needs 1"),
+        "{note}"
+    );
+}
