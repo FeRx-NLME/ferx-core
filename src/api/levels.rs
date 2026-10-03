@@ -31,17 +31,6 @@ use crate::types::{ParsedModel, Population, Subject};
 /// covariate.
 const TIME_COLUMN: &str = "TIME";
 
-/// Synthesized index columns are prefixed so they cannot collide with a real
-/// data column — and so the file readers know not to look for them in the CSV.
-pub(crate) const LEVEL_INDEX_PREFIX: &str = "__level_";
-
-/// Whether `name` is a synthesized level index column rather than a real data
-/// column. The CSV readers use this to skip it when collecting the columns they
-/// must find in the file.
-pub(crate) fn is_level_index_column(name: &str) -> bool {
-    name.starts_with(LEVEL_INDEX_PREFIX)
-}
-
 /// Bind every level block in `parsed` against `population`, mutating
 /// both: the population gains the synthesized index columns, and `parsed.model`
 /// is replaced by a re-parse that knows the level counts.
@@ -583,9 +572,15 @@ fn write_index_column(
         }
     }
 
-    if !population.covariate_names.contains(&column) {
-        population.covariate_names.push(column);
-    }
+    // The column lives only in the subjects' covariate maps, where the
+    // predictors (`Subject::obs_cov`) and `check_covariates`' carried-by-every-
+    // subject test read it. It is deliberately *not* added to
+    // `population.covariate_names`: that list is the data's columns as a user
+    // and downstream tools read them (`FitResult::covariate_names`, "Available
+    // covariate columns", GAM, the search resolver, the FREM CSV header), and a
+    // synthesized column is engine plumbing (#1644). The binder rejects a
+    // population with no observations, so every bound population has subjects
+    // to carry it.
     Ok(())
 }
 

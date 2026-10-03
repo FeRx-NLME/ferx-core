@@ -368,8 +368,8 @@ fn segment_count(warnings: &[String]) -> Option<usize> {
 // ── the shared bundle ────────────────────────────────────────────────────────
 
 /// One implementation, and **every** entry point proves it: on a fixture that trips both
-/// halves, `predict_diag`, `simulate_with_options_diag` (in *both* of its branches) and
-/// `simulate_adaptive` report the same findings.
+/// halves, `predict_diag`, `simulate_with_options_diag` (in *both* of its branches),
+/// `simulate_with_uncertainty_diag` (#1645) and `simulate_adaptive` report the same findings.
 ///
 /// Regression this catches: a per-entry-point filter — the fix #1280 explicitly rules out —
 /// creeping back in. Mutation: drop any one code from any caller's list and the set equality
@@ -409,6 +409,13 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
         "…and the model/data half too, or this compares one finding with itself: \
          {from_predict:?}"
     );
+    let uncertainty = simulate_with_uncertainty_diag(
+        &m,
+        &p,
+        &super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params),
+        &uncertainty_opts(),
+    )
+    .expect("sim");
 
     for (label, got) in [
         (
@@ -433,12 +440,37 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
                 .warnings,
             ),
         ),
+        (
+            "simulate_with_uncertainty_diag",
+            codes(&uncertainty.warnings),
+        ),
     ] {
         assert_eq!(
             from_predict, got,
             "{label} must report the same findings predict does; a per-entry-point filter is \
              exactly what #1280 rules out"
         );
+    }
+    // The uncertainty run's solver counters are its own, over every draw (#1645).
+    let solver = uncertainty
+        .warnings
+        .iter()
+        .find(|w| w.contains(SOLVER))
+        .expect("solver half");
+    assert!(
+        solver.contains("from this simulate_with_uncertainty() run over all parameter draws")
+            && solver.contains("at the drawn parameter sets"),
+        "{solver}"
+    );
+}
+
+/// Two asymptotic draws, two replicates each, seeded.
+fn uncertainty_opts() -> SimulateUncertaintyOptions {
+    SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2,
+        n_sim_per_draw: 2,
+        method: crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
+        seed: Some(17),
     }
 }
 
@@ -526,6 +558,97 @@ fn simulate_adaptive_reports_both_halves_of_the_bundle() {
     );
 }
 
+/// T12 (#1645): on a dose-free design the adaptive driver withholds `W_NO_DOSES` — its
+/// controller supplies the regimen — while `simulate_with_options_diag` on the same input still
+/// reports it. Measured before the arm existed: both returned it, from a `read_nonmem_csv` of an
+/// `ID,TIME,DV,MDV` grid (the ferx-r glue dropped it by hand on the adaptive path).
+///
+/// A straddle on the phase, plus a control: another reader finding still reaches the adaptive
+/// warnings, so the arm cannot pass by dropping reader warnings wholesale.
+#[test]
+fn simulate_adaptive_withholds_no_doses_and_only_there() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse");
+    assert!(
+        !m.is_algebraic(),
+        "the filter's own predicate must not be what hides it"
+    );
+    let obs_times = vec![6.0, 30.0, 54.0];
+    let subject = Subject {
+        id: "1".into(),
+        doses: Vec::new(),
+        obs_times: obs_times.clone(),
+        observations: vec![0.0; obs_times.len()],
+        obs_cmts: vec![1; obs_times.len()],
+        cens: vec![0; obs_times.len()],
+        ..Default::default()
+    };
+    let population = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: vec![
+            "W_NO_DOSES: parsed zero dose events across all 1 subject(s)".into(),
+            "W_ADDL_MISSING_II: subject '1' has ADDL with no II".into(),
+        ],
+    };
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        verify: false,
+        ..Default::default()
+    };
+    let controller = || |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let adaptive = simulate_adaptive(&m, &population, &m.default_params, 1, controller, &opts)
+        .expect("adaptive sim runs")
+        .warnings;
+    assert!(!has(&adaptive, "W_NO_DOSES"), "{adaptive:?}");
+    assert!(
+        has(&adaptive, "W_ADDL_MISSING_II"),
+        "…while other reader findings still reach it: {adaptive:?}"
+    );
+
+    let static_sim = simulate_with_options_diag(
+        &m,
+        &population,
+        &m.default_params,
+        1,
+        &SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        },
+    )
+    .expect("sim")
+    .warnings;
+    assert!(
+        has(&static_sim, "W_NO_DOSES"),
+        "a static simulation's regimen comes only from the data: {static_sim:?}"
+    );
+}
+
 /// The `W_`/`E_` tokens a warnings list carries, sorted and deduplicated. A message with no
 /// token contributes its first six words, so an untokenised finding still participates rather
 /// than vanishing from the comparison.
@@ -547,9 +670,8 @@ fn codes(warnings: &[String]) -> Vec<String> {
 /// The row-only entry points stay silent **by contract**, and this is the list.
 ///
 /// Regression this catches: a future entry point quietly joining the silent set, or one of
-/// these three starting to print to stderr instead of returning. `simulate_with_uncertainty`
-/// is the one that has findings and no channel to put them in; `predict` and
-/// `simulate_with_options` have a `_diag` twin one call away.
+/// these three starting to print to stderr instead of returning. Each has a `_diag` twin one
+/// call away — `simulate_with_uncertainty`'s since #1645.
 #[test]
 fn the_row_only_entry_points_stay_silent_by_contract() {
     let m = analytic_model();
@@ -574,6 +696,90 @@ fn the_row_only_entry_points_stay_silent_by_contract() {
         "the fixture must produce warnings, or 'the wrapper drops them' is vacuous"
     );
     assert_eq!(rows.len(), diag.results.len());
+}
+
+/// T11 (#1645): `simulate_with_uncertainty` is `simulate_with_uncertainty_diag(..).results`,
+/// bit for bit, on the same seed — from an output that did carry warnings.
+///
+/// Regression this catches: the wrapper and the `_diag` form drifting into two
+/// implementations — one of them drawing an extra variate, reordering draws, or skipping a
+/// draw the other keeps.
+#[test]
+fn simulate_with_uncertainty_is_its_diag_forms_rows_bit_for_bit() {
+    let m = analytic_model();
+    let p = pop_ss_bad_ii(2);
+    let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+    let diag = simulate_with_uncertainty_diag(&m, &p, &fit, &uncertainty_opts()).expect("sim");
+    let rows = simulate_with_uncertainty(&m, &p, &fit, &uncertainty_opts()).expect("sim");
+    assert!(
+        has(&diag.warnings, SS_II),
+        "the fixture must produce warnings, or 'the wrapper drops them' is vacuous: {:?}",
+        diag.warnings
+    );
+    let key = |r: &SimulationResult| {
+        let value = match r.outcome {
+            SimOutcome::Continuous { value } => value.to_bits(),
+            #[allow(unreachable_patterns)]
+            _ => panic!("a Gaussian fixture simulates continuous rows: {r:?}"),
+        };
+        (
+            r.draw,
+            r.sim,
+            r.id.clone(),
+            r.time.to_bits(),
+            r.cmt,
+            r.ipred.to_bits(),
+            value,
+        )
+    };
+    assert_eq!(rows.len(), 2 * 2 * 2 * p.subjects[0].obs_times.len());
+    assert!(rows.iter().all(|r| r.ipred.is_finite()), "{rows:?}");
+    assert_eq!(
+        rows.iter().map(key).collect::<Vec<_>>(),
+        diag.results.iter().map(key).collect::<Vec<_>>()
+    );
+}
+
+/// T10 (#1645): the uncertainty `_diag` relays data-reader findings through the shared filter,
+/// not from `Population::warnings` raw — the relay the ferx-r glue needs on that path.
+///
+/// A straddle on the filter's predicate, as in
+/// `reader_warnings_go_through_the_same_suppression_filter_fit_uses`: `W_NO_DOSES` is withheld
+/// on a compartment-free model and reported on a compartment one.
+#[test]
+fn simulate_with_uncertainty_diag_filters_reader_warnings_like_fit() {
+    const NO_DOSES: &str = "W_NO_DOSES: no dose records found";
+    let algebraic = parse_model_string(
+        "[parameters]\n  theta TVE0(8.0, 0.1, 100.0)\n  theta TVEMAX(4.0, 0.1, 100.0)\n  \
+         theta TVET50(1.0, 0.01, 100.0)\n  omega ETA_E0 ~ 0.04\n  sigma ADD ~ 1.0 \
+         (variance)\n[individual_parameters]\n  E0   = TVE0 * exp(ETA_E0)\n  EMAX = TVEMAX\n  \
+         ET50 = TVET50\n[structural_model]\n  EFF = EMAX * TIME / (ET50 + TIME)\n  y   = E0 - \
+         EFF\n[error_model]\n  DV ~ additive(ADD)\n",
+    )
+    .expect("parse");
+    assert!(algebraic.is_algebraic());
+    let mut p = pop(1);
+    p.subjects[0].doses.clear();
+    p.warnings.push(NO_DOSES.into());
+
+    let run = |m: &CompiledModel| {
+        let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+        simulate_with_uncertainty_diag(m, &p, &fit, &uncertainty_opts())
+            .expect("sim")
+            .warnings
+    };
+    let suppressed = run(&algebraic);
+    assert!(
+        !has(&suppressed, "W_NO_DOSES"),
+        "a compartment-free model has nothing to dose: {suppressed:?}"
+    );
+    let compartmental = analytic_model();
+    assert!(!compartmental.is_algebraic());
+    let reported = run(&compartmental);
+    assert!(
+        has(&reported, "W_NO_DOSES"),
+        "…while on a compartment model it is a real finding: {reported:?}"
+    );
 }
 
 // ── phase wording (#1304) ────────────────────────────────────────────────────
@@ -634,6 +840,21 @@ fn the_message_names_the_pass_that_produced_the_counters() {
     assert!(
         from_simulate.contains("from this simulate() pass over all subjects and replicates"),
         "{from_simulate}"
+    );
+    // The uncertainty run (#1645) integrates every draw at its own parameter set, so it names
+    // neither "the supplied parameters" nor a single pass, and keys its payload apart.
+    let (from_uncertainty, entry) =
+        ode_solver_diagnostics_warning(&stats, &o, SolverStatsPhase::SimulateUncertainty)
+            .expect("a warning");
+    assert!(
+        from_uncertainty.contains("at the drawn parameter sets")
+            && !from_uncertainty.contains("supplied parameters")
+            && !from_uncertainty.contains("final estimates"),
+        "{from_uncertainty}"
+    );
+    assert_eq!(
+        entry.details.as_ref().unwrap()["phase"],
+        serde_json::json!("simulate_with_uncertainty")
     );
 }
 
@@ -1073,9 +1294,9 @@ fn the_bundle_excludes_the_findings_that_are_about_a_fit() {
 /// provenance only on the unclean branch and `at the supplied parameters` only on the
 /// informational one — each defect hid in the clause the other test did not look at.
 ///
-/// Every non-fit phase is asserted, not just one: the three share `at_label` but have distinct
-/// `provenance` and `payer` strings, so a phase that lost its own wording would otherwise be
-/// covered by its neighbours.
+/// Every non-fit phase is asserted, not just one: three share `at_label` (the uncertainty run
+/// has its own) but all have distinct `provenance` and `payer` strings, so a phase that lost its
+/// own wording would otherwise be covered by its neighbours.
 #[test]
 fn the_informational_note_and_the_rejection_clause_name_their_pass_too() {
     let o = FitOptions::default();
@@ -1108,6 +1329,12 @@ fn the_informational_note_and_the_rejection_clause_name_their_pass_too() {
             SolverStatsPhase::SimulateAdaptive,
             "from this simulate_adaptive() pass",
             "this simulate_adaptive() run paid for both solves",
+        ),
+        (
+            SolverStatsPhase::SimulateUncertainty,
+            "from this simulate_with_uncertainty() run over all parameter draws, subjects and \
+             replicates",
+            "this simulate_with_uncertainty() run paid for both solves",
         ),
     ] {
         let (note, entry) = ode_solver_diagnostics_warning(&escalation_only, &o, phase)

@@ -326,8 +326,8 @@ let result = fit(&parsed.model, &population, &parsed.model.default_params, &pars
 
 Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
-`fit()` refuses it, naming the block. The simulate paths report the same
-problem as `E_THETA_LEVELS_UNBOUND`. To simulate with the model's own initial
+`fit()` refuses it, naming the block. The simulate paths and `predict` report
+the same problem as `E_THETA_LEVELS_UNBOUND`. To simulate with the model's own initial
 estimates, bind a design the same way, on the population from
 `read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
 the fit instead, as described in

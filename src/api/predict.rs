@@ -120,10 +120,13 @@ pub struct PredictionOutput {
 /// `fit()` gives for that precondition (#898): a dose the model cannot route or honour, a
 /// covariate the data does not carry, an unrouted non-Gaussian endpoint, an unbound
 /// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
-/// `markov`) a CTMM-only model, which has no predictor yet. An input failing several at once
-/// reports the first in *this* function's order, which is not `fit()`'s.
-/// [`predict`] returns that same text. Adding an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
-/// that is what `warnings` is for.
+/// `markov`) a CTMM-only model, which has no predictor yet. An unbound `theta NAME[...]` level
+/// block is the one exception to `fit()`'s text: it reports `E_THETA_LEVELS_UNBOUND`'s message,
+/// as the simulate paths do, followed by that diagnostic's suggestion for `predict` (#1644).
+/// An input failing several at once reports the first in *this* function's order, which is
+/// not `fit()`'s.
+/// [`predict`] returns that same text. Adding another check is explicitly *not* how a
+/// warning-severity finding reaches `predict()`; that is what `warnings` is for.
 pub fn predict_diag(
     model: &CompiledModel,
     population: &Population,
@@ -133,6 +136,20 @@ pub fn predict_diag(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     first_error(&check_modeled_dose_rates(model, population))?;
+    // An unbound `theta NAME[...]` block gathers from a synthesized `__level_NAME`
+    // column no population carries yet, so the covariate check below would name
+    // that engine-internal column as missing from the data. Report the real cause
+    // first, as `simulate()` does (#1644) — and, as `fit()`'s refusal does, name the
+    // way out in the `Err` itself: `first_error` returns the message alone.
+    if let Some(d) = check_unbound_theta_levels(model, UnboundLevelsEntry::Predict).first() {
+        let suggestion = d.suggestion.as_deref().unwrap_or_default();
+        let mut chars = suggestion.chars();
+        let capitalized: String = chars
+            .next()
+            .map(|c| c.to_uppercase().chain(chars).collect())
+            .unwrap_or_default();
+        return Err(format!("{} {capitalized}.", d.message));
+    }
     // Every identifier the parser could not bind resolves as a covariate, and a
     // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`

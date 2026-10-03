@@ -2013,6 +2013,8 @@ pub(crate) enum SolverStatsPhase {
     Simulate,
     /// One [`crate::api::simulate_adaptive`] pass.
     SimulateAdaptive,
+    /// One [`crate::api::simulate_with_uncertainty_diag`] run, over every parameter draw.
+    SimulateUncertainty,
 }
 
 impl SolverStatsPhase {
@@ -2023,6 +2025,7 @@ impl SolverStatsPhase {
             Self::Predict => "predict",
             Self::Simulate => "simulate",
             Self::SimulateAdaptive => "simulate_adaptive",
+            Self::SimulateUncertainty => "simulate_with_uncertainty",
         }
     }
 
@@ -2036,6 +2039,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "at the final estimates",
             Self::Predict | Self::Simulate | Self::SimulateAdaptive => "at the supplied parameters",
+            // Many parameter sets, none of them the caller's argument as such.
+            Self::SimulateUncertainty => "at the drawn parameter sets",
         }
     }
 
@@ -2053,6 +2058,7 @@ impl SolverStatsPhase {
             Self::Predict => "this predict() pass",
             Self::Simulate => "this simulate() pass",
             Self::SimulateAdaptive => "this simulate_adaptive() run",
+            Self::SimulateUncertainty => "this simulate_with_uncertainty() run",
         }
     }
 
@@ -2074,6 +2080,10 @@ impl SolverStatsPhase {
             Self::SimulateAdaptive => {
                 "Counters are from this simulate_adaptive() pass over all subjects and \
                  replicates."
+            }
+            Self::SimulateUncertainty => {
+                "Counters are from this simulate_with_uncertainty() run over all parameter \
+                 draws, subjects and replicates."
             }
         }
     }
@@ -2134,11 +2144,12 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 
 /// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
 ///
-/// **One implementation, three callers.** `predict_diag`, `simulate_with_options_diag` and
-/// `simulate_adaptive` all report exactly this list, so a diagnostic added to any source below
-/// reaches all three at once and none of them can carry a different subset than the others —
+/// **One implementation, four callers.** `predict_diag`, `simulate_with_options_diag`,
+/// `simulate_adaptive` and `simulate_with_uncertainty_diag` (#1645) all report exactly this
+/// list, so a diagnostic added to any source below reaches all four at once and none of them
+/// can carry a different subset than the others —
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
-/// all three on a fixture that trips both halves.
+/// them on a fixture that trips both halves.
 ///
 /// # What is in it, and what is not
 ///
@@ -2158,7 +2169,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    qualification since #1409: that filter takes a `&FitOptions` for the one
 ///    `W_CMT_DEFAULTED` channel that lives on the options rather than on the model — a
 ///    `[data_selection]` clause comparing `CMT` — and these entry points have none, so it is
-///    passed a default. See the call site.
+///    passed a default. See the call site. On `simulate_adaptive` alone `W_NO_DOSES` is
+///    withheld as well (#1645): its controller supplies the regimen, so a dose-free dataset is
+///    the normal input there and the finding's claim is false of the run, not merely oddly
+///    worded.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
 ///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
 ///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
@@ -2188,7 +2202,9 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 /// `the_bundle_excludes_the_findings_that_are_about_a_fit` pins the exclusions, so this comment
 /// cannot quietly stop matching the code.
 ///
-/// Within what it carries the list is **not** filtered per entry point: dropping a code because
+/// Within what it carries the list is **not** filtered per entry point — the one exception,
+/// `W_NO_DOSES` on `simulate_adaptive` (item 2), is a finding that is false of that run, which
+/// is a different test from reading oddly. Dropping a code because
 /// it reads oddly outside a fit is the special-case-on-shared-infrastructure arrangement that
 /// produced the "which entry point sees which finding" confusion #1280 was filed about. Two
 /// members are phrased for a fit (`W_ADDITIVE_INIT_SCALE` advises on optimizer basins;
@@ -2221,6 +2237,13 @@ pub(crate) fn non_fit_diagnostics(
             .warnings
             .iter()
             .filter(|w| !crate::api::validation::reader_warning_suppressed(model, &no_selection, w))
+            // The adaptive driver's controller supplies the whole regimen, so a dataset that
+            // carries only an observation grid is its normal input and `W_NO_DOSES` — "no dose
+            // was parsed, so a PK model has nothing to act on" — is false of this run (#1645).
+            // Every other caller's regimen can only come from the data.
+            .filter(|w| {
+                !(phase == SolverStatsPhase::SimulateAdaptive && w.starts_with("W_NO_DOSES"))
+            })
             .cloned(),
     );
     out.extend(

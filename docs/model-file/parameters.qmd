@@ -112,8 +112,8 @@ data itself, through the Rust API, calls `bind_theta_levels` between reading
 the population and `fit`. See
 [Assembling the inputs yourself](../api/fitting.qmd#assembling-the-inputs-yourself).
 A model that reaches `fit()` unbound is refused, naming the block, rather than
-silently predicting `NaN`. The simulate paths report the same problem as
-`E_THETA_LEVELS_UNBOUND`. To simulate a design with a fit's θ, bind it with
+silently predicting `NaN`. The simulate paths and `predict` report the same
+problem as `E_THETA_LEVELS_UNBOUND`. To simulate a design with a fit's θ, bind it with
 `bind_theta_levels_from_fit` and the fit's bindings, so the design keeps the
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).

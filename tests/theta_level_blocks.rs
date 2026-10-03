@@ -1080,3 +1080,72 @@ fn the_level_reporting_surface_is_reachable_from_outside_the_crate() {
         "five free coefficients stay inline"
     );
 }
+
+// ── #1644: the synthesized `__level_` column stays engine plumbing ───────────
+
+#[test]
+fn a_fit_reports_only_the_datas_real_covariate_columns() {
+    // `FitResult::covariate_names` (R's `fit$covariate_names`, the runlog's
+    // "Covariates:" line, `.fitrx`) lists the data's columns. The binder's
+    // synthesized `__level_PLACEBO` is not one of them.
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let (result, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("fit");
+    assert_eq!(result.covariate_names, ["STUDY", "PLA_IDX"]);
+
+    // Every real column declared: the bound re-parse raises no
+    // undeclared-covariate warning, and no warning names the column.
+    let declared = level_block_model().replace(
+        "[individual_parameters]",
+        "[covariates]\n  STUDY categorical\n  PLA_IDX categorical\n\n[individual_parameters]",
+    );
+    let (_dir, model_path, data_path) = write_case(&declared, DATA);
+    let (result, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("fit");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("__level_") || w.contains("not declared in [covariates]")),
+        "{:#?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn listing_the_index_column_in_covariate_names_changes_no_bit_of_the_fit() {
+    // #1644 stopped the binder adding `__level_PLACEBO` to
+    // `Population::covariate_names`; the predictors and the covariate check read
+    // the subjects' maps instead. The twin restores the old list on the same
+    // bound population: any engine read of the list would part the two fits.
+    // (Measured before the change: Q1/Q8 MBMA fits at `maxiter = 0` and to
+    // convergence, 204 and 108 iterations, OFV/θ/Ω/σ identical to the bit.)
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let (parsed, population) = read_composable(&model_path, &data_path, true);
+    let mut old_contract = population.clone();
+    old_contract
+        .covariate_names
+        .push("__level_PLACEBO".to_string());
+
+    let fit = |pop: &ferx_core::Population| {
+        ferx_core::fit(
+            &parsed.model,
+            pop,
+            &parsed.model.default_params,
+            &parsed.fit_options,
+        )
+        .expect("fit")
+    };
+    let (now, before) = (fit(&population), fit(&old_contract));
+    assert!(now.ofv.is_finite(), "OFV must be finite: {}", now.ofv);
+    assert_eq!(now.ofv.to_bits(), before.ofv.to_bits(), "OFV");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&now.theta), bits(&before.theta), "theta");
+    assert_eq!(now.covariate_names, ["STUDY", "PLA_IDX"]);
+}

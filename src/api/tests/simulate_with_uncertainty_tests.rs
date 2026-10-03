@@ -795,10 +795,26 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         draws.len()
     );
 
-    // The per-draw skip warning is pushed into `sim_warnings`, which this
-    // aggregated-uncertainty entry point discards (it returns only the row vec),
-    // so the message is not observable here. Pin the skip *predicate* directly:
-    // a flip-flop-theta draw is flagged, the in-domain point estimate is not.
+    // Since #1645 the `_diag` form returns the per-draw skip warnings the row-only
+    // form drops: one per draw missing from the rows, naming that draw.
+    let diag = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("diag");
+    let skipped: Vec<usize> = (1..=30).filter(|k| !draws.contains(k)).collect();
+    let named: Vec<usize> = diag
+        .warnings
+        .iter()
+        .filter_map(|w| {
+            w.strip_prefix("uncertainty draw ")?
+                .split_once(" skipped — ")?
+                .0
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert!(!skipped.is_empty());
+    assert_eq!(named, skipped, "{:#?}", diag.warnings);
+
+    // Pin the skip *predicate* directly too: a flip-flop-theta draw is flagged,
+    // the in-domain point estimate is not.
     let mut crossing = model.default_params.theta.clone();
     crossing[0] = 1.0; // TVCL = 1.0 → ke = 1.0/4 = 0.25 ≥ KTR = 0.2 (flip-flop)
     assert!(

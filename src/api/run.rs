@@ -453,7 +453,7 @@ pub(crate) fn simulation_design_covariates(
         // grid — it is not something the user can state, so demanding it here
         // would make every level-block model unsimulatable, naming a column with a
         // reserved `__level_` prefix as the fix.
-        .filter(|name| !crate::api::levels::is_level_index_column(name))
+        .filter(|name| !crate::parser::model_parser::is_level_index_column(name))
         .filter(|name| !names.iter().any(|n| n == *name))
         .map(|s| s.as_str())
         .collect();
@@ -995,7 +995,7 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
         // A a level block index column (#1064) is synthesized by
         // `bind_theta_levels` after the read, never present in the CSV — asking
         // the reader for it would fail on a column the user never wrote.
-        .filter(|c| !crate::api::levels::is_level_index_column(c))
+        .filter(|c| !crate::parser::model_parser::is_level_index_column(c))
         .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
         .collect()

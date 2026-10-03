@@ -186,6 +186,91 @@ fn the_simulate_paths_report_an_unbound_level_block_and_name_the_binder() {
 }
 
 #[test]
+fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
+    // #1644. Before, `predict_diag` ran only the covariate check, which named the
+    // synthesized `__level_PLACEBO` as "not found in data" — a column the user
+    // never wrote. Both sides of the entry-point gate in one test: predict's
+    // refusal names `predict`, simulate's suggestion is unchanged.
+    let parsed = parse_full_model(&no_eta_model()).unwrap();
+    let pop = population(2, 2);
+    let err = crate::api::predict_diag(&parsed.model, &pop, &parsed.model.default_params)
+        .err()
+        .expect("an unbound model must not predict");
+    // One assertion per sentence (and clause) of the message and the suggestion.
+    assert!(
+        err.starts_with(
+            "`theta PLACEBO[...]` was never bound to data, so it has no levels and every \
+             value gathered from it is NaN. "
+        ),
+        "the shared E_THETA_LEVELS_UNBOUND message: {err}"
+    );
+    assert!(
+        err.contains(
+            "Call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on the \
+             population you pass to `predict`"
+        ),
+        "the public binder, on the population predict reads: {err}"
+    );
+    assert!(
+        err.contains(", and predict with the model it re-parses into `parsed`."),
+        "the bound model is a re-parse, not the one in hand: {err}"
+    );
+    assert!(
+        err.ends_with(
+            "Or declare the block explicitly as `theta PLACEBO[N](...)` and index it with \
+             your own column."
+        ),
+        "the counted-form alternative: {err}"
+    );
+    for absent in [
+        "__level_",
+        "not found in data",
+        "before simulating",
+        "read_population_for_simulation",
+        "run_model_simulate",
+    ] {
+        assert!(
+            !err.contains(absent),
+            "`{absent}` in predict's refusal: {err}"
+        );
+    }
+
+    // The simulate side of the gate: the suggestion still says when to bind for a
+    // simulation (its sentences are pinned in
+    // `the_simulate_paths_report_an_unbound_level_block_and_name_the_binder`),
+    // and the simulate `Err` is still the bare message.
+    let diags = crate::api::validation::check_simulation_data(&parsed.model, &pop);
+    let sim = diags
+        .iter()
+        .find(|d| d.code == "E_THETA_LEVELS_UNBOUND")
+        .expect("simulate reports it");
+    assert!(
+        sim.suggestion
+            .as_deref()
+            .unwrap()
+            .contains("before simulating"),
+        "{sim:?}"
+    );
+    let sim_err = crate::api::simulate_with_options_diag(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &Default::default(),
+    )
+    .err()
+    .expect("an unbound model must not simulate");
+    assert_eq!(sim_err, sim.message);
+
+    // Bound, the same model predicts.
+    let mut pop = population(2, 2);
+    let mut bound = parse_full_model(&no_eta_model()).unwrap();
+    crate::api::bind_theta_levels(&mut bound, &no_eta_model(), &mut pop).unwrap();
+    crate::api::predict_diag(&bound.model, &pop, &bound.model.default_params)
+        .expect("a bound model predicts");
+}
+
+#[test]
 fn binding_expands_to_one_theta_per_observed_combination() {
     let mut pop = population(3, 4);
     let model = bind(&no_eta_model(), &mut pop).unwrap();
@@ -421,7 +506,10 @@ fn the_index_column_is_written_onto_every_subject() {
         assert_eq!(idx.len(), 3);
         assert!(idx[0] < idx[1] && idx[1] < idx[2]);
     }
-    assert!(pop.covariate_names.iter().any(|n| n == "__level_PLACEBO"));
+    // ...and nowhere else. `covariate_names` is the data's columns as users and
+    // downstream tools read them (`FitResult::covariate_names`, GAM, the FREM
+    // CSV header); the synthesized column is engine plumbing (#1644).
+    assert_eq!(pop.covariate_names, vec!["STUDY".to_string()]);
 }
 
 #[test]
