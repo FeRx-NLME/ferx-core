@@ -74,8 +74,9 @@ sharing the one `(init, lower, upper)` triple — and `FIX`, if given.
   at runtime; an out-of-range literal is a parse error.
 - A **bare** `PLACEBO` is an error — there is nothing to gather on. Index it.
 
-A helper in the R package that builds the index column for this form is planned
-([FeRx-NLME/ferx-r#370](https://github.com/FeRx-NLME/ferx-r/issues/370)).
+In R, `ferx_mbma_data()` builds and checks a summary-level MBMA dataset and
+emits the `LEVEL_IDX` index column for this form
+([FeRx-NLME/ferx-r#418](https://github.com/FeRx-NLME/ferx-r/pull/418)).
 
 ### Data-driven form: `theta NAME[COL, ...]`
 
@@ -117,6 +118,36 @@ problem as `E_THETA_LEVELS_UNBOUND`. To simulate a design with a fit's θ, bind 
 `bind_theta_levels_from_fit` and the fit's bindings, so the design keeps the
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
+
+### Where a block may be read
+
+Read a level block in `[individual_parameters]`, or directly in the
+prediction: a `[scaling] y = ...` readout, or the `y = ...` equation of a
+compartment-free model. These two spellings fit identically:
+
+```
+[individual_parameters]
+  S = SCALE[STUDY]
+[scaling]
+  y = central / V * S
+```
+
+```
+[scaling]
+  y = central / V * SCALE[STUDY]
+```
+
+ferx moves a block read in the prediction into an individual parameter for
+you, the same way it handles a θ written there by name. Both keep the analytic
+gradient, with two exceptions. The first is an index that reads anything other
+than data columns, numbers and individual parameters: a compartment amount
+(`SCALE[central]`), `TIME` or `T`, a θ or η, another block, or an `if`. The
+second is a model with no spare parameter slot left for it; ferx warns, naming
+the block. In either case the read stays in the readout and uses
+finite-difference gradients, like any other readout term the analytic path
+cannot serve. An index that does not read a compartment amount can instead be
+computed in `[individual_parameters]` (`K = ...`, then `SCALE[K]`), which keeps
+the analytic gradient.
 
 ### Identifiability
 
