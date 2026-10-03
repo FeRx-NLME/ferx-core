@@ -27637,3 +27637,52 @@ fn a_kappa_weight_reading_an_estimated_level_block_is_refused() {
         fixed.err()
     );
 }
+
+/// The remedy echoes the index as written (`KM_I = KM[...]`), so a computed index
+/// must come back readable, not only the bare identifier or number T8's spellings
+/// use. Every token arm, a nested bracket (whose `]` must not end the index), and
+/// the stop at the index's own `]` (the trailing `* 3` must not leak in).
+#[test]
+fn a_level_block_index_renders_back_as_written() {
+    let toks = tokenize("KM[(K + 1) * 2 - X / 4 ^ 2, Q[1]] * 3").unwrap();
+    assert_eq!(
+        render_index_tokens(&toks, 2),
+        "(K + 1) * 2 - X / 4^2, Q[1]",
+        "every arm, and the stop at the matching `]`"
+    );
+    // A token no index spells is shown as an ellipsis rather than dropped.
+    let toks = tokenize("KM[K == 1]").unwrap();
+    assert_eq!(render_index_tokens(&toks, 2), "K…1");
+}
+
+/// The hazard pre-check names the block a hazard reads, echoing the read, and
+/// does not mistake an `[covariate_nn]` output that shares a block's name
+/// (`NET.KM`) for a block read — the expression parser resolves the dot access
+/// before any block lookup, so refusing it here would refuse a valid model.
+#[cfg(feature = "survival")]
+#[test]
+fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
+    let spec = std::sync::Arc::new(GatherSpec {
+        name: "KM".to_string(),
+        levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+    });
+    let _scope = VectorThetaScope::enter(vec![VectorThetaDecl {
+        name: "KM".to_string(),
+        spec,
+        index_covariate: None,
+    }]);
+    let why = ode_level_block_read("H0 * KM[K + 1]")
+        .unwrap()
+        .expect("a block read in the hazard is refused");
+    assert!(
+        why.contains("`KM` is a θ level block, and an ODE-accumulated `hazard` cannot read")
+            && why.contains("`KM_I = KM[K + 1]`"),
+        "{why}"
+    );
+    assert_eq!(
+        ode_level_block_read("H0 * NET.KM").unwrap(),
+        None,
+        "`NET.KM` is an NN output access, not a block read"
+    );
+    assert_eq!(ode_level_block_read("H0 * exp(B * central)").unwrap(), None);
+}
