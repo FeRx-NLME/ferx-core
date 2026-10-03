@@ -705,16 +705,44 @@ pub(crate) fn check_residual_magnitude(
 /// levels, so every gather out of it is `NaN` (#1064).
 ///
 /// `fit()` refuses such a model up front with its own message; this is the same
-/// guard for the simulate paths, which do not go through `fit()`. Binding
-/// happens in `api::levels::bind_theta_levels`, which every file entry point
-/// calls — an in-memory caller that assembled the `CompiledModel` itself is the
-/// case this catches.
-pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnostic> {
+/// guard for the simulate and predict paths, which do not go through `fit()`.
+/// Binding happens in `api::levels::bind_theta_levels`, which every file entry
+/// point calls — an in-memory caller that assembled the `CompiledModel` itself is
+/// the case this catches. `entry` picks the suggestion: the message is shared,
+/// but only a simulation has a design population and a binding file entry
+/// point to name.
+pub(crate) fn check_unbound_theta_levels(
+    model: &CompiledModel,
+    entry: UnboundLevelsEntry,
+) -> Vec<Diagnostic> {
     model
         .theta_blocks()
         .unbound_level_blocks()
         .iter()
         .map(|name| {
+            let suggestion = match entry {
+                UnboundLevelsEntry::Simulate => format!(
+                    "call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on \
+                     the simulation population (`read_population_for_simulation`) before \
+                     simulating. `run_model_simulate` (`ferx --simulate`) binds for you, \
+                     against the [simulation] design. Or declare the block explicitly as \
+                     `theta {name}[N](...)` and index it with your own column"
+                ),
+                // `predict` is normally called with a fit's θ, so the binder to name is
+                // the one that lays θ out as the fit did. `bind_theta_levels` re-discovers
+                // the levels from the population at hand, and on new data reads a fit's θ
+                // at the wrong positions (#1644 review, row 1).
+                UnboundLevelsEntry::Predict => format!(
+                    "with a fit's θ, call `bind_theta_levels_from_fit(&mut parsed, \
+                     &model_text, &mut population, &fitted_levels)` on the population you \
+                     pass to `predict`, where `fitted_levels` is the `parsed.bindings.levels` \
+                     kept from binding the fit data, and predict with the model it re-parses \
+                     into `parsed`. `bind_theta_levels` on that population fits only a θ laid \
+                     out for the levels it discovers, such as the model's own \
+                     `default_params`. Or declare the block explicitly as `theta {name}[N](...)` \
+                     and index it with your own column"
+                ),
+            };
             Diagnostic::error(
                 "E_THETA_LEVELS_UNBOUND",
                 format!(
@@ -723,15 +751,19 @@ pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnosti
                 ),
             )
             .with_block("parameters")
-            .with_suggestion(format!(
-                "call `bind_theta_levels(&mut parsed, &model_text, &mut population)` on \
-                 the simulation population (`read_population_for_simulation`) before \
-                 simulating. `run_model_simulate` (`ferx --simulate`) binds for you, \
-                 against the [simulation] design. Or declare the block explicitly as \
-                 `theta {name}[N](...)` and index it with your own column"
-            ))
+            .with_suggestion(suggestion)
         })
         .collect()
+}
+
+/// Which entry point met an unbound level block — it decides
+/// [`check_unbound_theta_levels`]'s suggestion, not its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnboundLevelsEntry {
+    /// `simulate*` / `simulate_adaptive*`, through `check_simulation_data`.
+    Simulate,
+    /// `predict` / `predict_diag` (#1644).
+    Predict,
 }
 
 /// Every `NAME[COLUMN]` gather index the data carries must be an integer level
@@ -1341,7 +1373,7 @@ pub(crate) fn check_simulation_data(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
-    let mut diags = check_unbound_theta_levels(model);
+    let mut diags = check_unbound_theta_levels(model, UnboundLevelsEntry::Simulate);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));

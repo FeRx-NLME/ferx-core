@@ -21,7 +21,7 @@ pub(crate) use validation::{
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
     check_dose_compartments, check_endpoint_routing, check_kappa_weights, check_modeled_dose_rates,
     check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
-    check_variance_init_rails,
+    check_unbound_theta_levels, check_variance_init_rails, UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
@@ -89,8 +89,8 @@ pub use run::{
 pub(crate) use simulate::obs_row_time;
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
-    simulate_with_uncertainty, SimulateOptions, SimulateUncertaintyOptions, SimulationOutput,
-    SimulationResult,
+    simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
+    SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
 };
 
 // ── test-support re-exports (reached via `super::` from the relocated

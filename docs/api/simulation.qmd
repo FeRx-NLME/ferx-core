@@ -309,6 +309,18 @@ let sims = simulate_with_uncertainty(
 )?;
 ```
 
+### With diagnostics: `simulate_with_uncertainty_diag()`
+
+`simulate_with_uncertainty_diag()` takes the same arguments and returns a
+`SimulationOutput { results, warnings }`. `results` holds exactly the rows
+`simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same
+bundle `simulate_with_options_diag()` reports, plus a line for every parameter
+draw skipped in the flip-flop regime. Data-reader warnings reach it through the
+same filter `fit()` uses. So a caller that relays them should take them from
+here, not from `Population::warnings`, which still holds the ones the filter
+withholds (`W_NO_DOSES` on a compartment-free model, for example). See
+[Which entry points report warnings](../warnings.qmd#entry-points).
+
 ## Result Types
 
 ```rust

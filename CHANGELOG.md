@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **`simulate_adaptive` no longer reports `W_NO_DOSES`** (#1645). On that entry point the
+  controller supplies the regimen, so a dataset carrying only an observation grid is the
+  expected input, and the warning's advice (check for an `AMT` column with dose rows) does
+  not apply. Every
+  other entry point still reports it.
 - **The unseen-level refusal and `E_THETA_LENGTH` now name the action, not a Rust
   function** (#1623). Simulating a design with a level the fit never observed is still
   refused; its advice is now to simulate only the fit's levels, or to simulate the design
@@ -68,6 +73,12 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **`simulate_with_uncertainty_diag` returns uncertainty simulations with their warnings**
+  (#1645). It returns a `SimulationOutput` whose rows are exactly what
+  `simulate_with_uncertainty` returns. Its `warnings` carry the bundle
+  `simulate_with_options_diag` reports: parse and model/data findings, data-reader findings
+  through the same filter `fit()` uses, and ODE-solver diagnostics. They also name each
+  parameter draw skipped in the flip-flop regime, which used to be dropped silently.
 - **`bind_theta_levels_from_fit` binds a simulation design against a fit's level bindings**
   (#1614), so a `theta NAME[COL, ...]` model can be simulated with its fitted θ. Pass the
   `parsed.bindings.levels` kept from binding the fit data. Each design record gets its
@@ -90,6 +101,18 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A `theta NAME[COL, ...]` block's internal `__level_NAME` column no longer shows up in
+  the undeclared-covariate warning or in column lists** (#1644). The "not declared in
+  [covariates]" warning no longer lists it; the block's own columns, such as `STUDY`, are
+  still reported when undeclared.
+  `FitResult.covariate_names`, the "Available covariate columns" list, the GAM covariate
+  screen and the FREM dataset header now hold only the data's real columns. Estimates do not
+  change. A `.fitrx` written before this still lists the column in `covariate_names`; it
+  loads unchanged. `predict` on a model whose level block was never bound now reports
+  `E_THETA_LEVELS_UNBOUND`'s message and how to bind, as the simulate paths do. Before, it
+  reported `__level_NAME` as a covariate missing from the data. A model that *was* bound,
+  given a population that was not, still reports the column that way on `fit`, `predict`
+  and simulate (#1647).
 - **A θ read through a gather is now estimated on the default (analytic) gradient** (#1628).
   When an individual parameter read θ only through a gather (`CL = PLACEBO[PLA_IDX]`, a level
   block's bare `PLACEBO`, or an intermediate such as `PL = PLACEBO`), its analytic gradient in

@@ -1321,6 +1321,11 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
             "at the supplied parameters",
             "from this simulate_adaptive() pass",
         ),
+        (
+            SolverStatsPhase::SimulateUncertainty,
+            "at the drawn parameter sets",
+            "from this simulate_with_uncertainty() run over all parameter draws",
+        ),
     ] {
         let (msg, entry) = ode_solver_diagnostics_warning(&only, &FitOptions::default(), phase)
             .expect("a warning");

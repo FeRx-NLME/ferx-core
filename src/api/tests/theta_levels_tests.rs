@@ -186,6 +186,107 @@ fn the_simulate_paths_report_an_unbound_level_block_and_name_the_binder() {
 }
 
 #[test]
+fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
+    // #1644. Before, `predict_diag` ran only the covariate check, which named the
+    // synthesized `__level_PLACEBO` as "not found in data" — a column the user
+    // never wrote. Both sides of the entry-point gate in one test: predict's
+    // refusal names `predict`, simulate's suggestion is unchanged.
+    let parsed = parse_full_model(&no_eta_model()).unwrap();
+    let pop = population(2, 2);
+    let err = crate::api::predict_diag(&parsed.model, &pop, &parsed.model.default_params)
+        .err()
+        .expect("an unbound model must not predict");
+    // One assertion per sentence (and clause) of the message and the suggestion.
+    assert!(
+        err.starts_with(
+            "`theta PLACEBO[...]` was never bound to data, so it has no levels and every \
+             value gathered from it is NaN. "
+        ),
+        "the shared E_THETA_LEVELS_UNBOUND message: {err}"
+    );
+    // That the advice is also *true* — following it reproduces the fit's predictions on
+    // new data — is `from_fit::following_the_unbound_predict_refusal_gives_the_fits_predictions`.
+    assert!(
+        err.contains(
+            "With a fit's θ, call `bind_theta_levels_from_fit(&mut parsed, &model_text, &mut \
+             population, &fitted_levels)` on the population you pass to `predict`"
+        ),
+        "the from-fit binder, on the population predict reads: {err}"
+    );
+    assert!(
+        err.contains(
+            ", where `fitted_levels` is the `parsed.bindings.levels` kept from binding the fit \
+             data"
+        ),
+        "where the fit's bindings come from: {err}"
+    );
+    assert!(
+        err.contains(", and predict with the model it re-parses into `parsed`."),
+        "the bound model is a re-parse, not the one in hand: {err}"
+    );
+    assert!(
+        err.contains(
+            "`bind_theta_levels` on that population fits only a θ laid out for the levels it \
+             discovers, such as the model's own `default_params`."
+        ),
+        "when the other binder is the right one: {err}"
+    );
+    assert!(
+        err.ends_with(
+            "Or declare the block explicitly as `theta PLACEBO[N](...)` and index it with \
+             your own column."
+        ),
+        "the counted-form alternative: {err}"
+    );
+    for absent in [
+        "__level_",
+        "not found in data",
+        "before simulating",
+        "read_population_for_simulation",
+        "run_model_simulate",
+    ] {
+        assert!(
+            !err.contains(absent),
+            "`{absent}` in predict's refusal: {err}"
+        );
+    }
+
+    // The simulate side of the gate: the suggestion still says when to bind for a
+    // simulation (its sentences are pinned in
+    // `the_simulate_paths_report_an_unbound_level_block_and_name_the_binder`),
+    // and the simulate `Err` is still the bare message.
+    let diags = crate::api::validation::check_simulation_data(&parsed.model, &pop);
+    let sim = diags
+        .iter()
+        .find(|d| d.code == "E_THETA_LEVELS_UNBOUND")
+        .expect("simulate reports it");
+    assert!(
+        sim.suggestion
+            .as_deref()
+            .unwrap()
+            .contains("before simulating"),
+        "{sim:?}"
+    );
+    let sim_err = crate::api::simulate_with_options_diag(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &Default::default(),
+    )
+    .err()
+    .expect("an unbound model must not simulate");
+    assert_eq!(sim_err, sim.message);
+
+    // Bound, the same model predicts.
+    let mut pop = population(2, 2);
+    let mut bound = parse_full_model(&no_eta_model()).unwrap();
+    crate::api::bind_theta_levels(&mut bound, &no_eta_model(), &mut pop).unwrap();
+    crate::api::predict_diag(&bound.model, &pop, &bound.model.default_params)
+        .expect("a bound model predicts");
+}
+
+#[test]
 fn binding_expands_to_one_theta_per_observed_combination() {
     let mut pop = population(3, 4);
     let model = bind(&no_eta_model(), &mut pop).unwrap();
@@ -421,7 +522,10 @@ fn the_index_column_is_written_onto_every_subject() {
         assert_eq!(idx.len(), 3);
         assert!(idx[0] < idx[1] && idx[1] < idx[2]);
     }
-    assert!(pop.covariate_names.iter().any(|n| n == "__level_PLACEBO"));
+    // ...and nowhere else. `covariate_names` is the data's columns as users and
+    // downstream tools read them (`FitResult::covariate_names`, GAM, the FREM
+    // CSV header); the synthesized column is engine plumbing (#1644).
+    assert_eq!(pop.covariate_names, vec!["STUDY".to_string()]);
 }
 
 #[test]
@@ -1311,6 +1415,64 @@ mod from_fit {
             "every ipred finite: {:?}",
             rows.iter().map(|r| r.ipred).collect::<Vec<_>>()
         );
+    }
+
+    /// #1644 review round 1, row 1: the unbound-predict refusal's advice must be *true*,
+    /// not only present. A caller predicting new data (here: two of the fit's three
+    /// studies) with a fit's θ follows the binder the refusal names and must get the
+    /// fit's own predictions for those subjects, bit for bit.
+    ///
+    /// The first wording named `bind_theta_levels` on the predict population. That
+    /// re-discovers the levels (5 θ here, against the fit's 7), and `predict_diag` has no
+    /// θ-length guard (#1615), so the fit's θ came back `Ok` read at the wrong positions —
+    /// measured on this fixture at `74078e0c`: subject 3 at t = 1 predicted 2.455468 against
+    /// the fit's 7.557837, subject 2 at t = 2 0.182376 against 6.250023.
+    #[test]
+    fn following_the_unbound_predict_refusal_gives_the_fits_predictions() {
+        let text = no_eta_model();
+        let mut fit_pop = population(3, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+        assert_eq!(
+            fit.model.n_theta, 7,
+            "TVCL, TVV, 3 x 2 levels - 1 (sum_to_zero)"
+        );
+        // Distinct, non-cancelling level effects, so a misplaced read moves a prediction.
+        let mut theta = fit.model.default_params.theta.clone();
+        for (i, t) in theta.iter_mut().enumerate().skip(1).take(5) {
+            *t = 0.3 * i as f64 - 0.7;
+        }
+        let rows = |model: &CompiledModel, pop: &Population| -> Vec<(String, u64, u64)> {
+            crate::api::predict_diag(model, pop, &fit_theta_params(model, &theta))
+                .expect("predict")
+                .results
+                .into_iter()
+                .filter(|r| r.id != "1")
+                .map(|r| (r.id, r.time.to_bits(), r.pred.to_bits()))
+                .collect()
+        };
+        let want = rows(&fit.model, &fit_pop);
+        assert_eq!(want.len(), 4, "studies 2 and 3, two times each");
+
+        let mut new_data = population(3, 2);
+        new_data.subjects.remove(0);
+        let unbound = parse_full_model(&text).unwrap();
+        let err =
+            crate::api::predict_diag(&unbound.model, &new_data, &unbound.model.default_params)
+                .err()
+                .expect("an unbound model must not predict");
+        assert!(
+            err.contains("`bind_theta_levels_from_fit("),
+            "the refusal names the binder this test follows: {err}"
+        );
+
+        let mut followed = new_data.clone();
+        let parsed = bind_design(&text, &mut followed, &fit.bindings.levels).expect("bind");
+        assert_eq!(rows(&parsed.model, &followed), want);
+
+        // Why the advice cannot be `bind_theta_levels`: on this population it lays θ out
+        // for the levels it discovers, which is not the fit's layout.
+        let mut own = new_data.clone();
+        assert_eq!(bind(&text, &mut own).unwrap().n_theta, 5);
     }
 }
 

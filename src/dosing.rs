@@ -577,8 +577,9 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
 /// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
 /// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// set and drained by the draining `api` boundaries (`fit` / `simulate_with_options_diag`) into
-/// `FitResult.warnings` / `SimulationOutput.warnings` via [`take_ss_nonconvergence_warnings`].
+/// set and drained by the draining `api` boundaries (`fit` / `simulate_with_options_diag` /
+/// `simulate_with_uncertainty_diag`) into `FitResult.warnings` / `SimulationOutput.warnings` via
+/// [`take_ss_nonconvergence_warnings`].
 ///
 /// The message is model-structural (independent of subject and of objective-eval count), so the
 /// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its

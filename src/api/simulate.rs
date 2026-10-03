@@ -633,9 +633,9 @@ pub fn simulate_with_options_diag(
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
     // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
-    // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty` calls
-    // once per draw, and a scope there would be entered per draw to feed a return type that
-    // has no warnings channel to put it in.
+    // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty_diag`
+    // calls once per draw, and that caller opens one scope around all of its draws (with its
+    // own phase) — a scope in the chokepoint would nest inside it, once per draw.
     let (results, stats) = super::with_solver_stats(model, || {
         simulate_inner_with_draw(
             model,
@@ -1145,13 +1145,44 @@ pub struct SimulateUncertaintyOptions {
 /// Total rows returned: `n_uncertainty_draws * n_sim_per_draw * n_subjects *
 /// n_obs`. Each `SimulationResult` carries the originating `draw` and `sim`
 /// indices so downstream code can compute per-time uncertainty bands.
+///
+/// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
+/// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
 pub fn simulate_with_uncertainty(
     model: &CompiledModel,
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
 ) -> Result<Vec<SimulationResult>, String> {
+    simulate_with_uncertainty_diag(model, population, fit_result, opts).map(|o| o.results)
+}
+
+/// [`simulate_with_uncertainty`] with the diagnostics attached (#1645) — the uncertainty twin of
+/// [`simulate_with_options_diag`].
+///
+/// `results` is exactly what [`simulate_with_uncertainty`] returns. `warnings` carries, in this
+/// order: the per-draw and per-subject simulation diagnostics (a draw skipped because it landed
+/// in the flip-flop regime, #786; a degenerate hazard draw, #763 / #762), capped steady-state
+/// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
+/// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
+/// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
+/// collected over every draw. `postfit::non_fit_diagnostics` documents what that bundle
+/// includes and leaves out.
+///
+/// A caller relaying data-reader findings should take them from here, never from
+/// [`Population::warnings`] directly: the raw list still holds the findings the shared filter
+/// withholds (`W_NO_DOSES` / `W_CMT_DEFAULTED` on a compartment-free model).
+pub fn simulate_with_uncertainty_diag(
+    model: &CompiledModel,
+    population: &Population,
+    fit_result: &FitResult,
+    opts: &SimulateUncertaintyOptions,
+) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
+
+    // Start the SS-equilibration non-convergence sink clean, as `simulate_with_options_diag`
+    // does, so this run's `warnings` carry only its own capped equilibrations (#867).
+    crate::dosing::clear_ss_nonconvergence_warnings();
 
     // The fit's θ against this model's layout (#1614), before anything is drawn around
     // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
@@ -1193,11 +1224,49 @@ pub fn simulate_with_uncertainty(
     let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
-    // Per-subject simulation diagnostics (#762/#763) are collected but not surfaced on
-    // this uncertainty-aggregation path (its return is the flat row vec); the underlying
-    // per-subject handling — no whole-run panic, degenerate subjects censored — still
-    // applies. Use `simulate_with_options` when the warnings matter.
+    // Per-draw and per-subject simulation diagnostics (#786, #762/#763), returned in
+    // `warnings`. The per-subject handling — no whole-run panic, degenerate subjects
+    // censored — applies either way.
     let mut sim_warnings: Vec<String> = Vec::new();
+    // One solver-stats scope around every draw: the loop is serial (the RNG draw order is
+    // part of the contract), so the thread-local scope sees every integration. #1304.
+    let (looped, stats) = super::with_solver_stats(model, || -> Result<(), String> {
+        simulate_uncertainty_draws(
+            model,
+            population,
+            &draws,
+            opts,
+            &mut rng,
+            &mut results,
+            &mut sim_warnings,
+        )
+    });
+    looped?;
+    sim_warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    sim_warnings.extend(super::non_fit_diagnostics(
+        model,
+        population,
+        &template,
+        &stats,
+        super::SolverStatsPhase::SimulateUncertainty,
+    ));
+    Ok(SimulationOutput {
+        results,
+        warnings: sim_warnings,
+    })
+}
+
+/// The per-draw loop of [`simulate_with_uncertainty_diag`], appending each draw's rows to
+/// `results`. Split out so the caller can run it inside one solver-stats scope.
+fn simulate_uncertainty_draws(
+    model: &CompiledModel,
+    population: &Population,
+    draws: &[ModelParameters],
+    opts: &SimulateUncertaintyOptions,
+    rng: &mut rand::rngs::StdRng,
+    results: &mut Vec<SimulationResult>,
+    sim_warnings: &mut Vec<String>,
+) -> Result<(), String> {
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
@@ -1220,12 +1289,12 @@ pub fn simulate_with_uncertainty(
             k + 1,
             None,
             None,
-            &mut rng,
-            &mut sim_warnings,
+            rng,
+            sim_warnings,
         )?;
         results.append(&mut rows);
     }
-    Ok(results)
+    Ok(())
 }
 
 /// A single simulated observation.
@@ -1254,7 +1323,8 @@ pub struct SimulationResult {
     pub outcome: SimOutcome,
 }
 
-/// The result of [`simulate_with_options`]: the simulated rows plus any non-fatal
+/// The result of [`simulate_with_options_diag`] and [`simulate_with_uncertainty_diag`]: the
+/// simulated rows plus any non-fatal
 /// per-subject diagnostics collected during the run.
 ///
 /// `warnings` is the simulation analogue of [`FitResult::warnings`]: a subject whose
@@ -1271,9 +1341,9 @@ pub struct SimulationResult {
 /// only the rows (no diagnostics channel) — use `simulate_with_options` when the
 /// warnings matter (e.g. a population VPC).
 ///
-/// `simulate_with_uncertainty()` returns a flat row vec and so has no channel either; its
-/// per-draw findings are still collected internally (a skipped flip-flop draw, #786) and still
-/// dropped at the return. That is the one remaining silent simulate entry point, and
+/// `simulate_with_uncertainty()` returns a flat row vec and so has no channel either; since
+/// #1645 its diagnostics — including a skipped flip-flop draw (#786) — come back on
+/// [`simulate_with_uncertainty_diag`]'s `warnings`.
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` /
 /// `the_row_only_entry_points_stay_silent_by_contract` pin the two lists so a new entry point
 /// cannot quietly join the silent one.

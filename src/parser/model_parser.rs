@@ -5206,6 +5206,10 @@ pub fn parse_full_model_with(
             .referenced_covariates
             .iter()
             .filter(|c| !declared.contains(c.as_str()))
+            // A level block's synthesized index column is not a column the user
+            // wrote or can declare (#1644). The block's own columns (`STUDY` in
+            // `theta P[STUDY, TIME]`) are real ones and stay listed.
+            .filter(|c| !is_level_index_column(c))
             .map(|s| s.as_str())
             .collect();
         if !undeclared.is_empty() {
@@ -15428,11 +15432,25 @@ fn parse_theta_block_spec(name: &str, contents: &str) -> Result<ThetaBlockSpec, 
     Ok(ThetaBlockSpec::Columns { columns, contrast })
 }
 
+/// Prefix of every synthesized level index column: double-underscored so it
+/// cannot collide with a real data column, and so the file readers know not to
+/// look for it in the CSV. The producer ([`level_index_column`]) and the
+/// predicate ([`is_level_index_column`]) both read this one constant.
+pub(crate) const LEVEL_INDEX_PREFIX: &str = "__level_";
+
 /// Name of the synthesized per-record index column a level block
-/// gathers on. Double-underscore prefixed so it cannot collide with a real data
-/// column.
+/// gathers on.
 pub(crate) fn level_index_column(block: &str) -> String {
-    format!("__level_{block}")
+    format!("{LEVEL_INDEX_PREFIX}{block}")
+}
+
+/// Whether `name` is a synthesized level index column rather than a real data
+/// column. The column is engine plumbing: it lives in each subject's covariate
+/// maps, where the predictors read it, and in no list a user reads — the CSV
+/// readers skip it when collecting the columns they must find in the file, and
+/// the undeclared-covariate warning never names it (#1644).
+pub(crate) fn is_level_index_column(name: &str) -> bool {
+    name.starts_with(LEVEL_INDEX_PREFIX)
 }
 
 /// Turn a discovered [`LevelBinding`] into the block's level → θ map plus the

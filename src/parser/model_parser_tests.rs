@@ -26874,3 +26874,125 @@ fn hoist_leaves_the_indiv_param_program_unsplit() {
     assert_eq!(hp.n_vars, cp.n_vars);
     assert_eq!(hp.pk_var_slots, cp.pk_var_slots);
 }
+
+// ── #1644: the synthesized level-index column never reaches the user ─────────
+
+/// A compartment-free MBMA-shaped model (the #1644 probe fixture): `E0` carries
+/// a level block (or a counted gather), `[covariates]` is spliced in verbatim.
+fn level_block_warning_model(thetas: &str, e0: &str, covariates: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  {thetas}
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_EMAX ~ 0.04
+  sigma ADD ~ 0.1
+{covariates}
+[individual_parameters]
+  {e0}
+  EMAX = TVEMAX * exp(ETA_EMAX)
+  ET50 = TVET50
+
+[structural_model]
+  y = E0 + EMAX * TIME / (TIME + ET50)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+    )
+}
+
+const LEVEL_BLOCK_ALL_DECLARED: &str =
+    "\n[covariates]\n  STUDY categorical\n  ARM categorical\n  NARM continuous\n";
+const LEVEL_BLOCK_STUDY_UNDECLARED: &str = "\n[covariates]\n  ARM categorical\n  NARM continuous\n";
+
+/// The names the undeclared-covariate warning lists, or `None` when it is not
+/// raised. Also asserts that no parse warning of any kind names a synthesized
+/// column.
+fn undeclared_covariates(text: &str) -> Option<Vec<String>> {
+    let parsed = parse_full_model(text).expect("model parses");
+    let warnings = &parsed.model.parse_warnings;
+    assert!(
+        !warnings.iter().any(|w| w.contains(LEVEL_INDEX_PREFIX)),
+        "a parse warning names a synthesized level column: {warnings:?}"
+    );
+    let head = "not declared in [covariates]: ";
+    let hits: Vec<&String> = warnings.iter().filter(|w| w.contains(head)).collect();
+    assert!(hits.len() <= 1, "{hits:?}");
+    hits.first().map(|w| {
+        let rest = &w[w.find(head).unwrap() + head.len()..];
+        let list = &rest[..rest.find(". They are still usable").expect("tail")];
+        list.split(", ").map(str::to_string).collect()
+    })
+}
+
+/// T1. Every real column declared: the only name left would be the
+/// synthesized `__level_PLACEBO`, which the user never wrote and cannot declare.
+#[test]
+fn a_level_block_with_every_real_column_declared_raises_no_undeclared_warning() {
+    let text = level_block_warning_model(
+        "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+        "E0 = TVE0 + PLACEBO",
+        LEVEL_BLOCK_ALL_DECLARED,
+    );
+    assert_eq!(undeclared_covariates(&text), None);
+}
+
+/// T2. The block's own column is a real data column, so leaving it out of
+/// `[covariates]` is still reported — and it is the only name listed.
+#[test]
+fn a_level_blocks_own_undeclared_column_is_still_reported_alone() {
+    let text = level_block_warning_model(
+        "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+        "E0 = TVE0 + PLACEBO",
+        LEVEL_BLOCK_STUDY_UNDECLARED,
+    );
+    assert_eq!(
+        undeclared_covariates(&text),
+        Some(vec!["STUDY".to_string()])
+    );
+}
+
+/// T3. Two blocks, and a TIME-only block (`TIME` is the record time, not a
+/// covariate): the filter is the prefix, not one block's name.
+#[test]
+fn several_and_time_only_level_blocks_raise_no_undeclared_warning() {
+    let two = level_block_warning_model(
+        "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)\n  theta ARMFX[ARM](0.0, -10.0, 10.0)",
+        "E0 = TVE0 + PLACEBO + ARMFX",
+        LEVEL_BLOCK_ALL_DECLARED,
+    );
+    assert_eq!(undeclared_covariates(&two), None, "two blocks");
+    let time_only = level_block_warning_model(
+        "theta PLACEBO[TIME](0.0, -10.0, 10.0)",
+        "E0 = TVE0 + PLACEBO",
+        LEVEL_BLOCK_ALL_DECLARED,
+    );
+    assert_eq!(undeclared_covariates(&time_only), None, "TIME-only block");
+}
+
+/// T4 (control). A counted block indexed by the user's own column synthesizes
+/// nothing: `STUDY` is read directly, so leaving it undeclared is reported.
+#[test]
+fn a_counted_gathers_undeclared_index_column_is_reported() {
+    let text = level_block_warning_model(
+        "theta PLACEBO[3](0.0, -10.0, 10.0)",
+        "E0 = TVE0 + PLACEBO[STUDY]",
+        LEVEL_BLOCK_STUDY_UNDECLARED,
+    );
+    assert_eq!(
+        undeclared_covariates(&text),
+        Some(vec!["STUDY".to_string()])
+    );
+}
+
+/// T5. The producer and the predicate share one prefix.
+#[test]
+fn the_level_index_producer_and_predicate_share_one_prefix() {
+    assert!(is_level_index_column(&level_index_column("PLACEBO")));
+    assert_eq!(level_index_column("PLACEBO"), "__level_PLACEBO");
+    assert!(!is_level_index_column("LEVEL_PLACEBO"));
+    assert!(!is_level_index_column("STUDY"));
+}
