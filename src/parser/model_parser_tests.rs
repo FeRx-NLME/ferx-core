@@ -27322,3 +27322,318 @@ fn the_readout_sizing_note_names_no_block_when_none_was_dropped() {
         "{note}"
     );
 }
+
+// ── #1637, #1638, #1639: where a θ level block may be read ──────────────────
+//
+// A level block is readable exactly where a scalar θ is (#1636 plan §1). In
+// `[odes]`, `init(...)`, an ODE-accumulated `hazard =` and an error-model selector
+// condition it used to evaluate against an empty θ slice: `KM[2]` read a silent 0
+// (OFV 1367.88, no warning), `init(central) = KM[2]` panicked, `KM[K]` repelled every
+// subject to the 2.4e21 sentinel, and a selector `if (SCALE[STUDY] > 1.5)` compared
+// NaN and took the else branch for every row. A bare named block was refused in
+// `[odes]` naming the internal `__level_KM` column (#1636 plan §0, C1–C6, G1–G2).
+
+/// One model with a slot for each context a block may (or may not) be read in.
+/// Only the slots a case fills are non-empty, so every other context is a plain,
+/// valid model. `KM[3]` is a counted block, `KMN` a named one (bare = implicit
+/// index), `KZ` a named `ref` block — the shape whose free-θ count can be zero
+/// once bound (#1624), which is why the gate is a field, not a θ-range proxy.
+fn level_read_model(
+    ip_extra: &str,
+    odes_extra: &str,
+    init: &str,
+    event_model: &str,
+    scaling: &str,
+    err: &str,
+    derived: &str,
+) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVH0(0.03, 1e-5, 10.0)\n  theta KM[3](1.0, 0.1, 10.0)\n  \
+         theta KMN[STUDY, contrast = none](1.0, 0.1, 10.0)\n  \
+         theta KZ[STUDY, contrast = ref](0.0, -5.0, 5.0)\n  omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.05 (sd)\n  sigma ADD_ERR ~ 0.1 (sd)\n\n\
+         [covariates]\n  STUDY continuous\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  H0 = TVH0\n  \
+         K  = STUDY\n  {ip_extra}\n\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = -(CL/V) * central{odes_extra}\n  {init}\n\n\
+         {scaling}\n\n{event_model}\n\n[error_model]\n  {err}\n\n{derived}\n"
+    )
+}
+
+const LEVEL_READ_ERR: &str = "DV ~ proportional(PROP_ERR)";
+
+/// The four spellings of one read: `(block, read)`.
+const LEVEL_READ_SPELLINGS: [(&str, &str); 4] = [
+    ("KM", "KM[K]"),
+    ("KM", "KM[2]"),
+    ("KMN", "KMN"),
+    ("KZ", "KZ"),
+];
+
+/// The two refusing scopes, each with its parsed error. `[odes]`-side contexts:
+/// the RHS, `init(...)`, and (survival) the hazard.
+fn level_read_refusals(read: &str) -> Vec<(&'static str, String)> {
+    let mut out = vec![
+        (
+            "d/dt",
+            level_read_model("", &format!(" * {read}"), "", "", "", LEVEL_READ_ERR, ""),
+        ),
+        (
+            "init",
+            level_read_model(
+                "",
+                "",
+                &format!("init(central) = {read}"),
+                "",
+                "",
+                LEVEL_READ_ERR,
+                "",
+            ),
+        ),
+        (
+            "selector",
+            level_read_model(
+                "",
+                "",
+                "",
+                "",
+                "",
+                &format!(
+                    "if ({read} > 1.5) {{ DV ~ proportional(PROP_ERR) }} else {{ DV ~ \
+                     additive(ADD_ERR) }}"
+                ),
+                "",
+            ),
+        ),
+    ];
+    if cfg!(feature = "survival") {
+        out.push((
+            "hazard",
+            level_read_model(
+                "",
+                "",
+                "",
+                &format!("[event_model]\n  cmt    = 2\n  hazard = H0 * {read}"),
+                "",
+                LEVEL_READ_ERR,
+                "",
+            ),
+        ));
+    }
+    out.into_iter()
+        .map(|(ctx, m)| {
+            let err = match std::panic::catch_unwind(|| parse_full_model(&m)) {
+                Ok(Ok(_)) => panic!("[{ctx}, {read}] must be refused, parsed instead"),
+                Ok(Err(e)) => e,
+                Err(_) => panic!("[{ctx}, {read}] must be refused, panicked instead"),
+            };
+            (ctx, err)
+        })
+        .collect()
+}
+
+/// T8: every context × every spelling is refused at parse time, never evaluated
+/// against an empty θ slice. The text is the deliverable, so every sentence is
+/// asserted, and the two wordings are asserted from both sides in one test (a
+/// selector must not offer the `[individual_parameters]` remedy it cannot use; an
+/// ODE refusal must not send the user to a data column).
+#[test]
+fn a_level_block_read_where_theta_is_not_in_scope_is_refused() {
+    for (block, read) in LEVEL_READ_SPELLINGS {
+        for (ctx, err) in level_read_refusals(read) {
+            let tag = format!("[{ctx}, {read}]");
+            // Sentence 1, both scopes: what the name is.
+            assert!(
+                err.contains(&format!("`{block}` is a θ level block")),
+                "{tag} names the block: {err}"
+            );
+            for bad in [
+                "__level_",
+                "covariate",
+                "vector of",
+                "d/dt(__chz",
+                "not found",
+            ] {
+                assert!(!err.contains(bad), "{tag} must not say `{bad}`: {err}");
+            }
+            if ctx == "selector" {
+                assert!(err.starts_with("[error_model]: "), "{tag}: {err}");
+                assert!(
+                    err.contains(
+                        "An error-model selector condition reads per-row data columns \
+                         only, so it cannot read a θ."
+                    ),
+                    "{tag} says why: {err}"
+                );
+                assert!(
+                    err.contains("Put the grouping in a data column and select on that column."),
+                    "{tag} gives the remedy: {err}"
+                );
+                assert!(
+                    !err.contains("[individual_parameters]"),
+                    "{tag}: a selector cannot read an individual parameter either: {err}"
+                );
+            } else {
+                let place = if ctx == "hazard" {
+                    "an ODE-accumulated `hazard`"
+                } else {
+                    "[odes]"
+                };
+                assert!(
+                    err.contains(&format!("and {place} cannot read a θ directly.")),
+                    "{tag} says where and why: {err}"
+                );
+                assert!(
+                    err.contains(&format!(
+                        "Assign it in [individual_parameters] (e.g. `{block}_I = {read}`) and \
+                         use `{block}_I` instead."
+                    )),
+                    "{tag} gives the remedy, echoing the read: {err}"
+                );
+                assert!(
+                    !err.contains("data column"),
+                    "{tag}: the selector's remedy does not apply here: {err}"
+                );
+            }
+            match ctx {
+                "init" => assert!(err.starts_with("[odes] init(central): "), "{tag}: {err}"),
+                "hazard" => assert!(
+                    err.starts_with(&format!("[event_model] CMT=2 `hazard = H0 * {read}`: ")),
+                    "{tag} names the hazard as written: {err}"
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// T9: the same spellings where θ is in scope parse — the controls for T8, so the
+/// gate is a scope and not a blanket refusal. `KM[K]` reads an individual
+/// parameter, which an RUV magnitude cannot (a data column must be declared), so
+/// that context uses the data-column spelling `KM[STUDY]`.
+#[test]
+fn a_level_block_read_where_theta_is_in_scope_parses() {
+    for (_, read) in LEVEL_READ_SPELLINGS {
+        let ruv_read = if read == "KM[K]" { "KM[STUDY]" } else { read };
+        for (ctx, m) in [
+            (
+                "[individual_parameters]",
+                level_read_model(&format!("S = {read}"), "", "", "", "", LEVEL_READ_ERR, ""),
+            ),
+            (
+                "[scaling] y",
+                level_read_model(
+                    "",
+                    "",
+                    "",
+                    "",
+                    &format!("[scaling]\n  y = central / V * {read}"),
+                    LEVEL_READ_ERR,
+                    "",
+                ),
+            ),
+            (
+                "RUV magnitude",
+                level_read_model(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    &format!("DV ~ proportional(PROP_ERR * {ruv_read})"),
+                    "",
+                ),
+            ),
+            (
+                "[derived]",
+                level_read_model(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    LEVEL_READ_ERR,
+                    &format!("[derived]\n  D = {read}"),
+                ),
+            ),
+        ] {
+            parse_full_model(&m).unwrap_or_else(|e| panic!("[{ctx}, {read}] must parse: {e}"));
+        }
+    }
+}
+
+/// T10 (#1638): a residual magnitude reading a gather is θ-dependent, so GN takes
+/// its magnitude-aware fallback instead of a gradient with no direct `∂V/∂θ` — the
+/// gathered levels used to stay at exactly their init under `method = gn` — and its
+/// levels are not "unreferenced". Counted blocks only: a named block has no levels
+/// until it is bound to data, so its θ-dependence is decided on the bound re-parse,
+/// which `tests/theta_gather_gradient.rs` (T11) exercises through a fit. That a bare
+/// named block parses in a magnitude at all is T9's.
+#[test]
+fn a_gathered_residual_magnitude_is_theta_dependent() {
+    for (tag, read) in [("counted", "KM[STUDY]"), ("literal", "KM[2]")] {
+        let m = parse_model_string(&level_read_model(
+            "",
+            "",
+            "",
+            "",
+            "",
+            &format!("DV ~ proportional(PROP_ERR * {read})"),
+            "",
+        ))
+        .unwrap_or_else(|e| panic!("[{tag}] parse: {e}"));
+        assert!(
+            m.has_theta_dependent_ruv_magnitude(),
+            "[{tag}] a magnitude reading a θ level block is θ-dependent"
+        );
+        let block = read.split('[').next().unwrap();
+        let unreferenced: Vec<&String> = m
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("but not referenced") && w.contains(block))
+            .collect();
+        // The literal folds to the one level it reads, so only its siblings are
+        // genuinely unread.
+        if tag == "literal" {
+            assert!(
+                unreferenced.iter().all(|w| !w.contains("'KM[2]'")),
+                "[{tag}] the level read is referenced: {unreferenced:?}"
+            );
+        } else {
+            assert!(
+                unreferenced.is_empty(),
+                "[{tag}] no level is unreferenced: {unreferenced:?}"
+            );
+        }
+    }
+}
+
+/// T12 (#1639): an estimated level block in a kappa weight is refused, naming the
+/// block; the same block `FIX` is a known constant and is accepted; the existing
+/// scalar refusal is unchanged.
+#[test]
+fn a_kappa_weight_reading_an_estimated_level_block_is_refused() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  theta W[3](20.0, 1.0, 100.0)\n  kappa KAPPA_CL ~ 0.09 weight = W[STUDY]",
+        "  STUDY continuous\n",
+    ));
+    assert!(
+        err.contains(
+            "references estimated theta(s) `W` (a θ level block with an estimated level)."
+        ),
+        "names the block, once: {err}"
+    );
+    assert!(!err.contains("W[1]"), "not its level names: {err}");
+
+    let fixed = parse_model_string(&weighted_kappa_model_str(
+        "  theta W[3](20.0, 1.0, 100.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = W[STUDY]",
+        "  STUDY continuous\n",
+    ));
+    assert!(
+        fixed.is_ok(),
+        "a FIXed block is a known constant: {:?}",
+        fixed.err()
+    );
+}
