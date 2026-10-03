@@ -27192,6 +27192,37 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
     );
 }
 
+/// T2, the `T` time alias: the readout folds `T` to `TIME` after the pre-scan
+/// (`rewrite_scaling_time_alias`), so the two parses of `SCALE[T]` would key the
+/// gather differently. It must stay in the readout on FD. Lifting it anyway left an
+/// unread synth holding a slot and reading a data column `T` (PR #1653 review #2);
+/// the parse's debug check on unmatched gather synths turns that into a panic here.
+#[test]
+fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
+    let m = parse_model_string(&gather_readout_model(
+        "ode",
+        "theta SCALE[3](1.0, 0.1, 10.0)",
+        "",
+        "central / V * SCALE[T]",
+    ))
+    .expect("parse");
+    assert!(
+        readout_synth_names(&m).is_empty(),
+        "a `T`-indexed gather must not be lifted: {:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        readout_has_gather_op(&m),
+        "premise: the gather is still in the readout"
+    );
+    assert!(!gather_readout_program(&m).is_dual_evaluable());
+    assert!(
+        !m.referenced_covariates.iter().any(|c| c == "T"),
+        "`T` is the time alias here, not a data column: {:?}",
+        m.referenced_covariates
+    );
+}
+
 /// T2, slot overflow on the analytical engine: three gathers into a 2-slot spare
 /// pool. Every synth is dropped, the gathers stay in the bytecode, the readout is
 /// not dual-evaluable, and the sizing note names the blocks.

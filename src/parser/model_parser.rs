@@ -10098,6 +10098,9 @@ pub(crate) fn build_y_output_fn(
     declared_covariates: &[String],
     intermediates: &[(String, String)],
     parse_warnings: &mut Vec<String>,
+    // Out: every synthetic readout parameter this line now reads (#1636), so the caller
+    // can check that each lifted gather was matched by some `y` line.
+    synth_reads: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -10172,6 +10175,13 @@ pub(crate) fn build_y_output_fn(
     // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
+    visit_expr_nodes(&expr, &mut |e| {
+        if let Expression::Variable(n) = e {
+            if readout_synth.iter().any(|s| s.name == *n) && !synth_reads.contains(n) {
+                synth_reads.push(n.clone());
+            }
+        }
+    });
 
     // Reject KAPPA_* (IOV) references in a Form C output expression: the `[scaling]`
     // eta scope is BSV-only, so a kappa name parses as an unresolved identifier and
@@ -10428,6 +10438,8 @@ fn parse_scaling_block(
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
     let mut scaling_covariates: Vec<String> = Vec::new();
+    // Synthetic readout parameters the `y` lines read after the #486/#1636 rewrite.
+    let mut synth_reads: Vec<String> = Vec::new();
 
     // Named intermediates (#1030): every non-`obs_scale`/`y` key. Collected up
     // front — this is the one place with the full name scope in hand, so it owns
@@ -10560,6 +10572,7 @@ fn parse_scaling_block(
                     declared_covariates,
                     &intermediates,
                     parse_warnings,
+                    &mut synth_reads,
                 )?;
                 for cov in cov_names {
                     if !scaling_covariates.contains(&cov) {
@@ -10602,6 +10615,24 @@ fn parse_scaling_block(
             // and inlined into the entries that reference it — nothing left to do
             // on its own line.
             _ => {}
+        }
+    }
+
+    // #1636: a gather the pre-scan lifted must be the one the readout now reads. The
+    // pre-scan and `build_y_output_fn` parse the line separately and match by
+    // `readout_gather_key`, so a gap between the two parses (an identifier one of them
+    // resolves differently) leaves the gather in the readout on FD and the synth an
+    // unread individual parameter holding a slot. That costs speed, not correctness,
+    // so it is a debug-build check rather than a parse error.
+    for s in readout_synth {
+        if matches!(s.source, ReadoutSynthSource::Gather { .. }) {
+            debug_assert!(
+                synth_reads.contains(&s.name),
+                "#1636: readout gather synth `{}` was lifted but no `y` line reads it — \
+                 the pre-scan and the readout parse disagree on {:?}",
+                s.name,
+                s.source
+            );
         }
     }
 
@@ -20729,27 +20760,10 @@ fn collect_readout_theta_eta_synth(
     let mut gathers: Vec<(String, Expression)> = Vec::new();
     let indiv: std::collections::HashSet<&str> =
         indiv_var_names.iter().map(String::as_str).collect();
-    // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
-    // inline them here too, or the desugaring would miss it and drop an otherwise
-    // analytic readout to the FD fallback.
-    let intermediates = scaling_intermediates(scaling_lines)?;
-    for line in scaling_lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (key, value) = split_scaling_entry(trimmed)?;
-        let (base, _cmt) = parse_scaling_key(key)?;
-        if base != "y" {
-            continue;
-        }
-        // θ/η names resolve to `Theta`/`Eta`, and individual parameters to `Variable`
-        // (a gather index may read one, #1636); every other identifier — a state
-        // included — falls back to a covariate.
-        let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-        let mut expr =
-            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
-        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
+    // θ/η names resolve to `Theta`/`Eta`, and individual parameters to `Variable`
+    // (a gather index may read one, #1636); every other identifier — a state
+    // included — falls back to a covariate.
+    for expr in readout_y_exprs(scaling_lines, theta_names, eta_names, indiv_var_names)? {
         visit_expr_nodes(&expr, &mut |e: &Expression| match e {
             Expression::Theta(i) => {
                 thetas.insert(*i);
@@ -20807,7 +20821,26 @@ fn readout_used_theta_eta(
 > {
     let mut thetas = std::collections::HashSet::new();
     let mut etas = std::collections::HashSet::new();
+    for expr in readout_y_exprs(scaling_lines, theta_names, eta_names, &[])? {
+        visit_expr_nodes(&expr, &mut |e| note_theta_eta(e, &mut thetas, &mut etas));
+    }
+    Ok((thetas, etas))
+}
+
+/// Every `[scaling]` `y` / `y[CMT=N]` readout, parsed with θ, η and `defined` in scope
+/// and its named intermediates inlined (#1030). Shared by the #486/#1636 pre-scan and
+/// the unused-parameter union, so the two read the same expressions.
+fn readout_y_exprs(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    defined: &[String],
+) -> Result<Vec<Expression>, String> {
+    // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
+    // inline them here too, or the desugaring would miss it and drop an otherwise
+    // analytic readout to the FD fallback.
     let intermediates = scaling_intermediates(scaling_lines)?;
+    let mut out = Vec::new();
     for line in scaling_lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -20817,13 +20850,13 @@ fn readout_used_theta_eta(
         if parse_scaling_key(key)?.0 != "y" {
             continue;
         }
-        let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+        let ctx = ParseCtx::new(theta_names, eta_names, defined);
         let mut expr =
             parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
         inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
-        visit_expr_nodes(&expr, &mut |e| note_theta_eta(e, &mut thetas, &mut etas));
+        out.push(expr);
     }
-    Ok((thetas, etas))
+    Ok(out)
 }
 
 /// Rewrite the bare `THETA(i)` / `ETA(k)` nodes that the #486 desugaring covered into
