@@ -72,6 +72,13 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A θ read through a gather is now estimated on the default (analytic) gradient** (#1628).
+  When an individual parameter read θ only through a gather (`CL = PLACEBO[PLA_IDX]`, a level
+  block's bare `PLACEBO`, or an intermediate such as `PL = PLACEBO`), its analytic gradient in
+  every gathered θ was zero. The fit then returned the whole block at its initial values, while
+  `gradient = fd` estimated it. Fits of such models now move the block and land at the
+  finite-difference optimum. The same models also no longer warn that every level is "declared
+  in `[parameters]` but not referenced".
 - **Every `simulate*` entry point now refuses a θ vector whose length is not the model's**
   (#1614, `E_THETA_LENGTH`). A short vector used to simulate `Ok` rows from zeros past its
   end (every prediction `0.0` on a plain two-θ model given one value), and a long one

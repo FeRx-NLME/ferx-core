@@ -19505,6 +19505,86 @@ fn cov_static_fold_matches_unfolded_dual2() {
     }
 }
 
+/// #1628: `PL` reads θ only through a gather. Before the fix the classifier
+/// folded it to a dual constant, so `∂CL/∂PLACEBO[k]` came out `0` and every
+/// gathered θ sat at its initial value on the analytic gradient. `WTN` is the
+/// other side of the straddle: covariate-only, so it must still fold.
+const GATHER_ONLY_SLOT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.001, 100.0)
+  theta PLACEBO[3](0.2, -5.0, 5.0)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  PL  = PLACEBO[PLA_IDX]
+  WTN = WT / 70
+  CL  = TVCL * WTN * exp(PL + ETA_CL)
+  V1  = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn a_slot_reading_theta_only_through_a_gather_is_not_folded() {
+    let model = parse_model_string(GATHER_ONLY_SLOT_MODEL).expect("model compiles");
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present");
+    let slot = |name: &str| {
+        model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
+    };
+    assert!(
+        !prog.cov_static_mask[slot("PL")],
+        "PL reads θ through a gather: it must not fold to a constant"
+    );
+    assert!(
+        prog.cov_static_mask[slot("WTN")],
+        "WTN is covariate-only: it must still fold, or the fold is just off"
+    );
+
+    // The fold is an optimisation, so folded and unfolded duals must agree to
+    // the bit. Before the fix the folded `PL` row had an all-zero gradient.
+    let theta = [5.0, 0.2, -0.3, 0.4];
+    let eta = [0.1];
+    let cov: HashMap<String, f64> = [("WT".to_string(), 80.0), ("PLA_IDX".to_string(), 2.0)]
+        .into_iter()
+        .collect();
+    // n_theta + n_eta = 4 + 1 = 5.
+    let folded = prog.eval_param_duals::<5>(&theta, &eta, &cov);
+    let mut unfolded_prog = prog.clone();
+    unfolded_prog.cov_static_mask = Vec::new();
+    let unfolded = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
+    assert_eq!(folded.len(), unfolded.len());
+    for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
+        assert_eq!(a.value, b.value, "value mismatch at row {i}");
+        assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
+        assert_eq!(a.hess, b.hess, "hess mismatch at row {i}");
+    }
+    // And the gradient the fold must preserve is really there: `CL` moves with
+    // the level `PLA_IDX = 2` selects (θ index 2) and with no other level.
+    let cl = &folded[prog
+        .pk_slots_ref()
+        .iter()
+        .position(|&s| s == 0)
+        .expect("CL is PK slot 0")];
+    assert!(cl.value.is_finite() && cl.grad[2].is_finite());
+    assert!(
+        cl.grad[2].abs() > 1e-6,
+        "∂CL/∂PLACEBO[2] must be live, got {}",
+        cl.grad[2]
+    );
+    assert_eq!(cl.grad[1], 0.0, "PLA_IDX = 2 does not read PLACEBO[1]");
+    assert_eq!(cl.grad[3], 0.0, "PLA_IDX = 2 does not read PLACEBO[3]");
+}
+
 /// A covariate-heavy individual-parameters block modelled on the jasmine
 /// vancomycin-pediatrics run60 kernel: a large covariate-only prefix
 /// (CKD-EPI-/FFM-style pow/exp/log + sex/age branches — all cov-static) feeding
@@ -19657,6 +19737,11 @@ fn cov_static_classifier_helpers_cover_all_arms() {
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushNnOutput(0, 0)]), &dv));
+    // #1628: a gather reads θ, even though its own index is a covariate.
+    assert!(bytecode_is_dynamic(
+        &bc(vec![Op::PushCov(0), Op::PushThetaGather(0)]),
+        &dv
+    ));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushVar(0)]), &dv)); // slot 0 dynamic
     assert!(!bytecode_is_dynamic(&bc(vec![Op::PushVar(1)]), &dv)); // slot 1 static
     assert!(!bytecode_is_dynamic(
