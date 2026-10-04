@@ -133,9 +133,19 @@ section of the SDLC for the versioning policy).
   `CV%`. ETAs are now classified the way kappas are: by where the ETA sits, followed through an
   intermediate variable to where it is used (`ECL = ETA_CL`, `CL = TVCL * exp(ECL)` is
   log-normal). An ETA beside a second one in `exp(...)`, which used to get no row at all, now
-  gets one. The walk stops at a variable a block reads as a parameter — `[structural_model]`,
-  `[odes]`, `[scaling]`, `[initial_conditions]` or an endpoint block — and no longer at one only
-  `[derived]` reports, for ETAs and kappas alike. Labels only; estimates are unchanged.
+  gets one; so `iiv_on_ruv = ETA_RUV` is now refused when `ETA_RUV` also sits in a structural
+  `exp(ETA_CL + ETA_RUV)`, which used to fit with the eta silently doing two jobs. The walk stops
+  at a variable a block reads as a parameter — `[structural_model]`, `[odes]`, `[scaling]`,
+  `[initial_conditions]` or an endpoint block — and no longer at one only `[derived]` reports,
+  for ETAs and kappas alike.
+- **The closed-form log-normal gradient fallback no longer returns a wrong ∂f/∂η** (#1669). When
+  the compiled individual-parameter program declines (more than 24 θ + η, or an NN width
+  mismatch), the sensitivity providers fall back to `∂p/∂η = p` for each parameter's own η. That
+  was gated on every ETA being labelled log-normal, which is not the same thing: an ETA reached
+  through an intermediate (`TCL = TVCL * exp(ETA_CL)`, `CL = TCL * 1.5`) got a zero gradient,
+  and a second ETA in one `exp` (`exp(ETA_CL + ETA_V)`) a wrong one. The fallback is now used only when the
+  parser has checked that every parameter is `g(θ, cov) · exp(η)` with its η written in its own
+  assignment; otherwise the fit uses finite differences. No example model changes route.
 - **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
   model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
   so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read

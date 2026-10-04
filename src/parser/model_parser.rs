@@ -2086,6 +2086,15 @@ fn emit_eta_infos(
     if let Some(mut c) = class {
         if c.param_type == EtaParamType::Additive && c.eta_idx < cx.eta_names.len() {
             c.param_type = scale(c.eta_idx);
+            // Resolved by use to another scale: the pattern's θ is the anchor of
+            // the intermediate, not of the parameter, and its (Identity)
+            // transform would contradict the same model written inline
+            // (`exp(TVCL + ETA_CL)` → `Log`). Drop both, as the positional
+            // entries below do (#1669 review finding 2).
+            if c.param_type != EtaParamType::Additive {
+                c.theta_idx = None;
+                c.theta_transform = None;
+            }
         }
         apply_class(
             c,
@@ -2375,6 +2384,118 @@ fn leaf_scales(
     let mut out = Vec::new();
     walk(expr, is_leaf, None, &mut out);
     out
+}
+
+/// Whether the closed-form log-normal η chain the sensitivity providers fall
+/// back to is **exact** for this model (#1669 review finding 1).
+///
+/// That chain (`lognormal_param_derivatives`) computes `∂p_i/∂η_k =
+/// p_i · sel_flat[i, k]`, i.e. it assumes every individual parameter is
+/// `g(θ, cov) · exp(η)` with its one BSV η written directly in its own
+/// assignment and recorded in `eta_map`. It used to be gated on "every
+/// `eta_param_info` entry is `LogNormal`", but that label describes the scale an
+/// ETA enters, not this structure: an alias (`ECL = ETA_CL`, `CL = TVCL *
+/// exp(ECL)`) is log-normal yet `CL`'s `sel_flat` row is empty, so the chain
+/// returned `∂f/∂η = 0`. So the gate is computed here, from the statements:
+///
+/// - every assignment that reads a BSV η is a product with exactly one
+///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
+///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
+///   `eta_map` of its left-hand side names that η;
+/// - no assignment reads a variable that carries an η, directly or through
+///   another variable (the chain differentiates each row on its own).
+///
+/// Kappas are ignored — a model with kappas takes FD for the extended η
+/// anyway — and so are the `__ferx_ro_*` / `__ferx_pktime_*` synthetic
+/// parameters, as the label gate ignored them.
+fn lognormal_eta_chain_exact(
+    stmts: &[Statement],
+    indiv_var_names: &[String],
+    eta_map: &[i32],
+    n_eta_bsv: usize,
+) -> bool {
+    let mut assigns = Vec::new();
+    flatten_assigns(stmts, &mut assigns);
+    let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
+    let mut carrying: Vec<String> = Vec::new();
+    for (lhs, expr) in assigns {
+        if is_synthetic_readout_param(lhs) {
+            continue;
+        }
+        if expr_references_any(expr, &carrying).is_some() {
+            return false;
+        }
+        if !has_bsv(expr) {
+            continue;
+        }
+        let row_eta = indiv_var_names
+            .iter()
+            .position(|n| n == lhs)
+            .and_then(|i| usize::try_from(eta_map[i]).ok());
+        // `direct_lognormal_eta` already requires the η it returns to be the
+        // expression's only BSV η.
+        match direct_lognormal_eta(expr, n_eta_bsv) {
+            Some(e) if row_eta == Some(e) => {}
+            _ => return false,
+        }
+        if !carrying.iter().any(|c| c == lhs) {
+            carrying.push(lhs.to_owned());
+        }
+    }
+    true
+}
+
+/// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and
+/// quotient by η-free divisors) of η-free factors and exactly one `exp` whose
+/// argument is a sum holding `ETA` once, as a bare `+` term, beside η-free
+/// terms. `None` for any other shape. A kappa counts as η-free.
+fn direct_lognormal_eta(expr: &Expression, n_eta_bsv: usize) -> Option<usize> {
+    fn bsv_free(e: &Expression, n: usize) -> bool {
+        extract_eta_indices(e).iter().all(|&i| i >= n)
+    }
+    /// `Ok(None)` for an η-free factor, `Ok(Some(e))` for the one exp factor.
+    fn factor(e: &Expression, n: usize) -> Result<Option<usize>, ()> {
+        if bsv_free(e, n) {
+            return Ok(None);
+        }
+        match e {
+            Expression::BinOp(l, BinOp::Mul, r) => match (factor(l, n)?, factor(r, n)?) {
+                (Some(_), Some(_)) => Err(()),
+                (a, b) => Ok(a.or(b)),
+            },
+            Expression::BinOp(l, BinOp::Div, r) if bsv_free(r, n) => factor(l, n),
+            Expression::UnaryFn(name, arg) if name == "exp" => {
+                let mut terms = Vec::new();
+                signed_terms(arg, true, &mut terms);
+                let mut found = None;
+                for (positive, t) in terms {
+                    if bsv_free(t, n) {
+                        continue;
+                    }
+                    match (positive, t, found) {
+                        (true, Expression::Eta(i), None) if *i < n => found = Some(*i),
+                        _ => return Err(()),
+                    }
+                }
+                found.map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+    fn signed_terms<'a>(e: &'a Expression, positive: bool, out: &mut Vec<(bool, &'a Expression)>) {
+        match e {
+            Expression::BinOp(l, BinOp::Add, r) => {
+                signed_terms(l, positive, out);
+                signed_terms(r, positive, out);
+            }
+            Expression::BinOp(l, BinOp::Sub, r) => {
+                signed_terms(l, positive, out);
+                signed_terms(r, !positive, out);
+            }
+            _ => out.push((positive, e)),
+        }
+    }
+    factor(expr, n_eta_bsv).ok().flatten()
 }
 
 /// Apply a recognised `ExprClass` to the output vectors.
@@ -4121,6 +4242,14 @@ pub fn parse_full_model_with(
     // Uses BSV-only eta names (no kappas).
     let (eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
+    // What the closed-form log-normal sensitivity fallback needs, measured on
+    // the statements rather than read off the labels above (#1669 review).
+    indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
+        &indiv_stmts,
+        &indiv_var_names,
+        &eta_map,
+        eta_names_bsv.len(),
+    ));
     // Delattre class of every theta for the mixed BIC (#1177). Runs on the
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
@@ -25949,6 +26078,11 @@ pub struct IndivParamPartials {
     /// Written only by `parse_full_model_with`; read through
     /// [`crate::CompiledModel::data_bindings`]. Empty for hand-built fixtures.
     pub(crate) data_bindings: DataBindings,
+    /// Whether the closed-form log-normal η chain (`pk · sel_flat`) is exact
+    /// for this model, computed by `lognormal_eta_chain_exact`. `None` for
+    /// hand-built fixtures, which have no statements to measure: the providers
+    /// then keep the older rule, "every `eta_param_info` entry is `LogNormal`".
+    pub(crate) lognormal_eta_chain: Option<bool>,
 }
 
 impl IndivParamPartials {
@@ -25965,6 +26099,7 @@ impl IndivParamPartials {
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
             data_bindings: DataBindings::default(),
+            lognormal_eta_chain: None,
         }
     }
 
@@ -26071,6 +26206,7 @@ fn build_indiv_param_partials(
         theta_blocks: ThetaBlocks::empty(),
         const_pk_slots: Vec::new(),
         data_bindings: DataBindings::default(),
+        lognormal_eta_chain: None,
     }
 }
 

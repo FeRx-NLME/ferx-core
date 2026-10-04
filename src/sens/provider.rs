@@ -1223,6 +1223,20 @@ fn lognormal_param_derivatives(
     }
 }
 
+/// Whether [`lognormal_param_derivatives`] / [`lognormal_eta_derivatives_only`]
+/// are exact for `model`: every individual parameter is `g(θ, cov) · exp(η)`
+/// with its η written in its own assignment (the parser measures this, #1669).
+/// A hand-built fixture carries no statements, and keeps the older rule.
+fn lognormal_chain_exact(model: &CompiledModel) -> bool {
+    match model.indiv_param_partials.lognormal_eta_chain {
+        Some(exact) => exact,
+        None => model
+            .eta_param_info
+            .iter()
+            .all(|e| e.param_type == crate::types::EtaParamType::LogNormal),
+    }
+}
+
 /// Light η-only counterpart of [`lognormal_param_derivatives`]: just `∂p_i/∂η_k
 /// = pk_i·sel_ik`, for the same closed-form log-normal fallback. Used by
 /// [`subject_eta_grad_impl`]'s inner-loop path, which — like the compiled-program
@@ -1274,11 +1288,7 @@ fn resolve_param_derivs(
         }) {
         Some(v) => Some(v),
         None => {
-            if !model
-                .eta_param_info
-                .iter()
-                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
-            {
+            if !lognormal_chain_exact(model) {
                 return None;
             }
             let pd = lognormal_param_derivatives(model, subject, theta, pk);
@@ -4956,11 +4966,7 @@ fn subject_eta_grad_impl(
         }) {
         Some(v) => v,
         None => {
-            if !model
-                .eta_param_info
-                .iter()
-                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
-            {
+            if !lognormal_chain_exact(model) {
                 return None;
             }
             let dp_deta = lognormal_eta_derivatives_only(model, &pk);
