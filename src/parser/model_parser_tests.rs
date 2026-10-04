@@ -27937,3 +27937,66 @@ fn a_weighted_kappa_is_classified_before_the_weight_rewrite() {
     );
     assert_eq!(m.kappa_param_types, [Additive, LogNormal]);
 }
+
+/// #1659 review finding 1: a kappa that reaches its parameter through an
+/// intermediate variable takes the scale of the variable's use, not `Additive`
+/// for the intermediate's own root. Row 1 is the NONMEM IOV idiom
+/// (`IOVCL = KAPPA`, then `exp(ETA + IOVCL)`); rows 2–3 put the ETA in the
+/// intermediate too. A variable the structural model reads (`V`) is a parameter
+/// in its own right and stops the walk even though `K10` also reads it.
+#[test]
+fn a_kappa_through_an_intermediate_takes_the_scale_of_its_use() {
+    use crate::types::EtaParamType::*;
+    let cases: [(&str, &str, crate::types::EtaParamType); 7] = [
+        (
+            "nonmem idiom",
+            "  IOVCL = K\n  CL = TVCL * exp(ETA_CL + IOVCL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "eta and kappa in the intermediate",
+            "  ECL = ETA_CL + K\n  CL = TVCL * exp(ECL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "mu-referenced log intermediate",
+            "  LCL = log(TVCL) + ETA_CL + K\n  CL = exp(LCL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "two hops",
+            "  A = K\n  B = ETA_CL + A\n  CL = TVCL * exp(B)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "readers disagree",
+            "  A = K\n  CL = TVCL * exp(ETA_CL + A)\n  V = TVV + ETA_V + A",
+            Custom,
+        ),
+        (
+            "reassigned intermediate reads itself",
+            "  A = K\n  A = A + 0\n  CL = TVCL * exp(ETA_CL + A)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "structural parameter stops the walk",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV + ETA_V + K\n  K10 = CL / V",
+            Additive,
+        ),
+    ];
+    for (label, indiv, want) in cases {
+        let m = kappa_scale_model(&["K"], indiv);
+        assert_eq!(m.kappa_param_types, [want], "{label}");
+    }
+}
+
+/// #1659 review finding 2: `expit` is the `inv_logit` alias and must classify
+/// the same way.
+#[test]
+fn an_expit_kappa_is_logit() {
+    let m = kappa_scale_model(
+        &["K"],
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  P = expit(TVCL + ETA_V + K)",
+    );
+    assert_eq!(m.kappa_param_types, [crate::types::EtaParamType::Logit]);
+}
