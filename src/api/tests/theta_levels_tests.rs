@@ -3035,4 +3035,60 @@ mod absorption {
             "H7: η never reaches y"
         );
     }
+
+    /// The model-side half, per shape: the funnel's site and the η's route.
+    /// H1/G funnel through an individual parameter, H2/H5 through the readout;
+    /// H6/S1 (η only in a time-varying term) and S2 (η only in the state) have
+    /// none; H7's η never reaches `y`. The default readout of a model with no
+    /// `[scaling]` block (the `no_eta_model` shape) reaches `y` through `V`.
+    ///
+    /// `mbma_model` adds a parameter funnel reached only through the state.
+    #[test]
+    fn couplings_per_shape() {
+        use crate::parser::model_parser::{EtaCoupling, EtaRoute, ScaleShare};
+        fn coupling(text: &str) -> EtaCoupling {
+            let parsed = parse_full_model(text).unwrap();
+            let decl = &parsed.model.theta_blocks().level_blocks()[0];
+            assert_eq!(decl.eta_couplings.len(), 1, "one random effect");
+            decl.eta_couplings[0].clone()
+        }
+        let site = |param: Option<&str>, via: Option<&str>| ScaleShare {
+            param: param.map(str::to_string),
+            eta_via: via.map(str::to_string),
+        };
+        let via = |v: &str| Some(EtaRoute::Via(v.to_string()));
+        let cases: [(&str, Option<ScaleShare>, Option<EtaRoute>); 8] = [
+            ("H1", Some(site(Some("E0"), None)), via("E0")),
+            ("G", Some(site(Some("EMAX"), None)), via("EMAX")),
+            ("H2", Some(site(None, Some("E0"))), via("E0")),
+            ("H5", Some(site(None, Some("E0"))), via("E0")),
+            ("H6", None, via("EMAX")),
+            ("S1", None, via("V")),
+            ("S2", None, Some(EtaRoute::State)),
+            ("H7", None, None),
+        ];
+        for (tag, funnel, reach) in cases {
+            let c = coupling(&shape(tag, "STUDY", ""));
+            assert_eq!(c.eta, "ETA_E0", "{tag}");
+            assert!(!c.kappa, "{tag}");
+            assert_eq!(c.funnels.first().map(|f| f.site.clone()), funnel, "{tag}");
+            assert_eq!(c.reach, reach, "{tag}");
+        }
+
+        // No `[scaling]`: `y` is the amount over `V`.
+        let ne = coupling(&no_eta_model());
+        assert_eq!((ne.funnels.len(), ne.reach), (0, via("V")), "no_eta_model");
+        // A parameter funnel reached only through the state: `CL` carries both,
+        // and nothing else reads either.
+        let mb = coupling(&mbma_model(""));
+        assert_eq!(
+            mb.funnels
+                .iter()
+                .map(|f| f.site.clone())
+                .collect::<Vec<_>>(),
+            vec![site(Some("CL"), None)],
+            "mbma_model"
+        );
+        assert_eq!(mb.reach, Some(EtaRoute::State), "mbma_model");
+    }
 }
