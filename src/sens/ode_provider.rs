@@ -439,7 +439,15 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // (`static_walk_dim_supported`, applied in `ode_subject_supported`). A model past it
     // routes every subject to the event-driven walk (`ode_tvcov_supported`), whose dual
     // width is the `θ + η` program width bounded just above.
-    !model.pk_indices.is_empty()
+    //
+    // A model with no θ and no η at all (σ-only: every individual parameter a constant or a
+    // data column) has nothing to seed either walk with — the event walk's tables start at
+    // width 1, and the static walk's `param_derivatives` declines a zero-axis program — so
+    // admitting it would report "analytic" while every subject fell to FD. Measured: a
+    // 12-parameter σ-only model returned `None` from `ode_subject_sensitivities` before
+    // #1661 too. Such a model has no structural gradient to compute, so declining it costs
+    // nothing (#1661 review).
+    !model.pk_indices.is_empty() && model.n_theta + model.n_eta > 0
 }
 
 /// Whether the **static superposition** walk's dispatch tables cover this model's

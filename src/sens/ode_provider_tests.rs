@@ -12833,3 +12833,173 @@ fn ode_wider_than_static_walk_iov_matches_predict_iov() {
          ∂²f/∂s∂θ {worst_st:.2e}"
     );
 }
+
+/// A model with no θ and no η (σ-only: every individual parameter a constant) has nothing
+/// to seed either ODE walk with, so the provider returns `None` for every subject at any
+/// width. It must not be reported analytic, or `optimizer = auto` would pick a gradient
+/// optimizer while every subject fell to FD. Checked on both sides of the static walk's
+/// cap, since the wide side now routes to the event walk and the narrow side does not.
+#[test]
+fn ode_model_with_no_axes_is_not_reported_analytic() {
+    let src = |n: usize| -> String {
+        let decls: String = (1..=n).map(|i| format!("  K{i} = 0.0{i:02}\n")).collect();
+        let rate: Vec<String> = (1..=n).map(|i| format!("K{i}")).collect();
+        format!(
+            "[parameters]\n  sigma PROP_ERR ~ 0.02 (sd)\n[individual_parameters]\n{decls}\
+             [structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+             d/dt(central) = -({}) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+            rate.join(" + ")
+        )
+    };
+    let wide = parse_model_string(&src(13)).expect("parse σ-only wide model");
+    let narrow = parse_model_string(&src(12)).expect("parse σ-only narrow model");
+    assert_eq!(wide.n_theta + wide.n_eta, 0);
+    assert!(wide.pk_indices.len() > MAX_ODE_SENS_DIM);
+    assert!(narrow.pk_indices.len() <= MAX_ODE_SENS_DIM);
+
+    assert!(
+        !ode_analytical_supported(&wide),
+        "a zero-axis model past the cap must decline: the event walk has no width-0 arm"
+    );
+    assert!(!crate::sens::provider::analytic_outer_gradient_available(
+        &wide
+    ));
+    let subject = bolus_subject(&[1.0, 4.0]);
+    assert!(ode_subject_sensitivities(&wide, &subject, &[], &[]).is_none());
+
+    assert!(!ode_analytical_supported(&narrow));
+    assert!(!crate::sens::provider::analytic_outer_gradient_available(
+        &narrow
+    ));
+    assert!(ode_subject_sensitivities(&narrow, &subject, &[], &[]).is_none());
+}
+
+/// The widest ODE model the parser accepts, with its **last** individual parameter carrying
+/// an η: no individual-parameter count short of the parser's own ceiling may decline the
+/// model or drop a row. `n_fill` constants pad the layout; `KEX` is declared last.
+fn widest_ode_src(n_fill: usize, iov: bool) -> String {
+    let fill: String = (1..=n_fill)
+        .map(|i| format!("  FILL_{i} = 1 + 0.001 * {i}\n"))
+        .collect();
+    format!(
+        "[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(12.0, 1.0, 500.0)
+  theta TVKEX(0.1, 0.001, 10.0)
+  omega ETA_CL  ~ 0.15
+  omega ETA_KEX ~ 0.10
+  {kappa}
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL {kappa_term})
+  V  = TVV
+{fill}  KEX = TVKEX * exp(ETA_KEX)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central - KEX * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  {iov_opt}
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+",
+        kappa = if iov { "kappa KAPPA_CL ~ 0.02" } else { "" },
+        kappa_term = if iov { "+ KAPPA_CL" } else { "" },
+        iov_opt = if iov { "iov_column = OCC" } else { "" },
+    )
+}
+
+/// The largest padding the parser accepts, found by parsing, and asserted to be the
+/// ceiling (one more is refused).
+fn widest_ode_model(iov: bool) -> CompiledModel {
+    let n = (0..=crate::types::MAX_PK_PARAMS)
+        .rev()
+        .find(|&n| parse_model_string(&widest_ode_src(n, iov)).is_ok())
+        .expect("some padding must parse");
+    assert!(
+        parse_model_string(&widest_ode_src(n + 1, iov)).is_err(),
+        "the fixture must sit at the parser's ceiling"
+    );
+    let model = parse_model_string(&widest_ode_src(n, iov)).expect("parse widest");
+    let kex = model.indiv_param_names.iter().position(|s| s == "KEX");
+    assert_eq!(
+        kex,
+        Some(model.pk_indices.len() - 1),
+        "KEX must be the last seeded row"
+    );
+    assert!(model.pk_indices.len() > MAX_ODE_SENS_DIM);
+    model
+}
+
+#[test]
+fn ode_widest_parsable_model_is_analytic_and_exact() {
+    let model = widest_ode_model(false);
+    let subject = wide_ode_subject();
+    let (theta, eta) = ([4.0, 12.0, 0.1], [0.1, -0.05]);
+    assert!(ode_analytical_supported(&model));
+    assert!(ode_tvcov_supported(&model, &subject));
+    let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("analytic");
+    assert_overflow_row_is_live(sens.obs.iter().map(|o| o.df_deta[1]));
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
+
+#[test]
+fn ode_widest_parsable_iov_model_matches_predict_iov() {
+    let model = widest_ode_model(true);
+    assert!(ode_iov_supported(&model));
+    let theta = [4.0, 12.0, 0.1];
+    let mut subj = wide_ode_subject();
+    subj.occasions = vec![1, 1, 1, 2, 2, 2];
+    subj.dose_occasions = vec![1, 2];
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(groups.len(), 2);
+    let stacked = vec![0.1, -0.05, 0.06, -0.04];
+    assert_eq!(stacked.len(), model.n_eta + groups.len() * model.n_kappa);
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("analytic");
+    let grad = ode_subject_eta_grad_iov(&model, &subj, &theta, &stacked).expect("analytic inner");
+    assert_overflow_row_is_live(sens.obs.iter().map(|o| o.df_deta[1]));
+
+    let pred = |th: &[f64], st: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..model.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..groups.len())
+            .map(|g| st[model.n_eta + g..model.n_eta + g + 1].to_vec())
+            .collect();
+        crate::pk::predict_iov(&model, &subj, th, &eta_bsv, &kappas)[j]
+    };
+    let he = 1e-6;
+    for (j, (obs, g_in)) in sens.obs.iter().zip(&grad).enumerate() {
+        approx::assert_relative_eq!(
+            obs.f,
+            pred(&theta, &stacked, j),
+            max_relative = 1e-6,
+            epsilon = 1e-9
+        );
+        for k in 0..stacked.len() {
+            let mut sp = stacked.clone();
+            sp[k] += he;
+            let mut sm = stacked.clone();
+            sm[k] -= he;
+            let g = (pred(&theta, &sp, j) - pred(&theta, &sm, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+            approx::assert_relative_eq!(
+                g_in.df_deta[k],
+                obs.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-10
+            );
+        }
+        for m in 0..model.n_theta {
+            let s = he * (1.0 + theta[m].abs());
+            let mut tp = theta.to_vec();
+            tp[m] += s;
+            let mut tm = theta.to_vec();
+            tm[m] -= s;
+            let g = (pred(&tp, &stacked, j) - pred(&tm, &stacked, j)) / (2.0 * s);
+            approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+}

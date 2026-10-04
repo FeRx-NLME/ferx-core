@@ -330,7 +330,9 @@ section of the SDLC for the versioning policy).
   on the closed-form modified-release fast path keep it, which is analytic too). A
   reported 19-parameter PK/PD model evaluated about 4× faster, and its EBEs no longer
   stopped short on a third of the subjects. Validated against NONMEM 7.5.1 on a
-  14-parameter myelosuppression model (`nonmem_anchor/wide_ode_myelo`).
+  14-parameter myelosuppression model (`nonmem_anchor/wide_ode_myelo`). Separately, an ODE
+  model with no θ and no η is now reported as using finite differences, which it always
+  did; `optimizer = auto` therefore picks BOBYQA for it instead of L-BFGS.
 
 ## [0.4.0] - 2026-09-25
 
