@@ -20730,9 +20730,10 @@ fn level_block_eta_coupling(
                 continue;
             }
             seen.push(v);
-            if !(taint_b.contains(v) && taint_e.contains(v)) {
-                continue;
-            }
+            // No "carries both" pre-filter: the cut test below already rejects a
+            // parameter that carries only one, since the other still reaches `y`
+            // without it. Two gates rejecting the same inputs would each be
+            // untestable (AGENTS.md).
             let mut covariates = Vec::new();
             if !ctx.var_constant(v, &mut covariates, &mut Vec::new()) {
                 continue;

@@ -3165,6 +3165,38 @@ mod absorption {
                 "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -KE * central",
             );
         assert_eq!(coupling(&ode).reach, Some(EtaRoute::State), "ODE via KE");
+        // A random effect read only by an `if` condition still reaches `y`.
+        let cond = cf_model(
+            "",
+            "STUDY",
+            &format!("{BASE}  E0 = TVE0\n  if (ETA_E0 > 0) {{ E0 = TVE0 + 1 }}"),
+            &format!("E0 + PLACEBO + {EMAXY}"),
+        );
+        assert_eq!(coupling(&cond).reach, via("E0"), "η in a condition");
+        // Two readouts (an ODE model, which per-CMT error models need): the first has a readout funnel (`E0 + PLACEBO`), the
+        // second reads the block time-varyingly, so no single expression carries
+        // every route and there is no funnel.
+        let two = scaling_model("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0")
+            .replace("PLACEBO[STUDY, TIME]", "PLACEBO[STUDY]")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+            )
+            .replace(
+                "  y = central / V + E0 + PLACEBO",
+                "  y[CMT=1] = central / V + E0 + PLACEBO\n  y[CMT=2] = central / V + PLACEBO * TIME",
+            )
+            .replace(
+                "  DV ~ additive(ADD)",
+                "  CMT=1: DV ~ additive(ADD)\n  CMT=2: DV ~ additive(ADD)",
+            );
+        let c = coupling(&two);
+        assert_eq!((c.funnels.len(), c.reach), (0, via("E0")), "two readouts");
+        // The control: the first readout alone has the funnel.
+        let one_y = two
+            .replace("\n  y[CMT=2] = central / V + PLACEBO * TIME", "")
+            .replace("\n  CMT=2: DV ~ additive(ADD)", "");
+        assert_eq!(coupling(&one_y).funnels.len(), 1, "one readout");
     }
 
     fn has(err: &str, parts: &[&str]) {
@@ -3355,6 +3387,18 @@ mod absorption {
             assert_eq!(contrast, LevelContrast::SumToZeroWithin, "{route}");
             assert!(free > 0, "{route}");
         }
+
+        // An η that shares an expression with the block but has no funnel (H6) is
+        // named by that expression, not by its route.
+        let err = try_bind(&shape("H6", "STUDY, TIME", "sum_to_zero"), &pop).expect_err("H6");
+        has(
+            &err,
+            &[
+                "but the `y` readout reads this block and a random effect (through `EMAX`) at \
+               that grouping",
+            ],
+        );
+        lacks(&err, &["reaches `y`", EVERY_OBSERVATION]);
 
         // Every group a single level: the zero-free refusal names the route.
         let err = try_bind(&s2(""), &cf_pop(3, 1, &[1.0])).expect_err("single time");

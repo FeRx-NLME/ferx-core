@@ -177,7 +177,7 @@ and it is chosen by looking at both the model and the data:
 
 | Situation | Default |
 |---|---|
-| An expression that reads the block (an individual parameter or the `y` readout) also carries a random effect, directly or through a variable, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
+| The block's leading columns identify subjects one-to-one **and** the block absorbs a random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -220,12 +220,8 @@ Two limits on `ref` as it stands:
   first timepoint.
 
 A contrast that would leave a nested group's mean free while a random effect
-also carries it is a hard error, not a warning.
-
-"Reads the block" follows assignments: `E0 = TVE0 + ETA_E0` followed by
-`y = E0 + PLACEBO + ...` shares a scale, and so does `E1 = E0 + PLACEBO`. A
-random effect that reaches `y` only through a compartment state (`ETA_CL` on
-`CL`, read as `central / V`) does not count.
+also carries it is a hard error, not a warning. So is a one-column block that
+absorbs a random effect, under any contrast (below).
 
 A block must estimate at least one θ, whatever its contrast. One left with none
 after its contrast is applied — a single level under any contrast but `none`, or
@@ -240,6 +236,46 @@ constraint machinery: a group of *L* levels estimates *L − 1* thetas and the
 remaining level is derived (minus the sum of the others under sum-to-zero, or a
 constant 0 under `ref`). A derived level is not a parameter, so it does not
 appear in the estimate table; its value follows from the others.
+
+#### Which random effects count
+
+A random effect is per subject, so a block can absorb one only when its levels
+key to subjects: its leading columns (for a one-column block, the column itself)
+identify subjects one-to-one. Every subject sits on one value, and no two
+subjects share one. Given that, a random effect counts when either holds:
+
+- **The block takes a level at every observation.** Each level holds one
+  observation time of one subject, as `[STUDY, TIME]` does with one subject per
+  study. The block is then a free curve per subject at the observed times, so it
+  reproduces any per-subject effect: every random effect that reaches `y`
+  counts, whether through an individual parameter, the readout, or a compartment
+  state (`ETA_CL` on `CL`, read as `central / V`).
+- **The block and the random effect reach `y` only together**, through one
+  expression that is constant within a subject apart from the block itself. That
+  is an individual parameter (`E0 = TVE0 + PLACEBO + ETA_E0`, or
+  `TVPL = BASE + PLACEBO` followed by `PL = TVPL * exp(ETA_PL)`), or a sum or
+  product in the readout (`y = E0 + PLACEBO + ...` with `E0 = TVE0 + ETA_E0`).
+  Their effects on `y` are then proportional within each subject. The expression
+  may read a data covariate only if it is constant within every subject in the
+  data; one that reads `TIME` or a state does not qualify.
+
+A random effect on a parameter that `y` never reads does not count. Nor does one
+that enters `y` only through a time-varying term, such as `EMAX` in
+`EMAX * TIME / (TIME + ET50)`, when the block does not take a level at every
+observation: on `[STUDY, VISIT]` with several times per visit, it stays
+identified.
+
+A nested block that absorbs a random effect defaults to `sum_to_zero_within`, and
+an explicit `sum_to_zero`, `ref` or `none` is refused. A **one-column** block has
+no such rescue. `PLACEBO[STUDY]` with one subject per study makes each level the
+same quantity as that subject's random effect, under every contrast, so it is
+refused, with the advice to remove the block or drop the random effect. Fitted
+anyway, ω collapses to 0. With two or more subjects per study the same model
+binds, since the random effect is then identified from the spread within each
+study.
+
+Kappas (inter-occasion random effects) keep the earlier rule for now: they count
+on a nested block when an expression reads both.
 
 ### Fitting at this scale
 

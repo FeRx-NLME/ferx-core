@@ -438,10 +438,11 @@ fn constant_within_subjects(covariates: &[String], population: &Population) -> b
     population.subjects.iter().all(|subject| {
         covariates.iter().all(|c| {
             let mut values = (0..subject.obs_times.len()).map(|j| column_value(subject, c, j));
+            // Missing compares like any other value: a column absent from every
+            // record is constant, one present on only some records changes.
             match values.next() {
                 None => true,
-                Some(None) => false,
-                Some(Some(first)) => values.all(|v| v == Some(first)),
+                Some(first) => values.all(|v| v == first),
             }
         })
     })
