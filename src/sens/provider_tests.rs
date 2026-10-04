@@ -14123,7 +14123,20 @@ fn lognormal_fallback_declines_unless_every_eta_is_direct() {
             - compute_predictions_with_tv(m, &s, theta, &em)[j])
             / (2.0 * h)
     };
-    let cases: [(&str, &str, bool); 9] = [
+    let cases: [(&str, &str, bool); 11] = [
+        // #1669 review round 2: a row whose `eta_map` names an η, given an
+        // η-free value. `sel_flat` still names the η, so the chain would serve
+        // `∂CL/∂η = CL` where the truth is 0.
+        (
+            "eta-free else branch on an eta row",
+            "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL\n  }",
+            false,
+        ),
+        (
+            "eta-free reassignment of an eta row",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL",
+            false,
+        ),
         ("control: direct", "  CL = TVCL * exp(ETA_CL)", true),
         // Quotient and a covariate-free extra factor stay exact.
         (

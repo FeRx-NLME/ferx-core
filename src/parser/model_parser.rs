@@ -2402,6 +2402,7 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
+/// - no η-free assignment writes a row whose `eta_map` names an η;
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -2425,13 +2426,20 @@ fn lognormal_eta_chain_exact(
         if expr_references_any(expr, &carrying).is_some() {
             return false;
         }
-        if !has_bsv(expr) {
-            continue;
-        }
         let row_eta = indiv_var_names
             .iter()
             .position(|n| n == lhs)
             .and_then(|i| usize::try_from(eta_map[i]).ok());
+        if !has_bsv(expr) {
+            // An η-free value on a row whose `eta_map` names an η (an η-free
+            // `else` branch, a reassignment): `sel_flat` still names the η, so
+            // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
+            // review round 2).
+            if row_eta.is_some() {
+                return false;
+            }
+            continue;
+        }
         // `direct_lognormal_eta` already requires the η it returns to be the
         // expression's only BSV η.
         match direct_lognormal_eta(expr, n_eta_bsv) {
