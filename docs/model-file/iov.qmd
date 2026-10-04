@@ -54,6 +54,15 @@ decides.
 | `inv_logit(TH + ETA + KAPPA)` | logit, `SD = …, logit scale` |
 | `(TVV + KAPPA_V) * WT` | custom, no CV% or SD |
 
+A kappa that reaches its parameter through an intermediate variable is
+followed to where that variable is used: with `IOVCL = KAPPA_CL` and then
+`CL = TVCL * exp(ETA_CL + IOVCL)` (the NONMEM IOV idiom), the kappa is
+log-normal. A variable the structural model reads is a parameter in its own
+right, and the walk stops there: in the weighted example below, if the model
+reads `LEMAX` directly, `KAPPA_EMAX` is additive on `LEMAX`, so its SD is on
+the log scale `LEMAX` is written on. If only a later `EMAX = exp(LEMAX)` reads
+it, the kappa is log-normal.
+
 A kappa that enters two parameters on different scales, or that no parameter
 reads, is custom. A weighted kappa is classified on the expression as written,
 before the `weight =` rewrite, and its SD is labelled `at weight 1` (see

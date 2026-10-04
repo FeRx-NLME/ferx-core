@@ -273,7 +273,9 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   where it sits in its expression (see
   [How a kappa row is labelled](model-file/iov.qmd#how-a-kappa-row-is-labelled)).
   The console prints the same thing as `(CV% = …)`, `(SD = …)` or
-  `(SD = …, logit scale)`.
+  `(SD = …, logit scale)`; for a sample-size-weighted kappa the SD reads
+  `(SD = … at weight 1)` (or `(SD = … at weight 1, logit scale)`), the SD of a
+  one-subject arm, followed by the SD at the typical arm size.
 - **covariance_method**: which estimator produced the standard errors — `r`, `s`
   or `rsr`. Present only when a covariance matrix was produced; see below.
 

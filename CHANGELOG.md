@@ -114,8 +114,9 @@ section of the SDLC for the versioning policy).
   as `CV% = 1249.1`. A variance now reads on the scale its effect enters: `CV%` (YAML
   `cv_pct`) for log-normal, `SD` (YAML `sd`) for additive and logit, nothing for any other
   shape; a weighted kappa's SD is labelled `at weight 1`. Kappas are classified by where they
-  sit in their expression, and the result is carried as `FitResult.kappa_param_types`
-  (parallel to `kappa_names`, also in `.fitrx` bundles) for ferx-r to read.
+  sit in their expression, followed through an intermediate such as `IOVCL = KAPPA_CL`, and the
+  result is carried as `FitResult.kappa_param_types` (parallel to `kappa_names`, also in
+  `.fitrx` bundles) for ferx-r to read.
 - **A level block that would estimate no θ is refused under every contrast** (#1624). A single
   level under `ref` or `sum_to_zero_within`, or groups of one level each under
   `sum_to_zero_within`, used to bind silently with nothing to estimate; only `sum_to_zero` was
