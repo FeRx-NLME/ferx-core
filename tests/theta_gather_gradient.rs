@@ -993,3 +993,251 @@ fn a_readout_gather_converges_to_the_lifted_optimum() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+// ── #1638: the same block read in a residual magnitude, under Gauss-Newton ──────
+//
+// `DV ~ proportional(PROP_ERR * ERRSCALE[STUDY])`. The magnitude's θ set came from
+// `Expression::Theta` only, so a gathered magnitude looked θ-free; GN then used a
+// gradient with no direct `∂V/∂θ` and returned every level at exactly its init
+// (1.000000). FOCEI, which differentiates the magnitude itself, was unaffected.
+
+/// `PROP_ERR` FIXed, so the gathered scale is what carries the residual size and
+/// the data identify it per study.
+fn ruv_gather_model(theta: &str, read: &str, fit_options: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta TVV(8.0, 0.1, 500.0)
+  {theta}
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02 FIX
+
+[covariates]
+  STUDY continuous
+
+[individual_parameters]
+  CL = TVCL
+  V = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR * {read})
+
+[fit_options]
+  method = gn
+  covariance = false
+{fit_options}
+"#
+    )
+}
+
+/// The levels' shared init. Not 1.0: study 2's optimum is 1.035, too close to
+/// 1.0 for "left its init" to tell a moving level from a frozen one in a short fit.
+/// From 2.0 every optimum (4.21, 1.04, 2.79) is at least 0.7 away.
+const RUV_INIT: f64 = 2.0;
+
+/// Counted, and a bare named block (implicit index, bound from the data).
+const RUV_GATHER_FORMS: [(&str, &str, &str); 2] = [
+    (
+        "counted",
+        "theta ERRSCALE[3](2.0, 0.1, 10.0)",
+        "ERRSCALE[STUDY]",
+    ),
+    (
+        "named, bare",
+        "theta ERRSCALE[STUDY, contrast = none](2.0, 0.1, 10.0)",
+        "ERRSCALE",
+    ),
+];
+
+fn ruv_levels(result: &FitResult) -> Vec<(String, f64)> {
+    let out: Vec<(String, f64)> = result
+        .theta_names
+        .iter()
+        .zip(&result.theta)
+        .filter(|(n, _)| n.starts_with("ERRSCALE["))
+        .map(|(n, v)| (n.clone(), *v))
+        .collect();
+    assert_eq!(out.len(), 3, "three levels in {:?}", result.theta_names);
+    out
+}
+
+/// T11, per PR: after a few GN iterations the default gradient has taken the
+/// same steps as `gradient = fd`. The pair straddles the fix: before it the
+/// default-gradient levels stayed at their init *exactly* while FD's moved, so the
+/// move is asserted on both sides — a pair that agreed because neither moved would
+/// pin nothing.
+#[test]
+fn a_gathered_residual_magnitude_is_estimated_under_gauss_newton() {
+    const SHORT_GN: &str = "  maxiter = 5";
+    for (form, theta, read) in RUV_GATHER_FORMS {
+        let analytic = ruv_levels(&fit(&ruv_gather_model(theta, read, SHORT_GN)));
+        let fd = ruv_levels(&fit(&ruv_gather_model(
+            theta,
+            read,
+            &format!("{SHORT_GN}\n  gradient = fd"),
+        )));
+        let mut worst = 0.0_f64;
+        for ((name, a), (_, f)) in analytic.iter().zip(&fd) {
+            assert!(a.is_finite() && f.is_finite(), "{form}: {name} {a} / {f}");
+            for (side, v) in [("default", a), ("fd", f)] {
+                assert!(
+                    (v - RUV_INIT).abs() > 1e-6,
+                    "{form}: {name} = {v} stayed at its init on the {side} gradient"
+                );
+            }
+            worst = worst.max((a - f).abs() / f.abs());
+        }
+        eprintln!("{form}: short GN, worst level rel vs fd {worst:.3e}");
+        assert!(
+            worst < SHORT_GN_REL_TOL,
+            "{form}: {analytic:?} vs fd {fd:?} (rel {worst:.3e})"
+        );
+    }
+}
+
+/// Measured at `a4f521d5` + this change (macOS): 4.724e-12 on both forms, the two
+/// gradients taking the same five steps. Bounded at 1e-8 (≈ 2000× headroom). Before
+/// the fix the default-gradient levels sat exactly at their init (the "stayed at its
+/// init" assertion above is what fires on that regression, before this bound is
+/// reached).
+const SHORT_GN_REL_TOL: f64 = 1e-8;
+
+/// T11, to convergence: GN on the default gradient lands where GN on finite
+/// differences does. Gated: a fit to convergence.
+///
+/// Measured at `a4f521d5` + this change (macOS), identical on both forms: OFV
+/// 55.4188269074 (default) vs 55.4188342743 (FD), |Δ| 7.4e-6; worst level relative
+/// gap 1.2e-7. Bounds: OFV 1e-3 (≈ 136×), levels 1e-5 (≈ 83×). Before the fix the
+/// default-gradient levels stayed at their init (2.0, against optima 4.77 / 1.36 /
+/// 3.04), so either bound kills that by four orders of magnitude.
+///
+/// GN's optimum depends on the start here — from an init of 1.0 both gradients
+/// land at OFV 52.4389 instead — so the oracle is FD from the *same* start, not a
+/// fixed number.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_gathered_residual_magnitude_converges_to_the_fd_gauss_newton_optimum() {
+    const LEVEL_REL_TOL: f64 = 1e-5;
+    const OFV_TOL: f64 = 1e-3;
+    let mut failures: Vec<String> = Vec::new();
+    for (form, theta, read) in RUV_GATHER_FORMS {
+        let analytic = fit(&ruv_gather_model(theta, read, ""));
+        let fd = fit(&ruv_gather_model(theta, read, "  gradient = fd"));
+        let (la, lf) = (ruv_levels(&analytic), ruv_levels(&fd));
+        assert!(
+            analytic.ofv.is_finite()
+                && fd.ofv.is_finite()
+                && la.iter().chain(&lf).all(|(_, v)| v.is_finite()),
+            "{form}: OFV {} / {}, levels {la:?} / {lf:?}",
+            analytic.ofv,
+            fd.ofv
+        );
+        let d_ofv = (analytic.ofv - fd.ofv).abs();
+        let worst = la
+            .iter()
+            .zip(&lf)
+            .map(|((_, a), (_, f))| (a - f).abs() / f.abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "{form}: OFV gn {:.10} gn+fd {:.10} (|Δ| {d_ofv:.3e}); worst level rel {worst:.3e}; \
+             levels {la:?}",
+            analytic.ofv, fd.ofv
+        );
+        for (name, v) in &la {
+            if (v - RUV_INIT).abs() <= 1e-3 {
+                failures.push(format!("{form}: {name} = {v} stayed at its init"));
+            }
+        }
+        if d_ofv >= OFV_TOL {
+            failures.push(format!("{form}: OFV {} vs fd {}", analytic.ofv, fd.ofv));
+        }
+        if worst >= LEVEL_REL_TOL {
+            failures.push(format!(
+                "{form}: levels {la:?} vs fd {lf:?} (rel {worst:.3e})"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ── #1639: a named level block in a kappa weight, bound ─────────────────────────
+
+/// A named block has no levels until it is bound, so the unbound parse cannot see
+/// which θ a `weight = W` reads, and accepts it. The refusal must come from the
+/// bound re-parse that every file entry point runs (PR #1655 review #2). The FIX
+/// twin passes the same gate, so it straddles: a refusal that fired for any named
+/// block, estimated or not, would turn it red.
+#[test]
+fn a_kappa_weight_reading_a_bound_estimated_named_block_is_refused() {
+    let model = |fix: &str| {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta W[STUDY, contrast = none](20.0, 1.0, 100.0){fix}
+  omega ETA_V ~ 0.04
+  kappa KAPPA_CL ~ 0.09 weight = W
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(KAPPA_CL)
+  V = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  covariance = false
+  maxiter = 0
+  iov_column = OCC
+"#
+        )
+    };
+    // `DATA` plus a one-occasion `OCC` column: the IOV column must be its own, since
+    // the block binds on `STUDY`.
+    let data: String = DATA
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 {
+                format!("{l},OCC\n")
+            } else {
+                format!("{l},1\n")
+            }
+        })
+        .collect();
+    let run = |text: &str| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("m.ferx");
+        let data_path = dir.path().join("d.csv");
+        write!(std::fs::File::create(&model_path).unwrap(), "{text}").unwrap();
+        write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
+        run_model_with_data(
+            model_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+    };
+    // The premise: the unbound parse alone cannot refuse it.
+    assert!(
+        ferx_core::parser::model_parser::parse_full_model(&model("")).is_ok(),
+        "premise: an unbound named block has no levels to judge"
+    );
+    let refused = "references estimated theta(s) `W` (a θ level block with an estimated level)";
+    let err = run(&model("")).expect_err("an estimated named block in a weight is refused");
+    assert!(err.contains(refused), "{err}");
+    run(&model(" FIX")).unwrap_or_else(|e| panic!("a FIXed named block is a known constant: {e}"));
+}
