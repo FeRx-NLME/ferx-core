@@ -17707,10 +17707,16 @@ fn validate_ruv_expr(
                          the sigma are allowed)",
                         name
                     ));
-                } else if !name.eq_ignore_ascii_case("TIME") && !is_level_index_column(name) {
-                    // A level block's synthesized index column (`__level_NAME`, the
-                    // implicit index of a bare `NAME`) is engine plumbing the user
-                    // cannot declare; the binder fills it in every row (#1638).
+                } else if !name.eq_ignore_ascii_case("TIME")
+                    && !is_declared_level_index_column(name)
+                {
+                    // A declared level block's synthesized index column
+                    // (`__level_NAME`, the implicit index of a bare `NAME`) is engine
+                    // plumbing the user cannot declare; the binder fills it in every
+                    // row (#1638). Only a *declared* block's: the prefix alone would
+                    // let a typed `__level_TYPO` through, which the column readers
+                    // and the undeclared-covariate warning also skip, so it would read
+                    // 0 with no diagnostic (PR #1655 review #1).
                     //
                     // An undeclared covariate silently evaluates to 0.0 at every
                     // observation, collapsing the magnitude to a constant — so
@@ -17864,10 +17870,10 @@ fn build_ruv_magnitude(
         // `note_theta_eta` counts a gather as every θ of its block (#1638): a
         // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
         // magnitude-aware fallback, and the levels are not "unreferenced". η is
-        // already refused by `validate_ruv_expr`, so `_etas` stays empty.
-        let mut _etas = std::collections::HashSet::new();
+        // already refused by `validate_ruv_expr`, so `etas` stays empty.
+        let mut etas = std::collections::HashSet::new();
         visit_expr_nodes(&expr, &mut |e: &Expression| {
-            note_theta_eta(e, &mut used_thetas, &mut _etas);
+            note_theta_eta(e, &mut used_thetas, &mut etas);
             if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
                 uses_tad = true;
             }
@@ -18950,11 +18956,14 @@ fn level_block_unreadable_message(
              reads per-row data columns only, so it cannot read a θ. Put the grouping in a \
              data column and select on that column."
         ),
-        _ => format!(
+        LevelBlockScope::Ode => format!(
             "`{name}` is a θ level block, and {place} cannot read a θ directly. Assign it \
              in [individual_parameters] (e.g. `{name}_I = {spelling}`) and use `{name}_I` \
              instead."
         ),
+        LevelBlockScope::Readable => {
+            unreachable!("a level block is readable here; nothing to refuse")
+        }
     }
 }
 
@@ -18966,7 +18975,10 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
     let tokens = tokenize(src)?;
     for (pos, t) in tokens.iter().enumerate() {
         let Token::Ident(name) = t else { continue };
-        // `NAME.OUTPUT` is an NN output access, not a block read.
+        // `NAME.OUTPUT` is an NN output access, not a block read. No ODE-side context
+        // can read an NN output either, but the ODE parse says so itself; naming
+        // `OUTPUT` "a θ level block" because it shares a block's name would point the
+        // user at the wrong problem (PR #1655 review #5).
         if pos > 0 && tokens[pos - 1] == Token::Dot {
             continue;
         }
@@ -18992,7 +19004,20 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
 fn render_index_tokens(tokens: &[Token], start: usize) -> String {
     let mut out = String::new();
     let mut depth = 0usize;
+    // Whether the previous token ends an operand, so a `-` after it is binary.
+    // A leading `-`, or one after an operator, `(`, `[` or `,`, is unary and is
+    // printed tight (`KM[-K]`, not `KM[ - K]`), so the echoed remedy parses.
+    let mut after_operand = false;
     for t in tokens.iter().skip(start) {
+        let unary_minus = *t == Token::Minus && !after_operand;
+        after_operand = matches!(
+            t,
+            Token::Number(_) | Token::Ident(_) | Token::RParen | Token::RBracket
+        );
+        if unary_minus {
+            out.push('-');
+            continue;
+        }
         let piece = match t {
             Token::RBracket if depth == 0 => break,
             Token::LBracket => {
@@ -19013,11 +19038,32 @@ fn render_index_tokens(tokens: &[Token], start: usize) -> String {
             Token::Slash => " / ".into(),
             Token::Caret => "^".into(),
             Token::Comma => ", ".into(),
-            _ => "…".into(),
+            Token::EqEq => " == ".into(),
+            Token::Ne => " != ".into(),
+            Token::Lt => " < ".into(),
+            Token::Le => " <= ".into(),
+            Token::Gt => " > ".into(),
+            Token::Ge => " >= ".into(),
+            Token::AndAnd => " && ".into(),
+            Token::OrOr => " || ".into(),
+            Token::Bang => "!".into(),
+            Token::Dot => ".".into(),
+            Token::LBrace => "{".into(),
+            Token::RBrace => "}".into(),
+            Token::Eq => " = ".into(),
+            Token::Newline => " ".into(),
         };
         out.push_str(&piece);
     }
     out
+}
+
+/// Whether `name` is the synthesized index column of a θ level block this model
+/// declares (`__level_KM` for `theta KM[STUDY, ...]`), as opposed to any name that
+/// merely carries the prefix (#1638, PR #1655 review #1).
+fn is_declared_level_index_column(name: &str) -> bool {
+    name.strip_prefix(LEVEL_INDEX_PREFIX)
+        .is_some_and(|block| lookup_vector_theta(block).is_some())
 }
 
 /// Look up a declared θ level block by name.
@@ -19615,8 +19661,8 @@ enum LevelBlockScope {
     /// θ is in scope: `[individual_parameters]`, `[scaling]`, the residual magnitude,
     /// `[derived]`, `[mixture]`.
     Readable,
-    /// The `[odes]` right-hand side and `init(...)`, which read states and individual
-    /// parameters only. An injected `hazard =` line compiles here too.
+    /// The `[odes]` right-hand side and `init(...)`, which cannot read a θ directly.
+    /// An injected `hazard =` line compiles here too.
     Ode,
     /// An error-model selector `if (...)`, which reads per-row data columns only.
     SelectorCondition,

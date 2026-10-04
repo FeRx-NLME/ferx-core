@@ -1166,3 +1166,78 @@ fn a_gathered_residual_magnitude_converges_to_the_fd_gauss_newton_optimum() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+// ── #1639: a named level block in a kappa weight, bound ─────────────────────────
+
+/// A named block has no levels until it is bound, so the unbound parse cannot see
+/// which θ a `weight = W` reads, and accepts it. The refusal must come from the
+/// bound re-parse that every file entry point runs (PR #1655 review #2). The FIX
+/// twin passes the same gate, so it straddles: a refusal that fired for any named
+/// block, estimated or not, would turn it red.
+#[test]
+fn a_kappa_weight_reading_a_bound_estimated_named_block_is_refused() {
+    let model = |fix: &str| {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta W[STUDY, contrast = none](20.0, 1.0, 100.0){fix}
+  omega ETA_V ~ 0.04
+  kappa KAPPA_CL ~ 0.09 weight = W
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(KAPPA_CL)
+  V = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  covariance = false
+  maxiter = 0
+  iov_column = OCC
+"#
+        )
+    };
+    // `DATA` plus a one-occasion `OCC` column: the IOV column must be its own, since
+    // the block binds on `STUDY`.
+    let data: String = DATA
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 {
+                format!("{l},OCC\n")
+            } else {
+                format!("{l},1\n")
+            }
+        })
+        .collect();
+    let run = |text: &str| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("m.ferx");
+        let data_path = dir.path().join("d.csv");
+        write!(std::fs::File::create(&model_path).unwrap(), "{text}").unwrap();
+        write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
+        run_model_with_data(
+            model_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+    };
+    // The premise: the unbound parse alone cannot refuse it.
+    assert!(
+        ferx_core::parser::model_parser::parse_full_model(&model("")).is_ok(),
+        "premise: an unbound named block has no levels to judge"
+    );
+    let refused = "references estimated theta(s) `W` (a θ level block with an estimated level)";
+    let err = run(&model("")).expect_err("an estimated named block in a weight is refused");
+    assert!(err.contains(refused), "{err}");
+    run(&model(" FIX")).unwrap_or_else(|e| panic!("a FIXed named block is a known constant: {e}"));
+}

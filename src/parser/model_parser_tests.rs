@@ -27562,6 +27562,34 @@ fn a_level_block_read_where_theta_is_in_scope_parses() {
             parse_full_model(&m).unwrap_or_else(|e| panic!("[{ctx}, {read}] must parse: {e}"));
         }
     }
+    // The negative side of the magnitude's `__level_` allowance (PR #1655 review #1):
+    // only a *declared* block's index column passes. A typed `__level_TYPO` must stay
+    // an undeclared covariate, or it would read 0 with no diagnostic. The declared
+    // block's own column, written out, is the positive control.
+    let typo = level_read_model(
+        "",
+        "",
+        "",
+        "",
+        "",
+        "DV ~ proportional(PROP_ERR * __level_TYPO)",
+        "",
+    );
+    let err = expect_parse_err(&typo);
+    assert!(
+        err.contains("references undeclared covariate `__level_TYPO`"),
+        "an undeclared `__level_` name is still refused: {err}"
+    );
+    parse_full_model(&level_read_model(
+        "",
+        "",
+        "",
+        "",
+        "",
+        "DV ~ proportional(PROP_ERR * __level_KMN)",
+        "",
+    ))
+    .unwrap_or_else(|e| panic!("a declared block's index column reads: {e}"));
 }
 
 /// T10 (#1638): a residual magnitude reading a gather is θ-dependent, so GN takes
@@ -27626,6 +27654,16 @@ fn a_kappa_weight_reading_an_estimated_level_block_is_refused() {
         "names the block, once: {err}"
     );
     assert!(!err.contains("W[1]"), "not its level names: {err}");
+    // Read twice, named once (PR #1655 review #6).
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  theta W[3](20.0, 1.0, 100.0)\n  kappa KAPPA_CL ~ 0.09 weight = W[STUDY] * W[STUDY]",
+        "  STUDY continuous\n",
+    ));
+    assert_eq!(
+        err.matches("`W` (a θ level block").count(),
+        1,
+        "a block read twice is named once: {err}"
+    );
 
     let fixed = parse_model_string(&weighted_kappa_model_str(
         "  theta W[3](20.0, 1.0, 100.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = W[STUDY]",
@@ -27650,15 +27688,26 @@ fn a_level_block_index_renders_back_as_written() {
         "(K + 1) * 2 - X / 4^2, Q[1]",
         "every arm, and the stop at the matching `]`"
     );
-    // A token no index spells is shown as an ellipsis rather than dropped.
-    let toks = tokenize("KM[K == 1]").unwrap();
-    assert_eq!(render_index_tokens(&toks, 2), "K…1");
+    // Every token round-trips, so the echoed remedy is something the user can paste
+    // (PR #1655 review #4): a comparison is spelled out, and a unary minus is tight
+    // where a binary one is spaced.
+    for (src, want) in [
+        ("KM[K == 1]", "K == 1"),
+        ("KM[-K]", "-K"),
+        ("KM[2 * -K]", "2 * -K"),
+        ("KM[(-K) - 1]", "(-K) - 1"),
+        ("KM[K != 1 && !B || C <= 2]", "K != 1 && !B || C <= 2"),
+    ] {
+        let toks = tokenize(src).unwrap();
+        assert_eq!(render_index_tokens(&toks, 2), want, "{src}");
+    }
 }
 
 /// The hazard pre-check names the block a hazard reads, echoing the read, and
-/// does not mistake an `[covariate_nn]` output that shares a block's name
-/// (`NET.KM`) for a block read — the expression parser resolves the dot access
-/// before any block lookup, so refusing it here would refuse a valid model.
+/// does not call an `[covariate_nn]` output access that shares a block's name
+/// (`NET.KM`) a block read. No ODE-side context can read an NN output, so that
+/// hazard is refused anyway; but by the ODE parse, about the dot access, which is
+/// its actual problem — not as "`KM` is a θ level block" (PR #1655 review #5).
 #[cfg(feature = "survival")]
 #[test]
 fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
