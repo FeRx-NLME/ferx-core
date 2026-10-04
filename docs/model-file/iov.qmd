@@ -39,6 +39,27 @@ At each occasion *k*, the effective individual CL is `TVCL * exp(ETA_CL_i + KAPP
 
 **A kappa on an absorption parameter belongs to the dose.** A dose keeps the absorption parameters of **its own** occasion — the kernel of a built-in forcing (`MTT`, `MAT`, `KA`, …), a pathway fraction, a lag, `F` — for the whole of its absorption, even while a later occasion is in force; only disposition parameters (`CL`, `V`, …) switch at the occasion boundary. So a dose still absorbing when the next occasion begins delivers exactly its own mass ([#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)); see [Absorption parameters are read at the dose record](absorption.qmd#absorption-at-dose).
 
+### How a kappa row is labelled
+
+A kappa's variance is printed on the scale the kappa enters its parameter
+(#1643): `CV%` for a log-normal kappa, `SD` for an additive or logit one, and
+nothing for any other shape. The scale comes from **where the kappa sits**:
+walking up from the kappa through `+` and `-`, the first other operation
+decides.
+
+| Expression | Kappa reported as |
+|---|---|
+| `TVCL * exp(ETA_CL + KAPPA_CL)` | log-normal, `CV%` |
+| `TVV + ETA_V + KAPPA_V` | additive, `SD` |
+| `inv_logit(TH + ETA + KAPPA)` | logit, `SD = …, logit scale` |
+| `(TVV + KAPPA_V) * WT` | custom, no CV% or SD |
+
+A kappa that enters two parameters on different scales, or that no parameter
+reads, is custom. A weighted kappa is classified on the expression as written,
+before the `weight =` rewrite, and its SD is labelled `at weight 1` (see
+[What is reported](#what-is-reported)). The classification is stored on
+`FitResult.kappa_param_types`, parallel to `kappa_names`.
+
 ### Structural-model scope
 
 IOV composes with every structural model, including the **analytic absorption closed forms** — `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig`. A per-dose closed-form superposition cannot carry a dose's drug across an occasion boundary where the disposition changes, so a subject with IOV on such a model is served by an **exact event-driven walk**: the carried amount decays at each occasion's disposition, and each dose absorbs on the kernel of its own occasion (#1560). Predictions and gradients stay closed-form, with no ODE solve. A subject whose occasions push elimination past the absorption rate of any dose that has arrived by then — even one long since absorbed (the flip-flop regime) — or whose `n_eta + K·n_kappa` reaches 24, or that carries an `SS` dose, an infusion or a `TIME`-dependent parameter, is **transparently rerouted to the model's exact `transit()` / `igd()` ODE twin** instead. Both are automatic — no model change is needed — and covered on the [Absorption](absorption.qmd) page. A closed-form absorption model that has *no* ODE twin (one carrying a user `[odes]` / `[scaling]` / `[initial_conditions]` block, a role that shadows a reserved `F`/lagtime slot, or one whose twin could not be built — see [When a model loses its ODE twin](absorption.qmd)) still rejects IOV with an actionable message.
@@ -130,11 +151,12 @@ puts a **variance-structure decision inside a structural expression**:
 ### What is reported
 
 The estimate stays the **unweighted** $\gamma^2$ — the quantity a published MBMA
-reports — and the fit prints the effective SD at the median arm alongside it:
+reports. Its SD is labelled `at weight 1`, the SD of a one-subject arm, and the fit
+prints the effective SD at the median arm on the next line:
 
 ```
 --- KAPPA (IOV) Estimates ---
-  KAPPA_EMAX           = 4.145382  SE = 0.412000
+  KAPPA_EMAX           = 4.145382  (SD = 2.0360 at weight 1)  SE = 0.412000
                          weight = NARM  →  SD = 0.1440 at NARM = 200.0000 (κ ~ N(0, KAPPA_EMAX/NARM))
 ```
 

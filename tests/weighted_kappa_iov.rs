@@ -227,4 +227,10 @@ fn the_fit_reports_the_weight_and_the_typical_arm_size() {
         typical == 200.0 || typical == 25.0,
         "unexpected typical arm size {typical}"
     );
+    // #1643: the kappa's scale reaches the `FitResult`, parallel to `kappa_names`,
+    // so the printers and ferx-r can tell its CV% from an SD.
+    assert_eq!(
+        res.kappa_param_types,
+        vec![ferx_core::types::EtaParamType::LogNormal]
+    );
 }

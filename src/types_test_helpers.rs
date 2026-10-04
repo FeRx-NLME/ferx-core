@@ -95,6 +95,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -194,6 +195,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -342,6 +344,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         ferx_version: String::new(),
         environment: crate::environment::detect(),
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         sigma_types: Vec::new(),
         cov_eigenvalues: None,
@@ -493,6 +496,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
                 individual_param_name: "V".into(),
             },
         ],
+        kappa_param_types: Vec::new(),
         theta_transform: vec![
             ThetaTransform::Log,
             ThetaTransform::Log,

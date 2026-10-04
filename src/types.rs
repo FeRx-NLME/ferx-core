@@ -4277,6 +4277,12 @@ pub struct CompiledModel {
     /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
     /// classified are present). Forwarded into `FitResult`.
     pub eta_param_info: Vec<EtaParamInfo>,
+    /// Scale each IOV kappa enters its individual parameter on, **parallel to
+    /// `kappa_names`** (#1643): `LogNormal` under `exp`, `Logit` under
+    /// `inv_logit`, `Additive` when only `+`/`-` sit between the kappa and the
+    /// assignment, `Custom` otherwise (or when its uses disagree). Never
+    /// `LogitProbability`. Forwarded into `FitResult`.
+    pub kappa_param_types: Vec<EtaParamType>,
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
@@ -6995,6 +7001,12 @@ pub struct FitResult {
     /// Per-ETA transformation metadata (see `EtaParamInfo`). Used by the R
     /// layer to pick the correct CI / CV% formula for each random effect.
     pub eta_param_info: Vec<EtaParamInfo>,
+    /// Scale of each IOV kappa, parallel to `kappa_names` (see
+    /// `CompiledModel::kappa_param_types`, #1643). Picks CV% (log-normal) vs
+    /// SD (additive, logit) for the KAPPA rows. Empty on a `.fitrx` bundle
+    /// saved before #1643, and on a hand-built result; consumers then fall
+    /// back to the log-normal CV%.
+    pub kappa_param_types: Vec<EtaParamType>,
     /// Per-theta transformation (Identity / Log / Logit), parallel to `theta`.
     /// Tells the R layer whether a theta must be back-transformed before display.
     pub theta_transform: Vec<ThetaTransform>,

@@ -79,6 +79,7 @@ fn make_iov_model() -> CompiledModel {
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

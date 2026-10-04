@@ -263,7 +263,17 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   [Which covariance estimator produced these numbers](#covariance-estimator)
   before comparing one against another tool
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
-- **cv_pct**: Coefficient of variation for omega (sqrt(variance) * 100)
+- **cv_pct** / **sd**: how an `omega` / `omega_iov` variance reads on the scale
+  its random effect enters (#1643). A log-normal effect (`TVCL * exp(ETA)`) gets
+  `cv_pct` = sqrt(variance) * 100, the usual small-variance approximation. An
+  additive (`TVV + ETA`) or logit (`inv_logit(THETA + ETA)`) effect gets `sd` =
+  sqrt(variance) instead, since a CV% of an effect that does not multiply its
+  parameter means nothing. An effect in any other expression gets neither key.
+  An ETA's scale is its `eta_param_info` classification; a kappa's is read from
+  where it sits in its expression (see
+  [How a kappa row is labelled](model-file/iov.qmd#how-a-kappa-row-is-labelled)).
+  The console prints the same thing as `(CV% = …)`, `(SD = …)` or
+  `(SD = …, logit scale)`.
 - **covariance_method**: which estimator produced the standard errors — `r`, `s`
   or `rsr`. Present only when a covariance matrix was produced; see below.
 

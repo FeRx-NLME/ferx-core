@@ -2887,6 +2887,7 @@ fn fit_inner(
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
         environment: crate::environment::detect(),
         eta_param_info: model.eta_param_info.clone(),
+        kappa_param_types: model.kappa_param_types.clone(),
         theta_transform: model.theta_transform.clone(),
         sigma_types: model
             .error_spec

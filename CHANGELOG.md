@@ -108,6 +108,14 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
+  model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
+  so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read
+  as `CV% = 1249.1`. A variance now reads on the scale its effect enters: `CV%` (YAML
+  `cv_pct`) for log-normal, `SD` (YAML `sd`) for additive and logit, nothing for any other
+  shape; a weighted kappa's SD is labelled `at weight 1`. Kappas are classified by where they
+  sit in their expression, and the result is carried as `FitResult.kappa_param_types`
+  (parallel to `kappa_names`, also in `.fitrx` bundles) for ferx-r to read.
 - **A level block that would estimate no θ is refused under every contrast** (#1624). A single
   level under `ref` or `sum_to_zero_within`, or groups of one level each under
   `sum_to_zero_within`, used to bind silently with nothing to estimate; only `sum_to_zero` was

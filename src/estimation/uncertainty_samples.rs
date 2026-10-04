@@ -647,6 +647,7 @@ mod tests {
             ferx_version: String::new(),
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: vec![],
+            kappa_param_types: Vec::new(),
             theta_transform: vec![],
             sigma_types: vec![],
             cov_eigenvalues: None,

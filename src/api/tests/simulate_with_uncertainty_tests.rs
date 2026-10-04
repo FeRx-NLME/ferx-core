@@ -78,6 +78,7 @@ fn tiny_model() -> CompiledModel {
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -482,6 +483,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         ferx_version: String::new(),
         environment: crate::environment::EnvironmentInfo::default(),
         eta_param_info: vec![],
+        kappa_param_types: Vec::new(),
         theta_transform: vec![],
         sigma_types: vec![],
         cov_eigenvalues: None,

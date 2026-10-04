@@ -112,6 +112,7 @@ strings:
 | `theta.transform[i]` | `"identity"`, `"log"`, `"logit"`, `"logit_probability"` |
 | `sigma.types[i]` | `"proportional"`, `"additive"` |
 | `eta_param_info[i].param_type` | `"log_normal"`, `"additive"`, `"logit"`, `"logit_probability"`, `"custom"` |
+| `iov.kappa_param_types[i]` | `"log_normal"`, `"additive"`, `"logit"`, `"custom"` — parallel to `iov.kappa_names`; absent on a bundle saved before #1643, which loads with the list empty |
 
 Matrices use a row-major dense representation:
 

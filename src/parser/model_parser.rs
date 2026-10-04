@@ -2058,6 +2058,105 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Classify every IOV kappa by the scale it enters its individual parameter on
+/// (#1643). Returns one entry per kappa, **parallel to `kappa_names`**, so a
+/// consumer indexes it by kappa slot and never by statement order.
+///
+/// This is a different classifier from [`classify_indiv_params`] on purpose.
+/// The ETA classifier matches whole-expression patterns (`TVCL * exp(ETA)`,
+/// `THETA + ETA`, ...) because it also has to name the linked θ and its
+/// transform; a kappa needs only its scale, and it almost always shares the
+/// expression with an ETA (`exp(ETA_CL + KAPPA_CL)`, `TVV + ETA_V + KAPPA_V`),
+/// which no ETA pattern admits. So a kappa is classified by **where its leaf
+/// sits** ([`classify_kappa_scale`]). Where both classifiers answer, they
+/// must agree; `kappa_scale_walk_agrees_with_eta_patterns` pins that.
+///
+/// A kappa referenced in several assignments takes their common type; any
+/// disagreement, and a kappa no assignment reads, is `Custom`.
+fn classify_kappa_params(
+    stmts: &[Statement],
+    n_eta: usize,
+    kappa_names: &[String],
+) -> Vec<crate::types::EtaParamType> {
+    use crate::types::EtaParamType;
+
+    fn collect(stmts: &[Statement], slot: usize, out: &mut Vec<EtaParamType>) {
+        for s in stmts {
+            match s {
+                // No synthetic-parameter skip, unlike `classify_indiv_params`: a
+                // readout may not read a kappa (#107), so no `__ferx_ro_*` mirror
+                // holds one, and a `__ferx_pktime_*` line is a bare `TIME`.
+                Statement::Assign(_, expr) => classify_kappa_scale(expr, slot, out),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        collect(body, slot, out);
+                    }
+                    if let Some(body) = else_body {
+                        collect(body, slot, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (0..kappa_names.len())
+        .map(|k| {
+            let mut seen = Vec::new();
+            collect(stmts, n_eta + k, &mut seen);
+            match seen.split_first() {
+                Some((first, rest)) if rest.iter().all(|t| t == first) => *first,
+                _ => EtaParamType::Custom,
+            }
+        })
+        .collect()
+}
+
+/// Push the scale of every occurrence of `Eta(slot)` in `expr` onto `out`.
+///
+/// Walking up from the leaf through `+`, `-` and unary minus (`0 - x`), the
+/// first other ancestor decides: `exp` → `LogNormal`, `inv_logit`/`expit` →
+/// `Logit`, the assignment root → `Additive`, anything else (`*`, `/`, `^`,
+/// another function) → `Custom`. An inline `if` is transparent; a kappa in a
+/// condition or a gather index is not a scale position and is not counted.
+fn classify_kappa_scale(expr: &Expression, slot: usize, out: &mut Vec<crate::types::EtaParamType>) {
+    use crate::types::EtaParamType;
+
+    fn walk(e: &Expression, slot: usize, scale: Option<EtaParamType>, out: &mut Vec<EtaParamType>) {
+        match e {
+            Expression::Eta(i) if *i == slot => out.push(scale.unwrap_or(EtaParamType::Additive)),
+            Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
+                walk(l, slot, scale, out);
+                walk(r, slot, scale, out);
+            }
+            Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                walk(l, slot, Some(EtaParamType::Custom), out);
+                walk(r, slot, Some(EtaParamType::Custom), out);
+            }
+            Expression::UnaryFn(name, a) => {
+                let t = match name.as_str() {
+                    "exp" => EtaParamType::LogNormal,
+                    "inv_logit" | "expit" => EtaParamType::Logit,
+                    _ => EtaParamType::Custom,
+                };
+                walk(a, slot, Some(t), out);
+            }
+            // Transparent, like a statement-level `if`: each value branch keeps
+            // the scale above it, and a kappa read only in the condition is not
+            // a scale position at all.
+            Expression::Conditional(_, t, f) => {
+                walk(t, slot, scale, out);
+                walk(f, slot, scale, out);
+            }
+            _ => {}
+        }
+    }
+    walk(expr, slot, None, out);
+}
+
 /// Apply a recognised `ExprClass` to the output vectors.
 fn apply_class(
     c: ExprClass,
@@ -2708,6 +2807,11 @@ pub fn parse_full_model_with(
         .enumerate()
         .filter_map(|(k, w)| w.as_ref().map(|w| (n_eta + k, w.clone())))
         .collect();
+    // Kappas by position of their leaf, parallel to `kappa_names` (#1643). Taken
+    // before `rewrite_weighted_kappas` turns a weighted `K` into `K / sqrt(W)`:
+    // the scale is the one the user wrote, and after the rewrite every weighted
+    // kappa's nearest ancestor would be that `/`, i.e. `Custom`.
+    let kappa_param_types = classify_kappa_params(&indiv_stmts, n_eta, &kappa_names);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
         // *unweighted* κ — a plausible wrong answer rather than an error, which
@@ -3884,6 +3988,7 @@ pub fn parse_full_model_with(
         parse_warnings: Vec::new(), // populated below
         has_conditional_eta_params: false,
         eta_param_info,
+        kappa_param_types,
         theta_transform,
         theta_eta_linked,
         scaling: ScalingSpec::None,

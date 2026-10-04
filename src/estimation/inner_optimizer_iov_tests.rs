@@ -718,6 +718,7 @@ fn make_iov_model() -> CompiledModel {
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -3085,6 +3086,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -3249,6 +3251,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
         eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

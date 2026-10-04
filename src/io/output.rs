@@ -24,6 +24,187 @@ fn cv_pct(var: f64) -> f64 {
     }
 }
 
+/// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
+fn sd_from_var(var: f64) -> f64 {
+    if var > 0.0 {
+        var.sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// The console parenthetical describing a random-effect variance on the scale
+/// the effect enters (#1643): CV% for log-normal, SD for additive and logit,
+/// nothing for a custom expression. `None` for the type means "unknown" (a
+/// `.fitrx` saved before #1643, an ETA with no `eta_param_info` entry) and keeps
+/// the log-normal CV% every row printed before.
+///
+/// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
+/// unweighted γ², so an SD of it is the SD of a weight-1 arm and is labelled so
+/// — the line after the row gives the SD at the typical weight.
+fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
+    let at_weight = if weighted { " at weight 1" } else { "" };
+    match t {
+        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}", cv_pct(var))),
+        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at_weight)),
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => Some(format!(
+            "SD = {:.4}{}, logit scale",
+            sd_from_var(var),
+            at_weight
+        )),
+        Some(EtaParamType::Custom) => None,
+    }
+}
+
+/// The YAML line describing a random-effect variance on its scale (#1643):
+/// `cv_pct` for log-normal (and unknown, as before), `sd` for additive and
+/// logit, nothing for custom. Indented for an `omega`/`omega_iov` entry.
+fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
+    match t {
+        None | Some(EtaParamType::LogNormal) => Some(format!("    cv_pct: {:.2}", cv_pct(var))),
+        Some(EtaParamType::Additive | EtaParamType::Logit | EtaParamType::LogitProbability) => {
+            Some(format!("    sd: {:.6}", sd_from_var(var)))
+        }
+        Some(EtaParamType::Custom) => None,
+    }
+}
+
+/// The type of the ETA called `name`, looked up **by name** in
+/// `eta_param_info`: that list is in statement order, not `eta_names` order,
+/// and holds one entry per individual parameter the ETA appears in. All
+/// entries agree → that type; any disagreement → `Custom`; none → `None`.
+fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
+    let mut types = result
+        .eta_param_info
+        .iter()
+        .filter(|i| i.eta_name == name)
+        .map(|i| i.param_type);
+    let first = types.next()?;
+    Some(if types.all(|t| t == first) {
+        first
+    } else {
+        EtaParamType::Custom
+    })
+}
+
+/// `"  (note)"` for a row, or `""` when there is nothing to say or the
+/// covariance step failed (`show_cv == false`).
+fn note_suffix(note: Option<String>, show_cv: bool) -> String {
+    match note {
+        Some(n) if show_cv => format!("  ({})", n),
+        _ => String::new(),
+    }
+}
+
+/// Whether the console shows a CV%/SD parenthetical: not when the covariance
+/// step failed or fell back to SIR.
+fn shows_cv(result: &FitResult) -> bool {
+    !matches!(
+        result.covariance_status,
+        CovarianceStatus::Failed | CovarianceStatus::SirFallback
+    )
+}
+
+/// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
+fn format_omega_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let n_eta = result.omega.nrows();
+    let show_cv = shows_cv(result);
+    let mut out = String::new();
+    for i in 0..n_eta {
+        let var = result.omega[(i, i)];
+        let eta_name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
+        let label = if is_fixed {
+            fixed_label(eta_name)
+        } else {
+            eta_name.to_string()
+        };
+        let se_str = if is_fixed {
+            "---".to_string()
+        } else {
+            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+                Some(s) => format!("{:.6}", s),
+                None => "N/A".to_string(),
+            }
+        };
+        let note = note_suffix(
+            variance_note(eta_type(result, eta_name), var, false),
+            show_cv,
+        );
+        let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
+    }
+    out
+}
+
+/// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
+/// followed by its weighted-kappa line (#1031) when it has one.
+fn format_kappa_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let Some(iov) = result.omega_iov.as_ref() else {
+        return String::new();
+    };
+    let show_cv = shows_cv(result);
+    let mut out = String::new();
+    for i in 0..iov.nrows() {
+        let var = iov[(i, i)];
+        let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
+        let name = result
+            .kappa_names
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("KAPPA");
+        let label = if is_fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se_str = if is_fixed {
+            "---".to_string()
+        } else {
+            match &result.se_kappa {
+                Some(se) if i < se.len() => format!("{:.6}", se[i]),
+                _ => "N/A".to_string(),
+            }
+        };
+        let weight = result.kappa_weights.get(i).and_then(|w| w.as_deref());
+        let note = note_suffix(
+            variance_note(
+                result.kappa_param_types.get(i).copied(),
+                var,
+                weight.is_some(),
+            ),
+            show_cv,
+        );
+        let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
+        // Sample-size-weighted IOV (#1031): the estimate above is the
+        // *unweighted* γ² — the quantity a published MBMA reports — so
+        // print the effective SD at the median arm alongside it. A raw
+        // γ of 2.0 on a logit scale reads as alarming until it is divided.
+        if let Some(w) = weight {
+            let _ = match result.kappa_weight_typical.get(i).copied().flatten() {
+                Some(n) if n > 0.0 && var >= 0.0 => writeln!(
+                    out,
+                    "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
+                    "",
+                    w,
+                    var.sqrt() / n.sqrt(),
+                    w,
+                    n,
+                    name,
+                    w
+                ),
+                _ => writeln!(
+                    out,
+                    "  {:<20}   weight = {} (κ ~ N(0, {}/{}))",
+                    "", w, name, w
+                ),
+            };
+        }
+    }
+    out
+}
+
 /// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
 /// `param_corr` matrix entry when present, else fall back to
 /// `cov / (sqrt(var_i) · sqrt(var_j))` (0 when either variance is non-positive).
@@ -372,39 +553,9 @@ pub fn print_results(result: &FitResult) {
     if n_eta > 0 {
         eprintln!("\n--- OMEGA Estimates ---");
     }
-    let show_cv = !matches!(
-        result.covariance_status,
-        CovarianceStatus::Failed | CovarianceStatus::SirFallback
-    );
     // Check if omega has off-diagonal elements
     let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
-    for i in 0..n_eta {
-        let var = result.omega[(i, i)];
-        let eta_name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
-        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(eta_name)
-        } else {
-            eta_name.to_string()
-        };
-        let se_str = if is_fixed {
-            "---".to_string()
-        } else {
-            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
-                Some(s) => format!("{:.6}", s),
-                None => "N/A".to_string(),
-            }
-        };
-        if show_cv {
-            let cv = cv_pct(var);
-            eprintln!(
-                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
-                label, var, cv, se_str
-            );
-        } else {
-            eprintln!("  {:<20} = {:.6}  SE = {}", label, var, se_str);
-        }
-    }
+    eprint!("{}", format_omega_rows(result));
     if has_offdiag {
         eprintln!("  --- Correlations ---");
         for i in 0..n_eta {
@@ -484,56 +635,7 @@ pub fn print_results(result: &FitResult) {
     if let Some(ref iov) = result.omega_iov {
         eprintln!("\n--- KAPPA (IOV) Estimates ---");
         let n_kappa = iov.nrows();
-        for i in 0..n_kappa {
-            let var = iov[(i, i)];
-            let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
-            let name = result
-                .kappa_names
-                .get(i)
-                .map(|s| s.as_str())
-                .unwrap_or("KAPPA");
-            let label = if is_fixed {
-                fixed_label(name)
-            } else {
-                name.to_string()
-            };
-            let se_str = if is_fixed {
-                "---".to_string()
-            } else {
-                match &result.se_kappa {
-                    Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                    _ => "N/A".to_string(),
-                }
-            };
-            if show_cv {
-                let cv = cv_pct(var);
-                eprintln!(
-                    "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
-                    label, var, cv, se_str
-                );
-            } else {
-                eprintln!("  {:<20} = {:.6}  SE = {}", label, var, se_str);
-            }
-            // Sample-size-weighted IOV (#1031): the estimate above is the
-            // *unweighted* γ² — the quantity a published MBMA reports — so
-            // print the effective SD at the median arm alongside it. A raw
-            // γ of 2.0 on a logit scale reads as alarming until it is divided.
-            if let Some(Some(w)) = result.kappa_weights.get(i) {
-                match result.kappa_weight_typical.get(i).copied().flatten() {
-                    Some(n) if n > 0.0 && var >= 0.0 => eprintln!(
-                        "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
-                        "",
-                        w,
-                        var.sqrt() / n.sqrt(),
-                        w,
-                        n,
-                        name,
-                        w
-                    ),
-                    _ => eprintln!("  {:<20}   weight = {} (κ ~ N(0, {}/{}))", "", w, name, w),
-                }
-            }
-        }
+        eprint!("{}", format_kappa_rows(result));
         // Off-diagonal covariances/correlations (block_kappa)
         let has_offdiag = (0..n_kappa).any(|i| (0..i).any(|j| iov[(i, j)].abs() > 1e-15));
         if has_offdiag {
@@ -904,16 +1006,8 @@ pub fn format_summary(result: &FitResult) -> String {
                     None => "N/A".to_string(),
                 }
             };
-            if show_cv {
-                let cv = cv_pct(var);
-                let _ = writeln!(
-                    out,
-                    "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
-                    label, var, cv, se_str
-                );
-            } else {
-                let _ = writeln!(out, "  {:<16} = {:.6}  SE = {}", label, var, se_str);
-            }
+            let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
+            let _ = writeln!(out, "  {:<16} = {:.6}{}  SE = {}", label, var, note, se_str);
         }
         // Off-diagonal correlations (block omega).
         let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
@@ -2245,7 +2339,6 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     writeln!(f, "\nomega:").map_err(|e| e.to_string())?;
     for i in 0..n_eta {
         let var = result.omega[(i, i)];
-        let cv_pct = cv_pct(var);
         let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
         let se = crate::types::omega_se_at(&result.se_omega, n_eta, i, i);
         let key = result
@@ -2255,7 +2348,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
         writeln!(f, "  {}:", key).map_err(|e| e.to_string())?;
         writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
-        writeln!(f, "    cv_pct: {:.2}", cv_pct).map_err(|e| e.to_string())?;
+        if let Some(line) = variance_yaml_line(eta_type(result, &key), var) {
+            writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+        }
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
@@ -2419,7 +2514,6 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let n_kappa = iov.nrows();
         for i in 0..n_kappa {
             let var = iov[(i, i)];
-            let cv_pct = cv_pct(var);
             let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
             let se = result.se_kappa.as_ref().and_then(|v| v.get(i).copied());
             let name = result
@@ -2429,7 +2523,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .unwrap_or_else(|| format!("kappa_{}", i + 1));
             writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
             writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
-            writeln!(f, "    cv_pct: {:.2}", cv_pct).map_err(|e| e.to_string())?;
+            if let Some(line) = variance_yaml_line(result.kappa_param_types.get(i).copied(), var) {
+                writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+            }
             if is_fixed {
                 writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
                 writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
@@ -2925,6 +3021,7 @@ mod tests {
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
+            kappa_param_types: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
             cov_eigenvalues: None,
@@ -3724,6 +3821,7 @@ mod tests {
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
+            kappa_param_types: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
             cov_eigenvalues: None,
@@ -5158,5 +5256,205 @@ mod tests {
     fn print_results_smoke_with_neural_network_block() {
         // Covers the `--- NEURAL NETWORKS ---` print branch.
         print_results(&make_nn_result());
+    }
+
+    // ── #1643: ETA / KAPPA rows describe the variance on the effect's scale ──
+
+    /// T4: one assert per cell of the message's input space (type × weighted ×
+    /// sign of the variance). Exact strings, so deleting either phrase — "at
+    /// weight 1", "logit scale" — or swapping CV% for SD reddens a cell.
+    #[test]
+    fn variance_note_input_space() {
+        use EtaParamType::*;
+        let ln = 0.050133; // sqrt = 0.22390
+        let add = 156.036966; // sqrt = 12.491476 — the #1643 MBMA kappa
+        let note = |t, v, w| variance_note(t, v, w);
+        let s = |x: &str| Some(x.to_string());
+
+        // Unknown type (old bundle / ETA without info) and log-normal: today's CV%.
+        assert_eq!(note(None, ln, false), s("CV% = 22.4"));
+        assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.4"));
+        // Weighted log-normal kappa: unchanged (#1031 control).
+        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.4"));
+        assert_eq!(note(None, ln, true), s("CV% = 22.4"));
+        // Additive: SD, not a CV%; weighted says which arm size the SD is for.
+        assert_eq!(note(Some(Additive), add, false), s("SD = 12.4915"));
+        assert_eq!(
+            note(Some(Additive), add, true),
+            s("SD = 12.4915 at weight 1")
+        );
+        // Logit: SD on the logit scale, both logit spellings.
+        assert_eq!(
+            note(Some(Logit), add, false),
+            s("SD = 12.4915, logit scale")
+        );
+        assert_eq!(
+            note(Some(LogitProbability), add, false),
+            s("SD = 12.4915, logit scale")
+        );
+        assert_eq!(
+            note(Some(Logit), add, true),
+            s("SD = 12.4915 at weight 1, logit scale")
+        );
+        // Custom: nothing at all — no CV%, no SD, no N/A.
+        assert_eq!(note(Some(Custom), add, false), None);
+        assert_eq!(note(Some(Custom), add, true), None);
+        // Non-positive variance: zero, never NaN.
+        assert_eq!(note(Some(LogNormal), -1.0, false), s("CV% = 0.0"));
+        assert_eq!(note(Some(Additive), -1.0, false), s("SD = 0.0000"));
+        assert_eq!(note(Some(Logit), 0.0, false), s("SD = 0.0000, logit scale"));
+
+        // The covariance-failed rule still suppresses every parenthetical.
+        assert_eq!(note_suffix(s("SD = 1.0000"), true), "  (SD = 1.0000)");
+        assert_eq!(note_suffix(s("SD = 1.0000"), false), "");
+        assert_eq!(note_suffix(None, true), "");
+
+        // YAML key per type.
+        assert_eq!(variance_yaml_line(None, ln), s("    cv_pct: 22.39"));
+        assert_eq!(
+            variance_yaml_line(Some(LogNormal), ln),
+            s("    cv_pct: 22.39")
+        );
+        assert_eq!(
+            variance_yaml_line(Some(Additive), add),
+            s("    sd: 12.491476")
+        );
+        assert_eq!(variance_yaml_line(Some(Logit), add), s("    sd: 12.491476"));
+        assert_eq!(
+            variance_yaml_line(Some(LogitProbability), add),
+            s("    sd: 12.491476")
+        );
+        assert_eq!(variance_yaml_line(Some(Custom), add), None);
+        assert_eq!(
+            variance_yaml_line(Some(Additive), -1.0),
+            s("    sd: 0.000000")
+        );
+    }
+
+    /// A result with two ETAs whose `eta_param_info` is in the **reverse** of
+    /// `eta_names` order (statement order, #1643 §0e), plus three kappas.
+    fn classified_result() -> FitResult {
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        r.covariance_status = CovarianceStatus::Computed;
+        r.eta_names = vec!["eta_CL".into(), "eta_V".into()];
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]);
+        r.omega_fixed = vec![false, false];
+        let info = |n: &str, t| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: t,
+            linked_theta: None,
+            individual_param_name: n.to_uppercase(),
+        };
+        r.eta_param_info = vec![
+            info("eta_V", EtaParamType::Additive),
+            info("eta_CL", EtaParamType::LogNormal),
+        ];
+        r.omega_iov = Some(DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.050133, 0.0, 0.0, 0.0, 156.036966, 0.0, 0.0, 0.0, 0.3],
+        ));
+        r.kappa_names = vec!["K_LN".into(), "K_ADD".into(), "K_C".into()];
+        r.kappa_fixed = vec![false; 3];
+        r.kappa_param_types = vec![
+            EtaParamType::LogNormal,
+            EtaParamType::Additive,
+            EtaParamType::Custom,
+        ];
+        r
+    }
+
+    fn line_with<'a>(text: &'a str, name: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("no row for {name} in:\n{text}"))
+    }
+
+    /// T5: the KAPPA rows read `kappa_param_types` by kappa index, the log-normal
+    /// and additive rows in one test so swapping the index flips both.
+    #[test]
+    fn kappa_rows_follow_kappa_param_types() {
+        let r = classified_result();
+        let rows = format_kappa_rows(&r);
+        let ln = line_with(&rows, "K_LN");
+        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        assert!(!ln.contains("SD"), "{ln}");
+        let add = line_with(&rows, "K_ADD");
+        assert!(add.contains("= 156.036966  (SD = 12.4915)  SE ="), "{add}");
+        assert!(!add.contains("CV%"), "{add}");
+        let c = line_with(&rows, "K_C");
+        assert!(c.contains("= 0.300000  SE ="), "{c}");
+
+        // A weighted additive kappa: the SD is labelled as the weight-1 SD, and
+        // the #1031 line still follows with the SD at the typical weight.
+        let mut w = classified_result();
+        w.kappa_weights = vec![None, Some("NARM".into()), None];
+        w.kappa_weight_typical = vec![None, Some(4.0), None];
+        let rows = format_kappa_rows(&w);
+        let add = line_with(&rows, "K_ADD");
+        assert!(add.contains("(SD = 12.4915 at weight 1)"), "{add}");
+        assert!(
+            rows.contains("weight = NARM  →  SD = 6.2457 at NARM = 4.0000"),
+            "{rows}"
+        );
+
+        // A bundle saved before #1643 carries no types: today's CV% on every row.
+        let mut old = classified_result();
+        old.kappa_param_types.clear();
+        let rows = format_kappa_rows(&old);
+        assert!(
+            line_with(&rows, "K_ADD").contains("(CV% = 1249.1)"),
+            "{rows}"
+        );
+
+        // Covariance failed: no parenthetical on any row.
+        let mut failed = classified_result();
+        failed.covariance_status = CovarianceStatus::Failed;
+        assert!(!format_kappa_rows(&failed).contains('('));
+    }
+
+    /// T6: an ETA's type is looked up by name, not by position in
+    /// `eta_param_info` (which is in statement order).
+    #[test]
+    fn omega_rows_look_eta_types_up_by_name() {
+        let r = classified_result();
+        for text in [format_omega_rows(&r), format_summary(&r)] {
+            let cl = line_with(&text, "eta_CL");
+            assert!(cl.contains("= 0.100000  (CV% = 31.6)  SE ="), "{cl}");
+            let v = line_with(&text, "eta_V");
+            assert!(v.contains("= 0.200000  (SD = 0.4472)  SE ="), "{v}");
+        }
+
+        // One ETA classified differently in two parameters: Custom, so no note.
+        let mut both = classified_result();
+        both.eta_param_info.push(EtaParamInfo {
+            eta_name: "eta_V".into(),
+            param_type: EtaParamType::LogNormal,
+            linked_theta: None,
+            individual_param_name: "Q".into(),
+        });
+        assert_eq!(eta_type(&both, "eta_V"), Some(EtaParamType::Custom));
+        assert_eq!(eta_type(&both, "eta_CL"), Some(EtaParamType::LogNormal));
+        assert_eq!(eta_type(&both, "eta_KA"), None);
+        assert!(line_with(&format_omega_rows(&both), "eta_V").contains("= 0.200000  SE ="));
+    }
+
+    /// T7: both YAML sites (`omega`, `omega_iov`) write the key for the type.
+    #[test]
+    fn yaml_writes_cv_pct_or_sd_by_type() {
+        let r = classified_result();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        for want in [
+            "  eta_CL:\n    variance: 0.100000\n    cv_pct: 31.62\n",
+            "  eta_V:\n    variance: 0.200000\n    sd: 0.447214\n",
+            "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n",
+            "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n",
+            "  K_C:\n    variance: 0.300000\n    se: ~\n",
+        ] {
+            assert!(yaml.contains(want), "missing\n{want}\nin\n{yaml}");
+        }
     }
 }
