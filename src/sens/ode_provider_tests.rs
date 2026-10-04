@@ -12741,4 +12741,67 @@ fn ode_wider_than_static_walk_iov_matches_predict_iov() {
             approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-3, epsilon = 1e-6);
         }
     }
+
+    // Both κ occasion axes must be live, or the per-occasion blocks below are checked
+    // against zeros: κ_g0 moves the first occasion's observations, κ_g1 the second's.
+    let n_st = stacked.len();
+    let (k_g0, k_g1) = (model.n_eta, model.n_eta + 1);
+    assert!(sens.obs[..3].iter().any(|o| o.df_deta[k_g0].abs() > 1e-3));
+    assert!(sens.obs[3..].iter().any(|o| o.df_deta[k_g1].abs() > 1e-3));
+
+    // Second-order blocks, which FOCE/FOCEI's outer gradient consumes: `∂²f/∂s²` and
+    // `∂²f/∂s∂θ` over the stacked `[η, κ_g0, κ_g1]` axes, against double central FD of
+    // production `predict_iov`.
+    let h = 1e-4;
+    let shift = |v: &[f64], a: usize, da: f64| -> Vec<f64> {
+        let mut out = v.to_vec();
+        out[a] += da;
+        out
+    };
+    let (mut worst_ss, mut worst_st) = (0.0f64, 0.0f64);
+    for (j, obs) in sens.obs.iter().enumerate() {
+        for k in 0..n_st {
+            for l in 0..n_st {
+                let pp = shift(&shift(&stacked, k, h), l, h);
+                let pm = shift(&shift(&stacked, k, h), l, -h);
+                let mp = shift(&shift(&stacked, k, -h), l, h);
+                let mm = shift(&shift(&stacked, k, -h), l, -h);
+                let fd = (pred(&WIDE_THETA, &pp, j)
+                    - pred(&WIDE_THETA, &pm, j)
+                    - pred(&WIDE_THETA, &mp, j)
+                    + pred(&WIDE_THETA, &mm, j))
+                    / (4.0 * h * h);
+                let got = obs.d2f_deta2[k * n_st + l];
+                assert!(
+                    fd.is_finite() && got.is_finite(),
+                    "obs {j} ({k},{l}) non-finite"
+                );
+                worst_ss = worst_ss.max((got - fd).abs() / fd.abs().max(1e-2));
+            }
+            for m in 0..model.n_theta {
+                let sh = h * (1.0 + WIDE_THETA[m].abs());
+                let tp = shift(&WIDE_THETA, m, sh);
+                let tm = shift(&WIDE_THETA, m, -sh);
+                let ep = shift(&stacked, k, h);
+                let em = shift(&stacked, k, -h);
+                let fd = (pred(&tp, &ep, j) - pred(&tm, &ep, j) - pred(&tp, &em, j)
+                    + pred(&tm, &em, j))
+                    / (4.0 * h * sh);
+                let got = obs.d2f_deta_dtheta[k * model.n_theta + m];
+                assert!(
+                    fd.is_finite() && got.is_finite(),
+                    "obs {j} ({k},θ{m}) non-finite"
+                );
+                worst_st = worst_st.max((got - fd).abs() / fd.abs().max(1e-2));
+            }
+        }
+    }
+    // Measured worst (relative, floored at 1e-2): 8.9e-6 for `∂²f/∂s²`, 7.9e-6 for
+    // `∂²f/∂s∂θ`. Bound 1e-4 keeps ~11× headroom; a dropped or zeroed second-order block
+    // is an O(1) error.
+    assert!(
+        worst_ss < 1e-4 && worst_st < 1e-4,
+        "wide IOV second order vs double FD of predict_iov: ∂²f/∂s² {worst_ss:.2e}, \
+         ∂²f/∂s∂θ {worst_st:.2e}"
+    );
 }
