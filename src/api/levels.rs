@@ -539,8 +539,10 @@ fn resolve_contrast(
     // free: that study's η *is* the mean of its own levels. A check that only
     // looked for a fixed intercept would wave it through, which is precisely
     // the silent flat direction this codebase treats as a bug.
-    if let Some(found) = absorbed.as_ref().filter(|_| free > 0) {
-        if !nested {
+    if let Some(found) = absorbed.as_ref() {
+        // A one-column block with no free θ is the plain single-level case
+        // below: there is no level left for the random effect to be confused with.
+        if !nested && free > 0 {
             return Err(format!(
                 "{block}: each `{}` level belongs to a single subject, and {}, so a level and \
                  that subject's random effect are the same quantity: the model is not \
@@ -549,10 +551,12 @@ fn resolve_contrast(
                 found.clause(),
             ));
         }
-        if matches!(
-            resolved,
-            LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
-        ) {
+        if nested
+            && matches!(
+                resolved,
+                LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
+            )
+        {
             let leading = subject_key_columns(decl).join(", ");
             // When every group is a single level the within-group contrast
             // would leave nothing to estimate, so it is not the advice (#1624).
