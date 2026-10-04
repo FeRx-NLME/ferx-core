@@ -12474,7 +12474,10 @@ fn ode_readout_gather_dual_matches_fd() {
 //
 // 2-cpt PK driving an indirect response (inhibition of production), with the response
 // started at baseline by `init(...)` so its state is live before the first dose. Individual
-// parameters: CL V1 Q V2 K10 K12 K21 KIN KOUT IMAX IC50 BASE GAM = 13 (> 12) on 7 θ + 2 η.
+// parameters: CL V1 Q V2 K10 K12 K21 KIN KOUT IMAX IC50 BASE GAM = 13 (> 12) on 8 θ + 3 η.
+// `GAM` is declared last, so in the wide model it is the 13th row of every seed loop, and it
+// carries its own η: a walk that dropped the rows past the old cap would lose a live
+// derivative, not a zero one. The 12-parameter twin writes the constant `IMAX` inline.
 const WIDE_ODE_TEMPLATE: &str = r#"
 [parameters]
   theta TVCL(4.0,   0.1, 100.0)
@@ -12484,8 +12487,10 @@ const WIDE_ODE_TEMPLATE: &str = r#"
   theta TVKIN(10.0, 0.1, 100.0)
   theta TVKOUT(0.5, 0.01, 10.0)
   theta TVIC50(2.0, 0.01, 100.0)
+  theta TVGAM(2.0,  0.5, 5.0)
   omega ETA_CL   ~ 0.15
   omega ETA_KOUT ~ 0.10
+  omega ETA_GAM  ~ 0.05
   __KAPPA__
   sigma PROP_ERR ~ 0.02 (sd)
 [individual_parameters]
@@ -12498,16 +12503,16 @@ const WIDE_ODE_TEMPLATE: &str = r#"
   K21  = Q / V2
   KIN  = TVKIN
   KOUT = TVKOUT * exp(ETA_KOUT)
-  IMAX = 0.8
+  __IMAX_DECL__
   IC50 = TVIC50
   BASE = KIN / KOUT
-  __GAM_DECL__
+  GAM  = TVGAM * exp(ETA_GAM)
 [structural_model]
   ode(obs_cmt=resp, states=[central, peripheral, resp])
 [odes]
   init(resp) = BASE
   CP = central / V1
-  INH = IMAX * CP^__GAM__ / (IC50^__GAM__ + CP^__GAM__)
+  INH = __IMAX__ * CP^GAM / (IC50^GAM + CP^GAM)
   d/dt(central)    = -K10 * central - K12 * central + K21 * peripheral
   d/dt(peripheral) =  K12 * central - K21 * peripheral
   d/dt(resp)       =  KIN * (1 - INH) - KOUT * resp
@@ -12520,21 +12525,21 @@ const WIDE_ODE_TEMPLATE: &str = r#"
   ode_abstol = 1e-12
 "#;
 
-/// The 13-parameter model (`GAM` an individual parameter), or its 12-parameter twin
-/// (`GAM` written inline as `2`) — the same function, one parameter either side of the
+/// The 13-parameter model (`IMAX` an individual parameter), or its 12-parameter twin
+/// (`IMAX` written inline as `0.8`) — the same function, one parameter either side of the
 /// static walk's cap. `iov` adds a κ on CL.
 fn wide_ode_model(wide: bool, iov: bool) -> CompiledModel {
     let src = WIDE_ODE_TEMPLATE
-        .replace("__GAM_DECL__", if wide { "GAM  = 2" } else { "" })
-        .replace("__GAM__", if wide { "GAM" } else { "2" })
+        .replace("__IMAX_DECL__", if wide { "IMAX = 0.8" } else { "" })
+        .replace("__IMAX__", if wide { "IMAX" } else { "0.8" })
         .replace("__KAPPA__", if iov { "kappa KAPPA_CL ~ 0.02" } else { "" })
         .replace("__KAPPA_TERM__", if iov { "+ KAPPA_CL" } else { "" })
         .replace("__IOV_OPT__", if iov { "iov_column = OCC" } else { "" });
     parse_model_string(&src).expect("parse #1661 fixture")
 }
 
-const WIDE_THETA: [f64; 7] = [4.0, 12.0, 2.0, 25.0, 10.0, 0.5, 2.0];
-const WIDE_ETA: [f64; 2] = [0.1, -0.05];
+const WIDE_THETA: [f64; 8] = [4.0, 12.0, 2.0, 25.0, 10.0, 0.5, 2.0, 2.0];
+const WIDE_ETA: [f64; 3] = [0.1, -0.05, 0.08];
 
 /// Two boluses 12 h apart with observations after each, so the second dose lands on
 /// residual drug and a depressed response — both sides of that dose event are live.
@@ -12562,6 +12567,26 @@ fn assert_wide_fixture_straddles_the_cap(wide: &CompiledModel, narrow: &Compiled
     );
     assert_eq!(wide.n_theta + wide.n_eta, narrow.n_theta + narrow.n_eta);
     assert!(wide.n_theta + wide.n_eta <= MAX_ODE_AXES);
+    // The live `GAM` must sit past the old cap in the wide model's seed order.
+    let gam = wide.indiv_param_names.iter().position(|n| n == "GAM");
+    assert_eq!(
+        gam,
+        Some(wide.pk_indices.len() - 1),
+        "GAM must be the last seeded row: {:?}",
+        wide.indiv_param_names
+    );
+    assert!(gam.unwrap() >= MAX_ODE_SENS_DIM);
+}
+
+/// `ETA_GAM` reaches the prediction only through `GAM`, the row past the old cap. Assert
+/// its jet is live, so a walk that dropped that row would fail the parity checks against
+/// production rather than agree with a zero.
+fn assert_overflow_row_is_live(df_deta_gam: impl Iterator<Item = f64>) {
+    let peak = df_deta_gam.fold(0.0f64, |m, v| {
+        assert!(v.is_finite());
+        m.max(v.abs())
+    });
+    assert!(peak > 1e-2, "∂f/∂η_GAM must be live, peak {peak:.3e}");
 }
 
 /// A subject with **no** event-walk trigger (static covariates, fixed bolus doses) on a
@@ -12605,6 +12630,8 @@ fn ode_wider_than_static_walk_routes_to_event_walk_not_fd() {
 fn ode_wider_than_static_walk_matches_production() {
     let wide = wide_ode_model(true, false);
     let subject = wide_ode_subject();
+    let live = ode_subject_sensitivities(&wide, &subject, &WIDE_THETA, &WIDE_ETA).expect("wide");
+    assert_overflow_row_is_live(live.obs.iter().map(|o| o.df_deta[2]));
     check_vs_production(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
     check_hessian_vs_production_fd(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
     check_inner_outer_eta_parity(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
@@ -12691,13 +12718,14 @@ fn ode_wider_than_static_walk_iov_matches_predict_iov() {
     subj.dose_occasions = vec![1, 2];
     let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
     assert_eq!(groups.len(), 2, "fixture must have two κ occasion groups");
-    let stacked = vec![0.1, -0.05, 0.06, -0.04];
+    let stacked = vec![0.1, -0.05, 0.08, 0.06, -0.04];
     assert_eq!(stacked.len(), model.n_eta + groups.len() * model.n_kappa);
 
     let sens = ode_subject_sensitivities_iov(&model, &subj, &WIDE_THETA, &stacked)
         .expect("#1661: a too-wide ODE IOV model must be analytic");
     let grad = ode_subject_eta_grad_iov(&model, &subj, &WIDE_THETA, &stacked)
         .expect("#1661: the IOV inner gradient must be analytic too");
+    assert_overflow_row_is_live(sens.obs.iter().map(|o| o.df_deta[2]));
 
     let pred = |th: &[f64], st: &[f64], j: usize| -> f64 {
         let eta_bsv = st[..model.n_eta].to_vec();
