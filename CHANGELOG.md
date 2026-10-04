@@ -127,6 +127,15 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **An additive ETA with more than one other term keeps its SD row** (#1656, #1662). An ETA was
+  additive only as exactly `THETA + ETA`, so `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, or
+  `E0 = TVE0 + B_FLARE * FLARE + ETA_E0`, classified as custom and printed neither `SD` nor
+  `CV%`. ETAs are now classified the way kappas are: by where the ETA sits, followed through an
+  intermediate variable to where it is used (`ECL = ETA_CL`, `CL = TVCL * exp(ECL)` is
+  log-normal). An ETA beside a second one in `exp(...)`, which used to get no row at all, now
+  gets one. The walk stops at a variable a block reads as a parameter — `[structural_model]`,
+  `[odes]`, `[scaling]`, `[initial_conditions]` or an endpoint block — and no longer at one only
+  `[derived]` reports, for ETAs and kappas alike. Labels only; estimates are unchanged.
 - **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
   model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
   so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read
