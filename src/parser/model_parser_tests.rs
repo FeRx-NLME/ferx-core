@@ -28000,3 +28000,43 @@ fn an_expit_kappa_is_logit() {
     );
     assert_eq!(m.kappa_param_types, [crate::types::EtaParamType::Logit]);
 }
+
+/// #1621 T2. A `LevelContrast` serializes as its DSL token — the spelling
+/// `contrast = ...` takes and `label()` returns, and the one ferx-r's
+/// `level_contrast_token` writes into a `.fitrx` — and reads back from it.
+/// The `match` is exhaustive, so a new variant cannot skip this test.
+///
+/// Mutation — replace the per-variant renames with
+/// `#[serde(rename_all = "snake_case")]`: `Unconstrained` serializes as
+/// `"unconstrained"`, not `"none"`, and both the token assertion and the
+/// refusal of `"unconstrained"` on read die.
+#[test]
+fn level_contrast_serializes_as_its_dsl_token() {
+    for c in [
+        LevelContrast::Auto,
+        LevelContrast::SumToZero,
+        LevelContrast::SumToZeroWithin,
+        LevelContrast::Ref,
+        LevelContrast::Unconstrained,
+    ] {
+        let token = match c {
+            LevelContrast::Auto => "auto",
+            LevelContrast::SumToZero => "sum_to_zero",
+            LevelContrast::SumToZeroWithin => "sum_to_zero_within",
+            LevelContrast::Ref => "ref",
+            LevelContrast::Unconstrained => "none",
+        };
+        assert_eq!(c.label(), token);
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, format!("\"{token}\""));
+        let back: LevelContrast = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+    }
+    // No alias on read: only the DSL token names a contrast.
+    for alias in ["\"unconstrained\"", "\"Unconstrained\"", "\"SumToZero\""] {
+        assert!(
+            serde_json::from_str::<LevelContrast>(alias).is_err(),
+            "{alias} must not read"
+        );
+    }
+}

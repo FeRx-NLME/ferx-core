@@ -195,6 +195,55 @@ fn json_round_trip_matches_the_fit_result() {
     }
 }
 
+/// #1621 T5. `fit.json` (`--output-format json`) carries the fit's data-derived
+/// bindings, and the same `serde_json::from_str::<FitResult>` the `.json` arm of
+/// `read_fit_estimates` uses gives them back exactly.
+///
+/// Mutations — `#[serde(skip)]` on `FitResult::data_bindings`: the key is never
+/// written, the read defaults it to empty, and this dies. Drop its
+/// `skip_serializing_if` (review round 1, finding 2): a plain fit's JSON gains
+/// an empty `data_bindings` object and the first assertion dies.
+#[test]
+fn json_round_trip_carries_the_data_bindings() {
+    use crate::parser::model_parser::{DataBindings, LevelBinding, LevelContrast};
+    let mut fit = fit_with_iov();
+    // A fit with no data-derived binding writes the JSON it wrote before #1621.
+    assert!(fit.data_bindings.is_empty());
+    assert!(
+        fit.to_json_value().get("data_bindings").is_none(),
+        "an empty binding must not change a plain fit's JSON"
+    );
+    let mut b = DataBindings::default();
+    b.levels.insert(
+        "PLACEBO".into(),
+        LevelBinding {
+            labels: vec!["STUDY=1".into(), "STUDY=2".into(), "STUDY=3".into()],
+            groups: vec![0, 0, 0],
+            contrast: LevelContrast::SumToZero,
+        },
+    );
+    b.covariate_stats.insert(
+        "WT".into(),
+        crate::types::CovariateSummary {
+            median: 71.475,
+            mean: 215.2 / 3.0,
+            min: 55.55,
+            max: 90.2,
+            mode: 55.55,
+            levels: vec![55.55, 71.475, 90.2],
+        },
+    );
+    fit.data_bindings = b.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run-fit.json");
+    crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let back: FitResult = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.data_bindings, b);
+    assert!(read_fit_estimates(&path).is_ok());
+}
+
 #[test]
 fn fitrx_round_trip_matches_the_fit_result() {
     let mut fit = fit_with_iov();

@@ -233,6 +233,39 @@ verbatim as the caller supplied them (no canonicalisation), and the hashes are
 SHA-256 hex digests of the raw file bytes. They round-trip on save/load and
 are used by `run_sir` to refuse running against modified source files.
 
+### `data_bindings`
+
+The data-derived bindings the fitted model was compiled from
+(`FitResult::data_bindings`, [#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)):
+each `theta NAME[COL, ...]` level block's observed levels, and the summary
+statistics behind a symbolic `[covariate_model]` centre such as
+`center = median`. Rebuilding the fitted model on other data (a simulation
+design, a reloaded fit) needs these values, not ones re-resolved from that
+data. Both maps are keyed by name in sorted order:
+
+```json
+"data_bindings": {
+  "levels": {
+    "PLACEBO": {
+      "labels": ["STUDY=1", "STUDY=2", "STUDY=3"],
+      "groups": [0, 0, 0],
+      "contrast": "sum_to_zero"
+    }
+  },
+  "covariate_stats": {
+    "WT": { "median": 71.475, "mean": 71.73333333333332, "min": 55.55,
+            "max": 90.2, "mode": 55.55, "levels": [55.55, 61.3, 70.85, 72.1, 80.4, 90.2] }
+  }
+}
+```
+
+`contrast` is the DSL token: `"sum_to_zero"`, `"sum_to_zero_within"`, `"ref"` or
+`"none"` (`"auto"` is accepted on read, as sum-to-zero). `groups` is parallel to
+`labels`. Floats are written exactly, so a reloaded binding is bit-identical.
+The key is absent when the model has no data-derived binding, and on a bundle
+saved before #1621; both load with empty bindings. Edited bindings that list a
+level twice are refused when a design is bound against them.
+
 ## `ebes.csv`
 
 ```

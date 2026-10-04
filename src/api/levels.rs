@@ -103,7 +103,8 @@ pub fn bind_theta_levels(
 /// with θ for the levels it discovers (the model's `default_params`, for example).
 ///
 /// Also refused: `fitted` lacking a block the model declares, or carrying one it does
-/// not. Nothing is written to `population` unless every block binds.
+/// not, or listing a level of a block more than once. Nothing is written to `population`
+/// unless every block binds.
 pub fn bind_theta_levels_from_fit(
     parsed: &mut ParsedModel,
     model_text: &str,
@@ -153,6 +154,10 @@ pub fn bind_theta_levels_from_fit(
                 binding.groups.len()
             ));
         }
+        let repeated = repeated_labels(&binding.labels);
+        if !repeated.is_empty() {
+            return Err(repeated_labels_message(decl, &repeated));
+        }
         let mut table = Vec::new();
         let mut unseen = Vec::new();
         for level in discover_levels(decl, population)? {
@@ -177,6 +182,40 @@ pub fn bind_theta_levels_from_fit(
     parsed.model = rebound.model;
     parsed.model.name = model_name;
     Ok(())
+}
+
+/// Each label that occurs more than once in `labels`, once, in order of first
+/// occurrence.
+fn repeated_labels(labels: &[String]) -> Vec<&str> {
+    let mut repeated: Vec<&str> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        if labels[..i].contains(label) && !repeated.contains(&label.as_str()) {
+            repeated.push(label);
+        }
+    }
+    repeated
+}
+
+/// The refusal for a fitted binding that lists a level more than once (#1621).
+/// A `.fitrx` bundle carries its bindings as data a caller can edit, and a
+/// repeated label otherwise binds: the re-parse lays out one θ per *label*, so
+/// the model grows a θ the fit never had and the design reads the first copy.
+/// The fault is in the bindings, not the design, so the message says nothing
+/// about the design's levels.
+fn repeated_labels_message(decl: &LevelBlockDecl, repeated: &[&str]) -> String {
+    format!(
+        "theta {}[{}]: the fit's level bindings list {} level(s) more than once: {}. \
+         Each level has exactly one fitted theta, so the bindings are malformed — they \
+         are not the ones the fit recorded.",
+        decl.name(),
+        decl.columns().join(", "),
+        repeated.len(),
+        repeated
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// The refusal for design levels the fit never observed. Every label is listed — a
