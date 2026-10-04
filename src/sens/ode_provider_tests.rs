@@ -13088,3 +13088,43 @@ fn ode_kappa_only_iov_model_stays_analytic() {
         }
     }
 }
+
+/// A wide model with θ but no η: the outer gradient is analytic on the event walk, and
+/// with no random effects there is no inner gradient at all, so the fit must not warn that
+/// subjects fall back to finite differences. Pins the wide trigger against a narrowing to
+/// `n_eta > 0`, which would send this model's outer gradient to FD.
+#[test]
+fn ode_wide_theta_only_model_is_analytic_without_an_fd_warning() {
+    let src = WIDE_ODE_TEMPLATE
+        .replace("__IMAX_DECL__", "IMAX = 0.8")
+        .replace("__IMAX__", "IMAX")
+        .replace("__KAPPA__", "")
+        .replace("__KAPPA_TERM__", "")
+        .replace("__IOV_OPT__", "")
+        .replace("  omega ETA_CL   ~ 0.15\n", "")
+        .replace("  omega ETA_KOUT ~ 0.10\n", "")
+        .replace("  omega ETA_GAM  ~ 0.05\n", "")
+        .replace(" * exp(ETA_CL )", "")
+        .replace(" * exp(ETA_KOUT)", "")
+        .replace(" * exp(ETA_GAM)", "");
+    let model = parse_model_string(&src).expect("parse θ-only wide model");
+    assert_eq!(model.n_eta, 0, "fixture must carry no η");
+    assert!(model.pk_indices.len() > MAX_ODE_SENS_DIM);
+    let subject = wide_ode_subject();
+    assert!(ode_analytical_supported(&model));
+    assert!(ode_tvcov_supported(&model, &subject));
+    check_vs_production(&model, &subject, &WIDE_THETA, &[]);
+    let pop = crate::types::Population {
+        subjects: vec![subject],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    assert_eq!(
+        crate::estimation::inner_optimizer::fd_fallback_warning(&model, &pop, &WIDE_THETA),
+        None,
+        "an η-free model has no inner gradient to fall back from"
+    );
+}
