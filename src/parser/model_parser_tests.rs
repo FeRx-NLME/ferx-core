@@ -27739,3 +27739,264 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
     );
     assert_eq!(ode_level_block_read("H0 * exp(B * central)").unwrap(), None);
 }
+
+// ── #1643: kappa scale classification ────────────────────────────────────────
+
+/// A model declaring kappas `kappas` and the given `[individual_parameters]`.
+fn kappa_scale_model(kappas: &[&str], indiv: &str) -> CompiledModel {
+    let decls: String = kappas
+        .iter()
+        .map(|k| format!("  kappa {k} ~ 0.04\n"))
+        .collect();
+    let src = format!(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n{decls}  sigma EPS ~ 0.01\n\n\
+         [individual_parameters]\n{indiv}\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n"
+    );
+    parse_model_string(&src).unwrap_or_else(|e| panic!("parse failed: {e}\n{src}"))
+}
+
+/// T1: each leaf position maps to its scale, one kappa per shape, so a wrong
+/// arm of the walk names the shape that died.
+#[test]
+fn kappa_param_types_follow_the_leaf_position() {
+    use crate::types::EtaParamType::*;
+    let kappas = [
+        "K_EXP",
+        "K_BARE_EXP",
+        "K_ADD",
+        "K_ADD4",
+        "K_SUB",
+        "K_NEG",
+        "K_LOGIT",
+        "K_MUL",
+        "K_MIXED",
+        "K_UNUSED",
+        "K_IF",
+        "K_ELSE",
+        "K_COND",
+        "K_FN",
+    ];
+    let m = kappa_scale_model(
+        &kappas,
+        "  CL = TVCL * exp(ETA_CL + K_EXP)\n  \
+         V = TVV * exp(ETA_V)\n  \
+         A2 = exp(K_BARE_EXP)\n  \
+         A3 = TVV + ETA_V + K_ADD\n  \
+         A4 = TVV + TVCL + ETA_V + K_ADD4\n  \
+         A5 = TVV - K_SUB\n  \
+         A6 = -K_NEG + TVV\n  \
+         A7 = inv_logit(TVCL + ETA_V + K_LOGIT)\n  \
+         A8 = (TVV + K_MUL) * TVCL\n  \
+         A9 = TVCL * exp(K_MIXED)\n  \
+         A10 = TVV + K_MIXED\n  \
+         A12 = if (WT > 70) TVCL * exp(K_COND) else TVCL\n  \
+         A13 = TVV + log(K_FN + 2)\n  \
+         if (WT > 70) {\n    A11 = TVV + K_IF\n  } else {\n    A11 = TVCL * exp(K_ELSE)\n  }",
+    );
+    let expected = [
+        LogNormal, LogNormal, Additive, Additive, Additive, Additive, Logit, Custom, Custom,
+        Custom, Additive, LogNormal, LogNormal, Custom,
+    ];
+    assert_eq!(m.kappa_names, kappas);
+    assert_eq!(m.kappa_param_types.len(), m.kappa_names.len());
+    for (k, (name, want)) in kappas.iter().zip(expected).enumerate() {
+        assert_eq!(m.kappa_param_types[k], want, "kappa {name}");
+    }
+}
+
+/// T2: the field is parallel to `kappa_names` (declaration order), not to the
+/// order the statements first read the kappas in — `eta_param_info` is in
+/// statement order, and a kappa field must not copy that shape (#1643 §0e).
+#[test]
+fn kappa_param_types_are_parallel_to_kappa_names_not_statement_order() {
+    use crate::types::EtaParamType::*;
+    let m = kappa_scale_model(
+        &["K_B", "K_A"],
+        "  CL = TVCL * exp(ETA_CL + K_A)\n  V = TVV + ETA_V + K_B",
+    );
+    assert_eq!(m.kappa_names, ["K_B", "K_A"]);
+    assert_eq!(m.kappa_param_types, [Additive, LogNormal]);
+}
+
+/// T3: the kappa walk and the ETA pattern classifier are two implementations
+/// of one question. Run the walk on every ETA leaf of every example model and
+/// require it to agree with `eta_param_info` wherever that names a scale.
+#[test]
+fn kappa_scale_walk_agrees_with_eta_patterns() {
+    use crate::types::EtaParamType::*;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut compared = std::collections::HashMap::<String, usize>::new();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let Ok(m) = parse_model_string(&text) else {
+            continue;
+        };
+        // The raw `[individual_parameters]` block, re-parsed the way the parser does.
+        let mut lines = Vec::new();
+        let mut inside = false;
+        for l in text.lines() {
+            let t = l.split('#').next().unwrap().trim();
+            if t.starts_with('[') {
+                inside = t == "[individual_parameters]";
+                continue;
+            }
+            if inside && !t.is_empty() {
+                lines.push(t.to_string());
+            }
+        }
+        let indiv = lines.join("\n");
+        let etas: Vec<String> = m.eta_names.iter().chain(&m.kappa_names).cloned().collect();
+        let Ok(pre) = parse_block_statements(
+            &indiv,
+            ParseCtx::new(&m.theta_names, &etas, &[]),
+            StatementMode::Plain,
+        ) else {
+            continue;
+        };
+        let assigned = assigned_vars_in_order(&pre);
+        let Ok(stmts) = parse_block_statements(
+            &indiv,
+            ParseCtx::new(&m.theta_names, &etas, &assigned),
+            StatementMode::Plain,
+        ) else {
+            continue;
+        };
+        for info in &m.eta_param_info {
+            let want = match info.param_type {
+                LogNormal => LogNormal,
+                Additive => Additive,
+                Logit | LogitProbability => Logit,
+                Custom => continue,
+            };
+            let slot = m
+                .eta_names
+                .iter()
+                .position(|n| *n == info.eta_name)
+                .unwrap();
+            let mut got = Vec::new();
+            for s in &stmts {
+                if let Statement::Assign(n, e) = s {
+                    if *n == info.individual_param_name {
+                        super::classify_kappa_scale(e, slot, &mut got);
+                    }
+                }
+            }
+            if got.is_empty() {
+                continue; // assigned only inside an if, or by a desugared block
+            }
+            assert!(
+                got.iter().all(|&t| t == want),
+                "{}: {} in {} — ETA pattern says {want:?}, leaf walk says {got:?}",
+                path.display(),
+                info.eta_name,
+                info.individual_param_name
+            );
+            *compared.entry(format!("{want:?}")).or_default() += 1;
+        }
+    }
+    // Non-vacuous: both kinds the walk most often decides were actually compared.
+    assert!(
+        compared.get("LogNormal").copied().unwrap_or(0) >= 1,
+        "{compared:?}"
+    );
+    assert!(
+        compared.get("Additive").copied().unwrap_or(0) >= 1,
+        "{compared:?}"
+    );
+}
+
+/// The issue's own shape: a sample-size-weighted additive kappa (#1031) in an
+/// MBMA baseline. The weight rewrites the leaf to `K / sqrt(W)`, so the kappa
+/// must be classified on what the user wrote, before that rewrite — after it,
+/// every weighted kappa reads as `Custom`.
+#[test]
+fn a_weighted_kappa_is_classified_before_the_weight_rewrite() {
+    use crate::types::EtaParamType::*;
+    let src =
+        "[parameters]\n  theta TVE0(1.0, -100.0, 100.0)\n  theta PLACEBO(0.5, -100.0, 100.0)\n  \
+               omega ETA_E0 ~ 0.1\n  kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM\n  \
+               kappa KAPPA_LN ~ 0.04 weight = NARM\n  sigma ADD ~ 0.1\n\n\
+               [individual_parameters]\n  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM\n  \
+               SLOPE = PLACEBO * exp(KAPPA_LN)\n\n\
+               [structural_model]\n  y = BASE + SLOPE * TIME\n\n\
+               [error_model]\n  DV ~ additive(ADD)\n";
+    let m = parse_model_string(src).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        m.kappa_weights.iter().all(Option::is_some),
+        "fixture must declare both kappas weighted: {:?}",
+        m.kappa_weights
+    );
+    assert_eq!(m.kappa_param_types, [Additive, LogNormal]);
+}
+
+/// #1659 review finding 1: a kappa that reaches its parameter through an
+/// intermediate variable takes the scale of the variable's use, not `Additive`
+/// for the intermediate's own root. Row 1 is the NONMEM IOV idiom
+/// (`IOVCL = KAPPA`, then `exp(ETA + IOVCL)`); rows 2–3 put the ETA in the
+/// intermediate too. A variable the structural model reads (`V`) is a parameter
+/// in its own right and stops the walk even though `K10` also reads it.
+#[test]
+fn a_kappa_through_an_intermediate_takes_the_scale_of_its_use() {
+    use crate::types::EtaParamType::*;
+    let cases: [(&str, &str, crate::types::EtaParamType); 7] = [
+        (
+            "nonmem idiom",
+            "  IOVCL = K\n  CL = TVCL * exp(ETA_CL + IOVCL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "eta and kappa in the intermediate",
+            "  ECL = ETA_CL + K\n  CL = TVCL * exp(ECL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "mu-referenced log intermediate",
+            "  LCL = log(TVCL) + ETA_CL + K\n  CL = exp(LCL)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "two hops",
+            "  A = K\n  B = ETA_CL + A\n  CL = TVCL * exp(B)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "readers disagree",
+            "  A = K\n  CL = TVCL * exp(ETA_CL + A)\n  V = TVV + ETA_V + A",
+            Custom,
+        ),
+        (
+            "reassigned intermediate reads itself",
+            "  A = K\n  A = A + 0\n  CL = TVCL * exp(ETA_CL + A)\n  V = TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "structural parameter stops the walk",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV + ETA_V + K\n  K10 = CL / V",
+            Additive,
+        ),
+    ];
+    for (label, indiv, want) in cases {
+        let m = kappa_scale_model(&["K"], indiv);
+        assert_eq!(m.kappa_param_types, [want], "{label}");
+    }
+}
+
+/// #1659 review finding 2: `expit` is the `inv_logit` alias and must classify
+/// the same way.
+#[test]
+fn an_expit_kappa_is_logit() {
+    let m = kappa_scale_model(
+        &["K"],
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  P = expit(TVCL + ETA_V + K)",
+    );
+    assert_eq!(m.kappa_param_types, [crate::types::EtaParamType::Logit]);
+}

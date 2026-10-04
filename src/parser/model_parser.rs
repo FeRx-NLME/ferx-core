@@ -2058,6 +2058,184 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Classify every IOV kappa by the scale it enters its individual parameter on
+/// (#1643). Returns one entry per kappa, **parallel to `kappa_names`**, so a
+/// consumer indexes it by kappa slot and never by statement order.
+///
+/// This is a different classifier from [`classify_indiv_params`] on purpose.
+/// The ETA classifier matches whole-expression patterns (`TVCL * exp(ETA)`,
+/// `THETA + ETA`, ...) because it also has to name the linked θ and its
+/// transform; a kappa needs only its scale, and it almost always shares the
+/// expression with an ETA (`exp(ETA_CL + KAPPA_CL)`, `TVV + ETA_V + KAPPA_V`),
+/// which no ETA pattern admits. So a kappa is classified by **where its leaf
+/// sits** ([`leaf_scales`]). Where both classifiers answer, they must agree;
+/// `kappa_scale_walk_agrees_with_eta_patterns` pins that.
+///
+/// A kappa that only `+`/`-` separate from the root of its assignment takes the
+/// scale of that assignment's **use**: a variable another block reads
+/// (`structural`, the upper-cased identifiers of `[structural_model]`, `[odes]`,
+/// `[scaling]`, `[derived]`) or that nothing else reads is a parameter, and the
+/// kappa is `Additive` on it; an intermediate that later statements read
+/// (`IOVCL = KAPPA_CL`, then `CL = TVCL * exp(ETA_CL + IOVCL)` — the NONMEM IOV
+/// idiom) is followed into those statements with the same walk (#1659 review).
+///
+/// A kappa referenced in several places takes their common type; any
+/// disagreement, and a kappa nothing reads, is `Custom`.
+fn classify_kappa_params(
+    stmts: &[Statement],
+    n_eta: usize,
+    kappa_names: &[String],
+    structural: &HashSet<String>,
+) -> Vec<crate::types::EtaParamType> {
+    use crate::types::EtaParamType;
+
+    // Every assignment, top level and inside `if` branches, in statement order.
+    // No synthetic-parameter skip, unlike `classify_indiv_params`: a readout may
+    // not read a kappa (#107), so no `__ferx_ro_*` mirror holds one, and a
+    // `__ferx_pktime_*` line is a bare `TIME`.
+    fn flatten<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(lhs, expr) => out.push((lhs, expr)),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        flatten(body, out);
+                    }
+                    if let Some(body) = else_body {
+                        flatten(body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The scale(s) of a leaf that reached the root of the assignment to `var`.
+    fn root_scale(
+        var: &str,
+        assigns: &[(&str, &Expression)],
+        structural: &HashSet<String>,
+        visiting: &[&str],
+        out: &mut Vec<EtaParamType>,
+    ) {
+        let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
+        let readers: Vec<(&str, Vec<Option<EtaParamType>>)> = assigns
+            .iter()
+            .filter(|(lhs, _)| !visiting.contains(lhs))
+            .map(|(lhs, e)| (*lhs, leaf_scales(e, &is_var)))
+            .filter(|(_, scales)| !scales.is_empty())
+            .collect();
+        if structural.contains(&var.to_ascii_uppercase()) || readers.is_empty() {
+            out.push(EtaParamType::Additive);
+            return;
+        }
+        // The variables already on this path: a reassignment (`A = A + 1`) reads
+        // its own left-hand side and would otherwise recurse forever.
+        let path: Vec<&str> = visiting.iter().copied().chain([var]).collect();
+        for (lhs, scales) in readers {
+            for s in scales {
+                match s {
+                    Some(t) => out.push(t),
+                    None => root_scale(lhs, assigns, structural, &path, out),
+                }
+            }
+        }
+    }
+
+    let mut assigns = Vec::new();
+    flatten(stmts, &mut assigns);
+    (0..kappa_names.len())
+        .map(|k| {
+            let slot = n_eta + k;
+            let is_kappa = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
+            let mut seen = Vec::new();
+            for (lhs, expr) in &assigns {
+                for s in leaf_scales(expr, &is_kappa) {
+                    match s {
+                        Some(t) => seen.push(t),
+                        None => root_scale(lhs, &assigns, structural, &[], &mut seen),
+                    }
+                }
+            }
+            match seen.split_first() {
+                Some((first, rest)) if rest.iter().all(|t| t == first) => *first,
+                _ => EtaParamType::Custom,
+            }
+        })
+        .collect()
+}
+
+/// Push the scale of every occurrence of `Eta(slot)` in `expr` onto `out`,
+/// counting the assignment root as `Additive` (see [`leaf_scales`]).
+#[cfg(test)]
+fn classify_kappa_scale(expr: &Expression, slot: usize, out: &mut Vec<crate::types::EtaParamType>) {
+    let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
+    out.extend(
+        leaf_scales(expr, &is_eta)
+            .into_iter()
+            .map(|s| s.unwrap_or(crate::types::EtaParamType::Additive)),
+    );
+}
+
+/// The scale of every leaf of `expr` that `is_leaf` picks out.
+///
+/// Walking up from the leaf through `+`, `-` and unary minus (`0 - x`), the
+/// first other ancestor decides: `exp` → `LogNormal`, `inv_logit`/`expit` →
+/// `Logit`, anything else (`*`, `/`, `^`, another function) → `Custom`; `None`
+/// when the walk reaches the root, which the caller resolves. An inline `if` is
+/// transparent; a leaf in a condition or a gather index is not a scale position
+/// and is not counted.
+fn leaf_scales(
+    expr: &Expression,
+    is_leaf: &dyn Fn(&Expression) -> bool,
+) -> Vec<Option<crate::types::EtaParamType>> {
+    use crate::types::EtaParamType;
+
+    fn walk(
+        e: &Expression,
+        is_leaf: &dyn Fn(&Expression) -> bool,
+        scale: Option<EtaParamType>,
+        out: &mut Vec<Option<EtaParamType>>,
+    ) {
+        if is_leaf(e) {
+            out.push(scale);
+            return;
+        }
+        match e {
+            Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
+                walk(l, is_leaf, scale, out);
+                walk(r, is_leaf, scale, out);
+            }
+            Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                walk(l, is_leaf, Some(EtaParamType::Custom), out);
+                walk(r, is_leaf, Some(EtaParamType::Custom), out);
+            }
+            Expression::UnaryFn(name, a) => {
+                let t = match name.as_str() {
+                    "exp" => EtaParamType::LogNormal,
+                    "inv_logit" | "expit" => EtaParamType::Logit,
+                    _ => EtaParamType::Custom,
+                };
+                walk(a, is_leaf, Some(t), out);
+            }
+            // Transparent, like a statement-level `if`: each value branch keeps
+            // the scale above it, and a leaf read only in the condition is not
+            // a scale position at all.
+            Expression::Conditional(_, t, f) => {
+                walk(t, is_leaf, scale, out);
+                walk(f, is_leaf, scale, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, is_leaf, None, &mut out);
+    out
+}
+
 /// Apply a recognised `ExprClass` to the output vectors.
 fn apply_class(
     c: ExprClass,
@@ -2708,6 +2886,12 @@ pub fn parse_full_model_with(
         .enumerate()
         .filter_map(|(k, w)| w.as_ref().map(|w| (n_eta + k, w.clone())))
         .collect();
+    // Kappas by position of their leaf, parallel to `kappa_names` (#1643). Taken
+    // before `rewrite_weighted_kappas` turns a weighted `K` into `K / sqrt(W)`:
+    // the scale is the one the user wrote, and after the rewrite every weighted
+    // kappa's nearest ancestor would be that `/`, i.e. `Custom`.
+    let kappa_param_types =
+        classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &downstream_refs);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
         // *unweighted* κ — a plausible wrong answer rather than an error, which
@@ -3884,6 +4068,7 @@ pub fn parse_full_model_with(
         parse_warnings: Vec::new(), // populated below
         has_conditional_eta_params: false,
         eta_param_info,
+        kappa_param_types,
         theta_transform,
         theta_eta_linked,
         scaling: ScalingSpec::None,

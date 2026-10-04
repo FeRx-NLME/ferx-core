@@ -2612,6 +2612,7 @@ pub ferx_core::types::CompiledModel::indiv_param_partials: ferx_core::parser::mo
 pub ferx_core::types::CompiledModel::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::CompiledModel::kappa_mu_refs: std::collections::hash::map::HashMap<alloc::string::String, ferx_core::MuRef>
 pub ferx_core::types::CompiledModel::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CompiledModel::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::types::CompiledModel::kappa_weights: alloc::vec::Vec<core::option::Option<ferx_core::KappaWeight>>
 pub ferx_core::types::CompiledModel::log_transform: bool
 pub ferx_core::types::CompiledModel::mixture: core::option::Option<ferx_core::MixtureSpec>
@@ -3027,6 +3028,7 @@ pub ferx_core::types::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_is_diagonal: core::option::Option<bool>
 pub ferx_core::types::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::types::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::types::FitResult::kappa_weights: alloc::vec::Vec<core::option::Option<alloc::string::String>>
 pub ferx_core::types::FitResult::left_init: core::option::Option<bool>
@@ -4013,6 +4015,7 @@ pub ferx_core::CompiledModel::indiv_param_partials: ferx_core::parser::model_par
 pub ferx_core::CompiledModel::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::CompiledModel::kappa_mu_refs: std::collections::hash::map::HashMap<alloc::string::String, ferx_core::MuRef>
 pub ferx_core::CompiledModel::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CompiledModel::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::CompiledModel::kappa_weights: alloc::vec::Vec<core::option::Option<ferx_core::KappaWeight>>
 pub ferx_core::CompiledModel::log_transform: bool
 pub ferx_core::CompiledModel::mixture: core::option::Option<ferx_core::MixtureSpec>
@@ -4481,6 +4484,7 @@ pub ferx_core::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_is_diagonal: core::option::Option<bool>
 pub ferx_core::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::FitResult::kappa_weights: alloc::vec::Vec<core::option::Option<alloc::string::String>>
 pub ferx_core::FitResult::left_init: core::option::Option<bool>

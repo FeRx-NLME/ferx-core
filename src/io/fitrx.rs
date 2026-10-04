@@ -326,6 +326,12 @@ struct IovWire {
     kappa_weights: Vec<Option<String>>,
     #[serde(default)]
     kappa_weight_typical: Vec<Option<f64>>,
+    /// Scale of each kappa, parallel to `kappa_names`, spelled as
+    /// `eta_param_info`'s `param_type` (#1643). Defaulted so a bundle written
+    /// before #1643 still reads; it loads as empty, and the printers then fall
+    /// back to the log-normal CV%.
+    #[serde(default)]
+    kappa_param_types: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -701,6 +707,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             kappa_init_as_sd: r.kappa_init_as_sd.clone(),
             kappa_weights: r.kappa_weights.clone(),
             kappa_weight_typical: r.kappa_weight_typical.clone(),
+            kappa_param_types: r
+                .kappa_param_types
+                .iter()
+                .map(|&t| eta_param_type_to_str(t).into())
+                .collect(),
         }),
         eta_param_info: r
             .eta_param_info
@@ -1757,6 +1768,13 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
                 n_kappa
             ));
         }
+        if !iov.kappa_param_types.is_empty() && iov.kappa_param_types.len() != n_kappa {
+            return bail(format!(
+                "iov.kappa_param_types ({}) does not match iov.kappa_names ({})",
+                iov.kappa_param_types.len(),
+                n_kappa
+            ));
+        }
     }
     Ok(())
 }
@@ -1820,6 +1838,7 @@ fn wire_to_fit_result(
         kappa_init_as_sd,
         kappa_weights,
         kappa_weight_typical,
+        kappa_param_types,
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -1843,6 +1862,10 @@ fn wire_to_fit_result(
                 init_as_sd,
                 iov.kappa_weights,
                 iov.kappa_weight_typical,
+                iov.kappa_param_types
+                    .iter()
+                    .map(|t| eta_param_type_from_str(t))
+                    .collect::<Result<Vec<_>, _>>()?,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
                 iov.shrinkage_kappa_by_occ,
@@ -1853,6 +1876,7 @@ fn wire_to_fit_result(
         }
         None => (
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2015,6 +2039,7 @@ fn wire_to_fit_result(
         ferx_version: w.ferx_version,
         environment: w.environment.unwrap_or_default(),
         eta_param_info,
+        kappa_param_types,
         theta_transform,
         sigma_types,
         cov_eigenvalues: w.cov_eigenvalues,
@@ -2904,6 +2929,58 @@ mod tests {
         let loaded = load_fit(&path).unwrap();
         assert_eq!(loaded.fit.kappa_weights, vec![Some("NARM".to_string())]);
         assert_eq!(loaded.fit.kappa_weight_typical, vec![Some(200.0)]);
+    }
+
+    /// #1643: each kappa's scale rides the bundle, by kappa index, so a reloaded
+    /// fit still prints an SD for an additive kappa. Two kappas of different
+    /// types, so a wire that dropped or reordered the field fails here.
+    #[test]
+    fn roundtrip_kappa_param_types() {
+        use crate::types::EtaParamType::{Additive, LogNormal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kappa_types.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[156.0, 0.0, 0.0, 0.05]));
+        r.kappa_names = vec!["KAPPA_ARM".into(), "KAPPA_CL".into()];
+        r.kappa_fixed = vec![false, false];
+        r.shrinkage_kappa = vec![0.1, 0.1];
+        r.kappa_param_types = vec![Additive, LogNormal];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.kappa_param_types, vec![Additive, LogNormal]);
+    }
+
+    /// A bundle saved before #1643 has no `kappa_param_types` key: it still loads,
+    /// with the field empty (the printers then fall back to the CV% they always
+    /// printed). A present key of the wrong length is corrupt, not misaligned.
+    #[test]
+    fn fit_wire_missing_kappa_param_types_loads_empty() {
+        use crate::types::EtaParamType::Additive;
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[4.0]));
+        r.kappa_names = vec!["KAPPA_ARM".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        r.kappa_param_types = vec![Additive];
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        let iov = value["iov"].as_object_mut().unwrap();
+        assert!(
+            iov.remove("kappa_param_types").is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value.clone()).unwrap();
+        assert!(validate_parallel_lengths(&reloaded).is_ok());
+        assert!(reloaded.iov.as_ref().unwrap().kappa_param_types.is_empty());
+
+        value["iov"]["kappa_param_types"] = serde_json::json!(["additive", "log_normal"]);
+        let bad: FitWire = serde_json::from_value(value).unwrap();
+        let err = validate_parallel_lengths(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("iov.kappa_param_types (2) does not match iov.kappa_names (1)"),
+            "{err}"
+        );
     }
 
     #[test]
