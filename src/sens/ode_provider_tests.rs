@@ -13003,3 +13003,88 @@ fn ode_widest_parsable_iov_model_matches_predict_iov() {
         }
     }
 }
+
+/// The zero-axis decline is on `θ + η` together: a model with η but no θ, and an IOV model
+/// whose only random effect is a κ, both still have axes to seed and must stay analytic. A
+/// narrower rewrite of the condition (`n_theta > 0`, or copying it into
+/// `ode_iov_supported`, where `n_eta` can be 0) would decline them silently.
+const ONE_AXIS_KIND_ODE: &str = r#"
+[parameters]
+  __THETA__
+  __OMEGA__
+  __KAPPA__
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = 4.0 * exp(__CL_RE__)
+  V  = 12.0
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  __IOV_OPT__
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn ode_eta_only_model_stays_analytic() {
+    let src = ONE_AXIS_KIND_ODE
+        .replace("__THETA__", "")
+        .replace("__OMEGA__", "omega ETA_CL ~ 0.15")
+        .replace("__KAPPA__", "")
+        .replace("__CL_RE__", "ETA_CL")
+        .replace("__IOV_OPT__", "");
+    let model = parse_model_string(&src).expect("parse η-only ODE model");
+    assert_eq!((model.n_theta, model.n_eta), (0, 1));
+    assert!(ode_analytical_supported(&model));
+    let subject = wide_ode_subject();
+    check_vs_production(&model, &subject, &[], &[0.1]);
+    check_inner_outer_eta_parity(&model, &subject, &[], &[0.1]);
+}
+
+#[test]
+fn ode_kappa_only_iov_model_stays_analytic() {
+    let src = ONE_AXIS_KIND_ODE
+        .replace("__THETA__", "")
+        .replace("__OMEGA__", "")
+        .replace("__KAPPA__", "kappa KAPPA_CL ~ 0.02")
+        .replace("__CL_RE__", "KAPPA_CL")
+        .replace("__IOV_OPT__", "iov_column = OCC");
+    let model = parse_model_string(&src).expect("parse κ-only ODE IOV model");
+    assert_eq!((model.n_theta, model.n_eta, model.n_kappa), (0, 0, 1));
+    assert!(
+        ode_iov_supported(&model),
+        "a κ-only ODE IOV model must stay analytic"
+    );
+    let mut subj = wide_ode_subject();
+    subj.occasions = vec![1, 1, 1, 2, 2, 2];
+    subj.dose_occasions = vec![1, 2];
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    let stacked = vec![0.06, -0.04];
+    assert_eq!(stacked.len(), groups.len() * model.n_kappa);
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &[], &stacked).expect("analytic");
+    let pred = |st: &[f64], j: usize| -> f64 {
+        let kappas: Vec<Vec<f64>> = st.iter().map(|&k| vec![k]).collect();
+        crate::pk::predict_iov(&model, &subj, &[], &[], &kappas)[j]
+    };
+    let he = 1e-6;
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(
+            obs.f,
+            pred(&stacked, j),
+            max_relative = 1e-6,
+            epsilon = 1e-9
+        );
+        for k in 0..stacked.len() {
+            let mut sp = stacked.clone();
+            sp[k] += he;
+            let mut sm = stacked.clone();
+            sm[k] -= he;
+            let g = (pred(&sp, j) - pred(&sm, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+}
