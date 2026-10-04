@@ -199,12 +199,20 @@ fn json_round_trip_matches_the_fit_result() {
 /// bindings, and the same `serde_json::from_str::<FitResult>` the `.json` arm of
 /// `read_fit_estimates` uses gives them back exactly.
 ///
-/// Mutation — `#[serde(skip)]` on `FitResult::data_bindings`: the key is never
-/// written, the read defaults it to empty, and this dies.
+/// Mutations — `#[serde(skip)]` on `FitResult::data_bindings`: the key is never
+/// written, the read defaults it to empty, and this dies. Drop its
+/// `skip_serializing_if` (review round 1, finding 2): a plain fit's JSON gains
+/// an empty `data_bindings` object and the first assertion dies.
 #[test]
 fn json_round_trip_carries_the_data_bindings() {
     use crate::parser::model_parser::{DataBindings, LevelBinding, LevelContrast};
     let mut fit = fit_with_iov();
+    // A fit with no data-derived binding writes the JSON it wrote before #1621.
+    assert!(fit.data_bindings.is_empty());
+    assert!(
+        fit.to_json_value().get("data_bindings").is_none(),
+        "an empty binding must not change a plain fit's JSON"
+    );
     let mut b = DataBindings::default();
     b.levels.insert(
         "PLACEBO".into(),
