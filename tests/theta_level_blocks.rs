@@ -1209,19 +1209,24 @@ fn bindings_rows(subjects: &[(usize, f64)]) -> String {
     csv
 }
 
-/// Simulate the design under the fit's bindings `b`: the statistics go into the
-/// re-parse's bindings, then the levels bind from the fit — the from-fit path a
-/// reloaded `.fitrx` takes.
+/// Simulate the design under the fit's bindings `b`, by the sequence
+/// `docs/api/fitting.qmd#simulate-with-fit-theta` documents: the fit's
+/// statistics go into the design's bindings, a re-parse compiles them in, then
+/// the levels bind from the fit — the from-fit path a reloaded `.fitrx` takes.
 fn simulate_design_from(
+    model: &str,
     b: &ferx_core::parser::model_parser::DataBindings,
     design_path: &std::path::Path,
     theta: &[f64],
 ) -> (usize, Vec<f64>) {
     let mut pop =
         ferx_core::io::datareader::read_nonmem_csv(design_path, None, None).expect("design");
-    let mut parsed = ferx_core::parser::model_parser::parse_full_model(BINDINGS_MODEL).unwrap();
+    let mut parsed = ferx_core::parser::model_parser::parse_full_model(model).unwrap();
     parsed.bindings.covariate_stats = b.covariate_stats.clone();
-    ferx_core::api::bind_theta_levels_from_fit(&mut parsed, BINDINGS_MODEL, &mut pop, &b.levels)
+    parsed.model = ferx_core::parser::model_parser::parse_full_model_with(model, &parsed.bindings)
+        .expect("re-parse with the fit's statistics")
+        .model;
+    ferx_core::api::bind_theta_levels_from_fit(&mut parsed, model, &mut pop, &b.levels)
         .expect("bind the design from the fit");
     let mut params = parsed.model.default_params.clone();
     params.theta = theta.to_vec();
@@ -1291,8 +1296,13 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
     theta[3] = 12.0; // TVV
     assert_eq!(result.theta_names[3], "TVV");
 
-    let (n_live, a) = simulate_design_from(live, &design_path, &theta);
-    let (n_loaded, b) = simulate_design_from(&loaded.fit.data_bindings, &design_path, &theta);
+    let (n_live, a) = simulate_design_from(BINDINGS_MODEL, live, &design_path, &theta);
+    let (n_loaded, b) = simulate_design_from(
+        BINDINGS_MODEL,
+        &loaded.fit.data_bindings,
+        &design_path,
+        &theta,
+    );
     assert_eq!((n_live, n_loaded), (5, 5));
     assert_eq!(a.len(), 30);
     assert_eq!(a.len(), b.len());
@@ -1314,7 +1324,7 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
     // Same fitted levels, the design's own WT statistics: the ipred moves.
     let mut mixed = live.clone();
     mixed.covariate_stats = own_b.covariate_stats.clone();
-    let (_, c) = simulate_design_from(&mixed, &design_path, &theta);
+    let (_, c) = simulate_design_from(BINDINGS_MODEL, &mixed, &design_path, &theta);
     let mut worst = 0.0f64;
     for (x, y) in a.iter().zip(&c) {
         assert!(y.is_finite(), "{y}");
@@ -1323,5 +1333,92 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
     assert!(
         worst > 0.2,
         "design-own WT statistics moved ipred by only {worst}"
+    );
+}
+
+/// #1621 review round 1, finding 1: the documented from-fit sequence must also
+/// hold for a model with a symbolic `[covariate_model]` centre and **no** level
+/// block. `bind_theta_levels_from_fit` returns before re-parsing on such a model,
+/// so the fit's statistics reach it only through the documented re-parse.
+///
+/// Both sides of that step in one test: without the re-parse the model stays
+/// statistics-unbound and `simulate` refuses (measured on `e8e27f51`); with it,
+/// the design simulates bit-identically to the fitted model's own compilation
+/// (`bind_covariate_stats` on the fit data), and not like the design's own
+/// statistics (WT median 95.0 against the fit's 71.475).
+///
+/// Mutations — drop the re-parse from `simulate_design_from` and the documented
+/// arm panics on `simulate`; `fit.rs` copying `DataBindings::default()` leaves no
+/// statistics to re-parse with and the same arm dies.
+#[test]
+fn the_documented_from_fit_sequence_binds_statistics_without_a_level_block() {
+    let model = BINDINGS_MODEL
+        .replace("  theta PLACEBO[STUDY](0.0, -10.0, 10.0)\n", "")
+        .replace("CL = TVCL + PLACEBO", "CL = TVCL");
+    let (dir, model_path, data_path) = write_case(&model, &bindings_fit_data());
+    let design_path = dir.path().join("design.csv");
+    std::fs::write(&design_path, bindings_design_data()).unwrap();
+    let opts = ferx_core::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = ferx_core::api::fit_from_files(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+        None,
+        Some(opts),
+    )
+    .expect("fit");
+    assert!(result.data_bindings.levels.is_empty());
+    assert_eq!(result.data_bindings.covariate_stats["WT"].median, 71.475);
+    assert_eq!(result.theta_names, ["TVCL", "TVV", "THETA_V_WT"]);
+    let theta = [2.3, 12.0, 0.65];
+
+    // The other side: the sequence without the re-parse leaves the model unbound.
+    let mut pop =
+        ferx_core::io::datareader::read_nonmem_csv(&design_path, None, None).expect("design");
+    let mut bare = ferx_core::parser::model_parser::parse_full_model(&model).unwrap();
+    bare.bindings.covariate_stats = result.data_bindings.covariate_stats.clone();
+    ferx_core::api::bind_theta_levels_from_fit(&mut bare, &model, &mut pop, &Default::default())
+        .expect("no level block: a no-op");
+    assert!(bare.model.data_bindings().covariate_stats.is_empty());
+    let mut params = bare.model.default_params.clone();
+    params.theta = theta.to_vec();
+    let err = ferx_core::api::simulate_with_seed(&bare.model, &pop, &params, 2, 7).unwrap_err();
+    assert!(err.contains("still need data-derived statistics"), "{err}");
+
+    // The documented sequence.
+    let (n, a) = simulate_design_from(&model, &result.data_bindings, &design_path, &theta);
+    assert_eq!(n, 3);
+
+    // Reference: the fitted model as the fit compiled it, on the design.
+    let mut fit_pop =
+        ferx_core::io::datareader::read_nonmem_csv(&data_path, None, None).expect("fit data");
+    let mut fitted = ferx_core::parser::model_parser::parse_full_model(&model).unwrap();
+    ferx_core::api::bind_theta_levels(&mut fitted, &model, &mut fit_pop).unwrap();
+    ferx_core::api::bind_covariate_stats(&mut fitted, &model, &fit_pop).unwrap();
+    let mut params = fitted.model.default_params.clone();
+    params.theta = theta.to_vec();
+    let want: Vec<f64> = ferx_core::api::simulate_with_seed(&fitted.model, &pop, &params, 2, 7)
+        .expect("reference")
+        .iter()
+        .map(|r| r.ipred)
+        .collect();
+    assert_eq!(a.len(), 30);
+    assert_eq!(a.len(), want.len());
+    for (i, (x, y)) in a.iter().zip(&want).enumerate() {
+        assert!(x.is_finite() && *x > 0.0, "row {i}: {x}");
+        assert_eq!(x.to_bits(), y.to_bits(), "row {i}: {x} vs {y}");
+    }
+    // Not the design's own statistics: those move the ipred.
+    let mut own = ferx_core::parser::model_parser::parse_full_model(&model).unwrap();
+    ferx_core::api::bind_covariate_stats(&mut own, &model, &pop).unwrap();
+    let own_b = own.model.data_bindings().clone();
+    assert_eq!(own_b.covariate_stats["WT"].median, 95.0);
+    let (_, c) = simulate_design_from(&model, &own_b, &design_path, &theta);
+    assert!(
+        a.iter().zip(&c).any(|(x, y)| x.to_bits() != y.to_bits()),
+        "the design's own statistics must give different rows"
     );
 }

@@ -362,6 +362,7 @@ reloads them, so the same code works on `load_fit(path)?.fit`
 ```rust
 use ferx_core::api::read_population_for_simulation;
 use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
+use ferx_core::parser::model_parser::parse_full_model_with;
 
 // Continuing the example above (or with `result = load_fit(path)?.fit`).
 let mut design_parsed = parse_full_model_file(Path::new("model.ferx"))?;
@@ -369,12 +370,22 @@ let (mut design, _) = read_population_for_simulation(
     &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
     None, None, &design_parsed.column_map,
 )?;
-// The fit's covariate statistics, not the design's (`center = median` and friends).
+// The fit's covariate statistics, not the design's (`center = median` and friends),
+// compiled in by a re-parse.
 design_parsed.bindings.covariate_stats = result.data_bindings.covariate_stats.clone();
+design_parsed.model = parse_full_model_with(&model_text, &design_parsed.bindings)?.model;
 bind_theta_levels_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings.levels)?;
 let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
 let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
 ```
+
+Keep the re-parse even on a model with no level block.
+`bind_theta_levels_from_fit` re-parses only when the model declares one, so on a
+model whose only data-derived binding is a `center = median` it is the explicit
+re-parse that compiles the fit's statistics in. Without it, `simulate` refuses
+the model as unbound. Binding the design with `bind_covariate_stats` instead
+would silence that refusal with the *design's* statistics, which is wrong for a
+fit's θ.
 
 Each design record gets its level's index in the fit, and the model is re-parsed
 with the fit's labels, groups and contrast, so its θ layout is the fit's. A

@@ -85,9 +85,11 @@ section of the SDLC for the versioning policy).
   ([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)). `FitResult::data_bindings`
   holds each `theta NAME[COL, ...]` level block's levels and contrast and the statistics
   behind symbolic `[covariate_model]` centres (`center = median`), and `.fitrx` bundles and
-  `fit.json` save and reload them exactly. A reloaded fit can now drive
-  `bind_theta_levels_from_fit` on a simulation design without the original fit data
-  (`CompiledModel::data_bindings()` reads the same value off a bound model). Bundles saved
+  `fit.json` save and reload them exactly. A reloaded fit can now bind a simulation
+  design without the original fit data: put its statistics into the design's bindings,
+  re-parse, then call `bind_theta_levels_from_fit` with its levels (the sequence in
+  `docs/api/fitting.qmd`). `CompiledModel::data_bindings()` reads the same value off a
+  bound model. Bundles saved
   earlier load with empty bindings. `bind_theta_levels_from_fit` now refuses bindings that
   list a level twice, which previously bound silently with an extra θ.
 - **`simulate_with_uncertainty_diag` returns uncertainty simulations with their warnings**
