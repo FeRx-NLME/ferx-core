@@ -81,6 +81,14 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **Kappa (IOV) estimates in `format_summary()`, and a weighted kappa's weight in the fit
+  YAML** ([#1657](https://github.com/FeRx-NLME/ferx-core/issues/1657),
+  [#1660](https://github.com/FeRx-NLME/ferx-core/issues/1660)). The string summary now has a
+  `--- KAPPA (IOV) ---` section with the console's rows, including the weighted-kappa line. A
+  sample-size-weighted kappa's `omega_iov` entry adds `weight`, `weight_typical` and
+  `sd_at_typical_weight`; `variance` and `sd` are unchanged, and unweighted entries are
+  byte-identical.
+
 - **`simulate_with_uncertainty_diag` returns uncertainty simulations with their warnings**
   (#1645). It returns a `SimulationOutput` whose rows are exactly what
   `simulate_with_uncertainty` returns. Its `warnings` carry the bundle

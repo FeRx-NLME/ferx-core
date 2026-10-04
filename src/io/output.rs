@@ -137,6 +137,24 @@ fn format_omega_rows(result: &FitResult) -> String {
     out
 }
 
+/// A weighted kappa's (#1031) weight source text and, when the dataset gave a
+/// typical weight `n > 0` and the variance is non-negative, `(n, √var / √n)` —
+/// the SD of a typical arm. `None` for an unweighted kappa. The console's
+/// weight line and the fit YAML's `weight*` keys (#1660) both read this, so
+/// the two cannot print different numbers.
+fn kappa_weight_facts(
+    result: &FitResult,
+    i: usize,
+    var: f64,
+) -> Option<(&str, Option<(f64, f64)>)> {
+    let w = result.kappa_weights.get(i).and_then(|w| w.as_deref())?;
+    let typical = match result.kappa_weight_typical.get(i).copied().flatten() {
+        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var.sqrt() / n.sqrt())),
+        _ => None,
+    };
+    Some((w, typical))
+}
+
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
@@ -167,7 +185,7 @@ fn format_kappa_rows(result: &FitResult) -> String {
                 _ => "N/A".to_string(),
             }
         };
-        let weight = result.kappa_weights.get(i).and_then(|w| w.as_deref());
+        let weight = kappa_weight_facts(result, i, var);
         let note = note_suffix(
             variance_note(
                 result.kappa_param_types.get(i).copied(),
@@ -181,20 +199,14 @@ fn format_kappa_rows(result: &FitResult) -> String {
         // *unweighted* γ² — the quantity a published MBMA reports — so
         // print the effective SD at the median arm alongside it. A raw
         // γ of 2.0 on a logit scale reads as alarming until it is divided.
-        if let Some(w) = weight {
-            let _ = match result.kappa_weight_typical.get(i).copied().flatten() {
-                Some(n) if n > 0.0 && var >= 0.0 => writeln!(
+        if let Some((w, typical)) = weight {
+            let _ = match typical {
+                Some((n, sd)) => writeln!(
                     out,
                     "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
-                    "",
-                    w,
-                    var.sqrt() / n.sqrt(),
-                    w,
-                    n,
-                    name,
-                    w
+                    "", w, sd, w, n, name, w
                 ),
-                _ => writeln!(
+                None => writeln!(
                     out,
                     "  {:<20}   weight = {} (κ ~ N(0, {}/{}))",
                     "", w, name, w
@@ -1032,6 +1044,13 @@ pub fn format_summary(result: &FitResult) -> String {
                 }
             }
         }
+    }
+
+    // --- KAPPA (IOV) --- the console's rows verbatim (#1657), so the two
+    // cannot drift; includes the weighted-kappa line (#1031).
+    if result.omega_iov.is_some() {
+        let _ = writeln!(out, "\n--- KAPPA (IOV) ---");
+        out.push_str(&format_kappa_rows(result));
     }
 
     // --- SIGMA ---
@@ -2525,6 +2544,16 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
             if let Some(line) = variance_yaml_line(result.kappa_param_types.get(i).copied(), var) {
                 writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+            }
+            // A weighted kappa (#1660): `variance`/`sd` are the weight-1 γ², so
+            // add the weight and the typical arm's SD the console prints.
+            if let Some((w, typical)) = kappa_weight_facts(result, i, var) {
+                writeln!(f, "    weight: {}", yaml_quote(w)).map_err(|e| e.to_string())?;
+                if let Some((n, sd)) = typical {
+                    writeln!(f, "    weight_typical: {:.6}", n).map_err(|e| e.to_string())?;
+                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd)
+                        .map_err(|e| e.to_string())?;
+                }
             }
             if is_fixed {
                 writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
@@ -5456,5 +5485,100 @@ mod tests {
         ] {
             assert!(yaml.contains(want), "missing\n{want}\nin\n{yaml}");
         }
+    }
+
+    fn yaml_of(r: &FitResult) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
+        std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    /// `classified_result` with `K_ADD` weighted by `NARM`, typical arm 4.
+    fn weighted_result() -> FitResult {
+        let mut w = classified_result();
+        w.kappa_weights = vec![None, Some("NARM".into()), None];
+        w.kappa_weight_typical = vec![None, Some(4.0), None];
+        w
+    }
+
+    /// #1657: `format_summary` carries the KAPPA section — every kappa, its
+    /// type-appropriate note, and the weighted line — and it is the console's
+    /// rows verbatim. A fit without IOV has no such section.
+    #[test]
+    fn format_summary_has_the_kappa_section() {
+        let w = weighted_result();
+        let summary = format_summary(&w);
+        let at = summary
+            .find("\n--- KAPPA (IOV) ---\n")
+            .unwrap_or_else(|| panic!("no KAPPA header in:\n{summary}"));
+        // Placed between OMEGA and SIGMA.
+        assert!(summary.find("--- OMEGA ---").unwrap() < at, "{summary}");
+        assert!(at < summary.find("--- SIGMA").unwrap(), "{summary}");
+        assert!(
+            summary.contains(&format_kappa_rows(&w)),
+            "summary drifted from the console rows:\n{summary}"
+        );
+        let ln = line_with(&summary, "K_LN");
+        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        let add = line_with(&summary, "K_ADD");
+        assert!(
+            add.contains("= 156.036966  (SD = 12.4915 at weight 1)  SE ="),
+            "{add}"
+        );
+        let c = line_with(&summary, "K_C");
+        assert!(c.contains("= 0.300000  SE ="), "{c}");
+        assert!(
+            summary
+                .contains("weight = NARM  →  SD = 6.2457 at NARM = 4.0000 (κ ~ N(0, K_ADD/NARM))"),
+            "{summary}"
+        );
+
+        let mut no_iov = classified_result();
+        no_iov.omega_iov = None;
+        let s = format_summary(&no_iov);
+        assert!(!s.contains("KAPPA"), "{s}");
+        assert!(!s.contains("K_LN"), "{s}");
+    }
+
+    /// #1660: a weighted kappa's YAML entry adds `weight`, `weight_typical` and
+    /// `sd_at_typical_weight` — the numbers the console's weight line prints —
+    /// between `sd` and `se`, and changes nothing else in the file: removing
+    /// exactly those lines gives the unweighted file byte for byte.
+    #[test]
+    fn yaml_reports_a_weighted_kappa() {
+        let w = weighted_result();
+        let yaml = yaml_of(&w);
+        let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
+                     weight: \"NARM\"\n    weight_typical: 4.000000\n    \
+                     sd_at_typical_weight: 6.245738\n    se: ~\n";
+        assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
+        // The same number the console prints, to its 4 decimals.
+        let rows = format_kappa_rows(&w);
+        assert!(rows.contains("SD = 6.2457 at NARM = 4.0000"), "{rows}");
+        assert_eq!(format!("{:.4}", 6.245738_f64), "6.2457");
+
+        // Unweighted kappas (and every ETA): byte-identical to the same fit
+        // with no weights at all.
+        let plain = yaml_of(&classified_result());
+        assert!(!plain.contains("weight"), "{plain}");
+        let stripped: String = yaml
+            .lines()
+            .filter(|l| {
+                !(l.starts_with("    weight: ")
+                    || l.starts_with("    weight_typical: ")
+                    || l.starts_with("    sd_at_typical_weight: "))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(stripped, plain);
+
+        // No typical weight: `weight` alone, as the console's fallback line.
+        let mut no_typ = weighted_result();
+        no_typ.kappa_weight_typical = vec![None, None, None];
+        let yaml = yaml_of(&no_typ);
+        let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
+                     weight: \"NARM\"\n    se: ~\n";
+        assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
     }
 }

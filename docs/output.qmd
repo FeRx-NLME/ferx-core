@@ -276,6 +276,14 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   `(SD = …, logit scale)`; for a sample-size-weighted kappa the SD reads
   `(SD = … at weight 1)` (or `(SD = … at weight 1, logit scale)`), the SD of a
   one-subject arm, followed by the SD at the typical arm size.
+- **weight** / **weight_typical** / **sd_at_typical_weight**: present only on the
+  `omega_iov` entry of a sample-size-weighted kappa (`kappa K ~ γ² weight = W`,
+  #1660). `weight` is the source text of `W` (quoted), `weight_typical` the median
+  weight over the dataset's subject-occasions, and `sd_at_typical_weight` =
+  sqrt(variance / weight_typical), the between-arm SD at that typical arm — the
+  number the console's weight line prints. `variance` and `sd` keep their meaning
+  (the weight-1 γ² and its square root). Without a positive typical weight only
+  `weight` is written. An unweighted kappa's entry carries none of the three.
 - **covariance_method**: which estimator produced the standard errors — `r`, `s`
   or `rsr`. Present only when a covariance matrix was produced; see below.
 
