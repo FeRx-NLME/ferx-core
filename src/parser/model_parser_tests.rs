@@ -12254,19 +12254,21 @@ fn test_classify_if_no_else_skipped() {
 }
 
 #[test]
-fn test_classify_multi_eta_custom() {
-    // Expression with two ETAs (unusual) — both get their own Custom entry.
+fn test_classify_multi_eta_additive() {
+    // Expression with two ETAs (unusual) — each gets its own entry, and both
+    // are additive: only `+` separates each leaf from `CL` (#1656; before,
+    // matching no whole-expression pattern made both `Custom`).
     use crate::types::EtaParamType;
     let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL + ETA_V\n  V = 10.0");
-    let customs: Vec<_> = model
+    let additive: Vec<_> = model
         .eta_param_info
         .iter()
-        .filter(|i| i.param_type == EtaParamType::Custom)
+        .filter(|i| i.param_type == EtaParamType::Additive)
         .collect();
     assert_eq!(
-        customs.len(),
+        additive.len(),
         2,
-        "both ETAs in the expression should be Custom"
+        "both ETAs in the expression should be Additive"
     );
 }
 
@@ -28039,4 +28041,348 @@ fn level_contrast_serializes_as_its_dsl_token() {
             "{alias} must not read"
         );
     }
+}
+
+// ── #1656 / #1662: ETAs classified by leaf position; the consumer stop set ────
+
+/// A model with two BSV ETAs, a kappa `K`, a covariate effect θ `TH_WT`, a θ
+/// level block `PL[3]` and the given `[individual_parameters]`; `tail` replaces
+/// the default structural and error blocks when non-empty.
+fn eta_scale_model(indiv: &str, tail: &str) -> CompiledModel {
+    let tail = if tail.is_empty() {
+        "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n[error_model]\n  DV ~ proportional(EPS)\n"
+    } else {
+        tail
+    };
+    let src = format!(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         theta TH_WT(0.1, -10.0, 10.0)\n  theta PL[3](0.0, -10.0, 10.0)\n  \
+         omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa K ~ 0.04\n  sigma EPS ~ 0.01\n\n\
+         [individual_parameters]\n{indiv}\n\n{tail}"
+    );
+    parse_model_string(&src).unwrap_or_else(|e| panic!("parse failed: {e}\n{src}"))
+}
+
+/// `(individual parameter, type)` of every `eta_param_info` entry for `eta`.
+fn eta_entries(m: &CompiledModel, eta: &str) -> Vec<(String, crate::types::EtaParamType)> {
+    m.eta_param_info
+        .iter()
+        .filter(|i| i.eta_name == eta)
+        .map(|i| (i.individual_param_name.clone(), i.param_type))
+        .collect()
+}
+
+/// #1656: an ETA that only `+`/`-` separate from its parameter is `Additive`
+/// whatever else is summed beside it. Before, only exactly `THETA + ETA`
+/// (Pattern 3) was, and every row here was `Custom`.
+/// Dies under: the positional arm of `emit_eta_infos` pushing `Custom`.
+#[test]
+fn an_eta_beside_a_third_additive_term_is_additive() {
+    use crate::types::EtaParamType::Additive;
+    let cases = [
+        ("second theta", "V = TVV + TVCL + ETA_V"),
+        ("kappa", "V = TVV + ETA_V + K"),
+        ("level block", "V = TVV + PL[ARM] + ETA_V"),
+        ("covariate effect", "V = TVV + TH_WT * WT + ETA_V"),
+        ("subtracted", "V = TVV - ETA_V + TVCL"),
+        ("MBMA baseline (#1643)", "V = TVV + TVCL + ETA_V + K"),
+    ];
+    for (label, line) in cases {
+        let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n  {line}"), "");
+        assert_eq!(
+            eta_entries(&m, "ETA_V"),
+            [("V".into(), Additive)],
+            "{label}"
+        );
+        let info = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .unwrap();
+        assert_eq!(info.linked_theta, None, "{label}: no pattern names a θ");
+    }
+}
+
+/// #1656 differential pair: `TVV + ETA_V` and `TVV + ETA_V + K` straddle the
+/// old gate (the Pattern-3 match in `classify_expr`: `Some` for the first,
+/// `None` for the second — asserted, so the pair cannot quietly stop
+/// straddling), and both are `Additive` now.
+/// Dies under: the pattern side pushing `Custom` (twin 1) and the positional
+/// side pushing `Custom` (twin 2), each naming its own twin.
+#[test]
+fn the_pattern_three_pair_straddles_the_old_gate() {
+    use crate::types::EtaParamType::Additive;
+    let two = Expression::BinOp(
+        Box::new(Expression::Theta(1)),
+        BinOp::Add,
+        Box::new(Expression::Eta(1)),
+    );
+    let three = Expression::BinOp(
+        Box::new(two.clone()),
+        BinOp::Add,
+        Box::new(Expression::Eta(2)),
+    );
+    assert_eq!(
+        classify_expr(&two, 4).map(|c| c.param_type),
+        Some(Additive),
+        "twin 1 must be the old Pattern 3"
+    );
+    assert_eq!(
+        classify_expr(&three, 4),
+        None,
+        "twin 2 must miss every pattern"
+    );
+
+    let base = "  CL = TVCL * exp(ETA_CL)\n";
+    let m1 = eta_scale_model(&format!("{base}  V = TVV + ETA_V"), "");
+    let m2 = eta_scale_model(&format!("{base}  V = TVV + ETA_V + K"), "");
+    assert_eq!(
+        eta_entries(&m1, "ETA_V"),
+        [("V".into(), Additive)],
+        "twin 1 (pattern side)"
+    );
+    assert_eq!(
+        eta_entries(&m2, "ETA_V"),
+        [("V".into(), Additive)],
+        "twin 2 (positional side)"
+    );
+    let linked = |m: &CompiledModel| {
+        m.eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .and_then(|i| i.linked_theta.clone())
+    };
+    assert_eq!(
+        linked(&m1).as_deref(),
+        Some("TVV"),
+        "the pattern names the θ"
+    );
+}
+
+/// #1656 control: an ETA under a `*` is not additive on its parameter, however
+/// many `+` sit above it. Dies under: `leaf_scales` treating `*` as transparent.
+#[test]
+fn an_eta_under_a_product_stays_custom() {
+    use crate::types::EtaParamType::Custom;
+    for line in [
+        "V = TVV + ETA_V * WT",
+        "V = (TVV + ETA_V) * WT",
+        "V = TVV + ETA_V * WT + K",
+    ] {
+        let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n  {line}"), "");
+        assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Custom)], "{line}");
+    }
+}
+
+/// #1656: the other cells of the input space whose answer changed, one row per
+/// cell, with the old answer in the label.
+#[test]
+fn eta_scale_cells_the_patterns_missed() {
+    use crate::types::EtaParamType::*;
+    type Want<'a> = &'a [(&'a str, crate::types::EtaParamType)];
+    let cases: [(&str, &str, &str, Want); 6] = [
+        (
+            // Dies under: positional arm → Custom.
+            "logit with a covariate effect (was Custom)",
+            "  CL = TVCL\n  V = TVV * exp(ETA_V)\n  P1 = inv_logit(TVCL + TH_WT * WT + ETA_CL)",
+            "ETA_CL",
+            &[("P1", Logit)],
+        ),
+        (
+            // Dies under: positional arm skipped (the old drop).
+            "log-θ mu form with a kappa (had no entry)",
+            "  CL = exp(log(TVCL) + ETA_CL + K)\n  V = TVV * exp(ETA_V)",
+            "ETA_CL",
+            &[("CL", LogNormal)],
+        ),
+        (
+            // Dies under: positional arm skipped.
+            "second ETA in one exp (had no entry)",
+            "  CL = TVCL * exp(ETA_CL + ETA_V)\n  V = TVV",
+            "ETA_V",
+            &[("CL", LogNormal)],
+        ),
+        (
+            // Dies under: `root_scale` treating every variable as a parameter.
+            "bare ETA in an intermediate (was Custom)",
+            "  ECL = ETA_CL\n  CL = TVCL * exp(ECL)\n  V = TVV * exp(ETA_V)",
+            "ETA_CL",
+            &[("ECL", LogNormal)],
+        ),
+        (
+            // Dies under: the pattern side keeping `Additive`.
+            "Pattern 3 in an intermediate (was Additive)",
+            "  ECL = TVCL + ETA_CL\n  CL = exp(ECL)\n  V = TVV * exp(ETA_V)",
+            "ETA_CL",
+            &[("ECL", LogNormal)],
+        ),
+        (
+            // Dies under: positional arm → Custom.
+            "if branches that disagree on pattern (was Custom)",
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (WT > 70) {\n    V = TVV + ETA_V + K\n  } else {\n    V = TVV + ETA_V\n  }",
+            "ETA_V",
+            &[("V", Additive)],
+        ),
+    ];
+    for (label, indiv, eta, want) in cases {
+        let m = eta_scale_model(indiv, "");
+        let want: Vec<(String, _)> = want.iter().map(|(p, t)| (p.to_string(), *t)).collect();
+        assert_eq!(eta_entries(&m, eta), want, "{label}");
+    }
+    // The intermediate keeps the θ its pattern names, now on a log-normal ETA.
+    let m = eta_scale_model(
+        "  ECL = TVCL + ETA_CL\n  CL = exp(ECL)\n  V = TVV * exp(ETA_V)",
+        "",
+    );
+    let info = m
+        .eta_param_info
+        .iter()
+        .find(|i| i.eta_name == "ETA_CL")
+        .unwrap();
+    assert_eq!(info.linked_theta.as_deref(), Some("TVCL"));
+
+    // The same rule from the other side, and the one cell where an answer went
+    // from `Additive` to `Custom`: `V = TVV + ETA_V` that no block reads, only
+    // `K10 = CL / V`, is an intermediate, so `ETA_V` takes its scale in `K10` —
+    // exactly what a kappa there gets. Dies under: the pattern side keeping
+    // `Additive`.
+    let m = eta_scale_model(
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV + ETA_V\n  K10 = CL / V",
+        "[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = -K10 * central\n\n[scaling]\n  y = central\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n",
+    );
+    assert_eq!(
+        eta_entries(&m, "ETA_V"),
+        [("V".into(), Custom)],
+        "V read only by K10"
+    );
+}
+
+/// #1662: the walk stops at a variable a block reads **as a parameter**, and is
+/// case-insensitive. `[derived]` only reports a value, so a variable it reads
+/// is still followed into `[individual_parameters]`; `[initial_conditions]`
+/// and a `[scaling]` readout consume one. Each row names the mutation that
+/// reddens it.
+#[test]
+fn the_param_consumer_stop_set() {
+    use crate::types::EtaParamType::{self, *};
+    let pk = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+              [error_model]\n  DV ~ proportional(EPS)\n";
+    let derived = format!("{pk}\n[derived]\n  OUT = IOVCL\n");
+    let derived_eta = format!("{pk}\n[derived]\n  OUT = ECL\n");
+    let ic = format!("{pk}\n[initial_conditions]\n  init(central) = B0 * V\n");
+    let lower = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=v)\n\n\
+                 [error_model]\n  DV ~ proportional(EPS)\n";
+    let readout = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+                   [scaling]\n  y = central / V * S\n\n\
+                   [error_model]\n  DV ~ proportional(EPS)\n";
+    // (label, indiv, tail, kappa type, (ETA, its parameter, its type))
+    type Row<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        EtaParamType,
+        Option<(&'a str, &'a str, EtaParamType)>,
+    );
+    let rows: [Row; 5] = [
+        (
+            // Dies under: "derived" added to PARAM_CONSUMER_BLOCKS.
+            "[derived] does not stop the walk (kappa)",
+            "  IOVCL = K\n  CL = TVCL * exp(ETA_CL + IOVCL)\n  V = TVV * exp(ETA_V)",
+            &derived,
+            LogNormal,
+            None,
+        ),
+        (
+            // Dies under: "derived" added to PARAM_CONSUMER_BLOCKS.
+            "[derived] does not stop the walk (ETA)",
+            "  ECL = ETA_CL\n  CL = TVCL * exp(ECL + K)\n  V = TVV * exp(ETA_V)",
+            &derived_eta,
+            LogNormal,
+            Some(("ETA_CL", "ECL", LogNormal)),
+        ),
+        (
+            // Dies under: "initial_conditions" removed.
+            "[initial_conditions] consumes",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             B0 = 1 + K + ETA_CL\n  BX = B0 * 2",
+            &ic,
+            Additive,
+            Some(("ETA_CL", "B0", Additive)),
+        ),
+        (
+            // Dies under: `.to_ascii_uppercase()` dropped at the stop check.
+            "lower-case parameter name",
+            "  CL = TVCL * exp(ETA_CL)\n  v = TVV + ETA_V + K\n  k10 = CL / v",
+            lower,
+            Additive,
+            Some(("ETA_V", "v", Additive)),
+        ),
+        (
+            // Dies under: "scaling" removed.
+            "a [scaling] readout consumes",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             S = TVCL + ETA_CL + K\n  SX = S * 2",
+            readout,
+            Additive,
+            Some(("ETA_CL", "S", Additive)),
+        ),
+    ];
+    for (label, indiv, tail, kappa, eta) in rows {
+        let m = eta_scale_model(indiv, tail);
+        assert_eq!(m.kappa_param_types, [kappa], "{label}: kappa");
+        if let Some((eta, param, want)) = eta {
+            let got: Vec<_> = eta_entries(&m, eta)
+                .into_iter()
+                .filter(|(p, _)| p == param)
+                .collect();
+            assert_eq!(got, [(param.to_string(), want)], "{label}: {eta}");
+        }
+    }
+}
+
+/// #1662: a named `[event_model NAME]` reads parameters too, and its lines are
+/// in `extracted.named`, not the unnamed map. (No kappa here: an event
+/// predictor may not read an IOV-dependent parameter.)
+/// Dies under: the named-block loop of `param_consumer_identifiers` deleted.
+#[cfg(feature = "survival")]
+#[test]
+fn a_named_event_model_consumes_a_parameter() {
+    use crate::types::EtaParamType::Additive;
+    let m = eta_scale_model(
+        "  CL = TVCL\n  V = TVV * exp(ETA_V)\n  LAM = TVCL + ETA_CL + TH_WT\n  LX = LAM * 2",
+        "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n\n\
+         [event_model death]\n  cmt    = 2\n  family = exponential\n  scale  = LAM\n",
+    );
+    assert_eq!(
+        eta_entries(&m, "ETA_CL"),
+        [("LAM".into(), Additive)],
+        "ETA_CL on LAM"
+    );
+}
+
+/// #1662: every registered block is sorted into exactly one of the consumer
+/// lists, so a new block cannot reach the stop set (or miss it) by default.
+#[test]
+fn every_block_is_sorted_into_param_consumer_or_not() {
+    use std::collections::BTreeSet;
+    let registry: BTreeSet<&str> = BLOCK_REGISTRY.iter().map(|(name, _, _)| *name).collect();
+    let yes: BTreeSet<&str> = PARAM_CONSUMER_BLOCKS.iter().copied().collect();
+    let no: BTreeSet<&str> = NON_PARAM_CONSUMER_BLOCKS.iter().copied().collect();
+    assert_eq!(yes.len(), PARAM_CONSUMER_BLOCKS.len(), "duplicate consumer");
+    assert_eq!(
+        no.len(),
+        NON_PARAM_CONSUMER_BLOCKS.len(),
+        "duplicate non-consumer"
+    );
+    assert!(
+        yes.is_disjoint(&no),
+        "{:?}",
+        yes.intersection(&no).collect::<Vec<_>>()
+    );
+    let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
+    assert_eq!(sorted, registry);
 }

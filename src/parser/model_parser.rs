@@ -1946,7 +1946,16 @@ fn classify_theta_eta_linked(
 /// `(eta_param_infos, theta_transforms)`.
 ///
 /// `theta_transforms` is indexed parallel to `theta_names`; `eta_param_infos`
-/// contains one entry per BSV ETA that could be classified.
+/// holds one entry per (assignment, BSV ETA it reads), in statement order.
+///
+/// An ETA's scale is the one a kappa gets ([`classify_kappa_params`], #1656):
+/// where its leaf sits ([`leaf_scales`]), and for a leaf that only `+`/`-`
+/// separate from the root, the use of the assigned variable ([`root_scale`],
+/// with `consumers` as the stop set). So `TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`
+/// is `Additive` like `THETA + ETA`. The whole-expression patterns
+/// ([`classify_expr`]) still run first: they name the linked θ and its
+/// transform, and their non-additive answers stand (a hand-written
+/// `1/(1 + exp(-(TH + ETA)))` is logit, though the walk would see `exp`).
 ///
 /// Note: new metadata types (`EtaParamInfo`, `ThetaTransform`, `SigmaType`) are not yet
 /// written to the fit YAML — `io/output.rs` will be updated alongside ferx#53.
@@ -1954,15 +1963,24 @@ fn classify_indiv_params(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
+    consumers: &HashSet<String>,
 ) -> (
     Vec<crate::types::EtaParamInfo>,
     Vec<crate::types::ThetaTransform>,
 ) {
-    use crate::types::{EtaParamInfo, EtaParamType, ThetaTransform};
+    use crate::types::{EtaParamInfo, ThetaTransform};
 
     let n_theta = theta_names.len();
     let mut theta_transform = vec![ThetaTransform::Identity; n_theta];
     let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
+    let mut assigns = Vec::new();
+    flatten_assigns(stmts, &mut assigns);
+    let cx = EtaScaleCx {
+        theta_names,
+        eta_names,
+        assigns: &assigns,
+        consumers,
+    };
 
     for s in stmts {
         match s {
@@ -1981,71 +1999,42 @@ fn classify_indiv_params(
                     continue;
                 }
 
-                if let Some(c) = classify_expr(expr, n_theta) {
-                    apply_class(
-                        c,
-                        param_name,
-                        eta_names,
-                        theta_names,
-                        &mut theta_transform,
-                        &mut eta_infos,
-                    );
-                } else {
-                    // Unrecognised pattern → Custom for every ETA referenced.
-                    // Note: multiple ETAs in one expression each get their own entry.
-                    for ei in extract_eta_indices(expr) {
-                        if ei < eta_names.len() {
-                            eta_infos.push(EtaParamInfo {
-                                eta_name: eta_names[ei].clone(),
-                                param_type: EtaParamType::Custom,
-                                linked_theta: None,
-                                individual_param_name: param_name.clone(),
-                            });
-                        }
-                    }
-                }
+                emit_eta_infos(
+                    param_name,
+                    &[expr],
+                    classify_expr(expr, n_theta),
+                    &cx,
+                    &mut theta_transform,
+                    &mut eta_infos,
+                );
             }
             Statement::If { .. } => {
                 // For each individual parameter assigned inside this if/else block,
-                // check whether every branch uses the same pattern. If so, emit that
-                // classification; otherwise fall back to Custom.
+                // check whether every branch uses the same pattern. If so, that
+                // pattern names the linked θ; every ETA's scale is then positional
+                // across all branches (`emit_eta_infos`).
                 let candidate_names = collect_assigned_names_in_if(s);
                 for param_name in &candidate_names {
                     if let Some(exprs) = if_branch_exprs(s, param_name) {
                         let classes: Vec<Option<ExprClass>> =
                             exprs.iter().map(|e| classify_expr(e, n_theta)).collect();
-                        if classes.iter().all(|c| c.is_some()) {
-                            let first = classes[0].as_ref().unwrap();
-                            let unanimous = classes.iter().all(|c| {
-                                let c = c.as_ref().unwrap();
-                                c.param_type == first.param_type && c.eta_idx == first.eta_idx
-                            });
-                            if unanimous {
-                                apply_class(
-                                    first.clone(),
-                                    param_name,
-                                    eta_names,
-                                    theta_names,
-                                    &mut theta_transform,
-                                    &mut eta_infos,
-                                );
-                                continue;
-                            }
-                        }
-                        // Branches disagree or contain unrecognised patterns → Custom.
-                        let all_etas: std::collections::HashSet<usize> = exprs
-                            .iter()
-                            .flat_map(|e| extract_eta_indices(e))
-                            .filter(|&i| i < eta_names.len())
-                            .collect();
-                        for ei in all_etas {
-                            eta_infos.push(EtaParamInfo {
-                                eta_name: eta_names[ei].clone(),
-                                param_type: EtaParamType::Custom,
-                                linked_theta: None,
-                                individual_param_name: param_name.clone(),
-                            });
-                        }
+                        let unanimous = match classes.split_first() {
+                            Some((Some(first), rest)) => rest.iter().all(|c| {
+                                c.as_ref().is_some_and(|c| {
+                                    c.param_type == first.param_type && c.eta_idx == first.eta_idx
+                                })
+                            }),
+                            _ => false,
+                        };
+                        let class = if unanimous { classes[0].clone() } else { None };
+                        emit_eta_infos(
+                            param_name,
+                            &exprs,
+                            class,
+                            &cx,
+                            &mut theta_transform,
+                            &mut eta_infos,
+                        );
                     }
                     // if_branch_exprs returns None when a branch omits the param
                     // (no else arm, or incomplete coverage) — skip classification.
@@ -2058,26 +2047,240 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Shared inputs of the positional ETA classification in [`classify_indiv_params`].
+struct EtaScaleCx<'a> {
+    theta_names: &'a [String],
+    eta_names: &'a [String],
+    assigns: &'a [(&'a str, &'a Expression)],
+    consumers: &'a HashSet<String>,
+}
+
+/// Push one `EtaParamInfo` per BSV ETA that `exprs` (every expression assigned
+/// to `param_name` — one, or one per `if` branch) read.
+///
+/// `class` is the pattern classifier's answer, when it has one (unanimous across
+/// branches). It names the linked θ and transform for its own ETA, and its type
+/// stands unless it is `Additive`: that answer means the leaf reached the root,
+/// and which variable is the parameter is decided by use, as for a kappa
+/// (`ECL = TVCL + ETA_CL`, `CL = exp(ECL)` is log-normal). Every other ETA —
+/// all of them when no pattern matched, or one beside the pattern's — gets its
+/// positional scale and no linked θ (#1656).
+fn emit_eta_infos(
+    param_name: &str,
+    exprs: &[&Expression],
+    class: Option<ExprClass>,
+    cx: &EtaScaleCx<'_>,
+    theta_transform: &mut Vec<crate::types::ThetaTransform>,
+    eta_infos: &mut Vec<crate::types::EtaParamInfo>,
+) {
+    use crate::types::EtaParamType;
+    let scale = |ei: usize| {
+        let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == ei);
+        let mut seen = Vec::new();
+        for e in exprs {
+            resolved_leaf_scales(param_name, e, &is_eta, cx.assigns, cx.consumers, &mut seen);
+        }
+        common_scale(&seen)
+    };
+    let pattern_eta = class.as_ref().map(|c| c.eta_idx);
+    if let Some(mut c) = class {
+        if c.param_type == EtaParamType::Additive && c.eta_idx < cx.eta_names.len() {
+            c.param_type = scale(c.eta_idx);
+        }
+        apply_class(
+            c,
+            param_name,
+            cx.eta_names,
+            cx.theta_names,
+            theta_transform,
+            eta_infos,
+        );
+    }
+    let mut etas: Vec<usize> = Vec::new();
+    for ei in exprs.iter().flat_map(|e| extract_eta_indices(e)) {
+        if ei < cx.eta_names.len() && Some(ei) != pattern_eta && !etas.contains(&ei) {
+            etas.push(ei);
+        }
+    }
+    for ei in etas {
+        eta_infos.push(crate::types::EtaParamInfo {
+            eta_name: cx.eta_names[ei].clone(),
+            param_type: scale(ei),
+            linked_theta: None,
+            individual_param_name: param_name.to_owned(),
+        });
+    }
+}
+
+/// Every assignment, top level and inside `if` branches, in statement order.
+fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(lhs, expr) => out.push((lhs, expr)),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    flatten_assigns(body, out);
+                }
+                if let Some(body) = else_body {
+                    flatten_assigns(body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The scale of every leaf of `expr` (assigned to `lhs`) that `is_leaf` picks
+/// out, with a leaf that reached the root resolved by [`root_scale`].
+fn resolved_leaf_scales(
+    lhs: &str,
+    expr: &Expression,
+    is_leaf: &dyn Fn(&Expression) -> bool,
+    assigns: &[(&str, &Expression)],
+    consumers: &HashSet<String>,
+    out: &mut Vec<crate::types::EtaParamType>,
+) {
+    for s in leaf_scales(expr, is_leaf) {
+        match s {
+            Some(t) => out.push(t),
+            None => root_scale(lhs, assigns, consumers, &[], out),
+        }
+    }
+}
+
+/// The scale(s) of a leaf that reached the root of the assignment to `var`.
+///
+/// A variable a consuming block reads (`consumers`, built by
+/// [`param_consumer_identifiers`]) or that nothing else reads is a parameter,
+/// and the leaf is `Additive` on it; an intermediate that later statements read
+/// is followed into them with the same walk. `consumers` holds upper-cased
+/// identifiers, so the check is case-insensitive.
+fn root_scale(
+    var: &str,
+    assigns: &[(&str, &Expression)],
+    consumers: &HashSet<String>,
+    visiting: &[&str],
+    out: &mut Vec<crate::types::EtaParamType>,
+) {
+    use crate::types::EtaParamType;
+    let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
+    let readers: Vec<(&str, Vec<Option<EtaParamType>>)> = assigns
+        .iter()
+        .filter(|(lhs, _)| !visiting.contains(lhs))
+        .map(|(lhs, e)| (*lhs, leaf_scales(e, &is_var)))
+        .filter(|(_, scales)| !scales.is_empty())
+        .collect();
+    if consumers.contains(&var.to_ascii_uppercase()) || readers.is_empty() {
+        out.push(EtaParamType::Additive);
+        return;
+    }
+    // The variables already on this path: a reassignment (`A = A + 1`) reads
+    // its own left-hand side and would otherwise recurse forever.
+    let path: Vec<&str> = visiting.iter().copied().chain([var]).collect();
+    for (lhs, scales) in readers {
+        for s in scales {
+            match s {
+                Some(t) => out.push(t),
+                None => root_scale(lhs, assigns, consumers, &path, out),
+            }
+        }
+    }
+}
+
+/// The common type of every scale a random effect was seen at; `Custom` on any
+/// disagreement, and when it was seen at none (read only in a condition).
+fn common_scale(seen: &[crate::types::EtaParamType]) -> crate::types::EtaParamType {
+    match seen.split_first() {
+        Some((first, rest)) if rest.iter().all(|t| t == first) => *first,
+        _ => crate::types::EtaParamType::Custom,
+    }
+}
+
+/// Blocks that read an `[individual_parameters]` variable **as a parameter**:
+/// the stop set of [`root_scale`] (#1662). Every entry of `BLOCK_REGISTRY` is in
+/// exactly one of this list and [`NON_PARAM_CONSUMER_BLOCKS`];
+/// `every_block_is_sorted_into_param_consumer_or_not` pins the partition, so a
+/// new block cannot be added without deciding which.
+///
+/// This is deliberately not the tier-2 `downstream_refs` set, which answers a
+/// different question (which names need a slot) and includes `[derived]`.
+const PARAM_CONSUMER_BLOCKS: &[&str] = &[
+    "structural_model",
+    "odes",
+    // Form-C readouts (`y = CENT / V`) live here.
+    "scaling",
+    "initial_conditions",
+    "event_model",
+    "binary_model",
+    "markov_model",
+];
+
+/// The rest of `BLOCK_REGISTRY`, grouped by why none of them is a consumer.
+/// Read only by the partition test: the decision is the point, not the list.
+#[cfg(test)]
+const NON_PARAM_CONSUMER_BLOCKS: &[&str] = &[
+    // Report a value; a variable they read is still followed into the later
+    // `[individual_parameters]` statements that use it.
+    "derived",
+    "output",
+    // The block being classified, and the one desugared into it.
+    "individual_parameters",
+    "covariate_model",
+    // Read θ, η, σ, covariates, states or observations, never a parameter.
+    "error_model",
+    "diffusion",
+    "mixture",
+    "adaptive_dosing",
+    "covariate_nn",
+    "covariates",
+    "simulation",
+    "priors",
+    // Declarations and options.
+    "parameters",
+    "data",
+    "data_selection",
+    "fit_options",
+];
+
+/// Upper-cased identifiers of every [`PARAM_CONSUMER_BLOCKS`] block, unnamed
+/// and named (`[event_model NAME]`).
+fn param_consumer_identifiers(
+    unnamed: &HashMap<String, Vec<String>>,
+    named: &HashMap<String, HashMap<String, Vec<String>>>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for key in PARAM_CONSUMER_BLOCKS {
+        if let Some(lines) = unnamed.get(*key) {
+            collect_referenced_identifiers(lines, &mut out);
+        }
+        for lines in named.get(*key).into_iter().flat_map(HashMap::values) {
+            collect_referenced_identifiers(lines, &mut out);
+        }
+    }
+    out
+}
+
 /// Classify every IOV kappa by the scale it enters its individual parameter on
 /// (#1643). Returns one entry per kappa, **parallel to `kappa_names`**, so a
 /// consumer indexes it by kappa slot and never by statement order.
 ///
-/// This is a different classifier from [`classify_indiv_params`] on purpose.
-/// The ETA classifier matches whole-expression patterns (`TVCL * exp(ETA)`,
-/// `THETA + ETA`, ...) because it also has to name the linked θ and its
-/// transform; a kappa needs only its scale, and it almost always shares the
-/// expression with an ETA (`exp(ETA_CL + KAPPA_CL)`, `TVV + ETA_V + KAPPA_V`),
-/// which no ETA pattern admits. So a kappa is classified by **where its leaf
-/// sits** ([`leaf_scales`]). Where both classifiers answer, they must agree;
-/// `kappa_scale_walk_agrees_with_eta_patterns` pins that.
+/// A kappa is classified by **where its leaf sits** ([`leaf_scales`]): it needs
+/// only its scale, and it almost always shares the expression with an ETA
+/// (`exp(ETA_CL + KAPPA_CL)`, `TVV + ETA_V + KAPPA_V`). ETAs are classified by
+/// the same walk since #1656 ([`classify_indiv_params`]);
+/// `kappa_scale_walk_agrees_with_eta_patterns` pins that the walk agrees with
+/// the ETA patterns wherever those answer.
 ///
 /// A kappa that only `+`/`-` separate from the root of its assignment takes the
-/// scale of that assignment's **use**: a variable another block reads
-/// (`structural`, the upper-cased identifiers of `[structural_model]`, `[odes]`,
-/// `[scaling]`, `[derived]`) or that nothing else reads is a parameter, and the
-/// kappa is `Additive` on it; an intermediate that later statements read
-/// (`IOVCL = KAPPA_CL`, then `CL = TVCL * exp(ETA_CL + IOVCL)` — the NONMEM IOV
-/// idiom) is followed into those statements with the same walk (#1659 review).
+/// scale of that assignment's **use** ([`root_scale`]): a variable a consuming
+/// block reads (`consumers`, see [`PARAM_CONSUMER_BLOCKS`]) or that nothing
+/// else reads is a parameter, and the kappa is `Additive` on it; an
+/// intermediate that later statements read (`IOVCL = KAPPA_CL`, then
+/// `CL = TVCL * exp(ETA_CL + IOVCL)` — the NONMEM IOV idiom) is followed into
+/// those statements with the same walk (#1659 review).
 ///
 /// A kappa referenced in several places takes their common type; any
 /// disagreement, and a kappa nothing reads, is `Custom`.
@@ -2085,85 +2288,23 @@ fn classify_kappa_params(
     stmts: &[Statement],
     n_eta: usize,
     kappa_names: &[String],
-    structural: &HashSet<String>,
+    consumers: &HashSet<String>,
 ) -> Vec<crate::types::EtaParamType> {
-    use crate::types::EtaParamType;
-
-    // Every assignment, top level and inside `if` branches, in statement order.
-    // No synthetic-parameter skip, unlike `classify_indiv_params`: a readout may
-    // not read a kappa (#107), so no `__ferx_ro_*` mirror holds one, and a
-    // `__ferx_pktime_*` line is a bare `TIME`.
-    fn flatten<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-        for s in stmts {
-            match s {
-                Statement::Assign(lhs, expr) => out.push((lhs, expr)),
-                Statement::If {
-                    branches,
-                    else_body,
-                } => {
-                    for (_, body) in branches {
-                        flatten(body, out);
-                    }
-                    if let Some(body) = else_body {
-                        flatten(body, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// The scale(s) of a leaf that reached the root of the assignment to `var`.
-    fn root_scale(
-        var: &str,
-        assigns: &[(&str, &Expression)],
-        structural: &HashSet<String>,
-        visiting: &[&str],
-        out: &mut Vec<EtaParamType>,
-    ) {
-        let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
-        let readers: Vec<(&str, Vec<Option<EtaParamType>>)> = assigns
-            .iter()
-            .filter(|(lhs, _)| !visiting.contains(lhs))
-            .map(|(lhs, e)| (*lhs, leaf_scales(e, &is_var)))
-            .filter(|(_, scales)| !scales.is_empty())
-            .collect();
-        if structural.contains(&var.to_ascii_uppercase()) || readers.is_empty() {
-            out.push(EtaParamType::Additive);
-            return;
-        }
-        // The variables already on this path: a reassignment (`A = A + 1`) reads
-        // its own left-hand side and would otherwise recurse forever.
-        let path: Vec<&str> = visiting.iter().copied().chain([var]).collect();
-        for (lhs, scales) in readers {
-            for s in scales {
-                match s {
-                    Some(t) => out.push(t),
-                    None => root_scale(lhs, assigns, structural, &path, out),
-                }
-            }
-        }
-    }
-
+    // Every assignment, top level and inside `if` branches. No synthetic-parameter
+    // skip, unlike `classify_indiv_params`: a readout may not read a kappa (#107),
+    // so no `__ferx_ro_*` mirror holds one, and a `__ferx_pktime_*` line is a bare
+    // `TIME`.
     let mut assigns = Vec::new();
-    flatten(stmts, &mut assigns);
+    flatten_assigns(stmts, &mut assigns);
     (0..kappa_names.len())
         .map(|k| {
             let slot = n_eta + k;
             let is_kappa = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
             let mut seen = Vec::new();
             for (lhs, expr) in &assigns {
-                for s in leaf_scales(expr, &is_kappa) {
-                    match s {
-                        Some(t) => seen.push(t),
-                        None => root_scale(lhs, &assigns, structural, &[], &mut seen),
-                    }
-                }
+                resolved_leaf_scales(lhs, expr, &is_kappa, &assigns, consumers, &mut seen);
             }
-            match seen.split_first() {
-                Some((first, rest)) if rest.iter().all(|t| t == first) => *first,
-                _ => EtaParamType::Custom,
-            }
+            common_scale(&seen)
         })
         .collect()
 }
@@ -2925,8 +3066,11 @@ pub fn parse_full_model_with(
     // before `rewrite_weighted_kappas` turns a weighted `K` into `K / sqrt(W)`:
     // the scale is the one the user wrote, and after the rewrite every weighted
     // kappa's nearest ancestor would be that `/`, i.e. `Custom`.
+    // The stop set is the blocks that consume a parameter (#1662), not the
+    // tier-2 `downstream_refs` above: `[derived]` only reports a value.
+    let param_consumers = param_consumer_identifiers(blocks, &extracted.named);
     let kappa_param_types =
-        classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &downstream_refs);
+        classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
         // *unweighted* κ — a plausible wrong answer rather than an error, which
@@ -3976,7 +4120,7 @@ pub fn parse_full_model_with(
     // Classify [individual_parameters] expressions for the R metadata layer.
     // Uses BSV-only eta names (no kappas).
     let (eta_param_info, theta_transform) =
-        classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
+        classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
     // Delattre class of every theta for the mixed BIC (#1177). Runs on the
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
