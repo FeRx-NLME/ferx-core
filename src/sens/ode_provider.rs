@@ -26,7 +26,9 @@
 //! **LTBS** (`log(DV) ~ …`) output transforms; all five built-in input-rate
 //! forcings (igd/transit/weibull/first_order/zero_order, #430/#468/#530);
 //! **estimated lagtime** (incl. compartment-indexed `ALAG{cmt}`) for every forcing
-//! except `weibull()`; up to `MAX_ODE_SENS_DIM` individual parameters. Both the full
+//! except `weibull()`; any number of individual parameters (the static superposition walk
+//! seeds one dual axis per individual parameter and stops at `MAX_ODE_SENS_DIM`; wider
+//! models take the event-driven walk, which is sized on `θ + η` instead, #1661). Both the full
 //! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
 //! ([`ode_subject_eta_grad`]) are served (#410). On the event-driven walk these compose
 //! with **time-varying covariates**, **steady-state dosing** (dual SS-equilibration), and
@@ -54,8 +56,22 @@ use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
 
-/// Largest individual-parameter count for which the `Dual2<N>` path is
-/// monomorphised; models wider than this fall back to the gradient-free path.
+/// Largest individual-parameter count for which the **static superposition** walk's
+/// `Dual2<N>` / `DualMixed<NA, N>` / `Dual1<N>` tables are monomorphised (`N` = one dual
+/// axis per individual parameter).
+///
+/// This bounds the static walk only, through [`static_walk_dim_supported`]. It used to be
+/// the last clause of the model-level [`ode_analytical_supported`], which declined the
+/// whole model — including every subject the event-driven walk would have served, a walk
+/// sized on `θ + η` (`MAX_ODE_AXES`) that never reads this cap. A model with 6
+/// data-supplied PK parameters, a constant `D1` and `F4..F8` baseline scalings sits well
+/// past 12 individual parameters on only `8 θ + 4 η`, and ran its whole fit on finite
+/// differences at ~4.5× the cost per evaluation (#1661). A wider model now routes every
+/// subject to the event-driven walk instead (`ode_tvcov_supported`).
+///
+/// Do not raise this to admit wide models: the `(na, n)` mixed-order table grows
+/// quadratically in it (90 walk instantiations at 12, 495 at 30) and the event-driven
+/// walk already serves them.
 const MAX_ODE_SENS_DIM: usize = 12;
 
 // The `pk_indices.len()` dispatch tables in `ode_subject_sensitivities` and
@@ -256,9 +272,10 @@ pub(crate) fn ode_scaling_supported(model: &CompiledModel) -> bool {
 
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
-/// no `init(...)`, no IOV/SDE, no output transform, and an individual-parameter
-/// count within `MAX_ODE_SENS_DIM`. Per-subject gates (bolus-only doses, no TV
-/// covariates/resets) are checked in [`ode_subject_sensitivities`].
+/// no `init(...)`, no IOV/SDE, no output transform, and at least one individual
+/// parameter. Per-subject gates (bolus-only doses, no TV covariates/resets, and the
+/// static walk's `MAX_ODE_SENS_DIM` individual-parameter cap) are checked in
+/// [`ode_subject_sensitivities`].
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // A `TIME`-built-in structural parameter is served analytically on the ODE path
     // too: the subject routes through the event-driven TV-cov walk (`ode_tvcov_supported`
@@ -417,8 +434,26 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
         }
         None => return false,
     }
-    let n = model.pk_indices.len();
-    (1..=MAX_ODE_SENS_DIM).contains(&n)
+    // No `MAX_ODE_SENS_DIM` clause here (#1661): that cap sizes the static superposition
+    // walk's per-individual-parameter dual tables, so it is a static-walk gate
+    // (`static_walk_dim_supported`, applied in `ode_subject_supported`). A model past it
+    // routes every subject to the event-driven walk (`ode_tvcov_supported`), whose dual
+    // width is the `θ + η` program width bounded just above.
+    !model.pk_indices.is_empty()
+}
+
+/// Whether the **static superposition** walk's dispatch tables cover this model's
+/// individual-parameter count — the one ODE scope gate that depends on that count (#1661).
+///
+/// The static walk seeds one dual axis per individual parameter (`Dual2<N>` /
+/// `DualMixed<NA, N>` outer, `Dual1<N>` inner, `N = pk_indices.len()`) and its tables stop
+/// at `MAX_ODE_SENS_DIM`. The event-driven walk seeds `(θ, η)` instead, so a wider model is
+/// not out of analytic scope — it is out of *static-walk* scope, and
+/// [`ode_tvcov_supported`] takes every such subject. `ode_subject_supported` and
+/// `ode_tvcov_supported` both read this one predicate, so the two walks partition the
+/// subjects with no gap between them.
+fn static_walk_dim_supported(model: &CompiledModel) -> bool {
+    (1..=MAX_ODE_SENS_DIM).contains(&model.pk_indices.len())
 }
 
 /// True when `subject` has an infusion (RATE>0) into a compartment fed by a built-in absorption
@@ -502,6 +537,13 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
         || subject.has_tv_covariates()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
     {
+        return false;
+    }
+    // More individual parameters than the static walk's dual tables cover (#1661). Not
+    // an FD route: `ode_tvcov_supported` admits exactly these subjects, and the
+    // dispatchers consult it first. Kept here as well so the static walk can never be
+    // entered past its `[_; MAX_ODE_SENS_DIM]` stack buffers.
+    if !static_walk_dim_supported(model) {
         return false;
     }
     // Steady-state dosing is not yet supported over the dual loop (needs dual
@@ -780,6 +822,13 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // FD perturbs the twin's own value path. Mirrors the clause in
     // `subject_needs_per_event_pk` and `iov_walk_per_event`.
     let has_reset_snapshots = !subject.reset_covariates.is_empty();
+    // More individual parameters than the static walk's per-parameter dual tables cover
+    // (#1661). The static walk is the cheaper route, never the only one: this walk seeds
+    // `(θ, η)` rather than one axis per individual parameter, and serves every subject
+    // the static walk does (it is the superset — each static-walk feature also composes
+    // with TV covariates here). So a wide model takes this walk for *every* subject
+    // rather than falling to FD for the ones with no other trigger.
+    let too_wide_for_static_walk = !static_walk_dim_supported(model);
     if !ode_analytical_supported(model)
         || !(subject.has_tv_covariates()
             || has_reset_snapshots
@@ -788,7 +837,8 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
             || has_ss
             || has_rate_defined_under_f
             || has_modeled_dose
-            || uses_time)
+            || uses_time
+            || too_wide_for_static_walk)
     {
         return false;
     }
@@ -1160,7 +1210,11 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
         }
         None => return false,
     }
-    (1..=MAX_ODE_SENS_DIM).contains(&model.pk_indices.len())
+    // No `MAX_ODE_SENS_DIM` clause (#1661): the IOV walk dispatches on the stacked axis
+    // count (`dispatch_ode_iov_axes!`, bounded per subject by `MAX_ODE_IOV_AXES`) and on
+    // the program width bounded just above, and sizes its per-individual-parameter storage
+    // dynamically. The individual-parameter cap belongs to the non-IOV static walk only.
+    !model.pk_indices.is_empty()
 }
 
 /// Compute per-observation analytic sensitivities for an ODE model, or `None` if

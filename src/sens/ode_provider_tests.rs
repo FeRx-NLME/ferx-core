@@ -12464,3 +12464,281 @@ fn ode_readout_gather_dual_matches_fd() {
     );
     check_ode_gather_case("ODE, y = central / V * PLACEBO[PLA_IDX]", &m);
 }
+// ── #1661: more individual parameters than the static walk's dual tables ────────────────
+//
+// `MAX_ODE_SENS_DIM` (12) sizes the static superposition walk, which seeds one dual axis
+// per individual parameter. It used to be the last clause of the model-level
+// `ode_analytical_supported`, so a model past it ran its whole fit on finite differences
+// even though the event-driven walk — sized on `θ + η` — would have served every subject.
+// These fixtures sit one parameter either side of the cap on a small `θ + η`.
+//
+// 2-cpt PK driving an indirect response (inhibition of production), with the response
+// started at baseline by `init(...)` so its state is live before the first dose. Individual
+// parameters: CL V1 Q V2 K10 K12 K21 KIN KOUT IMAX IC50 BASE GAM = 13 (> 12) on 7 θ + 2 η.
+const WIDE_ODE_TEMPLATE: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVKIN(10.0, 0.1, 100.0)
+  theta TVKOUT(0.5, 0.01, 10.0)
+  theta TVIC50(2.0, 0.01, 100.0)
+  omega ETA_CL   ~ 0.15
+  omega ETA_KOUT ~ 0.10
+  __KAPPA__
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^0.75 * exp(ETA_CL __KAPPA_TERM__)
+  V1   = TVV1
+  Q    = TVQ
+  V2   = TVV2
+  K10  = CL / V1
+  K12  = Q / V1
+  K21  = Q / V2
+  KIN  = TVKIN
+  KOUT = TVKOUT * exp(ETA_KOUT)
+  IMAX = 0.8
+  IC50 = TVIC50
+  BASE = KIN / KOUT
+  __GAM_DECL__
+[structural_model]
+  ode(obs_cmt=resp, states=[central, peripheral, resp])
+[odes]
+  init(resp) = BASE
+  CP = central / V1
+  INH = IMAX * CP^__GAM__ / (IC50^__GAM__ + CP^__GAM__)
+  d/dt(central)    = -K10 * central - K12 * central + K21 * peripheral
+  d/dt(peripheral) =  K12 * central - K21 * peripheral
+  d/dt(resp)       =  KIN * (1 - INH) - KOUT * resp
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  __IOV_OPT__
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// The 13-parameter model (`GAM` an individual parameter), or its 12-parameter twin
+/// (`GAM` written inline as `2`) — the same function, one parameter either side of the
+/// static walk's cap. `iov` adds a κ on CL.
+fn wide_ode_model(wide: bool, iov: bool) -> CompiledModel {
+    let src = WIDE_ODE_TEMPLATE
+        .replace("__GAM_DECL__", if wide { "GAM  = 2" } else { "" })
+        .replace("__GAM__", if wide { "GAM" } else { "2" })
+        .replace("__KAPPA__", if iov { "kappa KAPPA_CL ~ 0.02" } else { "" })
+        .replace("__KAPPA_TERM__", if iov { "+ KAPPA_CL" } else { "" })
+        .replace("__IOV_OPT__", if iov { "iov_column = OCC" } else { "" });
+    parse_model_string(&src).expect("parse #1661 fixture")
+}
+
+const WIDE_THETA: [f64; 7] = [4.0, 12.0, 2.0, 25.0, 10.0, 0.5, 2.0];
+const WIDE_ETA: [f64; 2] = [0.1, -0.05];
+
+/// Two boluses 12 h apart with observations after each, so the second dose lands on
+/// residual drug and a depressed response — both sides of that dose event are live.
+fn wide_ode_subject() -> Subject {
+    let mut s = bolus_subject_wt(&[1.0, 4.0, 10.0, 13.0, 16.0, 24.0], 70.0);
+    s.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    s
+}
+
+/// Precondition shared by the tests below: the fixture really straddles the cap, on the
+/// individual-parameter count alone (the `θ + η` width is identical and small).
+fn assert_wide_fixture_straddles_the_cap(wide: &CompiledModel, narrow: &CompiledModel) {
+    assert!(
+        wide.pk_indices.len() > MAX_ODE_SENS_DIM,
+        "wide fixture must exceed the static-walk cap, has {}",
+        wide.pk_indices.len()
+    );
+    assert!(
+        narrow.pk_indices.len() <= MAX_ODE_SENS_DIM,
+        "narrow twin must fit the static-walk cap, has {}",
+        narrow.pk_indices.len()
+    );
+    assert_eq!(wide.n_theta + wide.n_eta, narrow.n_theta + narrow.n_eta);
+    assert!(wide.n_theta + wide.n_eta <= MAX_ODE_AXES);
+}
+
+/// A subject with **no** event-walk trigger (static covariates, fixed bolus doses) on a
+/// model past the cap is served by the event-driven walk, not declined to FD — and the
+/// 12-parameter twin of the same subject still takes the static walk. The pair straddles
+/// the cap, so deleting either the `ode_analytical_supported` relaxation or the
+/// `too_wide_for_static_walk` trigger reddens the wide half, and making the trigger fire
+/// unconditionally reddens the narrow half.
+#[test]
+fn ode_wider_than_static_walk_routes_to_event_walk_not_fd() {
+    let wide = wide_ode_model(true, false);
+    let narrow = wide_ode_model(false, false);
+    assert_wide_fixture_straddles_the_cap(&wide, &narrow);
+    let subject = wide_ode_subject();
+    assert!(!subject.has_tv_covariates() && subject.all_doses_fixed());
+
+    assert!(
+        ode_analytical_supported(&wide),
+        "#1661: the individual-parameter count must not decline the whole model"
+    );
+    assert!(
+        ode_tvcov_supported(&wide, &subject),
+        "#1661: a too-wide subject with no other trigger must take the event-driven walk"
+    );
+    assert!(
+        !ode_subject_supported(&wide, &subject),
+        "the static walk's [_; MAX_ODE_SENS_DIM] buffers must never see a wider model"
+    );
+
+    assert!(ode_subject_supported(&narrow, &subject));
+    assert!(
+        !ode_tvcov_supported(&narrow, &subject),
+        "a model inside the cap must keep the cheaper static walk"
+    );
+}
+
+/// The event-driven walk is exact on the too-wide model: value, `∂f/∂η`, `∂f/∂θ` against
+/// the production predictor and its FD, both second-order blocks against double FD of the
+/// predictor, and the light inner `Dual1` gradient against the outer `Dual2` one.
+#[test]
+fn ode_wider_than_static_walk_matches_production() {
+    let wide = wide_ode_model(true, false);
+    let subject = wide_ode_subject();
+    check_vs_production(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+    check_hessian_vs_production_fd(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+    check_inner_outer_eta_parity(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+
+    // Same function as the 12-parameter twin, which takes the static walk: the two walks
+    // must agree, so the wide route is not merely self-consistent.
+    let narrow = wide_ode_model(false, false);
+    let a = ode_subject_sensitivities(&wide, &subject, &WIDE_THETA, &WIDE_ETA).expect("wide");
+    let b = ode_subject_sensitivities(&narrow, &subject, &WIDE_THETA, &WIDE_ETA).expect("narrow");
+    assert_eq!(a.obs.len(), b.obs.len());
+    for (x, y) in a.obs.iter().zip(&b.obs) {
+        assert!(x.f.is_finite() && y.f.is_finite());
+        approx::assert_relative_eq!(x.f, y.f, max_relative = 1e-7, epsilon = 1e-9);
+        for k in 0..wide.n_eta {
+            approx::assert_relative_eq!(
+                x.df_deta[k],
+                y.df_deta[k],
+                max_relative = 1e-5,
+                epsilon = 1e-8
+            );
+        }
+        for m in 0..wide.n_theta {
+            approx::assert_relative_eq!(
+                x.df_dtheta[m],
+                y.df_dtheta[m],
+                max_relative = 1e-5,
+                epsilon = 1e-8
+            );
+        }
+    }
+}
+
+/// The reported shape: a too-wide model whose subject also carries time-varying
+/// covariates (the weight on CL steps between the two doses). That subject was already
+/// an event-walk subject, so only the model-level relaxation stands between it and FD.
+#[test]
+fn ode_wider_than_static_walk_tvcov_matches_production() {
+    let wide = wide_ode_model(true, false);
+    let mut subject = wide_ode_subject();
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(62.0), wt(80.0)];
+    subject.obs_covariates = vec![wt(62.0), wt(62.0), wt(62.0), wt(80.0), wt(80.0), wt(80.0)];
+    assert!(subject.has_tv_covariates());
+    check_vs_production(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+    check_hessian_vs_production_fd(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+    check_inner_outer_eta_parity(&wide, &subject, &WIDE_THETA, &WIDE_ETA);
+}
+
+/// What the fit reports follows the route: the outer gradient, the inner banner label and
+/// the per-subject inner route all say analytic for the too-wide model. Before #1661 all
+/// three said FD, `optimizer = auto` resolved to BOBYQA, and the inner EBE loop ran on
+/// central differences.
+#[test]
+fn ode_wider_than_static_walk_reports_analytic() {
+    use crate::estimation::inner_optimizer::{
+        inner_reports_analytic_model, resolve_gradient_method, InnerGradientMethod,
+    };
+    let wide = wide_ode_model(true, false);
+    let subject = wide_ode_subject();
+    assert!(crate::sens::provider::analytic_outer_gradient_available(
+        &wide
+    ));
+    assert!(inner_reports_analytic_model(&wide));
+    assert_eq!(
+        resolve_gradient_method(&wide, &subject),
+        InnerGradientMethod::Analytic
+    );
+}
+
+/// IOV carried the same cap in `ode_iov_supported`, though the IOV walk dispatches on the
+/// stacked `(θ, η, κ…)` width. The too-wide IOV model is now served, and matches FD of
+/// production `predict_iov` across two κ occasion groups.
+#[test]
+fn ode_wider_than_static_walk_iov_matches_predict_iov() {
+    let model = wide_ode_model(true, true);
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.pk_indices.len() > MAX_ODE_SENS_DIM);
+    assert!(
+        ode_iov_supported(&model),
+        "#1661: the individual-parameter count must not decline the IOV walk"
+    );
+    let mut subj = wide_ode_subject();
+    subj.occasions = vec![1, 1, 1, 2, 2, 2];
+    subj.dose_occasions = vec![1, 2];
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(groups.len(), 2, "fixture must have two κ occasion groups");
+    let stacked = vec![0.1, -0.05, 0.06, -0.04];
+    assert_eq!(stacked.len(), model.n_eta + groups.len() * model.n_kappa);
+
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &WIDE_THETA, &stacked)
+        .expect("#1661: a too-wide ODE IOV model must be analytic");
+    let grad = ode_subject_eta_grad_iov(&model, &subj, &WIDE_THETA, &stacked)
+        .expect("#1661: the IOV inner gradient must be analytic too");
+
+    let pred = |th: &[f64], st: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..model.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..groups.len())
+            .map(|g| {
+                st[model.n_eta + g * model.n_kappa..model.n_eta + (g + 1) * model.n_kappa].to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(&model, &subj, th, &eta_bsv, &kappas)[j]
+    };
+    let he = 1e-6;
+    assert_eq!(sens.obs.len(), grad.len());
+    for (j, (obs, g_in)) in sens.obs.iter().zip(&grad).enumerate() {
+        approx::assert_relative_eq!(
+            obs.f,
+            pred(&WIDE_THETA, &stacked, j),
+            max_relative = 1e-6,
+            epsilon = 1e-9
+        );
+        for k in 0..stacked.len() {
+            let mut sp = stacked.clone();
+            sp[k] += he;
+            let mut sm = stacked.clone();
+            sm[k] -= he;
+            let g = (pred(&WIDE_THETA, &sp, j) - pred(&WIDE_THETA, &sm, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+            approx::assert_relative_eq!(
+                g_in.df_deta[k],
+                obs.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-10
+            );
+        }
+        for m in 0..model.n_theta {
+            let s = he * (1.0 + WIDE_THETA[m].abs());
+            let mut tp = WIDE_THETA.to_vec();
+            tp[m] += s;
+            let mut tm = WIDE_THETA.to_vec();
+            tm[m] -= s;
+            let g = (pred(&tp, &stacked, j) - pred(&tm, &stacked, j)) / (2.0 * s);
+            approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+}
