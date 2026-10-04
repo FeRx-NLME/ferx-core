@@ -27697,6 +27697,10 @@ fn a_level_block_index_renders_back_as_written() {
         ("KM[2 * -K]", "2 * -K"),
         ("KM[(-K) - 1]", "(-K) - 1"),
         ("KM[K != 1 && !B || C <= 2]", "K != 1 && !B || C <= 2"),
+        ("KM[A < B > C >= D]", "A < B > C >= D"),
+        // Tokens no valid index contains still round-trip rather than vanish.
+        ("KM[N.X = {C}]", "N.X = {C}"),
+        ("KM[A\nB]", "A B"),
     ] {
         let toks = tokenize(src).unwrap();
         assert_eq!(render_index_tokens(&toks, 2), want, "{src}");
