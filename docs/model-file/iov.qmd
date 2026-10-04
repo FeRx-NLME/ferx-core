@@ -172,7 +172,22 @@ prints the effective SD at the median arm on the next line:
 A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
 $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.
 `FitResult` carries both as `kappa_weights` (the source text) and
-`kappa_weight_typical` (the median arm size).
+`kappa_weight_typical` (the median arm size). The same block, weight line included,
+appears in `format_summary()` (#1657), and the fit YAML's `omega_iov` entry for the
+kappa adds them as extra keys (#1660):
+
+```yaml
+omega_iov:
+  KAPPA_EMAX:
+    variance: 4.145382
+    sd: 2.036021
+    weight: "NARM"
+    weight_typical: 200.000000
+    sd_at_typical_weight: 0.143968
+    se: 0.412000
+```
+
+`variance` stays the unweighted $\gamma^2$; an unweighted kappa's entry is unchanged.
 
 ### Rules and diagnostics
 

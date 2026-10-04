@@ -275,8 +275,10 @@ diffing two fits, or piping into a report. The summary covers:
   the subject / observation / parameter counts.
 - **Objective function** — OFV, AIC, BIC.
 - **Parameter estimates** — the THETA table with SE and %RSE, OMEGA variances
-  with CV% and off-diagonal correlations, and SIGMA (with CV% for the
-  proportional component). `[FIX]`-flagged parameters show `---` for SE.
+  with CV% and off-diagonal correlations, KAPPA (IOV) variances for a fit with
+  occasion effects (the same rows the fit prints, including a weighted kappa's
+  `weight = …` line), and SIGMA (with CV% for the proportional component).
+  `[FIX]`-flagged parameters show `---` for SE.
 - **Diagnostics** — covariance status, condition number, and η / ε shrinkage.
 - **Run info** — wall time, ferx version, and any fit warnings.
 
