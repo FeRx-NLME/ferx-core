@@ -5553,10 +5553,17 @@ mod tests {
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
                      sd_at_typical_weight: 6.245738\n    se: ~\n";
         assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
-        // The same number the console prints, to its 4 decimals.
+        // The same number the console prints: the YAML's value, read back and
+        // rounded to the console's 4 decimals, is the one on the weight line.
+        let sd_at: f64 = yaml
+            .lines()
+            .find_map(|l| l.strip_prefix("    sd_at_typical_weight: "))
+            .expect("sd_at_typical_weight line")
+            .parse()
+            .expect("numeric sd_at_typical_weight");
         let rows = format_kappa_rows(&w);
-        assert!(rows.contains("SD = 6.2457 at NARM = 4.0000"), "{rows}");
-        assert_eq!(format!("{:.4}", 6.245738_f64), "6.2457");
+        let console = format!("SD = {sd_at:.4} at NARM = 4.0000");
+        assert!(rows.contains(&console), "{console} not in\n{rows}");
 
         // Unweighted kappas (and every ETA): byte-identical to the same fit
         // with no weights at all.
@@ -5573,12 +5580,31 @@ mod tests {
             .collect();
         assert_eq!(stripped, plain);
 
-        // No typical weight: `weight` alone, as the console's fallback line.
-        let mut no_typ = weighted_result();
-        no_typ.kappa_weight_typical = vec![None, None, None];
-        let yaml = yaml_of(&no_typ);
-        let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
-                     weight: \"NARM\"\n    se: ~\n";
-        assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
+        // The reader of the fit YAML (priors from a previous fit) still finds a
+        // weighted kappa's variance and SE past the three new keys.
+        let mut with_se = weighted_result();
+        with_se.se_kappa = Some(vec![0.01, 64.215384, 0.02]);
+        let parsed = crate::io::fit_estimates::parse_estimates_yaml(&yaml_of(&with_se))
+            .expect("parse fit YAML");
+        let k = parsed
+            .iter()
+            .find(|e| e.name == "K_ADD")
+            .expect("K_ADD read back");
+        assert_eq!(k.value, 156.036966);
+        assert_eq!(k.se, Some(64.215384));
+
+        // No usable typical weight (unknown, or a non-positive one from a
+        // hand-built / old bundle): `weight` alone, as the console's fallback.
+        for typical in [None, Some(0.0)] {
+            let mut no_typ = weighted_result();
+            no_typ.kappa_weight_typical = vec![None, typical, None];
+            let yaml = yaml_of(&no_typ);
+            let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
+                         weight: \"NARM\"\n    se: ~\n";
+            assert!(
+                yaml.contains(entry),
+                "{typical:?}: missing\n{entry}\nin\n{yaml}"
+            );
+        }
     }
 }

@@ -281,9 +281,10 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   #1660). `weight` is the source text of `W` (quoted), `weight_typical` the median
   weight over the dataset's subject-occasions, and `sd_at_typical_weight` =
   sqrt(variance / weight_typical), the between-arm SD at that typical arm — the
-  number the console's weight line prints. `variance` and `sd` keep their meaning
-  (the weight-1 γ² and its square root). Without a positive typical weight only
-  `weight` is written. An unweighted kappa's entry carries none of the three.
+  number the console's weight line prints. `variance` and its `cv_pct` / `sd` line
+  keep their meaning (the weight-1 γ² and its CV% or square root). Without a
+  positive typical weight, or when the variance is negative, only `weight` is
+  written. An unweighted kappa's entry carries none of the three.
 - **covariance_method**: which estimator produced the standard errors — `r`, `s`
   or `rsr`. Present only when a covariance matrix was produced; see below.
 
