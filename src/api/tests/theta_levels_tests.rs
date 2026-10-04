@@ -2430,3 +2430,193 @@ mod contrast_refusals {
         assert_eq!(v[17].value.to_bits(), neg_sum.to_bits());
     }
 }
+
+/// #1621: the parse records the data-derived bindings it compiled the model from.
+mod data_bindings {
+    use super::*;
+    use crate::api::{bind_covariate_stats, bind_theta_levels};
+    use crate::parser::model_parser::{DataBindings, LevelContrast};
+
+    /// A level block **and** a symbolic covariate centre, so both halves of
+    /// `DataBindings` are live.
+    fn model() -> String {
+        no_eta_model()
+            .replace("theta PLACEBO[STUDY, TIME]", "theta PLACEBO[STUDY]")
+            .replace(
+                "[structural_model]",
+                "[covariates]\n  WT continuous\n  STUDY categorical\n\n\
+                 [covariate_model]\n  V ~ WT power(center = median) => THETA_V_WT(0.9, 0.01, 5.0)\n\n\
+                 [structural_model]",
+            )
+    }
+
+    /// [`population`] with three studies and a subject weight that differs per
+    /// study (median 70.0).
+    fn pop() -> Population {
+        let mut pop = population(3, 2);
+        for (s, wt) in pop.subjects.iter_mut().zip([60.0, 70.0, 90.0]) {
+            s.covariates.insert("WT".to_string(), wt);
+        }
+        pop.covariate_names.push("WT".to_string());
+        pop
+    }
+
+    /// T1. `CompiledModel::data_bindings()` is exactly what the final parse was
+    /// bound with, in both bind orders, and empty on an unbound parse.
+    ///
+    /// Mutations — stamp only `levels` (the stats half comes back empty); stamp
+    /// `DataBindings::default()` (both halves empty); stamp from the bindings of
+    /// the first, unbound parse (empty again). Each dies on the non-empty /
+    /// equality assertions below.
+    #[test]
+    fn the_parse_stamps_both_halves_in_either_bind_order() {
+        let text = model();
+        let unbound = parse_full_model(&text).unwrap();
+        assert!(unbound.model.data_bindings().is_empty());
+        assert_eq!(*unbound.model.data_bindings(), DataBindings::default());
+
+        let mut seen: Vec<DataBindings> = Vec::new();
+        for levels_first in [true, false] {
+            let mut data = pop();
+            let mut parsed = parse_full_model(&text).unwrap();
+            if levels_first {
+                bind_theta_levels(&mut parsed, &text, &mut data).unwrap();
+                bind_covariate_stats(&mut parsed, &text, &data).unwrap();
+            } else {
+                bind_covariate_stats(&mut parsed, &text, &data).unwrap();
+                bind_theta_levels(&mut parsed, &text, &mut data).unwrap();
+            }
+            let stamped = parsed.model.data_bindings();
+            assert_eq!(stamped.levels, parsed.bindings.levels, "{levels_first}");
+            assert_eq!(
+                stamped.covariate_stats, parsed.bindings.covariate_stats,
+                "{levels_first}"
+            );
+            let placebo = &stamped.levels["PLACEBO"];
+            assert_eq!(placebo.labels, ["STUDY=1", "STUDY=2", "STUDY=3"]);
+            assert_eq!(placebo.groups, [0, 0, 0]);
+            assert_eq!(placebo.contrast, LevelContrast::SumToZero);
+            assert_eq!(stamped.covariate_stats["WT"].median, 70.0);
+            assert!(!stamped.is_empty());
+            seen.push(stamped.clone());
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+}
+
+/// #1621 T7: a fitted binding that lists a level more than once is refused.
+mod from_fit_repeated_labels {
+    use super::*;
+    use crate::api::bind_theta_levels_from_fit;
+    use crate::parser::model_parser::LevelBindings;
+
+    /// Two level blocks: `PLACEBO[STUDY, TIME]` is block 1 (declared first),
+    /// `EFF[STUDY]` block 2.
+    fn two_block_model() -> String {
+        no_eta_model()
+            .replace(
+                "theta TVV(10.0, 0.1, 500.0)",
+                "theta TVV(10.0, 0.1, 500.0)\n  theta EFF[STUDY](0.0, -10.0, 10.0)",
+            )
+            .replace("CL = TVCL + PLACEBO", "CL = TVCL + PLACEBO + EFF")
+    }
+
+    fn fitted(text: &str) -> LevelBindings {
+        let mut pop = population(2, 2);
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, &mut pop).unwrap();
+        parsed.bindings.levels
+    }
+
+    fn bind(text: &str, design: &mut Population, fitted: &LevelBindings) -> Result<usize, String> {
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, text, design, fitted)?;
+        Ok(parsed.model.n_theta)
+    }
+
+    /// Repeat `label` (with its group) at the end of `block`'s labels.
+    fn repeat(b: &mut LevelBindings, block: &str, label: &str) {
+        let binding = b.get_mut(block).unwrap();
+        let i = binding.labels.iter().position(|l| l == label).unwrap();
+        let g = binding.groups[i];
+        binding.labels.push(label.to_string());
+        binding.groups.push(g);
+    }
+
+    /// The refusal must blame the bindings, never the design.
+    fn assert_not_about_the_design(err: &str) {
+        assert!(
+            !err.contains("design") && !err.contains("never observed"),
+            "{err}"
+        );
+    }
+
+    /// T7. One repeated label is refused naming the block, its columns and the
+    /// label; the same bindings without the repeat bind (the control); several
+    /// repeats list each label once; a repeat in block 2 of 2 names block 2 only
+    /// and writes nothing to the population.
+    ///
+    /// Mutations — delete the repeat check (the bind goes `Ok` with 6 θ against the
+    /// fit's 5, one per label) and every arm dies on `unwrap_err`. Delete either sentence of
+    /// the message and the substring assertions die: the first sentence carries
+    /// the block, the count and the labels, the second the cause.
+    #[test]
+    fn a_repeated_label_in_the_fits_bindings_is_refused() {
+        let text = no_eta_model();
+        let clean = fitted(&text);
+        assert_eq!(bind(&text, &mut population(2, 2), &clean), Ok(5));
+
+        let mut once = clean.clone();
+        repeat(&mut once, "PLACEBO", "STUDY=2,TIME=1");
+        let err = bind(&text, &mut population(2, 2), &once).unwrap_err();
+        assert!(
+            err.contains(
+                "theta PLACEBO[STUDY, TIME]: the fit's level bindings list 1 level(s) more \
+                 than once: `STUDY=2,TIME=1`."
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "Each level has exactly one fitted theta, so the bindings are malformed — \
+                 they are not the ones the fit recorded."
+            ),
+            "{err}"
+        );
+        assert_not_about_the_design(&err);
+
+        let mut several = clean.clone();
+        repeat(&mut several, "PLACEBO", "STUDY=2,TIME=2");
+        repeat(&mut several, "PLACEBO", "STUDY=1,TIME=1");
+        repeat(&mut several, "PLACEBO", "STUDY=2,TIME=2");
+        let err = bind(&text, &mut population(2, 2), &several).unwrap_err();
+        assert!(
+            err.contains(
+                "list 2 level(s) more than once: `STUDY=2,TIME=2`, `STUDY=1,TIME=1`. Each"
+            ),
+            "{err}"
+        );
+        assert_not_about_the_design(&err);
+
+        let text2 = two_block_model();
+        let clean2 = fitted(&text2);
+        assert!(bind(&text2, &mut population(2, 2), &clean2).is_ok());
+        let mut second = clean2.clone();
+        repeat(&mut second, "EFF", "STUDY=1");
+        let mut design = population(2, 2);
+        let before = design.clone();
+        let err = bind(&text2, &mut design, &second).unwrap_err();
+        assert!(
+            err.starts_with("theta EFF[STUDY]: the fit's level bindings list 1"),
+            "{err}"
+        );
+        assert!(err.contains("`STUDY=1`."), "{err}");
+        assert!(!err.contains("PLACEBO"), "{err}");
+        assert_not_about_the_design(&err);
+        assert_eq!(design.covariate_names, before.covariate_names);
+        for (a, b) in design.subjects.iter().zip(&before.subjects) {
+            assert_eq!(a.covariates.len(), b.covariates.len(), "{}", a.id);
+            assert!(!a.covariates.contains_key("__level_PLACEBO"), "{}", a.id);
+        }
+    }
+}

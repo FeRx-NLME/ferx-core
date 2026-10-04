@@ -4591,6 +4591,14 @@ impl CompiledModel {
         &self.indiv_param_partials.theta_blocks
     }
 
+    /// The data-derived bindings (level blocks, covariate statistics) this
+    /// model was parsed with (#1621). Set only by the parse, so it always
+    /// describes the θ layout and covariate centres the model was compiled
+    /// with; empty for a model with neither, or one never bound.
+    pub fn data_bindings(&self) -> &crate::parser::model_parser::DataBindings {
+        &self.indiv_param_partials.data_bindings
+    }
+
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
@@ -7007,6 +7015,18 @@ pub struct FitResult {
     /// saved before #1643, and on a hand-built result; consumers then fall
     /// back to the log-normal CV%.
     pub kappa_param_types: Vec<EtaParamType>,
+    /// The data-derived bindings the fitted model was compiled from (#1621):
+    /// each θ level block's observed levels and contrast, and the covariate
+    /// statistics behind symbolic `[covariate_model]` centres. Rebuilding the
+    /// fitted model on other data — a design for `simulate`, a reloaded
+    /// `.fitrx` — needs exactly these, not ones re-resolved from that data.
+    /// Empty for a model with no data-derived binding, and on a `.fitrx`
+    /// bundle saved before #1621; omitted from JSON when empty.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::parser::model_parser::DataBindings::is_empty"
+    )]
+    pub data_bindings: crate::parser::model_parser::DataBindings,
     /// Per-theta transformation (Identity / Log / Logit), parallel to `theta`.
     /// Tells the R layer whether a theta must be back-transformed before display.
     pub theta_transform: Vec<ThetaTransform>,

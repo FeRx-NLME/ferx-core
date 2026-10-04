@@ -2888,6 +2888,7 @@ fn fit_inner(
         environment: crate::environment::detect(),
         eta_param_info: model.eta_param_info.clone(),
         kappa_param_types: model.kappa_param_types.clone(),
+        data_bindings: model.data_bindings().clone(),
         theta_transform: model.theta_transform.clone(),
         sigma_types: model
             .error_spec

@@ -353,23 +353,25 @@ new time grid, another study, or only more subjects per study, which can change
 the resolved contrast) would read the fitted values at the wrong positions.
 Nothing refuses this when the design has as many levels as the fit: the θ
 vector then has the right length, so the length check below cannot see it.
-Bind the design against the fit's own bindings instead. They are
-`parsed.bindings.levels` right after `bind_theta_levels` ran on the fit data, so
-keep them with the fit:
+Bind the design against the fit's own bindings instead. The fit carries them:
+`result.data_bindings` holds the level bindings and the `[covariate_model]`
+statistics the fitted model was compiled from, and a `.fitrx` bundle saves and
+reloads them, so the same code works on `load_fit(path)?.fit`
+([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)):
 
 ```rust
 use ferx_core::api::read_population_for_simulation;
 use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
 
-// Continuing the example above: keep the fit's bindings with `result`.
-let fitted_levels = parsed.bindings.levels.clone();
-
+// Continuing the example above (or with `result = load_fit(path)?.fit`).
 let mut design_parsed = parse_full_model_file(Path::new("model.ferx"))?;
 let (mut design, _) = read_population_for_simulation(
     &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
     None, None, &design_parsed.column_map,
 )?;
-bind_theta_levels_from_fit(&mut design_parsed, &model_text, &mut design, &fitted_levels)?;
+// The fit's covariate statistics, not the design's (`center = median` and friends).
+design_parsed.bindings.covariate_stats = result.data_bindings.covariate_stats.clone();
+bind_theta_levels_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings.levels)?;
 let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
 let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
 ```

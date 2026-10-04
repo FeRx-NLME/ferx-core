@@ -2480,6 +2480,41 @@ pub struct ParseBindings {
     pub model_dir: Option<std::path::PathBuf>,
 }
 
+/// The data-derived bindings a compiled model was parsed with (#1621).
+///
+/// The two data-derived halves of [`ParseBindings`], recorded on the model by
+/// the parse itself, read back through [`CompiledModel::data_bindings`], and
+/// carried by a fit into `FitResult::data_bindings` and every persisted form of
+/// it (`.fitrx`, `fit.json`). They travel as one value for the reason
+/// `ParseBindings` gives: a caller that kept one half and dropped the other
+/// would rebuild a model with a different θ layout or different covariate
+/// centres than the one that was fitted.
+///
+/// `model_dir` is deliberately not here — it is a path on the fitting
+/// machine, not something the data decided.
+///
+/// `#[non_exhaustive]`: build one with `DataBindings::default()` and assign
+/// the fields.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DataBindings {
+    /// Observed levels of each `theta NAME[COL, ...]` block.
+    #[serde(default)]
+    pub levels: LevelBindings,
+    /// Covariate summary statistics behind symbolic `center = median` and friends.
+    #[serde(default)]
+    pub covariate_stats: CovariateStatBindings,
+}
+
+impl DataBindings {
+    /// True when the model was parsed with no data-derived binding at all —
+    /// a model with no level block and no symbolic covariate centre, or one
+    /// that was never bound.
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty() && self.covariate_stats.is_empty()
+    }
+}
+
 /// [`parse_full_model`] with every data-derived binding supplied.
 pub fn parse_full_model_with(
     content: &str,
@@ -5448,6 +5483,12 @@ pub fn parse_full_model_with(
             ));
         }
     }
+
+    // Record what this model was compiled from (#1621), so a fit can carry it.
+    model.indiv_param_partials.data_bindings = DataBindings {
+        levels: bindings.levels.clone(),
+        covariate_stats: bindings.covariate_stats.clone(),
+    };
 
     Ok(ParsedModel {
         model,
@@ -19279,20 +19320,27 @@ fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
 /// η *is* the mean of that study's own timepoint levels. So the convention is
 /// not optional, and it has to read the variance structure rather than only
 /// scanning for a fixed intercept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialized as its DSL token (`auto`, `sum_to_zero`, `sum_to_zero_within`,
+/// `ref`, `none`) — the spelling `contrast = ...` takes, and the one a
+/// persisted fit's `data_bindings` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LevelContrast {
     /// Sum-to-zero, with the grouping chosen from the model + data: within the
     /// block's leading columns when the block shares an additive scale with a
     /// random effect and those columns identify subjects one-to-one, globally
     /// otherwise. The default.
     #[default]
+    #[serde(rename = "auto")]
     Auto,
     /// Sum-to-zero over every level of the block.
+    #[serde(rename = "sum_to_zero")]
     SumToZero,
     /// Sum-to-zero within each combination of the block's leading columns
     /// (all but the last). Leaves each group's mean to be carried by that
     /// group's random effect, which is what an unstructured placebo effect
     /// under between-study variability intends.
+    #[serde(rename = "sum_to_zero_within")]
     SumToZeroWithin,
     /// Dummy coding (R's `contr.treatment`): the block's first level is held at
     /// exactly 0 and every other θ is that level's *difference from it*, with
@@ -19306,9 +19354,11 @@ pub enum LevelContrast {
     /// one per group: only [`SumToZeroWithin`](Self::SumToZeroWithin) splits the
     /// levels into contrast groups, so `contrast = ref` on `[STUDY, TIME]` pins
     /// one cell globally rather than each study's own first timepoint.
+    #[serde(rename = "ref")]
     Ref,
     /// No constraint. Every level is estimated; the caller asserts the model is
     /// identified some other way (e.g. it declares no intercept).
+    #[serde(rename = "none")]
     Unconstrained,
 }
 
@@ -19398,7 +19448,7 @@ pub(crate) struct ScaleShare {
 }
 
 /// The observed levels of one level block, as discovered from the data.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LevelBinding {
     /// Level labels in level order, e.g. `STUDY=7,TIME=4`.
     pub labels: Vec<String>,
@@ -25751,6 +25801,10 @@ pub struct IndivParamPartials {
     /// post-dose sample). Empty for ODE / compartment-free models and for
     /// hand-built fixtures.
     pub(crate) const_pk_slots: Vec<usize>,
+    /// The data-derived bindings the parse compiled this model from (#1621).
+    /// Written only by `parse_full_model_with`; read through
+    /// [`crate::CompiledModel::data_bindings`]. Empty for hand-built fixtures.
+    pub(crate) data_bindings: DataBindings,
 }
 
 impl IndivParamPartials {
@@ -25766,6 +25820,7 @@ impl IndivParamPartials {
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
+            data_bindings: DataBindings::default(),
         }
     }
 
@@ -25871,6 +25926,7 @@ fn build_indiv_param_partials(
         indiv_param_program: None,
         theta_blocks: ThetaBlocks::empty(),
         const_pk_slots: Vec::new(),
+        data_bindings: DataBindings::default(),
     }
 }
 

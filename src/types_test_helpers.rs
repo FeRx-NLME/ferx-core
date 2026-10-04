@@ -345,6 +345,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         environment: crate::environment::detect(),
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        data_bindings: Default::default(),
         theta_transform: Vec::new(),
         sigma_types: Vec::new(),
         cov_eigenvalues: None,
@@ -497,6 +498,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
             },
         ],
         kappa_param_types: Vec::new(),
+        data_bindings: Default::default(),
         theta_transform: vec![
             ThetaTransform::Log,
             ThetaTransform::Log,

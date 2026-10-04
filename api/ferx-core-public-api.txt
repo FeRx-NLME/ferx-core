@@ -1300,6 +1300,11 @@ pub ferx_core::parser::model_parser::LevelContrast::SumToZero
 pub ferx_core::parser::model_parser::LevelContrast::SumToZeroWithin
 pub ferx_core::parser::model_parser::LevelContrast::Unconstrained
 pub struct ferx_core::parser::model_parser::CtmmGeneratorProgram
+#[non_exhaustive] pub struct ferx_core::parser::model_parser::DataBindings
+pub ferx_core::parser::model_parser::DataBindings::covariate_stats: ferx_core::parser::covariate_model::CovariateStatBindings
+pub ferx_core::parser::model_parser::DataBindings::levels: ferx_core::parser::model_parser::LevelBindings
+impl ferx_core::parser::model_parser::DataBindings
+pub fn ferx_core::parser::model_parser::DataBindings::is_empty(&self) -> bool
 pub struct ferx_core::parser::model_parser::IndivParamPartials
 impl ferx_core::parser::model_parser::IndivParamPartials
 pub fn ferx_core::parser::model_parser::IndivParamPartials::empty() -> Self
@@ -2647,6 +2652,7 @@ impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
@@ -3001,6 +3007,7 @@ pub ferx_core::types::FitResult::covariance_wall_time_secs: f64
 pub ferx_core::types::FitResult::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::covariate_relations: alloc::vec::Vec<ferx_core::CovariateRelationEstimate>
 pub ferx_core::types::FitResult::covariate_table: core::option::Option<ferx_core::CovariateTable>
+pub ferx_core::types::FitResult::data_bindings: ferx_core::parser::model_parser::DataBindings
 pub ferx_core::types::FitResult::data_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::data_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::dw_statistic: f64
@@ -4050,6 +4057,7 @@ impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
@@ -4457,6 +4465,7 @@ pub ferx_core::FitResult::covariance_wall_time_secs: f64
 pub ferx_core::FitResult::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::covariate_relations: alloc::vec::Vec<ferx_core::CovariateRelationEstimate>
 pub ferx_core::FitResult::covariate_table: core::option::Option<ferx_core::CovariateTable>
+pub ferx_core::FitResult::data_bindings: ferx_core::parser::model_parser::DataBindings
 pub ferx_core::FitResult::data_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::data_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::dw_statistic: f64

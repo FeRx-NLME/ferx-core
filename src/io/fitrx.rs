@@ -15,10 +15,11 @@
 //!
 //! See `docs/file-formats/fitrx.qmd` for the field-by-field schema.
 
+use crate::parser::model_parser::{DataBindings, LevelBinding};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -238,6 +239,52 @@ struct FitWire {
     #[cfg(feature = "nn")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     neural_networks: Option<Vec<crate::types::NeuralNetworkInfo>>,
+    /// The fitted model's data-derived bindings (#1621). Absent on bundles saved
+    /// before the field existed and for a model with none; both load empty.
+    #[serde(default, skip_serializing_if = "DataBindingsWire::is_empty")]
+    data_bindings: DataBindingsWire,
+}
+
+/// Wire form of [`DataBindings`]: the same fields, keyed by `BTreeMap` so
+/// `fit.json` is byte-deterministic (the in-memory maps are `HashMap`s).
+#[derive(Serialize, Deserialize, Default)]
+struct DataBindingsWire {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    levels: BTreeMap<String, LevelBinding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    covariate_stats: BTreeMap<String, CovariateSummary>,
+}
+
+impl DataBindingsWire {
+    fn is_empty(&self) -> bool {
+        self.levels.is_empty() && self.covariate_stats.is_empty()
+    }
+}
+
+impl From<&DataBindings> for DataBindingsWire {
+    fn from(b: &DataBindings) -> Self {
+        Self {
+            levels: b
+                .levels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            covariate_stats: b
+                .covariate_stats
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl From<DataBindingsWire> for DataBindings {
+    fn from(w: DataBindingsWire) -> Self {
+        let mut b = DataBindings::default();
+        b.levels = w.levels.into_iter().collect();
+        b.covariate_stats = w.covariate_stats.into_iter().collect();
+        b
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -759,6 +806,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         } else {
             Some(r.neural_networks.clone())
         },
+        data_bindings: DataBindingsWire::from(&r.data_bindings),
     }
 }
 
@@ -2074,6 +2122,7 @@ fn wire_to_fit_result(
         input_columns: w.input_columns,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
+        data_bindings: w.data_bindings.into(),
         // The covariate table is not persisted in the .fitrx bundle (yet); a
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
@@ -2981,6 +3030,147 @@ mod tests {
             err.contains("iov.kappa_param_types (2) does not match iov.kappa_names (1)"),
             "{err}"
         );
+    }
+
+    /// Bindings that exercise every shape the wire carries: a one-level block
+    /// under `none`, a `sum_to_zero_within` block with two groups, a `ref` block,
+    /// and two covariates whose statistics are not exactly representable in
+    /// decimal (so a lossy float path shows up as a bit difference).
+    fn sample_data_bindings() -> crate::parser::model_parser::DataBindings {
+        use crate::parser::model_parser::{DataBindings, LevelBinding, LevelContrast};
+        let level = |labels: &[&str], groups: &[usize], contrast| LevelBinding {
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            groups: groups.to_vec(),
+            contrast,
+        };
+        let mut b = DataBindings::default();
+        b.levels.insert(
+            "A_ONE".into(),
+            level(&["STUDY=1"], &[0], LevelContrast::Unconstrained),
+        );
+        b.levels.insert(
+            "B_WITHIN".into(),
+            level(
+                &[
+                    "STUDY=1,TIME=1",
+                    "STUDY=1,TIME=2",
+                    "STUDY=2,TIME=1",
+                    "STUDY=2,TIME=2",
+                ],
+                &[0, 0, 1, 1],
+                LevelContrast::SumToZeroWithin,
+            ),
+        );
+        b.levels.insert(
+            "C_REF".into(),
+            level(&["ARM=0", "ARM=1"], &[0, 0], LevelContrast::Ref),
+        );
+        b.covariate_stats.insert(
+            "WT".into(),
+            CovariateSummary {
+                median: 71.475,
+                mean: 215.2 / 3.0,
+                min: 0.1 + 0.2,
+                max: 90.2,
+                mode: 61.3,
+                levels: vec![0.1 + 0.2, 61.3, 90.2],
+            },
+        );
+        b.covariate_stats.insert(
+            "AGE".into(),
+            CovariateSummary {
+                median: 1.0 / 3.0,
+                mean: std::f64::consts::PI,
+                min: 1e-300,
+                max: 1e300,
+                mode: 2.0 / 3.0,
+                levels: vec![1e-300, 1.0 / 3.0, 1e300],
+            },
+        );
+        b
+    }
+
+    /// #1621 T3. The data-derived bindings round-trip through a `.fitrx`
+    /// bundle exactly (`f64` fields compared by `==` through `PartialEq`, so a
+    /// lossy float path fails), and `fit.json` carries them with their blocks
+    /// in sorted order and the contrast as its DSL token.
+    ///
+    /// Mutations — omit the field from `build_fit_wire` (write
+    /// `DataBindingsWire::default()`) or map it to `Default` on load: the
+    /// loaded bindings are empty and the `assert_eq!` dies.
+    #[test]
+    fn roundtrip_data_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.fitrx");
+        let mut r = minimal_fit_result();
+        r.data_bindings = sample_data_bindings();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let text = {
+            use std::io::Read as _;
+            let mut f = archive.by_name("fit.json").unwrap();
+            let mut s = String::new();
+            f.read_to_string(&mut s).unwrap();
+            s
+        };
+        let wire: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let lv = &wire["data_bindings"]["levels"];
+        assert_eq!(lv["A_ONE"]["contrast"], "none");
+        assert_eq!(lv["B_WITHIN"]["contrast"], "sum_to_zero_within");
+        assert_eq!(lv["B_WITHIN"]["groups"], serde_json::json!([0, 0, 1, 1]));
+        assert_eq!(lv["C_REF"]["contrast"], "ref");
+        // `BTreeMap` on the wire: blocks in sorted order, whatever the
+        // in-memory `HashMap` iterates in.
+        let (a, b, c) = (
+            text.find("\"A_ONE\"").unwrap(),
+            text.find("\"B_WITHIN\"").unwrap(),
+            text.find("\"C_REF\"").unwrap(),
+        );
+        assert!(a < b && b < c, "{text}");
+        let stats = &text[text.find("\"covariate_stats\"").unwrap()..];
+        assert!(stats.find("\"AGE\"").unwrap() < stats.find("\"WT\"").unwrap());
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.data_bindings, r.data_bindings);
+        assert_eq!(
+            loaded.fit.data_bindings.covariate_stats["AGE"]
+                .mean
+                .to_bits(),
+            std::f64::consts::PI.to_bits()
+        );
+    }
+
+    /// #1621 T4. A bundle saved before #1621 — and any fit whose model has no
+    /// data-derived binding — has no `data_bindings` key: the field is omitted
+    /// when empty, and a wire without it loads with empty bindings.
+    ///
+    /// Mutation — drop `#[serde(default)]` from `FitWire::data_bindings`:
+    /// `from_value` fails with a missing field and this dies.
+    #[test]
+    fn fit_wire_missing_data_bindings_loads_empty() {
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("data_bindings").is_none(),
+            "an empty binding must not be written"
+        );
+
+        let mut r = minimal_fit_result();
+        r.data_bindings = sample_data_bindings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("data_bindings")
+                .is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert!(reloaded.data_bindings.is_empty());
+        let b: crate::parser::model_parser::DataBindings = reloaded.data_bindings.into();
+        assert!(b.is_empty());
     }
 
     #[test]

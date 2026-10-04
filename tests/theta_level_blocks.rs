@@ -1149,3 +1149,179 @@ fn listing_the_index_column_in_covariate_names_changes_no_bit_of_the_fit() {
     assert_eq!(bits(&now.theta), bits(&before.theta), "theta");
     assert_eq!(now.covariate_names, ["STUDY", "PLA_IDX"]);
 }
+
+/// #1621: a level block **and** a `center = median` covariate centre, so a fit
+/// carries both halves of its data-derived bindings.
+const BINDINGS_MODEL: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL + PLACEBO
+  V  = TVV * exp(ETA_V)
+
+[covariates]
+  WT continuous
+  STUDY categorical
+
+[covariate_model]
+  V ~ WT power(center = median) => THETA_V_WT(0.9, 0.01, 5.0)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// Six subjects, three studies, two doses each (0 h, 12 h); WT median 71.475.
+fn bindings_fit_data() -> String {
+    let wts = [61.3, 70.85, 72.1, 80.4, 55.55, 90.2];
+    bindings_rows(
+        &wts.iter()
+            .enumerate()
+            .map(|(i, &w)| (i / 2 + 1, w))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Three subjects in studies 2 and 3 only, all heavier than the fit's: on its
+/// own data the design would bind two levels and a WT median of 95.0.
+fn bindings_design_data() -> String {
+    bindings_rows(&[(2, 95.0), (2, 101.3), (3, 88.8)])
+}
+
+fn bindings_rows(subjects: &[(usize, f64)]) -> String {
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,MDV,CMT,STUDY,WT\n");
+    for (i, &(study, wt)) in subjects.iter().enumerate() {
+        let id = i + 1;
+        for t in [0, 12] {
+            csv.push_str(&format!("{id},{t},0,100,1,1,1,{study},{wt}\n"));
+        }
+        for t in [1, 2, 4, 13, 14] {
+            csv.push_str(&format!("{id},{t},1.0,0,0,0,1,{study},{wt}\n"));
+        }
+    }
+    csv
+}
+
+/// Simulate the design under the fit's bindings `b`: the statistics go into the
+/// re-parse's bindings, then the levels bind from the fit — the from-fit path a
+/// reloaded `.fitrx` takes.
+fn simulate_design_from(
+    b: &ferx_core::parser::model_parser::DataBindings,
+    design_path: &std::path::Path,
+    theta: &[f64],
+) -> (usize, Vec<f64>) {
+    let mut pop =
+        ferx_core::io::datareader::read_nonmem_csv(design_path, None, None).expect("design");
+    let mut parsed = ferx_core::parser::model_parser::parse_full_model(BINDINGS_MODEL).unwrap();
+    parsed.bindings.covariate_stats = b.covariate_stats.clone();
+    ferx_core::api::bind_theta_levels_from_fit(&mut parsed, BINDINGS_MODEL, &mut pop, &b.levels)
+        .expect("bind the design from the fit");
+    let mut params = parsed.model.default_params.clone();
+    params.theta = theta.to_vec();
+    let rows =
+        ferx_core::api::simulate_with_seed(&parsed.model, &pop, &params, 2, 7).expect("simulate");
+    (parsed.model.n_theta, rows.iter().map(|r| r.ipred).collect())
+}
+
+/// #1621 T6. A fit through the file entry point carries its data-derived
+/// bindings; they survive `save_fit` → `load_fit`; and the design simulated from
+/// the reloaded bindings is bit-identical to the design simulated from the live
+/// ones. One analytic 1-cpt predictor, value path only; no gradient is involved
+/// (`outer_maxiter = 0`, no covariance step).
+///
+/// Straddle control, same test: the design bound on *its own* data gets a
+/// different θ layout (2 levels, so 4 θ against the fit's 5) and a different WT
+/// median (95.0 against 71.475), and its WT median alone moves the worst ipred
+/// by 0.2829 relative (measured) — so bit-identity above is a claim about
+/// bindings that matter. The bound is 0.2, ~30 % headroom.
+///
+/// Mutations — `fit.rs` copies `DataBindings::default()` into the result, or
+/// the parse stamp drops `covariate_stats`: the reloaded bindings are empty (or
+/// lack the statistics), the bindings assertions die, and the from-fit design
+/// refuses to bind or to simulate.
+#[test]
+fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
+    let (dir, model_path, data_path) = write_case(BINDINGS_MODEL, &bindings_fit_data());
+    let design_path = dir.path().join("design.csv");
+    std::fs::write(&design_path, bindings_design_data()).unwrap();
+
+    let opts = ferx_core::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = ferx_core::api::fit_from_files(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+        None,
+        Some(opts),
+    )
+    .expect("fit");
+    let live = &result.data_bindings;
+    assert_eq!(
+        live.levels["PLACEBO"].labels,
+        ["STUDY=1", "STUDY=2", "STUDY=3"]
+    );
+    assert_eq!(live.covariate_stats["WT"].median, 71.475);
+    assert_eq!(result.theta.len(), 5);
+
+    let fitrx = dir.path().join("fit.fitrx");
+    let pop = ferx_core::io::datareader::read_nonmem_csv(&data_path, None, None).expect("fit data");
+    ferx_core::io::fitrx::save_fit(
+        &result,
+        &pop,
+        BINDINGS_MODEL,
+        &fitrx,
+        ferx_core::io::fitrx::SaveFitOptions::default(),
+    )
+    .expect("save");
+    let loaded = ferx_core::io::fitrx::load_fit(&fitrx).expect("load");
+    assert_eq!(loaded.fit.data_bindings, *live);
+
+    // A distinctive θ, so every level and the WT exponent are live.
+    let mut theta: Vec<f64> = (0..5).map(|i| 0.3 + 0.17 * i as f64).collect();
+    theta[0] = 2.3;
+    theta[3] = 12.0; // TVV
+    assert_eq!(result.theta_names[3], "TVV");
+
+    let (n_live, a) = simulate_design_from(live, &design_path, &theta);
+    let (n_loaded, b) = simulate_design_from(&loaded.fit.data_bindings, &design_path, &theta);
+    assert_eq!((n_live, n_loaded), (5, 5));
+    assert_eq!(a.len(), 30);
+    assert_eq!(a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(x.is_finite() && *x > 0.0, "row {i}: {x}");
+        assert_eq!(x.to_bits(), y.to_bits(), "row {i}: {x} vs {y}");
+    }
+
+    // Control: what the design resolves on its own.
+    let mut own_pop =
+        ferx_core::io::datareader::read_nonmem_csv(&design_path, None, None).expect("design");
+    let mut own = ferx_core::parser::model_parser::parse_full_model(BINDINGS_MODEL).unwrap();
+    ferx_core::api::bind_theta_levels(&mut own, BINDINGS_MODEL, &mut own_pop).unwrap();
+    ferx_core::api::bind_covariate_stats(&mut own, BINDINGS_MODEL, &own_pop).unwrap();
+    let own_b = own.model.data_bindings();
+    assert_eq!(own.model.n_theta, 4);
+    assert_eq!(own_b.covariate_stats["WT"].median, 95.0);
+    assert_ne!(own_b, live);
+    // Same fitted levels, the design's own WT statistics: the ipred moves.
+    let mut mixed = live.clone();
+    mixed.covariate_stats = own_b.covariate_stats.clone();
+    let (_, c) = simulate_design_from(&mixed, &design_path, &theta);
+    let mut worst = 0.0f64;
+    for (x, y) in a.iter().zip(&c) {
+        assert!(y.is_finite(), "{y}");
+        worst = worst.max(((x - y) / x).abs());
+    }
+    assert!(
+        worst > 0.2,
+        "design-own WT statistics moved ipred by only {worst}"
+    );
+}
