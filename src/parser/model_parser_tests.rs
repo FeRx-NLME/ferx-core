@@ -12225,6 +12225,15 @@ fn test_classify_if_else_unanimous_lognormal() {
         .unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
     assert_eq!(cl_info.individual_param_name, "CL");
+    // The unanimous pattern still names its θ (#1669 review finding 4).
+    assert_eq!(cl_info.linked_theta.as_deref(), Some("TVCL"));
+
+    // ... and its transform: unanimous `exp(THETA + ETA)` packs TVCL on the log
+    // scale, exactly as the same line outside an `if` does.
+    let model = minimal_model_with_indiv(
+        "  if (TVCL > 1) {\n    CL = exp(TVCL + ETA_CL)\n  } else {\n    CL = exp(TVCL + ETA_CL)\n  }\n  V = TVV * exp(ETA_V)",
+    );
+    assert_eq!(model.theta_transform[0], crate::types::ThetaTransform::Log);
 }
 
 #[test]
@@ -28230,17 +28239,36 @@ fn eta_scale_cells_the_patterns_missed() {
         let want: Vec<(String, _)> = want.iter().map(|(p, t)| (p.to_string(), *t)).collect();
         assert_eq!(eta_entries(&m, eta), want, "{label}");
     }
-    // The intermediate keeps the θ its pattern names, now on a log-normal ETA.
-    let m = eta_scale_model(
+    // The same model written inline and through an intermediate (#1669 review
+    // finding 2). Inline, the `exp(THETA + ETA)` pattern names TVCL and packs it
+    // on the log scale. Through the intermediate the Pattern-3 answer is
+    // resolved by use to log-normal, and the pattern's θ and Identity transform
+    // describe the intermediate, so both are dropped rather than reported as a
+    // contradiction. Dies under: dropping the reset in `emit_eta_infos`.
+    use crate::types::ThetaTransform;
+    let inline = eta_scale_model("  CL = exp(TVCL + ETA_CL)\n  V = TVV * exp(ETA_V)", "");
+    let alias = eta_scale_model(
         "  ECL = TVCL + ETA_CL\n  CL = exp(ECL)\n  V = TVV * exp(ETA_V)",
         "",
     );
-    let info = m
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
-    assert_eq!(info.linked_theta.as_deref(), Some("TVCL"));
+    let cl = |m: &CompiledModel| {
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        (i.param_type, i.linked_theta.clone(), m.theta_transform[0])
+    };
+    assert_eq!(
+        cl(&inline),
+        (LogNormal, Some("TVCL".into()), ThetaTransform::Log),
+        "inline"
+    );
+    assert_eq!(
+        cl(&alias),
+        (LogNormal, None, ThetaTransform::Identity),
+        "alias"
+    );
 
     // The same rule from the other side, and the one cell where an answer went
     // from `Additive` to `Custom`: `V = TVV + ETA_V` that no block reads, only
