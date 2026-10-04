@@ -2620,3 +2620,419 @@ mod from_fit_repeated_labels {
         }
     }
 }
+
+// ── #1649 / #1650: when a level block absorbs a random effect ───────────────
+//
+// The labels of every cell come from an oracle, not from hand: the part of each
+// subject's η sensitivity that no fixed effect can reproduce, `P⊥_X Z`, with
+// `X` every θ column under the contrast and `Z` the per-subject η columns. A
+// rank of 0 where the block-free baseline is positive means ω is not informed
+// by the data at all — the case the binder must refuse.
+mod absorption {
+    use super::readout_share::{cf_model, cf_pop, scaling_model, BASE, EMAXY, T6};
+    use super::*;
+    use crate::api::bind_theta_levels_from_fit;
+    use crate::parser::model_parser::{LevelBindings, LevelContrast};
+    use nalgebra::DMatrix;
+
+    /// Rank threshold on singular values normalised by `‖Z‖_F`; the gap it
+    /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
+    const RANK_TOL: f64 = 1e-6;
+
+    /// `[STUDY, VISIT]`: VISIT 1 holds TIME 0, 1, 2 and VISIT 2 holds 4, 8, 12,
+    /// so the block does not resolve a subject's observations.
+    pub(super) fn visit_pop(n: usize, per: usize) -> Population {
+        let mut p = cf_pop(n, per, &T6);
+        for s in p.subjects.iter_mut() {
+            s.obs_covariates = T6
+                .iter()
+                .map(|t| {
+                    let mut m = HashMap::new();
+                    m.insert("VISIT".to_string(), if *t < 3.0 { 1.0 } else { 2.0 });
+                    m
+                })
+                .collect();
+        }
+        p
+    }
+
+    /// The model shapes of the #1649 plan. Every one carries `ETA_E0`.
+    const SHAPES: [&str; 8] = ["H1", "G", "H2", "H5", "H6", "S1", "S2", "H7"];
+
+    /// Shape `tag` with the block on `cols` and `contrast` (`""` = auto).
+    pub(super) fn shape(tag: &str, cols: &str, contrast: &str) -> String {
+        let cf = |ip: String, y: String| cf_model(contrast, cols, &ip, &y);
+        let pk = |ip: &str| {
+            let modifier = if contrast.is_empty() {
+                String::new()
+            } else {
+                format!(", contrast = {contrast}")
+            };
+            scaling_model(ip).replace(
+                "PLACEBO[STUDY, TIME]",
+                &format!("PLACEBO[{cols}{modifier}]"),
+            )
+        };
+        match tag {
+            "H1" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0"),
+                format!("E0 + {EMAXY}"),
+            ),
+            "G" => cf(
+                "  EMAX = TVEMAX + PLACEBO + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0".into(),
+                format!("E0 + {EMAXY}"),
+            ),
+            "H2" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "H5" => cf(
+                format!("{BASE}  E0 = TVE0 * exp(ETA_E0)"),
+                format!("E0 * exp(PLACEBO) + {EMAXY}"),
+            ),
+            "H6" => cf(
+                "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0".into(),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "S1" => pk("  CL = TVEMAX\n  V = TVET50 * exp(ETA_E0)\n  E0 = TVE0"),
+            "S2" => pk("  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0"),
+            "H7" => cf(
+                format!("{BASE}  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)"),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            _ => unreachable!("{tag}"),
+        }
+    }
+
+    /// Bind `text` against a copy of `pop`: the resolved contrast and the
+    /// block's free-θ count, or the refusal.
+    pub(super) fn try_bind(text: &str, pop: &Population) -> Result<(LevelContrast, usize), String> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text)?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p)?;
+        let free = parsed
+            .model
+            .theta_names
+            .iter()
+            .filter(|n| n.starts_with("PLACEBO["))
+            .count();
+        Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
+    }
+
+    /// The Jacobian pieces at the initial θ and η = 0, by central FD of the
+    /// f64 predictor: the block's per-level columns (bound under `none`), the
+    /// other θ columns, the per-subject η columns, and the level labels.
+    ///
+    /// The layout is taken from an η-free twin bound under `none`, then imposed
+    /// on the real model with [`bind_theta_levels_from_fit`], so a model the
+    /// binder refuses can still be measured.
+    pub(super) struct Jac {
+        xb: DMatrix<f64>,
+        xo: DMatrix<f64>,
+        z: DMatrix<f64>,
+        labels: Vec<String>,
+        one_column: bool,
+    }
+
+    pub(super) fn jacobian(text: &str, pop0: &Population) -> Jac {
+        let twin = text
+            .replace("ETA_E0", "0.0")
+            .replace("omega 0.0", "omega ETA_E0");
+        let mut p_twin = pop0.clone();
+        let mut pt = parse_full_model(&twin).unwrap();
+        crate::api::bind_theta_levels(&mut pt, &twin, &mut p_twin).expect("η-free twin binds");
+        let fitted: LevelBindings = pt.bindings.levels.clone();
+        let mut pop = pop0.clone();
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, text, &mut pop, &fitted).expect("from_fit");
+        let m = &parsed.model;
+        let theta0 = m.default_params.theta.clone();
+        let eta0 = vec![0.0; m.n_eta];
+        let preds = |th: &[f64], s: usize, et: &[f64]| {
+            crate::pk::compute_predictions_with_tv(m, &pop.subjects[s], th, et)
+        };
+        let ns = pop.subjects.len();
+        let lens: Vec<usize> = (0..ns).map(|s| preds(&theta0, s, &eta0).len()).collect();
+        let nrow: usize = lens.iter().sum();
+        let offs: Vec<usize> = lens
+            .iter()
+            .scan(0, |a, n| {
+                let o = *a;
+                *a += n;
+                Some(o)
+            })
+            .collect();
+        let theta_col = |k: usize| -> Vec<f64> {
+            let h = 1e-6 * theta0[k].abs().max(1.0);
+            let (mut tp, mut tm) = (theta0.clone(), theta0.clone());
+            tp[k] += h;
+            tm[k] -= h;
+            let mut col = vec![0.0; nrow];
+            for s in 0..ns {
+                let (a, b) = (preds(&tp, s, &eta0), preds(&tm, s, &eta0));
+                for j in 0..a.len() {
+                    col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
+                }
+            }
+            col
+        };
+        let block: Vec<usize> = (0..m.n_theta)
+            .filter(|&i| m.theta_names[i].starts_with("PLACEBO["))
+            .collect();
+        let other: Vec<usize> = (0..m.n_theta).filter(|i| !block.contains(i)).collect();
+        let mat = |cols: Vec<Vec<f64>>| DMatrix::from_fn(nrow, cols.len(), |r, c| cols[c][r]);
+        let mut zc = Vec::new();
+        for e in 0..m.n_eta {
+            for s in 0..ns {
+                let h = 1e-6;
+                let (mut ep, mut em) = (eta0.clone(), eta0.clone());
+                ep[e] += h;
+                em[e] -= h;
+                let (a, b) = (preds(&theta0, s, &ep), preds(&theta0, s, &em));
+                let mut col = vec![0.0; nrow];
+                for j in 0..a.len() {
+                    col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
+                }
+                zc.push(col);
+            }
+        }
+        let labels = fitted["PLACEBO"].labels.clone();
+        Jac {
+            xb: mat(block.iter().map(|&k| theta_col(k)).collect()),
+            xo: mat(other.iter().map(|&k| theta_col(k)).collect()),
+            z: mat(zc),
+            one_column: !labels[0].contains(','),
+            labels,
+        }
+    }
+
+    /// The coding matrix of `contrast` over the per-level columns.
+    fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
+        let l = j.labels.len();
+        // A one-column block is a single group (`assign_groups`).
+        let grp: Vec<&str> = j
+            .labels
+            .iter()
+            .map(|s| {
+                if j.one_column {
+                    ""
+                } else {
+                    s.split(',').next().unwrap()
+                }
+            })
+            .collect();
+        let unit = |k: usize, minus: Option<usize>| {
+            let mut c = vec![0.0; l];
+            c[k] = 1.0;
+            if let Some(m) = minus {
+                c[m] = -1.0;
+            }
+            c
+        };
+        let cols: Vec<Vec<f64>> = match contrast {
+            LevelContrast::Unconstrained => (0..l).map(|k| unit(k, None)).collect(),
+            LevelContrast::Ref => (1..l).map(|k| unit(k, None)).collect(),
+            LevelContrast::SumToZero => (0..l.saturating_sub(1))
+                .map(|k| unit(k, Some(l - 1)))
+                .collect(),
+            LevelContrast::SumToZeroWithin => (0..l)
+                .filter_map(|k| {
+                    let last = (0..l).rev().find(|&i| grp[i] == grp[k]).unwrap();
+                    (k != last).then(|| unit(k, Some(last)))
+                })
+                .collect(),
+            LevelContrast::Auto => unreachable!(),
+        };
+        DMatrix::from_fn(l, cols.len(), |r, c| cols[c][r])
+    }
+
+    /// Singular values of the part of `z` outside `col(x)`, normalised by `‖z‖_F`.
+    fn residual_sv(z: &DMatrix<f64>, x: &DMatrix<f64>) -> Vec<f64> {
+        let zn = z.norm();
+        assert!(zn.is_finite(), "non-finite η sensitivity");
+        if zn == 0.0 {
+            return Vec::new();
+        }
+        let r = if x.ncols() == 0 {
+            z.clone()
+        } else {
+            let svd = x.clone().svd(true, false);
+            let u = svd.u.unwrap();
+            let s = &svd.singular_values;
+            assert!(s.iter().all(|v| v.is_finite()), "non-finite θ sensitivity");
+            let mx = s.iter().copied().fold(0.0, f64::max);
+            let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > 1e-10 * mx).collect();
+            let q = DMatrix::from_fn(x.nrows(), keep.len(), |r, c| u[(r, keep[c])]);
+            z - &q * (q.transpose() * z)
+        };
+        r.svd(false, false)
+            .singular_values
+            .iter()
+            .map(|v| v / zn)
+            .collect()
+    }
+
+    fn rank(sv: &[f64]) -> usize {
+        sv.iter().filter(|&&v| v > RANK_TOL).count()
+    }
+
+    /// `(baseline rank, rank under contrast, free θ)`. Every singular value is
+    /// pushed onto `seen`, so the caller can report the gap around `RANK_TOL`.
+    pub(super) fn oracle(
+        j: &Jac,
+        contrast: LevelContrast,
+        seen: &mut Vec<f64>,
+    ) -> (usize, usize, usize) {
+        let base = residual_sv(&j.z, &j.xo);
+        let xb = &j.xb * coding(j, contrast);
+        let mut x = DMatrix::zeros(j.xo.nrows(), j.xo.ncols() + xb.ncols());
+        x.columns_mut(0, j.xo.ncols()).copy_from(&j.xo);
+        x.columns_mut(j.xo.ncols(), xb.ncols()).copy_from(&xb);
+        let under = residual_sv(&j.z, &x);
+        seen.extend(base.iter().chain(&under));
+        (rank(&base), rank(&under), xb.ncols())
+    }
+
+    /// The designs of the grid: `(tag, block columns, data)`.
+    fn designs() -> Vec<(&'static str, &'static str, Population)> {
+        vec![
+            ("1-col 1/study", "STUDY", cf_pop(3, 1, &T6)),
+            ("1-col 2/study", "STUDY", cf_pop(3, 2, &T6)),
+            ("[STUDY,TIME] 1/study", "STUDY, TIME", cf_pop(3, 1, &T6)),
+            ("[STUDY,TIME] 2/study", "STUDY, TIME", cf_pop(3, 2, &T6)),
+            ("[STUDY,VISIT] 1/study", "STUDY, VISIT", visit_pop(3, 1)),
+        ]
+    }
+
+    pub(super) const EXPLICIT: [(LevelContrast, &str); 4] = [
+        (LevelContrast::SumToZero, "sum_to_zero"),
+        (LevelContrast::SumToZeroWithin, "sum_to_zero_within"),
+        (LevelContrast::Ref, "ref"),
+        (LevelContrast::Unconstrained, "none"),
+    ];
+
+    /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
+    /// contrast exactly when the oracle says the block absorbs the random
+    /// effect under it (rank 0 against a positive baseline). Cells whose
+    /// contrast leaves no free θ are #1624's and skipped. `auto` must resolve
+    /// to a contrast that does not absorb, global whenever global does not, and
+    /// be refused only when every contrast absorbs.
+    #[test]
+    fn binder_agrees_with_the_jacobian_oracle() {
+        let mut wrong: Vec<String> = Vec::new();
+        let mut seen: Vec<f64> = Vec::new();
+        let (mut absorbed_cells, mut free_cells) = (0usize, 0usize);
+        for (dtag, cols, pop) in designs() {
+            for tag in SHAPES {
+                // G reads the block through `EMAX * TIME / (TIME + ET50)`, which is 0
+                // at TIME = 0: on a block keyed on TIME that level has no effect on
+                // `y` under any contrast, with or without the η, so the oracle
+                // measures an unidentified level rather than an absorbed η.
+                if tag == "G" && cols.contains(',') {
+                    continue;
+                }
+                let jac = jacobian(&shape(tag, cols, "none"), &pop);
+                let mut absorbs = HashMap::new();
+                for (c, token) in EXPLICIT {
+                    let (base, under, free) = oracle(&jac, c, &mut seen);
+                    if free == 0 {
+                        continue;
+                    }
+                    let absorbed = base > 0 && under == 0;
+                    absorbed_cells += usize::from(absorbed);
+                    free_cells += usize::from(!absorbed);
+                    absorbs.insert(token, absorbed);
+                    let got = try_bind(&shape(tag, cols, token), &pop);
+                    if got.is_err() != absorbed {
+                        wrong.push(format!(
+                            "{dtag} {tag} {token}: oracle rank {under} of {base} \
+                             ⇒ refuse={absorbed}, binder {got:?}"
+                        ));
+                    }
+                }
+                let all_absorb = absorbs.values().all(|a| *a);
+                match try_bind(&shape(tag, cols, ""), &pop) {
+                    Err(e) if !all_absorb => wrong.push(format!(
+                        "{dtag} {tag} auto: refused, but some contrast does not absorb: {e}"
+                    )),
+                    Err(_) => {}
+                    Ok(_) if all_absorb => wrong.push(format!(
+                        "{dtag} {tag} auto: bound, but every contrast absorbs"
+                    )),
+                    Ok((resolved, _)) => {
+                        let token = EXPLICIT.iter().find(|(c, _)| *c == resolved).unwrap().1;
+                        if absorbs.get(token).copied().unwrap_or(false) {
+                            wrong.push(format!("{dtag} {tag} auto → {token}, which absorbs"));
+                        }
+                        if absorbs.get("sum_to_zero") == Some(&false)
+                            && resolved != LevelContrast::SumToZero
+                        {
+                            wrong.push(format!(
+                                "{dtag} {tag} auto → {token}, but global does not absorb"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let zero = seen
+            .iter()
+            .copied()
+            .filter(|v| *v <= RANK_TOL)
+            .fold(0.0, f64::max);
+        let live = seen
+            .iter()
+            .copied()
+            .filter(|v| *v > RANK_TOL)
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "oracle: largest zero {zero:.3e}, smallest live {live:.3e}; \
+             {absorbed_cells} absorbed / {free_cells} identified cells"
+        );
+        assert!(
+            zero < 1e-8 && live > 1e-3,
+            "oracle gap collapsed: {zero:e} / {live:e}"
+        );
+        // Both sides of the gate must be exercised.
+        assert!(
+            absorbed_cells >= 20 && free_cells >= 20,
+            "{absorbed_cells} absorbed / {free_cells} identified cells"
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// T2, the differential pair. One model, one subject per study against two:
+    /// the one-column block is refused at one and binds its 2 free θ at two.
+    /// And on `[STUDY, TIME]` at one subject per study, an η that reaches `y`
+    /// only through the state (S2) takes the within-study contrast, while one
+    /// that never reaches `y` (H7) stays global. Before #1649 both one-column
+    /// sides bound and S2 was global, so the pair straddles the gate.
+    #[test]
+    fn one_subject_per_level_straddles_the_gate() {
+        let h1 = shape("H1", "STUDY", "");
+        let err = try_bind(&h1, &cf_pop(3, 1, &T6)).expect_err("1 subject/study");
+        assert!(err.starts_with("theta PLACEBO[STUDY]: "), "{err}");
+        assert_eq!(
+            try_bind(&h1, &cf_pop(3, 2, &T6)),
+            Ok((LevelContrast::SumToZero, 2)),
+            "2 subjects/study"
+        );
+
+        let one = cf_pop(3, 1, &T6);
+        assert_eq!(
+            try_bind(&shape("S2", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "S2: η reaches y through the state"
+        );
+        assert_eq!(
+            try_bind(&shape("H7", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZero, 17)),
+            "H7: η never reaches y"
+        );
+    }
+}
