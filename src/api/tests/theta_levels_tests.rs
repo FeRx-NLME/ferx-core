@@ -2676,9 +2676,10 @@ mod absorption {
     /// The model shapes of the #1649 plan, plus three that hold an individual
     /// parameter reading both the block and the η without being a funnel: the
     /// block read again in `y` (H8), the η read again (H9), and `TIME` read
-    /// inside it (H10). Every one carries `ETA_E0`.
-    const SHAPES: [&str; 11] = [
-        "H1", "G", "H2", "H5", "H6", "S1", "S2", "H7", "H8", "H9", "H10",
+    /// inside it (H10); and two readout funnels reached through a unary
+    /// function (H11) and a power (H12). Every one carries `ETA_E0`.
+    const SHAPES: [&str; 13] = [
+        "H1", "G", "H2", "H5", "H6", "S1", "S2", "H7", "H8", "H9", "H10", "H11", "H12",
     ];
 
     /// Shape `tag` with the block on `cols` and `contrast` (`""` = auto).
@@ -2733,6 +2734,14 @@ mod absorption {
             "H10" => cf(
                 format!("{BASE}  E0 = TVE0 + PLACEBO * TIME + ETA_E0"),
                 format!("E0 + {EMAXY}"),
+            ),
+            "H11" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("exp((E0 + PLACEBO + {EMAXY}) / 10)"),
+            ),
+            "H12" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("(E0 + PLACEBO + {EMAXY}) ^ 2"),
             ),
             _ => unreachable!("{tag}"),
         }
@@ -2910,8 +2919,9 @@ mod absorption {
         sv.iter().filter(|&&v| v > RANK_TOL).count()
     }
 
-    /// `(baseline rank, rank under contrast, free θ)`. Every singular value is
-    /// pushed onto `seen`, so the caller can report the gap around `RANK_TOL`.
+    /// `(baseline rank, rank under contrast, free θ)`. The largest singular
+    /// value of each side, the one that decides "rank 0", is pushed onto `seen`
+    /// so the caller can report the gap around `RANK_TOL`.
     pub(super) fn oracle(
         j: &Jac,
         contrast: LevelContrast,
@@ -2923,7 +2933,12 @@ mod absorption {
         x.columns_mut(0, j.xo.ncols()).copy_from(&j.xo);
         x.columns_mut(j.xo.ncols(), xb.ncols()).copy_from(&xb);
         let under = residual_sv(&j.z, &x);
-        seen.extend(base.iter().chain(&under));
+        let largest = |sv: &[f64]| sv.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        seen.extend(
+            [largest(&base), largest(&under)]
+                .into_iter()
+                .filter(|v| v.is_finite()),
+        );
         (rank(&base), rank(&under), xb.ncols())
     }
 
@@ -3141,6 +3156,15 @@ mod absorption {
             "mbma_model"
         );
         assert_eq!(mb.reach, Some(EtaRoute::State), "mbma_model");
+        // An ODE model whose state reads a parameter with no canonical PK name:
+        // only the `[odes]` line connects `KE` to the state.
+        let ode = shape("S2", "STUDY", "")
+            .replace("  CL = TVEMAX * exp(ETA_E0)", "  KE = TVEMAX * exp(ETA_E0)")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -KE * central",
+            );
+        assert_eq!(coupling(&ode).reach, Some(EtaRoute::State), "ODE via KE");
     }
 
     fn has(err: &str, parts: &[&str]) {
@@ -3372,10 +3396,27 @@ mod absorption {
                 .map(|t| HashMap::from([("WT".to_string(), 60.0 + 5.0 * t + k as f64)]))
                 .collect();
         }
-        for (tag, pop, refused) in [
-            ("constant WT", &constant, true),
-            ("varying WT", &varying, false),
-        ] {
+        // A covariate read only by an `if` condition counts too: the branches
+        // scale the level differently, so with `WT` crossing 65 inside a subject
+        // the level and the η stop being proportional.
+        let branch = |c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!(
+                    "{BASE}  E0 = TVE0 + PLACEBO + ETA_E0\n  \
+                     if (WT > 65) {{ E0 = TVE0 + 2 * PLACEBO + ETA_E0 }}"
+                ),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        let cases: [(&str, &dyn Fn(&str) -> String, &Population, bool); 4] = [
+            ("constant WT", &text, &constant, true),
+            ("varying WT", &text, &varying, false),
+            ("constant WT, if", &branch, &constant, true),
+            ("varying WT, if", &branch, &varying, false),
+        ];
+        for (tag, text, pop, refused) in cases {
             let jac = jacobian(&text("none"), "ETA_E0", pop);
             let (base, under, _) = oracle(&jac, LevelContrast::SumToZero, &mut Vec::new());
             assert!(base > 0, "{tag}: the η is identified without the block");
@@ -3470,5 +3511,42 @@ mod absorption {
         }
         let neg_sum = -theta[1..18].iter().fold(0.0, |a, t| a + t);
         assert_eq!(v[17].value.to_bits(), neg_sum.to_bits());
+    }
+
+    /// A kappa keeps the #1642 rule (out of #1649's scope, see
+    /// `EtaCoupling::kappa`): on a nested block, an expression reading the block
+    /// and the kappa selects the within-group contrast, and a kappa reaching
+    /// `y` only through the state does not; on a one-column block nothing is
+    /// refused. The last two differ from what the same shape does with an η.
+    #[test]
+    fn a_kappa_keeps_the_1642_rule() {
+        let kappa = |t: String| {
+            t.replace("omega ETA_E0 ~ 0.1", "kappa KAPPA_E0 ~ 0.1")
+                .replace("ETA_E0", "KAPPA_E0")
+        };
+        let one = cf_pop(3, 1, &T6);
+        let cases = [
+            (
+                "H2",
+                "STUDY, TIME",
+                Ok((LevelContrast::SumToZeroWithin, 15)),
+            ),
+            ("S2", "STUDY, TIME", Ok((LevelContrast::SumToZero, 17))),
+            ("H1", "STUDY", Ok((LevelContrast::SumToZero, 2))),
+        ];
+        for (tag, cols, want) in cases {
+            let text = kappa(shape(tag, cols, ""));
+            assert!(
+                text.contains("kappa KAPPA_E0") && !text.contains("ETA_E0"),
+                "{tag}"
+            );
+            assert_eq!(try_bind(&text, &one), want, "{tag} with a kappa");
+        }
+        // The η twins of the last two differ.
+        assert_eq!(
+            try_bind(&shape("S2", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZeroWithin, 15))
+        );
+        assert!(try_bind(&shape("H1", "STUDY", ""), &one).is_err());
     }
 }
