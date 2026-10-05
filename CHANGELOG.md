@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A level block that takes a separate level at every observation now counts every random
+  effect that reaches `y`, through the states too; one that does not no longer counts a
+  time-varying one** ([#1650](https://github.com/FeRx-NLME/ferx-core/issues/1650)). With one
+  subject per study, `[STUDY, TIME]` reproduces any per-subject effect, so an η on `CL` read
+  as `central / V` now resolves `contrast = auto` to `sum_to_zero_within`, and an explicit
+  `sum_to_zero`, `ref` or `none` is refused. On a block whose last column holds several
+  observation times (`[STUDY, VISIT]`), an η reaching `y` only through a time-varying term
+  (`EMAX` in `EMAX * TIME / (TIME + ET50)`) is identified and no longer refuses a global
+  contrast. A fit saved before this change keeps its layout when re-bound from the fit.
 - **`contrast = auto` on a level block now sees the `y` readout, and a random effect reached
   through a variable** ([#1642](https://github.com/FeRx-NLME/ferx-core/issues/1642)). A block
   read in the readout next to a parameter carrying an η (`E0 = TVE0 + ETA_E0`,
@@ -155,6 +164,12 @@ section of the SDLC for the versioning policy).
   and a second ETA in one `exp` (`exp(ETA_CL + ETA_V)`) a wrong one. The fallback is now used only when the
   parser has checked that every parameter is `g(θ, cov) · exp(η)` with its η written in its own
   assignment; otherwise the fit uses finite differences. No example model changes route.
+- **A one-column level block whose levels each belong to one subject is refused next to a
+  random effect it absorbs** ([#1649](https://github.com/FeRx-NLME/ferx-core/issues/1649)).
+  `theta PLACEBO[STUDY]` with one subject per study and `E0 = TVE0 + PLACEBO + ETA_E0` made
+  each level the same quantity as that subject's η under every contrast; the fit drove ω to 0
+  with a computed covariance and no warning naming the cause. It is now refused at bind time,
+  naming the expression and advising to remove the block or drop the random effect.
 - **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
   model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
   so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read
