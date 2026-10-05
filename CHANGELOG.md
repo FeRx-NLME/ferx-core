@@ -351,6 +351,17 @@ section of the SDLC for the versioning policy).
 
   IOV subjects keep the analytic covariance step.
 
+- **ODE models with more than 12 individual parameters now use exact analytic gradients**
+  (#1661). Until now the whole fit ran on finite differences. Data-copied PK parameters,
+  constants and `F` scalings all count, so sequential PK/PD models cross 12 on a small
+  `θ + η`. Such a model now takes the event-driven ODE sensitivity walk instead (subjects
+  on the closed-form modified-release fast path keep it, which is analytic too). A
+  reported 19-parameter PK/PD model evaluated about 4× faster, and its EBEs no longer
+  stopped short on a third of the subjects. Validated against NONMEM 7.5.1 on a
+  14-parameter myelosuppression model (`nonmem_anchor/wide_ode_myelo`). Separately, an ODE
+  model with no θ and no η is now reported as using finite differences, which it always
+  did; `optimizer = auto` therefore picks BOBYQA for it instead of L-BFGS.
+
 ## [0.4.0] - 2026-09-25
 
 **Upgrading from 0.3.1.** Most of this release is fixes, but a few changes can stop an

@@ -1,0 +1,59 @@
+# #1661 wide-ODE anchor — ferx twin of wide_ode_myelo.ctl.
+#
+# Sequential PK/PD: the 2-cpt PK parameters are data columns; the cell compartments
+# start at baseline through AMT=1 doses scaled by F3..F7 = BAS. That makes 14
+# individual parameters on only 4 theta + 3 eta, past the 12 the static ODE
+# sensitivity walk covers. Before #1661 the whole fit ran on finite differences.
+
+[parameters]
+  theta TVBAS(4, 0.1, 100)
+  theta TVMTT(80, 1, 1000)
+  theta TVSLOPE(0.06, 0.0001, 10)
+  theta TVGAM(0.25, 0.01, 2)
+
+  omega ETA_BAS   ~ 0.05
+  omega ETA_MTT   ~ 0.05
+  omega ETA_SLOPE ~ 0.05
+
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  V1  = V1I
+  K10 = K10I
+  K12 = K12I
+  K21 = K21I
+
+  BAS   = TVBAS   * exp(ETA_BAS)
+  MTT   = TVMTT   * exp(ETA_MTT)
+  SLOPE = TVSLOPE * exp(ETA_SLOPE)
+  GAM   = TVGAM
+  KTR   = 4 / MTT
+
+  F3 = BAS
+  F4 = BAS
+  F5 = BAS
+  F6 = BAS
+  F7 = BAS
+
+[structural_model]
+  ode(obs_cmt=circ, states=[central, peri, prol, tr1, tr2, tr3, circ])
+
+[odes]
+  CP    = central / V1
+  EDRUG = SLOPE * CP
+  FEED  = (BAS / circ)^GAM
+  d/dt(central) = -K10 * central - K12 * central + K21 * peri
+  d/dt(peri)    =  K12 * central - K21 * peri
+  d/dt(prol)    =  KTR * prol * (1 - EDRUG) * FEED - KTR * prol
+  d/dt(tr1)     =  KTR * prol - KTR * tr1
+  d/dt(tr2)     =  KTR * tr1  - KTR * tr2
+  d/dt(tr3)     =  KTR * tr2  - KTR * tr3
+  d/dt(circ)    =  KTR * tr3  - KTR * circ
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

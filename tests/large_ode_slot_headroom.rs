@@ -19,12 +19,11 @@
 //!   exercises the plain `f64` stack arrays used everywhere along the
 //!   value path — `PkParams::values` (`[f64; MAX_PK_PARAMS]`) and the
 //!   `ode/predictions.rs` extended-params buffers (`[f64; MAX_PK_PARAMS
-//!   + 2]`). At the slot counts this test uses the ODE analytic
-//!   sensitivity provider declines the model (its own independent cap
-//!   `MAX_ODE_SENS_DIM = 12` on `pk_indices.len()` in
-//!   `src/sens/ode_provider.rs`, orthogonal to `MAX_PK_PARAMS`), so the
-//!   run takes the finite-difference outer-gradient path — no `Dual2`
-//!   stack arrays constructed.
+//!   + 2]`). Since #1661 a model this wide takes the analytic ODE
+//!   sensitivity provider's event-driven walk, sized on `θ + η` rather
+//!   than on `pk_indices.len()`; the static superposition walk, whose
+//!   `MAX_ODE_SENS_DIM = 12` cap used to decline the whole model, is not
+//!   used. This test asserts only that the fit runs and stays finite.
 //!
 //! - **Closed-form analytic path**
 //!   (`bloated_slot_closed_form_model_engages_dual2_stack_arrays`):
@@ -77,15 +76,15 @@
 //!
 //! ## Analytic path scope
 //!
-//! Bloated-slot ODE models decline the analytic ODE sensitivity provider
-//! because of `MAX_ODE_SENS_DIM = 12` in `src/sens/ode_provider.rs` — a
-//! monomorphisation cap on `pk_indices.len()` that routes wider models to
-//! FD via a `1..=MAX_ODE_SENS_DIM` dispatch table with a silent `_ =>
-//! None` arm. So the analytic ODE path is not reachable at bloated slot
-//! counts today; widening it to admit wider models is a separate change
-//! (widening `MAX_ODE_SENS_DIM` and its dispatch tables in lockstep).
-//! The closed-form analytic path (`analytical_supported`) has no such
-//! cap and *is* exercised here.
+//! Until #1661, bloated-slot ODE models declined the analytic ODE
+//! sensitivity provider because `MAX_ODE_SENS_DIM = 12`, the static
+//! superposition walk's cap on `pk_indices.len()`, sat on the model-level
+//! gate. That cap now bounds the static walk only, and a wider model takes
+//! the event-driven walk, which is sized on `θ + η`. Exactness at the
+//! parser's own slot ceiling is pinned by
+//! `ode_widest_parsable_model_is_analytic_and_exact` in
+//! `src/sens/ode_provider_tests.rs`. The closed-form analytic path
+//! (`analytical_supported`) has no such cap and is exercised here as well.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, GradientMethod, OmegaMatrix, Population, Subject};

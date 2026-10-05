@@ -316,6 +316,13 @@ pub(crate) fn fd_fallback_warning(
     if model.n_kappa != 0 {
         return iov_fd_fallback_warning(model, population, theta);
     }
+    // No random effects: there is no inner EBE problem, so no inner gradient of either
+    // kind to report. Probing `subject_eta_grad` anyway counts every subject of an
+    // η-free event-walk model (whose `n_eta` dispatch starts at 1) as "finite-difference"
+    // and warns about a route that never runs (#1661 review).
+    if model.n_eta == 0 {
+        return None;
+    }
     let zeros = vec![0.0; model.n_eta];
     let n_total = population.subjects.len();
     let n_fd = population

@@ -1,0 +1,198 @@
+Sun Oct  4 04:44:09 PM UTC 2026
+$PROBLEM #1661 wide-ODE anchor: simulate the circulating-cell data
+; Sequential PK/PD: 2-cpt PK from data columns drives a 4-transit myelosuppression
+; chain (prol -> tr1 -> tr2 -> tr3 -> circ) with linear drug effect and feedback.
+; 14 individual parameters on 4 THETA + 3 ETA, which is what the anchor is about:
+; ferx used to run any ODE model with more than 12 individual parameters on finite
+; differences. Truth: BAS 5, MTT 100 h, SLOPE 0.1 L/mg, GAM 0.17,
+; OMEGA 0.1 / 0.05 / 0.1, proportional SD 0.15.
+$INPUT ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I
+$DATA wide_ode_myelo_template.csv IGNORE=@
+
+$SUBROUTINE ADVAN13 TOL=10
+$MODEL COMP=(CENT DEFDOSE) COMP=(PERI) COMP=(PROL) COMP=(TR1) COMP=(TR2)
+       COMP=(TR3) COMP=(CIRC DEFOBS)
+
+$PK
+V1  = V1I
+K10 = K10I
+K12 = K12I
+K21 = K21I
+BAS   = THETA(1)*EXP(ETA(1))
+MTT   = THETA(2)*EXP(ETA(2))
+SLOPE = THETA(3)*EXP(ETA(3))
+GAM   = THETA(4)
+KTR   = 4/MTT
+F3 = BAS
+F4 = BAS
+F5 = BAS
+F6 = BAS
+F7 = BAS
+
+$DES
+CP    = A(1)/V1
+EDRUG = SLOPE*CP
+FEED  = (BAS/A(7))**GAM
+DADT(1) = -K10*A(1) - K12*A(1) + K21*A(2)
+DADT(2) =  K12*A(1) - K21*A(2)
+DADT(3) =  KTR*A(3)*(1 - EDRUG)*FEED - KTR*A(3)
+DADT(4) =  KTR*A(3) - KTR*A(4)
+DADT(5) =  KTR*A(4) - KTR*A(5)
+DADT(6) =  KTR*A(5) - KTR*A(6)
+DADT(7) =  KTR*A(6) - KTR*A(7)
+
+$ERROR
+IPRED = F
+Y = IPRED*(1 + EPS(1))
+
+$THETA 5 100 0.1 0.17
+$OMEGA 0.1 0.05 0.1
+$SIGMA 0.0225
+
+$SIMULATION (1661) ONLYSIMULATION
+$TABLE ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I NOPRINT NOHEADER NOAPPEND
+       FORMAT=s1PE17.9 FILE=wide_ode_myelo_sim.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:        4 OCT 2026
+Days until program expires : 315
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.5.1
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ #1661 wide-ODE anchor: simulate the circulating-cell data
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ NO. OF DATA RECS IN DATA SET:      480
+ NO. OF DATA ITEMS IN DATA SET:  11
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   7
+ MDV DATA ITEM IS DATA ITEM NO.:  6
+0INDICES PASSED TO SUBROUTINE PRED:
+   5   2   3   0   0   0   4   0   0   0   0
+0LABELS FOR DATA ITEMS:
+ ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I
+0FORMAT FOR DATA:
+ (E3.0,E5.0,E4.0,4E2.0,E10.0,3E9.0)
+
+ TOT. NO. OF OBS RECS:      288
+ TOT. NO. OF INDIVIDUALS:       24
+0LENGTH OF THETA:   4
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   3
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+   0.5000E+01  0.1000E+03  0.1000E+00  0.1700E+00
+0INITIAL ESTIMATE OF OMEGA:
+ 0.1000E+00
+ 0.0000E+00   0.5000E-01
+ 0.0000E+00   0.0000E+00   0.1000E+00
+0INITIAL ESTIMATE OF SIGMA:
+ 0.2250E-01
+0SIMULATION STEP OMITTED:    NO
+ OBJ FUNC EVALUATED:         NO
+ ORIGINAL DATA USED ON EACH NEW SIMULATION:         NO
+ SEEDS RESET ON EACH NEW SUPERSET ITERATION:        YES
+0SIMULATION RANDOM METHOD SELECTED (RANMETHOD): 4U
+SEED   1 RESET TO INITIAL: YES
+ SOURCE   1:
+   SEED1:          1661   SEED2:             0   PSEUDO-NORMAL
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    NO
+ PRINTED:                NO
+ HEADER:                 NO
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE17.9
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I
+1DOUBLE PRECISION PREDPP VERSION 7.5.1
+
+ GENERAL NONLINEAR KINETICS MODEL WITH STIFF/NONSTIFF EQUATIONS (LSODA, ADVAN13)
+0MODEL SUBROUTINE USER-SUPPLIED - ID NO. 9999
+0MAXIMUM NO. OF BASIC PK PARAMETERS:   8
+0COMPARTMENT ATTRIBUTES
+ COMPT. NO.   FUNCTION   INITIAL    ON/OFF      DOSE      DEFAULT    DEFAULT
+                         STATUS     ALLOWED    ALLOWED    FOR DOSE   FOR OBS.
+    1         CENT         ON         YES        YES        YES        NO
+    2         PERI         ON         YES        YES        NO         NO
+    3         PROL         ON         YES        YES        NO         NO
+    4         TR1          ON         YES        YES        NO         NO
+    5         TR2          ON         YES        YES        NO         NO
+    6         TR3          ON         YES        YES        NO         NO
+    7         CIRC         ON         YES        YES        NO         YES
+    8         OUTPUT       OFF        YES        NO         NO         NO
+ INITIAL (BASE) TOLERANCE SETTINGS:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:  10
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+1
+ ADDITIONAL PK PARAMETERS - ASSIGNMENT OF ROWS IN GG
+ COMPT. NO.                             INDICES
+              SCALE      BIOAVAIL.   ZERO-ORDER  ZERO-ORDER  ABSORB
+                         FRACTION    RATE        DURATION    LAG
+    1            *           *           *           *           *
+    2            *           *           *           *           *
+    3            *           9           *           *           *
+    4            *          10           *           *           *
+    5            *          11           *           *           *
+    6            *          12           *           *           *
+    7            *          13           *           *           *
+    8            *           -           -           -           -
+             - PARAMETER IS NOT ALLOWED FOR THIS MODEL
+             * PARAMETER IS NOT SUPPLIED BY PK SUBROUTINE;
+               WILL DEFAULT TO ONE IF APPLICABLE
+0DATA ITEM INDICES USED BY PRED ARE:
+   EVENT ID DATA ITEM IS DATA ITEM NO.:      5
+   TIME DATA ITEM IS DATA ITEM NO.:          2
+   DOSE AMOUNT DATA ITEM IS DATA ITEM NO.:   3
+   COMPT. NO. DATA ITEM IS DATA ITEM NO.:    4
+
+0PK SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+ PK SUBROUTINE NOT CALLED AT NONEVENT (ADDITIONAL OR LAGGED) DOSE TIMES.
+0ERROR SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+0DES SUBROUTINE USES COMPACT STORAGE MODE.
+ TOLERANCES FOR SIMULATION STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:  10
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR TABLE/SCATTER STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:  10
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+1
+ SIMULATION STEP PERFORMED
+ SOURCE  1:
+    SEED1:     758107475   SEED2:             0
+ Elapsed simulation  time in seconds:     0.00
+ ESTIMATION STEP OMITTED:                 YES
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.035
+Stop Time:
+Sun Oct  4 04:44:12 PM UTC 2026

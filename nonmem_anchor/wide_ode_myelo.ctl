@@ -1,0 +1,53 @@
+$PROBLEM #1661 wide-ODE anchor: FOCEI fit of the NONMEM-simulated cell counts
+; Same model as wide_ode_myelo_sim.ctl, fitted from initial estimates deliberately
+; off the simulation truth (BAS 5, MTT 100, SLOPE 0.1, GAM 0.17; OMEGA 0.1/0.05/0.1;
+; proportional SD 0.15). The ferx twin is wide_ode_myelo_fit.ferx.
+$INPUT ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I
+$DATA wide_ode_myelo.csv IGNORE=@
+
+$SUBROUTINE ADVAN13 TOL=10
+$MODEL COMP=(CENT DEFDOSE) COMP=(PERI) COMP=(PROL) COMP=(TR1) COMP=(TR2)
+       COMP=(TR3) COMP=(CIRC DEFOBS)
+
+$PK
+V1  = V1I
+K10 = K10I
+K12 = K12I
+K21 = K21I
+BAS   = THETA(1)*EXP(ETA(1))
+MTT   = THETA(2)*EXP(ETA(2))
+SLOPE = THETA(3)*EXP(ETA(3))
+GAM   = THETA(4)
+KTR   = 4/MTT
+F3 = BAS
+F4 = BAS
+F5 = BAS
+F6 = BAS
+F7 = BAS
+
+$DES
+CP    = A(1)/V1
+EDRUG = SLOPE*CP
+FEED  = (BAS/A(7))**GAM
+DADT(1) = -K10*A(1) - K12*A(1) + K21*A(2)
+DADT(2) =  K12*A(1) - K21*A(2)
+DADT(3) =  KTR*A(3)*(1 - EDRUG)*FEED - KTR*A(3)
+DADT(4) =  KTR*A(3) - KTR*A(4)
+DADT(5) =  KTR*A(4) - KTR*A(5)
+DADT(6) =  KTR*A(5) - KTR*A(6)
+DADT(7) =  KTR*A(6) - KTR*A(7)
+
+$ERROR
+IPRED = F
+Y = IPRED*(1 + EPS(1))
+
+$THETA (0.1, 4, 100)       ; TVBAS
+$THETA (1, 80, 1000)       ; TVMTT
+$THETA (0.0001, 0.06, 10)  ; TVSLOPE
+$THETA (0.01, 0.25, 2)     ; TVGAM
+$OMEGA 0.05 0.05 0.05
+$SIGMA 0.04
+
+$ESTIMATION METHOD=1 INTERACTION MAXEVAL=9999 PRINT=5 NOABORT SIGDIGITS=4
+$COVARIANCE MATRIX=R UNCONDITIONAL
+$TABLE ID TIME DV PRED IPRED CWRES ETA1 ETA2 ETA3 NOPRINT ONEHEADER FILE=wide_ode_myelo.tab
