@@ -43,9 +43,10 @@ At each occasion *k*, the effective individual CL is `TVCL * exp(ETA_CL_i + KAPP
 
 A kappa's variance is printed on the scale the kappa enters its parameter
 (#1643): `CV%` for a log-normal kappa, `SD` for an additive or logit one, and
-nothing for any other shape. The scale comes from **where the kappa sits**:
-walking up from the kappa through `+` and `-`, the first other operation
-decides.
+nothing for any other shape. The scale comes from **where the kappa sits**,
+read along the whole path up to the parameter (#1714): through `+` and `-`
+only it is additive, under `inv_logit` logit, and under `exp` log-normal only
+if nothing but `*` and `/` sits between that `exp` and the parameter.
 
 | Expression | Kappa reported as |
 |---|---|
@@ -53,6 +54,7 @@ decides.
 | `TVV + ETA_V + KAPPA_V` | additive, `SD` |
 | `inv_logit(TH + ETA + KAPPA)` | logit, `SD = …, logit scale` |
 | `(TVV + KAPPA_V) * WT` | custom, no CV% or SD |
+| `TVCL * exp((exp(ETA_CL + KAPPA_CL)^L - 1) / L)` (Box-Cox) | custom, no CV% or SD |
 
 A kappa that reaches its parameter through an intermediate variable is
 followed to where that variable is used: with `IOVCL = KAPPA_CL` and then

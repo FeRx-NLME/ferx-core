@@ -29078,3 +29078,328 @@ fn the_inliner_matches_the_eager_one() {
         "{changed} of {seen} right-hand sides changed by inlining"
     );
 }
+
+// ── #1714: an `exp` is log-normal only through products ─────────────────────
+
+/// `[(param, type)]` of `eta` in `eta_scale_model(indiv)`, with `CL` log-normal
+/// on `ETA_CL` prepended when `indiv` does not assign it.
+fn eta_v_rows(indiv: &str, eta: &str) -> Vec<(String, crate::types::EtaParamType)> {
+    let indiv = if indiv.contains("CL =") {
+        indiv.to_string()
+    } else {
+        format!("  CL = TVCL * exp(ETA_CL)\n{indiv}")
+    };
+    eta_entries(&eta_scale_model(&indiv, ""), eta)
+}
+
+/// T1: inside one statement, an ETA under an `exp` is `LogNormal` only when
+/// every operation between that `exp` and the root is a `*` or `/`, so that
+/// `log V` is η-free ± η. Both sides of the rule in one table, so a rule stuck
+/// on either branch reddens it. Each `Custom` row names the cell and its
+/// answer before #1714.
+/// Dies under: (a) the nearest-ancestor rule (every Custom row); (b) `^`
+/// keeping the product (the two `^` rows and Box-Cox); (c) `±` keeping the
+/// product (shifted, `1 + exp`); (d) an `exp` keeping the product (`exp(exp)`).
+#[test]
+fn an_exp_reaches_its_parameter_only_through_products() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    let cases = [
+        (
+            "covariate power beside",
+            "V = TVV * exp(ETA_V) * (WT / 70)^0.75",
+            LogNormal,
+        ),
+        ("divided", "V = TVV / exp(ETA_V)", LogNormal),
+        ("negated inside", "V = TVV * exp(-ETA_V)", LogNormal),
+        (
+            "inline if, both arms products",
+            "V = if (WT > 70) TVV * exp(ETA_V) else 2 * TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        (
+            "(b) Box-Cox inline (was LogNormal)",
+            "V = TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT)",
+            Custom,
+        ),
+        (
+            "(b) Box-Cox in one arm of an if (was LogNormal)",
+            "V = if (WT > 70) TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT) else TVV * exp(ETA_V)",
+            Custom,
+        ),
+        (
+            "(b) constant power (was LogNormal)",
+            "V = TVV * exp(ETA_V)^2",
+            Custom,
+        ),
+        (
+            "(b) theta power (was LogNormal)",
+            "V = TVV * exp(ETA_V)^TH_WT",
+            Custom,
+        ),
+        (
+            "(c) shifted (was LogNormal)",
+            "V = TVV * exp(ETA_V) + TVCL",
+            Custom,
+        ),
+        (
+            "(c) one plus exp (was LogNormal)",
+            "V = TVV / (1 + exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "(d) exp of exp (was LogNormal)",
+            "V = TVV * exp(exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "sqrt above (was LogNormal)",
+            "V = sqrt(TVV^2 * exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "log above (was LogNormal)",
+            "V = log(TVV * exp(ETA_V))",
+            Custom,
+        ),
+    ];
+    for (label, line, want) in cases {
+        assert_eq!(
+            eta_v_rows(&format!("  {line}"), "ETA_V"),
+            [("V".into(), want)],
+            "{label}: {line}"
+        );
+    }
+}
+
+/// T2: the product path is followed across variables: a leaf that reaches the
+/// root of its assignment still inside a product takes the scale of the
+/// variable's use, starting in that state.
+/// Dies under: (e) a product root resolved at once to `LogNormal` (first two
+/// Custom rows); (f) a consumed variable's reassignment not followed (third);
+/// and the LogNormal rows under a product followed into `Custom` by mistake.
+#[test]
+fn a_product_path_is_followed_through_variables() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    type Row<'a> = (&'a str, &'a str, &'a str, crate::types::EtaParamType);
+    let cases: [Row; 7] = [
+        (
+            "(e) power of a bare exp (was LogNormal)",
+            "  EV = exp(ETA_V)\n  V = TVV * EV^TH_WT",
+            "EV",
+            Custom,
+        ),
+        (
+            "(e) shifted through an intermediate (was LogNormal)",
+            "  VI = TVV * exp(ETA_V)\n  V = VI + TVCL",
+            "VI",
+            Custom,
+        ),
+        (
+            "(f) power by reassignment (was LogNormal)",
+            "  V = TVV * exp(ETA_V)\n  V = V^0.5",
+            "V",
+            Custom,
+        ),
+        (
+            "Box-Cox through a local (was LogNormal)",
+            "  ETAT = (exp(ETA_V)^TH_WT - 1) / TH_WT\n  V = TVV * exp(ETAT)",
+            "ETAT",
+            Custom,
+        ),
+        (
+            "bare exp times a theta",
+            "  EV = exp(ETA_V)\n  V = TVV * EV",
+            "EV",
+            LogNormal,
+        ),
+        (
+            "product by reassignment",
+            "  V = TVV * exp(ETA_V)\n  V = V * 2",
+            "V",
+            LogNormal,
+        ),
+        (
+            "bare exp read by nothing",
+            "  A2 = exp(ETA_V)\n  V = TVV",
+            "A2",
+            LogNormal,
+        ),
+    ];
+    for (label, indiv, param, want) in cases {
+        assert_eq!(
+            eta_v_rows(indiv, "ETA_V"),
+            [(param.into(), want)],
+            "{label}"
+        );
+    }
+    // The docs' λ = 0 claim, measured: the hand-written Box-Cox at λ = 0
+    // exactly is `0 / 0`, which `BinOp::Div` returns as 0, so `ETAT` carries
+    // no variability (not the limit η). At λ = 0.01 it is ≈ η.
+    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
+    let stmts = stmts_of("ETAT = (exp(ETA_V)^TH_WT - 1) / TH_WT\n", &tn, &en);
+    let Statement::Assign(_, etat) = &stmts[0] else {
+        panic!("an assignment")
+    };
+    let none = HashMap::new();
+    let at =
+        |lambda: f64| eval_expression(etat, &[1.0, 10.0, lambda], &[0.0, 0.3], &none, &none, &[]);
+    assert_eq!(at(0.0), 0.0, "λ = 0: no variability");
+    assert!(
+        (at(0.01) - 0.3).abs() < 1e-2,
+        "λ = 0.01: ≈ η, got {}",
+        at(0.01)
+    );
+}
+
+/// T3: a `LogNormal` pattern answer is resolved by use, like the `Additive`
+/// one (#1669). On a change the pattern's θ is not the parameter's anchor and
+/// is dropped, but its `theta_transform` stays: a `Log` from `exp(TH + ETA)` is
+/// how θ itself is reported, and that must not move.
+/// Dies under: (g) no `LogNormal` re-resolution in `emit_eta_infos`; (h) the
+/// linked θ kept on a change; (h′) `theta_transform` dropped with it.
+#[test]
+fn a_log_normal_pattern_is_resolved_by_use() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    use crate::types::ThetaTransform;
+    // Both defining expressions are the pattern's own log-normal shapes, so
+    // the pair straddles the pattern gate rather than missing it.
+    let mul = Expression::BinOp(
+        Box::new(Expression::Theta(1)),
+        BinOp::Mul,
+        Box::new(Expression::UnaryFn(
+            "exp".into(),
+            Box::new(Expression::Eta(1)),
+        )),
+    );
+    let sum = Expression::UnaryFn(
+        "exp".into(),
+        Box::new(Expression::BinOp(
+            Box::new(Expression::Theta(1)),
+            BinOp::Add,
+            Box::new(Expression::Eta(1)),
+        )),
+    );
+    for e in [&mul, &sum] {
+        assert_eq!(
+            classify_expr(e, 4).map(|c| c.param_type),
+            Some(LogNormal),
+            "{e:?} must be a log-normal pattern"
+        );
+    }
+    let row = |indiv: &str| {
+        let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n{indiv}"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .unwrap()
+            .clone();
+        (
+            i.individual_param_name,
+            i.param_type,
+            i.linked_theta,
+            m.theta_transform[1],
+        )
+    };
+    assert_eq!(
+        row("  VI = TVV * exp(ETA_V)\n  V = VI^0.5"),
+        ("VI".into(), Custom, None, ThetaTransform::Identity),
+        "(g)/(h): the power above the pattern"
+    );
+    assert_eq!(
+        row("  V = TVV * exp(ETA_V)"),
+        (
+            "V".into(),
+            LogNormal,
+            Some("TVV".into()),
+            ThetaTransform::Identity
+        ),
+        "control: the pattern stands"
+    );
+    assert_eq!(
+        row("  V0 = exp(TVV + ETA_V)\n  V = V0^0.5"),
+        ("V0".into(), Custom, None, ThetaTransform::Log),
+        "(h′): θ keeps its log scale"
+    );
+}
+
+/// T4: a consumed variable is a parameter; a later `[individual_parameters]`
+/// reader that does not reassign it (`X = V + 1`) does not change its scale.
+/// The reader is an `[individual_parameters]` statement on purpose — the walk
+/// never scans `[derived]`, so a reader there would make this vacuous.
+/// Dies under: (i) following a consumed variable's non-reassigning readers.
+#[test]
+fn a_consumed_product_is_not_followed() {
+    use crate::types::EtaParamType::LogNormal;
+    assert_eq!(
+        eta_v_rows("  V = TVV * exp(ETA_V)\n  X = V + 1", "ETA_V"),
+        [("V".into(), LogNormal)]
+    );
+}
+
+/// T5: a kappa in a Box-Cox sum is `Custom`, and so is the ETA beside it; a
+/// kappa in a plain `exp` sum stays `LogNormal`.
+/// Dies under: (a) the nearest-ancestor rule, for kappas.
+#[test]
+fn kappa_in_a_box_cox_sum_is_custom() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    let m = kappa_scale_model(
+        &["K", "K2"],
+        "  CL = TVCL * exp(ETA_CL + K2)\n  \
+         V = TVV * exp((exp(ETA_V + K)^TVCL - 1) / TVCL)",
+    );
+    assert_eq!(m.kappa_param_types, [Custom, LogNormal], "K (Box-Cox), K2");
+    assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Custom)]);
+}
+
+/// T6: one definition reached in both states, through a transparent `if`:
+/// `ETA_CL` reaches `X`'s root in the sum state (log-normal on `CL`), `ETA_V`
+/// in the product state (`exp(exp)`, custom). Both branch orders, so the order
+/// the walk visits them in cannot hide a shared memo slot.
+/// Dies under: (j) the memo keyed by definition alone.
+#[test]
+fn the_memo_is_keyed_by_pending_kind() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    for x in [
+        "X = if (WT > 70) ETA_CL else exp(ETA_V)",
+        "X = if (WT > 70) exp(ETA_V) else ETA_CL",
+    ] {
+        let indiv = format!("  {x}\n  CL = TVCL * exp(X)\n  V = TVV");
+        assert_eq!(
+            eta_v_rows(&indiv, "ETA_CL"),
+            [("X".into(), LogNormal)],
+            "{x}"
+        );
+        assert_eq!(eta_v_rows(&indiv, "ETA_V"), [("X".into(), Custom)], "{x}");
+    }
+}
+
+/// T7: the product-state walk is memoised like the sum-state one: on a
+/// diamond of products over `exp(re)` the call count is linear in the depth.
+/// Dies under: (k) no memo lookup for the product state.
+#[test]
+fn the_product_walk_is_linear_on_a_diamond() {
+    use crate::types::EtaParamType::LogNormal;
+    for re in ["ETA_CL", "K"] {
+        let count = |d: usize| {
+            let src = op_diamond(d, &format!("exp({re})"), "*") + &format!("CL = X{d}\n");
+            let (eta, kappa, calls) = walk_counted(&src);
+            if re == "K" {
+                assert_eq!(kappa, LogNormal, "{re} depth {d}");
+            } else {
+                assert_eq!(eta, [LogNormal], "{re} depth {d}");
+            }
+            calls
+        };
+        let c0 = count(0);
+        let per_level = count(1) - c0;
+        assert!(per_level > 0, "{re}: the diamond reaches the walk");
+        assert_eq!(count(10) - c0, 10 * per_level, "{re}: depth 10 is linear");
+        assert_eq!(count(20) - c0, 20 * per_level, "{re}: depth 20 is linear");
+        assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
+    }
+}

@@ -169,6 +169,14 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **A hand-written Box-Cox ETA, or any `exp(η)` with a `^`, `+`/`-` or function above it, no
+  longer prints a log-normal `CV%`** ([#1714](https://github.com/FeRx-NLME/ferx-core/issues/1714)).
+  An ETA or kappa is labelled log-normal only when nothing but `*` and `/` sits between its `exp`
+  and the parameter, across intermediate variables; `TVV * exp((exp(ETA_V)^L - 1) / L)`,
+  `TVV * exp(ETA_V)^2` and `TVV * exp(ETA_V) + TH` are now custom, so their omega/kappa rows
+  print no `CV%` instead of a wrong one (31.6% at ω = 0.1 against a true 30–45% for Box-Cox
+  and 16.6% for the shift). Labels only: no estimate, objective or residual changes, and no
+  shipped example changes label.
 - **A level block whose levels have no effect on the likelihood binds only under a contrast
   that can carry them** ([#1679](https://github.com/FeRx-NLME/ferx-core/issues/1679)). On
   `PLACEBO[STUDY, TIME]` read through a factor that vanishes at `TIME = 0` (`PLACEBO * TIME`, a

@@ -475,11 +475,15 @@ against NONMEM.
 
 The patterns above decide MU-referencing. How an ETA's variance is
 **reported** — `CV%`, `SD`, or neither (see [the fit output](../output.qmd)) —
-is a separate, wider rule (#1656): walking up from the ETA through `+` and
-`-`, the first other operation decides. `exp(...)` is log-normal, `inv_logit`
-is logit, any other operation (`*`, `/`, `^`, another function) is custom, and
-reaching the top of the assignment means additive. So an ETA stays additive
-however many terms sit beside it:
+is a separate, wider rule (#1656), read along the whole path from the ETA up
+to the parameter (#1714). Through `+` and `-` only, the ETA is additive.
+`inv_logit` makes it logit. `exp(...)` makes it log-normal **only if every
+operation between that `exp` and the parameter is a `*` or `/`**, so that the
+log of the parameter is the ETA plus terms free of it. Any other operation —
+`*`, `/`, `^` or a function below the `exp`, or `^`, `+`, `-`, a function or a
+second `exp` above it — makes it custom, because the printed `CV%` would not be
+the CV of the parameter. So an ETA stays additive however many terms sit
+beside it, and log-normal however many factors multiply it:
 
 | Expression | ETA reported as |
 |---|---|
@@ -488,7 +492,11 @@ however many terms sit beside it:
 | `TVE0 + PLACEBO[STUDY] + ETA_E0 + KAPPA_ARM` | additive, `SD` |
 | `inv_logit(TH + TH_WT * WT + ETA)` | logit, `SD = …, logit scale` |
 | `TVCL * exp(ETA_CL + ETA_X)` | log-normal, `CV%`, for both |
+| `TVV * exp(ETA_V) * (WT / 70)^0.75`, `TVV / exp(ETA_V)` | log-normal, `CV%` |
 | `TVV + ETA_V * WT` | custom, no CV% or SD |
+| `TVV * exp(ETA_V)^2`, `TVV * exp(ETA_V)^TH` | custom, no CV% or SD |
+| `TVV * exp(ETA_V) + TH`, `TVV / (1 + exp(ETA_V))` | custom, no CV% or SD |
+| `sqrt(TVV^2 * exp(ETA_V))`, `TVV * exp(exp(ETA_V))` | custom, no CV% or SD |
 
 An ETA that reaches the top of an intermediate variable is followed to where
 that variable is used, exactly as a kappa is (see
@@ -499,16 +507,30 @@ stops at a variable a block reads as a parameter — `[structural_model]`,
 and continues past one that only `[derived]` reports. So `V = TVV + ETA_V` is
 additive when the model reads `V`, but custom when only `K10 = CL / V` does.
 The row is still listed under the variable the ETA is assigned in (`ECL`).
+A log-normal path is followed the same way: with `EV = exp(ETA_V)`, a later
+`V = TVV * EV` keeps `ETA_V` log-normal, while `V = TVV * EV^TH` or
+`VI = TVV * exp(ETA_V)` read as `V = VI + TH` makes it custom.
 
 A block reads a variable's **last** value, so a reassignment is followed
 before the walk stops (#1673): after `CL = TVCL + ETA_CL`, a later
 `CL = CL * TVV` makes `ETA_CL` custom, as `CL = (TVCL + ETA_CL) * TVV` on one
 line is, while `CL = CL + TH` keeps it additive and `CL = exp(CL)` makes it
-log-normal. A reassignment inside an `if` leaves the earlier value in use on
-the other path, so the two scales must agree. A statement only sees the value
-in force where it sits: a line before the assignment, a line after a
-reassignment that replaces it, or one in the other branch of an `if` does not
-change the label.
+log-normal. Likewise after `V = TVV * exp(ETA_V)`, `V = V * 2` keeps `ETA_V`
+log-normal and `V = V^0.5` makes it custom. A reassignment inside an `if`
+leaves the earlier value in use on the other path, so the two scales must
+agree. A statement only sees the value in force where it sits: a line before
+the assignment, a line after a reassignment that replaces it, or one in the
+other branch of an `if` does not change the label.
+
+**A hand-written Box-Cox ETA is custom.** The Box-Cox transform
+`ETAT = (exp(ETA_V)^LAMBDA - 1) / LAMBDA`, used as `V = TVV * exp(ETAT)`,
+puts a `^` above the inner `exp`, so `ETA_V` gets no `CV%` (before #1714 it
+printed `100·√ω`, which is not the CV of `V`: at `ω = 0.1` the printed 31.6
+against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or fix
+`LAMBDA` at exactly 0: the transform is then `0 / 0`, which ferx evaluates as
+0, so `ETAT` carries no variability at all rather than tending to `ETA_V`.
+Start it slightly away from zero, e.g. 0.01, as PsN does. A built-in
+`boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
 
 ## Covariate Detection
 
