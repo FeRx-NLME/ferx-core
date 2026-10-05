@@ -93,6 +93,24 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             "name must be <N>.<category>.md",
         ),
         (
+            "zero-number",
+            ("0.fixed.md", good),
+            ("12.fixed.md", good),
+            "name must be <N>.<category>.md",
+        ),
+        (
+            "leading-zero",
+            ("012.fixed.md", good),
+            ("12.fixed.md", good),
+            "name must be <N>.<category>.md",
+        ),
+        (
+            "placeholder-reference",
+            ("12.fixed.md", "- Fixed it (#0).\n"),
+            ("12.fixed.md", "- Fixed it (#12).\n"),
+            "no issue/PR reference",
+        ),
+        (
             "word-suffix",
             ("12-foo.fixed.md", good),
             ("12-2.fixed.md", good),
@@ -1062,5 +1080,75 @@ fn the_ci_changelog_job_checks_the_pr_tree() {
     assert!(
         !job.lines().any(|l| l.trim_start().starts_with("ref:")),
         "the Changelog job checks out a ref other than the PR:\n{job}"
+    );
+}
+
+/// Every fragment is validated, not just the first: the malformed one sorts AFTER a
+/// valid one here.
+#[test]
+fn check_validates_every_fragment_not_just_the_first() {
+    let t = tree(
+        "mixed",
+        &[
+            ("1.fixed.md", "- Fine (#1).\n"),
+            ("2.fixed.md", "Not a bullet (#2).\n"),
+        ],
+    );
+    let o = run(&t, &["check"]);
+    assert!(!o.status.success(), "a malformed second fragment passed");
+    assert!(stderr(&o).contains("2.fixed.md"), "{}", stderr(&o));
+}
+
+/// `assemble` rewrites every `[Unreleased]: ` line, so a second (even malformed)
+/// definition must be refused before anything changes.
+#[test]
+fn assemble_refuses_a_duplicate_unreleased_link() {
+    let t = tree("dup-link", &[("1.fixed.md", "- x (#1).\n")]);
+    let cl = format!("{HEAD}{TAIL}[Unreleased]: broken\n");
+    std::fs::write(t.join("CHANGELOG.md"), &cl).unwrap();
+    let o = run(&t, &["assemble", "0.2.0", "--date", "2026-10-05"]);
+    assert!(!o.status.success(), "assembled over two [Unreleased] links");
+    assert!(
+        stderr(&o).contains("exactly one '[Unreleased]:'"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(std::fs::read_to_string(t.join("CHANGELOG.md")).unwrap(), cl);
+    assert!(t.join("changelog.d").join("1.fixed.md").exists());
+}
+
+/// Every deleted fragment is verified, not just the first: #10 is assembled exactly,
+/// #20 is missing from the changelog.
+#[test]
+fn require_verifies_every_deleted_fragment() {
+    let (d, _) = git_repo("two-deletions");
+    commit_file(&d, "changelog.d/10.fixed.md", "- Ten (#10).\n");
+    commit_file(&d, "changelog.d/20.fixed.md", "- Twenty (#20).\n");
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        &d,
+        &[
+            "rm",
+            "-q",
+            "changelog.d/10.fixed.md",
+            "changelog.d/20.fixed.md",
+        ],
+    );
+    let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
+    commit_file(
+        &d,
+        "CHANGELOG.md",
+        &cl.replace(
+            "## [0.1.0]",
+            "## [0.2.0] - 2026-10-05\n\n### Fixed\n- Ten (#10).\n\n## [0.1.0]",
+        ),
+    );
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(!o.status.success(), "#20 was dropped and the PR passed");
+    let err = stderr(&o);
+    assert!(err.contains("changelog.d/20.fixed.md"), "{err}");
+    assert!(
+        !err.contains("changelog.d/10.fixed.md"),
+        "#10 was assembled:\n{err}"
     );
 }

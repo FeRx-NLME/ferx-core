@@ -188,7 +188,7 @@ cmd_check() {
       continue
     fi
     # <N>[-<k>].<category>.md, k >= 2: the second entry on one number is `-2`.
-    if ! printf '%s' "$name" | grep -Eq '^[0-9]+(-([2-9]|[1-9][0-9]+))?\.[a-z]+\.md$'; then
+    if ! printf '%s' "$name" | grep -Eq '^[1-9][0-9]*(-([2-9]|[1-9][0-9]+))?\.[a-z]+\.md$'; then
       echo "changelog.d/$name: name must be <N>.<category>.md (e.g. 1541.fixed.md;" \
         "1541-2.fixed.md for a second entry)" >&2
       errors=$((errors + 1))
@@ -230,7 +230,8 @@ cmd_check() {
       errors=$((errors + 1))
       continue
     fi
-    if ! printf '%s' "$body" | grep -Eq '#[0-9]+'; then
+    # A real number: `#0` / `#00` is a placeholder left in, not a reference.
+    if ! printf '%s' "$body" | grep -Eq '#[1-9][0-9]*'; then
       echo "changelog.d/$name: no issue/PR reference — cite it as (#NN)" >&2
       errors=$((errors + 1))
       continue
@@ -332,10 +333,13 @@ cmd_assemble() {
   # `[Unreleased]: <base>/compare/<prev>...HEAD` gives both the compare base URL
   # and the previous tag.
   local link base prev
+  # Exactly one `[Unreleased]:` definition of ANY form: the rewrite below
+  # replaces every line that starts so, and a malformed duplicate would be
+  # rewritten into a second pair of links.
+  [ "$(grep -c '^\[Unreleased\]: ' "$changelog" || true)" = "1" ] ||
+    die "assemble: CHANGELOG.md must have exactly one '[Unreleased]:' link definition"
   link="$(grep -E '^\[Unreleased\]: .*/compare/[^/]+\.\.\.HEAD$' "$changelog" || true)"
   [ -n "$link" ] || die "assemble: no '[Unreleased]: <url>/compare/<tag>...HEAD' link in CHANGELOG.md"
-  [ "$(printf '%s\n' "$link" | grep -c .)" = "1" ] ||
-    die "assemble: more than one '[Unreleased]:' compare link in CHANGELOG.md"
   base="$(printf '%s' "$link" | sed -E 's#^\[Unreleased\]: (.*)/compare/[^/]+\.\.\.HEAD$#\1#')"
   prev="$(printf '%s' "$link" | sed -E 's#^.*/compare/([^/]+)\.\.\.HEAD$#\1#')"
 
