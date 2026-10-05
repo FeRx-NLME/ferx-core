@@ -166,6 +166,11 @@ fn dry_run_prints_the_measured_container_layout() {
         envs.contains(&"CARGO_BUILD_JOBS=1"),
         "CARGO_BUILD_JOBS must default to 1 (2 is OOM-killed on the default 8 GB VM): {envs:?}"
     );
+    assert!(
+        envs.contains(&"CARGO_TARGET_DIR=/target"),
+        "CARGO_TARGET_DIR must point at the /target volume, or every run is a cold build in \
+         the throwaway /src/target: {envs:?}"
+    );
 
     // Marker first, then cargo with the passthrough args.
     let marker = d
@@ -185,10 +190,28 @@ fn dry_run_prints_the_measured_container_layout() {
         d.inner[cargo]
     );
 
-    // An OOM-killed rustc (6.9 GB peak on an 8 GB VM at -j1) gets the hint that blames
+    // The script's exit status is cargo's: a red Linux run must not report success.
+    assert!(
+        d.inner.get(cargo + 1).map(String::as_str) == Some("code=$?")
+            && d.inner.last().map(String::as_str) == Some("exit \"$code\""),
+        "the inner script must capture cargo's status on the next line and exit with it:\n{}",
+        d.inner.join("\n")
+    );
+
+    // `set -e` is off around cargo, or a failing cargo exits the script before the OOM
+    // hint below can ever print.
+    assert!(
+        d.inner[marker..cargo].iter().any(|l| l == "set +e"),
+        "`set +e` must sit between the marker and cargo, or the OOM hint is unreachable:\n{}",
+        d.inner.join("\n")
+    );
+
+    // An OOM-killed process (6.9 GB peak on an 8 GB VM at -j1) gets the hint that blames
     // the VM, not the test — and only when cargo failed with a SIGKILL in its stderr.
     let hint = d
-        .inner_line(|l| l.contains("rustc was killed — lower --jobs or raise Docker"))
+        .inner_line(|l| {
+            l.contains("SIGKILLed (likely out of memory) — lower --jobs or raise Docker")
+        })
         .expect("the inner script must carry the OOM hint");
     assert!(
         hint > cargo
@@ -267,6 +290,7 @@ fn missing_docker_and_dead_daemon_are_told_apart() {
     );
     assert!(
         err.contains("docker daemon not reachable (docker info failed)")
+            && err.contains("start the Docker daemon and retry")
             && !err.to_lowercase().contains("install"),
         "a present binary with a dead daemon must name the daemon, not suggest installing \
          docker: {err}"
