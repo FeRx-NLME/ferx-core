@@ -28,8 +28,11 @@ pub mod suggest_start;
 pub mod survival;
 pub mod types;
 
+// Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
+#[allow(deprecated)]
+pub use api::bind_theta_levels_from_fit;
 pub use api::{
-    bind_theta_levels, bind_theta_levels_from_fit, check_model_data, check_model_data_warnings,
+    bind_from_fit, bind_theta_levels, check_model_data, check_model_data_warnings,
     check_model_options, configure_global_thread_pool, fit, fit_from_files, install_on_engine_pool,
     predict, predict_diag, prepare_run, prepare_run_with_inits, resolve_data_path, run_from_file,
     run_model_simulate, run_model_simulate_with_overrides, run_model_with_data,

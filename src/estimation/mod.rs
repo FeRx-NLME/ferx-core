@@ -7,6 +7,7 @@ pub mod bayes;
 pub(crate) mod cov_diagnostics;
 pub(crate) mod covariance;
 pub(crate) mod covariate_mu_ref;
+pub(crate) mod fit_inputs;
 pub(crate) mod fixed_eta_gradient;
 pub(crate) mod focei_htilde_dx;
 pub mod gauss_newton;

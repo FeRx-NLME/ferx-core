@@ -484,6 +484,24 @@ fn an_unbound_symbolic_statistic_is_a_hard_error() {
         .expect_err("an unbound symbolic statistic must not reach a fit");
     assert!(e.contains("data-derived statistics"), "{e}");
     assert!(e.contains("bind_covariate_stats"), "{e}");
+    // #1619: the same text reaches a caller holding a fit's θ, for whom the
+    // fit-time binder is the wrong one (it centres on the data at hand). Each
+    // clause of the from-fit remedy, asserted on its own.
+    assert!(
+        e.contains(
+            " To run the model with a fit's θ instead (a simulation, a prediction, SIR or a \
+             covariance step), bind it with `ferx_core::api::bind_from_fit` and the fit's \
+             `data_bindings`:"
+        ),
+        "the from-fit binder: {e}"
+    );
+    assert!(
+        e.ends_with(
+            " statistics taken from the data at hand would centre the relations on that data, \
+             not on the data the θ was estimated from."
+        ),
+        "why not the fit-time binder: {e}"
+    );
     // …and the check the fit path runs reports it under its own code.
     let pop = population("WT", &[50.0, 70.0, 90.0]);
     let diags = crate::api::check_model_data(&parsed.model, &pop);

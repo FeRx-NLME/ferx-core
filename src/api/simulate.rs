@@ -337,8 +337,7 @@ pub(crate) fn validate_iov_simulatable(
 /// it was bound against, so a fit's θ only fits a design bound with the *fit's*
 /// level bindings. The message says so whenever the model declares a level block. It
 /// names no function, since a wrapper reaches it too; from Rust, the binder is
-/// [`bind_theta_levels_from_fit`](crate::bind_theta_levels_from_fit) with the fit's
-/// `parsed.bindings.levels`.
+/// [`bind_from_fit`](crate::bind_from_fit) with the fit's `data_bindings`.
 pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result<(), String> {
     let expected = model.default_params.theta.len();
     if theta.len() == expected {

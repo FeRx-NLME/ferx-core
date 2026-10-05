@@ -209,6 +209,8 @@ The second and third arguments to `run_sir` are `Option<&CompiledModel>` and `Op
 - **Supplied (`Some(...)`)**: used as-is. No hash check happens — caller owns verification.
 - **`None`**: `run_sir` re-reads from `fit.model_path` / `fit.data_path` (set automatically by `fit_from_files`). If `fit.model_hash` / `fit.data_hash` is set, the file is hashed and compared against the stored digest. **A mismatch is a hard error** — the whole point of `run_sir` is to refuse SIR against stale source.
 
+The re-read reads the data the way the fit did, `[data_selection]` included, and binds the model from the fit's `data_bindings`: the fit's level layout and its `[covariate_model]` statistics, never the ones the data at hand would give. A fit whose bindings are empty (a `.fitrx` saved before they were recorded) is refused when the model has a level block or a symbolic covariate centre; refit it. A supplied model must carry the fit's bindings and θ count, and the population must hold the fit's subjects in the fit's order. Each is refused otherwise rather than evaluated at the wrong θ layout ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). `run_covariance` resolves its inputs the same way.
+
 This means `run_sir(&fit, None, None, &opts)` "just works" after `fit_from_files`, with built-in integrity checking. For in-memory workflows where `fit()` was called directly (no paths recorded), pass the model and population explicitly.
 
 ### Hash storage on `FitResult`

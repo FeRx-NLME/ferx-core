@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    eval_gather, level_index_column, parse_full_model_with, LevelBinding, LevelBindings,
-    LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
+    eval_gather, level_index_column, parse_full_model_with, DataBindings, LevelBinding,
+    LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
 };
 use crate::types::{ParsedModel, Population, Subject};
 
@@ -57,14 +57,20 @@ pub fn bind_theta_levels(
             .map(|(i, l)| (l.clone(), i + 1))
             .collect();
         write_index_column(decl, &table, population)?;
-        bindings.insert(
-            decl.name().to_string(),
-            LevelBinding {
-                labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
-                groups,
-                contrast,
-            },
+        let binding = LevelBinding {
+            labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
+            groups,
+            contrast,
+        };
+        // #1672: the shapes the from-fit validation refuses are ones this binder
+        // never writes. Asserted on its own output, so every level fixture in the
+        // suite measures that claim instead of the refusal resting on it.
+        debug_assert!(
+            check_binding_shape(decl, &binding).is_ok(),
+            "bind_theta_levels wrote a binding the from-fit validation refuses: {:?}",
+            check_binding_shape(decl, &binding)
         );
+        bindings.insert(decl.name().to_string(), binding);
     }
 
     let model_name = parsed.model.name.clone();
@@ -105,6 +111,11 @@ pub fn bind_theta_levels(
 /// Also refused: `fitted` lacking a block the model declares, or carrying one it does
 /// not, or listing a level of a block more than once. Nothing is written to `population`
 /// unless every block binds.
+#[deprecated(
+    since = "0.4.1",
+    note = "use `bind_from_fit` with the fit's `data_bindings`, which also binds the \
+            covariate statistics from the fit"
+)]
 pub fn bind_theta_levels_from_fit(
     parsed: &mut ParsedModel,
     model_text: &str,
@@ -112,6 +123,142 @@ pub fn bind_theta_levels_from_fit(
     fitted: &LevelBindings,
 ) -> Result<(), String> {
     let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
+    validate_fitted_levels(&decls, fitted)?;
+    if decls.is_empty() {
+        return Ok(());
+    }
+    let tables = fitted_level_tables(&decls, population, fitted)?;
+    for (decl, table) in decls.iter().zip(&tables) {
+        write_index_column(decl, table, population)?;
+    }
+    let model_name = parsed.model.name.clone();
+    parsed.bindings.levels = fitted.clone();
+    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    parsed.model = rebound.model;
+    parsed.model.name = model_name;
+    Ok(())
+}
+
+/// Bind a model to a **fit's** data-derived bindings (#1619), so the fit's θ can
+/// drive it on `population`: a simulation design, new data to predict, or the
+/// fit's own data re-read.
+///
+/// `fitted` is the fit's [`DataBindings`] — `FitResult::data_bindings`, which a
+/// `.fitrx` bundle carries too. Both halves are applied in one call:
+///
+/// - **level blocks**: each record of `population` gets the index of its level
+///   *in the fit*, and the model is laid out with the fit's labels, groups and
+///   resolved contrast, so the θ layout is the fit's by construction;
+/// - **covariate statistics**: every symbolic centre (`center = median`, …)
+///   resolves to the *fit's* value, never to `population`'s. A design of heavier
+///   subjects than the fit's has a higher median weight, and centring on it would
+///   move every covariate factor the fitted θ was estimated against.
+///
+/// After this call, [`bind_covariate_stats`](crate::api::bind_covariate_stats) on the
+/// same model is a no-op: no relation is left unresolved for it to re-centre.
+///
+/// Refused, with nothing written to `population`:
+///
+/// - empty `fitted` on a model with a level block or a symbolic statistic: a fit
+///   made before ferx recorded its bindings, or an older `.fitrx`. The bindings are
+///   not re-discovered from the data, since a layout resolved today need not be the
+///   one the fit was estimated with;
+/// - level bindings that lack a block the model declares or carry one it does not,
+///   list a level twice, split a contrast group, record `auto` as the contrast, or
+///   whose labels and groups are not parallel;
+/// - covariate statistics that lack a covariate a symbolic relation reads, or
+///   carry one no relation reads;
+/// - a `population` level the fit never observed, since no θ was estimated for it.
+pub fn bind_from_fit(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &mut Population,
+    fitted: &DataBindings,
+) -> Result<(), String> {
+    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
+    let symbolic = crate::api::covariate_stats::symbolic_covariates(&parsed.model);
+    if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
+        return Err(no_fit_bindings_message(&decls, &symbolic));
+    }
+    validate_fitted_levels(&decls, &fitted.levels)?;
+    crate::api::covariate_stats::validate_fitted_stats(&parsed.model, &fitted.covariate_stats)?;
+    let tables = fitted_level_tables(&decls, population, &fitted.levels)?;
+    if decls.is_empty() && fitted.covariate_stats.is_empty() {
+        return Ok(());
+    }
+
+    for (decl, table) in decls.iter().zip(&tables) {
+        write_index_column(decl, table, population)?;
+    }
+    let model_name = parsed.model.name.clone();
+    parsed.bindings.levels = fitted.levels.clone();
+    parsed.bindings.covariate_stats = fitted.covariate_stats.clone();
+    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    parsed.model = rebound.model;
+    parsed.model.name = model_name;
+    crate::api::assert_covariate_model_bound(&parsed.model)
+}
+
+/// Write the level index columns of a model **already** bound to a fit's level
+/// bindings onto a population re-read for it: the `run_sir` / `run_covariance`
+/// cell where the caller supplies the bound model but not the population (#1622).
+/// The validation and unseen-level refusal of [`bind_from_fit`]; no re-parse, since
+/// the model in hand already carries the layout.
+pub(crate) fn write_fitted_level_columns(
+    model: &crate::types::CompiledModel,
+    population: &mut Population,
+    fitted: &LevelBindings,
+) -> Result<(), String> {
+    let decls: Vec<LevelBlockDecl> = model.theta_blocks().level_blocks().to_vec();
+    validate_fitted_levels(&decls, fitted)?;
+    let tables = fitted_level_tables(&decls, population, fitted)?;
+    for (decl, table) in decls.iter().zip(&tables) {
+        write_index_column(decl, table, population)?;
+    }
+    Ok(())
+}
+
+/// The refusal for a fit that carries no data-derived bindings at all, on a model
+/// that needs them (#1619). One clause per half the model actually has, so a
+/// level-only model hears nothing about statistics and the reverse.
+fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> String {
+    let mut needs: Vec<String> = Vec::new();
+    if !decls.is_empty() {
+        needs.push(format!(
+            "its theta level block(s) {} take their level layout from the data it was \
+             fitted on",
+            decls
+                .iter()
+                .map(|d| format!("`{}[{}]`", d.name(), d.columns().join(", ")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !symbolic.is_empty() {
+        needs.push(format!(
+            "its [covariate_model] relations state a statistic of {} symbolically, so their \
+             centres come from the data it was fitted on",
+            symbolic
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    format!(
+        "this fit carries no data-derived bindings, so the model cannot be rebuilt the way \
+         it was fitted: {}. The fit is an older `.fitrx` bundle, or was made before ferx \
+         recorded these bindings with a fit. Refit the model to record them.",
+        needs.join(", and ")
+    )
+}
+
+/// Check a fit's level bindings against the blocks the model declares, before
+/// anything is written (#1621, #1672). A `.fitrx` bundle carries its bindings as
+/// data a caller can edit, so every shape the re-parse would otherwise accept (a θ
+/// the fit never had, a group whose free θ are not contiguous, a contrast nobody
+/// resolved) is refused here, with the fault placed in the bindings.
+fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> Result<(), String> {
     let mut extra: Vec<&str> = fitted
         .keys()
         .filter(|name| !decls.iter().any(|d| d.name() == name.as_str()))
@@ -129,12 +276,7 @@ pub fn bind_theta_levels_from_fit(
                 .join(", ")
         ));
     }
-    if decls.is_empty() {
-        return Ok(());
-    }
-
-    let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
-    for decl in &decls {
+    for decl in decls {
         let binding = fitted.get(decl.name()).ok_or_else(|| {
             format!(
                 "theta {}[{}]: the fit's level bindings carry no `{}`, so there is no fitted \
@@ -158,6 +300,52 @@ pub fn bind_theta_levels_from_fit(
         if !repeated.is_empty() {
             return Err(repeated_labels_message(decl, &repeated));
         }
+        check_binding_shape(decl, binding)?;
+    }
+    Ok(())
+}
+
+/// The two shapes a binding ferx wrote can never have (#1672): an unresolved
+/// `auto` contrast, and a contrast group whose levels are not contiguous. Shared by
+/// the from-fit validation and by a `debug_assert!` on [`bind_theta_levels`]'s own
+/// output, which is what measures the claim that ferx never writes either.
+fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<(), String> {
+    if binding.contrast == LevelContrast::Auto {
+        return Err(format!(
+            "theta {}[{}]: the fit's level bindings are malformed: they record the contrast \
+             `auto`, and a fit never records `auto`, only the contrast it resolved to.",
+            decl.name(),
+            decl.columns().join(", ")
+        ));
+    }
+    let split =
+        binding.groups.iter().enumerate().find(|&(i, g)| {
+            i > 0 && binding.groups[i - 1] != *g && binding.groups[..i].contains(g)
+        });
+    if let Some((_, g)) = split {
+        return Err(format!(
+            "theta {}[{}]: the fit's level bindings are malformed: the levels of contrast \
+             group {g} are split. A fit records each group's levels contiguously, since a \
+             group's free theta occupy one contiguous range.",
+            decl.name(),
+            decl.columns().join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Each `population` level's index in the fit, per block, refusing a level the fit
+/// never observed. Computed for every block before any column is written, so a
+/// refusal leaves `population` untouched. `fitted` has passed
+/// [`validate_fitted_levels`], so every block has an entry.
+fn fitted_level_tables(
+    decls: &[LevelBlockDecl],
+    population: &Population,
+    fitted: &LevelBindings,
+) -> Result<Vec<Vec<(Level, usize)>>, String> {
+    let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
+    for decl in decls {
+        let binding = &fitted[decl.name()];
         let mut table = Vec::new();
         let mut unseen = Vec::new();
         for level in discover_levels(decl, population)? {
@@ -172,16 +360,7 @@ pub fn bind_theta_levels_from_fit(
         }
         tables.push(table);
     }
-
-    for (decl, table) in decls.iter().zip(&tables) {
-        write_index_column(decl, table, population)?;
-    }
-    let model_name = parsed.model.name.clone();
-    parsed.bindings.levels = fitted.clone();
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
-    parsed.model = rebound.model;
-    parsed.model.name = model_name;
-    Ok(())
+    Ok(tables)
 }
 
 /// Each label that occurs more than once in `labels`, once, in order of first
@@ -554,9 +733,9 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 /// Write the synthesized 1-based level index onto every subject.
 ///
 /// `table` pairs each level with its index: the level's own position for
-/// [`bind_theta_levels`], its position in the fit for [`bind_theta_levels_from_fit`].
-/// Both binders share this one writer, so the dose, EVID=2 and reset handling below
-/// cannot drift between them.
+/// [`bind_theta_levels`], its position in the fit for [`bind_from_fit`] (and the
+/// deprecated `bind_theta_levels_from_fit`). Every binder shares this one writer, so
+/// the dose, EVID=2 and reset handling below cannot drift between them.
 ///
 /// When the index is constant within a subject it goes into the subject-level
 /// covariate map only — no time-varying machinery is engaged, so the model
@@ -725,7 +904,7 @@ pub struct ThetaLevelValue {
 /// level in the θ vector, so standard errors can be joined to it.
 ///
 /// `theta` must be laid out for this bound model: the θ of a fit of `model`, or of a
-/// model rebound with [`bind_theta_levels_from_fit`]. A θ whose length is not the
+/// model rebound with [`bind_from_fit`]. A θ whose length is not the
 /// model's is refused; one of the right length but from a different binding cannot be
 /// detected, and is read at the wrong positions.
 ///

@@ -208,16 +208,13 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     // new data — is `from_fit::following_the_unbound_predict_refusal_gives_the_fits_predictions`.
     assert!(
         err.contains(
-            "With a fit's θ, call `bind_theta_levels_from_fit(&mut parsed, &model_text, &mut \
-             population, &fitted_levels)` on the population you pass to `predict`"
+            "With a fit's θ, call `bind_from_fit(&mut parsed, &model_text, &mut population, \
+             &fit.data_bindings)` on the population you pass to `predict`"
         ),
         "the from-fit binder, on the population predict reads: {err}"
     );
     assert!(
-        err.contains(
-            ", where `fitted_levels` is the `parsed.bindings.levels` kept from binding the fit \
-             data"
-        ),
+        err.contains(", with the `data_bindings` the fit (or its `.fitrx`) carries"),
         "where the fit's bindings come from: {err}"
     );
     assert!(
@@ -240,6 +237,8 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     );
     for absent in [
         "__level_",
+        "bind_theta_levels_from_fit",
+        "parsed.bindings.levels",
         "not found in data",
         "before simulating",
         "read_population_for_simulation",
@@ -1051,6 +1050,7 @@ mod binder_helpers {
 
 /// `bind_theta_levels_from_fit` (#1614): a simulation design bound against the fit's
 /// level bindings. Analytic one-compartment IV throughout; no gradient path.
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 mod from_fit {
     use super::*;
     use crate::api::{bind_theta_levels_from_fit, simulate_with_seed};
@@ -1482,12 +1482,14 @@ mod from_fit {
                 .err()
                 .expect("an unbound model must not predict");
         assert!(
-            err.contains("`bind_theta_levels_from_fit("),
+            err.contains("`bind_from_fit("),
             "the refusal names the binder this test follows: {err}"
         );
 
         let mut followed = new_data.clone();
-        let parsed = bind_design(&text, &mut followed, &fit.bindings.levels).expect("bind");
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_from_fit(&mut parsed, &text, &mut followed, fit.model.data_bindings())
+            .expect("bind");
         assert_eq!(rows(&parsed.model, &followed), want);
 
         // Why the advice cannot be `bind_theta_levels`: on this population it lays θ out
@@ -2172,6 +2174,7 @@ mod readout_share {
 //
 // Each refusal's sentences are asserted one by one, so deleting any of them
 // reddens a test here (the PR's message table names which).
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 mod contrast_refusals {
     use super::readout_share::{bind_parsed, cf_model, cf_pop, h2, BASE, EMAXY, T6};
     use super::*;
@@ -2505,6 +2508,7 @@ mod data_bindings {
 }
 
 /// #1621 T7: a fitted binding that lists a level more than once is refused.
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 mod from_fit_repeated_labels {
     use super::*;
     use crate::api::bind_theta_levels_from_fit;
@@ -2618,5 +2622,249 @@ mod from_fit_repeated_labels {
             assert_eq!(a.covariates.len(), b.covariates.len(), "{}", a.id);
             assert!(!a.covariates.contains_key("__level_PLACEBO"), "{}", a.id);
         }
+    }
+}
+
+/// `bind_from_fit` (#1619, #1672): the refusal table, cell by cell. Each refusal's
+/// sentences are asserted one by one, and every refusal leaves the population
+/// untouched. Analytic one-compartment IV; nothing is fitted, only bound.
+mod bind_from_fit {
+    use super::*;
+    use crate::api::bind_from_fit;
+    use crate::parser::model_parser::{DataBindings, LevelContrast};
+    use crate::types::ParsedModel;
+
+    /// `no_eta_model`, with and without its level block, with and without a
+    /// `center = median` relation on `WT`.
+    fn model(level: bool, median: bool) -> String {
+        let mut text = no_eta_model();
+        if !level {
+            text = text
+                .replace("theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", "")
+                .replace(" + PLACEBO", "");
+        }
+        if median {
+            text.push_str(
+                "\n[covariates]\n  WT continuous\n\n[covariate_model]\n  V ~ WT \
+                 power(center = median) => THETA_V_WT(0.6, 0.01, 5.0)\n",
+            );
+        }
+        text
+    }
+
+    /// [`population`] with a subject-level `WT` of `base + 10·study`.
+    fn weighed(n_studies: usize, n_times: usize, base: f64) -> Population {
+        let mut pop = population(n_studies, n_times);
+        for (s, subject) in pop.subjects.iter_mut().enumerate() {
+            subject
+                .covariates
+                .insert("WT".to_string(), base + 10.0 * s as f64);
+        }
+        pop.covariate_names.push("WT".to_string());
+        pop
+    }
+
+    /// The bindings a fit of `text` on `weighed(3, 2, 60)` records.
+    fn fitted(text: &str) -> DataBindings {
+        let mut pop = weighed(3, 2, 60.0);
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, &mut pop).unwrap();
+        crate::api::bind_covariate_stats(&mut parsed, text, &pop).unwrap();
+        parsed.model.data_bindings().clone()
+    }
+
+    /// Bind a fresh parse of `text` on `design`.
+    fn bind(text: &str, design: &mut Population, b: &DataBindings) -> Result<ParsedModel, String> {
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_from_fit(&mut parsed, text, design, b)?;
+        Ok(parsed)
+    }
+
+    /// The refusal, after checking it wrote nothing to the design.
+    fn refusal(text: &str, b: &DataBindings) -> String {
+        let mut design = weighed(3, 2, 80.0);
+        let before = format!("{design:?}");
+        let err = bind(text, &mut design, b)
+            .map(|_| ())
+            .expect_err("must be refused");
+        assert_eq!(
+            format!("{design:?}"),
+            before,
+            "a refusal wrote to the design"
+        );
+        err
+    }
+
+    /// Both halves come from the fit, at once: the design's own median (90) is not
+    /// the fit's (70), its level layout is the fit's, and the model records exactly
+    /// the fit's bindings. `bind_covariate_stats` afterwards is then a no-op (T3's
+    /// unit form).
+    ///
+    /// Mutations — stamp only `levels`, or skip the re-parse when the model has no
+    /// level block: the `Median`-only arm keeps an unresolved relation and is refused.
+    #[test]
+    fn both_halves_come_from_the_fit() {
+        for (level, median) in [(true, true), (false, true), (true, false)] {
+            let text = model(level, median);
+            let b = fitted(&text);
+            let mut design = weighed(3, 2, 80.0);
+            let mut parsed = bind(&text, &mut design, &b).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                parsed.model.data_bindings(),
+                &b,
+                "level {level} median {median}"
+            );
+            if median {
+                assert_eq!(b.covariate_stats["WT"].median, 70.0);
+            }
+            let n_theta = parsed.model.n_theta;
+            crate::api::bind_covariate_stats(&mut parsed, &text, &design).unwrap();
+            assert_eq!(
+                parsed.model.data_bindings(),
+                &b,
+                "a later stats bind is a no-op"
+            );
+            assert_eq!(parsed.model.n_theta, n_theta);
+        }
+        // A plain model with empty bindings binds as itself.
+        let text = model(false, false);
+        let mut design = weighed(3, 2, 80.0);
+        let parsed = bind(&text, &mut design, &DataBindings::default()).unwrap();
+        assert_eq!(parsed.model.n_theta, 2);
+    }
+
+    /// R1–R3: empty bindings on a model that needs them. Each half's clause is
+    /// asserted present exactly when the model has that half, all three cells in one
+    /// test, so forcing either clause on or off reddens it.
+    #[test]
+    fn empty_bindings_name_each_half_the_model_has() {
+        for (level, median) in [(true, false), (false, true), (true, true)] {
+            let err = refusal(&model(level, median), &DataBindings::default());
+            let cell = format!("level {level} median {median}: {err}");
+            assert!(
+                err.starts_with(
+                    "this fit carries no data-derived bindings, so the model cannot be \
+                     rebuilt the way it was fitted: "
+                ),
+                "{cell}"
+            );
+            assert_eq!(
+                err.contains(
+                    "its theta level block(s) `PLACEBO[STUDY, TIME]` take their level layout \
+                     from the data it was fitted on"
+                ),
+                level,
+                "{cell}"
+            );
+            assert_eq!(
+                err.contains(
+                    "its [covariate_model] relations state a statistic of `WT` symbolically, \
+                     so their centres come from the data it was fitted on"
+                ),
+                median,
+                "{cell}"
+            );
+            assert_eq!(err.contains(", and its"), level && median, "{cell}");
+            assert!(
+                err.ends_with(
+                    ". The fit is an older `.fitrx` bundle, or was made before ferx recorded \
+                     these bindings with a fit. Refit the model to record them."
+                ),
+                "{cell}"
+            );
+            for absent in ["design", "edited"] {
+                assert!(!err.contains(absent), "`{absent}` in {cell}");
+            }
+            assert_eq!(err.contains("statistic"), median, "{cell}");
+        }
+    }
+
+    /// R5 / R6: the statistics half is validated against the relations, never
+    /// filled in from the design.
+    ///
+    /// Mutations — delete either check: R5's cell binds on the design's median, or
+    /// is refused by `assert_covariate_model_bound` instead; R6's cells bind `Ok`.
+    #[test]
+    fn statistics_must_match_the_relations() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        b.covariate_stats.clear();
+        assert_eq!(
+            refusal(&text, &b),
+            "[covariate_model] relations state a statistic of `WT` symbolically, but the \
+             fit's covariate statistics carry no entry for it: they are not the statistics \
+             this model was fitted with."
+        );
+
+        let with_stats = fitted(&model(false, true));
+        for text in [model(false, false), model(true, false)] {
+            let mut b = fitted(&text);
+            b.covariate_stats = with_stats.covariate_stats.clone();
+            assert_eq!(
+                refusal(&text, &b),
+                "the fit's covariate statistics carry `WT`, which no [covariate_model] \
+                 relation of this model reads: the bindings belong to a different model."
+            );
+        }
+    }
+
+    /// R7 / R8 (#1672): the two shapes a fit never writes. The `debug_assert!` in
+    /// `bind_theta_levels` measures that claim on every level fixture of the suite.
+    ///
+    /// Mutations — delete either check: the cell re-parses into a layout no fit had
+    /// and binds `Ok`.
+    #[test]
+    fn a_split_group_or_an_auto_contrast_is_malformed() {
+        let text = model(true, false);
+        let mut b = fitted(&text);
+        let placebo = b.levels.get_mut("PLACEBO").unwrap();
+        assert_eq!(placebo.groups, vec![0; 6], "global sum_to_zero: one group");
+        placebo.groups = vec![0, 0, 1, 1, 0, 0];
+        assert_eq!(
+            refusal(&text, &b),
+            "theta PLACEBO[STUDY, TIME]: the fit's level bindings are malformed: the levels \
+             of contrast group 0 are split. A fit records each group's levels contiguously, \
+             since a group's free theta occupy one contiguous range."
+        );
+
+        let mut b = fitted(&text);
+        b.levels.get_mut("PLACEBO").unwrap().contrast = LevelContrast::Auto;
+        assert_eq!(
+            refusal(&text, &b),
+            "theta PLACEBO[STUDY, TIME]: the fit's level bindings are malformed: they record \
+             the contrast `auto`, and a fit never records `auto`, only the contrast it \
+             resolved to."
+        );
+
+        // A contiguous multi-group binding is not split: the check fires on a group's
+        // return, not on a group change.
+        let mut b = fitted(&text);
+        let placebo = b.levels.get_mut("PLACEBO").unwrap();
+        placebo.groups = vec![0, 0, 0, 1, 1, 1];
+        placebo.contrast = LevelContrast::SumToZeroWithin;
+        let mut design = weighed(3, 2, 80.0);
+        bind(&text, &mut design, &b).expect("contiguous groups bind");
+    }
+
+    /// R4 and the unseen-level refusal pass through unchanged, and still write
+    /// nothing.
+    #[test]
+    fn the_level_refusals_of_the_old_binder_still_apply() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        let placebo = b.levels.remove("PLACEBO").unwrap();
+        assert!(refusal(&text, &b).contains("the fit's level bindings carry no `PLACEBO`"));
+        b.levels.insert("EXTRA".to_string(), placebo);
+        assert!(refusal(&text, &b).contains("carry the block(s) `EXTRA`"));
+
+        let b = fitted(&text);
+        let mut design = weighed(4, 2, 80.0);
+        let before = format!("{design:?}");
+        let err = bind(&text, &mut design, &b).map(|_| ()).unwrap_err();
+        assert!(
+            err.contains("the design has 2 level(s) the fit estimated no theta for"),
+            "{err}"
+        );
+        assert_eq!(format!("{design:?}"), before);
     }
 }

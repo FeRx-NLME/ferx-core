@@ -755,6 +755,7 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY
 
 /// Read `design` as a simulation design for the model at `model_path` and bind
 /// it against `fitted` — the documented simulate-after-fit sequence.
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 fn bind_design_from_fit(
     model_path: &std::path::Path,
     design: &str,
@@ -1213,6 +1214,7 @@ fn bindings_rows(subjects: &[(usize, f64)]) -> String {
 /// `docs/api/fitting.qmd#simulate-with-fit-theta` documents: the fit's
 /// statistics go into the design's bindings, a re-parse compiles them in, then
 /// the levels bind from the fit — the from-fit path a reloaded `.fitrx` takes.
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 fn simulate_design_from(
     model: &str,
     b: &ferx_core::parser::model_parser::DataBindings,
@@ -1351,6 +1353,7 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
 /// arm panics on `simulate`; `fit.rs` copying `DataBindings::default()` leaves no
 /// statistics to re-parse with and the same arm dies.
 #[test]
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 fn the_documented_from_fit_sequence_binds_statistics_without_a_level_block() {
     let model = BINDINGS_MODEL
         .replace("  theta PLACEBO[STUDY](0.0, -10.0, 10.0)\n", "")
@@ -1421,4 +1424,263 @@ fn the_documented_from_fit_sequence_binds_statistics_without_a_level_block() {
         a.iter().zip(&c).any(|(x, y)| x.to_bits() != y.to_bits()),
         "the design's own statistics must give different rows"
     );
+}
+
+// ── #1619: `bind_from_fit`, one binder for a fit's data-derived bindings ──────
+//
+// The two-compartment oral fixture of the #1619 plan: `data/two_cpt_oral_cov.csv`
+// (30 subjects) with `STUDY = (ID − 1) mod 3 + 1`, `CL ~ WT power(center = median)`
+// and optionally `theta SHIFT[STUDY]` on `KA`. Analytic two-compartment predictor,
+// value path only: `outer_maxiter = 0`, no covariance step, so θ is the model's
+// initial estimates and no gradient is involved.
+
+/// `level`: the `SHIFT[STUDY]` block; `median`: `center = median`, else `= 70`.
+fn from_fit_model(level: bool, median: bool) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+{lvl}
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * {ka}exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[covariates]
+  WT   continuous
+  CRCL continuous
+  STUDY categorical
+
+[covariate_model]
+  CL ~ WT   power(center = {c}) => THETA_CL_WT(0.6, 0.01, 5.0)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+        lvl = if level {
+            "  theta SHIFT[STUDY](0.0, -2.0, 2.0)"
+        } else {
+            ""
+        },
+        ka = if level { "exp(SHIFT) * " } else { "" },
+        c = if median { "median" } else { "70" },
+    )
+}
+
+/// The fixture rows, with `STUDY`, keeping only subjects `keep` accepts by WT.
+fn from_fit_rows(keep: impl Fn(f64) -> bool) -> String {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/two_cpt_oral_cov.csv"),
+    )
+    .unwrap();
+    let mut out = String::new();
+    for (i, line) in src.lines().enumerate() {
+        if i == 0 {
+            out.push_str(&format!("{line},STUDY\n"));
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let id: usize = f[0].parse().unwrap();
+        if keep(f[8].parse().unwrap()) {
+            out.push_str(&format!("{line},{}\n", (id - 1) % 3 + 1));
+        }
+    }
+    out
+}
+
+/// A fitted case: the fit through `fit_from_files`, and `prepare_run`'s model,
+/// i.e. the model bound on the fit's own data — the reference every arm meets.
+struct FromFitCase {
+    dir: tempfile::TempDir,
+    model: String,
+    data_path: PathBuf,
+    fit: ferx_core::FitResult,
+    prep: ferx_core::PreparedRun,
+}
+
+fn from_fit_case(level: bool, median: bool) -> FromFitCase {
+    let model = from_fit_model(level, median);
+    let (dir, model_path, data_path) = write_case(&model, &from_fit_rows(|_| true));
+    let opts = ferx_core::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+    let fit = ferx_core::api::fit_from_files(m, Some(d), None, Some(opts)).expect("fit");
+    let prep = ferx_core::prepare_run(m, Some(d)).expect("prepare");
+    FromFitCase {
+        dir,
+        model,
+        data_path,
+        fit,
+        prep,
+    }
+}
+
+/// Read `path` the way the fit read its data, for a fresh unbound parse of `model`.
+fn read_unbound(
+    model: &str,
+    path: &std::path::Path,
+) -> (ferx_core::ParsedModel, ferx_core::Population) {
+    let parsed = ferx_core::parser::model_parser::parse_full_model(model).unwrap();
+    let (pop, _) = ferx_core::api::read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &parsed.column_map,
+    )
+    .expect("read");
+    (parsed, pop)
+}
+
+fn ipreds(
+    model: &ferx_core::CompiledModel,
+    pop: &ferx_core::Population,
+    theta: &[f64],
+) -> Vec<f64> {
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    ferx_core::api::simulate_with_seed(model, pop, &params, 1, 11)
+        .expect("simulate")
+        .iter()
+        .map(|r| r.ipred)
+        .collect()
+}
+
+fn assert_bits(got: &[f64], want: &[f64], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    for (i, (x, y)) in got.iter().zip(want).enumerate() {
+        assert!(x.is_finite() && *x > 0.0, "{what} row {i}: {x}");
+        assert_eq!(x.to_bits(), y.to_bits(), "{what} row {i}: {x} vs {y}");
+    }
+}
+
+/// #1619 T1. `bind_from_fit` on the **fit's own data** rebuilds exactly the model
+/// the fit was compiled to: the same bindings, the same θ count, the same level
+/// index column, and ipreds bit-identical to `prepare_run`'s bound model. The
+/// statistics-only model (`S`) is the #1668 trap: with no level block, a binder that
+/// re-parsed only for levels would stamp nothing.
+///
+/// Mutations — skip the re-parse when the model has no level block, or stamp only
+/// `levels`: `S` and `LS` stay statistics-unbound and the binder refuses.
+#[test]
+fn bind_from_fit_on_the_fit_data_rebuilds_the_fitted_model() {
+    for (level, median) in [(false, true), (true, false), (true, true)] {
+        let c = from_fit_case(level, median);
+        let what = format!("level {level} median {median}");
+        assert!(!c.fit.data_bindings.is_empty(), "{what}");
+        let (mut parsed, mut pop) = read_unbound(&c.model, &c.data_path);
+        ferx_core::bind_from_fit(&mut parsed, &c.model, &mut pop, &c.fit.data_bindings)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            parsed.model.data_bindings(),
+            c.prep.parsed.model.data_bindings(),
+            "{what}"
+        );
+        assert_eq!(parsed.model.n_theta, c.fit.theta.len(), "{what}");
+        if level {
+            let index = |p: &ferx_core::Population| -> Vec<u64> {
+                p.subjects
+                    .iter()
+                    .map(|s| s.covariates["__level_SHIFT"].to_bits())
+                    .collect()
+            };
+            assert_eq!(index(&pop), index(&c.prep.population), "{what}");
+        }
+        assert_bits(
+            &ipreds(&parsed.model, &pop, &c.fit.theta),
+            &ipreds(&c.prep.parsed.model, &c.prep.population, &c.fit.theta),
+            &what,
+        );
+    }
+}
+
+/// #1619 T2 + T3. A design of the fit's heavier half (WT above the fit's median):
+/// its own WT median is not the fit's, so a binder that resolves the statistics on
+/// the design re-centres `CL ~ WT`. The straddle is asserted in-test:
+///
+/// - **old** — `bind_covariate_stats` on the design: worst relative ipred against
+///   the reference **0.1743** (measured; bound 0.15);
+/// - **new** — `bind_from_fit` with the fit's bindings: bit-identical to the
+///   reference (the fitted model compiled on the fit data, simulated on the design),
+///   live **and** after `save_fit` → `load_fit`;
+/// - **T3** — `bind_covariate_stats(design)` *after* `bind_from_fit` changes no bit:
+///   the binder leaves no relation unresolved for it to re-centre.
+///
+/// Mutation — resolve the statistics on `population` instead of `fitted` in
+/// `bind_from_fit` (or bind levels only, so the later call re-centres): the new arm,
+/// or T3's, moves by the old arm's 0.17 and dies.
+#[test]
+fn bind_from_fit_keeps_the_fits_covariate_centres_on_a_design() {
+    let c = from_fit_case(false, true);
+    let fit_median = c.fit.data_bindings.covariate_stats["WT"].median;
+    assert_eq!(fit_median, 70.85);
+    let design_path = c.dir.path().join("design.csv");
+    std::fs::write(&design_path, from_fit_rows(|wt| wt > fit_median)).unwrap();
+    let theta = &c.fit.theta;
+
+    let (_, design) = read_unbound(&c.model, &design_path);
+    assert_eq!(design.subjects.len(), 15);
+    let reference = ipreds(&c.prep.parsed.model, &design, theta);
+    assert_eq!(reference.len(), 150);
+
+    // Old: the statistics resolved on the design.
+    let (mut old, old_pop) = read_unbound(&c.model, &design_path);
+    ferx_core::api::bind_covariate_stats(&mut old, &c.model, &old_pop).unwrap();
+    assert_eq!(old.model.data_bindings().covariate_stats["WT"].median, 80.6);
+    let moved = ipreds(&old.model, &old_pop, theta);
+    let mut worst = 0.0f64;
+    for (x, y) in moved.iter().zip(&reference) {
+        assert!(x.is_finite(), "{x}");
+        worst = worst.max(((x - y) / y).abs());
+    }
+    assert!(
+        worst > 0.15,
+        "the design's own median moved ipred by only {worst}"
+    );
+
+    // New: live, then from a reloaded `.fitrx`.
+    let fitrx = c.dir.path().join("fit.fitrx");
+    ferx_core::io::fitrx::save_fit(
+        &c.fit,
+        &c.prep.population,
+        &c.model,
+        &fitrx,
+        ferx_core::io::fitrx::SaveFitOptions::default(),
+    )
+    .expect("save");
+    let loaded = ferx_core::io::fitrx::load_fit(&fitrx).expect("load");
+    for (what, b) in [
+        ("live", &c.fit.data_bindings),
+        ("loaded", &loaded.fit.data_bindings),
+    ] {
+        let (mut parsed, mut pop) = read_unbound(&c.model, &design_path);
+        ferx_core::bind_from_fit(&mut parsed, &c.model, &mut pop, b).expect("bind");
+        assert_bits(&ipreds(&parsed.model, &pop, theta), &reference, what);
+        // T3: a stray statistics bind on the design afterwards is a no-op.
+        ferx_core::api::bind_covariate_stats(&mut parsed, &c.model, &pop).unwrap();
+        assert_bits(
+            &ipreds(&parsed.model, &pop, theta),
+            &reference,
+            &format!("{what}, then bind_covariate_stats"),
+        );
+    }
 }
