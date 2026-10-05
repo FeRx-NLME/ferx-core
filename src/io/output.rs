@@ -1175,8 +1175,10 @@ pub fn format_summary(result: &FitResult) -> String {
             let _ = writeln!(out, "  Eta shrinkage: {}", parts.join(", "));
         }
     }
-    // Kappa shrinkage (#1667): pooled, then per occasion slot as the console
-    // prints it; non-finite entries dropped as for the ETAs.
+    // Kappa shrinkage (#1667): pooled, then one line per occasion slot. Unlike
+    // the console, which prints `K NaN` and nests the slots under the pooled
+    // block, non-finite entries are dropped as for the ETAs, and each slot line
+    // names itself so it reads without a pooled parent.
     let kappa_parts = |sh: &[f64]| -> Vec<String> {
         sh.iter()
             .enumerate()
@@ -5528,6 +5530,8 @@ mod tests {
         r.omega_param_corr = Some(eta_corr);
         r.shrinkage_eta = vec![0.12, 0.08];
         r.shrinkage_kappa = vec![0.20, f64::NAN, 0.30];
+        // The third kappa has no name: its entries fall back to "KAPPA".
+        r.kappa_names.truncate(2);
         r.shrinkage_kappa_by_occ = vec![vec![0.10, f64::NAN, f64::INFINITY], vec![f64::NAN; 3]];
         let s = format_summary(&r);
 
@@ -5547,7 +5551,7 @@ mod tests {
             .find("  Eta shrinkage: eta_CL 12.0%, eta_V 8.0%\n")
             .unwrap();
         let pooled_at = s
-            .find("\n  Kappa shrinkage: K_LN 20.0%, K_C 30.0%\n")
+            .find("\n  Kappa shrinkage: K_LN 20.0%, KAPPA 30.0%\n")
             .unwrap_or_else(|| panic!("no pooled kappa shrinkage in:\n{s}"));
         assert!(diag_at < eta_at && eta_at < pooled_at, "{s}");
         assert!(
