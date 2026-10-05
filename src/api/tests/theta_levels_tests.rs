@@ -2676,10 +2676,12 @@ mod absorption {
     /// The model shapes of the #1649 plan, plus three that hold an individual
     /// parameter reading both the block and the η without being a funnel: the
     /// block read again in `y` (H8), the η read again (H9), and `TIME` read
-    /// inside it (H10); and two readout funnels reached through a unary
-    /// function (H11) and a power (H12). Every one carries `ETA_E0`.
-    const SHAPES: [&str; 13] = [
-        "H1", "G", "H2", "H5", "H6", "S1", "S2", "H7", "H8", "H9", "H10", "H11", "H12",
+    /// inside it (H10); two readout funnels reached through a unary function
+    /// (H11) and a power (H12); and an η scaled by `TIME` inside the funnel
+    /// candidate (H13). H6 and H13 are also the `TIME` twins of the `TAD` /
+    /// `TAFD` shapes in `the_clocks_vary_like_time`. Every one carries `ETA_E0`.
+    const SHAPES: [&str; 14] = [
+        "H1", "G", "H2", "H5", "H6", "S1", "S2", "H7", "H8", "H9", "H10", "H11", "H12", "H13",
     ];
 
     /// Shape `tag` with the block on `cols` and `contrast` (`""` = auto).
@@ -2742,6 +2744,10 @@ mod absorption {
             "H12" => cf(
                 format!("{BASE}  E0 = TVE0 + ETA_E0"),
                 format!("(E0 + PLACEBO + {EMAXY}) ^ 2"),
+            ),
+            "H13" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0 * TIME"),
+                format!("E0 + {EMAXY}"),
             ),
             _ => unreachable!("{tag}"),
         }
@@ -3592,5 +3598,66 @@ mod absorption {
             Ok((LevelContrast::SumToZeroWithin, 15))
         );
         assert!(try_bind(&shape("H1", "STUDY", ""), &one).is_err());
+    }
+
+    /// R1-1 (#1675 review). `TAD` and `TAFD` vary within a subject exactly as
+    /// `TIME` does, so a shape reading them must bind as its `TIME` twin does,
+    /// under every design and contrast of the oracle grid. With the only dose
+    /// at time 0 the three clocks are equal on these data, so the twin's oracle
+    /// cells in `binder_agrees_with_the_jacobian_oracle` (H6, H13) label these
+    /// too. The f64 predictor cannot label them directly: it reads `TAD` as 0
+    /// in a readout.
+    ///
+    /// Before the fix, `expr_constant` filed both clocks as data covariates
+    /// that were missing everywhere, so they read as constant: H6-with-`TAD`
+    /// was refused on one column and went to within on `[STUDY, VISIT]`.
+    #[test]
+    fn the_clocks_vary_like_time() {
+        let readout = |cols: &str, c: &str| {
+            cf_model(
+                c,
+                cols,
+                "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0",
+                "E0 + PLACEBO + EMAX * TAD / (TAD + ET50)",
+            )
+        };
+        let param = |cols: &str, c: &str| {
+            cf_model(
+                c,
+                cols,
+                &format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0 * TAFD"),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        let tad = |cols: &str, c: &str| readout(cols, c).replace("TAD", "tad");
+        type Shape<'a> = (&'a str, &'a dyn Fn(&str, &str) -> String, &'a str);
+        let cases: [Shape; 3] = [
+            ("TAD in y", &readout, "TAD"),
+            ("tad in y", &tad, "tad"),
+            ("TAFD in a parameter", &param, "TAFD"),
+        ];
+        let mut straddle = 0;
+        for (dtag, cols, pop) in designs() {
+            for (tag, text, clock) in cases {
+                for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+                    let clocked = text(cols, c);
+                    assert!(clocked.contains(clock), "{tag}");
+                    let twin = clocked.replace(clock, "TIME");
+                    let (got, want) = (try_bind(&clocked, &pop), try_bind(&twin, &pop));
+                    assert_eq!(
+                        got.is_ok(),
+                        want.is_ok(),
+                        "{dtag} {tag} {c:?}: {got:?} vs {want:?}"
+                    );
+                    if let (Ok(g), Ok(w)) = (&got, &want) {
+                        assert_eq!(g, w, "{dtag} {tag} {c:?}");
+                    }
+                    straddle += usize::from(want.is_ok());
+                }
+            }
+        }
+        // The twins bind in most cells, so a clock read as constant (refused, or
+        // pushed to within) is visible.
+        assert!(straddle >= 40, "only {straddle} twin cells bind");
     }
 }

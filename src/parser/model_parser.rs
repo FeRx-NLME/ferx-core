@@ -20977,6 +20977,13 @@ impl<'a> CouplingCtx<'a> {
             Expression::Variable(n) | Expression::Covariate(n) => {
                 if self.states.is_state(n) {
                     false
+                } else if scaling_intermediate_reserved(n).is_some() {
+                    // The eval-time clocks (`TAD`, `TAFD`, the `T` alias) and the
+                    // mixture index vary within a subject like `TIME` does; filed
+                    // as a data covariate they would be missing everywhere and so
+                    // read as constant (#1675 review, R1-1). `MACHEPS` is constant
+                    // but lands here too, which only costs a funnel nobody writes.
+                    false
                 } else if self.assigns.iter().any(|a| a.lhs == n.as_str()) {
                     self.var_constant(n, covs, stack)
                 } else {
