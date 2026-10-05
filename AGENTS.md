@@ -332,8 +332,8 @@ reference. If the realised error surprises you, chase it — that is information
 **Linux is the reference platform for fit numbers.** Tier-3 bands, anchor tolerances,
 headroom claims and "is this red on `main`?" all come from a Linux run, because CI is Linux
 and macOS fits differ through the **OS math library, not the CPU** (#1688): at `cff801db`
-`per_route_lag` reaches OFV −688.936445811360 on Linux arm64 *and* amd64, bit-identical down
-to the covariance eigenvalues, while native macOS arm64 stops at −420.33 with `converged: true`
+`per_route_lag` reaches OFV −688.936445811360 on Linux arm64 *and* amd64, the same in every
+printed digit down to the covariance eigenvalues, while native macOS arm64 stops at −420.33 with `converged: true`
 and fails. A macOS number names its platform and is never subtracted from, or compared
 against, a Linux one. Two ways to get a Linux number: `tools/linux-test.sh -- <cargo args>`
 (Docker, against a read-only copy of the tree; prints a `ferx-platform: Linux/…` marker line

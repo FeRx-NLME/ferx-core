@@ -472,7 +472,7 @@ CI runs on Linux, so reference numbers for fits — Tier-3 bands, anchor
 tolerances, headroom claims, and whether a test is red on `main` — come from
 Linux. macOS fits can differ, and the cause is the **OS math library, not the
 CPU**: at `cff801db` the `per_route_lag` fit reaches the same OFV
-(−688.936445811360) on Linux arm64 and Linux amd64, bit for bit, while native
+(−688.936445811360) on Linux arm64 and Linux amd64, in every printed digit, while native
 macOS arm64 converges to a different optimum (−420.33) and fails the test. A
 number measured on macOS names its platform and is never compared against a
 Linux one; a macOS-only failure is a question about the test, not a reason to

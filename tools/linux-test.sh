@@ -6,10 +6,10 @@
 #
 # Linux is the reference platform for fit numbers. macOS and Linux disagree on fits
 # because of the OS math library, not the CPU: at cff801db `per_route_lag` reaches
-# OFV -688.936445811360 on Linux arm64 AND on Linux amd64, bit-identical down to the
-# covariance eigenvalues, while native macOS arm64 stops at -420.33 and fails. CI
-# (`slow-tests.yml`) runs on ubuntu-latest, so "is this red on main?" is a Linux
-# question, and a Mac-only red answers a different one.
+# OFV -688.936445811360 on Linux arm64 AND on Linux amd64 — the same in every printed
+# digit, down to the covariance eigenvalues — while native macOS arm64 stops at
+# -420.33 and fails. CI (`slow-tests.yml`) runs on ubuntu-latest, so "is this red
+# on main?" is a Linux question, and a Mac-only red answers a different one.
 #
 # The container layout is load-bearing; each piece was measured on #1688:
 #
@@ -55,6 +55,9 @@ Example (the slow-tests.yml core leg):
       --features ci,survival,slow-tests --profile ci-test --no-fail-fast
 
 The docker binary is $FERX_DOCKER (default: docker).
+
+Ctrl-C does not stop a running container (#1693); stop it with
+  docker kill $(docker ps -q --filter ancestor=rustlang/rust:nightly)
 
 Caches live in Docker volumes, not in this tree:
   ferx-linux-target, ferx-linux-registry   (and *-amd64 under --amd64)
@@ -127,7 +130,7 @@ $cargo_cmd 2> >(tee /tmp/cargo.stderr >&2)
 code=\$?
 wait
 if [ \"\$code\" -ne 0 ] && grep -q 'SIGKILL' /tmp/cargo.stderr; then
-  echo 'linux-test: rustc was killed — lower --jobs or raise Docker'\"'\"'s memory' >&2
+  echo 'linux-test: a process was SIGKILLed (likely out of memory) — lower --jobs or raise Docker'\"'\"'s memory' >&2
 fi
 exit \"\$code\""
 
@@ -159,7 +162,7 @@ if ! command -v "$docker_bin" >/dev/null 2>&1; then
   exit 2
 fi
 if ! "$docker_bin" info >/dev/null 2>&1; then
-  echo "linux-test: docker daemon not reachable (docker info failed) — start Docker Desktop and retry" >&2
+  echo "linux-test: docker daemon not reachable (docker info failed) — start the Docker daemon and retry" >&2
   exit 2
 fi
 
