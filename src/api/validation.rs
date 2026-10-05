@@ -730,9 +730,10 @@ pub(crate) fn check_unbound_theta_levels(
                 ),
                 // `predict` is normally called with a fit's θ, so the binder to name is
                 // the one that lays θ out as the fit did, from the fit's own bindings
-                // (#1619: both halves, so a symbolic covariate centre is the fit's too). `bind_theta_levels` re-discovers
-                // the levels from the population at hand, and on new data reads a fit's θ
-                // at the wrong positions (#1644 review, row 1).
+                // (#1619: both halves, so a symbolic covariate centre is the fit's too).
+                // `bind_theta_levels` re-discovers the levels from the population at
+                // hand, and on new data reads a fit's θ at the wrong positions (#1644
+                // review, row 1).
                 UnboundLevelsEntry::Predict => format!(
                     "with a fit's θ, call `bind_from_fit(&mut parsed, &model_text, &mut \
                      population, &fit.data_bindings)` on the population you pass to \

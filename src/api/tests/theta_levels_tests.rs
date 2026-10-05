@@ -2897,6 +2897,29 @@ mod bind_from_fit {
         bind(&text, &mut design, &b).expect("under `auto`, the recorded contrast is the fit's");
     }
 
+    /// #1680 review r1, finding 6: a refusal from the re-parse itself — here a fitted
+    /// `WT` median of 0, which `power` divides by — leaves the design without index
+    /// columns and `parsed` as it was. On a model with a level block, so there are
+    /// columns to leave behind.
+    ///
+    /// Mutation — write the index columns before the re-parse (the r1 order): the
+    /// design gains `__level_PLACEBO` and `refusal`'s untouched-design check dies.
+    #[test]
+    fn a_refusal_from_the_re_parse_writes_nothing() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        b.covariate_stats.get_mut("WT").unwrap().median = 0.0;
+        let err = refusal(&text, &b);
+        assert!(err.contains("WT"), "the parser's own refusal: {err}");
+
+        let mut parsed = parse_full_model(&text).unwrap();
+        let before = parsed.model.n_theta;
+        let mut design = weighed(3, 2, 80.0);
+        bind_from_fit(&mut parsed, &text, &mut design, &b).unwrap_err();
+        assert_eq!(parsed.model.n_theta, before, "parsed is not replaced");
+        assert!(parsed.bindings.levels.is_empty(), "nor its bindings");
+    }
+
     /// R4 and the unseen-level refusal pass through unchanged, and still write
     /// nothing.
     #[test]

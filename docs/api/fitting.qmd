@@ -406,7 +406,10 @@ it discovers (the model's `default_params`, for example).
 Bindings that a fit could not have written are refused too, since a `.fitrx`
 stores them as editable data. That covers a level listed twice, a contrast
 group split across non-adjacent levels, an unresolved `auto` contrast, a
-missing covariate statistic, and one that no relation reads.
+contrast other than the one the block declares (`ref` and `sum_to_zero` free
+the same number of θ, so a swap would otherwise read the fitted values under
+the wrong convention), a missing covariate statistic, and one that no relation
+reads.
 
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows

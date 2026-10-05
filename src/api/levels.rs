@@ -175,6 +175,23 @@ pub fn bind_from_fit(
     population: &mut Population,
     fitted: &DataBindings,
 ) -> Result<(), String> {
+    bind_from_fit_on(parsed, model_text, Some(population), fitted)
+}
+
+/// [`bind_from_fit`], with the population optional: it is written to only when the
+/// model declares a level block, so a caller holding a borrowed population of a
+/// model without one (`run_sir` / `run_covariance`, #1622) need not copy it. `None`
+/// on a model that declares a level block is refused.
+///
+/// Every step that can refuse — validation, the unseen-level tables, the re-parse
+/// and the bound assert — runs before anything is written, so a refusal leaves both
+/// `parsed` and the population as they were.
+pub(crate) fn bind_from_fit_on(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: Option<&mut Population>,
+    fitted: &DataBindings,
+) -> Result<(), String> {
     let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
     let symbolic = crate::api::covariate_stats::symbolic_covariates(&parsed.model);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
@@ -182,21 +199,37 @@ pub fn bind_from_fit(
     }
     validate_fitted_levels(&decls, &fitted.levels)?;
     crate::api::covariate_stats::validate_fitted_stats(&parsed.model, &fitted.covariate_stats)?;
-    let tables = fitted_level_tables(&decls, population, &fitted.levels)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(());
     }
+    let tables = match (&population, decls.is_empty()) {
+        (_, true) => Vec::new(),
+        (Some(p), false) => fitted_level_tables(&decls, p, &fitted.levels)?,
+        (None, false) => {
+            return Err(format!(
+                "theta {}: a level block needs the population its index columns are written to",
+                decls[0].name()
+            ))
+        }
+    };
 
-    for (decl, table) in decls.iter().zip(&tables) {
-        write_index_column(decl, table, population)?;
+    // The re-parse reads no population, so it runs first: a refusal from it (or from
+    // the bound assert) must not leave index columns behind.
+    let mut bindings = parsed.bindings.clone();
+    bindings.levels = fitted.levels.clone();
+    bindings.covariate_stats = fitted.covariate_stats.clone();
+    let mut rebound = parse_full_model_with(model_text, &bindings)?.model;
+    crate::api::assert_covariate_model_bound(&rebound)?;
+
+    if let Some(population) = population {
+        for (decl, table) in decls.iter().zip(&tables) {
+            write_index_column(decl, table, population)?;
+        }
     }
-    let model_name = parsed.model.name.clone();
-    parsed.bindings.levels = fitted.levels.clone();
-    parsed.bindings.covariate_stats = fitted.covariate_stats.clone();
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
-    parsed.model = rebound.model;
-    parsed.model.name = model_name;
-    crate::api::assert_covariate_model_bound(&parsed.model)
+    rebound.name = parsed.model.name.clone();
+    parsed.model = rebound;
+    parsed.bindings = bindings;
+    Ok(())
 }
 
 /// Write the level index columns of a model **already** bound to a fit's level

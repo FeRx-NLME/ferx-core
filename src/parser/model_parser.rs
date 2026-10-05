@@ -2625,6 +2625,14 @@ pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
 pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
+    parse_full_model_source(&content, path)
+}
+
+/// [`parse_full_model_file`] on text already read from `path`: relative paths
+/// resolve against `path`'s directory as they would from the file. For a caller
+/// that also hashes the bytes it parses (`run_sir` / `run_covariance`, #1622), so
+/// the hashed, parsed and compiled text are one read of the file, not three.
+pub(crate) fn parse_full_model_source(content: &str, path: &Path) -> Result<ParsedModel, String> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     // `[priors] from_fit` (#254 phase 2) is resolved **inside** the parse, not
     // after it: the import is expanded during parsing (it is the only place the
@@ -2632,7 +2640,7 @@ pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     // model and the previous fit it updates from travel together in a run
     // directory, and the user runs `ferx` from wherever they happen to be.
     let mut parsed = parse_full_model_with(
-        &content,
+        content,
         &ParseBindings {
             model_dir: dir.map(|d| d.to_path_buf()),
             ..ParseBindings::default()

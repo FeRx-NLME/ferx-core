@@ -5,13 +5,16 @@
 //! `options.sir = true`, but lets callers drive SIR after a fit has completed
 //! (potentially from a different session, loaded via `.fitrx`).
 //!
-//! Hash-verification rules:
-//! - If the caller supplies `model` / `population` directly, those are used
-//!   as-is. We cannot verify against `fit.model_hash` / `fit.data_hash`
-//!   because the in-memory values don't carry their source bytes.
-//! - If the caller passes `None`, we re-read from `fit.model_path` /
-//!   `fit.data_path`. If a stored hash exists, a mismatch is a **hard error**
-//!   — the whole point of `run_sir` is to refuse stale data.
+//! Input rules (shared with `run_covariance` through
+//! `estimation::fit_inputs::resolve_fit_inputs`, #1622):
+//! - `None` re-reads from `fit.model_path` / `fit.data_path`, reads the data the
+//!   way the fit did (`[data_selection]` included) and binds the model from
+//!   `fit.data_bindings`. If a stored hash exists, a mismatch is a **hard error**.
+//! - A supplied `model` / `population` is not hash-checked (the in-memory values
+//!   don't carry their source bytes), but must be the fitted one: the fit's
+//!   bindings and θ count, the fit's subjects in the fit's order.
+//! - `Some(model)` with `population = None` still reads the hash-verified model
+//!   file, for the reader settings the re-read needs; pass both to avoid it.
 
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::types::*;
@@ -82,10 +85,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// caller passes `None` for both `model` and `population`, this function
 /// parses the full model file (including `[fit_options]`) and threads
 /// `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, there
-/// is no source of `iov_column`, so `run_sir` returns an error rather
-/// than silently dropping occasion parsing. Workaround: pass both
-/// `Some(model)` and `Some(population)` for IOV cases.
+/// `Some(model)` for an IOV model but leaves `population = None`, `run_sir`
+/// returns an error rather than read occasions with an `iov_column` the
+/// supplied model may not share: the model carries none, and the model file's
+/// need not be the one it was built with. Workaround: pass both `Some(model)`
+/// and `Some(population)` for IOV cases.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -707,18 +711,27 @@ mod tests {
 #[cfg(test)]
 mod from_fit_bindings {
     use super::*;
-    use crate::estimation::fit_inputs::test_fixtures::{case, Kind};
+    use crate::estimation::fit_inputs::test_fixtures::{sir_case, Kind};
 
     /// Every kind, `sir_ess` and `sir_ci_theta` `to_bits`. The ESS is asserted above
     /// 10 on every arm first: on a degenerate proposal (ESS ≈ 1, measured with the
     /// level block on `Q`) a bit match compares a single draw and would pass on a
     /// wrong model too.
     ///
+    /// Tier 3: five fits with their covariance step and ten SIR runs. The resolver it
+    /// exercises is the one `run_covariance` shares, whose per-PR test
+    /// (`run_covariance::from_fit_bindings::the_re_read_binds_and_filters_as_the_fit_did`)
+    /// dies on the same two mutations.
+    ///
     /// Mutations — skip the bind in `resolve_fit_inputs`: `Median`'s ESS moves (29.87
     /// vs 126.31 measured before the fix) and `Level` is refused on `n_theta`; drop the
     /// selection from the re-read: `Select` is refused on the subject count (a panic in
     /// the inner loop before #1622).
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn the_re_read_equals_the_model_bound_on_the_fit_data() {
         for kind in [
             Kind::Plain,
@@ -727,7 +740,7 @@ mod from_fit_bindings {
             Kind::LevelMedian,
             Kind::Select,
         ] {
-            let c = case(kind);
+            let c = sir_case(kind);
             let want = run_sir(
                 &c.fit,
                 Some(&c.prep.parsed.model),

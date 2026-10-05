@@ -86,9 +86,9 @@ section of the SDLC for the versioning policy).
   `[covariate_model]` statistics behind `center = median` and friends. A design of heavier
   subjects than the fit's no longer re-centres the covariate factors on its own median
   (17% on predictions, measured). Bindings a fit cannot have written are refused: empty
-  bindings on a model that needs them, a split contrast group or a stored `auto` contrast
-  ([#1672](https://github.com/FeRx-NLME/ferx-core/issues/1672)), and a missing or unread
-  covariate statistic.
+  bindings on a model that needs them, a split contrast group, a stored `auto` contrast or one
+  the block does not declare ([#1672](https://github.com/FeRx-NLME/ferx-core/issues/1672)),
+  and a missing or unread covariate statistic.
 
 - **A fit carries the data-derived bindings its model was compiled from**
   ([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)). `FitResult::data_bindings`

@@ -7,12 +7,16 @@
 //! This is the covariance-step analogue of
 //! [`run_sir`](crate::estimation::run_sir::run_sir).
 //!
-//! Hash-verification rules match `run_sir`:
-//! - If the caller supplies `model` / `population` directly, those are used
-//!   as-is (no hash check — the in-memory values don't carry their source bytes).
-//! - If the caller passes `None`, we re-read from `fit.model_path` /
-//!   `fit.data_path`. If a stored hash exists, a mismatch is a **hard error** —
-//!   the point of `run_covariance` is to refuse stale inputs.
+//! Input rules (shared with `run_sir` through
+//! `estimation::fit_inputs::resolve_fit_inputs`, #1622):
+//! - `None` re-reads from `fit.model_path` / `fit.data_path`, reads the data the
+//!   way the fit did (`[data_selection]` included) and binds the model from
+//!   `fit.data_bindings`. If a stored hash exists, a mismatch is a **hard error**.
+//! - A supplied `model` / `population` is not hash-checked (the in-memory values
+//!   don't carry their source bytes), but must be the fitted one: the fit's
+//!   bindings and θ count, the fit's subjects in the fit's order.
+//! - `Some(model)` with `population = None` still reads the hash-verified model
+//!   file, for the reader settings the re-read needs; pass both to avoid it.
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
@@ -63,10 +67,11 @@ use crate::types::*;
 /// not survive on a `CompiledModel`. When the caller passes `None` for both
 /// `model` and `population`, this function parses the full model file and
 /// threads `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, there is no
-/// source of `iov_column`, so `run_covariance` returns an error rather than
-/// silently dropping occasion parsing. Workaround: pass both `Some(model)` and
-/// `Some(population)` for IOV cases.
+/// `Some(model)` for an IOV model but leaves `population = None`,
+/// `run_covariance` returns an error rather than read occasions with an
+/// `iov_column` the supplied model may not share: the model carries none, and the
+/// model file's need not be the one it was built with. Workaround: pass both
+/// `Some(model)` and `Some(population)` for IOV cases.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
@@ -976,24 +981,13 @@ mod from_fit_bindings {
         assert_eq!(se(got), se(want), "{what}: se_theta bits");
     }
 
-    /// T6. `None, None` equals the oracle to the bit on every kind. Each kind's
-    /// fixture is checked to be live first: the median relation is unresolved on
-    /// the bare parse, the level block moves `n_theta`, and the selection drops a
-    /// subject, so a re-read that skipped any of them would have something to differ on.
-    ///
-    /// Mutations — skip the bind in `resolve_fit_inputs`: `Median` returns `Ok` with
-    /// no covariance and `Level` is refused on `n_theta`; read with
-    /// `read_population_routed_by` again: `Select` is refused on the subject count
-    /// (and, without that guard, measured worst relative difference 20.0).
-    #[test]
-    fn the_re_read_equals_the_model_bound_on_the_fit_data() {
-        for kind in [
-            Kind::Plain,
-            Kind::Median,
-            Kind::Level,
-            Kind::LevelMedian,
-            Kind::Select,
-        ] {
+    /// T6's oracle on one kind: `None, None` equals the call with `prepare_run`'s
+    /// bound model and population to the bit. The fixture is checked to be live first:
+    /// the median relation is unresolved on the bare parse, the level block moves
+    /// `n_theta`, and the selection drops a subject, so a re-read that skipped any of
+    /// them would have something to differ on.
+    fn assert_re_read_matches(kind: Kind) {
+        {
             let c = case(kind);
             let bare = unbound(&c);
             let symbolic = bare
@@ -1024,24 +1018,49 @@ mod from_fit_bindings {
         }
     }
 
+    /// T6, per PR: the two kinds each of the resolver's two halves is visible on.
+    ///
+    /// Mutations — skip the bind in `resolve_fit_inputs`: `Median` returns `Ok` with
+    /// no covariance; read with `read_population_routed_by` again: `Select` is
+    /// refused on the subject count (and, without that guard, measured worst
+    /// relative difference 20.0).
+    #[test]
+    fn the_re_read_binds_and_filters_as_the_fit_did() {
+        assert_re_read_matches(Kind::Median);
+        assert_re_read_matches(Kind::Select);
+    }
+
+    /// T6, every kind (Tier 3: five fits and ten covariance steps, which ran past
+    /// 60 s under the coverage build of `Tests + coverage (core)`). Adds the plain
+    /// control and the level kinds, where skipping the bind is refused on `n_theta`.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn the_re_read_equals_the_model_bound_on_the_fit_data() {
+        for kind in [
+            Kind::Plain,
+            Kind::Median,
+            Kind::Level,
+            Kind::LevelMedian,
+            Kind::Select,
+        ] {
+            assert_re_read_matches(kind);
+        }
+    }
+
     /// T8. A fit that carries no bindings (an older `.fitrx`, here a live fit with
-    /// `data_bindings` cleared): a plain model is unaffected, and a model that needs
-    /// bindings is refused with the binder's text behind the entry prefix — not
-    /// re-bound on the data, and not run unbound.
+    /// `data_bindings` cleared): a model that needs bindings is refused with the
+    /// binder's text behind the entry prefix — not re-bound on the data, and not run
+    /// unbound. (A plain model records no bindings at all, so T6's `Plain` kind is
+    /// the unaffected control.)
     ///
     /// Mutation — drop the empty-bindings refusal in `bind_from_fit`: `Level` panics
     /// or is refused on `n_theta`, `Median` is refused on its missing statistic; each
     /// assertion on the text dies.
     #[test]
     fn a_fit_without_bindings_is_refused_when_the_model_needs_them() {
-        let plain = case(Kind::Plain);
-        assert!(
-            plain.fit.data_bindings.is_empty(),
-            "a plain model records none"
-        );
-        let got = run_covariance(&plain.fit, None, None, &plain.opts).unwrap();
-        assert_same_covariance(&got, &oracle(&plain), "plain");
-
         for (kind, has_level, has_stat) in [
             (Kind::Level, true, false),
             (Kind::Median, false, true),
@@ -1138,9 +1157,12 @@ mod from_fit_bindings {
         .expect("a bound model re-reads its own population");
         assert_same_covariance(&got, &oracle(&level), "Level Some/None");
 
-        // A population that is not the fit's subjects (here one dropped, the shape
-        // a `FitOptions` row filter the file does not state leaves) is refused: the
-        // EBEs are matched by position, and the inner loop indexed past them.
+        // A population that is not the fit's subjects is refused: the EBEs are matched
+        // by position, and the inner loop indexed past them. Both causes, one message
+        // each (#1680 review r1, finding 5). First, one subject dropped (the shape a
+        // `FitOptions` row filter the file does not state leaves)…
+        const WHY: &str = "The fit's EBEs are matched to subjects by position, so the \
+                           population must be the one the fit saw.";
         let mut short = level.prep.population.clone();
         short.subjects.pop();
         let err = run_covariance(
@@ -1153,9 +1175,39 @@ mod from_fit_bindings {
         .unwrap_err();
         assert_eq!(
             err,
-            "run_covariance: the population has 29 subjects but the fit has 30, or not in the \
-             fit's order. The fit's EBEs are matched to subjects by position, so the population \
-             must be the one the fit saw."
+            format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
+        );
+        // …then the right count in the wrong order, naming the first position.
+        let mut swapped = level.prep.population.clone();
+        swapped.subjects.swap(1, 2);
+        let err = run_covariance(
+            &level.fit,
+            Some(&level.prep.parsed.model),
+            Some(&swapped),
+            &level.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "run_covariance: subject 2 of the population is `3`, but the fit's is `2`. {WHY}"
+            )
+        );
+        // Finding 7: checked before binding, so a population with a level the fit
+        // never saw hears that it is not the fit's, not the design advice of the
+        // unseen-level refusal.
+        let mut extra = level.prep.population.clone();
+        let mut newcomer = extra.subjects[0].clone();
+        newcomer.id = "99".to_string();
+        newcomer.covariates.insert("STUDY".to_string(), 4.0);
+        extra.subjects.push(newcomer);
+        let err = run_covariance(&level.fit, None, Some(&extra), &level.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("run_covariance: the population has 31 subjects but the fit has 30. {WHY}")
         );
 
         let median = case(Kind::Median);
@@ -1188,5 +1240,51 @@ mod from_fit_bindings {
             ),
             "{err}"
         );
+    }
+
+    /// #1680 review r1, finding 2: with a supplied model and no population, the model
+    /// file is still read — for its reader settings — so a changed or missing file is
+    /// refused. Each refusal carries the entry prefix, says why the file is needed and
+    /// how not to need it, and following that advice runs.
+    ///
+    /// Mutations — drop the `because` text from either failure, or the prefix from
+    /// the read error: the matching assertion dies.
+    #[test]
+    fn a_supplied_model_reads_the_model_file_only_for_its_reader() {
+        const BECAUSE: &str = " The population is re-read with this file's `[data]` \
+                               renames and `[data_selection]`, which decide the rows the \
+                               fit saw. Pass `population = Some(&pop)` as well, and the \
+                               model file is not read.";
+        let c = case(Kind::Median);
+        let model = &c.prep.parsed.model;
+
+        let text = std::fs::read_to_string(&c.model_path).unwrap();
+        std::fs::write(&c.model_path, format!("{text}\n# edited after the fit\n")).unwrap();
+        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.starts_with("run_covariance: model hash mismatch for "),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
+            "{err}"
+        );
+
+        std::fs::remove_file(&c.model_path).unwrap();
+        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.starts_with("run_covariance: cannot read the model file "),
+            "{err}"
+        );
+        assert!(err.ends_with(BECAUSE), "{err}");
+
+        // The advice: with the population supplied too, the file is not read.
+        let got = run_covariance(&c.fit, Some(model), Some(&c.prep.population), &c.opts)
+            .expect("no model file needed");
+        assert!(got.covariance_matrix.is_some());
     }
 }
