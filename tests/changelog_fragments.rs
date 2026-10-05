@@ -293,7 +293,12 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
         "assemble",
         &[
             ("20.fixed.md", "- Second fix (#20).\n\n\n"),
-            ("3.fixed.md", "- First fix (#3).\n  Continued.\n"),
+            // Interior blank lines and a table, as in the migrated fragments:
+            // they must survive assembly verbatim.
+            (
+                "3.fixed.md",
+                "- First fix (#3).\n  Continued.\n\n  | a | b |\n  |---|---|\n\n  After.\n",
+            ),
             ("3-2.fixed.md", "- Another for #3.\n"),
             ("7.performance.md", "- Faster (#7).\n"),
             ("9.added.md", "- New thing (#9).\n"),
@@ -334,7 +339,7 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
 ### Changed\n- Different (#43).\n\n\
 ### Deprecated\n- Old (#42).\n\n\
 ### Removed\n- Gone (#41).\n\n\
-### Fixed\n- First fix (#3).\n  Continued.\n- Another for #3.\n- Second fix (#20).\n\n\
+### Fixed\n- First fix (#3).\n  Continued.\n\n  | a | b |\n  |---|---|\n\n  After.\n- Another for #3.\n- Second fix (#20).\n\n\
 ### Security\n- Patched (#40).\n\n\
 ### Performance\n- Faster (#7).\n\n\
 ## [0.1.0] - 2026-01-01\n\n### Fixed\n- Old fix (#1).\n\n\
@@ -827,6 +832,13 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
         !lines.iter().any(|l| l.starts_with("ref:")),
         "changelog.yml overrides the checkout ref"
     );
+    // A path filter would skip exactly the source-only PRs the gate exists for.
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("paths:") || l.starts_with("paths-ignore:")),
+        "changelog.yml filters its trigger by path"
+    );
     // No step may mask the gate.
     assert!(
         !lines.iter().any(
@@ -968,5 +980,38 @@ fn the_release_workflow_checks_the_changelog_before_publishing() {
     assert!(
         yml.contains("TAG: ${{ github.event.inputs.tag || github.ref_name }}"),
         "release.yml passes the wrong tag"
+    );
+}
+
+/// `ci.yml`'s `Changelog` job validates the PR's own fragments only on the default
+/// (merge) checkout. With `ref: main` it would inspect the base branch, and a malformed
+/// fragment added by the PR would pass both workflows (`require` only asks whether
+/// one was added). The delegation itself is pinned in `preflight_owns_the_fast_gates`.
+#[test]
+fn the_ci_changelog_job_checks_the_pr_tree() {
+    let p = repo_root().join(".github").join("workflows").join("ci.yml");
+    let yml = std::fs::read_to_string(&p).unwrap();
+    let start = yml
+        .find("\n  changelog:\n")
+        .expect("ci.yml has no `changelog` job");
+    // Past the `\n  changelog:\n` header; the job ends at the next key indented by
+    // exactly two spaces (the next job).
+    let rest = &yml[start + "\n  changelog:\n".len()..];
+    let end = rest
+        .match_indices("\n  ")
+        .map(|(i, _)| i)
+        .find(|&i| {
+            let line = &rest[i + 3..];
+            !line.starts_with(' ') && !line.starts_with('#') && !line.starts_with('-')
+        })
+        .unwrap_or(rest.len());
+    let job = &rest[..end];
+    assert!(
+        job.contains("run: tools/preflight.sh changelog"),
+        "job body mis-sliced:\n{job}"
+    );
+    assert!(
+        !job.lines().any(|l| l.trim_start().starts_with("ref:")),
+        "the Changelog job checks out a ref other than the PR:\n{job}"
     );
 }
