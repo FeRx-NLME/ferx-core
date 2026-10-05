@@ -16,9 +16,12 @@ use ferx_core::types::FitOptions;
 use ferx_core::{fit, prepare_run, run_sir};
 use std::path::PathBuf;
 
-/// Measured worst `|ln(SIR endpoint / Wald endpoint)|` over both endpoints is
-/// recorded on the test; this is the bound, with the headroom stated there.
-const WALD_LOG_GAP_TOL: f64 = 0.35;
+/// Worst `|ln(SIR endpoint / Wald endpoint)|` over both endpoints. Measured
+/// 0.1774 (lower; upper 0.0498) on Linux/aarch64 at base `c8a0727b`, seed 1705,
+/// 1000/250 draws, ESS 143.2 — the same digits as macOS/arm64. The bound gives
+/// that ~1.7× headroom: the gap is a real SIR-vs-asymptotic difference that moves
+/// with the seed, not round-off.
+const WALD_LOG_GAP_TOL: f64 = 0.30;
 
 fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
     ci.as_ref()
@@ -32,17 +35,18 @@ fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
 ///    ESS, to the bit — on a weighted kappa this time, and with an ESS high
 ///    enough (asserted > 10 first) that a bit match compares a distribution,
 ///    not one draw. Mutation: drop either path's fill → that path's `expect`.
-/// 2. **Bracketing.** The κ interval contains the fitted κ. Mutation: read
+/// 2. **Bracketing.** The κ interval contains the fitted κ. Mutations: read
 ///    `omega` instead of `omega_iov` in `kappa_variances` → `ETA_E0`'s
-///    interval (2.05–25.2 measured) cannot contain κ ≈ 156.
+///    interval [2.05, 25.2] against κ = 156.0; report the SD `√κ` instead of
+///    the variance → [9.12, 19.2]. Both measured, both die here.
 /// 3. **Agreement with the covariance step.** The SIR interval and the Wald
 ///    interval on the scale the proposal is built on (`ln L_kk`, i.e.
-///    `κ·exp(±2·1.96·se_kappa/(2κ))`) agree endpoint by endpoint to
-///    [`WALD_LOG_GAP_TOL`] on the log scale. They are not expected to be
-///    equal — SIR exists to correct the asymptotic interval — but an interval
-///    built from the wrong coordinate (an off-diagonal, a Cholesky factor, the
-///    standard deviation instead of the variance) misses by far more: reading
-///    `L_kk` instead of `L_kk²` halves `ln κ`, a gap of ~2.5 here.
+///    `κ·exp(±1.96·se_kappa/κ)`) agree endpoint by endpoint to
+///    [`WALD_LOG_GAP_TOL`] on the log scale. Not expected to be equal — SIR
+///    exists to correct the asymptotic interval. No mutation of this diff
+///    reaches this bound before the bracket above; it pins the measured
+///    agreement, so an interval that drifts away from the covariance step's
+///    without leaving κ (a wrong percentile, a mis-weighted resample) is seen.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

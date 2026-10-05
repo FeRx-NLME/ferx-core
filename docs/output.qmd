@@ -319,7 +319,7 @@ it's free-form text), and `ferx_version`.
 
 A fit run with `sir = true`, or a `FitResult` returned by `run_sir`, gets a `sir:`
 block (see [SIR](estimation/sir.qmd)). Abridged, from the `mbma_placebo` BTAV
-fixture (`tests/data/mbma_placebo/`, macOS run):
+fixture (`tests/data/mbma_placebo/`, seed 1705, Linux run):
 
 ```yaml
 sir:
