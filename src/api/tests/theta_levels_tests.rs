@@ -2979,6 +2979,10 @@ mod absorption {
     /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
     const RANK_TOL: f64 = 1e-6;
 
+    /// `T6` with 0.5 in place of 0: every level of a `TIME`-keyed block holds a
+    /// record after the dose, so none is dead by construction (#1679).
+    pub(super) const NO0: [f64; 6] = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+
     /// `[STUDY, VISIT]`: VISIT 1 holds TIME 0, 1, 2 and VISIT 2 holds 4, 8, 12,
     /// so the block does not resolve a subject's observations.
     pub(super) fn visit_pop(n: usize, per: usize) -> Population {
@@ -3091,40 +3095,75 @@ mod absorption {
         Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
     }
 
-    /// The Jacobian pieces at the initial θ and η = 0, by central FD of the
-    /// f64 predictor: the block's per-level columns (bound under `none`), the
-    /// other θ columns, the per-subject η columns, and the level labels.
+    /// The Jacobian pieces at the initial θ and η = κ = 0, by central FD of
+    /// the f64 predictor: the block's per-level columns (bound under `none`),
+    /// the other θ columns, the per-subject η columns, the per-unit columns of
+    /// each random effect (a subject for an η, an occasion group of a subject
+    /// for a kappa), and the level labels.
     ///
-    /// The layout is taken from an η-free twin bound under `none`, then imposed
-    /// on the real model with [`bind_theta_levels_from_fit`], so a model the
-    /// binder refuses can still be measured.
+    /// The layout is the `none` layout of the levels the data shows
+    /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],
+    /// so a model the binder refuses can still be measured.
     pub(super) struct Jac {
         xb: DMatrix<f64>,
         xo: DMatrix<f64>,
         z: DMatrix<f64>,
+        /// Per random effect: its name, whether it is a kappa, its unit columns.
+        res: Vec<(String, bool, DMatrix<f64>)>,
         labels: Vec<String>,
         one_column: bool,
     }
 
-    pub(super) fn jacobian(text: &str, eta: &str, pop0: &Population) -> Jac {
-        let twin = text
-            .replace(eta, "0.0")
-            .replace("omega 0.0", &format!("omega {eta}"));
-        let mut p_twin = pop0.clone();
-        let mut pt = parse_full_model(&twin).unwrap();
-        crate::api::bind_theta_levels(&mut pt, &twin, &mut p_twin).expect("η-free twin binds");
-        let fitted: LevelBindings = pt.bindings.levels.clone();
+    /// Every block of `text` under `contrast = none`, on the levels `pop` shows.
+    pub(super) fn none_layout(text: &str, pop: &Population) -> LevelBindings {
+        let parsed = parse_full_model(text).unwrap();
+        parsed
+            .model
+            .theta_blocks()
+            .level_blocks()
+            .iter()
+            .map(|d| {
+                let levels = discover_levels(d, pop).unwrap();
+                let binding = crate::parser::model_parser::LevelBinding {
+                    labels: levels.iter().map(|l| l.label(d.columns())).collect(),
+                    groups: vec![0; levels.len()],
+                    contrast: LevelContrast::Unconstrained,
+                };
+                (d.name().to_string(), binding)
+            })
+            .collect()
+    }
+
+    pub(super) fn jacobian(text: &str, pop0: &Population) -> Jac {
+        let fitted = none_layout(text, pop0);
         let mut pop = pop0.clone();
         let mut parsed = parse_full_model(text).unwrap();
         bind_theta_levels_from_fit(&mut parsed, text, &mut pop, &fitted).expect("from_fit");
         let m = &parsed.model;
         let theta0 = m.default_params.theta.clone();
         let eta0 = vec![0.0; m.n_eta];
-        let preds = |th: &[f64], s: usize, et: &[f64]| {
-            crate::pk::compute_predictions_with_tv(m, &pop.subjects[s], th, et)
+        let n_kappa = m.n_kappa;
+        let groups: Vec<usize> = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                crate::stats::likelihood::iov_occasion_groups(s)
+                    .len()
+                    .max(1)
+            })
+            .collect();
+        let kappa0 = |s: usize| vec![vec![0.0; n_kappa]; groups[s]];
+        let preds = |th: &[f64], s: usize, et: &[f64], ka: &[Vec<f64>]| {
+            if n_kappa > 0 {
+                crate::pk::predict_iov(m, &pop.subjects[s], th, et, ka)
+            } else {
+                crate::pk::compute_predictions_with_tv(m, &pop.subjects[s], th, et)
+            }
         };
         let ns = pop.subjects.len();
-        let lens: Vec<usize> = (0..ns).map(|s| preds(&theta0, s, &eta0).len()).collect();
+        let lens: Vec<usize> = (0..ns)
+            .map(|s| preds(&theta0, s, &eta0, &kappa0(s)).len())
+            .collect();
         let nrow: usize = lens.iter().sum();
         let offs: Vec<usize> = lens
             .iter()
@@ -3134,45 +3173,85 @@ mod absorption {
                 Some(o)
             })
             .collect();
-        let theta_col = |k: usize| -> Vec<f64> {
-            let h = 1e-6 * theta0[k].abs().max(1.0);
-            let (mut tp, mut tm) = (theta0.clone(), theta0.clone());
-            tp[k] += h;
-            tm[k] -= h;
+        // One FD column: the difference of the predictions at two points, laid
+        // into the rows of subject `s` (or of every subject when `s` is `None`).
+        let fd = |only: Option<usize>, plus: &dyn Fn(usize) -> (Vec<f64>, Vec<f64>), h: f64| {
             let mut col = vec![0.0; nrow];
-            for s in 0..ns {
-                let (a, b) = (preds(&tp, s, &eta0), preds(&tm, s, &eta0));
+            for s in (0..ns).filter(|s| only.is_none_or(|o| o == *s)) {
+                let (a, b) = plus(s);
                 for j in 0..a.len() {
                     col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
                 }
             }
             col
         };
+        let theta_col = |k: usize| -> Vec<f64> {
+            let h = 1e-6 * theta0[k].abs().max(1.0);
+            let (mut tp, mut tm) = (theta0.clone(), theta0.clone());
+            tp[k] += h;
+            tm[k] -= h;
+            fd(
+                None,
+                &|s| {
+                    (
+                        preds(&tp, s, &eta0, &kappa0(s)),
+                        preds(&tm, s, &eta0, &kappa0(s)),
+                    )
+                },
+                h,
+            )
+        };
         let block: Vec<usize> = (0..m.n_theta)
             .filter(|&i| m.theta_names[i].starts_with("PLACEBO["))
             .collect();
         let other: Vec<usize> = (0..m.n_theta).filter(|i| !block.contains(i)).collect();
-        let mat = |cols: Vec<Vec<f64>>| DMatrix::from_fn(nrow, cols.len(), |r, c| cols[c][r]);
+        let mat = |cols: &[Vec<f64>]| DMatrix::from_fn(nrow, cols.len(), |r, c| cols[c][r]);
+        let h = 1e-6;
+        let mut res = Vec::new();
         let mut zc = Vec::new();
         for e in 0..m.n_eta {
+            let (mut ep, mut em) = (eta0.clone(), eta0.clone());
+            ep[e] += h;
+            em[e] -= h;
+            let cols: Vec<Vec<f64>> = (0..ns)
+                .map(|s| {
+                    fd(
+                        Some(s),
+                        &|s| {
+                            (
+                                preds(&theta0, s, &ep, &kappa0(s)),
+                                preds(&theta0, s, &em, &kappa0(s)),
+                            )
+                        },
+                        h,
+                    )
+                })
+                .collect();
+            res.push((m.eta_names[e].clone(), false, mat(&cols)));
+            zc.extend(cols);
+        }
+        for q in 0..n_kappa {
+            let mut cols = Vec::new();
             for s in 0..ns {
-                let h = 1e-6;
-                let (mut ep, mut em) = (eta0.clone(), eta0.clone());
-                ep[e] += h;
-                em[e] -= h;
-                let (a, b) = (preds(&theta0, s, &ep), preds(&theta0, s, &em));
-                let mut col = vec![0.0; nrow];
-                for j in 0..a.len() {
-                    col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
+                for g in 0..groups[s] {
+                    let (mut kp, mut km) = (kappa0(s), kappa0(s));
+                    kp[g][q] += h;
+                    km[g][q] -= h;
+                    cols.push(fd(
+                        Some(s),
+                        &|s| (preds(&theta0, s, &eta0, &kp), preds(&theta0, s, &eta0, &km)),
+                        h,
+                    ));
                 }
-                zc.push(col);
             }
+            res.push((m.kappa_names[q].clone(), true, mat(&cols)));
         }
         let labels = fitted["PLACEBO"].labels.clone();
         Jac {
-            xb: mat(block.iter().map(|&k| theta_col(k)).collect()),
-            xo: mat(other.iter().map(|&k| theta_col(k)).collect()),
-            z: mat(zc),
+            xb: mat(&block.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
+            xo: mat(&other.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
+            z: mat(&zc),
+            res,
             one_column: !labels[0].contains(','),
             labels,
         }
@@ -3289,29 +3368,52 @@ mod absorption {
         (LevelContrast::Unconstrained, "none"),
     ];
 
+    /// The clause every dead-level refusal with live levels left carries.
+    const DEAD_LEVELS: &str =
+        "has no effect on the predictions or the residual error at any of its records";
+
+    /// Whether the block coded by `contrast` loses rank on its own: some free θ
+    /// moves only levels with no effect (#1679, #1702 review F1). A dead level
+    /// costs nothing where the coding reaches it only through the other levels —
+    /// the reference under `ref`, one level per group under sum-to-zero.
+    pub(super) fn block_loses_rank(j: &Jac, contrast: LevelContrast) -> bool {
+        let xb = &j.xb * coding(j, contrast);
+        rank(&residual_sv(&xb, &DMatrix::zeros(xb.nrows(), 0))) < xb.ncols()
+    }
+
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
-    /// contrast exactly when the oracle says the block absorbs the random
-    /// effect under it (rank 0 against a positive baseline). Cells whose
-    /// contrast leaves no free θ are #1624's and skipped. `auto` must resolve
-    /// to a contrast that does not absorb, global whenever global does not, and
-    /// be refused only when every contrast absorbs.
+    /// contrast exactly when the oracle does: the block absorbs the random
+    /// effect under it (rank 0 against a positive baseline), or the coded block
+    /// loses rank on its own ([`block_loses_rank`]). Cells whose contrast leaves
+    /// no free θ are #1624's and skipped. `auto` must resolve to a contrast the
+    /// oracle accepts, global whenever global is accepted, and be refused only
+    /// when every contrast is. Exactly 4 cells have a level with no effect
+    /// (`rank X_B < L`); on those the verdict straddles — the within-group
+    /// contrast binds where no absorbed random effect takes the dead level's
+    /// slack (H10, and G at 2 subjects per study) and is refused where one does
+    /// (G at one) — and the dead cells are checked by the same oracle, not
+    /// skipped.
+    ///
+    /// Mutations — `dead_levels` returns nothing (the dead cells bind under
+    /// `none`); the dead failure ignores the contrast (within is refused on H10);
+    /// the slack clause dropped (G within binds at one subject per study).
     #[test]
     fn binder_agrees_with_the_jacobian_oracle() {
         let mut wrong: Vec<String> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
+        let mut dead_cells: Vec<String> = Vec::new();
+        let (mut dead_bound, mut dead_refused) = (0usize, 0usize);
         let mut seen: Vec<f64> = Vec::new();
         let (mut absorbed_cells, mut free_cells) = (0usize, 0usize);
         for (dtag, cols, pop) in designs() {
             for tag in SHAPES {
-                let jac = jacobian(&shape(tag, cols, "none"), "ETA_E0", &pop);
+                let jac = jacobian(&shape(tag, cols, "none"), &pop);
                 // A shape that reads the block only through a factor of `TIME` (G,
                 // H10) gives a block keyed on TIME a level with no effect on `y` at
-                // TIME = 0, η or not: the oracle would measure that unidentified
-                // level, not an absorbed η. Such cells are skipped, and listed.
-                if rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0))) < jac.xb.ncols()
-                {
-                    skipped.push(format!("{dtag} {tag}"));
-                    continue;
+                // TIME = 0, η or not (#1679).
+                let dead = rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0)))
+                    < jac.xb.ncols();
+                if dead {
+                    dead_cells.push(format!("{dtag} {tag}"));
                 }
                 let mut absorbs = HashMap::new();
                 for (c, token) in EXPLICIT {
@@ -3319,15 +3421,20 @@ mod absorption {
                     if free == 0 {
                         continue;
                     }
-                    let absorbed = base > 0 && under == 0;
+                    let absorbed = (base > 0 && under == 0) || block_loses_rank(&jac, c);
                     absorbed_cells += usize::from(absorbed);
                     free_cells += usize::from(!absorbed);
+                    if dead {
+                        dead_refused += usize::from(absorbed);
+                        dead_bound += usize::from(!absorbed);
+                    }
                     absorbs.insert(token, absorbed);
                     let got = try_bind(&shape(tag, cols, token), &pop);
                     if got.is_err() != absorbed {
                         wrong.push(format!(
-                            "{dtag} {tag} {token}: oracle rank {under} of {base} \
-                             ⇒ refuse={absorbed}, binder {got:?}"
+                            "{dtag} {tag} {token}: oracle rank {under} of {base}, block rank \
+                             loss {} ⇒ refuse={absorbed}, binder {got:?}",
+                            block_loses_rank(&jac, c)
                         ));
                     }
                 }
@@ -3375,7 +3482,7 @@ mod absorption {
             "oracle gap collapsed: {zero:e} / {live:e}"
         );
         assert_eq!(
-            skipped,
+            dead_cells,
             [
                 "[STUDY,TIME] 1/study G",
                 "[STUDY,TIME] 1/study H10",
@@ -3383,6 +3490,14 @@ mod absorption {
                 "[STUDY,TIME] 2/study H10",
             ],
             "cells whose block has an unidentified level"
+        );
+        // The dead cells straddle: some contrasts carry their dead level, some
+        // do not (measured: within binds on 3 of the 4, and every other
+        // contrast is refused).
+        assert_eq!(
+            (dead_bound, dead_refused),
+            (3, 13),
+            "dead cells: bound / refused"
         );
         // Both sides of the gate must be exercised.
         assert!(
@@ -3761,7 +3876,9 @@ mod absorption {
             (
                 "the random effect `ETA_E0` reaches `y` directly",
                 Box::new(direct),
-                pop.clone(),
+                // Off `TIME = 0`: `CL` has no effect on a bolus read at its own dose
+                // time, so on `T6` this block has dead levels (#1679), refused first.
+                cf_pop(3, 1, &NO0),
             ),
         ];
         for (route, text, pop) in &cases {
@@ -3857,7 +3974,7 @@ mod absorption {
             ("varying WT, if", &branch, &varying, false),
         ];
         for (tag, text, pop, refused) in cases {
-            let jac = jacobian(&text("none"), "ETA_E0", pop);
+            let jac = jacobian(&text("none"), pop);
             let (base, under, _) = oracle(&jac, LevelContrast::SumToZero, &mut Vec::new());
             assert!(base > 0, "{tag}: the η is identified without the block");
             assert_eq!(under == 0, refused, "{tag}: oracle rank {under} of {base}");
@@ -3893,7 +4010,7 @@ mod absorption {
             let with = |c: &str| {
                 base_text.replace("[STUDY, TIME]", &format!("[STUDY, TIME, contrast = {c}]"))
             };
-            let jac = jacobian(&with("none"), "ETA_V", &pop);
+            let jac = jacobian(&with("none"), &pop);
             for (c, token) in EXPLICIT {
                 let (base, under, free) = oracle(&jac, c, &mut Vec::new());
                 if free == 0 {
@@ -3953,41 +4070,1315 @@ mod absorption {
         assert_eq!(v[17].value.to_bits(), neg_sum.to_bits());
     }
 
-    /// A kappa keeps the #1642 rule (out of #1649's scope, see
-    /// `EtaCoupling::kappa`): on a nested block, an expression reading the block
-    /// and the kappa selects the within-group contrast, and a kappa reaching
-    /// `y` only through the state does not; on a one-column block nothing is
-    /// refused. The last two differ from what the same shape does with an η.
-    #[test]
-    fn a_kappa_keeps_the_1642_rule() {
-        let kappa = |t: String| {
-            t.replace("omega ETA_E0 ~ 0.1", "kappa KAPPA_E0 ~ 0.1")
-                .replace("ETA_E0", "KAPPA_E0")
-        };
-        let one = cf_pop(3, 1, &T6);
-        let cases = [
-            (
-                "H2",
-                "STUDY, TIME",
-                Ok((LevelContrast::SumToZeroWithin, 15)),
-            ),
-            ("S2", "STUDY, TIME", Ok((LevelContrast::SumToZero, 17))),
-            ("H1", "STUDY", Ok((LevelContrast::SumToZero, 2))),
-        ];
-        for (tag, cols, want) in cases {
-            let text = kappa(shape(tag, cols, ""));
-            assert!(
-                text.contains("kappa KAPPA_E0") && !text.contains("ETA_E0"),
-                "{tag}"
-            );
-            assert_eq!(try_bind(&text, &one), want, "{tag} with a kappa");
+    /// `[block | X]` as one matrix.
+    fn hcat(parts: &[&DMatrix<f64>]) -> DMatrix<f64> {
+        let nrows = parts.first().map_or(0, |p| p.nrows());
+        let ncols = parts.iter().map(|p| p.ncols()).sum();
+        let mut x = DMatrix::zeros(nrows, ncols);
+        let mut at = 0;
+        for p in parts {
+            x.columns_mut(at, p.ncols()).copy_from(p);
+            at += p.ncols();
         }
-        // The η twins of the last two differ.
+        x
+    }
+
+    /// The rank random effect `name` keeps outside the other θ, the random
+    /// effects at a coarser-or-equal unit (every η for a kappa; the other η for
+    /// an η), and — under `Some(contrast)` — the block coded by `contrast`.
+    pub(super) fn unit_rank(j: &Jac, name: &str, contrast: Option<LevelContrast>) -> usize {
+        let (r, (_, kappa, zr)) = j
+            .res
+            .iter()
+            .enumerate()
+            .find(|(_, (n, ..))| n == name)
+            .unwrap_or_else(|| panic!("no random effect {name}"));
+        let mut parts: Vec<&DMatrix<f64>> = vec![&j.xo];
+        let xb = contrast.map(|c| &j.xb * coding(j, c));
+        parts.extend(xb.as_ref());
+        parts.extend(
+            j.res
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, k, _))| *i != r && (*kappa || !*k))
+                .map(|(_, (.., z))| z),
+        );
+        rank(&residual_sv(zr, &hcat(&parts)))
+    }
+
+    /// The joint oracle (#1678, #1696): the random effects `contrast` absorbs —
+    /// each `r` with `rank P⊥(X_c, Z_coarser) Z_r = 0 < rank P⊥(X_o, Z_coarser) Z_r` —
+    /// and the block's free θ under it. With one random effect this is [`oracle`].
+    pub(super) fn joint_oracle(j: &Jac, contrast: LevelContrast) -> (Vec<String>, usize) {
+        let free = coding(j, contrast).ncols();
+        let absorbed = j
+            .res
+            .iter()
+            .filter(|(name, ..)| {
+                unit_rank(j, name, None) > 0 && unit_rank(j, name, Some(contrast)) == 0
+            })
+            .map(|(name, ..)| name.clone())
+            .collect();
+        (absorbed, free)
+    }
+
+    /// Whether the binder agrees with [`joint_oracle`] on `text(contrast)` over
+    /// `pop`, by T1's rule: an explicit contrast leaving a free θ is refused
+    /// exactly when the oracle absorbs something under it, and `auto` resolves
+    /// to a contrast that absorbs nothing — global whenever global absorbs
+    /// nothing — and is refused only when every contrast absorbs. Disagreements
+    /// are pushed onto `wrong`.
+    pub(super) fn agrees_with_joint_oracle(
+        tag: &str,
+        text: &dyn Fn(&str) -> String,
+        pop: &Population,
+        wrong: &mut Vec<String>,
+    ) {
+        let jac = jacobian(&text("none"), pop);
+        let mut absorbs = HashMap::new();
+        for (c, token) in EXPLICIT {
+            let (absorbed, free) = joint_oracle(&jac, c);
+            if free == 0 {
+                continue;
+            }
+            let refuse = !absorbed.is_empty() || block_loses_rank(&jac, c);
+            absorbs.insert(token, refuse);
+            let got = try_bind(&text(token), pop);
+            if got.is_err() != refuse {
+                wrong.push(format!(
+                    "{tag} {token}: oracle absorbs {absorbed:?}, binder {got:?}"
+                ));
+            }
+        }
+        let all_absorb = absorbs.values().all(|a| *a);
+        match try_bind(&text(""), pop) {
+            Err(e) if !all_absorb => wrong.push(format!(
+                "{tag} auto: refused, but some contrast absorbs nothing: {e}"
+            )),
+            Err(_) => {}
+            Ok(_) if all_absorb => {
+                wrong.push(format!("{tag} auto: bound, but every contrast absorbs"))
+            }
+            Ok((resolved, _)) => {
+                let token = EXPLICIT.iter().find(|(c, _)| *c == resolved).unwrap().1;
+                if absorbs.get(token).copied().unwrap_or(false) {
+                    wrong.push(format!("{tag} auto → {token}, which absorbs"));
+                }
+                if absorbs.get("sum_to_zero") == Some(&false)
+                    && resolved != LevelContrast::SumToZero
+                {
+                    wrong.push(format!("{tag} auto → {token}, but global absorbs nothing"));
+                }
+            }
+        }
+    }
+
+    /// `cf_pop` with `occ` occasions per subject, also written as an `OCC`
+    /// column. As **arms** every occasion carries the whole grid (the MBMA
+    /// layout: records at one time, one per arm); as **periods** the occasions
+    /// split the grid into consecutive runs.
+    pub(super) fn occ_pop(
+        n: usize,
+        per: usize,
+        times: &[f64],
+        occ: usize,
+        arms: bool,
+    ) -> Population {
+        let mut p = cf_pop(n, per, times);
+        for s in p.subjects.iter_mut() {
+            let rows: Vec<(f64, u32)> = if arms {
+                times
+                    .iter()
+                    .flat_map(|&t| (1..=occ as u32).map(move |o| (t, o)))
+                    .collect()
+            } else {
+                let run = times.len().div_ceil(occ);
+                times
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &t)| (t, (i / run + 1) as u32))
+                    .collect()
+            };
+            let n_obs = rows.len();
+            s.obs_times = rows.iter().map(|r| r.0).collect();
+            s.occasions = rows.iter().map(|r| r.1).collect();
+            s.obs_covariates = rows
+                .iter()
+                .map(|r| HashMap::from([("OCC".to_string(), r.1 as f64)]))
+                .collect();
+            s.observations = vec![1.0; n_obs];
+            s.obs_cmts = vec![1; n_obs];
+            s.cens = vec![0; n_obs];
+        }
+        p
+    }
+
+    /// The kappa shapes of the #1678 grid, on `KAPPA_E0`, with `ETA_E0` on `E0`
+    /// when `eta` (else on an unread `Z`): K-E0 (kappa and block on `E0`), K-y
+    /// (kappa on `E0`, block in `y`), K-EMAX (kappa on `EMAX`, block on `E0`),
+    /// K-unread (kappa on a parameter `y` never reads).
+    pub(super) fn kshape(tag: &str, eta: bool, cols: &str, contrast: &str) -> String {
+        let e = if eta { " + ETA_E0" } else { "" };
+        let unread = if eta {
+            ""
+        } else {
+            "\n  Z = TVE0 * exp(ETA_E0)"
+        };
+        let (ip, y) = match tag {
+            "K-E0" => (
+                format!("{BASE}  E0 = TVE0 + PLACEBO + KAPPA_E0{e}"),
+                format!("E0 + {EMAXY}"),
+            ),
+            "K-y" => (
+                format!("{BASE}  E0 = TVE0 + KAPPA_E0{e}"),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "K-EMAX" => (
+                format!("  EMAX = TVEMAX + KAPPA_E0\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO{e}"),
+                format!("E0 + {EMAXY}"),
+            ),
+            "K-unread" => (
+                format!("{BASE}  E0 = TVE0 + PLACEBO{e}\n  ZK = TVE0 * exp(KAPPA_E0)"),
+                format!("E0 + {EMAXY}"),
+            ),
+            _ => unreachable!("{tag}"),
+        };
+        cf_model(contrast, cols, &format!("{ip}{unread}"), &y).replace(
+            "  omega ETA_E0 ~ 0.1\n",
+            "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+        )
+    }
+
+    /// The K3′ sentence: a kappa that is its η by another name.
+    const KAPPA_IS_ETA: &str = "every subject has a single occasion, so `KAPPA_E0` cannot be \
+                                told apart from `ETA_E0` with or without this block: the model \
+                                is not identified.";
+
+    /// K1 (#1678). One model per verdict class of the kappa grid, against the
+    /// joint oracle: a kappa is absorbed when the block's levels nest in its
+    /// occasions, which a one-occasion subject, a period layout and a
+    /// `[STUDY, OCC]` block give, and an arm layout or two subjects per study do
+    /// not. The full grid is `the_full_kappa_grid_agrees_with_the_joint_oracle`.
+    ///
+    /// Mutations — the #1642 rule restored for a kappa (a nested block with a
+    /// shared expression: the arms cells are refused under global); the
+    /// subject as a kappa's unit (the period cells bind global, the arm cells
+    /// go within).
+    #[test]
+    fn a_kappa_counts_when_the_levels_nest_in_its_occasions() {
+        type Cell = (&'static str, &'static str, bool, &'static str, Population);
+        let st = "STUDY, TIME";
+        let so = "STUDY, OCC";
+        let cells: Vec<Cell> = vec![
+            (
+                "K-E0",
+                "STUDY",
+                false,
+                "1-col 1 occ",
+                occ_pop(3, 1, &T6, 1, false),
+            ),
+            (
+                "K-E0",
+                "STUDY",
+                false,
+                "1-col 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            (
+                "K-E0",
+                "STUDY",
+                true,
+                "1-col 3 arms",
+                occ_pop(3, 1, &T6, 3, true),
+            ),
+            (
+                "K-E0",
+                st,
+                false,
+                "1/st 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            (
+                "K-E0",
+                st,
+                true,
+                "1/st 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            (
+                "K-E0",
+                st,
+                false,
+                "1/st 2 arms",
+                occ_pop(3, 1, &T6, 2, true),
+            ),
+            ("K-E0", st, true, "1/st 2 arms", occ_pop(3, 1, &T6, 2, true)),
+            (
+                "K-E0",
+                so,
+                false,
+                "1/st 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            ("K-E0", so, true, "1/st 3 arms", occ_pop(3, 1, &T6, 3, true)),
+            (
+                "K-E0",
+                so,
+                false,
+                "2/st 2 periods",
+                occ_pop(3, 2, &T6, 2, false),
+            ),
+            (
+                "K-y",
+                st,
+                false,
+                "1/st 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            (
+                "K-EMAX",
+                st,
+                false,
+                "1/st 3 periods",
+                occ_pop(3, 1, &T6, 3, false),
+            ),
+            (
+                "K-EMAX",
+                st,
+                true,
+                "1/st 1 occ",
+                occ_pop(3, 1, &T6, 1, false),
+            ),
+            (
+                "K-unread",
+                st,
+                false,
+                "1/st 2 periods",
+                occ_pop(3, 1, &T6, 2, false),
+            ),
+            (
+                "K-unread",
+                st,
+                true,
+                "1/st 2 arms",
+                occ_pop(3, 1, &T6, 2, true),
+            ),
+            ("K-E0", st, true, "2/st 2 arms", occ_pop(3, 2, &T6, 2, true)),
+        ];
+        let mut wrong = Vec::new();
+        let mut refused = 0;
+        for (shape, cols, eta, design, pop) in &cells {
+            let tag = format!("{shape} η={eta} [{cols}] {design}");
+            let text = |c: &str| kshape(shape, *eta, cols, c);
+            agrees_with_joint_oracle(&tag, &text, pop, &mut wrong);
+            refused += usize::from(try_bind(&text("sum_to_zero"), pop).is_err());
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        // Both sides of the gate: global is refused on some cells and not others.
+        assert!(
+            (4..cells.len() - 4).contains(&refused),
+            "{refused} refused under global"
+        );
+    }
+
+    /// K2 (#1678, #1696). The differential pair: η and κ on `E0`, one subject
+    /// per study, arms. Keyed on `[STUDY, OCC]` the levels nest in the occasions
+    /// too, so both random effects are absorbed and the block is refused under
+    /// every contrast; keyed on `[STUDY, TIME]` each level holds every arm, so
+    /// only the η is, and the block takes the within-study contrast. Before the
+    /// fix both took within. The oracle straddles: κ⊥η keeps 3 of 3 under
+    /// within on `[STUDY, TIME]` and 0 on `[STUDY, OCC]`.
+    ///
+    /// Mutation — drop the joint clause: `[STUDY, OCC]` binds within.
+    #[test]
+    fn a_kappa_and_an_eta_absorbed_together_are_refused() {
+        let pop = occ_pop(3, 1, &T6, 2, true);
+        let within = Some(LevelContrast::SumToZeroWithin);
+        let by_occ = |c: &str| kshape("K-E0", true, "STUDY, OCC", c);
+        let by_time = |c: &str| kshape("K-E0", true, "STUDY, TIME", c);
+        let (jo, jt) = (
+            jacobian(&by_occ("none"), &pop),
+            jacobian(&by_time("none"), &pop),
+        );
         assert_eq!(
-            try_bind(&shape("S2", "STUDY, TIME", ""), &one),
+            unit_rank(&jo, "KAPPA_E0", None),
+            3,
+            "κ⊥η base, [STUDY, OCC]"
+        );
+        assert_eq!(
+            unit_rank(&jo, "KAPPA_E0", within),
+            0,
+            "κ⊥η within, [STUDY, OCC]"
+        );
+        assert_eq!(
+            unit_rank(&jt, "KAPPA_E0", None),
+            3,
+            "κ⊥η base, [STUDY, TIME]"
+        );
+        assert_eq!(
+            unit_rank(&jt, "KAPPA_E0", within),
+            3,
+            "κ⊥η within, [STUDY, TIME]"
+        );
+        for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+            let err = try_bind(&by_occ(c), &pop).expect_err(c);
+            assert!(
+                err.contains("the levels absorb `ETA_E0` and `KAPPA_E0` together"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            try_bind(&by_time(""), &pop),
             Ok((LevelContrast::SumToZeroWithin, 15))
         );
-        assert!(try_bind(&shape("H1", "STUDY", ""), &one).is_err());
+    }
+
+    /// K3 (#1678). A kappa's funnel holds when the covariates it reads are
+    /// constant within each **occasion**: `E0 = TVE0 + PLACEBO * X + KAPPA_E0` on
+    /// `[STUDY, OCC]`, one subject per study, 3 periods. With `X` constant within
+    /// each occasion (but not within the subject) the kappa is absorbed and auto
+    /// goes within; with `X` varying per record it is not, and auto is global.
+    /// The oracle agrees on both sides.
+    ///
+    /// Mutation — `constant_within_units` reads the subject for a kappa: the
+    /// occasion-constant `X` changes within the subject, the funnel fails, and
+    /// that side binds global.
+    #[test]
+    fn a_kappa_funnel_is_measured_per_occasion() {
+        let text = |c: &str| {
+            cf_model(
+                c,
+                "STUDY, OCC",
+                &format!("{BASE}  E0 = TVE0 + PLACEBO * X + KAPPA_E0\n  Z = TVE0 * exp(ETA_E0)"),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+            )
+        };
+        let with_x = |per_record: bool| {
+            let mut p = occ_pop(3, 1, &T6, 3, false);
+            for s in p.subjects.iter_mut() {
+                let occ = s.occasions.clone();
+                for (j, m) in s.obs_covariates.iter_mut().enumerate() {
+                    let x = if per_record {
+                        1.0 + 0.3 * j as f64
+                    } else {
+                        1.0 + occ[j] as f64
+                    };
+                    m.insert("X".to_string(), x);
+                }
+            }
+            p
+        };
+        for (tag, per_record, want) in [
+            ("occasion-constant X", false, LevelContrast::SumToZeroWithin),
+            ("per-record X", true, LevelContrast::SumToZero),
+        ] {
+            let pop = with_x(per_record);
+            let jac = jacobian(&text("none"), &pop);
+            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            assert_eq!(
+                absorbed.is_empty(),
+                per_record,
+                "{tag}: oracle {absorbed:?}"
+            );
+            assert_eq!(try_bind(&text(""), &pop).map(|(c, _)| c), Ok(want), "{tag}");
+        }
+    }
+
+    /// K5 (#1678). Occasions derived by `iov_occasion = time(3)` count exactly as
+    /// the same occasions read from a column: on `[STUDY, TIME]`, one subject per
+    /// study, two periods, the kappa is absorbed either way and auto goes
+    /// within. With no occasions at all (the column twin on data that carries
+    /// none) the kappa counts nowhere, and auto is global — `fit()` refuses that
+    /// model later for its missing occasions.
+    ///
+    /// Mutation — skip the derivation in `bind_theta_levels`: the derived twin
+    /// has no occasions and binds global.
+    #[test]
+    fn derived_occasions_count_like_a_column() {
+        let base = kshape("K-E0", false, "STUDY, TIME", "");
+        let derived = format!("{base}\n[fit_options]\n  iov_occasion = time(3)\n");
+        let column = format!("{base}\n[fit_options]\n  iov_column = OCC\n");
+        let periods = occ_pop(3, 1, &T6, 2, false);
+        let bare = cf_pop(3, 1, &T6);
+        assert!(bare.subjects.iter().all(|s| s.occasions.is_empty()));
+        let within = Ok((LevelContrast::SumToZeroWithin, 15));
+        assert_eq!(try_bind(&column, &periods), within, "column");
+        assert_eq!(try_bind(&derived, &bare), within, "derived");
+        assert_eq!(
+            try_bind(&column, &bare),
+            Ok((LevelContrast::SumToZero, 17)),
+            "no occasions"
+        );
+    }
+
+    /// N1 (#1696a). Two subjects per study on disjoint times: the `STUDY` key
+    /// does not identify subjects, but every `(STUDY, TIME)` level lies in one
+    /// subject, so the η is absorbed — global sum-to-zero is refused and auto
+    /// goes within. With the two subjects sharing the times no level nests and
+    /// the block binds global. The oracle agrees on both.
+    ///
+    /// Mutation — restore `subject_key_identifies_subjects`: the disjoint
+    /// design binds global.
+    #[test]
+    fn levels_nested_in_subjects_absorb_the_eta() {
+        let text = |c: &str| shape("H1", "STUDY, TIME", c);
+        let mut disjoint = cf_pop(3, 2, &T6);
+        for (k, s) in disjoint.subjects.iter_mut().enumerate() {
+            s.obs_times = if k % 2 == 0 {
+                vec![0.0, 1.0, 2.0]
+            } else {
+                vec![4.0, 8.0, 12.0]
+            };
+            s.observations = vec![1.0; 3];
+            s.obs_cmts = vec![1; 3];
+            s.cens = vec![0; 3];
+        }
+        let shared = cf_pop(3, 2, &T6);
+        for (tag, pop, absorbed) in [("disjoint", &disjoint, true), ("shared", &shared, false)] {
+            let jac = jacobian(&text("none"), pop);
+            let (got, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            assert_eq!(!got.is_empty(), absorbed, "{tag}: oracle {got:?}");
+            assert_eq!(
+                try_bind(&text("sum_to_zero"), pop).is_err(),
+                absorbed,
+                "{tag}"
+            );
+        }
+        assert_eq!(
+            try_bind(&text(""), &disjoint),
+            Ok((LevelContrast::SumToZeroWithin, 15))
+        );
+        assert_eq!(
+            try_bind(&text(""), &shared),
+            Ok((LevelContrast::SumToZero, 17))
+        );
+    }
+
+    /// J1 (#1696b). Two η absorbed together: `ETA_E0` on `E0` and `ETA_EM` on
+    /// `EMAX`, `[STUDY, TIME]`, one subject per study. Each alone takes within,
+    /// but within leaves each subject's mean to one of them while the levels
+    /// reproduce the other (`ETA_EM` beyond `ETA_E0`: 2 under no block, 0 under
+    /// within), so every contrast is refused. Two subjects per study: no level
+    /// nests, and the block binds global.
+    ///
+    /// Mutation — drop the joint clause: one subject per study binds within.
+    #[test]
+    fn two_etas_absorbed_together_are_refused() {
+        let text = |c: &str| {
+            cf_model(
+                c,
+                "STUDY, TIME",
+                "  EMAX = TVEMAX + ETA_EM\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + ETA_E0",
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  omega ETA_EM ~ 0.1\n",
+            )
+        };
+        let one = cf_pop(3, 1, &T6);
+        let jac = jacobian(&text("none"), &one);
+        assert_eq!(unit_rank(&jac, "ETA_EM", None), 2);
+        assert_eq!(
+            unit_rank(&jac, "ETA_EM", Some(LevelContrast::SumToZeroWithin)),
+            0
+        );
+        for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+            let err = try_bind(&text(c), &one).expect_err(c);
+            has(&err, &["the levels absorb `ETA_E0` and `ETA_EM` together"]);
+        }
+        assert_eq!(
+            try_bind(&text(""), &cf_pop(3, 2, &T6)),
+            Ok((LevelContrast::SumToZero, 17))
+        );
+        // Each alone is fine under within: the refusal is the pair's.
+        let within = Ok((LevelContrast::SumToZeroWithin, 15));
+        let alone_e0 = text("").replace("TVEMAX + ETA_EM", "TVEMAX");
+        let alone_em = text("").replace("PLACEBO + ETA_E0", "PLACEBO");
+        assert_eq!(try_bind(&alone_e0, &one), within, "ETA_E0 alone");
+        assert_eq!(try_bind(&alone_em, &one), within, "ETA_EM alone");
+    }
+
+    /// The kappa and joint refusals, sentence by sentence (message cells K1,
+    /// K2, K2′, K3, K3′ of the #1679 plan). Each conditional sentence has both
+    /// sides of its gate here: the one-column kappa against its η twin, K2
+    /// against K2′, K3′ against the same model on two occasions and against a
+    /// kappa on another parameter.
+    #[test]
+    fn the_kappa_refusals_name_the_occasion() {
+        const OCCASION_HEAD: &str =
+            "theta PLACEBO[STUDY]: each `STUDY` level lies within a single occasion of one \
+             subject, and the individual parameter `E0` reads this block and carries a random \
+             effect, so a level and that occasion's random effect are the same quantity: the \
+             model is not identified under any contrast.";
+        // K1: one-column, one occasion, kappa only — against its η twin.
+        let one_occ = occ_pop(3, 1, &T6, 1, false);
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            let err = try_bind(&kshape("K-E0", false, "STUDY", c), &one_occ).expect_err(c);
+            has(&err, &[OCCASION_HEAD, ONE_COLUMN_FIX]);
+            lacks(&err, &["belongs to a single subject", "that subject's"]);
+            let eta = try_bind(&shape("H1", "STUDY", c), &one_occ).expect_err(c);
+            has(
+                &eta,
+                &[
+                    "belongs to a single subject",
+                    "that subject's random effect",
+                ],
+            );
+            lacks(&eta, &["occasion"]);
+        }
+
+        // K2: nested, kappa alone, explicit global — within is the advice.
+        let periods = occ_pop(3, 1, &T6, 2, false);
+        for c in ["sum_to_zero", "ref", "none"] {
+            let err = try_bind(&kshape("K-E0", false, "STUDY, TIME", c), &periods).expect_err(c);
+            has(
+                &err,
+                &[
+                    &format!(
+                        "theta PLACEBO[STUDY, TIME]: `contrast = {c}` lets the levels reproduce \
+                         `KAPPA_E0` at every occasion: the individual parameter `E0` reads this \
+                         block and carries a random effect at that grouping{SAME_QUANTITY}"
+                    ),
+                    USE_WITHIN,
+                ],
+            );
+            lacks(&err, &["group's mean free"]);
+        }
+        // K2′: the same, with a single time per study, so within leaves nothing.
+        let single = occ_pop(3, 1, &[1.0], 1, false);
+        let err = try_bind(
+            &kshape("K-E0", false, "STUDY, TIME", "sum_to_zero"),
+            &single,
+        )
+        .expect_err("single time");
+        has(
+            &err,
+            &[
+                "lets the levels reproduce `KAPPA_E0` at every occasion",
+                " Every STUDY group has a single level, so the random effect already carries \
+                 each group's value: remove the block, or drop the random effect.",
+            ],
+        );
+        lacks(&err, &["Use `contrast"]);
+
+        // K3: an η and a kappa absorbed together, on two periods.
+        for c in ["", "sum_to_zero", "sum_to_zero_within"] {
+            let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", c), &periods).expect_err(c);
+            has(
+                &err,
+                &[
+                    "theta PLACEBO[STUDY, TIME]: the levels absorb `ETA_E0` and `KAPPA_E0` \
+                     together (the individual parameter `E0` reads this block and carries a \
+                     random effect).",
+                    " `contrast = sum_to_zero_within` leaves each subject's mean to one of them, \
+                     and the levels reproduce the other, so the model is not identified under \
+                     any contrast.",
+                    " Drop one of the random effects, or remove the block.",
+                ],
+            );
+            lacks(&err, &["Use `contrast", "single occasion"]);
+        }
+        // K3′: the same model on one occasion — the kappa is the η by another name.
+        let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", ""), &one_occ).expect_err("K3′");
+        has(
+            &err,
+            &[KAPPA_IS_ETA, " Drop one of the two random effects."],
+        );
+        lacks(&err, &["absorb", "remove the block", "within"]);
+        // ... but not when the kappa sits on another parameter: then the block is
+        // what confuses them.
+        let err =
+            try_bind(&kshape("K-EMAX", true, "STUDY, TIME", ""), &one_occ).expect_err("K-EMAX");
+        has(
+            &err,
+            &["the levels absorb `ETA_E0` and `KAPPA_E0` together ("],
+        );
+        lacks(&err, &["single occasion"]);
+    }
+
+    /// The labels of `[STUDY, TIME]`'s `TIME = 0` levels on `n` studies.
+    fn time_zero_labels(n: usize) -> Vec<String> {
+        (1..=n).map(|s| format!("`STUDY={s},TIME=0`")).collect()
+    }
+
+    /// G without a random effect on the block's scale: `EMAX` reads the block,
+    /// and `y` reads `EMAX` only through a factor of `TIME`.
+    fn g_no_eta(cols: &str, c: &str) -> String {
+        cf_model(
+            c,
+            cols,
+            "  EMAX = TVEMAX + PLACEBO\n  ET50 = TVET50\n  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)",
+            &format!("E0 + {EMAXY}"),
+        )
+    }
+
+    /// D1 (#1679, #1702 review F1). G with no η on `[STUDY, TIME]`, three
+    /// studies: on `T6` each study's `TIME = 0` level has no effect (the oracle:
+    /// `rank X_B` 15 of 18, against 18 of 18 on the "no 0" grid). What that
+    /// costs depends on the contrast. Global sum-to-zero (three dead levels in
+    /// its one group), `ref` (two outside the reference) and `none` lose rank
+    /// and are refused; within (one per group) carries them, and auto takes it.
+    /// On the "no 0" grid auto is global. Before the fix both grids bound
+    /// global (17), so the pair straddles. And a one-column `[TIME]` block, whose
+    /// one dead level is the reference and the sum-to-zero's derived level at
+    /// once, binds under `ref` where its `[STUDY, TIME]` twin is refused.
+    ///
+    /// Every spelling that carries the block to `y` is held to the same oracle,
+    /// over every contrast and on both grids — an exponential time course
+    /// (G-exp), an ODE state at its initial value, a PK `CL` at its own dose
+    /// time, `[TIME]` — so a check that only looked for a product with `TIME`
+    /// fails on all but G. The PK cell is dead by the time-varying covariate
+    /// convention (a record's value governs the interval ending at it), which
+    /// oracle and binder share; the NONMEM anchor nearest to it is
+    /// `tests/tvcov_intermediate_nonmem.rs` (an `EVID=2` covariate change on
+    /// ADVAN3), which pins that convention for an analytical model, not for a
+    /// level block.
+    ///
+    /// Mutations — check only products with `TIME` (G-exp, ODE, PK bind under
+    /// `none`); `dead_levels` returns nothing (every `none` cell binds); the
+    /// failure ignores the contrast (within refused, `[TIME]` + `ref` refused).
+    #[test]
+    fn a_level_with_no_effect_at_time_zero_is_refused() {
+        let t6 = cf_pop(3, 1, &T6);
+        let no0 = cf_pop(3, 1, &NO0);
+        let rank_xb = |pop: &Population| {
+            let jac = jacobian(&g_no_eta("STUDY, TIME", "none"), pop);
+            rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0)))
+        };
+        assert_eq!(
+            (rank_xb(&t6), rank_xb(&no0)),
+            (15, 18),
+            "the oracle straddles"
+        );
+        let g = |c: &str| g_no_eta("STUDY, TIME", c);
+        assert_eq!(
+            try_bind(&g(""), &t6),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "T6"
+        );
+        assert_eq!(
+            try_bind(&g(""), &no0),
+            Ok((LevelContrast::SumToZero, 17)),
+            "no 0"
+        );
+        for c in ["sum_to_zero", "ref", "none"] {
+            let err = try_bind(&g(c), &t6).expect_err(c);
+            has(&err, &[DEAD_LEVELS, &time_zero_labels(3).join(", ")]);
+        }
+        // The `ref` pair: the dead level is `[TIME]`'s reference.
+        assert_eq!(
+            try_bind(&g_no_eta("TIME", "ref"), &t6),
+            Ok((LevelContrast::Ref, 5)),
+            "[TIME], ref"
+        );
+
+        let g_exp = |c: &str| g(c).replace(EMAXY, "EMAX * (1 - exp(-TIME / ET50))");
+        let ode = |c: &str| {
+            cf_model(
+                c,
+                "STUDY, TIME",
+                "  KE = TVET50\n  PB = PLACEBO\n  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)",
+                "E",
+            )
+            .replace(
+                "[structural_model]\n  y = E\n",
+                "[structural_model]\n  ode(states=[E])\n\n[odes]\n  d/dt(E) = (1 + PB) - KE * E\n\n[scaling]\n  y = E\n",
+            )
+        };
+        let pk = |c: &str| {
+            shape("S2", "STUDY, TIME", c)
+                .replace(
+                    "  CL = TVEMAX * exp(ETA_E0)",
+                    "  CL = TVEMAX * exp(PLACEBO)",
+                )
+                .replace("  y = central / V + E0 + PLACEBO", "  y = central / V + E0")
+                .replace("  E0 = TVE0", "  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)")
+                // k = 0.2 rather than 2: at k = 2 the `TIME = 12` level moves
+                // `y` by ~1e-8, live to the bitwise check (D4) but under the FD
+                // oracle's rank threshold, so the oracle would measure itself.
+                .replace("  V = TVET50", "  V = 10 * TVET50")
+        };
+        type Text<'a> = &'a dyn Fn(&str) -> String;
+        let one_col = |c: &str| g_no_eta("TIME", c);
+        let cases: [(&str, Text, String); 5] = [
+            ("G", &g, time_zero_labels(3).join(", ")),
+            ("G-exp", &g_exp, time_zero_labels(3).join(", ")),
+            ("ODE", &ode, time_zero_labels(3).join(", ")),
+            (
+                "PK CL at the dose time",
+                &pk,
+                time_zero_labels(3).join(", "),
+            ),
+            ("[TIME]", &one_col, "`TIME=0`".to_string()),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, text, labels) in cases {
+            agrees_with_joint_oracle(&format!("{tag} T6"), text, &t6, &mut wrong);
+            agrees_with_joint_oracle(&format!("{tag} no 0"), text, &no0, &mut wrong);
+            let err = try_bind(&text("none"), &t6).expect_err(tag);
+            has(&err, &[DEAD_LEVELS, &labels]);
+            assert!(try_bind(&text("none"), &no0).is_ok(), "{tag}: none on no 0");
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// Every partial dead-level refusal ends with this caveat (#1702 review F3).
+    const CHECK_SEES: &str = " The check sees only the initial estimates and a point near \
+                              them, so a θ that switches the block off there (a lag or a \
+                              threshold) makes a live level look dead: check that θ's initial \
+                              estimate.";
+
+    /// The dead-level refusals, sentence by sentence (message cells D1–D4 of
+    /// the #1679 plan, and the contrast-aware cells of the #1702 review), each
+    /// conditional sentence with both sides of its gate here: the `TIME = 0`
+    /// advice (every listed level at `TIME = 0`, every one at `TIME = 4`, a
+    /// mixed set); the consequence (a contrast that carries the levels named,
+    /// or none exists); a rank loss against a slack (an absorbed η taking the
+    /// within-group constraint); and the absorption refusal's advice (within
+    /// named, or not when it cannot carry the dead levels either). Then every
+    /// level dead (D3) and more labels than are shown (D4).
+    #[test]
+    fn the_dead_level_refusal_says_what_the_levels_hold() {
+        const AT_ZERO: &str = " Every one of them holds only records at `TIME = 0`.";
+        const ZERO_FIX: &str = " Key the block so those records share a level with a later \
+                                time, or read the block where it acts at `TIME = 0`.";
+        const GENERAL_FIX: &str =
+            " Key the block so those records share a level with records it acts on.";
+        const WITHIN_CARRIES: &str = " Under `contrast = sum_to_zero` that leaves θ the data \
+                                      cannot estimate, which `contrast = sum_to_zero_within` \
+                                      does not.";
+        const NO_CONTRAST: &str = " That leaves θ the data cannot estimate under any contrast.";
+        const MEASURED: &str = "at any of its records, at the initial estimates or at a nearby \
+                                point: ";
+        let t6 = cf_pop(3, 1, &T6);
+        let at = |factor: &str, c: &str| {
+            cf_model(
+                c,
+                "STUDY, TIME",
+                &format!("{BASE}  E0 = TVE0 + PLACEBO * {factor}\n  Z = TVE0 * exp(ETA_E0)"),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        // D1: every listed level at TIME = 0; within carries them.
+        let err = try_bind(&at("TIME", "sum_to_zero"), &t6).expect_err("TIME");
+        has(
+            &err,
+            &[
+                &format!(
+                    "theta PLACEBO[STUDY, TIME]: each of these levels {DEAD_LEVELS}, at the \
+                     initial estimates or at a nearby point: {}.",
+                    time_zero_labels(3).join(", ")
+                ),
+                &format!("{WITHIN_CARRIES}{AT_ZERO}{ZERO_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &[GENERAL_FIX, NO_CONTRAST]);
+        assert!(err.ends_with(CHECK_SEES), "{err}");
+        // D2: every listed level at TIME = 4, under `none`; within carries them.
+        let err = try_bind(&at("(TIME - 4)", "none"), &t6).expect_err("TIME - 4");
+        has(
+            &err,
+            &[
+                "`STUDY=1,TIME=4`, `STUDY=2,TIME=4`, `STUDY=3,TIME=4`.",
+                " Under `contrast = none` that leaves θ the data cannot estimate, which \
+                 `contrast = sum_to_zero_within` does not.",
+                &format!("{GENERAL_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["TIME = 0", "later time", NO_CONTRAST]);
+        // A mixed set, two per study: no contrast carries them, auto included.
+        let err = try_bind(&at("TIME * (TIME - 4)", ""), &t6).expect_err("mixed");
+        has(
+            &err,
+            &[
+                MEASURED,
+                "`STUDY=1,TIME=0`, `STUDY=1,TIME=4`, `STUDY=2,TIME=0`, `STUDY=2,TIME=4`, \
+                 `STUDY=3,TIME=0` and 1 more.",
+                &format!("{NO_CONTRAST}{GENERAL_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["TIME = 0", "Under `contrast"]);
+        // D4: seven studies, five labels shown.
+        let err = try_bind(&at("TIME", "sum_to_zero"), &cf_pop(7, 1, &T6)).expect_err("7");
+        has(
+            &err,
+            &[&format!("{} and 2 more.", time_zero_labels(5).join(", "))],
+        );
+        lacks(&err, &["`STUDY=6,TIME=0`"]);
+
+        // The slack: G with its η on `EMAX`, one subject per study. The η is
+        // absorbed, so within is the only candidate, and the dead `TIME = 0`
+        // level — which the η does not read either — takes each study's
+        // constraint. H10 (the η on `E0`, read at `TIME = 0`) is the other side.
+        let err = try_bind(&shape("G", "STUDY, TIME", ""), &t6).expect_err("G slack");
+        has(
+            &err,
+            &[
+                MEASURED,
+                &time_zero_labels(3).join(", "),
+                " Under `contrast = sum_to_zero_within` such a level takes its group's \
+                 sum-to-zero constraint, so the other levels reproduce the individual parameter \
+                 `EMAX` reads this block and carries a random effect — the two are the same \
+                 quantity, so the model is not identified.",
+                &format!("{AT_ZERO}{ZERO_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["leaves θ the data cannot estimate"]);
+        assert_eq!(
+            try_bind(&shape("H10", "STUDY, TIME", ""), &t6),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "H10"
+        );
+        // The absorption refusal no longer advises a within that fails too.
+        let err = try_bind(&shape("G", "STUDY, TIME", "sum_to_zero"), &t6).expect_err("G s2z");
+        has(
+            &err,
+            &[
+                " `contrast = sum_to_zero_within` does not help: some levels have no effect at \
+               any of their records, which that contrast cannot carry either. Drop the random \
+               effect, or key the block so every level acts on its records.",
+            ],
+        );
+        lacks(&err, &[USE_WITHIN]);
+        let err = try_bind(&shape("H1", "STUDY, TIME", "sum_to_zero"), &t6).expect_err("H1");
+        has(&err, &[USE_WITHIN]);
+        lacks(&err, &["does not help"]);
+
+        // D3: every level dead — the SLOPE0 twin with the slope fixed at 0.
+        let err = try_bind(&slope0(true), &t6).expect_err("every level dead");
+        assert_eq!(
+            err,
+            "theta PLACEBO[STUDY, TIME]: no level of the block affects the likelihood at the \
+             initial estimates or at a nearby point; the block estimates nothing. Check the \
+             expression that reads it."
+        );
+    }
+
+    /// SLOPE0: the block enters `E0` through a slope initialised at 0, so it
+    /// has no effect at the initial estimates. `fixed` fixes the slope there.
+    fn slope0(fixed: bool) -> String {
+        let tvs = if fixed {
+            "(0.0, -10.0, 10.0, FIX)"
+        } else {
+            "(0.0, -10.0, 10.0)"
+        };
+        cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO * TVS\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace(
+            "  theta TVET50(1.5, 0.1, 20.0)\n",
+            &format!("  theta TVET50(1.5, 0.1, 20.0)\n  theta TVS{tvs}\n"),
+        )
+    }
+
+    /// D2 (#1679). A block dead only at the initial estimates binds: the
+    /// jittered point moves the slope off 0. Fixed at 0, the slope stays there
+    /// at both points, and the block is refused.
+    ///
+    /// Mutations — check the initial estimates only (SLOPE0 refused); jitter a
+    /// `FIX` θ too (the twin binds).
+    #[test]
+    fn a_level_dead_only_at_the_initial_estimates_binds() {
+        let pop = cf_pop(3, 1, &NO0);
+        assert_eq!(
+            try_bind(&slope0(false), &pop),
+            Ok((LevelContrast::SumToZero, 17))
+        );
+        assert!(try_bind(&slope0(true), &pop).is_err());
+    }
+
+    /// D3 (#1679). A block read only in the residual magnitude
+    /// (`DV ~ proportional(PROP * ERRSCALE[STUDY])`) has no effect on any
+    /// prediction, but it is live: the check compares the residual magnitudes
+    /// too.
+    ///
+    /// Mutation — drop `ruv_obs_mult` from the compared values: refused as
+    /// every level dead.
+    #[test]
+    fn a_level_read_only_in_the_residual_magnitude_binds() {
+        let text = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta ERRSCALE[STUDY, contrast = none](2.0, 0.1, 10.0)
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02 FIX
+[individual_parameters]
+  CL = TVCL
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * ERRSCALE)
+"#;
+        let mut pop = population(3, 6);
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, &mut pop).expect("binds");
+        assert_eq!(parsed.model.n_theta, 2 + 3);
+    }
+
+    /// D4 (#1679). The check steps finitely and compares per record: on the
+    /// "direct" fixture (`CL = TVEMAX * exp(PLACEBO)`, a bolus at 0) the level at
+    /// `TIME = 12` moves `y` by about 1e-8 against `E0 = 1.5` (∂y/∂level ≈ 6e-8),
+    /// and must stay live.
+    ///
+    /// Mutation — compare the summed objective under a 1e-6 relative step: that
+    /// change is lost in the sum's rounding, and the level is refused.
+    #[test]
+    fn the_dead_check_steps_finitely_and_per_record() {
+        let text = shape("S2", "STUDY, TIME", "none")
+            .replace(
+                "  CL = TVEMAX * exp(ETA_E0)",
+                "  CL = TVEMAX * exp(PLACEBO)",
+            )
+            .replace("  y = central / V + E0 + PLACEBO", "  y = central / V + E0")
+            .replace("  E0 = TVE0", "  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)");
+        let pop = cf_pop(3, 1, &[12.0]);
+        let jac = jacobian(&text, &pop);
+        let effect = jac.xb.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        assert!(
+            effect > 0.0 && effect < 1e-6,
+            "∂y/∂level at TIME = 12: {effect:e}"
+        );
+        assert_eq!(try_bind(&text, &pop), Ok((LevelContrast::Unconstrained, 3)));
+    }
+
+    /// D5 (#1679). A point where anything evaluates non-finite is inconclusive,
+    /// and the level counts as live: here the jitter drives `TVN` negative, so
+    /// `TVN ^ 0.5` is NaN on every record at the second point (`log` would not
+    /// do: it is floored), and the `TIME = 0` levels, dead at the first, bind
+    /// under global sum-to-zero. With `TVN` positive at both points the same
+    /// levels are refused there — both sides of the gate.
+    ///
+    /// Mutation — compare NaN bits like any others: the NaN point reads as
+    /// unchanged and the levels are refused.
+    #[test]
+    fn a_non_finite_evaluation_is_inconclusive() {
+        let text = |bounds: &str| {
+            cf_model(
+                "sum_to_zero",
+                "STUDY, TIME",
+                &format!(
+                    "{BASE}  E0 = TVE0 + TVN ^ 0.5 + PLACEBO * TIME\n  Z = TVE0 * exp(ETA_E0)"
+                ),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  theta TVET50(1.5, 0.1, 20.0)\n",
+                &format!("  theta TVET50(1.5, 0.1, 20.0)\n  theta TVN{bounds}\n"),
+            )
+        };
+        let pop = cf_pop(3, 1, &T6);
+        assert_eq!(
+            try_bind(&text("(0.05, -1.0, 0.1)"), &pop),
+            Ok((LevelContrast::SumToZero, 17)),
+            "NaN at the jittered point"
+        );
+        let err = try_bind(&text("(0.05, 0.01, 1.0)"), &pop).expect_err("finite at both");
+        has(&err, &[DEAD_LEVELS]);
+    }
+
+    /// D6 (#1679). The check skips a model with a likelihood channel it does not
+    /// read: a block read only by a hazard parameter has no effect on any
+    /// prediction, but the event model reads it, so the model binds. The same
+    /// block with the event model removed is refused — both sides in one test.
+    ///
+    /// Mutation — delete `dead_check_reads_every_channel`: the joint model is
+    /// refused as every level dead.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn channels_the_check_does_not_read_are_skipped() {
+        let joint = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0 * exp(PLACEBO)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let pop = cf_pop(3, 2, &NO0);
+        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 2)));
+        let pk_only = joint.replace("[event_model]\n  cmt    = 3\n  hazard = H0\n", "");
+        let err = try_bind(&pk_only, &pop).expect_err("no event model");
+        has(&err, &["no level of the block affects the likelihood"]);
+    }
+
+    /// #1702 review F2. A θ initialised at the centre of tight bounds still
+    /// steps: `PLACEBO[STUDY, TIME](0.0, -0.1, 0.1)` with the block read
+    /// directly in `E0` is live everywhere and binds. Before the fix the step
+    /// fell back to the midpoint — the θ itself — at both points, and the block
+    /// was refused as estimating nothing. With `(0.0, -0.5, 0.5)` it bound
+    /// either way: the pair straddles the old fallback.
+    ///
+    /// Mutation — restore the midpoint fallback: the ±0.1 block is refused.
+    #[test]
+    fn a_theta_at_the_centre_of_tight_bounds_still_steps() {
+        let pop = cf_pop(3, 1, &NO0);
+        for bounds in ["(0.0, -0.1, 0.1)", "(0.0, -0.5, 0.5)"] {
+            let text = cf_model(
+                "",
+                "STUDY, TIME",
+                &format!("{BASE}  E0 = TVE0 + PLACEBO\n  Z = TVE0 * exp(ETA_E0)"),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace("(0.0, -10.0, 10.0)", bounds);
+            assert!(text.contains(bounds), "{bounds}");
+            assert_eq!(
+                try_bind(&text, &pop),
+                Ok((LevelContrast::SumToZero, 17)),
+                "{bounds}"
+            );
+        }
+        // Bounds that leave no room at all: the θ cannot step, which measures
+        // nothing, so the levels count as live and the block binds. Read as "no
+        // change", every level would be dead.
+        let pinned = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace("(0.0, -10.0, 10.0)", "(0.0, 0.0, 0.0)");
+        assert_eq!(
+            try_bind(&pinned, &pop),
+            Ok((LevelContrast::SumToZero, 17)),
+            "no room"
+        );
+        // The helper itself: never onto a bound, and back to `x` only with no room.
+        assert!((toward_interior(0.0, -0.1, 0.1, 0.13) - 0.05).abs() < 1e-15);
+        assert!((toward_interior(0.09, -0.1, 0.1, 0.25) + 0.005).abs() < 1e-15);
+        assert_eq!(toward_interior(1.0, 1.0, 1.0, 0.1), 1.0);
+    }
+
+    /// #1702 review F3. A θ that switches the block off near its initial
+    /// estimate makes a live level look dead at both points the check uses:
+    /// `E0 = TVE0 + PLACEBO * max(0, TIME - TLAG)` with `TLAG` at 2 leaves the
+    /// levels at `TIME` 0.5, 1 and 2 unmoved there, though any `TLAG` below
+    /// their time reads them. The check cannot see past that, so the refusal
+    /// says what it measured and points at such a θ.
+    ///
+    /// Mutation — drop the caveat sentence: this test and the message test die.
+    #[test]
+    fn a_theta_gated_read_names_what_the_check_saw() {
+        let text = cf_model(
+            "none",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO * max(0, TIME - TLAG)\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace(
+            "  theta TVET50(1.5, 0.1, 20.0)\n",
+            "  theta TVET50(1.5, 0.1, 20.0)\n  theta TLAG(2.0, 0.0, 24.0)\n",
+        );
+        let err = try_bind(&text, &cf_pop(3, 1, &NO0)).expect_err("TLAG");
+        has(
+            &err,
+            &[
+                "at the initial estimates or at a nearby point: `STUDY=1,TIME=0.5`, \
+                 `STUDY=1,TIME=1`, `STUDY=1,TIME=2`, `STUDY=2,TIME=0.5`, `STUDY=2,TIME=1` and \
+                 4 more.",
+                CHECK_SEES,
+            ],
+        );
+    }
+
+    /// #1702 review F4. K3′ is decided by the parameters that read each random
+    /// effect, not by the diagnostic clause. A kappa and an η in one
+    /// `CL = TVEMAX * exp(ETA_E0 + KAPPA_E0)`, reaching `y` only through the
+    /// states, are one random effect by two names on one occasion: K3′. A kappa
+    /// on `CL` and an η on `V` share the route but not the parameter: K3.
+    ///
+    /// Mutations — compare the clauses again: the route twin takes K3 (its
+    /// clauses name each random effect). Compare the routes only: κ-`CL` /
+    /// η-`V` takes K3′. Skip `if` branches when collecting the readers: the
+    /// branched κ-`CL` / η-`V` takes K3′.
+    #[test]
+    fn a_route_twin_is_named_by_its_parameter() {
+        let one_occ = occ_pop(3, 1, &T6, 1, false);
+        let route = |cl: &str, v: &str| {
+            shape("S2", "STUDY, TIME", "")
+                .replace("  CL = TVEMAX * exp(ETA_E0)", &format!("  CL = {cl}"))
+                .replace("  V = TVET50", &format!("  V = {v}"))
+                .replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+                )
+        };
+        let twin = route("TVEMAX * exp(ETA_E0 + KAPPA_E0)", "TVET50");
+        let err = try_bind(&twin, &one_occ).expect_err("twin");
+        has(&err, &[KAPPA_IS_ETA]);
+        let apart = route("TVEMAX * exp(KAPPA_E0)", "TVET50 * exp(ETA_E0)");
+        let err = try_bind(&apart, &one_occ).expect_err("apart");
+        has(
+            &err,
+            &["the levels absorb `ETA_E0` and `KAPPA_E0` together ("],
+        );
+        lacks(&err, &["single occasion"]);
+        // The same two, each read only inside an `if` branch: the readers walk
+        // the branches, or both would read as read by nothing — and equal.
+        let branched = route("TVEMAX", "TVET50").replace(
+            "  E0 = TVE0",
+            "  E0 = TVE0\n  if (STUDY > 0) {\n    CL = TVEMAX * exp(KAPPA_E0)\n    \
+             V = TVET50 * exp(ETA_E0)\n  }",
+        );
+        let err = try_bind(&branched, &one_occ).expect_err("branched");
+        has(
+            &err,
+            &["the levels absorb `ETA_E0` and `KAPPA_E0` together ("],
+        );
+        lacks(&err, &["single occasion"]);
+    }
+
+    /// #1702 review F5. On a one-column block K3′ adds that the block has to go
+    /// as well: dropping either random effect leaves one that each level is the
+    /// same quantity as. On `[STUDY, TIME]` it does not.
+    ///
+    /// Mutation — drop the clause: the one-column side dies.
+    #[test]
+    fn a_kappa_twin_on_a_one_column_block_also_removes_the_block() {
+        const ALSO: &str =
+            " Each `STUDY` level also lies within a single subject, so remove the block as well.";
+        let one_occ = occ_pop(3, 1, &T6, 1, false);
+        let err = try_bind(&kshape("K-E0", true, "STUDY", ""), &one_occ).expect_err("1-col");
+        has(
+            &err,
+            &[
+                KAPPA_IS_ETA,
+                &format!(" Drop one of the two random effects.{ALSO}"),
+            ],
+        );
+        let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", ""), &one_occ).expect_err("nested");
+        has(&err, &[KAPPA_IS_ETA]);
+        lacks(&err, &["remove the block"]);
+    }
+
+    /// #1702 review F6. Two kappas absorbed together leave each **occasion's**
+    /// mean to one of them under within; an η among them leaves each subject's.
+    /// The verdict is the joint oracle's on both.
+    ///
+    /// Mutation — "subject's" for every set: the kappa pair dies.
+    #[test]
+    fn two_kappas_absorbed_together_name_the_occasion() {
+        let periods = occ_pop(3, 1, &T6, 2, false);
+        let two_kappas = cf_model(
+            "",
+            "STUDY, TIME",
+            "  EMAX = TVEMAX + KAPPA_EM\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + KAPPA_E0\n  \
+             Z = TVE0 * exp(ETA_E0)",
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace(
+            "  omega ETA_E0 ~ 0.1\n",
+            "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n  kappa KAPPA_EM ~ 0.1\n",
+        );
+        let jac = jacobian(
+            &two_kappas.replace(
+                "PLACEBO[STUDY, TIME]",
+                "PLACEBO[STUDY, TIME, contrast = none]",
+            ),
+            &periods,
+        );
+        let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZeroWithin);
+        assert_eq!(absorbed.len(), 2, "oracle: {absorbed:?}");
+        let err = try_bind(&two_kappas, &periods).expect_err("κ + κ");
+        has(&err, &["leaves each occasion's mean to one of them"]);
+        let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", ""), &periods).expect_err("η + κ");
+        has(&err, &["leaves each subject's mean to one of them"]);
+    }
+
+    /// The whole #1678 grid, slow-gated: block columns `[STUDY]`, `[STUDY,
+    /// TIME]`, `[STUDY, OCC]` × 1–2 subjects per study × 1–3 occasions as arms
+    /// or periods × the four kappa shapes × with or without an η, against the
+    /// joint oracle. The κ ≡ η cells (one occasion, η and kappa at the same
+    /// site, levels nested) are unidentified with or without the block: the
+    /// oracle, which measures what the block adds, does not refuse them, and
+    /// the binder must, with the K3′ sentence.
+    ///
+    /// Gated on measured cost (minutes in a local debug build, and CI runs the
+    /// levels tests 6–22× slower); the per-PR K1, K2 and K3 die on the same
+    /// mutations.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn the_full_kappa_grid_agrees_with_the_joint_oracle() {
+        let mut wrong = Vec::new();
+        let (mut cells, mut twins) = (0usize, 0usize);
+        for cols in ["STUDY", "STUDY, TIME", "STUDY, OCC"] {
+            for per in [1, 2] {
+                for occ in [1, 2, 3] {
+                    for arms in [true, false] {
+                        if occ == 1 && !arms {
+                            continue; // one occasion: arms and periods coincide
+                        }
+                        let pop = occ_pop(3, per, &T6, occ, arms);
+                        for tag in ["K-E0", "K-y", "K-EMAX", "K-unread"] {
+                            for eta in [false, true] {
+                                cells += 1;
+                                let layout = if arms { "arms" } else { "periods" };
+                                let cell =
+                                    format!("{tag} η={eta} [{cols}] {per}/st {occ} {layout}");
+                                let text = |c: &str| kshape(tag, eta, cols, c);
+                                let twin = occ == 1 && eta && matches!(tag, "K-E0" | "K-y");
+                                if twin {
+                                    if let Err(e) = try_bind(&text(""), &pop) {
+                                        if e.contains(KAPPA_IS_ETA) {
+                                            twins += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                agrees_with_joint_oracle(&cell, &text, &pop, &mut wrong);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("kappa grid: {cells} cells, {twins} κ ≡ η");
+        // Measured: K-E0 and K-y on each of the three block shapes, one subject per
+        // study, one occasion. The `[STUDY]` pair is also refused by the oracle
+        // (the η alone absorbs a one-column block); the other four are the plan's.
+        assert_eq!(twins, 6, "κ ≡ η cells");
+        assert!(
+            wrong.is_empty(),
+            "{} of {cells} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
     /// R1-1 (#1675 review). `TAD` and `TAFD` vary within a subject exactly as

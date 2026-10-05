@@ -21,11 +21,12 @@
 
 use std::collections::HashMap;
 
+use crate::api::apply_iov_occasion_rule;
 use crate::parser::model_parser::{
-    eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaRoute, LevelBinding,
-    LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
+    eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
+    LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
 };
-use crate::types::{ParsedModel, Population, Subject};
+use crate::types::{CompiledModel, IovOccasionRule, ParsedModel, Population, Subject};
 
 /// The record time, addressable as a level column even though it is not a
 /// covariate.
@@ -47,16 +48,50 @@ pub fn bind_theta_levels(
         return Ok(());
     }
 
-    let mut bindings = LevelBindings::new();
+    // Pass 1: discover every block and write its index column. A level's index
+    // is its position in the sorted level list whatever the contrast, so the
+    // columns can be written before any contrast is resolved. They go onto a
+    // scratch copy, so a refusal below leaves `population` untouched.
+    let mut bound = population.clone();
+    let mut discovered: Vec<Vec<Level>> = Vec::with_capacity(decls.len());
     for decl in &decls {
-        let levels = discover_levels(decl, population)?;
-        let (contrast, groups) = resolve_contrast(decl, &levels, population)?;
+        let levels = discover_levels(decl, &bound)?;
         let table: Vec<(Level, usize)> = levels
             .iter()
             .enumerate()
             .map(|(i, l)| (l.clone(), i + 1))
             .collect();
-        write_index_column(decl, &table, population)?;
+        write_index_column(decl, &table, &mut bound)?;
+        discovered.push(levels);
+    }
+
+    // A kappa's unit is a subject-occasion, so the binder needs the occasions
+    // `fit()` will use: a derived `iov_occasion` rule is applied on a copy, by
+    // the same call `fit()` makes.
+    let derived;
+    let with_occasions: &Population =
+        if parsed.model.n_kappa > 0 && parsed.fit_options.iov_occasion != IovOccasionRule::Column {
+            let mut p = bound.clone();
+            apply_iov_occasion_rule(
+                &mut p,
+                &parsed.fit_options.iov_occasion,
+                parsed.fit_options.iov_column.is_some(),
+                &mut Vec::new(),
+            );
+            derived = p;
+            &derived
+        } else {
+            &bound
+        };
+
+    // Rule 1 (#1679): measure which levels the likelihood never reads. Whether
+    // that costs the model anything depends on the contrast, so the verdict is
+    // the contrast resolution's.
+    let dead = measure_dead_levels(parsed, model_text, &decls, &discovered, with_occasions)?;
+
+    let mut bindings = LevelBindings::new();
+    for ((decl, levels), dead) in decls.iter().zip(&discovered).zip(&dead) {
+        let (contrast, groups) = resolve_contrast(decl, levels, dead, with_occasions)?;
         let binding = LevelBinding {
             labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
             groups,
@@ -78,10 +113,13 @@ pub fn bind_theta_levels(
     // level ones: a model that also declares `[covariate_model]` statistics
     // (#1111) may have had those bound already, and re-parsing with the level
     // bindings alone would drop them.
-    parsed.bindings.levels = bindings;
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    let mut all = parsed.bindings.clone();
+    all.levels = bindings;
+    let rebound = parse_full_model_with(model_text, &all)?;
+    parsed.bindings = all;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
+    *population = bound;
     Ok(())
 }
 
@@ -597,37 +635,50 @@ fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
     }
 }
 
-/// Whether the block's subject-key columns ([`subject_key_columns`]) identify
-/// subjects one-to-one: every subject's records share one combination, and no
-/// two subjects share it.
+/// The unit a random effect varies over: a subject for an η, an occasion of
+/// one subject for a kappa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Subject,
+    Occasion,
+}
+
+/// The unit observation row `j` of `subject` lies in, within that subject:
+/// the subject itself for [`Unit::Subject`], the row's occasion for
+/// [`Unit::Occasion`] — `None` when the subject carries no occasions, so a
+/// kappa counts nowhere (`fit()` reports the missing occasions later).
+fn unit_of(subject: &Subject, unit: Unit, j: usize) -> Option<u32> {
+    match unit {
+        Unit::Subject => Some(0),
+        Unit::Occasion => subject.occasions.get(j).copied(),
+    }
+}
+
+/// Whether every level's observation records lie in a single unit (#1678,
+/// #1696): one subject for an η, one occasion of one subject for a kappa.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
-/// coarser than or equal to the block's". η in this engine is per subject, so
-/// only when the key identifies one subject can that subject's η carry the
-/// corresponding group's levels (#1064). For a one-column block it means each
-/// level is one subject's (#1649).
-fn subject_key_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
-    let key_columns = subject_key_columns(decl);
-    let mut subject_keys: Vec<Vec<f64>> = Vec::with_capacity(population.subjects.len());
-    for subject in &population.subjects {
-        let mut first: Option<Vec<f64>> = None;
+/// coarser than or equal to the block's": only then can a unit's random effect
+/// carry its levels (#1064). For a one-column block it means each level is one
+/// unit's (#1649). It does not ask the leading columns to identify subjects:
+/// two subjects of one study on disjoint times nest a `[STUDY, TIME]` block in
+/// subjects while sharing its `STUDY` key.
+fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Unit) -> bool {
+    let mut owner: HashMap<Vec<u64>, (usize, u32)> = HashMap::new();
+    for (s, subject) in population.subjects.iter().enumerate() {
         for j in 0..subject.obs_times.len() {
-            let key: Option<Vec<f64>> = key_columns
+            let level: Option<Vec<u64>> = decl
+                .columns()
                 .iter()
-                .map(|c| column_value(subject, c, j))
+                .map(|c| column_value(subject, c, j).map(f64::to_bits))
                 .collect();
-            let Some(key) = key else { return false };
-            match &first {
-                None => first = Some(key),
-                Some(f) if *f == key => {}
-                Some(_) => return false,
+            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j)) else {
+                return false;
+            };
+            if *owner.entry(level).or_insert((s, u)) != (s, u) {
+                return false;
             }
         }
-        let Some(key) = first else { return false };
-        if subject_keys.contains(&key) {
-            return false;
-        }
-        subject_keys.push(key);
     }
     true
 }
@@ -664,105 +715,615 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
     })
 }
 
-/// Whether every covariate in `covariates` is constant within every subject's
-/// observation records — the data-side condition of a funnel (`EtaCoupling::funnels`).
-fn constant_within_subjects(covariates: &[String], population: &Population) -> bool {
+/// Whether every covariate in `covariates` is constant within every unit's
+/// observation records — the data-side condition of a funnel
+/// (`EtaCoupling::funnels`): within each subject for an η, within each
+/// occasion of a subject for a kappa.
+fn constant_within_units(covariates: &[String], population: &Population, unit: Unit) -> bool {
     population.subjects.iter().all(|subject| {
         covariates.iter().all(|c| {
-            let mut values = (0..subject.obs_times.len()).map(|j| column_value(subject, c, j));
             // Missing compares like any other value: a column absent from every
             // record is constant, one present on only some records changes.
-            match values.next() {
-                None => true,
-                Some(first) => values.all(|v| v == first),
-            }
+            let mut first: Vec<(u32, Option<f64>)> = Vec::new();
+            (0..subject.obs_times.len()).all(|j| {
+                let Some(u) = unit_of(subject, unit, j) else {
+                    return false;
+                };
+                let v = column_value(subject, c, j);
+                match first.iter().find(|(u0, _)| *u0 == u) {
+                    Some((_, v0)) => *v0 == v,
+                    None => {
+                        first.push((u, v));
+                        true
+                    }
+                }
+            })
         })
     })
 }
 
-/// Where the binder found a random effect absorbed by a block, for its
+/// A random effect a block absorbs, and where the binder found it, for its
 /// diagnostics.
-enum Absorbed<'a> {
+struct Absorbed<'a> {
+    coupling: &'a EtaCoupling,
+    /// The parameters that read the random effect directly
+    /// (`LevelBlockDecl::eta_readers`).
+    readers: &'a [String],
+    how: How<'a>,
+}
+
+enum How<'a> {
     /// An expression that reads the block and the random effect.
     Site(&'a ScaleShare),
-    /// A random effect reaching `y` by a route that never meets the block, on a
-    /// block that resolves the observations.
-    Route(&'a str, &'a EtaRoute),
+    /// The random effect reaching `y` by a route that never meets the block, on
+    /// a block that resolves the observations.
+    Route(&'a EtaRoute),
 }
 
 impl Absorbed<'_> {
+    fn name(&self) -> &str {
+        &self.coupling.eta
+    }
+
+    fn kappa(&self) -> bool {
+        self.coupling.kappa
+    }
+
     fn clause(&self) -> String {
-        match self {
-            Absorbed::Site(share) => share_site(share),
-            Absorbed::Route(eta, route) => {
+        match &self.how {
+            How::Site(share) => share_site(share),
+            How::Route(route) => {
                 let how = match route {
                     EtaRoute::Direct => "directly".to_string(),
                     EtaRoute::Via(v) => format!("through `{v}`"),
                     EtaRoute::State => "through the model's states".to_string(),
                 };
-                format!("the random effect `{eta}` reaches `y` {how}")
+                format!("the random effect `{}` reaches `y` {how}", self.name())
             }
         }
     }
 }
 
-/// The first random effect the block absorbs, by the #1649 rule: the block's
-/// subject key identifies subjects one-to-one, and either a funnel holds on
-/// this data (its covariates constant within subjects) or the block resolves
-/// the observations and the random effect reaches `y` at all. A kappa keeps
-/// the #1642 rule: a nested block and a shared expression.
-fn absorbed<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Option<Absorbed<'a>> {
-    if !subject_key_identifies_subjects(decl, population) {
+/// Every random effect the block absorbs (#1649, #1678, #1696): the block's
+/// levels nest in the random effect's units ([`levels_nest_in_units`]), and
+/// either a funnel holds on this data (its covariates constant within those
+/// units) or the block resolves the observations and the random effect reaches
+/// `y` at all. An η and a kappa follow the same rule, each on its own unit.
+fn absorbed<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Absorbed<'a>> {
+    let has = |kappa: bool| decl.eta_couplings.iter().any(|c| c.kappa == kappa);
+    let by_subject = has(false) && levels_nest_in_units(decl, population, Unit::Subject);
+    let by_occasion = has(true) && levels_nest_in_units(decl, population, Unit::Occasion);
+    let resolving = resolves_observations(decl, population);
+    decl.eta_couplings
+        .iter()
+        .enumerate()
+        .filter_map(|(k, c)| {
+            let (unit, nested) = if c.kappa {
+                (Unit::Occasion, by_occasion)
+            } else {
+                (Unit::Subject, by_subject)
+            };
+            if !nested {
+                return None;
+            }
+            let funnel = c
+                .funnels
+                .iter()
+                .find(|f| constant_within_units(&f.covariates, population, unit));
+            let how = match funnel {
+                Some(f) => How::Site(&f.site),
+                None => {
+                    let route = c.reach.as_ref().filter(|_| resolving)?;
+                    match &c.share {
+                        Some(share) => How::Site(share),
+                        None => How::Route(route),
+                    }
+                }
+            };
+            let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
+            Some(Absorbed {
+                coupling: c,
+                readers,
+                how,
+            })
+        })
+        .collect()
+}
+
+/// Whether the dead-level check reads every channel of the model's likelihood:
+/// the per-record predictions and residual magnitudes. A hazard, a Markov or
+/// binary endpoint, a mixture, or an EKF diffusion term reads the block through
+/// something it does not compare, so a level it calls dead could be live there.
+/// Such a model is not checked at all — a skipped check binds, it never refuses.
+fn dead_check_reads_every_channel(model: &CompiledModel) -> bool {
+    model.mixture.is_none() && !model.is_sde() && !model.has_non_gaussian()
+}
+
+/// `x` moved by `step` toward the inside of `[lo, hi]`: up when that stays
+/// below `hi`, down when that stays above `lo`, else by half the larger gap to
+/// a bound — never onto a bound, and never back to `x` unless `lo == x == hi`
+/// leaves no room at all, which the dead-level check reads as "cannot step"
+/// (#1702 review, F2).
+fn toward_interior(x: f64, lo: f64, hi: f64, step: f64) -> f64 {
+    if x + step < hi {
+        x + step
+    } else if x - step > lo {
+        x - step
+    } else if hi - x >= x - lo {
+        x + 0.5 * (hi - x)
+    } else {
+        x - 0.5 * (x - lo)
+    }
+}
+
+/// How far the dead-level check moves a random effect to see whether it reads
+/// a record.
+const RE_STEP: f64 = 0.1;
+
+/// The values the likelihood reads from one subject: per record, its
+/// prediction and its residual-magnitude multipliers. Every η and κ is at
+/// `re`, and random effect `bump` (an η index, or `n_eta` + a κ index) at
+/// `re + RE_STEP`.
+fn record_values(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    re: f64,
+    bump: Option<usize>,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let mut eta = vec![re; model.n_eta];
+    let mut kappa = vec![re; model.n_kappa];
+    match bump {
+        Some(r) if r < model.n_eta => eta[r] += RE_STEP,
+        Some(r) => kappa[r - model.n_eta] += RE_STEP,
+        None => {}
+    }
+    let preds = if model.n_kappa > 0 {
+        let groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
+        crate::pk::predict_iov(model, subject, theta, &eta, &vec![kappa; groups.max(1)])
+    } else {
+        crate::pk::compute_predictions_with_tv(model, subject, theta, &eta)
+    };
+    let mult = model.ruv_obs_mult(subject, theta).unwrap_or_default();
+    (preds, mult)
+}
+
+/// Whether two [`record_values`] agree bitwise on the records `rows` (every
+/// record when `None`), every value finite. A non-finite value is not an
+/// agreement: it measures nothing.
+fn same_records(
+    a: &(Vec<f64>, Vec<Vec<f64>>),
+    b: &(Vec<f64>, Vec<Vec<f64>>),
+    rows: Option<&[usize]>,
+) -> bool {
+    let same = |x: &f64, y: &f64| x.is_finite() && y.is_finite() && x.to_bits() == y.to_bits();
+    if a.0.len() != b.0.len() || a.1.len() != b.1.len() {
+        return false;
+    }
+    let all: Vec<usize>;
+    let rows = match rows {
+        Some(r) => r,
+        None => {
+            all = (0..a.0.len().max(a.1.len())).collect();
+            &all
+        }
+    };
+    rows.iter().all(|&j| {
+        let pred = match (a.0.get(j), b.0.get(j)) {
+            (Some(x), Some(y)) => same(x, y),
+            (None, None) => true,
+            _ => false,
+        };
+        let mult = match (a.1.get(j), b.1.get(j)) {
+            (Some(x), Some(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+            (None, None) => true,
+            _ => false,
+        };
+        pred && mult
+    })
+}
+
+/// The level indices (1-based) a subject's records carry for `column`, on
+/// every kind of record: a level's θ is read by exactly these subjects.
+fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
+    let mut out: Vec<f64> = subject
+        .covariates
+        .get(column)
+        .copied()
+        .into_iter()
+        .collect();
+    for maps in [
+        &subject.obs_covariates,
+        &subject.dose_covariates,
+        &subject.pk_only_covariates,
+        &subject.reset_covariates,
+    ] {
+        out.extend(maps.iter().filter_map(|m| m.get(column).copied()));
+    }
+    out.sort_by(f64::total_cmp);
+    out.dedup();
+    out
+}
+
+/// The observation rows of `subject` whose `column` index is `index`.
+fn rows_of(subject: &Subject, column: &str, index: f64) -> Vec<usize> {
+    (0..subject.obs_times.len())
+        .filter(|&j| {
+            subject
+                .obs_covariates
+                .get(j)
+                .and_then(|m| m.get(column))
+                .or_else(|| subject.covariates.get(column))
+                == Some(&index)
+        })
+        .collect()
+}
+
+/// What rule 1 measured on one block (#1679).
+#[derive(Default)]
+struct DeadLevels {
+    /// The dead levels, as indices into the block's levels.
+    dead: Vec<usize>,
+    /// Parallel to `dead`: the random effects (by name) that move some record
+    /// of that level, at either point. A level no random effect reads either
+    /// can take a within-group constraint from one that is absorbed.
+    read_by: Vec<Vec<String>>,
+}
+
+impl DeadLevels {
+    fn reads(&self, dead_level: usize, random_effect: &str) -> bool {
+        self.dead
+            .iter()
+            .position(|&i| i == dead_level)
+            .is_some_and(|p| self.read_by[p].iter().any(|r| r == random_effect))
+    }
+}
+
+/// Rule 1 (#1679): the non-`FIX` levels of `decl` whose θ the likelihood never
+/// reads, and which random effects read their records.
+///
+/// `model` is the model bound with every block under `contrast = none`, so each
+/// level has a θ of its own. A level is dead when a finite step in its θ leaves
+/// every value [`record_values`] returns bitwise unchanged, on every subject
+/// that carries it, at both of two points: the initial θ with η = κ = 0, and a
+/// deterministic jitter of every non-`FIX` θ inside its bounds with η = κ =
+/// 0.05. One point is not enough — a θ initialised at 0 can switch the block
+/// off there alone. A point where anything is non-finite, or where the θ has
+/// no room to step, is inconclusive, and the level counts as live: only a
+/// measured "no change" counts. Whether a dead level costs the model anything
+/// depends on the contrast; [`dead_failure`] decides that.
+///
+/// Values are compared per record under a step of `0.1·max(|θ|, 1)`, not
+/// summed into an objective under a tiny step: a live level whose effect is
+/// small against the rest of `y` must still move its own record.
+fn dead_levels(
+    model: &CompiledModel,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    population: &Population,
+) -> DeadLevels {
+    let p = &model.default_params;
+    let theta0 = p.theta.clone();
+    let mut jittered = theta0.clone();
+    for (k, x) in jittered.iter_mut().enumerate() {
+        if !p.theta_fixed.get(k).copied().unwrap_or(false) {
+            // Distinct per θ, so no two jitters cancel.
+            let step = (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0);
+            *x = toward_interior(*x, p.theta_lower[k], p.theta_upper[k], step);
+        }
+    }
+    let points = [(theta0, 0.0), (jittered, 0.05)];
+    let column = level_index_column(decl.name());
+    let readers: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .map(|s| indices_read(s, &column))
+        .collect();
+    let base: Vec<Vec<_>> = points
+        .iter()
+        .map(|(th, re)| {
+            population
+                .subjects
+                .iter()
+                .map(|s| record_values(model, s, th, *re, None))
+                .collect()
+        })
+        .collect();
+
+    let mut out = DeadLevels::default();
+    for (i, level) in levels.iter().enumerate() {
+        let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
+        let Some(k) = model.theta_names.iter().position(|n| *n == name) else {
+            continue;
+        };
+        if p.theta_fixed.get(k).copied().unwrap_or(false) {
+            continue;
+        }
+        let index = (i + 1) as f64;
+        let unchanged_at = |(point, (th, re)): (usize, &(Vec<f64>, f64))| {
+            let mut stepped = th.clone();
+            let step = 0.1 * th[k].abs().max(1.0);
+            stepped[k] = toward_interior(th[k], p.theta_lower[k], p.theta_upper[k], step);
+            if stepped[k] == th[k] {
+                return false;
+            }
+            population.subjects.iter().enumerate().all(|(s, subject)| {
+                !readers[s].contains(&index)
+                    || same_records(
+                        &base[point][s],
+                        &record_values(model, subject, &stepped, *re, None),
+                        None,
+                    )
+            })
+        };
+        if !points.iter().enumerate().all(unchanged_at) {
+            continue;
+        }
+        let names: Vec<&String> = model.eta_names.iter().chain(&model.kappa_names).collect();
+        let read_by = names
+            .iter()
+            .enumerate()
+            .filter(|&(r, _)| {
+                points.iter().enumerate().any(|(point, (th, re))| {
+                    population.subjects.iter().enumerate().any(|(s, subject)| {
+                        let rows = rows_of(subject, &column, index);
+                        !rows.is_empty()
+                            && !same_records(
+                                &base[point][s],
+                                &record_values(model, subject, th, *re, Some(r)),
+                                Some(&rows),
+                            )
+                    })
+                })
+            })
+            .map(|(_, n)| (*n).clone())
+            .collect();
+        out.dead.push(i);
+        out.read_by.push(read_by);
+    }
+    out
+}
+
+/// Run [`dead_levels`] on every block, on the model re-parsed with every block
+/// under `contrast = none`, so the measurement is each level's own θ whatever
+/// contrast the block will take. A model whose likelihood reads a channel the
+/// check does not compare is not measured: every block comes back with no dead
+/// level.
+fn measure_dead_levels(
+    parsed: &ParsedModel,
+    model_text: &str,
+    decls: &[LevelBlockDecl],
+    discovered: &[Vec<Level>],
+    population: &Population,
+) -> Result<Vec<DeadLevels>, String> {
+    let mut none = parsed.bindings.clone();
+    none.levels = decls
+        .iter()
+        .zip(discovered)
+        .map(|(decl, levels)| {
+            let binding = LevelBinding {
+                labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
+                groups: vec![0; levels.len()],
+                contrast: LevelContrast::Unconstrained,
+            };
+            (decl.name().to_string(), binding)
+        })
+        .collect();
+    let model = parse_full_model_with(model_text, &none)?.model;
+    if !dead_check_reads_every_channel(&model) {
+        return Ok(decls.iter().map(|_| DeadLevels::default()).collect());
+    }
+    Ok(decls
+        .iter()
+        .zip(discovered)
+        .map(|(decl, levels)| dead_levels(&model, decl, levels, population))
+        .collect())
+}
+
+/// Why a contrast cannot carry a block's dead levels (#1679, #1702 review F1).
+enum DeadFailure {
+    /// The coded block loses rank: a free θ moves only dead levels. Under
+    /// `none` that is any dead level; under `ref` one that is not its group's
+    /// reference; under sum-to-zero two in one group.
+    Rank,
+    /// Under the within-group contrast, these dead levels — which the absorbed
+    /// random effect does not read either — take their groups' constraints, so
+    /// the other levels are free to reproduce that random effect.
+    Slack(Vec<usize>),
+}
+
+/// Whether `contrast`, grouping the levels as `groups`, can carry the block's
+/// dead levels. A dead level costs a degree of freedom only where the coding
+/// gives it a direction of its own: the reference level under `ref`, and one
+/// level per group under sum-to-zero, are coded through the other levels, so a
+/// dead one there loses nothing.
+fn dead_failure(
+    groups: &[usize],
+    contrast: LevelContrast,
+    dead: &DeadLevels,
+    absorbed: Option<&Absorbed>,
+) -> Option<DeadFailure> {
+    if dead.dead.is_empty() {
         return None;
     }
-    let nested = decl.columns().len() >= 2;
-    let resolving = resolves_observations(decl, population);
-    decl.eta_couplings.iter().find_map(|c| {
-        if c.kappa {
-            return c.share.as_ref().filter(|_| nested).map(Absorbed::Site);
+    let count_in = |g: usize| dead.dead.iter().filter(|&&i| groups[i] == g).count();
+    match contrast {
+        LevelContrast::Unconstrained => return Some(DeadFailure::Rank),
+        LevelContrast::Ref => {
+            let is_reference = |i: usize| i == 0 || groups[i - 1] != groups[i];
+            if dead.dead.iter().any(|&i| !is_reference(i)) {
+                return Some(DeadFailure::Rank);
+            }
         }
-        if let Some(f) = c
-            .funnels
-            .iter()
-            .find(|f| constant_within_subjects(&f.covariates, population))
-        {
-            return Some(Absorbed::Site(&f.site));
+        _ => {
+            if dead.dead.iter().any(|&i| count_in(groups[i]) >= 2) {
+                return Some(DeadFailure::Rank);
+            }
         }
-        let route = c.reach.as_ref().filter(|_| resolving)?;
-        Some(match &c.share {
-            Some(share) => Absorbed::Site(share),
-            None => Absorbed::Route(&c.eta, route),
+    }
+    if contrast == LevelContrast::SumToZeroWithin {
+        if let Some(found) = absorbed {
+            let slack: Vec<usize> = dead
+                .dead
+                .iter()
+                .copied()
+                .filter(|&i| !dead.reads(i, found.name()))
+                .collect();
+            if !slack.is_empty() {
+                return Some(DeadFailure::Slack(slack));
+            }
+        }
+    }
+    None
+}
+
+/// How many dead labels a refusal lists before it counts the rest.
+const DEAD_LABELS_SHOWN: usize = 5;
+
+/// The refusal for a block whose dead levels `contrast` cannot carry: every
+/// level dead (the block estimates nothing), or the levels at fault, listed,
+/// with what they cost under `contrast` — and `alt`, a contrast that carries
+/// them, when there is one. The `TIME = 0` advice appears only when every
+/// listed level holds only records at `TIME = 0`.
+#[allow(clippy::too_many_arguments)]
+fn dead_levels_message(
+    block: &str,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    dead: &DeadLevels,
+    failure: &DeadFailure,
+    contrast: LevelContrast,
+    alt: Option<LevelContrast>,
+    absorbed: Option<&Absorbed>,
+    population: &Population,
+) -> String {
+    if dead.dead.len() == levels.len() {
+        return format!(
+            "{block}: no level of the block affects the likelihood at the initial estimates or \
+             at a nearby point; the block estimates nothing. Check the expression that reads it."
+        );
+    }
+    let listed: &[usize] = match failure {
+        DeadFailure::Rank => &dead.dead,
+        DeadFailure::Slack(levels) => levels,
+    };
+    let shown: Vec<String> = listed
+        .iter()
+        .take(DEAD_LABELS_SHOWN)
+        .map(|&i| format!("`{}`", levels[i].label(decl.columns())))
+        .collect();
+    let more = match listed.len().saturating_sub(DEAD_LABELS_SHOWN) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    let mut message = format!(
+        "{block}: each of these levels has no effect on the predictions or the residual error \
+         at any of its records, at the initial estimates or at a nearby point: {}{more}.",
+        shown.join(", ")
+    );
+    match (failure, alt, absorbed) {
+        (DeadFailure::Slack(_), _, Some(found)) => message.push_str(&format!(
+            " Under `contrast = sum_to_zero_within` such a level takes its group's sum-to-zero \
+             constraint, so the other levels reproduce {} — the two are the same quantity, so \
+             the model is not identified.",
+            found.clause()
+        )),
+        (_, Some(alt), _) => message.push_str(&format!(
+            " Under `contrast = {}` that leaves θ the data cannot estimate, which \
+             `contrast = {}` does not.",
+            contrast_token(contrast),
+            contrast_token(alt)
+        )),
+        _ => message.push_str(" That leaves θ the data cannot estimate under any contrast."),
+    }
+    let listed_values: Vec<&[f64]> = listed
+        .iter()
+        .map(|&i| levels[i].values.as_slice())
+        .collect();
+    let at_time_zero = population.subjects.iter().all(|subject| {
+        (0..subject.obs_times.len()).all(|j| {
+            let values: Option<Vec<f64>> = decl
+                .columns()
+                .iter()
+                .map(|c| column_value(subject, c, j))
+                .collect();
+            let is_listed = values.is_some_and(|v| listed_values.contains(&v.as_slice()));
+            !is_listed || subject.obs_times[j] == 0.0
         })
-    })
+    });
+    if at_time_zero {
+        message.push_str(
+            " Every one of them holds only records at `TIME = 0`. Key the block so those records \
+             share a level with a later time, or read the block where it acts at `TIME = 0`.",
+        );
+    } else {
+        message.push_str(" Key the block so those records share a level with records it acts on.");
+    }
+    message.push_str(
+        " The check sees only the initial estimates and a point near them, so a θ that switches \
+         the block off there (a lag or a threshold) makes a live level look dead: check that \
+         θ's initial estimate.",
+    );
+    message
 }
 
 /// Resolve [`LevelContrast::Auto`], group the levels under it, and reject the
 /// configurations that are still rank-deficient once resolved.
 ///
-/// Two refusals, in this order: a block that absorbs a random effect
-/// ([`absorbed`]) under a contrast that leaves it free θ (#1064, #1642,
-/// #1649, #1650), then a block left with no free θ at all (#1624) — whatever
-/// the contrast, since a block that estimates nothing cannot be told apart
-/// from not declaring it.
+/// Three refusals, in this order: a block that absorbs two or more random
+/// effects ([`absorbed`]), under every contrast (#1696); a block that absorbs
+/// one under a contrast that leaves it free θ (#1064, #1642, #1649, #1650,
+/// #1678); then a block left with no free θ at all (#1624) — whatever the
+/// contrast, since a block that estimates nothing cannot be told apart from
+/// not declaring it.
 ///
-/// A nested block (two or more columns) that absorbs a random effect resolves
-/// `auto` to the within-group contrast, which leaves each subject's mean to
-/// the random effect; an explicit global contrast is refused. A one-column
-/// block has no such rescue: each level *is* one subject's, so it is refused
-/// under every contrast.
+/// A nested block (two or more columns) that absorbs one random effect resolves
+/// `auto` to the within-group contrast, which leaves each unit's mean to the
+/// random effect; an explicit global contrast is refused. A one-column block
+/// has no such rescue: each level *is* one unit's, so it is refused under every
+/// contrast. Two absorbed random effects have no rescue either: within leaves
+/// each unit's mean to one of them, and the levels reproduce the other.
 fn resolve_contrast(
     decl: &LevelBlockDecl,
     levels: &[Level],
+    dead: &DeadLevels,
     population: &Population,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
     let nested = decl.columns().len() >= 2;
+    let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
     let absorbed = absorbed(decl, population);
+    if absorbed.len() >= 2 {
+        return Err(jointly_absorbed_message(
+            &block, decl, &absorbed, population,
+        ));
+    }
+    let absorbed = absorbed.into_iter().next();
+    // A contrast the block can take: one the absorbed random effect allows,
+    // that leaves a free θ, and that carries the dead levels.
+    let admissible = |c: LevelContrast| {
+        let allowed = match &absorbed {
+            None => true,
+            Some(_) => nested && c == LevelContrast::SumToZeroWithin,
+        };
+        let groups = assign_groups(decl, levels, c);
+        allowed
+            && free_count(&groups, c) > 0
+            && dead_failure(&groups, c, dead, absorbed.as_ref()).is_none()
+    };
     let resolved = match decl.contrast() {
         LevelContrast::Auto if nested && absorbed.is_some() => LevelContrast::SumToZeroWithin,
+        // Global sum-to-zero unless it cannot carry the dead levels and the
+        // within-group contrast can (#1702 review, F1).
+        LevelContrast::Auto
+            if nested
+                && !admissible(LevelContrast::SumToZero)
+                && admissible(LevelContrast::SumToZeroWithin) =>
+        {
+            LevelContrast::SumToZeroWithin
+        }
         LevelContrast::Auto => LevelContrast::SumToZero,
         other => other,
     };
-    let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
     let groups = assign_groups(decl, levels, resolved);
     let free = free_count(&groups, resolved);
 
@@ -776,10 +1337,18 @@ fn resolve_contrast(
         // A one-column block with no free θ is the plain single-level case
         // below: there is no level left for the random effect to be confused with.
         if !nested && free > 0 {
+            let (unit, whose) = if found.kappa() {
+                (
+                    "lies within a single occasion of one subject",
+                    "that occasion's",
+                )
+            } else {
+                ("belongs to a single subject", "that subject's")
+            };
             return Err(format!(
-                "{block}: each `{}` level belongs to a single subject, and {}, so a level and \
-                 that subject's random effect are the same quantity: the model is not \
-                 identified under any contrast. Remove the block, or drop the random effect.",
+                "{block}: each `{}` level {unit}, and {}, so a level and {whose} random effect \
+                 are the same quantity: the model is not identified under any contrast. Remove \
+                 the block, or drop the random effect.",
                 decl.columns()[0],
                 found.clause(),
             ));
@@ -799,23 +1368,67 @@ fn resolve_contrast(
                     " Every {leading} group has a single level, so the random effect already \
                      carries each group's value: remove the block, or drop the random effect."
                 )
+            } else if !admissible(LevelContrast::SumToZeroWithin) {
+                // The within-group rescue fails on the block's dead levels
+                // (#1702 review, F1), so it is not the advice either.
+                " `contrast = sum_to_zero_within` does not help: some levels have no effect at \
+                 any of their records, which that contrast cannot carry either. Drop the random \
+                 effect, or key the block so every level acts on its records."
+                    .to_string()
             } else {
                 " Use `contrast = sum_to_zero_within` (the default for this shape), or drop \
                  the random effect."
                     .to_string()
             };
-            let why = match found {
-                Absorbed::Site(_) => format!("{} at that grouping", found.clause()),
-                Absorbed::Route(..) => format!(
+            let why = match found.how {
+                How::Site(_) => format!("{} at that grouping", found.clause()),
+                How::Route(_) => format!(
                     "{}, and the block takes a level at every observation, so it can \
                      reproduce any effect that random effect has",
                     found.clause()
                 ),
             };
+            // A kappa is not a group's mean: the levels reproduce it occasion by
+            // occasion, which the within-group contrast removes as it does an η.
+            if found.kappa() {
+                return Err(format!(
+                    "{block}: `contrast = {}` lets the levels reproduce `{}` at every occasion: \
+                     {why} — the two are the same quantity, so the model is not identified.{fix}",
+                    contrast_token(resolved),
+                    found.name(),
+                ));
+            }
             return Err(format!(
                 "{block}: `contrast = {}` leaves each {leading} group's mean free, but {why} \
                  — the two are the same quantity, so the model is not identified.{fix}",
                 contrast_token(resolved),
+            ));
+        }
+    }
+
+    // Rule 1 (#1679): a level the likelihood never reads, where the contrast
+    // gives it a direction of its own.
+    if free > 0 {
+        if let Some(failure) = dead_failure(&groups, resolved, dead, absorbed.as_ref()) {
+            let alt = [
+                LevelContrast::SumToZero,
+                LevelContrast::SumToZeroWithin,
+                LevelContrast::Ref,
+                LevelContrast::Unconstrained,
+            ]
+            .into_iter()
+            .filter(|&c| c != resolved && (nested || c != LevelContrast::SumToZeroWithin))
+            .find(|&c| admissible(c));
+            return Err(dead_levels_message(
+                &block,
+                decl,
+                levels,
+                dead,
+                &failure,
+                resolved,
+                alt,
+                absorbed.as_ref(),
+                population,
             ));
         }
     }
@@ -851,6 +1464,82 @@ fn resolve_contrast(
     }
 
     Ok((resolved, groups))
+}
+
+/// The refusal for a block that absorbs two or more random effects (#1696).
+///
+/// One case is not the block's doing: a kappa and an η absorbed at the same
+/// site while every subject has a single occasion. The kappa is then the η by
+/// another name, so the model is unidentified with or without the block, and
+/// the refusal says so instead of blaming it.
+fn jointly_absorbed_message(
+    block: &str,
+    decl: &LevelBlockDecl,
+    absorbed: &[Absorbed],
+    population: &Population,
+) -> String {
+    let one_occasion = population.subjects.iter().all(|s| {
+        s.occasions
+            .first()
+            .is_some_and(|o| s.occasions.iter().all(|x| x == o))
+    });
+    if one_occasion {
+        // The same site is the same readers: the individual parameters that
+        // read each random effect directly (#1702 review, F4). Comparing the
+        // diagnostic clauses would not do: a route clause names its random
+        // effect, and two random effects on different parameters can share a
+        // route.
+        let twin = absorbed.iter().filter(|k| k.kappa()).find_map(|k| {
+            absorbed
+                .iter()
+                .find(|e| !e.kappa() && e.readers == k.readers)
+                .map(|e| (k, e))
+        });
+        if let Some((k, e)) = twin {
+            // On a one-column block dropping either one still leaves a
+            // random effect that each level is the same quantity as (F5).
+            let one_column = if decl.columns().len() == 1 {
+                format!(
+                    " Each `{}` level also lies within a single subject, so remove the block as \
+                     well.",
+                    decl.columns()[0]
+                )
+            } else {
+                String::new()
+            };
+            return format!(
+                "{block}: every subject has a single occasion, so `{}` cannot be told apart from \
+                 `{}` with or without this block: the model is not identified. Drop one of the \
+                 two random effects.{one_column}",
+                k.name(),
+                e.name(),
+            );
+        }
+    }
+    let names: Vec<String> = absorbed.iter().map(|a| format!("`{}`", a.name())).collect();
+    let (last, rest) = names.split_last().expect("two or more");
+    let mut sites: Vec<String> = Vec::new();
+    for a in absorbed {
+        let clause = a.clause();
+        if !sites.contains(&clause) {
+            sites.push(clause);
+        }
+    }
+    // Within leaves each unit's mean to one of them: a subject's when an η is
+    // among them, an occasion's when they are all kappas (F6).
+    let unit = if absorbed.iter().all(|a| a.kappa()) {
+        "occasion"
+    } else {
+        "subject"
+    };
+    format!(
+        "{block}: the levels absorb {} and {last} together ({}). `contrast = sum_to_zero_within` \
+         leaves each {unit}'s mean to one of them, and the levels reproduce the other, so the \
+         model is not identified under any contrast. Drop one of the random effects, or remove \
+         the block.",
+        rest.join(", "),
+        sites.join("; "),
+    )
 }
 
 /// The free θ a contrast leaves over `groups`: every level under `none`, one
