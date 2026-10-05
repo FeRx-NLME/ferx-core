@@ -3096,10 +3096,11 @@ mod absorption {
     }
 
     /// The Jacobian pieces at the initial θ and η = κ = 0 ([`jacobian_at`] for
-    /// another point), by central FD of the f64 predictor: the block's per-level columns (bound under `none`),
-    /// the other θ columns, the per-subject η columns, the per-unit columns of
-    /// each random effect (a subject for an η, an occasion group of a subject
-    /// for a kappa), and the level labels.
+    /// another point), by central FD of the f64 predictor: the block's
+    /// per-level columns (bound under `none`), the other θ columns, the
+    /// per-subject η columns, the per-unit columns of each random effect (a
+    /// subject for an η, an occasion group of a subject for a kappa), and the
+    /// level labels.
     ///
     /// The layout is the `none` layout of the levels the data shows
     /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],

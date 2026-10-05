@@ -20228,8 +20228,8 @@ pub(crate) struct EtaCoupling {
     /// (`TVE0 + PLACEBO * exp(KAPPA) + ETA`) varies within the η's unit, and
     /// the η is then judged as if each subject's kappas were equal. That can
     /// only over-refuse — the η is identified solely through the spread of a
-    /// subject's kappas, by a singular value proportional to that spread — and
-    /// never binds a block some κ leaves unidentified (#1708).
+    /// subject's kappas, by a singular value that grows with that spread — and
+    /// reading a kappa as constant never turns a refusal into a bind (#1708).
     pub(crate) kappa: bool,
     /// The first expression that reads the block and this random effect,
     /// states not tainted (#1642). Names the site in diagnostics.
