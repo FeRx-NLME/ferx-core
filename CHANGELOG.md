@@ -26,6 +26,15 @@ section of the SDLC for the versioning policy).
   `→  SD = 0.1120 …`, so it compares directly with the row's `(CV% = … at weight 1)`; a kappa
   of unknown type gets the same. Additive, logit and custom kappas keep `SD = …`, unweighted
   rows are unchanged, and the fit YAML is unchanged (`sd_at_typical_weight` × 100 is the CV%).
+- **A kappa on a level block is now measured on its occasions**
+  ([#1678](https://github.com/FeRx-NLME/ferx-core/issues/1678)). A kappa counts toward
+  `contrast = auto`, and refuses a contrast that leaves its levels free, exactly when each of
+  the block's levels lies within one occasion of one subject — the η rule, with the occasion in
+  place of the subject. In the MBMA layout, where each arm is an occasion carrying the study's
+  full visit grid, a between-arm kappa no longer refuses an explicit `sum_to_zero`; a
+  `[STUDY, OCC]` block, or occasions that split a subject's records into periods, now counts
+  it. Occasions derived by `iov_occasion = dose | time(...)` count like an `iov_column`.
+  `mbma_placebo` binds as before.
 - **A level block that takes a separate level at every observation now counts every random
   effect that reaches `y`, through the states too; one that does not no longer counts a
   time-varying one** ([#1650](https://github.com/FeRx-NLME/ferx-core/issues/1650)). With one
@@ -151,6 +160,19 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **A level block with a level that has no effect on the likelihood is refused**
+  ([#1679](https://github.com/FeRx-NLME/ferx-core/issues/1679)). On `PLACEBO[STUDY, TIME]` read
+  through a factor that vanishes at `TIME = 0` (`PLACEBO * TIME`, a block on `EMAX` in
+  `EMAX * TIME / (TIME + ET50)`, an ODE state at its initial value), each study's `TIME = 0`
+  level estimated nothing and was bound anyway, leaving a flat direction under every contrast.
+  The refusal lists the levels and, when they hold only `TIME = 0` records, says so.
+- **A level block that absorbs two random effects, or whose levels nest in subjects that do
+  not share a key, is refused** ([#1696](https://github.com/FeRx-NLME/ferx-core/issues/1696)).
+  `[STUDY, TIME]` with one subject per study and an η on each of `E0` and `EMAX` (or an η and a
+  kappa on the same baseline, with occasions as periods) bound within-study although the levels
+  then reproduce one of them; it is now refused under every contrast. Two subjects of one study
+  on disjoint times nest the block in subjects too, so a global contrast there is now refused
+  and `auto` takes `sum_to_zero_within`.
 - **`run_sir` and `run_covariance` run on the model as it was fitted**
   ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). With `model = None` they
   re-read the data with the model's `[data_selection]` and bind the model from the fit's

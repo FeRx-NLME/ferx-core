@@ -3963,12 +3963,9 @@ pub fn parse_full_model_with(
                     );
                     c.share =
                         block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, Some(k));
-                    if k >= n_eta {
-                        // Out of scope for the per-subject rule (see `EtaCoupling::kappa`).
-                        c.kappa = true;
-                        c.funnels.clear();
-                        c.reach = None;
-                    }
+                    // A kappa runs the same walk; the binder measures it on its
+                    // own unit, the occasion (see `EtaCoupling::kappa`).
+                    c.kappa = k >= n_eta;
                     c
                 })
                 .collect();
@@ -19891,9 +19888,14 @@ pub(crate) struct ScaleShare {
 pub(crate) struct EtaCoupling {
     /// The random effect's declared name.
     pub(crate) eta: String,
-    /// An IOV kappa rather than a subject-level η. A kappa varies by occasion
-    /// within a subject, so the per-subject conditions below do not describe
-    /// it; the binder keeps it on the #1642 rule (`share` on a nested block).
+    /// An IOV kappa rather than a subject-level η (#1678). The fields below are
+    /// computed for a kappa exactly as for an η; what differs is the unit the
+    /// binder measures them on. A kappa varies by occasion, so "within a
+    /// subject" reads "within an occasion of one subject": the block's levels
+    /// must nest in occasions, and a funnel's covariates be constant within
+    /// each. Other random effects in a funnel candidate count as constant, which
+    /// is exact for a kappa added to its parameter; a kappa inside a nonlinear
+    /// ratio is judged at kappa = 0.
     pub(crate) kappa: bool,
     /// The first expression that reads the block and this random effect,
     /// states not tainted (#1642). Names the site in diagnostics.

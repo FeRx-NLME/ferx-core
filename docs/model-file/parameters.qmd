@@ -177,8 +177,10 @@ and it is chosen by looking at both the model and the data:
 
 | Situation | Default |
 |---|---|
-| The block's leading columns identify subjects one-to-one **and** the block absorbs a random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
-| A **one-column** block whose levels each belong to one subject absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
+| The block's levels each lie within one subject (within one occasion of one subject, for a kappa) **and** the block absorbs one random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
+| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
+| The block absorbs **two** random effects | refused, under every contrast (see [Two random effects](#two-random-effects)) |
+| A level has no effect on the likelihood | refused, under every contrast (see [Levels with no effect](#levels-with-no-effect)) |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -240,10 +242,12 @@ appear in the estimate table; its value follows from the others.
 
 #### Which random effects count
 
-A random effect is per subject, so a block can absorb one only when its levels
-key to subjects: its leading columns (for a one-column block, the column itself)
-identify subjects one-to-one. Every subject sits on one value, and no two
-subjects share one. Given that, a random effect counts when either holds:
+A random effect is per subject, so a block can absorb one only when each of its
+levels lies within one subject: every observation record of a level belongs to
+the same subject. `[STUDY, TIME]` with one subject per study does that, and so
+does `[STUDY, TIME]` with two subjects per study observed at different times,
+even though the two then share each `STUDY` value. Given that, a random effect
+counts when either holds:
 
 - **The block takes a level at every observation.** Each level holds one
   observation time of one subject, as `[STUDY, TIME]` does with one subject per
@@ -275,8 +279,59 @@ anyway, ω collapses to 0. With two or more subjects per study the same model
 binds, since the random effect is then identified from the spread within each
 study.
 
-Kappas (inter-occasion random effects) keep the earlier rule for now: they count
-on a nested block when an expression reads both.
+#### Kappas
+
+A kappa (an inter-occasion random effect) follows the same rule, with an
+**occasion of one subject** in place of the subject. It counts only when each of
+the block's levels lies within one occasion, and a covariate in the shared
+expression must be constant within each occasion rather than within the subject.
+
+So the layout of the occasions decides it. In the MBMA layout the arms of a
+study are the occasions and each arm carries the study's full visit grid; a
+`[STUDY, TIME]` level then holds one record of every arm, and the between-arm
+kappa does not count. `PLACEBO[STUDY, TIME]` with `ETA_E0` and `KAPPA_ARM` on the
+same baseline binds within-study, the kappa estimated from the spread between
+arms. When the occasions split a subject's records into periods instead, or the
+block is keyed on the occasion itself (`PLACEBO[STUDY, OCC]`), the levels nest in
+the occasions and the kappa counts.
+
+The occasions are the ones the fit uses: the `iov_column` data column, or the
+ones `iov_occasion = dose` or `time(...)` derives. Data with no occasions gives
+a kappa nowhere to count; the fit then refuses the missing occasions itself.
+
+#### Two random effects
+
+When the block absorbs two random effects — an η and a kappa, or two η on
+different parameters — it is refused under every contrast. Within-group
+sum-to-zero leaves each subject's mean to one of them, and the levels then
+reproduce the other: on `[STUDY, TIME]` with one subject per study, `ETA_E0` on
+`E0` and `ETA_EM` on `EMAX` are each fine alone, but not together. Drop one of
+the random effects, or remove the block.
+
+One case is named differently. When every subject has a single occasion and the
+kappa sits where the η does, the kappa *is* the η by another name: the model is
+unidentified with or without the block, and the message says so.
+
+#### Levels with no effect
+
+A level whose θ changes nothing the likelihood reads cannot be estimated, and
+the block is refused under every contrast, before any contrast is chosen. The
+typical case is a level that holds only records at `TIME = 0`, where the block is
+read through a factor that vanishes there: `PLACEBO * TIME`, an Emax term
+`EMAX * TIME / (TIME + ET50)` with the block on `EMAX`, an ODE state that starts
+at its initial value, or a clearance read at its own dose time. The message
+lists the levels; key the block so those records share a level with a later
+time, or read the block where it acts at `TIME = 0`.
+
+The check compares every record's prediction and residual magnitude after a
+step in each level's θ, at two points: the initial estimates, and a nearby
+point with every non-`FIX` θ moved inside its bounds and every random effect at
+0.05. A level is refused only when nothing changes at both. A block that acts
+only through a θ initialised at 0 therefore binds; one whose θ is fixed at 0
+does not. A point where anything evaluates non-finite says nothing, and the
+level counts as live. A model with a hazard, Markov or binary endpoint, a
+mixture or a `[diffusion]` block is not checked, since those read the block
+through channels the check does not compare.
 
 ### Fitting at this scale
 
