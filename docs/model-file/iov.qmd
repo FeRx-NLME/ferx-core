@@ -199,8 +199,10 @@ The figure is printed exactly when the row's note is (#1698). A kappa whose
 expression gives it no label (custom) has no note, and a failed or SIR-fallback
 covariance step hides every note; in both cases the line keeps only
 `weight = NARM (κ ~ N(0, KAPPA_P/NARM))`. The fit YAML still writes
-`sd_at_typical_weight` in both cases, as it writes `sd` and `cv_pct` whatever the
-covariance step did.
+`sd_at_typical_weight` in both cases. When the covariance step failed, that matches
+`sd` and `cv_pct`, which the YAML writes whatever the covariance step did. For a
+custom kappa it is the one spread key written, since a custom entry has no `sd`
+or `cv_pct`.
 
 A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
 $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.

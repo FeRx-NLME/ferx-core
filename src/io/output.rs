@@ -5485,20 +5485,21 @@ mod tests {
         // CV% = 100 · SD.
         //
         // #1698: the spread follows the row note's `show_cv` gate. Both sides
-        // of the gate in this one loop — a computed covariance step prints the
-        // spread, a failed or SIR-fallback one the bare line — so forcing the
-        // gate either way reddens a cell.
+        // of the gate in this one loop, every status spelled out — a computed
+        // or not-requested (`covariance = false`, the commonest) step prints
+        // the spread, a failed or SIR-fallback one the bare line — so forcing
+        // the gate either way reddens a cell.
         let pad = " ".repeat(25);
         let weight_line = |name: &str, spread: Option<&str>| match spread {
             Some(spread) => format!("{pad}weight = NARM  →  {spread} (κ ~ N(0, {name}/NARM))"),
             None => format!("{pad}weight = NARM (κ ~ N(0, {name}/NARM))"),
         };
-        for status in [
-            CovarianceStatus::Computed,
-            CovarianceStatus::Failed,
-            CovarianceStatus::SirFallback,
+        for (status, show) in [
+            (CovarianceStatus::Computed, true),
+            (CovarianceStatus::NotRequested, true),
+            (CovarianceStatus::Failed, false),
+            (CovarianceStatus::SirFallback, false),
         ] {
-            let show = status == CovarianceStatus::Computed;
             for (typed, cells) in [
                 (
                     true,

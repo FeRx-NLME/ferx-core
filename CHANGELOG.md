@@ -27,7 +27,8 @@ section of the SDLC for the versioning policy).
   `(SD = … at weight 1, logit scale)` order. When the row has no CV%/SD note — a custom kappa,
   or a covariance step that failed or fell back to SIR — the line drops its figure too and
   reads `weight = NARM (κ ~ N(0, KAPPA/NARM))`; a custom kappa's line used to print `SD = …`.
-  Additive and log-normal lines, unweighted rows and the fit YAML are unchanged.
+  With a computed covariance step, additive and log-normal lines are unchanged; unweighted rows
+  and the fit YAML are unchanged.
 - **A sample-size-weighted log-normal kappa's weight line reports a CV%, like its row**
   ([#1683](https://github.com/FeRx-NLME/ferx-core/issues/1683)). The console and `ferx summary`
   line under the row now reads `→  CV% = 11.2 at NARM = 4.0000` instead of the log-scale
