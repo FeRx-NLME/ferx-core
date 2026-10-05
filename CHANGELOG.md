@@ -152,6 +152,14 @@ section of the SDLC for the versioning policy).
   no covariance or a wrong SIR interval, and a fit with `ignore_subjects` got a wrong
   covariance or a panic. A supplied model with the wrong θ count or bindings, or a
   population whose subjects are not the fit's, is now refused instead of panicking.
+- **A reassigned individual parameter is labelled by its last assignment** (#1673). In
+  `CL = TVCL + ETA_CL` followed by `CL = CL * TVV`, the ETA was labelled additive and printed an
+  `SD`, though the `CL` the model uses is a product; it is now custom, as `CL = (TVCL + ETA_CL) *
+  TVV` on one line is. A later `CL = CL + TH` stays additive and `CL = exp(CL)` is log-normal.
+  A statement only reads the value in force where it sits, so a line before the assignment, after
+  a reassignment that replaces it, or in the other branch of an `if` no longer changes the label.
+  Kappas follow the same rule. Labels only: estimates and objective values are unchanged, and no
+  example model's labels change.
 - **A sample-size-weighted log-normal kappa's CV% is labelled `at weight 1`**
   ([#1666](https://github.com/FeRx-NLME/ferx-core/issues/1666)). The console and `ferx summary`
   row now reads `(CV% = … at weight 1)`, as the SD rows of additive and logit kappas already
@@ -391,6 +399,10 @@ section of the SDLC for the versioning policy).
   ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)).
 
 ### Performance
+- **Labelling ETAs and kappas is linear in the number of intermediates** (#1674). The walk that
+  decides each random effect's scale followed every path through the intermediates, so a diamond
+  of them (`B = A + 1`, `C = A + 2`, `D = B + C`, ...) doubled its work per level: the parse took
+  11.7 s at depth 18. It now visits each assignment once, and the same parse takes 1.7 s.
 - **Closed-form transit and inverse-Gaussian models keep IOV and time-varying-covariate
   subjects analytic** (#1560). `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
   `two_cpt_ig` subjects with IOV or a time-varying covariate used to run on the model's ODE
