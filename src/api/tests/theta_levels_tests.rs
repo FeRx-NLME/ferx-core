@@ -3171,6 +3171,73 @@ mod absorption {
                 "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -KE * central",
             );
         assert_eq!(coupling(&ode).reach, Some(EtaRoute::State), "ODE via KE");
+        // R1-2 (#1675 review): a parameter only the engine reads by name reaches
+        // the states (an ODE model's bare `F`, an analytical `D1`); an unread one
+        // with a canonical PK name (`KA` on `one_cpt_iv`) is dead, like `ZZ`.
+        let pk_ip = |extra: &str| {
+            scaling_model(&format!(
+                "  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0\n{extra}"
+            ))
+            .replace("PLACEBO[STUDY, TIME]", "PLACEBO[STUDY]")
+        };
+        for (tag, extra, want) in [
+            ("unread KA", "  KA = TVEMAX * exp(ETA_E0)", None),
+            ("unread ZZ", "  ZZ = TVEMAX * exp(ETA_E0)", None),
+            (
+                "analytical D1",
+                "  D1 = TVEMAX * exp(ETA_E0)",
+                Some(EtaRoute::State),
+            ),
+        ] {
+            assert_eq!(coupling(&pk_ip(extra)).reach, want, "{tag}");
+        }
+        let ode_f = pk_ip("  F = TVEMAX * exp(ETA_E0)").replace(
+            "  pk one_cpt_iv(cl=CL, v=V)",
+            "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+        );
+        assert_eq!(coupling(&ode_f).reach, Some(EtaRoute::State), "ODE bare F");
+        // ... and only those: an analytical model reads `F` only through `pk(...)`,
+        // and an ODE model reads no other canonical name by itself.
+        assert_eq!(
+            coupling(&pk_ip("  F = TVEMAX * exp(ETA_E0)")).reach,
+            None,
+            "analytical unread F"
+        );
+        let ode_ka = pk_ip("  KA = TVEMAX * exp(ETA_E0)").replace(
+            "  pk one_cpt_iv(cl=CL, v=V)",
+            "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+        );
+        assert_eq!(coupling(&ode_ka).reach, None, "ODE unread KA");
+        // R1-3: across readouts the most direct route wins. One reads the η
+        // itself, the other only through the state.
+        let routes = shape("S2", "STUDY", "")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+            )
+            .replace(
+                "  y = central / V + E0 + PLACEBO",
+                "  y[CMT=1] = central / V + E0 + ETA_E0\n  y[CMT=2] = central / V + PLACEBO",
+            )
+            .replace(
+                "  DV ~ additive(ADD)",
+                "  CMT=1: DV ~ additive(ADD)\n  CMT=2: DV ~ additive(ADD)",
+            );
+        assert_eq!(
+            coupling(&routes).reach,
+            Some(EtaRoute::Direct),
+            "Direct beats State"
+        );
+        // The binder side of the KA/ZZ pair, on the saturating block.
+        let sat = |extra: &str| pk_ip(extra).replace("PLACEBO[STUDY]", "PLACEBO[STUDY, TIME]");
+        let one = cf_pop(3, 1, &T6);
+        for extra in ["  KA = TVEMAX * exp(ETA_E0)", "  ZZ = TVEMAX * exp(ETA_E0)"] {
+            assert_eq!(
+                try_bind(&sat(extra), &one),
+                Ok((LevelContrast::SumToZero, 17)),
+                "{extra}"
+            );
+        }
         // A random effect read only by an `if` condition still reaches `y`.
         let cond = cf_model(
             "",

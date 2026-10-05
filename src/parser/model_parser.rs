@@ -20578,9 +20578,18 @@ impl StateInputs {
             indiv_var_names
                 .iter()
                 .filter(|n| {
+                    // A canonical PK name is read by the engine itself only as an
+                    // ODE model's bare dose route (`F`, `ALAG`/`LAGTIME`); an
+                    // analytical model reads what `pk(...)` binds, which is
+                    // `pk_param_map`. Any other unread canonical name (`KA` on
+                    // `one_cpt_iv`) is dead (#1675 review, R1-2).
                     tokens.contains(n.as_str())
                         || crate::types::DoseAttr::from_indexed_name(n).is_some()
-                        || PkParams::name_to_index(&n.to_lowercase()).is_some()
+                        || (ode_states.is_some()
+                            && matches!(
+                                PkParams::name_to_index(&n.to_lowercase()),
+                                Some(crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)
+                            ))
                 })
                 .cloned(),
         );

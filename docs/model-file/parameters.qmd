@@ -178,6 +178,7 @@ and it is chosen by looking at both the model and the data:
 | Situation | Default |
 |---|---|
 | The block's leading columns identify subjects one-to-one **and** the block absorbs a random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
+| A **one-column** block whose levels each belong to one subject absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -257,7 +258,7 @@ subjects share one. Given that, a random effect counts when either holds:
   product in the readout (`y = E0 + PLACEBO + ...` with `E0 = TVE0 + ETA_E0`).
   Their effects on `y` are then proportional within each subject. The expression
   may read a data covariate only if it is constant within every subject in the
-  data; one that reads `TIME` or a state does not qualify.
+  data; one that reads `TIME`, `TAD`, `TAFD` or a state does not qualify.
 
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in
