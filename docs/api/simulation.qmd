@@ -436,7 +436,10 @@ What actually happens, for `UncertaintyMethod::Asymptotic`:
   with `lower == upper`, so an unpinned continuous draw would otherwise be
   rejected for every model with a FIX.)
 - A draw that lands outside the packed bounds, or that unpacks to a
-  non-positive theta / sigma / Omega diagonal, is discarded and redrawn, up
+  non-finite theta or a non-positive sigma / Omega / kappa diagonal, is
+  discarded and redrawn. A theta has no sign condition beyond its declared
+  bounds, so a theta declared `(0, -5, 5)` draws from the full normal, not one
+  truncated at 0 ([#1701](https://github.com/FeRx-NLME/ferx-core/issues/1701)). Redrawing goes on up
   to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is
   an `Err`, and usually means an ill-conditioned covariance matrix or an
   estimate sitting on a bound.

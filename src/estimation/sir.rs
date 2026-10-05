@@ -13,7 +13,8 @@ use crate::estimation::parameterization::{
     compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::estimation::uncertainty_samples::{
-    bounds_to_draw_scale, from_draw_scale, log_abs_jacobian, logit_theta_coords, to_draw_scale,
+    admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian, logit_theta_coords,
+    to_draw_scale,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -99,7 +100,9 @@ enum SampleOutcome {
     Accepted,
     /// Packed coordinate index that fell outside its bound.
     OutOfBounds(usize),
-    NonPositiveParams,
+    /// In bounds, but failed `admissible_values`: a non-finite θ, or a
+    /// non-positive σ / Ω / κ variance.
+    InadmissibleValues,
     NonFiniteOfv,
     Cancelled,
 }
@@ -395,7 +398,7 @@ fn all_invalid_weights_message(
     conditioned: &ConditionedProposal,
 ) -> String {
     let mut n_bounds = 0usize;
-    let mut n_nonpos = 0usize;
+    let mut n_inadmissible = 0usize;
     let mut n_ofv = 0usize;
     let mut n_cancelled = 0usize;
     let mut per_coord: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -405,7 +408,7 @@ fn all_invalid_weights_message(
                 n_bounds += 1;
                 *per_coord.entry(i).or_insert(0) += 1;
             }
-            SampleOutcome::NonPositiveParams => n_nonpos += 1,
+            SampleOutcome::InadmissibleValues => n_inadmissible += 1,
             SampleOutcome::NonFiniteOfv => n_ofv += 1,
             SampleOutcome::Cancelled => n_cancelled += 1,
             SampleOutcome::Accepted => {}
@@ -413,10 +416,11 @@ fn all_invalid_weights_message(
     }
     let mut msg = format!(
         "All {} SIR samples had invalid weights (rejected: {} out of bounds, {} \
-         non-positive theta/sigma/omega, {} non-finite OFV, {} cancelled).",
+         non-finite theta or non-positive sigma/omega/kappa variance, {} non-finite OFV, \
+         {} cancelled).",
         outcomes.len(),
         n_bounds,
-        n_nonpos,
+        n_inadmissible,
         n_ofv,
         n_cancelled
     );
@@ -453,6 +457,29 @@ fn all_invalid_weights_message(
         );
     }
     msg
+}
+
+/// Screen one packed draw before any inner-loop work is spent on it: the
+/// packed bounds first, then `admissible_values` — finite θ, positive
+/// variances, no sign condition on θ (#1701). The first out-of-bounds
+/// coordinate is recorded so a total rejection can name it (#1021).
+fn screen_draw(
+    x_k: &[f64],
+    bounds: &PackedBounds,
+    template: &ModelParameters,
+) -> Result<ModelParameters, SampleOutcome> {
+    let out_of_bounds = x_k
+        .iter()
+        .zip(bounds.lower.iter().zip(bounds.upper.iter()))
+        .position(|(&x, (&lo, &hi))| x < lo || x > hi);
+    if let Some(i) = out_of_bounds {
+        return Err(SampleOutcome::OutOfBounds(i));
+    }
+    let params_k = unpack_params(x_k, template);
+    if !admissible_values(&params_k) {
+        return Err(SampleOutcome::InadmissibleValues);
+    }
+    Ok(params_k)
 }
 
 /// Math kernel for the SIR procedure. Operates on pre-built parameter and
@@ -683,35 +710,10 @@ fn run_sir_core_scoped(
             if crate::cancel::is_cancelled(&options.cancel) {
                 return (f64::NEG_INFINITY, SampleOutcome::Cancelled);
             }
-            // Reject samples outside parameter bounds (avoids wasting inner-loop work).
-            // The first offending coordinate is recorded so a total rejection can
-            // name the parameter whose bound the proposal keeps overshooting (#1021).
-            let out_of_bounds = x_k
-                .iter()
-                .zip(bounds.lower.iter().zip(bounds.upper.iter()))
-                .position(|(&x, (&lo, &hi))| x < lo || x > hi);
-            if let Some(i) = out_of_bounds {
-                return (f64::NEG_INFINITY, SampleOutcome::OutOfBounds(i));
-            }
-
-            let params_k = unpack_params(x_k, params);
-
-            // Check for invalid parameters: theta, sigma, and omega
-            let theta_invalid = params_k.theta.iter().any(|&t| !t.is_finite() || t <= 0.0);
-            let sigma_invalid = params_k
-                .sigma
-                .values
-                .iter()
-                .any(|&s| !s.is_finite() || s <= 0.0);
-            let n_eta = params_k.omega.dim();
-            let omega_invalid = (0..n_eta).any(|i| {
-                let var = params_k.omega.matrix[(i, i)];
-                let lii = params_k.omega.chol[(i, i)];
-                !var.is_finite() || var <= 0.0 || !lii.is_finite() || lii <= 0.0
-            });
-            if theta_invalid || sigma_invalid || omega_invalid {
-                return (f64::NEG_INFINITY, SampleOutcome::NonPositiveParams);
-            }
+            let params_k = match screen_draw(x_k, &bounds, params) {
+                Ok(p) => p,
+                Err(outcome) => return (f64::NEG_INFINITY, outcome),
+            };
 
             // Run inner loop warm-started from ML EBEs
             let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
@@ -1136,7 +1138,7 @@ mod tests {
             SampleOutcome::OutOfBounds(1),
             SampleOutcome::OutOfBounds(0),
             SampleOutcome::NonFiniteOfv,
-            SampleOutcome::NonPositiveParams,
+            SampleOutcome::InadmissibleValues,
         ];
         let coord_names = vec!["TVCL".to_string(), "PROP_ERR".to_string()];
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.0]));
@@ -1145,7 +1147,7 @@ mod tests {
         let msg = all_invalid_weights_message(&outcomes, &coord_names, &conditioned);
         assert!(msg.contains("All 5 SIR samples"), "{msg}");
         assert!(msg.contains("3 out of bounds"), "{msg}");
-        assert!(msg.contains("1 non-positive"), "{msg}");
+        assert!(msg.contains("1 non-finite theta or non-positive"), "{msg}");
         assert!(msg.contains("1 non-finite OFV"), "{msg}");
         // Most-frequent offender first, with its hit count.
         assert!(msg.contains("PROP_ERR (2)"), "{msg}");
@@ -1153,6 +1155,85 @@ mod tests {
         // Proposal diagnosis + what to do about it.
         assert!(msg.contains("rank-deficient"), "{msg}");
         assert!(msg.contains("Fix or drop one parameter"), "{msg}");
+    }
+
+    /// #1701: `screen_draw` sorts each draw into the counter the failure
+    /// message reports. A negative θ inside its declared box is a draw, not a
+    /// rejection. A θ outside its box is "out of bounds", named by coordinate.
+    /// A σ that unpacks to 0 is "non-positive … variance". That draw needs a
+    /// box wide enough to let `exp` underflow, since the production box keeps
+    /// every log-packed coordinate far from it. (An Ω or κ Cholesky diagonal of
+    /// 0 cannot be reached this way: `unpack_params` refuses the factor first.
+    /// Those clauses are pinned on `admissible_values` directly.) Both outcomes
+    /// are asserted together, so the fix cannot simply drop the variance check
+    /// along with θ's.
+    ///
+    /// Mutations: restoring `|| t <= 0.0` fails the first `Ok`; deleting the σ
+    /// clause of `admissible_values` turns its `Err` into `Ok`.
+    #[test]
+    fn screen_draw_lets_bounds_govern_theta_and_still_rejects_a_bad_variance() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta SLOPE(-1.0, -5.0, 5.0)
+  theta TVV(10.0, FIX)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(SLOPE + ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        )
+        .expect("parse");
+        let params = model.default_params.clone();
+        let PackedStart {
+            packed: x_hat,
+            bounds,
+            ..
+        } = pack_with_bounds(&params);
+        // SLOPE packs on its natural scale, so the packed value is θ itself.
+        assert_eq!(x_hat[1], -1.0);
+        let screen = |x: &[f64], b: &PackedBounds| screen_draw(x, b, &params).map(|p| p.theta);
+
+        let theta = screen(&x_hat, &bounds).expect("a negative θ inside its box is a draw");
+        assert_eq!(theta[1], -1.0);
+
+        let mut outside = x_hat.clone();
+        outside[1] = -6.0;
+        assert_eq!(
+            screen(&outside, &bounds),
+            Err(SampleOutcome::OutOfBounds(1))
+        );
+
+        // Packed layout: TVCL, SLOPE, TVV, ln L(ETA_CL), ln σ.
+        let wide = PackedBounds {
+            lower: vec![f64::NEG_INFINITY; x_hat.len()],
+            upper: vec![f64::INFINITY; x_hat.len()],
+        };
+        let mut sigma_zero = x_hat.clone();
+        sigma_zero[4] = -800.0; // exp(-800) == 0.0
+        let got = screen(&sigma_zero, &wide);
+        assert_eq!(got, Err(SampleOutcome::InadmissibleValues));
+        let outcomes = vec![screen(&outside, &bounds).unwrap_err(), got.unwrap_err()];
+
+        let names = coordinate_names(&params);
+        let cov = DMatrix::identity(1, 1);
+        let conditioned = condition_free_proposal(&cov, &[1.0], &names[..1]).unwrap();
+        let msg = all_invalid_weights_message(&outcomes, &names, &conditioned);
+        assert!(msg.contains("1 out of bounds"), "{msg}");
+        assert!(
+            msg.contains("1 non-finite theta or non-positive sigma/omega/kappa variance"),
+            "{msg}"
+        );
+        assert!(msg.contains("SLOPE (1)"), "{msg}");
     }
 
     /// A clean run must not decorate the failure message with proposal

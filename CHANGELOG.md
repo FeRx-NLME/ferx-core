@@ -185,6 +185,15 @@ section of the SDLC for the versioning policy).
   then reproduce one of them; it is now refused under every contrast. Two subjects of one study
   on disjoint times nest the block in subjects too, so a global contrast there is now refused
   and `auto` takes `sum_to_zero_within`.
+- **SIR resamples a θ that may be negative**
+  ([#1701](https://github.com/FeRx-NLME/ferx-core/issues/1701)). SIR rejected every sample
+  with any θ ≤ 0, whatever the θ's declared bounds. A level block, a covariate slope or a
+  shift declared e.g. `(0, -50, 50)`, and any `[covariate_nn]` model with a negative weight,
+  therefore failed with "All N SIR samples had invalid weights", both in-fit and from
+  `run_sir`. `simulate_with_uncertainty`'s asymptotic draws
+  were silently truncated to θ > 0. θ is now governed by its bounds alone, and only σ and
+  the Ω and κ diagonals must be positive. Models whose θ all have a lower bound ≥ 0 get
+  bit-identical results.
 - **`run_sir` and `run_covariance` run on the model as it was fitted**
   ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). With `model = None` they
   re-read the data with the model's `[data_selection]` and bind the model from the fit's
