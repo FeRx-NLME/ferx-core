@@ -28414,3 +28414,232 @@ fn every_block_is_sorted_into_param_consumer_or_not() {
     let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
     assert_eq!(sorted, registry);
 }
+
+// ── #1673 / #1674: the walk follows reassignments; it is linear in the statements ──
+
+/// The type of the random effect `RE` in `indiv`, once as the ETA `ETA_CL`
+/// (its `eta_param_info` entries) and once as the kappa `K`
+/// (`kappa_param_types`), so every row is checked on both classifiers.
+fn re_scale_twins(
+    indiv: &str,
+) -> (
+    Vec<(String, crate::types::EtaParamType)>,
+    crate::types::EtaParamType,
+) {
+    let eta = eta_scale_model(&indiv.replace("RE", "ETA_CL"), "");
+    let kappa = eta_scale_model(
+        &format!("  CL0 = TVCL * exp(ETA_CL)\n{}", indiv.replace("RE", "K")),
+        "",
+    );
+    (eta_entries(&eta, "ETA_CL"), kappa.kappa_param_types[0])
+}
+
+/// #1673: a consumer sees a variable's **last** value, so a later statement
+/// that reassigns it is followed before the consumer check stops the walk.
+/// Every row is a cell of the enumeration in the PR (reassignment shape ×
+/// operator × a reader between the two assignments), with the old answer in
+/// the label; each is asserted for an ETA and for a kappa. `CL = CL * TVV` and
+/// `CL = CL + TH_WT` sit in the same table, so a walk that ignores the
+/// reassignment fails the first and one that calls every reassignment `Custom`
+/// fails the second.
+#[test]
+fn a_reassignment_is_followed_before_the_consumer_check() {
+    use crate::types::EtaParamType::{self, *};
+    let head = "  V = TVV * exp(ETA_V)\n  CL = TVCL + RE\n";
+    let rows: [(&str, &str, EtaParamType); 12] = [
+        // Dies under: the consumer check before the reassignment (the bug).
+        ("one *, was Additive", "  CL = CL * TVV", Custom),
+        // Dies under: every replaced definition pushing `Custom`.
+        ("one +, unchanged", "  CL = CL + TH_WT", Additive),
+        ("one -, unchanged", "  CL = CL - TH_WT", Additive),
+        ("one /, was Additive", "  CL = CL / TVV", Custom),
+        ("one exp, was Additive", "  CL = exp(CL)", LogNormal),
+        // Dies under: following a reassignment's leaf without recursing into
+        // the reassignment's own definition.
+        (
+            "chained + then *, was Additive",
+            "  CL = CL + TH_WT\n  CL = CL * TVV",
+            Custom,
+        ),
+        (
+            "chained * then +, was Additive",
+            "  CL = CL * TVV\n  CL = CL + TH_WT",
+            Custom,
+        ),
+        (
+            "reads itself twice, one under *, was Additive",
+            "  CL = CL + CL * TVV",
+            Custom,
+        ),
+        (
+            "reads itself twice, both +, unchanged",
+            "  CL = CL + CL",
+            Additive,
+        ),
+        // Dies under: a consumed variable following its other readers once a
+        // reassignment replaces it — `K10` is not the parameter either way.
+        (
+            "a reader between, then +, unchanged",
+            "  K10 = CL / V\n  CL = CL + TH_WT",
+            Additive,
+        ),
+        (
+            "a reader between, then *, was Additive",
+            "  K10 = CL / V\n  CL = CL * TVV",
+            Custom,
+        ),
+        // Dies under: a reassignment inside an `if` replacing the definition —
+        // where `WT <= 70` the consumer still sees `TVCL + RE`, so the two
+        // scales disagree.
+        (
+            "conditional exp, was Additive",
+            "  if (WT > 70) {\n    CL = exp(CL)\n  }",
+            Custom,
+        ),
+    ];
+    for (label, tail, want) in rows {
+        let (eta, kappa) = re_scale_twins(&format!("{head}{tail}"));
+        assert_eq!(eta, [("CL".into(), want)], "ETA: {label}");
+        assert_eq!(kappa, want, "kappa: {label}");
+    }
+}
+
+/// #1673: a definition is read only while it is in force — after it, up to the
+/// assignment that replaces it, and never from a sibling `if` branch. Each row
+/// is asserted for an ETA and for a kappa.
+#[test]
+fn a_definition_is_read_only_while_it_is_in_force() {
+    use crate::types::EtaParamType::{self, *};
+    let rows: [(&str, &str, &str, EtaParamType); 3] = [
+        (
+            // Dies under: readers scanned from the first statement, not from
+            // the one after the definition (`CLX` reads the earlier `ECL`).
+            // Was Custom.
+            "a reader before the definition",
+            "  ECL = TVCL\n  CLX = ECL * 2\n  ECL = ECL + RE\n  \
+             CL = TVCL * exp(ECL)\n  V = TVV * exp(ETA_V)",
+            "ECL",
+            LogNormal,
+        ),
+        (
+            // Dies under: the walk not stopping at the assignment that replaces
+            // the definition (`V` reads the later `A`). Was Custom.
+            "a reader after the replacement",
+            "  A = RE\n  CL = TVCL * exp(A)\n  A = TVV\n  V = TVV * exp(ETA_V) * A",
+            "A",
+            LogNormal,
+        ),
+        (
+            // Dies under: dropping the sibling-branch skip (the `else` reads the
+            // `CL` defined before the `if`, not the one in the other branch).
+            // Was Additive; stays Additive.
+            "a reader in a sibling branch",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL\n  \
+             if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = exp(CL)\n  }",
+            "CL",
+            Additive,
+        ),
+    ];
+    for (label, indiv, param, want) in rows {
+        let (eta, kappa) = re_scale_twins(indiv);
+        assert_eq!(eta, [(param.into(), want)], "ETA: {label}");
+        assert_eq!(kappa, want, "kappa: {label}");
+    }
+}
+
+/// `[individual_parameters]` statements parsed alone, with `ETA_CL` the one BSV
+/// ETA (slot 0) and `K` the one kappa (slot 1).
+fn walk_stmts(src: &str) -> Vec<Statement> {
+    let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = ["ETA_CL", "K"].iter().map(|s| s.to_string()).collect();
+    // Assigned names, so an intermediate parses as a variable, not a covariate.
+    let assigned: Vec<String> = src
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim().to_string()))
+        .collect();
+    let ctx = ParseCtx::new(&tn, &en, &assigned);
+    parse_block_statements(src, ctx, StatementMode::Plain).expect("parses")
+}
+
+/// `(ETA_CL's types, K's type, root_scale calls)` for `src`, with `CL` the one
+/// consumed variable.
+fn walk_counted(
+    src: &str,
+) -> (
+    Vec<crate::types::EtaParamType>,
+    crate::types::EtaParamType,
+    usize,
+) {
+    let stmts = walk_stmts(src);
+    let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
+    let consumers: HashSet<String> = ["CL".to_string()].into();
+    super::ROOT_SCALE_CALLS.with(|c| c.set(0));
+    let (infos, _) = classify_indiv_params(&stmts, &tn, &["ETA_CL".to_string()], &consumers);
+    let kappa = classify_kappa_params(&stmts, 1, &["K".to_string()], &consumers);
+    let calls = super::ROOT_SCALE_CALLS.with(|c| c.get());
+    (
+        infos.iter().map(|i| i.param_type).collect(),
+        kappa[0],
+        calls,
+    )
+}
+
+/// A diamond of intermediates `depth` levels deep below the random effect `re`:
+/// `X0 = re`, then `B = X + 1`, `C = X + 2`, `X' = B + C` per level, so the
+/// walk reaches every `X` by `2^level` paths.
+fn diamond(depth: usize, re: &str) -> String {
+    let mut s = format!("X0 = {re}\n");
+    for i in 0..depth {
+        s += &format!(
+            "B{i} = X{i} + 1\nC{i} = X{i} + 2\nX{n} = B{i} + C{i}\n",
+            n = i + 1
+        );
+    }
+    s + &format!("CL = TVCL * exp(X{depth})\n")
+}
+
+/// #1674: the walk is memoised per definition, so on a diamond it makes a fixed
+/// number of calls per level — linear in the depth — where the walk by path
+/// made `2^depth` (measured before the fix: parse time 0.12 s / 0.65 s / 11.7 s
+/// at depth 10 / 14 / 18, ETA and kappa alike). The depths are checked in
+/// increasing order, so without the memo the test fails at depth 20 (~10⁶
+/// calls) instead of running depth 30 (~10⁹).
+/// Dies under: removing the memo lookup in `root_scale`.
+#[test]
+fn the_scale_walk_is_linear_on_a_diamond() {
+    use crate::types::EtaParamType::LogNormal;
+    for re in ["ETA_CL", "K"] {
+        let count = |d: usize| {
+            let (eta, kappa, calls) = walk_counted(&diamond(d, re));
+            // The answer, not just the cost: `+` all the way down to an `exp`.
+            if re == "K" {
+                assert_eq!(kappa, LogNormal, "{re} depth {d}");
+            } else {
+                assert_eq!(eta, [LogNormal], "{re} depth {d}");
+            }
+            calls
+        };
+        let c0 = count(0);
+        let per_level = count(1) - c0;
+        assert!(per_level > 0, "{re}: the diamond reaches the walk");
+        assert_eq!(count(10) - c0, 10 * per_level, "{re}: depth 10 is linear");
+        assert_eq!(count(20) - c0, 20 * per_level, "{re}: depth 20 is linear");
+        assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
+    }
+}
+
+/// An in-place reassignment that only reads itself terminates — a reader is
+/// always a later definition, so the walk never re-enters the one it is in — and
+/// classifies as it did before #1673 when its operator keeps the scale.
+/// Dies under: starting the reader scan at the definition itself
+/// (`skip(def)`), which recurses without end.
+#[test]
+fn a_self_reassignment_terminates() {
+    use crate::types::EtaParamType::{Additive, LogNormal};
+    let (eta, _, calls) = walk_counted("CL = TVCL + ETA_CL\nCL = CL + 2\nCL = CL + 3\n");
+    assert_eq!(eta, [Additive]);
+    // `CL`'s three definitions, each walked once.
+    assert_eq!(calls, 3, "one call per definition");
+    let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
+    assert_eq!(kappa, LogNormal);
+}
