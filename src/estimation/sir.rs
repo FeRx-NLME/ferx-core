@@ -100,7 +100,9 @@ enum SampleOutcome {
     Accepted,
     /// Packed coordinate index that fell outside its bound.
     OutOfBounds(usize),
-    NonPositiveParams,
+    /// In bounds, but failed `admissible_values`: a non-finite θ, or a
+    /// non-positive σ / Ω / κ variance.
+    InadmissibleValues,
     NonFiniteOfv,
     Cancelled,
 }
@@ -396,7 +398,7 @@ fn all_invalid_weights_message(
     conditioned: &ConditionedProposal,
 ) -> String {
     let mut n_bounds = 0usize;
-    let mut n_nonpos = 0usize;
+    let mut n_inadmissible = 0usize;
     let mut n_ofv = 0usize;
     let mut n_cancelled = 0usize;
     let mut per_coord: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -406,7 +408,7 @@ fn all_invalid_weights_message(
                 n_bounds += 1;
                 *per_coord.entry(i).or_insert(0) += 1;
             }
-            SampleOutcome::NonPositiveParams => n_nonpos += 1,
+            SampleOutcome::InadmissibleValues => n_inadmissible += 1,
             SampleOutcome::NonFiniteOfv => n_ofv += 1,
             SampleOutcome::Cancelled => n_cancelled += 1,
             SampleOutcome::Accepted => {}
@@ -418,7 +420,7 @@ fn all_invalid_weights_message(
          {} cancelled).",
         outcomes.len(),
         n_bounds,
-        n_nonpos,
+        n_inadmissible,
         n_ofv,
         n_cancelled
     );
@@ -475,7 +477,7 @@ fn screen_draw(
     }
     let params_k = unpack_params(x_k, template);
     if !admissible_values(&params_k) {
-        return Err(SampleOutcome::NonPositiveParams);
+        return Err(SampleOutcome::InadmissibleValues);
     }
     Ok(params_k)
 }
@@ -1136,7 +1138,7 @@ mod tests {
             SampleOutcome::OutOfBounds(1),
             SampleOutcome::OutOfBounds(0),
             SampleOutcome::NonFiniteOfv,
-            SampleOutcome::NonPositiveParams,
+            SampleOutcome::InadmissibleValues,
         ];
         let coord_names = vec!["TVCL".to_string(), "PROP_ERR".to_string()];
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.0]));
@@ -1219,7 +1221,7 @@ mod tests {
         let mut sigma_zero = x_hat.clone();
         sigma_zero[4] = -800.0; // exp(-800) == 0.0
         let got = screen(&sigma_zero, &wide);
-        assert_eq!(got, Err(SampleOutcome::NonPositiveParams));
+        assert_eq!(got, Err(SampleOutcome::InadmissibleValues));
         let outcomes = vec![screen(&outside, &bounds).unwrap_err(), got.unwrap_err()];
 
         let names = coordinate_names(&params);
