@@ -190,17 +190,7 @@ pub fn prepare_run_with_inits(
 
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
 
-    let iov_col = parsed.fit_options.iov_column.as_deref();
-    let sel_filter = build_selection_filter(&parsed.fit_options)?;
-    let (mut population, covariate_table) = read_population_for(
-        &parsed.model,
-        &parsed.covariate_decls,
-        &data_path,
-        None,
-        iov_col,
-        sel_filter.as_ref(),
-        &parsed.column_map,
-    )?;
+    let (mut population, covariate_table) = read_population_as_fitted(&parsed, &data_path)?;
 
     // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
     // combination, so its level count is a property of the data. Bind it now —
@@ -1196,12 +1186,36 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
     true
 }
 
+/// Read a model file's dataset the way a fit of that file reads it: its
+/// `[covariates]` declarations, `[data]` column renames, `iov_column` and
+/// `[data_selection]` filter, routed by the model. [`prepare_run`] reads with
+/// this, and so do `run_sir` / `run_covariance` when they re-read `fit.data_path`
+/// (#1622), so the re-read cannot drop a clause the fit applied: before it, the
+/// re-read took no selection filter and a fit with `ignore_subjects` came back
+/// with the ignored subjects in it.
+pub(crate) fn read_population_as_fitted(
+    parsed: &ParsedModel,
+    data_path: &str,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    let sel_filter = build_selection_filter(&parsed.fit_options)?;
+    read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data_path,
+        None,
+        parsed.fit_options.iov_column.as_deref(),
+        sel_filter.as_ref(),
+        &parsed.column_map,
+    )
+}
+
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
 /// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
-/// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path`. The same
-/// reader call as [`read_population_for`] with no covariate declarations and no
-/// row filter, so the population comes back the way the original fit saw it —
-/// the endpoint's rows as event records, not as Gaussian observations (#1199).
+/// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path` when the fit
+/// recorded no model file to take the reader settings from. The same reader call
+/// as [`read_population_for`] with no covariate declarations and no row filter, so
+/// the endpoint's rows come back as event records, not as Gaussian observations
+/// (#1199). With a model file, [`read_population_as_fitted`] is the reader.
 pub(crate) fn read_population_routed_by(
     model: &CompiledModel,
     data_path: &Path,

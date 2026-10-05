@@ -89,6 +89,15 @@ section of the SDLC for the versioning policy).
   with a per-dose kernel).
 
 ### Added
+- **`bind_from_fit` binds a model to a fit's data-derived bindings in one call**
+  ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)). Pass the fit's
+  `data_bindings` and both halves come from the fit: the level layout, and the
+  `[covariate_model]` statistics behind `center = median` and friends. A design of heavier
+  subjects than the fit's no longer re-centres the covariate factors on its own median
+  (17% on predictions, measured). Bindings a fit cannot have written are refused: empty
+  bindings on a model that needs them, a split contrast group, a stored `auto` contrast or one
+  the block does not declare ([#1672](https://github.com/FeRx-NLME/ferx-core/issues/1672)),
+  and a missing or unread covariate statistic.
 
 - **A fit carries the data-derived bindings its model was compiled from**
   ([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)). `FitResult::data_bindings`
@@ -136,6 +145,13 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **`run_sir` and `run_covariance` run on the model as it was fitted**
+  ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). With `model = None` they
+  re-read the data with the model's `[data_selection]` and bind the model from the fit's
+  `data_bindings`. Before, a level-block model panicked, a `center = median` model returned
+  no covariance or a wrong SIR interval, and a fit with `ignore_subjects` got a wrong
+  covariance or a panic. A supplied model with the wrong θ count or bindings, or a
+  population whose subjects are not the fit's, is now refused instead of panicking.
 - **A reassigned individual parameter is labelled by its last assignment** (#1673). In
   `CL = TVCL + ETA_CL` followed by `CL = CL * TVV`, the ETA was labelled additive and printed an
   `SD`, though the `CL` the model uses is a product; it is now custom, as `CL = (TVCL + ETA_CL) *
@@ -376,6 +392,11 @@ section of the SDLC for the versioning policy).
   (`if (TAD > 5)`, `max(TAD, 0)`), which no schedule can give a pre-dose window — those
   runs already match `predict()`. A compartment that diverges on its own is still not
   blamed on the clock (#1535).
+
+### Deprecated
+- **`bind_theta_levels_from_fit`**: use `bind_from_fit` with the fit's `data_bindings`,
+  which binds the covariate statistics from the fit too
+  ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)).
 
 ### Performance
 - **Labelling ETAs and kappas is linear in the number of intermediates** (#1674). The walk that

@@ -344,25 +344,30 @@ to the bit. The test suite pins that on a level-block model, alone, with
 `prepare_run(model_path, data_path)` instead, which does all of this and
 returns the inputs without fitting.
 
-### Simulating with a fit's θ: `bind_theta_levels_from_fit` {#simulate-with-fit-theta}
+### Simulating with a fit's θ: `bind_from_fit` {#simulate-with-fit-theta}
 
-A level block's θ vector is laid out by the levels of the data it was bound
-against. `bind_theta_levels` on a simulation design re-discovers the levels from
-the design, so a design whose combinations differ from the fit's (a subset, a
-new time grid, another study, or only more subjects per study, which can change
-the resolved contrast) would read the fitted values at the wrong positions.
-Nothing refuses this when the design has as many levels as the fit: the θ
-vector then has the right length, so the length check below cannot see it.
+A fit's θ belongs to the model as it was compiled for the fit's data, and two
+parts of that compilation come from the data. A level block's θ vector is laid
+out by the levels the fit observed. A symbolic `[covariate_model]` centre
+(`center = median` and friends) is the fit data's statistic. Binding a
+simulation design with `bind_theta_levels` and `bind_covariate_stats`
+re-derives both from the *design*. A design whose level combinations differ
+from the fit's (a subset, a new time grid, another study, or only more subjects
+per study, which can change the resolved contrast) reads the fitted values at
+the wrong positions. A design of heavier subjects re-centres every covariate
+factor on its own median. Neither is refused: the θ vector has the right
+length, and the model is fully bound.
+
 Bind the design against the fit's own bindings instead. The fit carries them:
-`result.data_bindings` holds the level bindings and the `[covariate_model]`
-statistics the fitted model was compiled from, and a `.fitrx` bundle saves and
-reloads them, so the same code works on `load_fit(path)?.fit`
-([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)):
+`result.data_bindings` holds the level bindings and the covariate statistics
+the fitted model was compiled from, and a `.fitrx` bundle saves and reloads
+them, so the same code works on `load_fit(path)?.fit`
+([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621),
+[#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)):
 
 ```rust
-use ferx_core::api::read_population_for_simulation;
+use ferx_core::api::{bind_from_fit, read_population_for_simulation};
 use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
-use ferx_core::parser::model_parser::parse_full_model_with;
 
 // Continuing the example above (or with `result = load_fit(path)?.fit`).
 let mut design_parsed = parse_full_model_file(Path::new("model.ferx"))?;
@@ -370,22 +375,19 @@ let (mut design, _) = read_population_for_simulation(
     &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
     None, None, &design_parsed.column_map,
 )?;
-// The fit's covariate statistics, not the design's (`center = median` and friends),
-// compiled in by a re-parse.
-design_parsed.bindings.covariate_stats = result.data_bindings.covariate_stats.clone();
-design_parsed.model = parse_full_model_with(&model_text, &design_parsed.bindings)?.model;
-bind_theta_levels_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings.levels)?;
+bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)?;
 let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
 let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
 ```
 
-Keep the re-parse even on a model with no level block.
-`bind_theta_levels_from_fit` re-parses only when the model declares one, so on a
-model whose only data-derived binding is a `center = median` it is the explicit
-re-parse that compiles the fit's statistics in. Without it, `simulate` refuses
-the model as unbound. Binding the design with `bind_covariate_stats` instead
-would silence that refusal with the *design's* statistics, which is wrong for a
-fit's θ.
+One call binds both halves. On the measured case, a design of the fit's
+heavier half (WT median 80.6 against the fit's 70.85) simulates bit for bit
+like the fitted model. Centred on its own median it moves the predictions by up
+to 17%. After `bind_from_fit`, a `bind_covariate_stats` call on the same model
+changes nothing, because no relation is left for it to resolve. A fit that
+carries no bindings, such as a `.fitrx` saved before they were recorded, is
+refused rather than re-bound on the design. Refit the model to record them.
+`bind_theta_levels_from_fit`, the earlier levels-only binder, is deprecated.
 
 Each design record gets its level's index in the fit, and the model is re-parsed
 with the fit's labels, groups and contrast, so its θ layout is the fit's. A
@@ -400,6 +402,14 @@ because the R wrapper passes it through verbatim: simulate only the fit's
 levels, or simulate the design on its own levels without the fit's θ. From
 Rust, the second is `bind_theta_levels` on the design, with a θ for the levels
 it discovers (the model's `default_params`, for example).
+
+Bindings that a fit could not have written are refused too, since a `.fitrx`
+stores them as editable data. That covers a level listed twice, a contrast
+group split across non-adjacent levels, an unresolved `auto` contrast, a
+contrast other than the one the block declares (`ref` and `sum_to_zero` free
+the same number of θ, so a swap would otherwise read the fitted values under
+the wrong convention), a missing covariate statistic, and one that no relation
+reads.
 
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
@@ -424,7 +434,7 @@ applies: the negated sum of its group's free θ under `sum_to_zero` and
 `sum_to_zero_within`, and `0` for a `ref` reference level. The value is read
 through the same evaluator the predictions use, never re-derived. The θ must be
 laid out for that bound model, so pass the fit's own θ with the model it was
-fitted with (or one rebound with `bind_theta_levels_from_fit`). A θ of the wrong
+fitted with (or one rebound with `bind_from_fit`). A θ of the wrong
 length is refused. Unbound blocks and counted `theta NAME[N]` blocks are left
 out.
 

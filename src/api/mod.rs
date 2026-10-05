@@ -48,10 +48,14 @@ pub use adaptive::{
 };
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
+// Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
+#[allow(deprecated)]
+pub use levels::bind_theta_levels_from_fit;
 pub use levels::{
-    bind_theta_levels, bind_theta_levels_from_fit, level_map as theta_level_map,
-    theta_level_values, ThetaLevelValue,
+    bind_from_fit, bind_theta_levels, level_map as theta_level_map, theta_level_values,
+    ThetaLevelValue,
 };
+pub(crate) use levels::{bind_from_fit_on, write_fitted_level_columns};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{
@@ -78,7 +82,8 @@ pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{
-    build_selection_filter_merged, log_transform_observations, read_population_routed_by,
+    build_selection_filter_merged, log_transform_observations, read_population_as_fitted,
+    read_population_routed_by,
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,

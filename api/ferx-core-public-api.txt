@@ -83,6 +83,7 @@ pub ferx_core::api::ThetaLevelValue::value: f64
 pub const ferx_core::api::FIT_RAYON_STACK_SIZE: usize
 pub fn ferx_core::api::assert_covariate_model_bound(model: &ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_covariate_stats(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &ferx_core::Population) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::api::bind_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_theta_levels_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::LevelBindings) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::check_experimental_features(model: &ferx_core::CompiledModel) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
@@ -4990,6 +4991,7 @@ pub const ferx_core::PK_IDX_V: usize
 pub const ferx_core::PK_IDX_V2: usize
 pub const ferx_core::PK_IDX_V3: usize
 pub fn ferx_core::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
+pub fn ferx_core::bind_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::bind_theta_levels_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::LevelBindings) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::check_model_data(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>

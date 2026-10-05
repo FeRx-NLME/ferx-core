@@ -99,9 +99,84 @@ pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String>
          data file (`fit_from_files`, `ferx <model> --data ...`), which binds them; call \
          `ferx_core::api::bind_covariate_stats` before `fit` when driving the API directly; or \
          state the constants as literals (`center = 70`) and the θ explicitly \
-         (`=> NAME(init, lower, upper)`), which needs no data at all.",
+         (`=> NAME(init, lower, upper)`), which needs no data at all. To run the model with \
+         a fit's θ instead (a simulation, a prediction, SIR or a covariance step), bind it \
+         with `ferx_core::api::bind_from_fit` and the fit's `data_bindings`: statistics \
+         taken from the data at hand would centre the relations on that data, not on the \
+         data the θ was estimated from.",
         lines.join("\n")
     ))
+}
+
+/// The covariates the model's still-unresolved relations read, sorted and
+/// deduplicated: what a from-fit binding must supply statistics for (#1619).
+pub(crate) fn symbolic_covariates(model: &CompiledModel) -> Vec<String> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = spec
+        .unresolved()
+        .iter()
+        .map(|r| r.covariate.clone())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Check a fit's covariate statistics against the relations of `model`, before
+/// anything is bound (#1619): every covariate an unresolved relation reads must
+/// have an entry, and no entry may name a covariate no relation reads. Like the
+/// level bindings, the statistics travel in a `.fitrx` as data a caller can edit,
+/// and the binder must never fill a gap by summarising the population at hand.
+pub(crate) fn validate_fitted_stats(
+    model: &CompiledModel,
+    fitted: &CovariateStatBindings,
+) -> Result<(), String> {
+    let missing: Vec<String> = symbolic_covariates(model)
+        .into_iter()
+        .filter(|c| !fitted.contains_key(c))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "[covariate_model] relations state a statistic of {} symbolically, but the fit's \
+             covariate statistics carry no entry for it: they are not the statistics this \
+             model was fitted with.",
+            backticked(&missing)
+        ));
+    }
+    let read: HashSet<&str> = model
+        .covariate_model
+        .as_ref()
+        .map(|spec| {
+            spec.relations
+                .iter()
+                .map(|r| r.covariate.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut extra: Vec<String> = fitted
+        .keys()
+        .filter(|c| !read.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if !extra.is_empty() {
+        extra.sort_unstable();
+        return Err(format!(
+            "the fit's covariate statistics carry {}, which no [covariate_model] relation of \
+             this model reads: the bindings belong to a different model.",
+            backticked(&extra)
+        ));
+    }
+    Ok(())
+}
+
+fn backticked(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Summarise one covariate over the population.

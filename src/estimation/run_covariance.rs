@@ -7,20 +7,22 @@
 //! This is the covariance-step analogue of
 //! [`run_sir`](crate::estimation::run_sir::run_sir).
 //!
-//! Hash-verification rules match `run_sir`:
-//! - If the caller supplies `model` / `population` directly, those are used
-//!   as-is (no hash check — the in-memory values don't carry their source bytes).
-//! - If the caller passes `None`, we re-read from `fit.model_path` /
-//!   `fit.data_path`. If a stored hash exists, a mismatch is a **hard error** —
-//!   the point of `run_covariance` is to refuse stale inputs.
+//! Input rules (shared with `run_sir` through
+//! `estimation::fit_inputs::resolve_fit_inputs`, #1622):
+//! - `None` re-reads from `fit.model_path` / `fit.data_path`, reads the data the
+//!   way the fit did (`[data_selection]` included) and binds the model from
+//!   `fit.data_bindings`. If a stored hash exists, a mismatch is a **hard error**.
+//! - A supplied `model` / `population` is not hash-checked (the in-memory values
+//!   don't carry their source bytes), but must be the fitted one: the fit's
+//!   bindings and θ count, the fit's subjects in the fit's order.
+//! - `Some(model)` with `population = None` still reads the hash-verified model
+//!   file, for the reader settings the re-read needs; pass both to avoid it.
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
-use crate::io::hash::sha256_file;
 use crate::types::*;
-use std::path::Path;
 
 /// Run the covariance step against an existing fit. Returns a new `FitResult`
 /// that is a clone of `fit` with the covariance fields refreshed:
@@ -65,10 +67,11 @@ use std::path::Path;
 /// not survive on a `CompiledModel`. When the caller passes `None` for both
 /// `model` and `population`, this function parses the full model file and
 /// threads `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, there is no
-/// source of `iov_column`, so `run_covariance` returns an error rather than
-/// silently dropping occasion parsing. Workaround: pass both `Some(model)` and
-/// `Some(population)` for IOV cases.
+/// `Some(model)` for an IOV model but leaves `population = None`,
+/// `run_covariance` returns an error rather than read occasions with an
+/// `iov_column` the supplied model may not share: the model carries none, and the
+/// model file's need not be the one it was built with. Workaround: pass both
+/// `Some(model)` and `Some(population)` for IOV cases.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
@@ -111,83 +114,19 @@ fn run_covariance_scoped(
     // any downstream failure so a user pointing at the wrong model/dataset
     // hears about that first.
 
-    // --- Resolve model -----------------------------------------------------
-    let model_owned: Option<CompiledModel>;
-    let mut iov_column_from_parse: Option<String> = None;
-    // `[data]` canonical-role → header remapping (#730). Captured from the parse
-    // so a re-read from disk honours renames like `TIME = TAFD` — otherwise the
-    // CSV reader looks for the canonical headers and mis-parses / hard-errors on
-    // a dataset the original fit read fine. Only meaningful on the re-parse path
-    // (model == None); a caller-supplied model+population never re-reads.
-    let mut column_map_from_parse: Vec<(String, String)> = Vec::new();
-    let model_ref: &CompiledModel = match model {
-        Some(m) => m,
-        None => {
-            let path = fit.model_path.as_deref().ok_or_else(|| {
-                "run_covariance: no model supplied and fit.model_path is None. \
-                 Either pass `model = Some(&model)` or re-fit via fit_from_files \
-                 so the path is recorded."
-                    .to_string()
-            })?;
-            if let Some(expected) = &fit.model_hash {
-                let actual = sha256_file(Path::new(path))?;
-                if &actual != expected {
-                    return Err(format!(
-                        "run_covariance: model hash mismatch for {}. Stored: {}, current: {}. \
-                         The .ferx file has changed since the fit was produced — refusing \
-                         to run the covariance step against stale source.",
-                        path, expected, actual
-                    ));
-                }
-            }
-            let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
-            iov_column_from_parse = parsed.fit_options.iov_column.clone();
-            column_map_from_parse = parsed.column_map.clone();
-            model_owned = Some(parsed.model);
-            model_owned.as_ref().unwrap()
-        }
-    };
-
-    // --- Resolve population -----------------------------------------------
-    let pop_owned: Option<Population>;
-    let pop_ref: &Population = match population {
-        Some(p) => p,
-        None => {
-            if model.is_some() && model_ref.n_kappa > 0 {
-                return Err(
-                    "run_covariance: caller-supplied `model` for an IOV (n_kappa > 0) model \
-                     requires `population` to also be supplied — `iov_column` from \
-                     `[fit_options]` is needed to parse per-occasion kappas correctly."
-                        .to_string(),
-                );
-            }
-            let path = fit.data_path.as_deref().ok_or_else(|| {
-                "run_covariance: no population supplied and fit.data_path is None. \
-                 Either pass `population = Some(&pop)` or re-fit via fit_from_files \
-                 so the path is recorded."
-                    .to_string()
-            })?;
-            if let Some(expected) = &fit.data_hash {
-                let actual = sha256_file(Path::new(path))?;
-                if &actual != expected {
-                    return Err(format!(
-                        "run_covariance: data hash mismatch for {}. Stored: {}, current: {}. \
-                         The dataset has changed since the fit was produced — refusing \
-                         to run the covariance step against stale data.",
-                        path, expected, actual
-                    ));
-                }
-            }
-            let p = crate::api::read_population_routed_by(
-                model_ref,
-                Path::new(path),
-                iov_column_from_parse.as_deref(),
-                &column_map_from_parse,
-            )?;
-            pop_owned = Some(p);
-            pop_owned.as_ref().unwrap()
-        }
-    };
+    // --- Resolve model and population (#1622) ------------------------------
+    //
+    // Shared with `run_sir`: re-parsed and re-read the way the fit read them —
+    // `[data]` renames (#730), `iov_column`, `[data_selection]` — and bound from
+    // `fit.data_bindings`.
+    let inputs = crate::estimation::fit_inputs::resolve_fit_inputs(
+        fit,
+        model,
+        population,
+        "run_covariance",
+    )?;
+    let model_ref = inputs.model();
+    let pop_ref = inputs.population();
 
     // This entry point re-runs the inner loop (EBEs → the prediction walk), so
     // it needs the same dose-compartment precondition `fit()` enforces (#375) —
@@ -995,5 +934,357 @@ mod tests {
             "expected IOV-needs-population error, got: {}",
             err
         );
+    }
+}
+
+/// #1622: `run_covariance` runs on the model **as fitted**, whichever inputs the
+/// caller supplies. Analytic two-compartment oral fixture (`fit_inputs::test_fixtures`),
+/// FOCEI with the analytic Dual2 inner gradient; the covariance is the FD-of-OFV
+/// Hessian. The oracle is the call with `Some(model), Some(population)` from
+/// `prepare_run`, the model bound on the fit's own data.
+#[cfg(test)]
+mod from_fit_bindings {
+    use super::*;
+    use crate::estimation::fit_inputs::test_fixtures::{case, unbound, Case, Kind};
+
+    fn bits(m: &nalgebra::DMatrix<f64>) -> Vec<u64> {
+        m.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn oracle(c: &Case) -> FitResult {
+        run_covariance(
+            &c.fit,
+            Some(&c.prep.parsed.model),
+            Some(&c.prep.population),
+            &c.opts,
+        )
+        .expect("the oracle runs")
+    }
+
+    fn assert_same_covariance(got: &FitResult, want: &FitResult, what: &str) {
+        let want_cov = want
+            .covariance_matrix
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: the oracle has a covariance"));
+        let got_cov = got
+            .covariance_matrix
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: no covariance matrix; warnings {:?}", got.warnings));
+        assert_eq!(got_cov.shape(), want_cov.shape(), "{what}");
+        assert_eq!(bits(got_cov), bits(want_cov), "{what}: covariance bits");
+        assert_eq!(got.covariance_status, CovarianceStatus::Computed, "{what}");
+        let se = |f: &FitResult| {
+            f.se_theta
+                .as_ref()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+        };
+        assert_eq!(se(got), se(want), "{what}: se_theta bits");
+    }
+
+    /// T6's oracle on one kind: `None, None` equals the call with `prepare_run`'s
+    /// bound model and population to the bit. The fixture is checked to be live first:
+    /// the median relation is unresolved on the bare parse, the level block moves
+    /// `n_theta`, and the selection drops a subject, so a re-read that skipped any of
+    /// them would have something to differ on.
+    fn assert_re_read_matches(kind: Kind) {
+        {
+            let c = case(kind);
+            let bare = unbound(&c);
+            let symbolic = bare
+                .covariate_model
+                .as_ref()
+                .is_some_and(|s| !s.unresolved().is_empty());
+            assert_eq!(
+                symbolic,
+                matches!(kind, Kind::Median | Kind::LevelMedian),
+                "{kind:?}: the bare parse leaves the median relation unresolved"
+            );
+            let level = matches!(kind, Kind::Level | Kind::LevelMedian);
+            assert_eq!(c.fit.theta.len(), if level { 8 } else { 6 }, "{kind:?}");
+            assert_eq!(
+                bare.n_theta != c.fit.theta.len(),
+                level,
+                "{kind:?}: an unbound level block has fewer θ than the fit"
+            );
+            assert_eq!(
+                c.fit.subjects.len(),
+                if kind == Kind::Select { 29 } else { 30 },
+                "{kind:?}: [data_selection] dropped subject 3"
+            );
+
+            let got = run_covariance(&c.fit, None, None, &c.opts)
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert_same_covariance(&got, &oracle(&c), &format!("{kind:?} None/None"));
+        }
+    }
+
+    /// T6, per PR: the two kinds each of the resolver's two halves is visible on.
+    ///
+    /// Mutations — skip the bind in `resolve_fit_inputs`: `Median` returns `Ok` with
+    /// no covariance; read with `read_population_routed_by` again: `Select` is
+    /// refused on the subject count (and, without that guard, measured worst
+    /// relative difference 20.0).
+    #[test]
+    fn the_re_read_binds_and_filters_as_the_fit_did() {
+        assert_re_read_matches(Kind::Median);
+        assert_re_read_matches(Kind::Select);
+    }
+
+    /// T6, every kind (Tier 3: five fits and ten covariance steps, which ran past
+    /// 60 s under the coverage build of `Tests + coverage (core)`). Adds the plain
+    /// control and the level kinds, where skipping the bind is refused on `n_theta`.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn the_re_read_equals_the_model_bound_on_the_fit_data() {
+        for kind in [
+            Kind::Plain,
+            Kind::Median,
+            Kind::Level,
+            Kind::LevelMedian,
+            Kind::Select,
+        ] {
+            assert_re_read_matches(kind);
+        }
+    }
+
+    /// T8. A fit that carries no bindings (an older `.fitrx`, here a live fit with
+    /// `data_bindings` cleared): a model that needs bindings is refused with the
+    /// binder's text behind the entry prefix — not re-bound on the data, and not run
+    /// unbound. (A plain model records no bindings at all, so T6's `Plain` kind is
+    /// the unaffected control.)
+    ///
+    /// Mutation — drop the empty-bindings refusal in `bind_from_fit`: `Level` panics
+    /// or is refused on `n_theta`, `Median` is refused on its missing statistic; each
+    /// assertion on the text dies.
+    #[test]
+    fn a_fit_without_bindings_is_refused_when_the_model_needs_them() {
+        for (kind, has_level, has_stat) in [
+            (Kind::Level, true, false),
+            (Kind::Median, false, true),
+            (Kind::LevelMedian, true, true),
+        ] {
+            let mut c = case(kind);
+            assert!(!c.fit.data_bindings.is_empty(), "{kind:?}");
+            c.fit.data_bindings = Default::default();
+            let err = run_covariance(&c.fit, None, None, &c.opts)
+                .map(|_| ())
+                .expect_err("refused");
+            assert!(
+                err.starts_with(
+                    "run_covariance: this fit carries no data-derived bindings, so the model \
+                     cannot be rebuilt the way it was fitted: "
+                ),
+                "{kind:?}: {err}"
+            );
+            assert_eq!(
+                err.contains("its theta level block(s) `SHIFT[STUDY]`"),
+                has_level,
+                "{kind:?}: {err}"
+            );
+            assert_eq!(
+                err.contains("a statistic of `WT` symbolically"),
+                has_stat,
+                "{kind:?}: {err}"
+            );
+            assert!(
+                err.ends_with(
+                    "The fit is an older `.fitrx` bundle, or was made before ferx recorded \
+                     these bindings with a fit. Refit the model to record them."
+                ),
+                "{kind:?}: {err}"
+            );
+        }
+    }
+
+    /// T9. The `Some(model)` cells. Each was a panic or an `Ok` without covariance
+    /// before #1622:
+    ///
+    /// - an unbound level model is refused for not carrying the fit's bindings, and
+    ///   — when the fit carries none to compare — for its θ count (was an index panic);
+    /// - a bound level model without a population is bit-identical to the oracle
+    ///   (was `Ok` with no covariance: the re-read had no level index column);
+    /// - an unbound median model is refused (was `Ok` with no covariance).
+    ///
+    /// Mutations — delete the bindings comparison, the `n_theta` check, the index
+    /// write, or the `assert_covariate_model_bound` call: one cell each panics, or
+    /// returns `Ok`, and dies.
+    #[test]
+    fn a_supplied_model_must_be_the_fitted_one() {
+        let level = case(Kind::Level);
+        let bare = unbound(&level);
+        let err = run_covariance(
+            &level.fit,
+            Some(&bare),
+            Some(&level.prep.population),
+            &level.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "run_covariance: the supplied model is not bound with this fit's bindings: its \
+             data-derived bindings (level layout, covariate statistics) differ from the fit's \
+             `data_bindings`. Pass `model = None` to rebuild it from the fit, or bind it with \
+             `ferx_core::api::bind_from_fit` and the fit's `data_bindings`."
+        );
+
+        let mut no_bindings = level.fit.clone();
+        no_bindings.data_bindings = Default::default();
+        let err = run_covariance(
+            &no_bindings,
+            Some(&bare),
+            Some(&level.prep.population),
+            &level.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "run_covariance: the model has n_theta = 6 but the fit has 8 θ. Verify you supplied \
+             the same model the fit used, bound the way the fit was (`bind_from_fit` with the \
+             fit's `data_bindings`)."
+        );
+
+        let got = run_covariance(
+            &level.fit,
+            Some(&level.prep.parsed.model),
+            None,
+            &level.opts,
+        )
+        .expect("a bound model re-reads its own population");
+        assert_same_covariance(&got, &oracle(&level), "Level Some/None");
+
+        // A population that is not the fit's subjects is refused: the EBEs are matched
+        // by position, and the inner loop indexed past them. Both causes, one message
+        // each (#1680 review r1, finding 5). First, one subject dropped (the shape a
+        // `FitOptions` row filter the file does not state leaves)…
+        const WHY: &str = "The fit's EBEs are matched to subjects by position, so the \
+                           population must be the one the fit saw.";
+        let mut short = level.prep.population.clone();
+        short.subjects.pop();
+        let err = run_covariance(
+            &level.fit,
+            Some(&level.prep.parsed.model),
+            Some(&short),
+            &level.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
+        );
+        // …then the right count in the wrong order, naming the first position.
+        let mut swapped = level.prep.population.clone();
+        swapped.subjects.swap(1, 2);
+        let err = run_covariance(
+            &level.fit,
+            Some(&level.prep.parsed.model),
+            Some(&swapped),
+            &level.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "run_covariance: subject 2 of the population is `3`, but the fit's is `2`. {WHY}"
+            )
+        );
+        // Finding 7: checked before binding, so a population with a level the fit
+        // never saw hears that it is not the fit's, not the design advice of the
+        // unseen-level refusal.
+        let mut extra = level.prep.population.clone();
+        let mut newcomer = extra.subjects[0].clone();
+        newcomer.id = "99".to_string();
+        newcomer.covariates.insert("STUDY".to_string(), 4.0);
+        extra.subjects.push(newcomer);
+        let err = run_covariance(&level.fit, None, Some(&extra), &level.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("run_covariance: the population has 31 subjects but the fit has 30. {WHY}")
+        );
+
+        let median = case(Kind::Median);
+        let bare = unbound(&median);
+        let err = run_covariance(
+            &median.fit,
+            Some(&bare),
+            Some(&median.prep.population),
+            &median.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.contains("is not bound with this fit's bindings"),
+            "{err}"
+        );
+        let mut no_bindings = median.fit.clone();
+        no_bindings.data_bindings = Default::default();
+        let err = run_covariance(
+            &no_bindings,
+            Some(&bare),
+            Some(&median.prep.population),
+            &median.opts,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.starts_with(
+                "run_covariance: [covariate_model] relations still need data-derived statistics:"
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1680 review r1, finding 2: with a supplied model and no population, the model
+    /// file is still read — for its reader settings — so a changed or missing file is
+    /// refused. Each refusal carries the entry prefix, says why the file is needed and
+    /// how not to need it, and following that advice runs.
+    ///
+    /// Mutations — drop the `because` text from either failure, or the prefix from
+    /// the read error: the matching assertion dies.
+    #[test]
+    fn a_supplied_model_reads_the_model_file_only_for_its_reader() {
+        const BECAUSE: &str = " The population is re-read with this file's `[data]` \
+                               renames and `[data_selection]`, which decide the rows the \
+                               fit saw. Pass `population = Some(&pop)` as well, and the \
+                               model file is not read.";
+        let c = case(Kind::Median);
+        let model = &c.prep.parsed.model;
+
+        let text = std::fs::read_to_string(&c.model_path).unwrap();
+        std::fs::write(&c.model_path, format!("{text}\n# edited after the fit\n")).unwrap();
+        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.starts_with("run_covariance: model hash mismatch for "),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
+            "{err}"
+        );
+
+        std::fs::remove_file(&c.model_path).unwrap();
+        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.starts_with("run_covariance: cannot read the model file "),
+            "{err}"
+        );
+        assert!(err.ends_with(BECAUSE), "{err}");
+
+        // The advice: with the population supplied too, the file is not read.
+        let got = run_covariance(&c.fit, Some(model), Some(&c.prep.population), &c.opts)
+            .expect("no model file needed");
+        assert!(got.covariance_matrix.is_some());
     }
 }

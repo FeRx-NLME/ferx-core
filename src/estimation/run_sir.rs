@@ -5,19 +5,20 @@
 //! `options.sir = true`, but lets callers drive SIR after a fit has completed
 //! (potentially from a different session, loaded via `.fitrx`).
 //!
-//! Hash-verification rules:
-//! - If the caller supplies `model` / `population` directly, those are used
-//!   as-is. We cannot verify against `fit.model_hash` / `fit.data_hash`
-//!   because the in-memory values don't carry their source bytes.
-//! - If the caller passes `None`, we re-read from `fit.model_path` /
-//!   `fit.data_path`. If a stored hash exists, a mismatch is a **hard error**
-//!   — the whole point of `run_sir` is to refuse stale data.
+//! Input rules (shared with `run_covariance` through
+//! `estimation::fit_inputs::resolve_fit_inputs`, #1622):
+//! - `None` re-reads from `fit.model_path` / `fit.data_path`, reads the data the
+//!   way the fit did (`[data_selection]` included) and binds the model from
+//!   `fit.data_bindings`. If a stored hash exists, a mismatch is a **hard error**.
+//! - A supplied `model` / `population` is not hash-checked (the in-memory values
+//!   don't carry their source bytes), but must be the fitted one: the fit's
+//!   bindings and θ count, the fit's subjects in the fit's order.
+//! - `Some(model)` with `population = None` still reads the hash-verified model
+//!   file, for the reader settings the re-read needs; pass both to avoid it.
 
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
-use crate::io::hash::sha256_file;
 use crate::types::*;
 use nalgebra::DVector;
-use std::path::Path;
 
 /// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
 /// skipping any that are already there.
@@ -84,10 +85,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// caller passes `None` for both `model` and `population`, this function
 /// parses the full model file (including `[fit_options]`) and threads
 /// `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, there
-/// is no source of `iov_column`, so `run_sir` returns an error rather
-/// than silently dropping occasion parsing. Workaround: pass both
-/// `Some(model)` and `Some(population)` for IOV cases.
+/// `Some(model)` for an IOV model but leaves `population = None`, `run_sir`
+/// returns an error rather than read occasions with an `iov_column` the
+/// supplied model may not share: the model carries none, and the model file's
+/// need not be the one it was built with. Workaround: pass both `Some(model)`
+/// and `Some(population)` for IOV cases.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -126,94 +128,14 @@ fn run_sir_scoped(
     // model or dataset should hear about that first; the cov-missing case
     // is downstream and only matters once the inputs are confirmed.
 
-    // --- Resolve model -----------------------------------------------------
+    // --- Resolve model and population (#1622) ------------------------------
     //
-    // When re-reading from disk we use `parse_full_model_file` (not the
-    // CompiledModel-only `parse_model_file`) because IOV models need the
-    // `iov_column` name from `[fit_options]` to parse occasions out of the
-    // data; that info doesn't survive on `CompiledModel`. The parsed
-    // fit_options are stashed in `iov_column_from_parse` for the
-    // population re-read below.
-    let model_owned: Option<CompiledModel>;
-    let mut iov_column_from_parse: Option<String> = None;
-    // `[data]` column renames (#730), as in `run_covariance`: the re-read has to
-    // resolve `TIME = TAFD` the way the original fit did.
-    let mut column_map_from_parse: Vec<(String, String)> = Vec::new();
-    let model_ref: &CompiledModel = match model {
-        Some(m) => m,
-        None => {
-            let path = fit.model_path.as_deref().ok_or_else(|| {
-                "run_sir: no model supplied and fit.model_path is None. \
-                 Either pass `model = Some(&model)` or re-fit via fit_from_files \
-                 so the path is recorded."
-                    .to_string()
-            })?;
-            if let Some(expected) = &fit.model_hash {
-                let actual = sha256_file(Path::new(path))?;
-                if &actual != expected {
-                    return Err(format!(
-                        "run_sir: model hash mismatch for {}. Stored: {}, current: {}. \
-                         The .ferx file has changed since the fit was produced — refusing \
-                         to run SIR against stale source.",
-                        path, expected, actual
-                    ));
-                }
-            }
-            let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
-            iov_column_from_parse = parsed.fit_options.iov_column.clone();
-            column_map_from_parse = parsed.column_map.clone();
-            model_owned = Some(parsed.model);
-            model_owned.as_ref().unwrap()
-        }
-    };
-
-    // --- Resolve population -----------------------------------------------
-    let pop_owned: Option<Population>;
-    let pop_ref: &Population = match population {
-        Some(p) => p,
-        None => {
-            // For IOV models the population MUST be parsed with the correct
-            // `iov_column` so per-occasion kappas line up with the data. We
-            // can only obtain that name from the model file's `[fit_options]`
-            // block (parse_full_model_file path above). When the caller
-            // supplied a `Some(model)` but no population, we have no
-            // iov_column source for n_kappa > 0 models — refuse rather than
-            // silently produce wrong likelihoods.
-            if model.is_some() && model_ref.n_kappa > 0 {
-                return Err(
-                    "run_sir: caller-supplied `model` for an IOV (n_kappa > 0) model \
-                     requires `population` to also be supplied — `iov_column` from \
-                     `[fit_options]` is needed to parse per-occasion kappas correctly."
-                        .to_string(),
-                );
-            }
-            let path = fit.data_path.as_deref().ok_or_else(|| {
-                "run_sir: no population supplied and fit.data_path is None. \
-                 Either pass `population = Some(&pop)` or re-fit via fit_from_files \
-                 so the path is recorded."
-                    .to_string()
-            })?;
-            if let Some(expected) = &fit.data_hash {
-                let actual = sha256_file(Path::new(path))?;
-                if &actual != expected {
-                    return Err(format!(
-                        "run_sir: data hash mismatch for {}. Stored: {}, current: {}. \
-                         The dataset has changed since the fit was produced — refusing \
-                         to run SIR against stale data.",
-                        path, expected, actual
-                    ));
-                }
-            }
-            let p = crate::api::read_population_routed_by(
-                model_ref,
-                Path::new(path),
-                iov_column_from_parse.as_deref(),
-                &column_map_from_parse,
-            )?;
-            pop_owned = Some(p);
-            pop_owned.as_ref().unwrap()
-        }
-    };
+    // Shared with `run_covariance`: re-parsed and re-read the way the fit read
+    // them, `[data_selection]` included, and bound from `fit.data_bindings`.
+    let inputs =
+        crate::estimation::fit_inputs::resolve_fit_inputs(fit, model, population, "run_sir")?;
+    let model_ref = inputs.model();
+    let pop_ref = inputs.population();
 
     // Re-runs the inner loop (EBEs → the prediction walk), so it needs the same
     // dose-compartment precondition `fit()` enforces (#375) — a `Result`-returning
@@ -283,6 +205,7 @@ fn run_sir_scoped(
 mod tests {
     use super::*;
     use crate::api::fit_from_files;
+    use crate::io::hash::sha256_file;
 
     /// #1037: a fit that already carries the same `SIR:` line — because it was
     /// fitted with `sir = true`, or because its `run_sir` output is being piped
@@ -778,5 +701,73 @@ mod tests {
         fit.ofv_prior = 0.0;
         fit.ofv_data = 0.0;
         assert_eq!(data_ofv(&fit), 100.0);
+    }
+}
+
+/// #1622 T7: `run_sir(None, None)` runs on the model **as fitted**, so it equals the
+/// call with `prepare_run`'s bound model and population to the bit. Same fixture and
+/// engine as `run_covariance::from_fit_bindings` (analytic two-compartment oral,
+/// FOCEI, analytic Dual2 inner gradient).
+#[cfg(test)]
+mod from_fit_bindings {
+    use super::*;
+    use crate::estimation::fit_inputs::test_fixtures::{sir_case, Kind};
+
+    /// Every kind, `sir_ess` and `sir_ci_theta` `to_bits`. The ESS is asserted above
+    /// 10 on every arm first: on a degenerate proposal (ESS ≈ 1, measured with the
+    /// level block on `Q`) a bit match compares a single draw and would pass on a
+    /// wrong model too.
+    ///
+    /// Tier 3: five fits with their covariance step and ten SIR runs. The resolver it
+    /// exercises is the one `run_covariance` shares, whose per-PR test
+    /// (`run_covariance::from_fit_bindings::the_re_read_binds_and_filters_as_the_fit_did`)
+    /// dies on the same two mutations.
+    ///
+    /// Mutations — skip the bind in `resolve_fit_inputs`: `Median`'s ESS moves (29.87
+    /// vs 126.31 measured before the fix) and `Level` is refused on `n_theta`; drop the
+    /// selection from the re-read: `Select` is refused on the subject count (a panic in
+    /// the inner loop before #1622).
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn the_re_read_equals_the_model_bound_on_the_fit_data() {
+        for kind in [
+            Kind::Plain,
+            Kind::Median,
+            Kind::Level,
+            Kind::LevelMedian,
+            Kind::Select,
+        ] {
+            let c = sir_case(kind);
+            let want = run_sir(
+                &c.fit,
+                Some(&c.prep.parsed.model),
+                Some(&c.prep.population),
+                &c.opts,
+            )
+            .unwrap_or_else(|e| panic!("{kind:?} oracle: {e}"));
+            let got =
+                run_sir(&c.fit, None, None, &c.opts).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let ess = want.sir_ess.expect("the oracle reports an ESS");
+            assert!(ess > 10.0, "{kind:?}: degenerate SIR oracle, ESS {ess}");
+            assert_eq!(
+                got.sir_ess.map(f64::to_bits),
+                want.sir_ess.map(f64::to_bits),
+                "{kind:?}: ESS {:?} vs {:?}",
+                got.sir_ess,
+                want.sir_ess
+            );
+            let ci = |f: &FitResult| {
+                f.sir_ci_theta.as_ref().map(|v| {
+                    v.iter()
+                        .map(|(a, b)| (a.to_bits(), b.to_bits()))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert!(ci(&want).is_some(), "{kind:?}");
+            assert_eq!(ci(&got), ci(&want), "{kind:?}: sir_ci_theta bits");
+        }
     }
 }
