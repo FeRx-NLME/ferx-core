@@ -278,11 +278,11 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   `(SD = …, logit scale)`; for a sample-size-weighted kappa each reads
   `at weight 1` — `(CV% = … at weight 1)`, `(SD = … at weight 1)` or
   `(SD = … at weight 1, logit scale)` (#1666) — the figure of a one-subject arm,
-  followed by a line with the same figure at the typical arm size: `CV% = …` under
-  a CV% row, `SD = …, logit scale` under a logit row (#1697), `SD = …` otherwise
-  (#1683). When the covariance step failed or fell back to SIR the console drops
-  the row's note and that line's figure together (#1698); the YAML keys are
-  written either way.
+  followed by a line with the same note at the typical arm size, worded alike:
+  `CV% = … at NARM = …`, `SD = … at NARM = …` or `SD = … at NARM = …, logit scale`
+  (#1683, #1697). That line's figure is printed exactly when the row's note is
+  (#1698): a custom kappa, or a covariance step that failed or fell back to SIR,
+  leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
 - **weight** / **weight_typical** / **sd_at_typical_weight**: present only on the
   `omega_iov` entry of a sample-size-weighted kappa (`kappa K ~ γ² weight = W`,
   #1660). `weight` is the source text of `W` (quoted), `weight_typical` the median
