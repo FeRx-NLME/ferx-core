@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions release-semantics)
+ALL_GROUPS=(changelog fmt check clippy rustdoc docs public-api debug-assertions release-semantics)
 
 # Groups that are NOT in the default selection.
 #
@@ -143,6 +143,10 @@ the test targets but runs nothing, so \`Tests + coverage (core)\` can still go r
 after a green preflight. The default set gates compilation and lint, not
 behaviour. Three exceptions: \`docs\`, whose gate IS its test run (a filesystem walk
 over \`docs/\`, not a fit), and the two opt-in suites above.
+
+\`changelog\` compiles nothing: it validates the \`changelog.d/\` fragments
+(#1545). Whether a PR needs one is \`tools/changelog.sh require\`, run in CI by
+\`changelog.yml\`, since only the PR knows its diff and labels.
 EOF
 }
 
@@ -240,6 +244,17 @@ run() {
 }
 
 # ── Groups ──────────────────────────────────────────────────────────────────
+
+group_changelog() {
+  CI_JOB="Changelog"
+  # Every `changelog.d/` fragment is a well-formed single bullet in a known
+  # category, and CHANGELOG.md's `[Unreleased]` is empty (#1545). No cargo at
+  # all — a shell walk over one directory — so it runs first. Whether a PR that
+  # needs a fragment HAS one is a different question, about the diff rather than
+  # the tree; that is `tools/changelog.sh require`, run by
+  # `.github/workflows/changelog.yml` because it needs the PR's labels.
+  run tools/changelog.sh check
+}
 
 group_fmt() {
   CI_JOB="Format"

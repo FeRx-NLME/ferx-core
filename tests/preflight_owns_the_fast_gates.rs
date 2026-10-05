@@ -1,4 +1,4 @@
-//! Guard: the `Check`, `Clippy`, `Format` and `Rustdoc` jobs in
+//! Guard: the `Check`, `Clippy`, `Format`, `Rustdoc` and `Changelog` jobs in
 //! `.github/workflows/ci.yml` must run their cargo commands **through
 //! `tools/preflight.sh`**, and that script must actually fail when a gate fails (#1157).
 //!
@@ -346,6 +346,8 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("clippy", "clippy"),
         ("fmt", "fmt"),
         ("rustdoc", "rustdoc"),
+        // #1545. Runs no cargo, so (1a) is vacuous for it; (1b) and (2) are not.
+        ("changelog", "changelog"),
         // NOT `debug-assertions`. It had a job of its own under #344; #1248
         // retired it, because `[profile.ci-cov]` puts the guards inside the two
         // coverage jobs that had to run anyway. Those jobs cannot delegate here —
@@ -1085,7 +1087,8 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 8] = [
+    let expected: [(&str, usize); 9] = [
+        ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
