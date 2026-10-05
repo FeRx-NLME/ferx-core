@@ -5869,7 +5869,9 @@ mod tests {
     /// Ω(2,0) = 1e-15 exactly (dropped), Ω(2,1) = 2e-15 (kept), Ω_IOV(2,1) =
     /// −3e-15 (kept, so the cut is on `|cov|`). `omega_param_corr`,
     /// `omega_iov_param_corr` and the cov/√var fallback give three different
-    /// numbers for the (1,0) pairs, so reading the wrong source shows.
+    /// numbers for the (1,0) pairs, so reading the wrong source shows. Every
+    /// packed Ω SE is distinct, so the console's off-diagonal SE pins the
+    /// `(i, j)` it is read at — `(i, i)` or `(j, j)` prints another number.
     fn corr_result() -> FitResult {
         let mut r = weighted_result();
         r.omega = DMatrix::from_row_slice(
@@ -5878,7 +5880,7 @@ mod tests {
             &[0.1, 0.02, 1e-15, 0.02, 0.2, 2e-15, 1e-15, 2e-15, 0.3],
         );
         r.omega_fixed = vec![false; 3];
-        r.se_omega = Some(vec![0.01; 6]);
+        r.se_omega = Some(vec![0.01, 0.02, 0.03, 0.04, 0.05, 0.06]);
         let mut ec = DMatrix::identity(3, 3);
         ec[(1, 0)] = -0.25;
         ec[(0, 1)] = -0.25;
@@ -5921,8 +5923,8 @@ mod tests {
                 "console OMEGA",
                 format_omega_corr_rows(&r),
                 "  --- Correlations ---\n  \
-                 eta_V × eta_CL = 0.020000  (param corr = -0.2500)  SE = 0.010000\n  \
-                 ETA × eta_V = 0.000000  (param corr = 0.0000)  SE = 0.010000\n",
+                 eta_V × eta_CL = 0.020000  (param corr = -0.2500)  SE = 0.020000\n  \
+                 ETA × eta_V = 0.000000  (param corr = 0.0000)  SE = 0.050000\n",
             ),
             (
                 "console KAPPA",
