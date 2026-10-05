@@ -2873,6 +2873,23 @@ pub(crate) fn apply_frem_prediction_override(
     }
 }
 
+/// Per-observation predictions for one subject at `(theta, eta)` — the unchecked
+/// prediction kernel under [`crate::predict`], [`crate::fit`] and the simulators.
+///
+/// # No model/data checks
+///
+/// This kernel (and its [`compute_predictions_with_tv_into`] /
+/// [`compute_predictions_with_tv_into_with_schedule`] variants) runs **none** of the
+/// checks the public entry points run first. In particular, a name in
+/// [`CompiledModel::referenced_covariates`](crate::types::CompiledModel::referenced_covariates)
+/// that is absent from [`Subject::covariates`](crate::types::Subject::covariates)
+/// evaluates to `0.0` — silently. That includes `TAD`, `TAFD` and `MACHEPS` read in a
+/// readout (`y = …`) or `[scaling]`: they are solver-injected built-ins only inside
+/// `[odes]`, and an ordinary covariate everywhere else (#1028), so a readout
+/// `E0 + EMAX * TAD / (TAD + ET50)` on data without a `TAD` column returns `E0` here.
+///
+/// Run [`crate::check_model_data`] on the `(model, population)` pair first, or call
+/// [`crate::predict`], which refuses such a population with `E_MISSING_COVARIATE`.
 pub fn compute_predictions_with_tv(
     model: &crate::types::CompiledModel,
     subject: &Subject,
@@ -2895,6 +2912,9 @@ pub fn compute_predictions_with_tv(
 /// The scratch buffer is used by per-event analytical/ODE paths, including
 /// time-varying covariates, `TIME`, and resets. Static fast paths do not touch
 /// it. Callers can start with an empty buffer and reuse it unconditionally.
+///
+/// Runs no model/data checks: a covariate missing from the data — including a
+/// readout `TAD` — reads as `0.0`. See [`compute_predictions_with_tv`].
 pub fn compute_predictions_with_tv_into(
     model: &crate::types::CompiledModel,
     subject: &Subject,
@@ -2916,6 +2936,9 @@ pub fn compute_predictions_with_tv_into(
 /// fallback for models that don't support event-driven propagation.
 /// Callers that don't have a schedule cached can pass `None` to fall
 /// back to building one on demand.
+///
+/// Runs no model/data checks: a covariate missing from the data — including a
+/// readout `TAD` — reads as `0.0`. See [`compute_predictions_with_tv`].
 pub fn compute_predictions_with_tv_into_with_schedule(
     model: &crate::types::CompiledModel,
     subject: &Subject,
