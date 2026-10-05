@@ -187,7 +187,15 @@ it is a CV% too, so the two compare directly:
 ```
 
 An additive or logit kappa gets `SD = …` there, as above, and so does one whose
-expression gives it no label (custom).
+expression gives it no label (custom). A logit kappa's carries its row's tag,
+`SD = …, logit scale` (#1697).
+
+When the covariance step failed or fell back to SIR, the row drops its CV% or SD
+note, and the weight line drops its figure with it, keeping only
+`weight = NARM (κ ~ N(0, KAPPA_EMAX/NARM))` (#1698): the line's figure is the
+row's note at the typical arm, so it is shown exactly when the note is. The fit
+YAML still writes `sd_at_typical_weight`, as it writes `sd` and `cv_pct`
+whatever the covariance step did.
 
 A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
 $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.

@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A sample-size-weighted logit kappa's weight line says `logit scale`, like its row; the
+  line's figure is hidden when the row's is** ([#1697](https://github.com/FeRx-NLME/ferx-core/issues/1697),
+  [#1698](https://github.com/FeRx-NLME/ferx-core/issues/1698)). The console and `ferx summary`
+  line now reads `→  SD = …, logit scale at NARM = …` under a logit kappa. When the
+  covariance step failed or fell back to SIR the row has no CV%/SD note, and the line now
+  drops its figure too, reading `weight = NARM (κ ~ N(0, KAPPA/NARM))`. Additive and custom
+  lines, unweighted rows and the fit YAML are unchanged.
 - **A sample-size-weighted log-normal kappa's weight line reports a CV%, like its row**
   ([#1683](https://github.com/FeRx-NLME/ferx-core/issues/1683)). The console and `ferx summary`
   line under the row now reads `→  CV% = 11.2 at NARM = 4.0000` instead of the log-scale
