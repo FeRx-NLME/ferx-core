@@ -156,11 +156,18 @@ deficiency looks like:
 
 ```
 All 1000 SIR samples had invalid weights (rejected: 1000 out of bounds, 0
-non-positive theta/sigma/omega, 0 non-finite OFV, 0 cancelled). Bound first
-overshot by: TVET50 (734), TVEMAX (266) (count of samples, first offending
-coordinate only). Proposal covariance is rank-deficient beyond the FIX-ed
-parameters: ...
+non-finite theta or non-positive sigma/omega/kappa variance, 0 non-finite OFV,
+0 cancelled). Bound first overshot by: TVET50 (734), TVEMAX (266) (count of
+samples, first offending coordinate only). Proposal covariance is rank-deficient
+beyond the FIX-ed parameters: ...
 ```
+
+A theta is checked against its declared bounds and nothing else. A theta
+declared `(0, -50, 50)`, such as a level block, a covariate slope or a shift,
+is sampled on its natural scale and may go negative. A theta whose lower bound
+is 0 or more is sampled as $\log\theta$, so it stays positive anyway. Only the
+variances (sigma and the omega and kappa diagonals) must be positive
+([#1701](https://github.com/FeRx-NLME/ferx-core/issues/1701)).
 
 The fit-time counterpart of this diagnosis is the covariance step's own
 `Covariance step regularized: eigenvalue floor applied to FD Hessian ...`

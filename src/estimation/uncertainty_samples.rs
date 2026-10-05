@@ -332,32 +332,43 @@ fn clamp_fixed_indices(x: &mut [f64], fixed_mask: &[bool], x_hat: &[f64]) {
     }
 }
 
-/// Check that a candidate packed parameter vector unpacks to a parameter set
-/// that is in-bounds and has positive theta / sigma / omega-diagonal values.
-/// `bounds` is taken by reference to avoid recomputing it for each candidate
-/// (it doesn't change across draws within a single sampler call).
+/// Check that a candidate packed parameter vector is in-bounds and unpacks to
+/// [`admissible_values`]. `bounds` is taken by reference to avoid recomputing
+/// it for each candidate (it doesn't change across draws within a single
+/// sampler call).
 fn candidate_is_valid(x: &[f64], template: &ModelParameters, bounds: &PackedBounds) -> bool {
     for (i, &xi) in x.iter().enumerate() {
         if xi < bounds.lower[i] || xi > bounds.upper[i] {
             return false;
         }
     }
-    let p = unpack_params(x, template);
-    if p.theta.iter().any(|&t| !t.is_finite() || t <= 0.0) {
-        return false;
-    }
-    if p.sigma.values.iter().any(|&s| !s.is_finite() || s <= 0.0) {
-        return false;
-    }
-    let n_eta = p.omega.dim();
-    for i in 0..n_eta {
-        let var = p.omega.matrix[(i, i)];
-        let lii = p.omega.chol[(i, i)];
-        if !var.is_finite() || var <= 0.0 || !lii.is_finite() || lii <= 0.0 {
-            return false;
-        }
-    }
-    true
+    admissible_values(&unpack_params(x, template))
+}
+
+/// The value check every uncertainty draw passes after its bounds check — the
+/// MVN sampler here and SIR's `screen_draw` share it, so the two cannot
+/// disagree about which draws exist.
+///
+/// θ needs only to be **finite**: its declared bounds govern it, and they are
+/// checked on the packed vector first. A θ declared `(0, -50, 50)` — a level
+/// block, a covariate slope, a shift — packs on its natural scale and is meant
+/// to go negative; a sign check here rejected every such SIR sample and
+/// truncated every such MVN draw to `θ > 0` (#1701). A θ with lower bound
+/// `>= 0` packs as `ln θ` (`theta_packs_log`), so any in-bounds draw unpacks
+/// to `exp(·) >= 1e-10` and has no sign to check.
+///
+/// Positivity is required of the **variances** only: σ, and the Ω and Ω_IOV
+/// (κ) diagonals, variance and Cholesky diagonal alike. All are log-packed, so
+/// this guards `exp` under- or overflow rather than a reachable sign flip.
+pub(crate) fn admissible_values(p: &ModelParameters) -> bool {
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    let omega_ok = |om: &OmegaMatrix| {
+        (0..om.dim()).all(|i| positive(om.matrix[(i, i)]) && positive(om.chol[(i, i)]))
+    };
+    p.theta.iter().all(|t| t.is_finite())
+        && p.sigma.values.iter().all(|&s| positive(s))
+        && omega_ok(&p.omega)
+        && p.omega_iov.as_ref().is_none_or(omega_ok)
 }
 
 /// Draw `n_draws` parameter samples from the uncertainty distribution.
@@ -1190,5 +1201,100 @@ mod tests {
             draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
                 .unwrap_err();
         assert!(err.contains("doesn't match packed parameters"), "{err}");
+    }
+
+    /// #1701: θ needs only to be finite, while σ and the Ω and Ω_IOV (κ)
+    /// diagonals must be positive. Each line below fails if its clause is
+    /// deleted from `admissible_values`. The first, a negative θ, fails if the
+    /// old `t <= 0.0` comes back.
+    #[test]
+    fn admissible_values_requires_positive_variances_and_only_finite_theta() {
+        let mut base = tiny_template();
+        base.theta[0] = -3.0;
+        base.omega_iov = Some(OmegaMatrix::from_diagonal(
+            &[0.01],
+            vec!["kappa_CL".to_string()],
+        ));
+        assert!(admissible_values(&base), "a negative θ is admissible");
+
+        let rejects = |what: &str, edit: &dyn Fn(&mut ModelParameters)| {
+            let mut p = base.clone();
+            edit(&mut p);
+            assert!(!admissible_values(&p), "{what} must be rejected");
+        };
+        rejects("θ = NaN", &|p| p.theta[0] = f64::NAN);
+        rejects("θ = inf", &|p| p.theta[1] = f64::INFINITY);
+        rejects("σ < 0", &|p| p.sigma.values[0] = -0.1);
+        rejects("σ = 0", &|p| p.sigma.values[0] = 0.0);
+        rejects("Ω variance < 0", &|p| p.omega.matrix[(0, 0)] = -0.04);
+        rejects("Ω Cholesky diagonal < 0", &|p| p.omega.chol[(0, 0)] = -0.2);
+        rejects("κ variance < 0", &|p| {
+            p.omega_iov.as_mut().unwrap().matrix[(0, 0)] = -0.01
+        });
+        rejects("κ Cholesky diagonal < 0", &|p| {
+            p.omega_iov.as_mut().unwrap().chol[(0, 0)] = -0.1
+        });
+    }
+
+    /// #1701 on the MVN sampler: a θ declared `(-0.05, -5, 5)` packs on its
+    /// natural scale, and its draws must be the untruncated normal around the
+    /// estimate. The old sign check redrew every negative draw, so the sample
+    /// was the normal truncated at 0. Its mean is about +0.06 here, against an
+    /// estimate of −0.05. Mutation: restoring `t <= 0.0` fails the straddle
+    /// and the mean.
+    #[test]
+    fn asymptotic_draws_of_a_negative_bounded_theta_are_not_truncated_at_zero() {
+        let mut template = tiny_template();
+        template.theta[0] = -0.05;
+        template.theta_lower[0] = -5.0;
+        template.theta_upper[0] = 5.0;
+        assert!(!theta_packs_log(template.theta_lower[0]));
+        let n_packed = crate::estimation::parameterization::packed_len(&template);
+        let cov = DMatrix::identity(n_packed, n_packed) * 0.01; // sd 0.1
+        let fit = fit_with_cov(&template, cov);
+        let mut rng = StdRng::seed_from_u64(1701);
+        let draws = draw_parameter_samples(
+            &fit,
+            &template,
+            4000,
+            UncertaintyMethod::Asymptotic,
+            &mut rng,
+        )
+        .unwrap();
+        let th: Vec<f64> = draws.iter().map(|p| p.theta[0]).collect();
+        assert!(th.iter().all(|t| t.is_finite()));
+        assert!(
+            th.iter().any(|&t| t < 0.0) && th.iter().any(|&t| t > 0.0),
+            "draws must straddle 0"
+        );
+        let (mean, _) = mean_sd(&th);
+        // SE(mean) = 0.1/sqrt(4000) = 0.0016. Measured |mean + 0.05| = 0.0015.
+        // 0.01 is ~6 SE, and an order of magnitude short of the truncated
+        // mean's +0.11 offset.
+        assert!((mean + 0.05).abs() < 0.01, "mean {mean}, want -0.05");
+    }
+
+    /// The other half of #1701's argument: dropping θ's sign check changes
+    /// nothing for a θ with lower bound `>= 0`. That θ packs as `ln θ`, so
+    /// every point of its packed box, both ends included, unpacks to a positive
+    /// finite θ, and the old check could never fire there. Mutation: making
+    /// `theta_packs_log` strict (`> 0.0`) puts a lower-0 θ on its natural
+    /// scale, whose box starts at exactly 0.
+    #[test]
+    fn a_theta_with_a_non_negative_lower_bound_is_positive_on_its_whole_packed_box() {
+        for lower in [0.0, 1e-3, 2.0] {
+            let mut template = tiny_template();
+            template.theta[0] = lower + 1.0;
+            template.theta_lower[0] = lower;
+            template.theta_upper[0] = 50.0;
+            assert!(theta_packs_log(lower), "lower {lower}");
+            let bounds = crate::estimation::parameterization::compute_bounds(&template);
+            let mut x = crate::estimation::parameterization::pack_params(&template);
+            for end in [bounds.lower[0], bounds.upper[0]] {
+                x[0] = end;
+                let t = unpack_params(&x, &template).theta[0];
+                assert!(t.is_finite() && t > 0.0, "lower {lower}: θ = {t} at {end}");
+            }
+        }
     }
 }

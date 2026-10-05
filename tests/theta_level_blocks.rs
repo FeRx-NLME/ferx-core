@@ -1689,3 +1689,128 @@ fn bind_from_fit_keeps_the_fits_covariate_centres_on_a_design() {
         );
     }
 }
+
+/// Three studies × five subjects of a one-compartment IV bolus, with a study
+/// shift on `ln CL` of −0.4 / 0 / +0.4 and deterministic stand-ins for the
+/// between-subject and residual noise (no RNG, so the fixture is the same
+/// bytes on every platform).
+fn shifted_study_data() -> String {
+    let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY\n");
+    let shift = [-0.4, 0.0, 0.4];
+    let mut k = 0.0f64;
+    for (study, sh) in shift.iter().enumerate() {
+        for j in 0..5 {
+            let id = study * 5 + j + 1;
+            let eta = 0.2 * (1.7 * id as f64).sin();
+            let cl = 2.0 * (sh + eta).exp();
+            s += &format!("{id},0,.,1,100,1,0,1,{}\n", study + 1);
+            for t in [0.5, 1.0, 2.0, 4.0, 8.0, 12.0] {
+                k += 1.0;
+                let dv = 10.0 * (-cl / 10.0 * t).exp() * (1.0 + 0.08 * (3.1 * k).sin());
+                s += &format!("{id},{t},{dv:.6},0,.,1,0,0,{}\n", study + 1);
+            }
+        }
+    }
+    s
+}
+
+/// #1701: SIR used to reject every sample with *any* θ ≤ 0, whatever the θ's
+/// declared bounds, so a level block — whose coefficients are deviations
+/// around 0 — could never be resampled: "All N SIR samples had invalid
+/// weights (… N non-positive theta/sigma/omega …)". The bounds govern θ now.
+///
+/// Mutation: restoring `|| t <= 0.0` in `admissible_values` turns the SIR
+/// result into `None` plus a `SIR failed` warning, and the first assertion
+/// fails. The interval of the study-1 coefficient (true −0.4) must reach below
+/// zero, which only a sampler that accepts a negative θ can produce.
+///
+/// Oracle: on this well-identified block the SIR 95% interval agrees with the
+/// covariance step's Wald interval `θ̂ ± 1.96·SE`. The bound is measured, see
+/// `SIR_WALD_TOL`.
+#[test]
+fn in_fit_sir_resamples_a_negative_bounded_level_block() {
+    let model = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 20.0)
+  theta SHIFT[STUDY](0.0, -2.0, 2.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.08 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(SHIFT + ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = focei
+  maxiter       = 4
+  covariance    = true
+  sir           = true
+  sir_samples   = 4000
+  sir_resamples = 2000
+  sir_seed      = 1701
+"#;
+    let (_dir, model_path, data_path) = write_case(model, &shifted_study_data());
+    let (result, _pop) = run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("fit");
+
+    let names = &result.theta_names;
+    let ci = result
+        .sir_ci_theta
+        .as_ref()
+        .unwrap_or_else(|| panic!("no SIR CIs; warnings: {:?}", result.warnings));
+    let se = result.se_theta.as_ref().expect("covariance step SEs");
+    let s1 = names
+        .iter()
+        .position(|n| n == "SHIFT[STUDY=1]")
+        .unwrap_or_else(|| panic!("{names:?}"));
+
+    let mut worst = 0.0f64;
+    for (i, name) in names.iter().enumerate() {
+        let (lo, hi) = ci[i];
+        assert!(
+            lo.is_finite() && hi.is_finite() && lo < hi,
+            "{name}: SIR CI ({lo}, {hi})"
+        );
+        assert!(se[i].is_finite() && se[i] > 0.0, "{name}: SE {}", se[i]);
+        if !name.starts_with("SHIFT") {
+            continue;
+        }
+        let half = 1.96 * se[i];
+        let (wlo, whi) = (result.theta[i] - half, result.theta[i] + half);
+        // Gap in units of the Wald half-width, worse end.
+        let gap = (lo - wlo).abs().max((hi - whi).abs()) / half;
+        eprintln!(
+            "{name}: θ̂ {} SIR ({lo}, {hi}) Wald ({wlo}, {whi}) gap {gap}",
+            result.theta[i]
+        );
+        worst = worst.max(gap);
+    }
+    assert!(worst.is_finite(), "{worst}");
+    let (lo1, _) = ci[s1];
+    assert!(
+        lo1 < 0.0,
+        "SHIFT[STUDY=1] SIR CI must reach below 0, got {:?}",
+        ci[s1]
+    );
+    assert!(
+        worst < SIR_WALD_TOL,
+        "SIR vs Wald gap {worst} (tol {SIR_WALD_TOL})"
+    );
+}
+
+/// Worst SIR-vs-Wald end gap over the `SHIFT` coefficients, in Wald
+/// half-widths. Measured 0.264 / 0.314 (STUDY=1 / STUDY=2) at 4000/2000 draws.
+/// SIR comes out wider at both ends, as expected for 15 subjects. At 400/200
+/// draws the same gaps were 0.58 / 0.69, so most of what is left is Monte Carlo
+/// error in the 2.5% / 97.5% percentiles. 0.5 is 1.6× the measured worst.
+const SIR_WALD_TOL: f64 = 0.5;
