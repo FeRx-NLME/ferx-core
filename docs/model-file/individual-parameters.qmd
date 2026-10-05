@@ -500,6 +500,16 @@ and continues past one that only `[derived]` reports. So `V = TVV + ETA_V` is
 additive when the model reads `V`, but custom when only `K10 = CL / V` does.
 The row is still listed under the variable the ETA is assigned in (`ECL`).
 
+A block reads a variable's **last** value, so a reassignment is followed
+before the walk stops (#1673): after `CL = TVCL + ETA_CL`, a later
+`CL = CL * TVV` makes `ETA_CL` custom, as `CL = (TVCL + ETA_CL) * TVV` on one
+line is, while `CL = CL + TH` keeps it additive and `CL = exp(CL)` makes it
+log-normal. A reassignment inside an `if` leaves the earlier value in use on
+the other path, so the two scales must agree. A statement only sees the value
+in force where it sits: a line before the assignment, a line after a
+reassignment that replaces it, or one in the other branch of an `if` does not
+change the label.
+
 ## Covariate Detection
 
 Any uppercase identifier in the expression that does not match a theta name,

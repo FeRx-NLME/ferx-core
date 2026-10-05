@@ -67,7 +67,9 @@ log-normal. `[derived]` and `[output]` only report a value, so a variable they
 read is still followed (#1662).
 
 ETAs are classified by the same rule (#1656), so `TVV + ETA_V + KAPPA_V`
-reports an `SD` for both rows.
+reports an `SD` for both rows. A reassigned parameter is labelled by its last
+assignment for both, too (see
+[How an ETA row is labelled](individual-parameters.qmd#how-an-eta-row-is-labelled), #1673).
 
 A kappa that enters two parameters on different scales, or that no parameter
 reads, is custom. A weighted kappa is classified on the expression as written,
