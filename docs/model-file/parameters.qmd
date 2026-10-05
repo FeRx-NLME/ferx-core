@@ -299,6 +299,16 @@ The occasions are the ones the fit uses: the `iov_column` data column, or the
 ones `iov_occasion = dose` or `time(...)` derives. Data with no occasions gives
 a kappa nowhere to count; the fit then refuses the missing occasions itself.
 
+A kappa can also sit inside the shared expression of an η, as in
+`E0 = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`. The check reads it as constant
+within the subject. That is exact when the kappa is added to the expression, or
+multiplies all of it (`(TVE0 + PLACEBO) * exp(KAPPA_ARM) / (1 + ETA_E0 * X)`).
+When it does not separate from the block, as in
+`TVE0 + PLACEBO * exp(KAPPA_ARM) + ETA_E0`, the η is identified only through
+the spread of the kappas between a subject's occasions, and the block is
+refused as if that spread were zero. The check never binds a block that leaves
+the model unidentified this way.
+
 #### Two random effects
 
 When the block absorbs two random effects — an η and a kappa, or two η on
