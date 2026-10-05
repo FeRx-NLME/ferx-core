@@ -41,8 +41,8 @@ fn sd_from_var(var: f64) -> f64 {
 ///
 /// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
 /// unweighted γ², so a CV% or SD of it is that of a weight-1 arm and is
-/// labelled so (#1666) — the line after the row gives the SD at the typical
-/// weight.
+/// labelled so (#1666) — the line after the row gives the same figure at the
+/// typical weight ([`typical_weight_spread`], #1683).
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
     match t {
@@ -121,12 +121,12 @@ fn format_omega_rows(result: &FitResult) -> String {
     let mut out = String::new();
     for i in 0..n_eta {
         let var = result.omega[(i, i)];
-        let eta_name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+        let name = eta_name(result, i);
         let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
-            fixed_label(eta_name)
+            fixed_label(name)
         } else {
-            eta_name.to_string()
+            name.to_string()
         };
         let se_str = if is_fixed {
             "---".to_string()
@@ -136,10 +136,7 @@ fn format_omega_rows(result: &FitResult) -> String {
                 None => "N/A".to_string(),
             }
         };
-        let note = note_suffix(
-            variance_note(eta_type(result, eta_name), var, false),
-            show_cv,
-        );
+        let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
     }
     out
@@ -163,6 +160,18 @@ fn kappa_weight_facts(
     Some((w, typical))
 }
 
+/// The typical-arm spread on a weighted kappa's weight line, on the scale of
+/// the row above it (#1683): `CV% = …` where the row is a CV% (log-normal, and
+/// an unknown type as in [`variance_note`]), `SD = …` otherwise. `sd` is the
+/// typical-arm SD from [`kappa_weight_facts`], so the CV% is `100 · sd` — the
+/// YAML's `sd_at_typical_weight` times 100.
+fn typical_weight_spread(t: Option<EtaParamType>, sd: f64) -> String {
+    match t {
+        None | Some(EtaParamType::LogNormal) => format!("CV% = {:.1}", sd * 100.0),
+        Some(_) => format!("SD = {:.4}", sd),
+    }
+}
+
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
@@ -175,11 +184,7 @@ fn format_kappa_rows(result: &FitResult) -> String {
     for i in 0..iov.nrows() {
         let var = iov[(i, i)];
         let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
-        let name = result
-            .kappa_names
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("KAPPA");
+        let name = kappa_name(result, i);
         let label = if is_fixed {
             fixed_label(name)
         } else {
@@ -194,14 +199,8 @@ fn format_kappa_rows(result: &FitResult) -> String {
             }
         };
         let weight = kappa_weight_facts(result, i, var);
-        let note = note_suffix(
-            variance_note(
-                result.kappa_param_types.get(i).copied(),
-                var,
-                weight.is_some(),
-            ),
-            show_cv,
-        );
+        let kappa_type = result.kappa_param_types.get(i).copied();
+        let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
         // Sample-size-weighted IOV (#1031): the estimate above is the
         // *unweighted* γ² — the quantity a published MBMA reports — so
@@ -211,8 +210,14 @@ fn format_kappa_rows(result: &FitResult) -> String {
             let _ = match typical {
                 Some((n, sd)) => writeln!(
                     out,
-                    "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
-                    "", w, sd, w, n, name, w
+                    "  {:<20}   weight = {}  →  {} at {} = {:.4} (κ ~ N(0, {}/{}))",
+                    "",
+                    w,
+                    typical_weight_spread(kappa_type, sd),
+                    w,
+                    n,
+                    name,
+                    w
                 ),
                 None => writeln!(
                     out,
@@ -232,6 +237,105 @@ fn kappa_name(result: &FitResult, k: usize) -> &str {
         .get(k)
         .map(|s| s.as_str())
         .unwrap_or("KAPPA")
+}
+
+/// The name of ETA `k`, or `"ETA"` when the result carries none.
+fn eta_name(result: &FitResult, k: usize) -> &str {
+    result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA")
+}
+
+/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
+/// covariance matrix: the names, the covariance and its parameter correlation.
+struct OffDiagCorr<'a> {
+    i: usize,
+    j: usize,
+    name_i: &'a str,
+    name_j: &'a str,
+    cov: f64,
+    corr: f64,
+}
+
+/// The off-diagonal entries of `m` the console and `format_summary` report, in
+/// row-major lower-triangle order: every `|cov| > 1e-15`, its correlation from
+/// `param_corr` or the cov/√var fallback ([`param_corr_fallback`]). The four
+/// correlation walks (Ω and Ω_IOV, console and summary) all read this, so they
+/// cannot disagree on which pairs are correlated (#1682); each keeps its own
+/// line format.
+fn offdiag_corrs<'a>(
+    m: &nalgebra::DMatrix<f64>,
+    param_corr: Option<&nalgebra::DMatrix<f64>>,
+    name: impl Fn(usize) -> &'a str,
+) -> Vec<OffDiagCorr<'a>> {
+    let mut out = Vec::new();
+    for i in 0..m.nrows() {
+        for j in 0..i {
+            let cov = m[(i, j)];
+            if cov.abs() <= 1e-15 {
+                continue;
+            }
+            out.push(OffDiagCorr {
+                i,
+                j,
+                name_i: name(i),
+                name_j: name(j),
+                cov,
+                corr: param_corr_fallback(param_corr, cov, m[(i, i)], m[(j, j)], i, j),
+            });
+        }
+    }
+    out
+}
+
+/// The console's `--- Correlations ---` block under the OMEGA rows of
+/// [`print_results`], or `""` for a diagonal Ω.
+fn format_omega_corr_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let n_eta = result.omega.nrows();
+    let corrs = offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
+        eta_name(result, k)
+    });
+    let mut out = String::new();
+    if corrs.is_empty() {
+        return out;
+    }
+    out.push_str("  --- Correlations ---\n");
+    for c in corrs {
+        let se_str = match crate::types::omega_se_at(&result.se_omega, n_eta, c.i, c.j) {
+            Some(s) => format!("  SE = {:.6}", s),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "  {} × {} = {:.6}  (param corr = {:.4}){}",
+            c.name_i, c.name_j, c.cov, c.corr, se_str,
+        );
+    }
+    out
+}
+
+/// The console's `--- Correlations ---` block under the KAPPA rows of
+/// [`print_results`] (block_kappa), or `""` for a diagonal or absent Ω_IOV.
+fn format_kappa_corr_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let Some(iov) = result.omega_iov.as_ref() else {
+        return String::new();
+    };
+    let corrs = offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
+        kappa_name(result, k)
+    });
+    let mut out = String::new();
+    if corrs.is_empty() {
+        return out;
+    }
+    out.push_str("  --- Correlations ---\n");
+    for c in corrs {
+        let _ = writeln!(
+            out,
+            "  {} × {} = {:.6}  (param corr = {:.4})",
+            c.name_i, c.name_j, c.cov, c.corr,
+        );
+    }
+    out
 }
 
 /// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
@@ -582,39 +686,8 @@ pub fn print_results(result: &FitResult) {
     if n_eta > 0 {
         eprintln!("\n--- OMEGA Estimates ---");
     }
-    // Check if omega has off-diagonal elements
-    let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
     eprint!("{}", format_omega_rows(result));
-    if has_offdiag {
-        eprintln!("  --- Correlations ---");
-        for i in 0..n_eta {
-            for j in 0..i {
-                let cov = result.omega[(i, j)];
-                if cov.abs() <= 1e-15 {
-                    continue;
-                }
-                let name_i = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
-                let name_j = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
-                let param_corr = param_corr_fallback(
-                    result.omega_param_corr.as_ref(),
-                    cov,
-                    result.omega[(i, i)],
-                    result.omega[(j, j)],
-                    i,
-                    j,
-                );
-                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
-                let se_str = match se_cov {
-                    Some(s) => format!("  SE = {:.6}", s),
-                    None => String::new(),
-                };
-                eprintln!(
-                    "  {} × {} = {:.6}  (param corr = {:.4}){}",
-                    name_i, name_j, cov, param_corr, se_str,
-                );
-            }
-        }
-    }
+    eprint!("{}", format_omega_corr_rows(result));
 
     // Sigma estimates
     let err_type = match result.error_model {
@@ -661,45 +734,11 @@ pub fn print_results(result: &FitResult) {
     }
 
     // IOV (KAPPA) estimates
-    if let Some(ref iov) = result.omega_iov {
+    if result.omega_iov.is_some() {
         eprintln!("\n--- KAPPA (IOV) Estimates ---");
-        let n_kappa = iov.nrows();
         eprint!("{}", format_kappa_rows(result));
         // Off-diagonal covariances/correlations (block_kappa)
-        let has_offdiag = (0..n_kappa).any(|i| (0..i).any(|j| iov[(i, j)].abs() > 1e-15));
-        if has_offdiag {
-            eprintln!("  --- Correlations ---");
-            for i in 0..n_kappa {
-                for j in 0..i {
-                    let cov = iov[(i, j)];
-                    if cov.abs() <= 1e-15 {
-                        continue;
-                    }
-                    let name_i = result
-                        .kappa_names
-                        .get(i)
-                        .map(|s| s.as_str())
-                        .unwrap_or("KAPPA");
-                    let name_j = result
-                        .kappa_names
-                        .get(j)
-                        .map(|s| s.as_str())
-                        .unwrap_or("KAPPA");
-                    let param_corr = param_corr_fallback(
-                        result.omega_iov_param_corr.as_ref(),
-                        cov,
-                        iov[(i, i)],
-                        iov[(j, j)],
-                        i,
-                        j,
-                    );
-                    eprintln!(
-                        "  {} × {} = {:.6}  (param corr = {:.4})",
-                        name_i, name_j, cov, param_corr,
-                    );
-                }
-            }
-        }
+        eprint!("{}", format_kappa_corr_rows(result));
     }
 
     // Importance sampling marginal log-likelihood
@@ -774,7 +813,7 @@ pub fn print_results(result: &FitResult) {
         if let Some(ref ci) = result.sir_ci_omega {
             let n_eta = result.omega.nrows();
             for i in 0..n_eta.min(ci.len()) {
-                let name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+                let name = eta_name(result, i);
                 eprintln!("  {} : [{:.6}, {:.6}]", name, ci[i].0, ci[i].1);
             }
         }
@@ -795,7 +834,7 @@ pub fn print_results(result: &FitResult) {
         eprintln!("\n--- Shrinkage ---");
         for (k, &sh) in result.shrinkage_eta.iter().enumerate() {
             if sh.is_finite() {
-                let name = result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA");
+                let name = eta_name(result, k);
                 eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
             }
         }
@@ -806,11 +845,7 @@ pub fn print_results(result: &FitResult) {
     if !result.shrinkage_kappa.is_empty() {
         eprintln!("\n--- Kappa Shrinkage (pooled) ---");
         for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
-            let name = result
-                .kappa_names
-                .get(k)
-                .map(|s| s.as_str())
-                .unwrap_or("KAPPA");
+            let name = kappa_name(result, k);
             if sh.is_finite() {
                 eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
             } else {
@@ -824,11 +859,7 @@ pub fn print_results(result: &FitResult) {
                     .iter()
                     .enumerate()
                     .map(|(k, &sh)| {
-                        let name = result
-                            .kappa_names
-                            .get(k)
-                            .map(|s| s.as_str())
-                            .unwrap_or("KAPPA");
+                        let name = kappa_name(result, k);
                         if sh.is_finite() {
                             format!("{} {:.1}%", name, sh * 100.0)
                         } else {
@@ -1020,7 +1051,7 @@ pub fn format_summary(result: &FitResult) -> String {
         let _ = writeln!(out, "\n--- OMEGA ---");
         for i in 0..n_eta {
             let var = result.omega[(i, i)];
-            let name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+            let name = eta_name(result, i);
             let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
             let label = if is_fixed {
                 fixed_label(name)
@@ -1039,27 +1070,10 @@ pub fn format_summary(result: &FitResult) -> String {
             let _ = writeln!(out, "  {:<16} = {:.6}{}  SE = {}", label, var, note, se_str);
         }
         // Off-diagonal correlations (block omega).
-        let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
-        if has_offdiag {
-            for i in 0..n_eta {
-                for j in 0..i {
-                    let cov = result.omega[(i, j)];
-                    if cov.abs() <= 1e-15 {
-                        continue;
-                    }
-                    let ni = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
-                    let nj = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
-                    let corr = param_corr_fallback(
-                        result.omega_param_corr.as_ref(),
-                        cov,
-                        result.omega[(i, i)],
-                        result.omega[(j, j)],
-                        i,
-                        j,
-                    );
-                    let _ = writeln!(out, "  corr({}, {}) = {:.4}", ni, nj, corr);
-                }
-            }
+        for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
+            eta_name(result, k)
+        }) {
+            let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
 
@@ -1070,28 +1084,10 @@ pub fn format_summary(result: &FitResult) -> String {
         out.push_str(&format_kappa_rows(result));
         // Off-diagonal correlations (block_kappa, #1667), in the OMEGA style
         // above and from the same matrix the console reads.
-        for i in 0..iov.nrows() {
-            for j in 0..i {
-                let cov = iov[(i, j)];
-                if cov.abs() <= 1e-15 {
-                    continue;
-                }
-                let corr = param_corr_fallback(
-                    result.omega_iov_param_corr.as_ref(),
-                    cov,
-                    iov[(i, i)],
-                    iov[(j, j)],
-                    i,
-                    j,
-                );
-                let _ = writeln!(
-                    out,
-                    "  corr({}, {}) = {:.4}",
-                    kappa_name(result, i),
-                    kappa_name(result, j),
-                    corr
-                );
-            }
+        for c in offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
+            kappa_name(result, k)
+        }) {
+            let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
 
@@ -1167,7 +1163,7 @@ pub fn format_summary(result: &FitResult) -> String {
             .enumerate()
             .filter(|(_, sh)| sh.is_finite())
             .map(|(k, sh)| {
-                let name = result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA");
+                let name = eta_name(result, k);
                 format!("{} {:.1}%", name, sh * 100.0)
             })
             .collect();
@@ -5478,6 +5474,61 @@ mod tests {
             assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
         }
 
+        // #1683: the weight line under a weighted kappa is on its row's scale —
+        // CV% under a CV% row (log-normal; unknown type), SD under an SD row
+        // (additive, logit) and under a custom row, which has no note. Exact
+        // lines, typed and untyped, on both surfaces: the LN line printing
+        // `SD =`, or the additive / logit / custom line printing `CV% =`,
+        // reddens a cell. The SD lines are byte-identical to before #1683.
+        // Typical arm n = 4, so SD = √var / 2; CV% = 100 · SD.
+        let pad = " ".repeat(25);
+        let weight_line = |name: &str, spread: &str| {
+            format!("{pad}weight = NARM  →  {spread} at NARM = 4.0000 (κ ~ N(0, {name}/NARM))")
+        };
+        for (typed, cells) in [
+            (
+                true,
+                [
+                    ("K_LN", "CV% = 11.2"),
+                    ("K_ADD", "SD = 6.2457"),
+                    ("K_LGT", "SD = 6.2457"),
+                    ("K_C", "SD = 0.2739"),
+                ],
+            ),
+            (
+                false,
+                [
+                    ("K_LN", "CV% = 11.2"),
+                    ("K_ADD", "CV% = 624.6"),
+                    ("K_LGT", "CV% = 624.6"),
+                    ("K_C", "CV% = 27.4"),
+                ],
+            ),
+        ] {
+            let r = mk(true, typed);
+            for (surface, text) in [
+                ("console", format_kappa_rows(&r)),
+                ("summary", format_summary(&r)),
+            ] {
+                for (name, spread) in cells {
+                    let want = weight_line(name, spread);
+                    let got = text
+                        .lines()
+                        .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
+                        .unwrap_or_else(|| panic!("{surface}: no weight line for {name}:\n{text}"));
+                    assert_eq!(got, want, "{surface} typed={typed} {name}");
+                }
+            }
+        }
+        // Unweighted: no weight line on either surface.
+        let plain = mk(false, true);
+        for (surface, text) in [
+            ("console", format_kappa_rows(&plain)),
+            ("summary", format_summary(&plain)),
+        ] {
+            assert!(!text.contains("weight = "), "{surface}:\n{text}");
+        }
+
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
         // entry, followed by the #1660 weight keys; no typical-arm CV% key.
         let yaml = yaml_of(&mk(true, true));
@@ -5808,6 +5859,131 @@ mod tests {
                 yaml.contains(entry),
                 "{typical:?}: missing\n{entry}\nin\n{yaml}"
             );
+        }
+    }
+
+    // ── #1682: one off-diagonal walk behind all four correlation surfaces ──
+
+    /// A block Ω (3 ETAs, the third unnamed) and block Ω_IOV (3 kappas, the
+    /// third unnamed), each with an entry on every side of the `1e-15` cut:
+    /// Ω(2,0) = 1e-15 exactly (dropped), Ω(2,1) = 2e-15 (kept), Ω_IOV(2,1) =
+    /// −3e-15 (kept, so the cut is on `|cov|`). `omega_param_corr`,
+    /// `omega_iov_param_corr` and the cov/√var fallback give three different
+    /// numbers for the (1,0) pairs, so reading the wrong source shows. Every
+    /// packed Ω SE is distinct, so the console's off-diagonal SE pins the
+    /// `(i, j)` it is read at — `(i, i)` or `(j, j)` prints another number.
+    fn corr_result() -> FitResult {
+        let mut r = weighted_result();
+        r.omega = DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.1, 0.02, 1e-15, 0.02, 0.2, 2e-15, 1e-15, 2e-15, 0.3],
+        );
+        r.omega_fixed = vec![false; 3];
+        r.se_omega = Some(vec![0.01, 0.02, 0.03, 0.04, 0.05, 0.06]);
+        let mut ec = DMatrix::identity(3, 3);
+        ec[(1, 0)] = -0.25;
+        ec[(0, 1)] = -0.25;
+        r.omega_param_corr = Some(ec);
+        let iov = r.omega_iov.as_mut().unwrap();
+        iov[(1, 0)] = 0.5;
+        iov[(0, 1)] = 0.5;
+        iov[(2, 1)] = -3e-15;
+        iov[(1, 2)] = -3e-15;
+        let mut kc = DMatrix::identity(3, 3);
+        kc[(1, 0)] = 0.7;
+        kc[(0, 1)] = 0.7;
+        r.omega_iov_param_corr = Some(kc);
+        r.kappa_names.truncate(2);
+        r
+    }
+
+    /// The console's correlation blocks and `format_summary`'s `corr(...)`
+    /// lines, exact, for the same fixture: which pairs appear (the `1e-15` cut,
+    /// on `|cov|`), which correlation source each surface reads (Ω's matrix for
+    /// ETAs, Ω_IOV's for kappas, the fallback without one), and the `ETA` /
+    /// `KAPPA` name fallbacks. Both surfaces are asserted in one test so a
+    /// change to the shared walk reddens each by name.
+    #[test]
+    fn offdiag_corrs_agree_across_console_and_summary() {
+        let summary_corr = |s: &str| -> String {
+            s.lines()
+                .filter(|l| l.starts_with("  corr("))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+
+        // Every surface is compared before anything fails, so a mutation of the
+        // shared walk names each surface it reaches, not only the first.
+        let r = corr_result();
+        let s = format_summary(&r);
+        let kappa_at = s.find("--- KAPPA (IOV) ---").unwrap();
+        let surfaces = [
+            (
+                "console OMEGA",
+                format_omega_corr_rows(&r),
+                "  --- Correlations ---\n  \
+                 eta_V × eta_CL = 0.020000  (param corr = -0.2500)  SE = 0.020000\n  \
+                 ETA × eta_V = 0.000000  (param corr = 0.0000)  SE = 0.050000\n",
+            ),
+            (
+                "console KAPPA",
+                format_kappa_corr_rows(&r),
+                "  --- Correlations ---\n  \
+                 K_ADD × K_LN = 0.500000  (param corr = 0.7000)\n  \
+                 KAPPA × K_ADD = -0.000000  (param corr = 0.0000)\n",
+            ),
+            (
+                "summary OMEGA",
+                summary_corr(&s[..kappa_at]),
+                "  corr(eta_V, eta_CL) = -0.2500\n  \
+                 corr(ETA, eta_V) = 0.0000\n",
+            ),
+            (
+                "summary KAPPA",
+                summary_corr(&s[kappa_at..]),
+                "  corr(K_ADD, K_LN) = 0.7000\n  \
+                 corr(KAPPA, K_ADD) = 0.0000\n",
+            ),
+        ];
+        let wrong: Vec<String> = surfaces
+            .iter()
+            .filter(|(_, got, want)| got != want)
+            .map(|(name, got, want)| format!("{name}:\n got: {got:?}\nwant: {want:?}"))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // No precomputed correlation: both surfaces fall back to cov/√var.
+        let mut fb = corr_result();
+        fb.omega_param_corr = None;
+        fb.omega_iov_param_corr = None;
+        assert!(
+            format_omega_corr_rows(&fb)
+                .contains("eta_V × eta_CL = 0.020000  (param corr = 0.1414)"),
+            "console OMEGA fallback"
+        );
+        assert!(
+            format_kappa_corr_rows(&fb).contains("K_ADD × K_LN = 0.500000  (param corr = 0.1788)"),
+            "console KAPPA fallback"
+        );
+        let s = format_summary(&fb);
+        assert!(
+            s.contains("  corr(eta_V, eta_CL) = 0.1414\n"),
+            "summary OMEGA fallback:\n{s}"
+        );
+        assert!(
+            s.contains("  corr(K_ADD, K_LN) = 0.1788\n"),
+            "summary KAPPA fallback:\n{s}"
+        );
+
+        // Diagonal, and IOV-free: no correlation block, no header, anywhere.
+        let diag = classified_result();
+        let mut no_iov = classified_result();
+        no_iov.omega_iov = None;
+        for (tag, r) in [("diagonal", &diag), ("no IOV", &no_iov)] {
+            assert_eq!(format_omega_corr_rows(r), "", "{tag}");
+            assert_eq!(format_kappa_corr_rows(r), "", "{tag}");
+            assert_eq!(summary_corr(&format_summary(r)), "", "{tag}");
         }
     }
 }

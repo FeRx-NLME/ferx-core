@@ -278,7 +278,8 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   `(SD = …, logit scale)`; for a sample-size-weighted kappa each reads
   `at weight 1` — `(CV% = … at weight 1)`, `(SD = … at weight 1)` or
   `(SD = … at weight 1, logit scale)` (#1666) — the figure of a one-subject arm,
-  followed by the SD at the typical arm size.
+  followed by a line with the same figure at the typical arm size: `CV% = …` under
+  a CV% row, `SD = …` otherwise (#1683).
 - **weight** / **weight_typical** / **sd_at_typical_weight**: present only on the
   `omega_iov` entry of a sample-size-weighted kappa (`kappa K ~ γ² weight = W`,
   #1660). `weight` is the source text of `W` (quoted), `weight_typical` the median

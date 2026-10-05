@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A sample-size-weighted log-normal kappa's weight line reports a CV%, like its row**
+  ([#1683](https://github.com/FeRx-NLME/ferx-core/issues/1683)). The console and `ferx summary`
+  line under the row now reads `→  CV% = 11.2 at NARM = 4.0000` instead of the log-scale
+  `→  SD = 0.1120 …`, so it compares directly with the row's `(CV% = … at weight 1)`; a kappa
+  of unknown type gets the same. Additive, logit and custom kappas keep `SD = …`, unweighted
+  rows are unchanged, and the fit YAML is unchanged (`sd_at_typical_weight` × 100 is the CV%).
 - **A level block that takes a separate level at every observation now counts every random
   effect that reaches `y`, through the states too; one that does not no longer counts a
   time-varying one** ([#1650](https://github.com/FeRx-NLME/ferx-core/issues/1650)). With one
