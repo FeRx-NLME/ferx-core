@@ -1689,3 +1689,44 @@ fn bind_from_fit_keeps_the_fits_covariate_centres_on_a_design() {
         );
     }
 }
+
+/// K4 (#1678). ferx-r's `mbma_placebo` example, model and data copied verbatim
+/// from ferx-r `6c34b15` into `tests/data/mbma_placebo/`: one subject per study,
+/// its arms as occasions of `KAPPA_ARM`, every arm on the study's full visit
+/// grid. Each `(STUDY, TIME)` level holds a record of every arm, so its levels
+/// do not nest in the kappa's occasions and the kappa is not absorbed; `ETA_E0`
+/// is, so the block binds within-study, 18 free levels, under the model's
+/// explicit contrast and under `auto` alike.
+///
+/// Mutation — any rule that counts `KAPPA_ARM` as absorbed here (the occasion
+/// unit read as the subject) adds a second absorbed random effect and the
+/// joint refusal fires under both.
+#[test]
+fn mbma_placebo_stays_within() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
+    let model_path = dir.join("mbma_placebo.ferx");
+    let data_path = dir.join("mbma_placebo.csv");
+    let explicit = std::fs::read_to_string(&model_path).unwrap();
+    let auto = explicit.replace(", contrast = sum_to_zero_within", "");
+    assert_ne!(auto, explicit, "the auto twin drops the contrast");
+    let tmp = tempfile::tempdir().unwrap();
+    let auto_path = tmp.path().join("mbma_placebo_auto.ferx");
+    std::fs::write(&auto_path, &auto).unwrap();
+    for (tag, path) in [("explicit", &model_path), ("auto", &auto_path)] {
+        let (parsed, _) = read_composable(path, &data_path, true);
+        let binding = &parsed.bindings.levels["PLACEBO"];
+        assert_eq!(
+            binding.contrast,
+            ferx_core::parser::model_parser::LevelContrast::SumToZeroWithin,
+            "{tag}"
+        );
+        let free = parsed
+            .model
+            .theta_names
+            .iter()
+            .filter(|n| n.starts_with("PLACEBO["))
+            .count();
+        assert_eq!(free, 18, "{tag}: free levels");
+        assert_eq!(binding.labels.len(), 24, "{tag}: 6 studies × 4 visits");
+    }
+}
