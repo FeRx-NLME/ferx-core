@@ -315,6 +315,43 @@ fit ran under — `os`/`arch` from the running binary's target, `in_docker`
 indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since
 it's free-form text), and `ferx_version`.
 
+### SIR intervals (`sir:`)
+
+A fit run with `sir = true`, or a `FitResult` returned by `run_sir`, gets a `sir:`
+block (see [SIR](estimation/sir.qmd)). Abridged, from the `mbma_placebo` BTAV
+fixture (`tests/data/mbma_placebo/`, macOS run):
+
+```yaml
+sir:
+  effective_sample_size: 143.2
+  ci_theta:
+    # ... one entry per theta, keyed by name
+  ci_omega:
+    ETA_E0:
+      lower: 2.053046
+      upper: 25.221134
+  ci_sigma:
+    ADD_ERR:
+      lower: 1.000000
+      upper: 1.000000
+  ci_kappa:
+    KAPPA_ARM:
+      lower: 83.166077
+      upper: 367.409851
+```
+
+Each `lower` / `upper` pair is the 2.5th / 97.5th percentile of the resampled
+draws, on the scale the estimate is reported on: a θ as estimated, and the
+**variance** for an `omega`, `sigma` or `kappa` entry. `ci_omega` and
+`ci_kappa` cover the diagonal only, so a `block_omega` / `block_kappa`
+covariance gets no interval. `ci_kappa` (#1705) holds one entry per kappa,
+keyed by its name; for a sample-size-weighted kappa the interval is on the
+weight-1 γ², like the `omega_iov` entry's `variance`. A model with no kappa
+writes no `ci_kappa:` key. On the `FitResult` the same numbers are
+`sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (`None` without a
+kappa) and `sir_ess`, and they are saved in a `.fitrx` bundle; a bundle saved
+before #1705 loads with `sir_ci_kappa = None`.
+
 ## FitResult Fields (Rust API / console)
 
 The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `method_wall_times_secs`, `covariance_wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.

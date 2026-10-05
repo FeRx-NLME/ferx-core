@@ -113,6 +113,13 @@ section of the SDLC for the versioning policy).
   with a per-dose kernel).
 
 ### Added
+- **SIR reports an interval for each IOV kappa variance**
+  ([#1705](https://github.com/FeRx-NLME/ferx-core/issues/1705)). `FitResult.sir_ci_kappa`
+  carries the 95% SIR interval of each `omega_iov` diagonal (in `kappa_names` order), on both
+  `sir = true` and `run_sir`, which agree to the bit. It is printed in the console's SIR
+  block, written as `ci_kappa:` in the fit YAML's `sir:` section and saved in `.fitrx`; a model
+  with no kappa writes nothing new, and an older bundle loads with `None`. Between-arm
+  variability in an MBMA fit now gets a SIR interval like every other variance.
 - **`bind_from_fit` binds a model to a fit's data-derived bindings in one call**
   ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)). Pass the fit's
   `data_bindings` and both halves come from the fit: the level layout, and the
