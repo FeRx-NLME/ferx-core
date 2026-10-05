@@ -329,6 +329,19 @@ a test that has quietly stopped testing: at `3e-2` a regression delivering 99% o
 mass passes green, and that was the only end-to-end `fit()` → sdtab check against an external
 reference. If the realised error surprises you, chase it — that is information.
 
+**Linux is the reference platform for fit numbers.** Tier-3 bands, anchor tolerances,
+headroom claims and "is this red on `main`?" all come from a Linux run, because CI is Linux
+and macOS fits differ through the **OS math library, not the CPU** (#1688): at `cff801db`
+`per_route_lag` reaches OFV −688.936445811360 on Linux arm64 *and* amd64, the same in every
+printed digit down to the covariance eigenvalues, while native macOS arm64 stops at −420.33 with `converged: true`
+and fails. A macOS number names its platform and is never subtracted from, or compared
+against, a Linux one. Two ways to get a Linux number: `tools/linux-test.sh -- <cargo args>`
+(Docker, against a read-only copy of the tree; prints a `ferx-platform: Linux/…` marker line
+that log readers check), and `gh workflow run slow-tests.yml --ref <branch> -f nocapture=true`
+for the x86_64 CI digits of a *passing* test's `eprintln!`. A macOS-only red is a question about
+the test's identifiability (#1551, #1671) — never a reason to widen a band until it covers both
+platforms.
+
 **When the bug report is "two implementations disagree", the fix is one implementation.** This
 is the `*_g<T: PkNum>` rule in *Analytic Sensitivities* below, generalised past `sens/` to any
 two engines, and it buys a *test* property: after #1223 extracted `fill_prestart_states`, one

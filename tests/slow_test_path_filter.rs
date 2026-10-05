@@ -916,3 +916,70 @@ fn inline_comments_do_not_leak_into_globs() {
     assert_eq!(strip_inline_comment("'src/a#b/**'"), "'src/a#b/**'");
     assert_eq!(strip_inline_comment("'src/**'"), "'src/**'");
 }
+
+/// The `workflow_dispatch` `nocapture` input (#1688): how to get a passing test's
+/// `eprintln!` digits from an x86_64 Linux run, the reference platform for fit numbers.
+///
+/// Three ways to get it wrong, each pinned: drop the input (dispatch then has no way to
+/// ask); pass `--nocapture` unconditionally (it floods every nightly and push log); or put
+/// the expression before `--no-fail-fast`, where `--` would hand `--no-fail-fast` to the
+/// test harness instead of cargo.
+#[test]
+fn dispatch_nocapture_input_is_boolean_and_conditional() {
+    const EXPR: &str = "${{ inputs.nocapture && '-- --nocapture' || '' }}";
+    let workflow =
+        std::fs::read_to_string(repo_root().join(WORKFLOW)).expect("slow-tests.yml is readable");
+    let lines: Vec<&str> = workflow.lines().map(strip_yaml_comment).collect();
+    let indent = |l: &str| l.len() - l.trim_start().len();
+
+    // The `workflow_dispatch:` block: every following line indented deeper than it.
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "workflow_dispatch:")
+        .expect("slow-tests.yml declares `workflow_dispatch:`");
+    let base = indent(lines[start]);
+    let block: Vec<&str> = lines[start + 1..]
+        .iter()
+        .copied()
+        .take_while(|l| l.trim().is_empty() || indent(l) > base)
+        .collect();
+    let input = block
+        .iter()
+        .position(|l| l.trim() == "nocapture:")
+        .unwrap_or_else(|| {
+            panic!("workflow_dispatch must declare a `nocapture` input: {block:#?}")
+        });
+    let input_indent = indent(block[input]);
+    let body: Vec<&str> = block[input + 1..]
+        .iter()
+        .copied()
+        .take_while(|l| l.trim().is_empty() || indent(l) > input_indent)
+        .map(str::trim)
+        .collect();
+    assert!(
+        body.contains(&"type: boolean"),
+        "the `nocapture` input must be `type: boolean`, or `inputs.nocapture &&` is a \
+         non-empty string and always true: {body:?}"
+    );
+
+    // The cargo command carries the expression, after `--no-fail-fast`.
+    let stripped = lines.join("\n");
+    let at = stripped.find(EXPR).unwrap_or_else(|| {
+        panic!("the slow-tests cargo command must carry `{EXPR}` (outside comments)")
+    });
+    let nff = stripped
+        .find("--no-fail-fast")
+        .expect("the cargo command passes --no-fail-fast");
+    assert!(
+        nff < at,
+        "`{EXPR}` must come after `--no-fail-fast`: its `--` ends cargo's own arguments"
+    );
+
+    // And nowhere is `--nocapture` passed unconditionally.
+    let rest = stripped.replacen(EXPR, "", 1);
+    assert!(
+        !rest.contains("--nocapture"),
+        "`--nocapture` appears outside the dispatch-gated expression — every nightly would \
+         print every passing test's output"
+    );
+}

@@ -466,6 +466,44 @@ not a style question. And anything `ferx-tools` needs must also be reachable fro
 ferx-r, which consumes `ferx-core` as an ordinary external crate — an API that
 only makes sense "because we're in the same workspace" is the wrong API.
 
+### 8.8 Reference platform (Linux)
+
+CI runs on Linux, so reference numbers for fits — Tier-3 bands, anchor
+tolerances, headroom claims, and whether a test is red on `main` — come from
+Linux. macOS fits can differ, and the cause is the **OS math library, not the
+CPU**: at `cff801db` the `per_route_lag` fit reaches the same OFV
+(−688.936445811360) on Linux arm64 and Linux amd64, in every printed digit, while native
+macOS arm64 converges to a different optimum (−420.33) and fails the test. A
+number measured on macOS names its platform and is never compared against a
+Linux one; a macOS-only failure is a question about the test, not a reason to
+widen its tolerance.
+
+To get a Linux number locally, run cargo through Docker:
+
+```bash
+tools/linux-test.sh -- test --no-default-features \
+    --features ci,survival,slow-tests --profile ci-test --test per_route_lag
+```
+
+The script mounts the checkout read-only and copies it into the container, so
+tests that regenerate committed fixtures cannot touch your tree. It builds with
+one job by default: Docker Desktop's default 8 GB VM runs out of memory at two
+jobs on the full slow sweep (`--jobs N` once you have raised Docker's memory).
+Before cargo starts, the container prints a
+`ferx-platform: Linux/<arch> <libc> <rustc>` marker, which tooling uses to tell a
+Linux log from a macOS one. Build caches live in the Docker volumes
+`ferx-linux-target` and `ferx-linux-registry` (`--amd64` uses its own pair);
+`tools/linux-test.sh --help` shows how to remove them.
+
+To get the x86_64 CI digits of a test that *passes* — whose `eprintln!` output
+cargo normally swallows — dispatch the slow-test workflow with `nocapture`:
+
+```bash
+gh workflow run slow-tests.yml --ref <branch> -f nocapture=true
+```
+
+Scheduled and push runs never set it, so their logs stay readable.
+
 ---
 
 ## 9. Releases

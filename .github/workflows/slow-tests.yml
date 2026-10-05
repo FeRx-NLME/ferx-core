@@ -10,6 +10,14 @@ on:
   schedule:
     - cron: '0 6 * * *'   # daily at 06:00 UTC
   workflow_dispatch:       # manual trigger
+    inputs:
+      # The one way to get a passing test's eprintln! digits from an x86_64 Linux run --
+      # the reference platform for fit numbers (#1688). Off by default: it would flood
+      # every nightly log, and push/schedule events have no `inputs`, so they never see it.
+      nocapture:
+        description: 'Run cargo test with nocapture, printing the eprintln! output of passing tests'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -159,7 +167,7 @@ jobs:
           timeout --signal=INT --kill-after=2m 100m \
             cargo test --workspace --exclude docs-lint --no-default-features \
               --features ${{ matrix.features }} \
-              --profile ci-test --no-fail-fast \
+              --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \
                    echo "::error::slow-tests (${{ matrix.leg }}) exceeded its 100m budget - a test is hanging or the suite outgrew the runner; see FeRx-NLME/ferx-core#1239"; \
