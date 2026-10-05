@@ -159,6 +159,15 @@ unreleased_content() {
 cmd_check() {
   local errors=0 name stem cat body first bad headings
   [ -f "$changelog" ] || die "no CHANGELOG.md at $changelog"
+  # The directory and its README are part of the convention, not optional: an
+  # accidental `git rm changelog.d/*` after assembly would otherwise delete the
+  # guide and, with it, the tracked directory.
+  [ -d "$frag_dir" ] && [ ! -L "$frag_dir" ] ||
+    die "no changelog.d/ directory at $frag_dir — restore it (with its README.md)"
+  if [ ! -f "$frag_dir/README.md" ] || [ -L "$frag_dir/README.md" ]; then
+    echo "changelog.d/README.md: missing or not a regular file — restore it" >&2
+    errors=$((errors + 1))
+  fi
 
   # Exactly one `## [Unreleased]` heading. Without one, an empty section and a
   # missing section look the same to everything below, and `assemble` would

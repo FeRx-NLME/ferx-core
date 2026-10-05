@@ -994,6 +994,42 @@ fn the_release_workflow_checks_the_changelog_before_publishing() {
         yml.contains("TAG: ${{ github.event.inputs.tag || github.ref_name }}"),
         "release.yml passes the wrong tag"
     );
+    // It must check the TAGGED tree (`ref: main` would validate main while a hotfix
+    // tag from a release branch publishes), and nothing may mask a red check.
+    assert!(
+        yml.contains("ref: ${{ github.event.inputs.tag || github.ref }}"),
+        "release.yml no longer checks out the tag"
+    );
+    let masking: Vec<&str> = yml
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- "))
+        .filter(|l| l.starts_with("if:") || l.starts_with("continue-on-error:"))
+        .collect();
+    assert!(
+        masking.is_empty(),
+        "release.yml can skip or ignore the changelog check: {masking:?}"
+    );
+}
+
+/// The directory and its README are required: without them an empty tree and a
+/// deleted one would look the same.
+#[test]
+fn check_requires_the_directory_and_its_readme() {
+    let t = tree("no-readme", &[("1.fixed.md", "- x (#1).\n")]);
+    std::fs::remove_file(t.join("changelog.d").join("README.md")).unwrap();
+    let o = run(&t, &["check"]);
+    assert!(!o.status.success(), "check passed without README.md");
+    assert!(stderr(&o).contains("README.md: missing"), "{}", stderr(&o));
+
+    let t = tree("no-dir", &[]);
+    std::fs::remove_dir_all(t.join("changelog.d")).unwrap();
+    let o = run(&t, &["check"]);
+    assert!(!o.status.success(), "check passed without changelog.d/");
+    assert!(
+        stderr(&o).contains("no changelog.d/ directory"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 /// `ci.yml`'s `Changelog` job validates the PR's own fragments only on the default
