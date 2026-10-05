@@ -113,6 +113,14 @@ section of the SDLC for the versioning policy).
   with a per-dose kernel).
 
 ### Added
+- **Random-effect shape transforms: `boxcox(η, λ)`, `tdist(η, ν)`, `johndraper(η, λ)` and the
+  `[eta_shape]` block** ([#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)). Write
+  `CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))`, or keep `CL = TVCL * exp(ETA_CL)` and declare
+  `ETA_CL ~ boxcox(LAMBDA)` (or `boxcox()` to auto-declare `LAMBDA_ETA_CL` at PsN's defaults) in
+  `[eta_shape]`. The transforms are Petersson et al. 2009's, as PsN `transform` writes them;
+  `boxcox` is exact through λ = 0, where the hand-written form is `0/0`. Gradients stay analytic
+  (including `∂/∂λ`), and the objective, posthoc ETAs and IPRED match NONMEM 7.6 to ~1e-7. A
+  shaped ETA's omega row prints no CV% for now; a shape-aware spread is planned.
 - **`bind_from_fit` binds a model to a fit's data-derived bindings in one call**
   ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)). Pass the fit's
   `data_bindings` and both halves come from the fit: the level layout, and the

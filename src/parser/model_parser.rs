@@ -2669,9 +2669,10 @@ const NON_PARAM_CONSUMER_BLOCKS: &[&str] = &[
     // `[individual_parameters]` statements that use it.
     "derived",
     "output",
-    // The block being classified, and the one desugared into it.
+    // The block being classified, and the ones desugared into it.
     "individual_parameters",
     "covariate_model",
+    "eta_shape",
     // Read θ, η, σ, covariates, states or observations, never a parameter.
     "error_model",
     "diffusion",
@@ -3346,6 +3347,10 @@ pub fn parse_full_model_with(
     // line, which re-emits these very blocks — sees a plain classical model. A
     // twin built from un-desugared text would silently carry no covariate effect.
     let covariate_model = apply_covariate_model_block(&mut extracted, bindings)?;
+    // `[eta_shape]` desugaring (#1716), after `[covariate_model]` so the lines it
+    // generated are rewritten too, and before the absorption twin re-emits the
+    // blocks: everything below sees inline `boxcox(ETA, SHAPE)` calls.
+    apply_eta_shape_block(&mut extracted, bindings)?;
     let absorption_ode_equivalent_src: Option<String> =
         absorption_ode_equivalent_source(&extracted);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
@@ -7158,6 +7163,65 @@ fn push_covariate_decl(
         levels,
     });
     Ok(())
+}
+
+/// Desugar the optional `[eta_shape]` block (#1716) into inline shape calls,
+/// rewriting `[parameters]` and `[individual_parameters]` in place
+/// (`crate::parser::eta_shape::apply_eta_shape`). A no-op when the block is
+/// absent.
+fn apply_eta_shape_block(
+    extracted: &mut ExtractedBlocks,
+    bindings: &ParseBindings,
+) -> Result<(), String> {
+    let Some(block_lines) = extracted.unnamed.remove("eta_shape") else {
+        return Ok(());
+    };
+    // `[parameters]` parsed once more for its η/κ/θ names, as
+    // `apply_covariate_model_block` does and for the same reason.
+    let param_lines = extracted
+        .unnamed
+        .get("parameters")
+        .ok_or("Missing [parameters] block")?
+        .clone();
+    let (thetas, _, _, _, _, eta_names, kappa_info, _, _, _, _) =
+        parse_parameters(&param_lines, &bindings.levels)?;
+    let theta_names: Vec<String> = thetas.into_iter().map(|t| t.name).collect();
+    let mut parameters = extracted.unnamed.remove("parameters").unwrap_or_default();
+    let mut individual_parameters = extracted
+        .unnamed
+        .remove("individual_parameters")
+        .ok_or("[eta_shape] needs an [individual_parameters] block to apply to")?;
+    let cx = crate::parser::eta_shape::EtaShapeContext {
+        eta_names: &eta_names,
+        kappa_names: &kappa_info.names_ordered,
+        theta_names: &theta_names,
+    };
+    // Every other block, unnamed and named (`[event_model NAME]`), by type.
+    let others: Vec<(&str, &[String])> = extracted
+        .unnamed
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_slice()))
+        .chain(
+            extracted
+                .named
+                .iter()
+                .flat_map(|(k, by_name)| by_name.values().map(move |v| (k.as_str(), v.as_slice()))),
+        )
+        .collect();
+    let applied = crate::parser::eta_shape::apply_eta_shape(
+        &block_lines,
+        &mut parameters,
+        &mut individual_parameters,
+        &others,
+        &cx,
+    );
+    extracted
+        .unnamed
+        .insert("parameters".to_string(), parameters);
+    extracted
+        .unnamed
+        .insert("individual_parameters".to_string(), individual_parameters);
+    applied
 }
 
 /// Desugar the optional `[covariate_model]` block (#1111), rewriting
@@ -14589,6 +14653,7 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("derived", BlockForm::Unnamed, None),
     ("diffusion", BlockForm::Unnamed, None),
     ("error_model", BlockForm::Unnamed, None),
+    ("eta_shape", BlockForm::Unnamed, None),
     ("event_model", BlockForm::Either, Some("survival")),
     ("fit_options", BlockForm::Unnamed, None),
     ("individual_parameters", BlockForm::Unnamed, None),
@@ -19796,7 +19861,8 @@ const UNARY_FN_ARM_MISSING: &str =
 /// parser desugars plus the conditions-only `present`.
 fn supported_function_list() -> String {
     format!(
-        "{}, min(a, b), max(a, b), clamp(x, lo, hi), present(x) (conditions only)",
+        "{}, min(a, b), max(a, b), clamp(x, lo, hi), boxcox(eta, lambda), tdist(eta, nu), \
+         johndraper(eta, lambda), present(x) (conditions only)",
         SUPPORTED_UNARY_FNS.join(", ")
     )
 }
@@ -20706,6 +20772,15 @@ pub(crate) enum BinOp {
     Div,
     /// Euclidean remainder — result always non-negative for positive divisor.
     Mod,
+    /// A random-effect shape transform `h(l; r)` — `boxcox(η, λ)`,
+    /// `tdist(η, ν)`, `johndraper(η, λ)` — or, for the symbolic partials only,
+    /// one of its first derivatives (#1716). A binary operator rather than a
+    /// node of its own, so every walker that recurses into a `BinOp`'s operands
+    /// sees the η inside it; the kernel is `crate::parser::eta_shape::shape_g`.
+    Shape(
+        crate::parser::eta_shape::ShapeKind,
+        crate::parser::eta_shape::ShapeOut,
+    ),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -23229,6 +23304,7 @@ fn eval_expr<E: EvalEnv>(
                     }
                 }
                 BinOp::Mod => l.rem_euclid(r),
+                BinOp::Shape(kind, out) => crate::parser::eta_shape::shape_f64(*kind, *out, l, r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -23437,7 +23513,9 @@ enum Op {
     IsPresent,
     JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
     Jump(u32),
-    Mod,   // rem_euclid (binary)
+    Mod, // rem_euclid (binary)
+    /// `h(a; b)`, a random-effect shape transform (binary; #1716).
+    Shape(crate::parser::eta_shape::ShapeKind),
     Floor, // unary
     Ceil,  // unary
     Round, // unary
@@ -23500,6 +23578,7 @@ fn ip_op_cost(op: &Op) -> u32 {
     match op {
         Op::Pow | Op::Exp | Op::Ln | Op::Sqrt | Op::Logit | Op::InvLogit => 20,
         Op::Div | Op::Mod => 4,
+        Op::Shape(_) => 30,
         _ => 1,
     }
 }
@@ -23554,6 +23633,7 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::JumpIfFalse(_)
             | Op::Jump(_)
             | Op::Mod
+            | Op::Shape(_)
             | Op::Floor
             | Op::Ceil
             | Op::Round => {}
@@ -23721,6 +23801,7 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Div
         | Op::Pow
         | Op::Mod
+        | Op::Shape(_)
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -24339,6 +24420,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Mul
             | Op::Div
             | Op::Mod
+            | Op::Shape(_)
             | Op::Pow
             | Op::CmpLt
             | Op::CmpLe
@@ -24437,6 +24519,10 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 BinOp::Mul => Op::Mul,
                 BinOp::Div => Op::Div,
                 BinOp::Mod => Op::Mod,
+                BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value) => Op::Shape(*kind),
+                // The partial nodes exist only in the symbolic
+                // `IndivParamPartials`, which nothing compiles (#145).
+                BinOp::Shape(_, out) => unreachable!("compile_bytecode: shape partial {out:?}"),
             });
         }
         Expression::Power(base, exp) => {
@@ -24628,6 +24714,11 @@ fn eval_bytecode(
                 let e = pop!();
                 let b = pop!();
                 push!(b.powf(e));
+            }
+            Op::Shape(kind) => {
+                let s = pop!();
+                let eta = pop!();
+                push!(crate::parser::eta_shape::shape_g(kind, eta, s));
             }
             Op::Mod => {
                 let b = pop!();
@@ -24891,6 +24982,12 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                 let e = pop!();
                 let b = pop!();
                 push!(b.pow(e));
+            }
+            // The same kernel the `f64` VM runs, over `T`: exact jets (#1716).
+            Op::Shape(kind) => {
+                let s = pop!();
+                let eta = pop!();
+                push!(crate::parser::eta_shape::shape_g(kind, eta, s));
             }
             Op::Mod => {
                 let b = pop!();
@@ -25691,6 +25788,7 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::JumpIfFalse(_)
         | Op::Jump(_)
         | Op::Mod
+        | Op::Shape(_)
         | Op::Floor
         | Op::Ceil
         | Op::Round => false,
@@ -27078,6 +27176,20 @@ fn differentiate_with_chain(
                 div(num, denom)
             }
             BinOp::Mod => Expression::Literal(0.0), // mod is discontinuous; derivative is 0 a.e.
+            // ∂h(l; r) = ∂h/∂η · l' + ∂h/∂s · r', the partials being the kernel's
+            // own (`ShapeOut::DEta` / `DShape`). A partial node is a first
+            // derivative already, and nothing differentiates twice.
+            BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value) => {
+                use crate::parser::eta_shape::ShapeOut;
+                let part = |out| Expression::BinOp(l.clone(), BinOp::Shape(*kind, out), r.clone());
+                let dl = differentiate_with_chain(l, axis, chain);
+                let dr = differentiate_with_chain(r, axis, chain);
+                add(
+                    mul(part(ShapeOut::DEta), dl),
+                    mul(part(ShapeOut::DShape), dr),
+                )
+            }
+            BinOp::Shape(_, out) => unreachable!("differentiate: second derivative of {out:?}"),
         },
         Expression::UnaryFn(name, arg) => {
             let da = differentiate_with_chain(arg, axis, chain);
@@ -27227,7 +27339,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
                         Expression::BinOp(Box::new(l), *op, Box::new(r))
                     }
                 }
-                BinOp::Mod => Expression::BinOp(Box::new(l), *op, Box::new(r)),
+                BinOp::Mod | BinOp::Shape(..) => Expression::BinOp(Box::new(l), *op, Box::new(r)),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -28087,6 +28199,40 @@ fn parse_atom(
                 // does not have. `min`/`max`/`clamp` are exempt because they are
                 // desugared below and never reach `UnaryFn`; they keep their own
                 // arity diagnostics.
+                // A shape transform `boxcox(η, λ)` / `tdist(η, ν)` /
+                // `johndraper(η, λ)` (#1716): exactly two arguments, built as the
+                // `BinOp::Shape` its kernel evaluates.
+                if let Some(kind) = crate::parser::eta_shape::ShapeKind::from_name(&func_name) {
+                    let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
+                    let arity = || {
+                        format!(
+                            "`{func_name}` takes exactly two arguments: `{func_name}(eta, shape)`."
+                        )
+                    };
+                    if tokens.get(p) != Some(&Token::Comma) {
+                        return Err(arity());
+                    }
+                    let (shape, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if tokens.get(p) != Some(&Token::RParen) {
+                        return Err(arity());
+                    }
+                    // One shape per random effect. This is also how an ETA that
+                    // `[eta_shape]` shapes *and* the model wraps inline is caught:
+                    // the desugaring nests the two calls.
+                    let mut nested = false;
+                    visit_expr_nodes(&arg, &mut |e| {
+                        nested |= matches!(e, Expression::BinOp(_, BinOp::Shape(..), _));
+                    });
+                    if nested {
+                        return Err(format!(
+                            "`{func_name}(...)` is applied to an expression that is already \
+                             shape-transformed — a random effect takes one shape, written \
+                             either inline or in [eta_shape], not both."
+                        ));
+                    }
+                    let op = BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value);
+                    return Ok((Expression::BinOp(Box::new(arg), op, Box::new(shape)), p + 1));
+                }
                 if !is_min_max && !is_clamp && !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
                     if func_name == "present" {
                         return Err(format!(
