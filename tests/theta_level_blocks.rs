@@ -1809,7 +1809,9 @@ fn in_fit_sir_resamples_a_negative_bounded_level_block() {
 }
 
 /// Worst SIR-vs-Wald end gap over the `SHIFT` coefficients, in Wald
-/// half-widths. Measured 0.264 / 0.314 (STUDY=1 / STUDY=2) at 4000/2000 draws.
+/// half-widths. Measured 0.264 / 0.314 (STUDY=1 / STUDY=2) at 4000/2000 draws
+/// on Linux/aarch64 (`tools/linux-test.sh`, glibc 2.41), the reference platform.
+/// macOS arm64 gives the same values to ~12 digits.
 /// SIR comes out wider at both ends, as expected for 15 subjects. At 400/200
 /// draws the same gaps were 0.58 / 0.69, so most of what is left is Monte Carlo
 /// error in the 2.5% / 97.5% percentiles. 0.5 is 1.6× the measured worst.
