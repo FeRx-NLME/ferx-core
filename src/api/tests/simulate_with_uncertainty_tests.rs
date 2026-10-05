@@ -441,6 +441,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sir_ci_theta: None,
         sir_ci_omega: None,
         sir_ci_sigma: None,
+        sir_ci_kappa: None,
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,

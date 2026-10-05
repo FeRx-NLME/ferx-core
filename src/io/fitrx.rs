@@ -343,6 +343,11 @@ struct SirWire {
     ci_theta: Option<Vec<(f64, f64)>>,
     ci_omega: Option<Vec<(f64, f64)>>,
     ci_sigma: Option<Vec<(f64, f64)>>,
+    /// IOV kappa variance CIs (#1705). Additive: absent in bundles written
+    /// before it existed (loads as `None`), and omitted when `None` so a
+    /// non-IOV bundle's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_kappa: Option<Vec<(f64, f64)>>,
     ess: Option<f64>,
     /// Retained packed-parameter draws when `sir_keep_samples = true` was set.
     /// `None` otherwise; consumed by `simulate_with_uncertainty()`.
@@ -737,6 +742,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 ci_theta: r.sir_ci_theta.clone(),
                 ci_omega: r.sir_ci_omega.clone(),
                 ci_sigma: r.sir_ci_sigma.clone(),
+                ci_kappa: r.sir_ci_kappa.clone(),
                 ess: r.sir_ess,
                 resamples_packed: r.sir_resamples_packed.clone(),
             })
@@ -1937,16 +1943,18 @@ fn wire_to_fit_result(
         ),
     };
 
-    let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ess, sir_resamples_packed) = match w.sir {
-        Some(s) => (
-            s.ci_theta,
-            s.ci_omega,
-            s.ci_sigma,
-            s.ess,
-            s.resamples_packed,
-        ),
-        None => (None, None, None, None, None),
-    };
+    let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ci_kappa, sir_ess, sir_resamples_packed) =
+        match w.sir {
+            Some(s) => (
+                s.ci_theta,
+                s.ci_omega,
+                s.ci_sigma,
+                s.ci_kappa,
+                s.ess,
+                s.resamples_packed,
+            ),
+            None => (None, None, None, None, None, None),
+        };
 
     // `validate_parallel_lengths` has already ensured that omega/sigma
     // `init_as_sd` are either empty (pre-issue-#5 bundle) or exactly the
@@ -2029,6 +2037,7 @@ fn wire_to_fit_result(
         sir_ci_theta,
         sir_ci_omega,
         sir_ci_sigma,
+        sir_ci_kappa,
         sir_ess,
         sir_resamples_packed,
         // .fitrx v1: importance_sampling is not serialised — re-run via
@@ -2957,6 +2966,58 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[0].len(), 2);
         assert!((loaded.fit.ebe_kappas[0][0][0] - 0.01).abs() < 1e-9);
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
+    }
+
+    /// #1705: a SIR fit's kappa intervals survive the bundle, per kappa and in
+    /// order. Two kappas with distinct intervals, so a wire that dropped the
+    /// field on either the save or the load side, or reordered it, fails here.
+    #[test]
+    fn roundtrip_keeps_sir_ci_kappa() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_kappa.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[156.0, 0.0, 0.0, 0.05]));
+        r.kappa_names = vec!["KAPPA_ARM".into(), "KAPPA_CL".into()];
+        r.kappa_fixed = vec![false, false];
+        r.shrinkage_kappa = vec![0.1, 0.1];
+        r.sir_ess = Some(143.2);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        r.sir_ci_kappa = Some(vec![(83.2, 367.4), (0.02, 0.12)]);
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_ci_kappa, r.sir_ci_kappa);
+    }
+
+    /// #1705: a bundle written before `ci_kappa` existed has no such key under
+    /// `sir`; it loads with `sir_ci_kappa = None` rather than failing. And a SIR
+    /// fit with no kappa writes no key at all, so its bundle bytes are what they
+    /// were before #1705 (mutation: drop `skip_serializing_if`, and the key comes
+    /// back as `null`).
+    #[test]
+    fn fit_wire_missing_sir_ci_kappa_loads_none() {
+        let mut r = minimal_fit_result();
+        r.sir_ess = Some(50.0);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        let no_kappa = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !no_kappa["sir"]
+                .as_object()
+                .unwrap()
+                .contains_key("ci_kappa"),
+            "a fit with no kappa must not write the key: {}",
+            no_kappa["sir"]
+        );
+
+        r.sir_ci_kappa = Some(vec![(0.02, 0.12)]);
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        let sir = value["sir"].as_object_mut().unwrap();
+        assert!(
+            sir.remove("ci_kappa").is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert!(reloaded.sir.as_ref().unwrap().ci_kappa.is_none());
     }
 
     /// A weighted kappa (#1031) carries its declaration and the arm size it was

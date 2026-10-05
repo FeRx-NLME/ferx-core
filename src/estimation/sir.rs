@@ -32,6 +32,9 @@ pub struct SirResult {
     pub ci_omega: Vec<(f64, f64)>,
     /// 95% CI for each sigma
     pub ci_sigma: Vec<(f64, f64)>,
+    /// 95% CI for each IOV kappa variance (the `omega_iov` diagonal, packed
+    /// order). Empty when the model declares no kappa (#1705).
+    pub ci_kappa: Vec<(f64, f64)>,
     /// Effective sample size (ESS = 1 / sum(w_k^2))
     pub effective_sample_size: f64,
     /// Resampled packed parameter vectors, retained when
@@ -42,6 +45,16 @@ pub struct SirResult {
     /// — currently the rank deficiency and the bound-driven shrinkage the
     /// proposal needed (#1021). Empty on a clean run.
     pub warnings: Vec<String>,
+}
+
+impl SirResult {
+    /// `ci_kappa` as `FitResult.sir_ci_kappa` carries it: `None` for a model
+    /// with no kappa, so a non-IOV fit's writers and `.fitrx` are unchanged
+    /// (#1705). The one conversion both the in-fit and the standalone
+    /// (`run_sir`) path use.
+    pub(crate) fn kappa_ci(&self) -> Option<Vec<(f64, f64)>> {
+        (!self.ci_kappa.is_empty()).then(|| self.ci_kappa.clone())
+    }
 }
 
 /// How many proposal standard deviations must fit between the ML estimate and
@@ -804,10 +817,12 @@ fn run_sir_core_scoped(
     let n_theta = params.theta.len();
     let n_eta = params.omega.dim();
     let n_sigma = params.sigma.values.len();
+    let n_kappa = params.omega_iov.as_ref().map_or(0, |m| m.dim());
 
     let mut theta_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_theta];
     let mut omega_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_eta];
     let mut sigma_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_sigma];
+    let mut kappa_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_kappa];
 
     for &idx in &resampled_indices {
         let p = unpack_params(&samples[idx], params);
@@ -820,11 +835,15 @@ fn run_sir_core_scoped(
         for (j, &s) in p.sigma.values.iter().enumerate() {
             sigma_samples[j].push(s);
         }
+        for (ks, v) in kappa_samples.iter_mut().zip(kappa_variances(&p)) {
+            ks.push(v);
+        }
     }
 
     let ci_theta: Vec<(f64, f64)> = theta_samples.iter().map(|s| percentile_ci(s)).collect();
     let ci_omega: Vec<(f64, f64)> = omega_samples.iter().map(|s| percentile_ci(s)).collect();
     let ci_sigma: Vec<(f64, f64)> = sigma_samples.iter().map(|s| percentile_ci(s)).collect();
+    let ci_kappa: Vec<(f64, f64)> = kappa_samples.iter().map(|s| percentile_ci(s)).collect();
 
     let resamples_packed = if options.sir_keep_samples {
         Some(
@@ -841,9 +860,20 @@ fn run_sir_core_scoped(
         ci_theta,
         ci_omega,
         ci_sigma,
+        ci_kappa,
         effective_sample_size: ess,
         resamples_packed,
         warnings: conditioned.warnings(),
+    })
+}
+
+/// The IOV kappa variances of one unpacked draw — the `omega_iov` diagonal, in
+/// packed (`kappa_names`) order, as `ci_kappa` reports them (#1705). Empty for a
+/// model with no kappa. Only the diagonal, like `ci_omega`: a `block_kappa`'s
+/// covariances get no interval on either side.
+fn kappa_variances(p: &ModelParameters) -> Vec<f64> {
+    p.omega_iov.as_ref().map_or_else(Vec::new, |iov| {
+        (0..iov.dim()).map(|j| iov.matrix[(j, j)]).collect()
     })
 }
 
@@ -893,6 +923,44 @@ mod tests {
 
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("P{i}")).collect()
+    }
+
+    /// #1705: `ci_kappa` reads each kappa's own variance, in packed order, and
+    /// only the diagonal. Two kappas with distinct variances and a non-zero
+    /// covariance, so reading `(0, 0)` for every kappa, transposing the index
+    /// or reading an off-diagonal each give a different vector. A model with no
+    /// kappa yields none, which is what keeps a non-IOV fit's `sir_ci_kappa`
+    /// `None`.
+    #[test]
+    fn kappa_variances_are_the_iov_diagonal_in_packed_order() {
+        let mut p =
+            crate::types::test_helpers::analytical_model(GradientMethod::Auto).default_params;
+        assert!(kappa_variances(&p).is_empty(), "no kappa → no κ variances");
+        p.omega_iov = Some(OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(2, 2, &[0.05, 0.01, 0.01, 0.03]),
+            vec!["KAPPA_CL".into(), "KAPPA_V".into()],
+            false,
+        ));
+        assert_eq!(kappa_variances(&p), vec![0.05, 0.03]);
+    }
+
+    /// #1705: what `FitResult.sir_ci_kappa` carries — `None` for no kappa, the
+    /// intervals otherwise. Mutation: `Some(self.ci_kappa.clone())` regardless
+    /// makes a non-IOV fit write an empty `ci_kappa:` key.
+    #[test]
+    fn kappa_ci_is_none_without_a_kappa() {
+        let mut r = SirResult {
+            ci_theta: vec![(1.0, 2.0)],
+            ci_omega: vec![(0.1, 0.2)],
+            ci_sigma: vec![(0.01, 0.02)],
+            ci_kappa: Vec::new(),
+            effective_sample_size: 10.0,
+            resamples_packed: None,
+            warnings: Vec::new(),
+        };
+        assert_eq!(r.kappa_ci(), None);
+        r.ci_kappa = vec![(0.02, 0.12)];
+        assert_eq!(r.kappa_ci(), Some(vec![(0.02, 0.12)]));
     }
 
     /// #1548: a `LogitProbability` θ is proposed on the logit scale, and the

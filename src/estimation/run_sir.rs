@@ -193,6 +193,7 @@ fn run_sir_scoped(
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
     push_sir_warnings(&mut out.warnings, &sir.warnings);
+    out.sir_ci_kappa = sir.kappa_ci();
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
     out.sir_ci_sigma = Some(sir.ci_sigma);
@@ -412,6 +413,9 @@ mod tests {
         assert_eq!(ci_theta.len(), fit.theta.len());
         assert_eq!(ci_omega.len(), fit.omega.nrows());
         assert_eq!(ci_sigma.len(), fit.sigma.len());
+        // #1705: warfarin declares no kappa, so there is no κ interval — `None`,
+        // not `Some(vec![])`, so the writers and the bundle stay byte-identical.
+        assert_eq!(out.sir_ci_kappa, None);
         // ESS is bounded by sir_samples; with sir_samples=8, sir_resamples=4
         // we expect ess > 0 and ess <= sir_samples.
         assert!(ess > 0.0 && ess <= opts.sir_samples as f64);
@@ -469,6 +473,102 @@ mod tests {
             err.contains("IOV") && err.contains("population"),
             "expected IOV-needs-population error, got: {}",
             err
+        );
+    }
+
+    /// The bits of a SIR CI vector, so `assert_eq!` compares exactly and a `NaN`
+    /// endpoint cannot compare equal to anything but the same `NaN`.
+    fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
+        ci.as_ref()
+            .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
+    }
+
+    /// #1705: `sir_ci_kappa` is filled on **both** SIR paths and they agree to the
+    /// bit — `fit(sir = true)` and `run_sir` on the same fit, model, population
+    /// and options. `warfarin_iov` (one kappa on CL, analytic one-compartment
+    /// oral, FOCE as the file declares it; covariance forced on here).
+    ///
+    /// The standalone input has every SIR field cleared, so a `run_sir` that
+    /// stopped filling `sir_ci_kappa` cannot pass on the value it inherited from
+    /// the clone. Mutations, one per side: drop the fill in `run_sir` → the
+    /// "standalone" `expect` dies; drop it in `fit()` → the "in-fit" `expect`
+    /// dies. θ/Ω/σ/ESS ride along as bits, so a κ column that perturbed the
+    /// resampling on one path only would show here too.
+    ///
+    /// Not a bracketing test: this fixture's ESS is low (4.9 of 1000 measured on
+    /// macOS), so its CI is a handful of distinct draws. Bracketing and the
+    /// agreement with the Wald interval are pinned on `mbma_placebo`
+    /// (`tests/sir_ci_kappa.rs`, Tier 3), where ESS is ~143.
+    #[test]
+    fn in_fit_and_standalone_sir_report_the_same_kappa_ci() {
+        let prep =
+            crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+                .expect("prepare warfarin_iov");
+        let opts = FitOptions {
+            verbose: false,
+            run_covariance_step: true,
+            sir: true,
+            sir_samples: 300,
+            sir_resamples: 100,
+            sir_seed: Some(1705),
+            ..prep.parsed.fit_options.clone()
+        };
+        let model = &prep.parsed.model;
+        let pop = &prep.population;
+        let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit warfarin_iov");
+        assert!(
+            fit.covariance_matrix.is_some(),
+            "the covariance step must succeed, or neither SIR path runs"
+        );
+
+        let mut bare = fit.clone();
+        bare.sir_ci_theta = None;
+        bare.sir_ci_omega = None;
+        bare.sir_ci_sigma = None;
+        bare.sir_ci_kappa = None;
+        bare.sir_ess = None;
+        let standalone = run_sir(&bare, Some(model), Some(pop), &opts).expect("run_sir");
+
+        let k_fit = fit
+            .sir_ci_kappa
+            .as_ref()
+            .expect("in-fit SIR filled no sir_ci_kappa");
+        let k_sa = standalone
+            .sir_ci_kappa
+            .as_ref()
+            .expect("standalone run_sir filled no sir_ci_kappa");
+        assert_eq!(k_fit.len(), fit.kappa_names.len(), "one CI per kappa");
+        for &(lo, hi) in k_fit {
+            assert!(lo.is_finite() && hi.is_finite(), "κ CI [{lo}, {hi}]");
+            assert!(
+                0.0 < lo && lo <= hi,
+                "κ CI [{lo}, {hi}] is not a variance interval"
+            );
+        }
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_kappa),
+            ci_bits(&fit.sir_ci_kappa),
+            "κ: {k_sa:?} vs {k_fit:?}"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "θ"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_omega),
+            ci_bits(&fit.sir_ci_omega),
+            "Ω"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_sigma),
+            ci_bits(&fit.sir_ci_sigma),
+            "σ"
+        );
+        assert_eq!(
+            standalone.sir_ess.map(f64::to_bits),
+            fit.sir_ess.map(f64::to_bits),
+            "ESS"
         );
     }
 
