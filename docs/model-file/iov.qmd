@@ -71,7 +71,7 @@ reports an `SD` for both rows.
 
 A kappa that enters two parameters on different scales, or that no parameter
 reads, is custom. A weighted kappa is classified on the expression as written,
-before the `weight =` rewrite, and its SD is labelled `at weight 1` (see
+before the `weight =` rewrite, and its CV% or SD is labelled `at weight 1` (see
 [What is reported](#what-is-reported)). The classification is stored on
 `FitResult.kappa_param_types`, parallel to `kappa_names`.
 
@@ -166,8 +166,9 @@ puts a **variance-structure decision inside a structural expression**:
 ### What is reported
 
 The estimate stays the **unweighted** $\gamma^2$ — the quantity a published MBMA
-reports. Its SD is labelled `at weight 1`, the SD of a one-subject arm, and the fit
-prints the effective SD at the median arm on the next line:
+reports. Its SD — or, for a log-normal kappa, its CV% (#1666) — is labelled
+`at weight 1`, the figure of a one-subject arm, and the fit prints the effective SD
+at the median arm on the next line:
 
 ```
 --- KAPPA (IOV) Estimates ---
@@ -193,7 +194,9 @@ omega_iov:
     se: 0.412000
 ```
 
-`variance` stays the unweighted $\gamma^2$; an unweighted kappa's entry is unchanged.
+`variance` stays the unweighted $\gamma^2$, and its `cv_pct` (log-normal) or `sd`
+line is the weight-1 figure; the typical arm is read from `sd_at_typical_weight`
+(times 100 for a log-normal kappa's CV%). An unweighted kappa's entry is unchanged.
 
 ### Rules and diagnostics
 
