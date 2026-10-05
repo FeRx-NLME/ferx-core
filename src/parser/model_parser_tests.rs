@@ -28497,11 +28497,18 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             Custom,
         ),
     ];
+    let mut wrong = Vec::new();
     for (label, tail, want) in rows {
         let (eta, kappa) = re_scale_twins(&format!("{head}{tail}"));
-        assert_eq!(eta, [("CL".into(), want)], "ETA: {label}");
-        assert_eq!(kappa, want, "kappa: {label}");
+        if eta != [("CL".into(), want)] {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
     }
+    // Every wrong row and side at once, so a failure names all it broke.
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// #1673: a definition is read only while it is in force — after it, up to the
@@ -28510,7 +28517,7 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
 #[test]
 fn a_definition_is_read_only_while_it_is_in_force() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, &str, EtaParamType); 3] = [
+    let rows: [(&str, &str, &str, EtaParamType); 5] = [
         (
             // Dies under: readers scanned from the first statement, not from
             // the one after the definition (`CLX` reads the earlier `ECL`).
@@ -28539,12 +28546,42 @@ fn a_definition_is_read_only_while_it_is_in_force() {
             "CL",
             Additive,
         ),
+        (
+            // Dies under: a body that is neither nested in nor enclosing the
+            // definition treated as a sibling branch (#1687 review finding 1:
+            // the readers in the second `if` were dropped, so `ECL` read as a
+            // parameter). Was LogNormal before this PR, Additive at its first head.
+            "defined in one if, read in a later if",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    ECL = RE\n  } else {\n    ECL = RE + 0\n  }\n  \
+             if (SEX > 0) {\n    CL = TVCL * exp(ECL)\n  } else {\n    CL = TVCL * exp(ECL) * 2\n  }",
+            "ECL",
+            LogNormal,
+        ),
+        (
+            // Dies under: the same (#1687 review finding 2: the reassignment in
+            // the second `if` was not followed). Where `SEX > 0` the consumer
+            // sees `CL * TVV`, elsewhere the additive value, so the scales
+            // disagree. Was Additive.
+            "consumed, reassigned in a later if",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = TVCL\n  }\n  \
+             if (SEX > 0) {\n    CL = CL * TVV\n  }",
+            "CL",
+            Custom,
+        ),
     ];
+    let mut wrong = Vec::new();
     for (label, indiv, param, want) in rows {
         let (eta, kappa) = re_scale_twins(indiv);
-        assert_eq!(eta, [(param.into(), want)], "ETA: {label}");
-        assert_eq!(kappa, want, "kappa: {label}");
+        if eta != [(param.into(), want)] {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// `[individual_parameters]` statements parsed alone, with `ETA_CL` the one BSV

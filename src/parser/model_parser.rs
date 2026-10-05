@@ -2128,15 +2128,18 @@ fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expre
     flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
 }
 
-/// [`flatten_assigns`], also recording each assignment's **scope**: the ids of
-/// the `if` bodies enclosing it, outermost first (`[]` at top level). Every
-/// body gets a fresh id, so two sibling branches never share one.
+/// The `if` branches enclosing an assignment, outermost first (`[]` at top
+/// level): each is `(if statement, branch)`, the statement numbered in
+/// flattening order and the branch by position, `else` last.
+type Scope = Vec<(usize, usize)>;
+
+/// [`flatten_assigns`], also recording each assignment's [`Scope`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
-    scope: &mut Vec<usize>,
-    next_body: &mut usize,
+    scope: &mut Scope,
+    next_if: &mut usize,
     out: &mut Vec<(&'a str, &'a Expression)>,
-    scopes: &mut Vec<Vec<usize>>,
+    scopes: &mut Vec<Scope>,
 ) {
     for s in stmts {
         match s {
@@ -2148,15 +2151,28 @@ fn flatten_assigns_scoped<'a>(
                 branches,
                 else_body,
             } => {
-                for body in branches.iter().map(|(_, b)| b).chain(else_body) {
-                    *next_body += 1;
-                    scope.push(*next_body);
-                    flatten_assigns_scoped(body, scope, next_body, out, scopes);
+                *next_if += 1;
+                let id = *next_if;
+                let bodies = branches.iter().map(|(_, b)| b).chain(else_body);
+                for (branch, body) in bodies.enumerate() {
+                    scope.push((id, branch));
+                    flatten_assigns_scoped(body, scope, next_if, out, scopes);
                     scope.pop();
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Whether two assignments sit in different branches of one `if` statement, so
+/// that no evaluation runs both. Two scopes agree up to the first `if` where
+/// they part: the same statement with different branches is that case, while a
+/// different statement (two `if`s one after the other) is not (#1687 review).
+fn in_sibling_branches(a: &Scope, b: &Scope) -> bool {
+    match a.iter().zip(b).find(|(x, y)| x != y) {
+        Some(((if_a, _), (if_b, _))) => if_a == if_b,
+        None => false,
     }
 }
 
@@ -2179,7 +2195,7 @@ thread_local! {
 /// so it is computed once (`memo`) however many paths reach it (#1674).
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
-    scopes: Vec<Vec<usize>>,
+    scopes: Vec<Scope>,
     consumers: &'a HashSet<String>,
     memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
 }
@@ -2225,9 +2241,11 @@ impl<'a> ScaleWalk<'a> {
     ///
     /// The definition is **in force** from the next assignment up to and
     /// including the first later assignment to the same variable in the same or
-    /// an enclosing scope (a reassignment inside an `if` leaves it live on the
-    /// other path); an assignment in a sibling `if` branch never sees it. Its
-    /// **readers** are the assignments in that range that read the variable.
+    /// an enclosing scope (a reassignment inside an `if`, including a later
+    /// `if`, leaves it live on the other path); an assignment in the other
+    /// branch of the `if` that holds the definition never sees it
+    /// ([`in_sibling_branches`]). Its **readers** are the assignments in that
+    /// range that read the variable.
     ///
     /// A variable a consuming block reads (`consumers`, built by
     /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
@@ -2256,8 +2274,8 @@ impl<'a> ScaleWalk<'a> {
         let (mut read, mut replaced) = (false, false);
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
-            if !(other.starts_with(scope) || scope.starts_with(other)) {
-                continue; // a sibling branch never sees this definition
+            if in_sibling_branches(scope, other) {
+                continue; // the other branch of an `if` never sees this definition
             }
             if !consumed || *lhs == var {
                 for s in leaf_scales(e, &is_var) {
