@@ -28680,3 +28680,401 @@ fn a_self_reassignment_terminates() {
     let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
     assert_eq!(kappa, LogNormal);
 }
+
+// ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
+
+/// A diamond of intermediates `depth` levels deep on top of `X0 = x0`, with
+/// `op` joining each level: `B = X op 2`, `C = X op 3`, `X' = B op C`. Every
+/// `X` is reached by `2^level` paths.
+fn op_diamond(depth: usize, x0: &str, op: &str) -> String {
+    let mut s = format!("X0 = {x0}\n");
+    for i in 0..depth {
+        s += &format!(
+            "B{i} = X{i} {op} 2\nC{i} = X{i} {op} 3\nX{n} = B{i} {op} C{i}\n",
+            n = i + 1
+        );
+    }
+    s
+}
+
+/// Statements parsed alone, every assigned name in scope as a variable.
+fn stmts_of(src: &str, tn: &[String], en: &[String]) -> Vec<Statement> {
+    let assigned: Vec<String> = src
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim().to_string()))
+        .collect();
+    let ctx = ParseCtx::new(tn, en, &assigned);
+    parse_block_statements(src, ctx, StatementMode::Plain).expect("parses")
+}
+
+/// `(mu-refs, covariate groups, nodes the inliner handled)` for `src`, with
+/// thetas `TVCL`, `TVV` and the one eta `ETA_CL`. Statement-level, so neither
+/// the forward-reference guard nor the symbolic partials (#1684's follow-up)
+/// run.
+fn inline_counted(src: &str) -> (HashMap<String, MuRef>, Vec<CovariateMuRef>, usize) {
+    let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = vec!["ETA_CL".to_string()];
+    let stmts = stmts_of(src, &tn, &en);
+    super::INLINED_NODES.with(|c| c.set(0));
+    let mu = detect_mu_refs(&stmts, &tn, &en, &[]);
+    let groups = detect_covariate_mu_refs(&stmts, &tn, &en, 1, &HashSet::new());
+    (mu, groups, super::INLINED_NODES.with(|c| c.get()))
+}
+
+/// #1684: the mu-reference scans read local definitions through an
+/// [`InlineScope`], so on a diamond they handle a fixed number of nodes per
+/// level — linear in the depth — where building the inlined tree cloned
+/// `2^depth` nodes (measured before the fix, both scans together, with the
+/// `+` diamond in a full parse: 104 079 cloned nodes at depth 10, 106 954 103
+/// at depth 20). The depths are checked in increasing order, so a regression
+/// fails at depth 20 instead of running depth 30.
+///
+/// Three diamonds, one per path the scans take into a definition:
+///
+/// - `+`, the #1684 report: `CL = TVCL * exp(ETA_CL + X)`. Every diamond line
+///   misses on its raw form and is classified again inlined.
+/// - `+` under `inv_logit(X + ETA_CL)`: the covariate scan splits the sum and
+///   keeps `X` whole. No mu-reference (`X` is not a theta), one theta.
+/// - `*` over a covariate: `T = TVCL`, `CL = X * T * exp(ETA_CL)`. The raw
+///   form has no anchor, so `CL` is classified inlined: the anchor walk enters
+///   `X` and finds none, `find_exp_eta_in_mul` meets `X` before `exp` and must
+///   not walk it, and the covariate scan splits off `X` whole and reads it
+///   once. A mu-reference on `TVCL` at every depth.
+/// - `*` over a theta: `CL = X * exp(ETA_CL)`. `X` holds `2^depth` copies of
+///   `TVV` on its product chain; the anchor list is capped at two. No
+///   mu-reference past depth 0.
+///
+/// Dies under (each on the inliner's side only;
+/// `the_coupling_walk_is_linear_on_a_diamond` stays green): removing the memo
+/// lookup in `Inlined::mul_anchors` (`*` diamonds); removing `truncate(2)` in
+/// `mul_anchors_of` (`*` over a theta); removing the memo lookup in
+/// `Inlined::typical_summary` (`*` over a covariate); the `is_definition` early
+/// return in `rhs_contains_eta` or in `find_exp_eta_in_mul` (`*` over a
+/// covariate); `flatten_chain` through definitions in `split_typical_and_eta`
+/// (`*` over a covariate) or in `split_sum_eta` (`+` under `inv_logit`);
+/// classifying a materialised copy instead of the view in `detect_mu_refs`
+/// (`+` diamond).
+#[test]
+fn the_inliner_is_linear_on_a_diamond() {
+    type Want = fn(usize) -> Option<&'static str>;
+    let cases: [(&str, &str, &str, &str, Want); 4] = [
+        (
+            "+ diamond",
+            "TVV",
+            "+",
+            "CL = TVCL * exp(ETA_CL + X{d})\n",
+            |_| Some("TVCL"),
+        ),
+        (
+            "+ under inv_logit",
+            "TVV",
+            "+",
+            "CL = inv_logit(X{d} + ETA_CL)\n",
+            |_| None,
+        ),
+        (
+            "* over a covariate",
+            "WT",
+            "*",
+            "T = TVCL\nCL = X{d} * T * exp(ETA_CL)\n",
+            |_| Some("TVCL"),
+        ),
+        (
+            "* over a theta",
+            "TVV",
+            "*",
+            "CL = X{d} * exp(ETA_CL)\n",
+            |d| (d == 0).then_some("TVV"),
+        ),
+    ];
+    for (label, x0, op, tail, want) in cases {
+        let count = |d: usize| {
+            let src = op_diamond(d, x0, op) + &tail.replace("{d}", &d.to_string());
+            let (mu, groups, nodes) = inline_counted(&src);
+            // The answer, not just the cost.
+            assert_eq!(
+                mu.get("ETA_CL").map(|m| m.theta_name.as_str()),
+                want(d),
+                "inliner, {label}, depth {d}: mu-ref"
+            );
+            assert!(
+                groups.is_empty(),
+                "inliner, {label}, depth {d}: one theta, no group"
+            );
+            nodes
+        };
+        // From depth 1: level 0 reads `X0` directly, a different first step.
+        let c1 = count(1);
+        let per_level = count(2) - c1;
+        assert!(
+            per_level > 0,
+            "inliner, {label}: the diamond reaches the scans"
+        );
+        for d in [10, 20, 30] {
+            assert_eq!(
+                count(d) - c1,
+                (d - 1) * per_level,
+                "inliner, {label}: depth {d} is linear"
+            );
+        }
+    }
+}
+
+/// A self-reference assigned once (`X = X + TVV`) does not resolve into
+/// itself: inside a definition only names written *before* it resolve. The
+/// statement-level scan bypasses the forward-reference guard that rejects
+/// this line in a model file. It runs on a thread with a deadline, so a
+/// resolution loop fails the test instead of hanging it.
+/// Dies under: `at < limit` → `at <= limit` in `Inlined::resolve`, which
+/// resolves `X` into its own body without end (stack overflow).
+#[test]
+fn the_inliner_terminates_on_a_self_reference() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mu, groups, _) = inline_counted("X = X + TVV\nCL = X * exp(ETA_CL)\nV = TVV * X\n");
+        let _ = tx.send((mu.len(), groups.len()));
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("inliner: the scan terminates on a self-reference");
+    // `X` reads the unresolved name `X` and `TVV`: no anchor of its own, one theta.
+    assert_eq!(got, (0, 0), "inliner: nothing to anchor");
+}
+
+/// `level_block_eta_coupling` for `src` as `[individual_parameters]`, with
+/// `ETA_E0` the one random effect and the readout `y = E0 + PLACEBO`, where
+/// `PLACEBO` is the level block; and the `var_constant` calls it made.
+fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
+    let tn: Vec<String> = vec!["TVE0".to_string()];
+    let en: Vec<String> = vec!["ETA_E0".to_string()];
+    let stmts = stmts_of(src, &tn, &en);
+    let block = Expression::ThetaGather {
+        spec: std::sync::Arc::new(GatherSpec {
+            name: "PLACEBO".to_string(),
+            levels: vec![LevelRule::Free(1), LevelRule::Free(2)],
+        }),
+        idx: Box::new(Expression::Covariate("STUDY".to_string())),
+    };
+    let readout = [Expression::BinOp(
+        Box::new(Expression::Variable("E0".to_string())),
+        BinOp::Add,
+        Box::new(block),
+    )];
+    let states = StateInputs::new(&[], true, None, PkModel::OneCptIv, &HashMap::new(), &[]);
+    super::VAR_CONSTANT_CALLS.with(|c| c.set(0));
+    let c = level_block_eta_coupling(&stmts, &readout, "PLACEBO", 0, "ETA_E0", &states);
+    (c, super::VAR_CONSTANT_CALLS.with(|c| c.get()))
+}
+
+/// #1676: `var_constant` is memoised per variable for one
+/// `level_block_eta_coupling` call, so on a diamond under the random effect's
+/// parameter it makes a fixed number of calls per level, where the walk by
+/// path made `2^depth` (measured before the fix, in a full parse: 28 583
+/// calls at depth 10, 29 359 969 at depth 20). The answer is checked at every
+/// depth too: the readout `E0 + PLACEBO` is the one funnel, reached through
+/// `E0`, and the covariate `WT` at the bottom of the diamond reaches it
+/// through the memo.
+/// Dies under (on the coupling's side only; `the_inliner_is_linear_on_a_diamond`
+/// stays green): removing the memo lookup in `var_constant`; storing the
+/// memo's covariates as `Some(Vec::new())` (the funnel's `WT` goes missing).
+#[test]
+fn the_coupling_walk_is_linear_on_a_diamond() {
+    let count = |d: usize| {
+        let src = op_diamond(d, "TVE0 * WT", "+") + &format!("E0 = X{d} + ETA_E0\n");
+        let (c, calls) = coupling_counted(&src);
+        let want = vec![Funnel {
+            site: ScaleShare {
+                param: None,
+                eta_via: Some("E0".to_string()),
+            },
+            covariates: vec!["WT".to_string()],
+        }];
+        assert_eq!(c.funnels, want, "coupling, depth {d}: funnels");
+        assert_eq!(
+            c.reach,
+            Some(EtaRoute::Via("E0".to_string())),
+            "coupling, depth {d}"
+        );
+        calls
+    };
+    let c0 = count(0);
+    let per_level = count(1) - c0;
+    assert!(per_level > 0, "coupling: the diamond reaches var_constant");
+    for d in [10, 20, 30] {
+        assert_eq!(
+            count(d) - c0,
+            d * per_level,
+            "coupling: depth {d} is linear"
+        );
+    }
+}
+
+/// A self-reassignment (`E0 = E0 + 1`) is a cycle for `var_constant`: it still
+/// terminates, and the parameter still varies, the cycle guard's answer, now
+/// memoised.
+/// Dies under: removing the `stack` cycle guard in `var_constant` (unbounded
+/// recursion; the memo is written only after the walk, so it cannot stand in
+/// for the guard).
+#[test]
+fn the_coupling_walk_terminates_on_a_self_reassignment() {
+    let (c, calls) = coupling_counted("E0 = TVE0 + ETA_E0\nE0 = E0 + 1\n");
+    assert!(c.funnels.is_empty(), "coupling: E0 varies, so no funnel");
+    assert_eq!(c.reach, Some(EtaRoute::Via("E0".to_string())));
+    assert!(calls > 0, "coupling: var_constant ran");
+}
+
+/// The pre-#1684 inliner, kept as the oracle for [`InlineScope`]: each
+/// definition is resolved where it is written and stored as a full tree, and
+/// a use substitutes a copy (exponential on a diamond, which is why it is
+/// test-only now). One entry per statement: the inlined right-hand side of
+/// an assignment.
+fn eager_inlined(stmts: &[Statement]) -> Vec<Option<Expression>> {
+    fn inline(expr: &Expression, defs: &HashMap<String, Expression>) -> Expression {
+        match expr {
+            Expression::Variable(name) | Expression::Covariate(name) => match defs.get(name) {
+                Some(def) => def.clone(),
+                None => expr.clone(),
+            },
+            Expression::BinOp(l, op, r) => {
+                Expression::BinOp(Box::new(inline(l, defs)), *op, Box::new(inline(r, defs)))
+            }
+            Expression::Power(b, e) => {
+                Expression::Power(Box::new(inline(b, defs)), Box::new(inline(e, defs)))
+            }
+            Expression::UnaryFn(name, a) => {
+                Expression::UnaryFn(name.clone(), Box::new(inline(a, defs)))
+            }
+            _ => expr.clone(),
+        }
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    count_all_assignments(stmts, &mut counts);
+    let mut defs: HashMap<String, Expression> = HashMap::new();
+    stmts
+        .iter()
+        .map(|s| {
+            let Statement::Assign(name, raw) = s else {
+                return None;
+            };
+            let inlined = inline(raw, &defs);
+            if counts[name.as_str()] == 1 && !expr_contains_eta(raw) {
+                defs.insert(name.clone(), inlined.clone());
+            }
+            Some(inlined)
+        })
+        .collect()
+}
+
+/// Every top-level right-hand side, read through [`InlineScope`] and built by
+/// the [`eager_inlined`] oracle: the same tree, the same mu-reference, the
+/// same covariate group, the same eta for retirement. Returns `(right-hand
+/// sides compared, right-hand sides inlining changed)`.
+fn assert_inliner_matches_eager(
+    label: &str,
+    stmts: &[Statement],
+    tn: &[String],
+    en: &[String],
+    n_bsv: usize,
+) -> (usize, usize) {
+    let eager = eager_inlined(stmts);
+    let mut scope = InlineScope::new(stmts);
+    let (mut n, mut changed) = (0, 0);
+    for (at, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, raw) = s else {
+            continue;
+        };
+        let want = eager[at].as_ref().expect("an assignment");
+        let view = scope.view(at, raw);
+        let got = view.materialise();
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{want:?}"),
+            "{label}: `{name}` tree"
+        );
+        n += 1;
+        changed += usize::from(format!("{raw:?}") != format!("{want:?}"));
+        assert_eq!(
+            format!("{:?}", classify_mu_ref(view, tn, en, &[])),
+            format!("{:?}", classify_mu_ref(want, tn, en, &[])),
+            "{label}: `{name}` mu-ref"
+        );
+        assert_eq!(
+            format!("{:?}", classify_covariate_mu_ref(view, tn, en, n_bsv)),
+            format!("{:?}", classify_covariate_mu_ref(want, tn, en, n_bsv)),
+            "{label}: `{name}` covariate group"
+        );
+        assert_eq!(
+            split_typical_and_eta(view).map(|(_, e, t)| (e, t)),
+            split_typical_and_eta(want).map(|(_, e, t)| (e, t)),
+            "{label}: `{name}` split"
+        );
+        scope.record(at, name, raw);
+    }
+    (n, changed)
+}
+
+/// #1684 equivalence: on every example model's `[individual_parameters]`, as
+/// the full parse hands them to the scans, the lazy inliner reads the same
+/// tree as the eager one and classifies it the same way. Plus statement-level
+/// shapes the examples lack: a definition inside a conditional (substitution
+/// stops there), a forward reference (it resolves against the definition's
+/// own scope), the written-out logit forms, a chain through a pure alias, and
+/// a product with the definition in the middle (the built typical value
+/// re-associates through it).
+/// Dies under: substitution into a conditional (`frozen` ignored in
+/// `Inlined::resolve`); use-site resolution (`limit` not narrowed to the
+/// definition's index); `flatten_chain` not flattening through definitions in
+/// `TypicalParts::build`.
+#[test]
+fn the_inliner_matches_the_eager_one() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+    let mut paths: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    paths.sort();
+    let (mut models, mut seen, mut changed) = (0, 0, 0);
+    for p in &paths {
+        super::MU_REF_SCAN_INPUT.with(|c| *c.borrow_mut() = None);
+        let text = std::fs::read_to_string(p).unwrap();
+        if parse_full_model(&text).is_err() {
+            continue; // a feature this build lacks
+        }
+        let Some((stmts, tn, en, n_bsv)) = super::MU_REF_SCAN_INPUT.with(|c| c.borrow_mut().take())
+        else {
+            continue;
+        };
+        let label = p.file_name().unwrap().to_string_lossy().to_string();
+        let (n, ch) = assert_inliner_matches_eager(&label, &stmts, &tn, &en, n_bsv);
+        models += 1;
+        seen += n;
+        changed += ch;
+    }
+    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
+    let shapes = [
+        "A = TVV\nB = if (WT > 70) A else TVCL\nCL = B * exp(ETA_CL)",
+        "A = FOO\nFOO = TVCL\nCL = A * exp(ETA_CL)",
+        "L = TVCL + TH_WT * WT\nCL = 1 / (1 + exp(-(L + ETA_CL)))\nV = 1 / (1 + exp(-L - ETA_V))",
+        "L = TVCL\nM = L\nCL = inv_logit(logit(M) + ETA_CL)\nV = exp(log(M * WT) + ETA_V)",
+        "X = TVV * TH_WT * WT\nCL = 2 * X * exp(ETA_CL) * TVCL\nV = (TVCL + X + WT) * exp(ETA_V)",
+        "X = TVCL\nY = X ^ TH_WT\nCL = Y * exp(ETA_CL + ETA_V)",
+    ];
+    for (i, src) in shapes.iter().enumerate() {
+        let stmts = stmts_of(src, &tn, &en);
+        let (n, ch) = assert_inliner_matches_eager(&format!("shape {i}"), &stmts, &tn, &en, 2);
+        seen += n;
+        changed += ch;
+    }
+    // Not vacuous: models were replayed, and inlining changed many right-hand sides.
+    assert!(models >= 60, "{models} example models replayed");
+    // Measured: 12 of 366 under `--features ci`.
+    assert!(
+        changed >= 12,
+        "{changed} of {seen} right-hand sides changed by inlining"
+    );
+}
