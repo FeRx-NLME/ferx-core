@@ -2846,6 +2846,57 @@ mod bind_from_fit {
         bind(&text, &mut design, &b).expect("contiguous groups bind");
     }
 
+    /// #1680 review r1, finding 1: a recorded contrast that is not the one the block
+    /// declares. `ref` and `sum_to_zero` free the same number of θ, so an edited
+    /// `.fitrx` passes every count check and reads the fitted θ (levels 2..n against
+    /// level 1) as levels 1..n−1 with the last at minus their sum. Both directions,
+    /// and the control: under a declared `auto`, any resolved contrast is the fit's.
+    ///
+    /// Mutation — drop the declared-contrast comparison: both edited cells bind `Ok`.
+    #[test]
+    fn a_contrast_other_than_the_declared_one_is_refused() {
+        let text = model(true, false).replace(
+            "theta PLACEBO[STUDY, TIME](",
+            "theta PLACEBO[STUDY, TIME, contrast = ref](",
+        );
+        let b = fitted(&text);
+        assert_eq!(b.levels["PLACEBO"].contrast, LevelContrast::Ref);
+        let mut design = weighed(3, 2, 80.0);
+        bind(&text, &mut design, &b).expect("the fit's own contrast binds");
+
+        let mut edited = b.clone();
+        edited.levels.get_mut("PLACEBO").unwrap().contrast = LevelContrast::SumToZero;
+        assert_eq!(
+            refusal(&text, &edited),
+            "theta PLACEBO[STUDY, TIME]: the fit's level bindings record the contrast \
+             `sum_to_zero`, but this block declares `contrast = ref`. A fit records the \
+             contrast its block declares, so the bindings are malformed or belong to a \
+             different model."
+        );
+
+        let text = model(true, false).replace(
+            "theta PLACEBO[STUDY, TIME](",
+            "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](",
+        );
+        let mut edited = fitted(&text);
+        edited.levels.get_mut("PLACEBO").unwrap().contrast = LevelContrast::Ref;
+        assert!(
+            refusal(&text, &edited).contains(
+                "record the contrast `ref`, but this block declares `contrast = sum_to_zero`."
+            ),
+            "the other direction"
+        );
+
+        // Declared `auto`: the binding records what `auto` resolved to, and any
+        // resolved contrast passes the shape check.
+        let text = model(true, false);
+        let mut b = fitted(&text);
+        assert_eq!(b.levels["PLACEBO"].contrast, LevelContrast::SumToZero);
+        b.levels.get_mut("PLACEBO").unwrap().contrast = LevelContrast::Ref;
+        let mut design = weighed(3, 2, 80.0);
+        bind(&text, &mut design, &b).expect("under `auto`, the recorded contrast is the fit's");
+    }
+
     /// R4 and the unseen-level refusal pass through unchanged, and still write
     /// nothing.
     #[test]

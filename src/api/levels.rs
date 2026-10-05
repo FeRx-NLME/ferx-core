@@ -255,9 +255,11 @@ fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> Str
 
 /// Check a fit's level bindings against the blocks the model declares, before
 /// anything is written (#1621, #1672). A `.fitrx` bundle carries its bindings as
-/// data a caller can edit, so every shape the re-parse would otherwise accept (a θ
-/// the fit never had, a group whose free θ are not contiguous, a contrast nobody
-/// resolved) is refused here, with the fault placed in the bindings.
+/// data a caller can edit, so every shape a fit could not have written (a θ the fit
+/// never had, a contrast nobody resolved or the block does not declare, a split
+/// group) is refused here, with the fault placed in the bindings. Some of these the
+/// re-parse would accept silently; for the others this gives the message, and the
+/// guarantee that nothing was written first.
 fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> Result<(), String> {
     let mut extra: Vec<&str> = fitted
         .keys()
@@ -305,10 +307,17 @@ fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> R
     Ok(())
 }
 
-/// The two shapes a binding ferx wrote can never have (#1672): an unresolved
-/// `auto` contrast, and a contrast group whose levels are not contiguous. Shared by
-/// the from-fit validation and by a `debug_assert!` on [`bind_theta_levels`]'s own
-/// output, which is what measures the claim that ferx never writes either.
+/// The shapes a binding ferx wrote can never have (#1672): an unresolved `auto`
+/// contrast, a contrast other than the one the block declares, and a contrast group
+/// whose levels are not contiguous. Shared by the from-fit validation and by a
+/// `debug_assert!` on [`bind_theta_levels`]'s own output, which is what measures the
+/// claim that ferx never writes any of them.
+///
+/// The declared-contrast check is one the re-parse cannot make for itself: `ref` and
+/// `sum_to_zero` free the same number of θ, so a swapped contrast lays out a θ vector
+/// of the right length and reads the fitted values under the other convention (#1680
+/// review). A split group the parser refuses too; the check here gives the message,
+/// and the guarantee that nothing was written first.
 fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<(), String> {
     if binding.contrast == LevelContrast::Auto {
         return Err(format!(
@@ -316,6 +325,17 @@ fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<
              `auto`, and a fit never records `auto`, only the contrast it resolved to.",
             decl.name(),
             decl.columns().join(", ")
+        ));
+    }
+    if decl.contrast() != LevelContrast::Auto && binding.contrast != decl.contrast() {
+        return Err(format!(
+            "theta {}[{}]: the fit's level bindings record the contrast `{}`, but this block \
+             declares `contrast = {}`. A fit records the contrast its block declares, so the \
+             bindings are malformed or belong to a different model.",
+            decl.name(),
+            decl.columns().join(", "),
+            contrast_token(binding.contrast),
+            contrast_token(decl.contrast())
         ));
     }
     let split =
