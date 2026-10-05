@@ -3372,22 +3372,36 @@ mod absorption {
     const DEAD_LEVELS: &str =
         "has no effect on the predictions or the residual error at any of its records";
 
+    /// Whether the block coded by `contrast` loses rank on its own: some free θ
+    /// moves only levels with no effect (#1679, #1702 review F1). A dead level
+    /// costs nothing where the coding reaches it only through the other levels —
+    /// the reference under `ref`, one level per group under sum-to-zero.
+    pub(super) fn block_loses_rank(j: &Jac, contrast: LevelContrast) -> bool {
+        let xb = &j.xb * coding(j, contrast);
+        rank(&residual_sv(&xb, &DMatrix::zeros(xb.nrows(), 0))) < xb.ncols()
+    }
+
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
-    /// contrast exactly when the oracle says the block absorbs the random
-    /// effect under it (rank 0 against a positive baseline). Cells whose
-    /// contrast leaves no free θ are #1624's and skipped. `auto` must resolve
-    /// to a contrast that does not absorb, global whenever global does not, and
-    /// be refused only when every contrast absorbs. A cell whose block has a
-    /// level with no effect (`rank X_B < L`) is refused under every contrast by
-    /// the dead-level check (#1679); there are exactly 4.
+    /// contrast exactly when the oracle does: the block absorbs the random
+    /// effect under it (rank 0 against a positive baseline), or the coded block
+    /// loses rank on its own ([`block_loses_rank`]). Cells whose contrast leaves
+    /// no free θ are #1624's and skipped. `auto` must resolve to a contrast the
+    /// oracle accepts, global whenever global is accepted, and be refused only
+    /// when every contrast is. Exactly 4 cells have a level with no effect
+    /// (`rank X_B < L`); on those the verdict straddles — the within-group
+    /// contrast binds where no absorbed random effect takes the dead level's
+    /// slack (H10, and G at 2 subjects per study) and is refused where one does
+    /// (G at one) — and the dead cells are checked by the same oracle, not
+    /// skipped.
     ///
-    /// Mutations — `dead_levels` returns nothing (the 4 cells bind); the dead
-    /// check moved after `resolve_contrast` (G refuses with an absorption
-    /// message instead).
+    /// Mutations — `dead_levels` returns nothing (the dead cells bind under
+    /// `none`); the dead failure ignores the contrast (within is refused on H10);
+    /// the slack clause dropped (G within binds at one subject per study).
     #[test]
     fn binder_agrees_with_the_jacobian_oracle() {
         let mut wrong: Vec<String> = Vec::new();
         let mut dead_cells: Vec<String> = Vec::new();
+        let (mut dead_bound, mut dead_refused) = (0usize, 0usize);
         let mut seen: Vec<f64> = Vec::new();
         let (mut absorbed_cells, mut free_cells) = (0usize, 0usize);
         for (dtag, cols, pop) in designs() {
@@ -3395,21 +3409,11 @@ mod absorption {
                 let jac = jacobian(&shape(tag, cols, "none"), &pop);
                 // A shape that reads the block only through a factor of `TIME` (G,
                 // H10) gives a block keyed on TIME a level with no effect on `y` at
-                // TIME = 0, η or not (#1679). Such a cell has `rank X_B < L`: it must
-                // be refused under every contrast and under auto, by the dead-level
-                // check, before any random effect is looked at.
-                if rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0))) < jac.xb.ncols()
-                {
+                // TIME = 0, η or not (#1679).
+                let dead = rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0)))
+                    < jac.xb.ncols();
+                if dead {
                     dead_cells.push(format!("{dtag} {tag}"));
-                    for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
-                        match try_bind(&shape(tag, cols, c), &pop) {
-                            Err(e) if e.contains(DEAD_LEVELS) => {}
-                            got => wrong.push(format!(
-                                "{dtag} {tag} {c:?}: a dead level, but the binder gave {got:?}"
-                            )),
-                        }
-                    }
-                    continue;
                 }
                 let mut absorbs = HashMap::new();
                 for (c, token) in EXPLICIT {
@@ -3417,15 +3421,20 @@ mod absorption {
                     if free == 0 {
                         continue;
                     }
-                    let absorbed = base > 0 && under == 0;
+                    let absorbed = (base > 0 && under == 0) || block_loses_rank(&jac, c);
                     absorbed_cells += usize::from(absorbed);
                     free_cells += usize::from(!absorbed);
+                    if dead {
+                        dead_refused += usize::from(absorbed);
+                        dead_bound += usize::from(!absorbed);
+                    }
                     absorbs.insert(token, absorbed);
                     let got = try_bind(&shape(tag, cols, token), &pop);
                     if got.is_err() != absorbed {
                         wrong.push(format!(
-                            "{dtag} {tag} {token}: oracle rank {under} of {base} \
-                             ⇒ refuse={absorbed}, binder {got:?}"
+                            "{dtag} {tag} {token}: oracle rank {under} of {base}, block rank \
+                             loss {} ⇒ refuse={absorbed}, binder {got:?}",
+                            block_loses_rank(&jac, c)
                         ));
                     }
                 }
@@ -3481,6 +3490,14 @@ mod absorption {
                 "[STUDY,TIME] 2/study H10",
             ],
             "cells whose block has an unidentified level"
+        );
+        // The dead cells straddle: some contrasts carry their dead level, some
+        // do not (measured: within binds on 3 of the 4, and every other
+        // contrast is refused).
+        assert_eq!(
+            (dead_bound, dead_refused),
+            (3, 13),
+            "dead cells: bound / refused"
         );
         // Both sides of the gate must be exercised.
         assert!(
@@ -4124,7 +4141,7 @@ mod absorption {
             if free == 0 {
                 continue;
             }
-            let refuse = !absorbed.is_empty();
+            let refuse = !absorbed.is_empty() || block_loses_rank(&jac, c);
             absorbs.insert(token, refuse);
             let got = try_bind(&text(token), pop);
             if got.is_err() != refuse {
@@ -4705,18 +4722,31 @@ mod absorption {
         )
     }
 
-    /// D1 (#1679). The differential pair: G with no η on `[STUDY, TIME]` binds
-    /// global sum-to-zero on the "no 0" grid and is refused on `T6`, where each
-    /// study's `TIME = 0` level has no effect. Before the fix both bound
-    /// global (17). The oracle straddles: `rank X_B` 15 of 18 against 18 of 18.
+    /// D1 (#1679, #1702 review F1). G with no η on `[STUDY, TIME]`, three
+    /// studies: on `T6` each study's `TIME = 0` level has no effect (the oracle:
+    /// `rank X_B` 15 of 18, against 18 of 18 on the "no 0" grid). What that
+    /// costs depends on the contrast. Global sum-to-zero (three dead levels in
+    /// its one group), `ref` (two outside the reference) and `none` lose rank
+    /// and are refused; within (one per group) carries them, and auto takes it.
+    /// On the "no 0" grid auto is global. Before the fix both grids bound
+    /// global (17), so the pair straddles. And a one-column `[TIME]` block, whose
+    /// one dead level is the reference and the sum-to-zero's derived level at
+    /// once, binds under `ref` where its `[STUDY, TIME]` twin is refused.
     ///
-    /// The same refusal holds whatever carries the block to `y`, so a check that
-    /// only looked for a product with `TIME` misses all but G: an exponential
-    /// time course (G-exp), a one-column `[TIME]` block, an ODE state that
-    /// starts at 0, and a PK `CL` at the dose time.
+    /// Every spelling that carries the block to `y` is held to the same oracle,
+    /// over every contrast and on both grids — an exponential time course
+    /// (G-exp), an ODE state at its initial value, a PK `CL` at its own dose
+    /// time, `[TIME]` — so a check that only looked for a product with `TIME`
+    /// fails on all but G. The PK cell is dead by the time-varying covariate
+    /// convention (a record's value governs the interval ending at it), which
+    /// oracle and binder share; the NONMEM anchor nearest to it is
+    /// `tests/tvcov_intermediate_nonmem.rs` (an `EVID=2` covariate change on
+    /// ADVAN3), which pins that convention for an analytical model, not for a
+    /// level block.
     ///
-    /// Mutations — check only products with `TIME` (G-exp, ODE, PK bind);
-    /// `dead_levels` returns nothing (all bind).
+    /// Mutations — check only products with `TIME` (G-exp, ODE, PK bind under
+    /// `none`); `dead_levels` returns nothing (every `none` cell binds); the
+    /// failure ignores the contrast (within refused, `[TIME]` + `ref` refused).
     #[test]
     fn a_level_with_no_effect_at_time_zero_is_refused() {
         let t6 = cf_pop(3, 1, &T6);
@@ -4730,14 +4760,29 @@ mod absorption {
             (15, 18),
             "the oracle straddles"
         );
+        let g = |c: &str| g_no_eta("STUDY, TIME", c);
         assert_eq!(
-            try_bind(&g_no_eta("STUDY, TIME", ""), &no0),
+            try_bind(&g(""), &t6),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "T6"
+        );
+        assert_eq!(
+            try_bind(&g(""), &no0),
             Ok((LevelContrast::SumToZero, 17)),
             "no 0"
         );
+        for c in ["sum_to_zero", "ref", "none"] {
+            let err = try_bind(&g(c), &t6).expect_err(c);
+            has(&err, &[DEAD_LEVELS, &time_zero_labels(3).join(", ")]);
+        }
+        // The `ref` pair: the dead level is `[TIME]`'s reference.
+        assert_eq!(
+            try_bind(&g_no_eta("TIME", "ref"), &t6),
+            Ok((LevelContrast::Ref, 5)),
+            "[TIME], ref"
+        );
 
-        let g_exp =
-            |c: &str| g_no_eta("STUDY, TIME", c).replace(EMAXY, "EMAX * (1 - exp(-TIME / ET50))");
+        let g_exp = |c: &str| g(c).replace(EMAXY, "EMAX * (1 - exp(-TIME / ET50))");
         let ode = |c: &str| {
             cf_model(
                 c,
@@ -4756,47 +4801,57 @@ mod absorption {
                     "  CL = TVEMAX * exp(ETA_E0)",
                     "  CL = TVEMAX * exp(PLACEBO)",
                 )
-                .replace(
-                    "  y = central / V + E0 + PLACEBO",
-                    "  y = central / V + E0 + ETA_E0",
-                )
+                .replace("  y = central / V + E0 + PLACEBO", "  y = central / V + E0")
+                .replace("  E0 = TVE0", "  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)")
+                // k = 0.2 rather than 2: at k = 2 the `TIME = 12` level moves
+                // `y` by ~1e-8, live to the bitwise check (D4) but under the FD
+                // oracle's rank threshold, so the oracle would measure itself.
+                .replace("  V = TVET50", "  V = 10 * TVET50")
         };
         type Text<'a> = &'a dyn Fn(&str) -> String;
         let one_col = |c: &str| g_no_eta("TIME", c);
-        let cases: [(&str, Text, Vec<String>); 5] = [
-            ("G", &|c| g_no_eta("STUDY, TIME", c), time_zero_labels(3)),
-            ("G-exp", &g_exp, time_zero_labels(3)),
-            ("ODE", &ode, time_zero_labels(3)),
-            ("PK CL at the dose time", &pk, time_zero_labels(3)),
-            ("[TIME]", &one_col, vec!["`TIME=0`".to_string()]),
+        let cases: [(&str, Text, String); 5] = [
+            ("G", &g, time_zero_labels(3).join(", ")),
+            ("G-exp", &g_exp, time_zero_labels(3).join(", ")),
+            ("ODE", &ode, time_zero_labels(3).join(", ")),
+            (
+                "PK CL at the dose time",
+                &pk,
+                time_zero_labels(3).join(", "),
+            ),
+            ("[TIME]", &one_col, "`TIME=0`".to_string()),
         ];
+        let mut wrong = Vec::new();
         for (tag, text, labels) in cases {
-            for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
-                let block = if tag == "[TIME]" {
-                    "TIME"
-                } else {
-                    "STUDY, TIME"
-                };
-                let err = try_bind(&text(c), &t6).expect_err(&format!("{tag} {c:?}"));
-                has(
-                    &err,
-                    &[&format!(
-                        "theta PLACEBO[{block}]: each of these levels {DEAD_LEVELS}, so its θ \
-                         cannot be estimated under any contrast: {}.",
-                        labels.join(", ")
-                    )],
-                );
-            }
-            // The control: off `TIME = 0` every level is live, and auto binds.
-            assert!(try_bind(&text(""), &no0).is_ok(), "{tag} on the no-0 grid");
+            agrees_with_joint_oracle(&format!("{tag} T6"), text, &t6, &mut wrong);
+            agrees_with_joint_oracle(&format!("{tag} no 0"), text, &no0, &mut wrong);
+            let err = try_bind(&text("none"), &t6).expect_err(tag);
+            has(&err, &[DEAD_LEVELS, &labels]);
+            assert!(try_bind(&text("none"), &no0).is_ok(), "{tag}: none on no 0");
         }
+        assert!(
+            wrong.is_empty(),
+            "{} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
+    /// Every partial dead-level refusal ends with this caveat (#1702 review F3).
+    const CHECK_SEES: &str = " The check sees only the initial estimates and a point near \
+                              them, so a θ that switches the block off there (a lag or a \
+                              threshold) makes a live level look dead: check that θ's initial \
+                              estimate.";
+
     /// The dead-level refusals, sentence by sentence (message cells D1–D4 of
-    /// the #1679 plan), with both sides of the `TIME = 0` gate in one test:
-    /// every dead level at `TIME = 0` (G), every one at `TIME = 4`, and one at
-    /// each (a mixed set takes the general advice). Then every level dead (D3)
-    /// and more labels than are shown (D4).
+    /// the #1679 plan, and the contrast-aware cells of the #1702 review), each
+    /// conditional sentence with both sides of its gate here: the `TIME = 0`
+    /// advice (every listed level at `TIME = 0`, every one at `TIME = 4`, a
+    /// mixed set); the consequence (a contrast that carries the levels named,
+    /// or none exists); a rank loss against a slack (an absorbed η taking the
+    /// within-group constraint); and the absorption refusal's advice (within
+    /// named, or not when it cannot carry the dead levels either). Then every
+    /// level dead (D3) and more labels than are shown (D4).
     #[test]
     fn the_dead_level_refusal_says_what_the_levels_hold() {
         const AT_ZERO: &str = " Every one of them holds only records at `TIME = 0`.";
@@ -4804,50 +4859,113 @@ mod absorption {
                                 time, or read the block where it acts at `TIME = 0`.";
         const GENERAL_FIX: &str =
             " Key the block so those records share a level with records it acts on.";
+        const WITHIN_CARRIES: &str = " Under `contrast = sum_to_zero` that leaves θ the data \
+                                      cannot estimate, which `contrast = sum_to_zero_within` \
+                                      does not.";
+        const NO_CONTRAST: &str = " That leaves θ the data cannot estimate under any contrast.";
+        const MEASURED: &str = "at any of its records, at the initial estimates or at a nearby \
+                                point: ";
         let t6 = cf_pop(3, 1, &T6);
-        let at = |factor: &str| {
+        let at = |factor: &str, c: &str| {
             cf_model(
-                "",
+                c,
                 "STUDY, TIME",
                 &format!("{BASE}  E0 = TVE0 + PLACEBO * {factor}\n  Z = TVE0 * exp(ETA_E0)"),
                 &format!("E0 + {EMAXY}"),
             )
         };
-        // D1: every dead level at TIME = 0.
-        let err = try_bind(&at("TIME"), &t6).expect_err("TIME");
-        has(&err, &[AT_ZERO, ZERO_FIX]);
-        lacks(&err, &[GENERAL_FIX]);
-        assert!(err.ends_with(ZERO_FIX), "{err}");
-        // D2: every dead level at TIME = 4, then a mixed set.
-        for (factor, labels) in [
-            (
-                "(TIME - 4)",
+        // D1: every listed level at TIME = 0; within carries them.
+        let err = try_bind(&at("TIME", "sum_to_zero"), &t6).expect_err("TIME");
+        has(
+            &err,
+            &[
+                &format!(
+                    "theta PLACEBO[STUDY, TIME]: each of these levels {DEAD_LEVELS}, at the \
+                     initial estimates or at a nearby point: {}.",
+                    time_zero_labels(3).join(", ")
+                ),
+                &format!("{WITHIN_CARRIES}{AT_ZERO}{ZERO_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &[GENERAL_FIX, NO_CONTRAST]);
+        assert!(err.ends_with(CHECK_SEES), "{err}");
+        // D2: every listed level at TIME = 4, under `none`; within carries them.
+        let err = try_bind(&at("(TIME - 4)", "none"), &t6).expect_err("TIME - 4");
+        has(
+            &err,
+            &[
                 "`STUDY=1,TIME=4`, `STUDY=2,TIME=4`, `STUDY=3,TIME=4`.",
-            ),
-            (
-                "TIME * (TIME - 4)",
+                " Under `contrast = none` that leaves θ the data cannot estimate, which \
+                 `contrast = sum_to_zero_within` does not.",
+                &format!("{GENERAL_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["TIME = 0", "later time", NO_CONTRAST]);
+        // A mixed set, two per study: no contrast carries them, auto included.
+        let err = try_bind(&at("TIME * (TIME - 4)", ""), &t6).expect_err("mixed");
+        has(
+            &err,
+            &[
+                MEASURED,
                 "`STUDY=1,TIME=0`, `STUDY=1,TIME=4`, `STUDY=2,TIME=0`, `STUDY=2,TIME=4`, \
                  `STUDY=3,TIME=0` and 1 more.",
-            ),
-        ] {
-            let err = try_bind(&at(factor), &t6).expect_err(factor);
-            has(&err, &[DEAD_LEVELS, labels, GENERAL_FIX]);
-            lacks(&err, &["TIME = 0", "later time"]);
-            assert!(err.ends_with(GENERAL_FIX), "{err}");
-        }
+                &format!("{NO_CONTRAST}{GENERAL_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["TIME = 0", "Under `contrast"]);
         // D4: seven studies, five labels shown.
-        let err = try_bind(&at("TIME"), &cf_pop(7, 1, &T6)).expect_err("7 studies");
+        let err = try_bind(&at("TIME", "sum_to_zero"), &cf_pop(7, 1, &T6)).expect_err("7");
         has(
             &err,
             &[&format!("{} and 2 more.", time_zero_labels(5).join(", "))],
         );
         lacks(&err, &["`STUDY=6,TIME=0`"]);
+
+        // The slack: G with its η on `EMAX`, one subject per study. The η is
+        // absorbed, so within is the only candidate, and the dead `TIME = 0`
+        // level — which the η does not read either — takes each study's
+        // constraint. H10 (the η on `E0`, read at `TIME = 0`) is the other side.
+        let err = try_bind(&shape("G", "STUDY, TIME", ""), &t6).expect_err("G slack");
+        has(
+            &err,
+            &[
+                MEASURED,
+                &time_zero_labels(3).join(", "),
+                " Under `contrast = sum_to_zero_within` such a level takes its group's \
+                 sum-to-zero constraint, so the other levels reproduce the individual parameter \
+                 `EMAX` reads this block and carries a random effect — the two are the same \
+                 quantity, so the model is not identified.",
+                &format!("{AT_ZERO}{ZERO_FIX}{CHECK_SEES}"),
+            ],
+        );
+        lacks(&err, &["leaves θ the data cannot estimate"]);
+        assert_eq!(
+            try_bind(&shape("H10", "STUDY, TIME", ""), &t6),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "H10"
+        );
+        // The absorption refusal no longer advises a within that fails too.
+        let err = try_bind(&shape("G", "STUDY, TIME", "sum_to_zero"), &t6).expect_err("G s2z");
+        has(
+            &err,
+            &[
+                " `contrast = sum_to_zero_within` does not help: some levels have no effect at \
+               any of their records, which that contrast cannot carry either. Drop the random \
+               effect, or key the block so every level acts on its records.",
+            ],
+        );
+        lacks(&err, &[USE_WITHIN]);
+        let err = try_bind(&shape("H1", "STUDY, TIME", "sum_to_zero"), &t6).expect_err("H1");
+        has(&err, &[USE_WITHIN]);
+        lacks(&err, &["does not help"]);
+
         // D3: every level dead — the SLOPE0 twin with the slope fixed at 0.
         let err = try_bind(&slope0(true), &t6).expect_err("every level dead");
         assert_eq!(
             err,
-            "theta PLACEBO[STUDY, TIME]: no level of the block affects the likelihood; the \
-             block estimates nothing. Check the expression that reads it."
+            "theta PLACEBO[STUDY, TIME]: no level of the block affects the likelihood at the \
+             initial estimates or at a nearby point; the block estimates nothing. Check the \
+             expression that reads it."
         );
     }
 
@@ -4946,8 +5064,9 @@ mod absorption {
     /// D5 (#1679). A point where anything evaluates non-finite is inconclusive,
     /// and the level counts as live: here the jitter drives `TVN` negative, so
     /// `TVN ^ 0.5` is NaN on every record at the second point (`log` would not
-    /// do: it is floored), and the `TIME = 0` levels, dead at the first, bind. With `TVN` positive at both points the
-    /// same levels are refused — both sides of the gate.
+    /// do: it is floored), and the `TIME = 0` levels, dead at the first, bind
+    /// under global sum-to-zero. With `TVN` positive at both points the same
+    /// levels are refused there — both sides of the gate.
     ///
     /// Mutation — compare NaN bits like any others: the NaN point reads as
     /// unchanged and the levels are refused.
@@ -4955,7 +5074,7 @@ mod absorption {
     fn a_non_finite_evaluation_is_inconclusive() {
         let text = |bounds: &str| {
             cf_model(
-                "",
+                "sum_to_zero",
                 "STUDY, TIME",
                 &format!(
                     "{BASE}  E0 = TVE0 + TVN ^ 0.5 + PLACEBO * TIME\n  Z = TVE0 * exp(ETA_E0)"
@@ -5014,6 +5133,174 @@ mod absorption {
         let pk_only = joint.replace("[event_model]\n  cmt    = 3\n  hazard = H0\n", "");
         let err = try_bind(&pk_only, &pop).expect_err("no event model");
         has(&err, &["no level of the block affects the likelihood"]);
+    }
+
+    /// #1702 review F2. A θ initialised at the centre of tight bounds still
+    /// steps: `PLACEBO[STUDY, TIME](0.0, -0.1, 0.1)` with the block read
+    /// directly in `E0` is live everywhere and binds. Before the fix the step
+    /// fell back to the midpoint — the θ itself — at both points, and the block
+    /// was refused as estimating nothing. With `(0.0, -0.5, 0.5)` it bound
+    /// either way: the pair straddles the old fallback.
+    ///
+    /// Mutation — restore the midpoint fallback: the ±0.1 block is refused.
+    #[test]
+    fn a_theta_at_the_centre_of_tight_bounds_still_steps() {
+        let pop = cf_pop(3, 1, &NO0);
+        for bounds in ["(0.0, -0.1, 0.1)", "(0.0, -0.5, 0.5)"] {
+            let text = cf_model(
+                "",
+                "STUDY, TIME",
+                &format!("{BASE}  E0 = TVE0 + PLACEBO\n  Z = TVE0 * exp(ETA_E0)"),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace("(0.0, -10.0, 10.0)", bounds);
+            assert!(text.contains(bounds), "{bounds}");
+            assert_eq!(
+                try_bind(&text, &pop),
+                Ok((LevelContrast::SumToZero, 17)),
+                "{bounds}"
+            );
+        }
+        // The helper itself: never onto a bound, and back to `x` only with no room.
+        assert!((toward_interior(0.0, -0.1, 0.1, 0.13) - 0.05).abs() < 1e-15);
+        assert!((toward_interior(0.09, -0.1, 0.1, 0.25) + 0.005).abs() < 1e-15);
+        assert_eq!(toward_interior(1.0, 1.0, 1.0, 0.1), 1.0);
+    }
+
+    /// #1702 review F3. A θ that switches the block off near its initial
+    /// estimate makes a live level look dead at both points the check uses:
+    /// `E0 = TVE0 + PLACEBO * max(0, TIME - TLAG)` with `TLAG` at 2 leaves the
+    /// levels at `TIME` 0.5, 1 and 2 unmoved there, though any `TLAG` below
+    /// their time reads them. The check cannot see past that, so the refusal
+    /// says what it measured and points at such a θ.
+    ///
+    /// Mutation — drop the caveat sentence: this test and the message test die.
+    #[test]
+    fn a_theta_gated_read_names_what_the_check_saw() {
+        let text = cf_model(
+            "none",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO * max(0, TIME - TLAG)\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace(
+            "  theta TVET50(1.5, 0.1, 20.0)\n",
+            "  theta TVET50(1.5, 0.1, 20.0)\n  theta TLAG(2.0, 0.0, 24.0)\n",
+        );
+        let err = try_bind(&text, &cf_pop(3, 1, &NO0)).expect_err("TLAG");
+        has(
+            &err,
+            &[
+                "at the initial estimates or at a nearby point: `STUDY=1,TIME=0.5`, \
+                 `STUDY=1,TIME=1`, `STUDY=1,TIME=2`, `STUDY=2,TIME=0.5`, `STUDY=2,TIME=1` and \
+                 4 more.",
+                CHECK_SEES,
+            ],
+        );
+    }
+
+    /// #1702 review F4. K3′ is decided by the parameters that read each random
+    /// effect, not by the diagnostic clause. A kappa and an η in one
+    /// `CL = TVEMAX * exp(ETA_E0 + KAPPA_E0)`, reaching `y` only through the
+    /// states, are one random effect by two names on one occasion: K3′. A kappa
+    /// on `CL` and an η on `V` share the route but not the parameter: K3.
+    ///
+    /// Mutations — compare the clauses again: the route twin takes K3 (its
+    /// clauses name each random effect). Compare the routes only: κ-`CL` /
+    /// η-`V` takes K3′. Skip `if` branches when collecting the readers: the
+    /// branched κ-`CL` / η-`V` takes K3′.
+    #[test]
+    fn a_route_twin_is_named_by_its_parameter() {
+        let one_occ = occ_pop(3, 1, &T6, 1, false);
+        let route = |cl: &str, v: &str| {
+            shape("S2", "STUDY, TIME", "")
+                .replace("  CL = TVEMAX * exp(ETA_E0)", &format!("  CL = {cl}"))
+                .replace("  V = TVET50", &format!("  V = {v}"))
+                .replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+                )
+        };
+        let twin = route("TVEMAX * exp(ETA_E0 + KAPPA_E0)", "TVET50");
+        let err = try_bind(&twin, &one_occ).expect_err("twin");
+        has(&err, &[KAPPA_IS_ETA]);
+        let apart = route("TVEMAX * exp(KAPPA_E0)", "TVET50 * exp(ETA_E0)");
+        let err = try_bind(&apart, &one_occ).expect_err("apart");
+        has(
+            &err,
+            &["the levels absorb `ETA_E0` and `KAPPA_E0` together ("],
+        );
+        lacks(&err, &["single occasion"]);
+        // The same two, each read only inside an `if` branch: the readers walk
+        // the branches, or both would read as read by nothing — and equal.
+        let branched = route("TVEMAX", "TVET50").replace(
+            "  E0 = TVE0",
+            "  E0 = TVE0\n  if (STUDY > 0) {\n    CL = TVEMAX * exp(KAPPA_E0)\n    \
+             V = TVET50 * exp(ETA_E0)\n  }",
+        );
+        let err = try_bind(&branched, &one_occ).expect_err("branched");
+        has(
+            &err,
+            &["the levels absorb `ETA_E0` and `KAPPA_E0` together ("],
+        );
+        lacks(&err, &["single occasion"]);
+    }
+
+    /// #1702 review F5. On a one-column block K3′ adds that the block has to go
+    /// as well: dropping either random effect leaves one that each level is the
+    /// same quantity as. On `[STUDY, TIME]` it does not.
+    ///
+    /// Mutation — drop the clause: the one-column side dies.
+    #[test]
+    fn a_kappa_twin_on_a_one_column_block_also_removes_the_block() {
+        const ALSO: &str =
+            " Each `STUDY` level also lies within a single subject, so remove the block as well.";
+        let one_occ = occ_pop(3, 1, &T6, 1, false);
+        let err = try_bind(&kshape("K-E0", true, "STUDY", ""), &one_occ).expect_err("1-col");
+        has(
+            &err,
+            &[
+                KAPPA_IS_ETA,
+                &format!(" Drop one of the two random effects.{ALSO}"),
+            ],
+        );
+        let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", ""), &one_occ).expect_err("nested");
+        has(&err, &[KAPPA_IS_ETA]);
+        lacks(&err, &["remove the block"]);
+    }
+
+    /// #1702 review F6. Two kappas absorbed together leave each **occasion's**
+    /// mean to one of them under within; an η among them leaves each subject's.
+    /// The verdict is the joint oracle's on both.
+    ///
+    /// Mutation — "subject's" for every set: the kappa pair dies.
+    #[test]
+    fn two_kappas_absorbed_together_name_the_occasion() {
+        let periods = occ_pop(3, 1, &T6, 2, false);
+        let two_kappas = cf_model(
+            "",
+            "STUDY, TIME",
+            "  EMAX = TVEMAX + KAPPA_EM\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + KAPPA_E0\n  \
+             Z = TVE0 * exp(ETA_E0)",
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace(
+            "  omega ETA_E0 ~ 0.1\n",
+            "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n  kappa KAPPA_EM ~ 0.1\n",
+        );
+        let jac = jacobian(
+            &two_kappas.replace(
+                "PLACEBO[STUDY, TIME]",
+                "PLACEBO[STUDY, TIME, contrast = none]",
+            ),
+            &periods,
+        );
+        let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZeroWithin);
+        assert_eq!(absorbed.len(), 2, "oracle: {absorbed:?}");
+        let err = try_bind(&two_kappas, &periods).expect_err("κ + κ");
+        has(&err, &["leaves each occasion's mean to one of them"]);
+        let err = try_bind(&kshape("K-E0", true, "STUDY, TIME", ""), &periods).expect_err("η + κ");
+        has(&err, &["leaves each subject's mean to one of them"]);
     }
 
     /// The whole #1678 grid, slow-gated: block columns `[STUDY]`, `[STUDY,

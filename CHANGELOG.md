@@ -160,12 +160,15 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
-- **A level block with a level that has no effect on the likelihood is refused**
-  ([#1679](https://github.com/FeRx-NLME/ferx-core/issues/1679)). On `PLACEBO[STUDY, TIME]` read
-  through a factor that vanishes at `TIME = 0` (`PLACEBO * TIME`, a block on `EMAX` in
-  `EMAX * TIME / (TIME + ET50)`, an ODE state at its initial value), each study's `TIME = 0`
-  level estimated nothing and was bound anyway, leaving a flat direction under every contrast.
-  The refusal lists the levels and, when they hold only `TIME = 0` records, says so.
+- **A level block whose levels have no effect on the likelihood binds only under a contrast
+  that can carry them** ([#1679](https://github.com/FeRx-NLME/ferx-core/issues/1679)). On
+  `PLACEBO[STUDY, TIME]` read through a factor that vanishes at `TIME = 0` (`PLACEBO * TIME`, a
+  block on `EMAX` in `EMAX * TIME / (TIME + ET50)`, an ODE state at its initial value), each
+  study's `TIME = 0` level estimated nothing and global sum-to-zero bound anyway, leaving a flat
+  direction. `auto` now takes `sum_to_zero_within` there, which codes one such level per study
+  through the others; a contrast that gives one a θ of its own (`none`, `ref` outside the
+  reference, two in one sum-to-zero group) is refused, listing the levels and naming a contrast
+  that works when there is one.
 - **A level block that absorbs two random effects, or whose levels nest in subjects that do
   not share a key, is refused** ([#1696](https://github.com/FeRx-NLME/ferx-core/issues/1696)).
   `[STUDY, TIME]` with one subject per study and an η on each of `E0` and `EMAX` (or an η and a

@@ -3969,6 +3969,9 @@ pub fn parse_full_model_with(
                     c
                 })
                 .collect();
+            decl.eta_readers = (0..eta_names.len())
+                .map(|k| direct_eta_readers(&indiv_stmts, k))
+                .collect();
         }
     }
 
@@ -15671,6 +15674,7 @@ fn parse_parameters(
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 scale_share: None,
                                 eta_couplings: Vec::new(),
+                                eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                             });
                             (levels, theta_names, Some(index_covariate))
@@ -19844,6 +19848,11 @@ pub struct LevelBlockDecl {
     /// that random effect". The binder adds the data-side half and resolves
     /// [`LevelContrast::Auto`] and its refusals from it.
     pub(crate) eta_couplings: Vec<EtaCoupling>,
+    /// Per random effect, parallel to `eta_couplings`: the individual parameters
+    /// whose own expression reads it, sorted. Two random effects with the same
+    /// readers enter the model at the same site, which is what lets the binder
+    /// call a kappa the η by another name (#1696).
+    pub(crate) eta_readers: Vec<Vec<String>>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
 }
@@ -22330,6 +22339,40 @@ fn readout_used_theta_eta(
         visit_expr_nodes(&expr, &mut |e| note_theta_eta(e, &mut thetas, &mut etas));
     }
     Ok((thetas, etas))
+}
+
+/// The individual parameters whose own expression reads random effect `k`,
+/// sorted (see [`LevelBlockDecl::eta_readers`]), `if` branches included. Only
+/// direct reads count: a parameter that reads another one carrying the random
+/// effect is not listed.
+fn direct_eta_readers(stmts: &[Statement], k: usize) -> Vec<String> {
+    fn walk(stmts: &[Statement], k: usize, out: &mut Vec<String>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assign(name, expr) => {
+                    if extract_eta_indices(expr).contains(&k) && !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        walk(body, k, out);
+                    }
+                    if let Some(body) = else_body {
+                        walk(body, k, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(stmts, k, &mut out);
+    out.sort();
+    out
 }
 
 /// Every `[scaling]` `y` / `y[CMT=N]` readout, parsed with θ, η and `defined` in scope

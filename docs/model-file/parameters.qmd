@@ -180,7 +180,7 @@ and it is chosen by looking at both the model and the data:
 | The block's levels each lie within one subject (within one occasion of one subject, for a kappa) **and** the block absorbs one random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
 | A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
 | The block absorbs **two** random effects | refused, under every contrast (see [Two random effects](#two-random-effects)) |
-| A level has no effect on the likelihood | refused, under every contrast (see [Levels with no effect](#levels-with-no-effect)) |
+| A level has no effect on the likelihood | `auto` takes a contrast that carries it; an explicit contrast that cannot is refused (see [Levels with no effect](#levels-with-no-effect)) |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -309,26 +309,44 @@ reproduce the other: on `[STUDY, TIME]` with one subject per study, `ETA_E0` on
 the random effects, or remove the block.
 
 One case is named differently. When every subject has a single occasion and the
-kappa sits where the η does, the kappa *is* the η by another name: the model is
-unidentified with or without the block, and the message says so.
+kappa is read by the same parameters as the η, the kappa *is* the η by another
+name: the model is unidentified with or without the block, and the message says
+so. On a one-column block it adds that the block has to go as well, since either
+random effect left alone is the same quantity as each level.
 
 #### Levels with no effect
 
-A level whose θ changes nothing the likelihood reads cannot be estimated, and
-the block is refused under every contrast, before any contrast is chosen. The
-typical case is a level that holds only records at `TIME = 0`, where the block is
-read through a factor that vanishes there: `PLACEBO * TIME`, an Emax term
-`EMAX * TIME / (TIME + ET50)` with the block on `EMAX`, an ODE state that starts
-at its initial value, or a clearance read at its own dose time. The message
-lists the levels; key the block so those records share a level with a later
-time, or read the block where it acts at `TIME = 0`.
+A level whose θ changes nothing the likelihood reads cannot be estimated on its
+own. The typical case is a level that holds only records at `TIME = 0`, where
+the block is read through a factor that vanishes there: `PLACEBO * TIME`, an
+Emax term `EMAX * TIME / (TIME + ET50)` with the block on `EMAX`, an ODE state
+that starts at its initial value, or a clearance read at its own dose time.
+
+Whether that costs the model anything depends on the contrast. A contrast that
+codes such a level through the others loses nothing: the reference level under
+`ref`, and one level per group under sum-to-zero, whose value is then minus the
+sum of the rest. One that gives it a θ of its own does: any such level under
+`none`, one outside the reference under `ref`, two in one group under
+sum-to-zero. On `PLACEBO[STUDY, TIME]` with a `TIME = 0` level in each study,
+global sum-to-zero, `ref` and `none` are refused, and `auto` takes
+`sum_to_zero_within`, which has one such level per study. One more case is
+refused: when the block absorbs a random effect that does not read those
+records either, the level takes its study's within-group constraint, and the
+other levels are left free to reproduce the random effect.
+
+A refusal lists the levels, names a contrast that would carry them when there is
+one, and — when they hold only `TIME = 0` records — suggests keying the block so
+those records share a level with a later time, or reading the block where it
+acts at `TIME = 0`.
 
 The check compares every record's prediction and residual magnitude after a
 step in each level's θ, at two points: the initial estimates, and a nearby
 point with every non-`FIX` θ moved inside its bounds and every random effect at
-0.05. A level is refused only when nothing changes at both. A block that acts
-only through a θ initialised at 0 therefore binds; one whose θ is fixed at 0
-does not. A point where anything evaluates non-finite says nothing, and the
+0.05. A level counts as having no effect only when nothing changes at both. A
+block that acts only through a θ initialised at 0 therefore binds; one whose θ
+is fixed at 0 does not. Two points are not a proof: a θ that switches the block
+off near its initial estimate (a lag, a threshold) can make a live level look
+dead at both, which the refusal says. A point where anything evaluates non-finite says nothing, and the
 level counts as live. A model with a hazard, Markov or binary endpoint, a
 mixture or a `[diffusion]` block is not checked, since those read the block
 through channels the check does not compare.
