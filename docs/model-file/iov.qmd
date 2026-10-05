@@ -186,8 +186,23 @@ it is a CV% too, so the two compare directly:
                          weight = NARM  →  CV% = 11.2 at NARM = 4.0000 (κ ~ N(0, KAPPA_CL/NARM))
 ```
 
-An additive or logit kappa gets `SD = …` there, as above, and so does one whose
-expression gives it no label (custom).
+The line's figure is the row's note at the typical arm, worded the same way with
+`at NARM = …` in place of `at weight 1`. An additive kappa gets `SD = …`, as
+above, and a logit kappa keeps its row's tag in the row's order (#1697):
+
+```
+  KAPPA_P              = 0.250000  (SD = 0.5000 at weight 1, logit scale)  SE = 0.031000
+                         weight = NARM  →  SD = 0.2500 at NARM = 4.0000, logit scale (κ ~ N(0, KAPPA_P/NARM))
+```
+
+The figure is printed exactly when the row's note is (#1698). A kappa whose
+expression gives it no label (custom) has no note, and a failed or SIR-fallback
+covariance step hides every note; in both cases the line keeps only
+`weight = NARM (κ ~ N(0, KAPPA_P/NARM))`. The fit YAML still writes
+`sd_at_typical_weight` in both cases. When the covariance step failed, that matches
+`sd` and `cv_pct`, which the YAML writes whatever the covariance step did. For a
+custom kappa it is the one spread key written, since a custom entry has no `sd`
+or `cv_pct`.
 
 A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
 $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.

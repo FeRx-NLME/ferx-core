@@ -42,19 +42,25 @@ fn sd_from_var(var: f64) -> f64 {
 /// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
 /// unweighted γ², so a CV% or SD of it is that of a weight-1 arm and is
 /// labelled so (#1666) — the line after the row gives the same figure at the
-/// typical weight ([`typical_weight_spread`], #1683).
+/// typical weight (#1683), built by the same [`spread_note`].
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
+    spread_note(t, sd_from_var(var), at_weight)
+}
+
+/// A spread `sd` (non-negative) on the scale of type `t`, qualified by `at`:
+/// `CV% = 100·sd{at}` for log-normal and unknown, `SD = sd{at}` for additive,
+/// `SD = sd{at}, logit scale` for logit, nothing for custom. The one formatter
+/// behind a kappa's row ([`variance_note`], `at` = `" at weight 1"`) and its
+/// weight line (`at` = `" at NARM = 4.0000"`, #1697), so the two cannot word
+/// the same quantity differently.
+fn spread_note(t: Option<EtaParamType>, sd: f64, at: &str) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => {
-            Some(format!("CV% = {:.1}{}", cv_pct(var), at_weight))
+        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}{}", sd * 100.0, at)),
+        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd, at)),
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
+            Some(format!("SD = {:.4}{}, logit scale", sd, at))
         }
-        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at_weight)),
-        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => Some(format!(
-            "SD = {:.4}{}, logit scale",
-            sd_from_var(var),
-            at_weight
-        )),
         Some(EtaParamType::Custom) => None,
     }
 }
@@ -160,18 +166,6 @@ fn kappa_weight_facts(
     Some((w, typical))
 }
 
-/// The typical-arm spread on a weighted kappa's weight line, on the scale of
-/// the row above it (#1683): `CV% = …` where the row is a CV% (log-normal, and
-/// an unknown type as in [`variance_note`]), `SD = …` otherwise. `sd` is the
-/// typical-arm SD from [`kappa_weight_facts`], so the CV% is `100 · sd` — the
-/// YAML's `sd_at_typical_weight` times 100.
-fn typical_weight_spread(t: Option<EtaParamType>, sd: f64) -> String {
-    match t {
-        None | Some(EtaParamType::LogNormal) => format!("CV% = {:.1}", sd * 100.0),
-        Some(_) => format!("SD = {:.4}", sd),
-    }
-}
-
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
@@ -206,18 +200,21 @@ fn format_kappa_rows(result: &FitResult) -> String {
         // *unweighted* γ² — the quantity a published MBMA reports — so
         // print the effective SD at the median arm alongside it. A raw
         // γ of 2.0 on a logit scale reads as alarming until it is divided.
+        // The spread is the row's note at the typical arm — the same
+        // `spread_note`, its `at` clause naming the arm (#1683, #1697) — so it
+        // goes wherever the note does (#1698): no spread when `show_cv` is
+        // false (covariance failed or fell back to SIR) or the type has no
+        // note (custom), the bare line as when no typical weight exists. The
+        // YAML's `sd_at_typical_weight` is written regardless, like `sd`.
         if let Some((w, typical)) = weight {
-            let _ = match typical {
-                Some((n, sd)) => writeln!(
+            let spread = typical
+                .filter(|_| show_cv)
+                .and_then(|(n, sd)| spread_note(kappa_type, sd, &format!(" at {} = {:.4}", w, n)));
+            let _ = match spread {
+                Some(spread) => writeln!(
                     out,
-                    "  {:<20}   weight = {}  →  {} at {} = {:.4} (κ ~ N(0, {}/{}))",
-                    "",
-                    w,
-                    typical_weight_spread(kappa_type, sd),
-                    w,
-                    n,
-                    name,
-                    w
+                    "  {:<20}   weight = {}  →  {} (κ ~ N(0, {}/{}))",
+                    "", w, spread, name, w
                 ),
                 None => writeln!(
                     out,
@@ -5474,59 +5471,101 @@ mod tests {
             assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
         }
 
-        // #1683: the weight line under a weighted kappa is on its row's scale —
-        // CV% under a CV% row (log-normal; unknown type), SD under an SD row
-        // (additive, logit) and under a custom row, which has no note. Exact
-        // lines, typed and untyped, on both surfaces: the LN line printing
-        // `SD =`, or the additive / logit / custom line printing `CV% =`,
-        // reddens a cell. The SD lines are byte-identical to before #1683.
-        // Typical arm n = 4, so SD = √var / 2; CV% = 100 · SD.
+        // #1683 / #1697: the weight line under a weighted kappa is its row's
+        // note at the typical arm, worded by the same `spread_note` — CV% under
+        // a CV% row (log-normal; unknown type), SD under an SD row (additive),
+        // `SD = … at NARM = …, logit scale` under a logit row, in the row's
+        // own `(SD = … at weight 1, logit scale)` order. A custom row has no
+        // note, so its line has no spread (the bare `weight = NARM (κ ~ …)`).
+        // Exact lines, typed and untyped, on both surfaces: the LN line
+        // printing `SD =`, the additive / logit line printing `CV% =`, the
+        // logit tag dropped, moved, or put on the additive line, or a custom
+        // spread reappearing, each reddens a cell. The additive line is
+        // byte-identical to before #1697. Typical arm n = 4, so SD = √var / 2;
+        // CV% = 100 · SD.
+        //
+        // #1698: the spread follows the row note's `show_cv` gate. Both sides
+        // of the gate in this one loop, every status spelled out — a computed
+        // or not-requested (`covariance = false`, the commonest) step prints
+        // the spread, a failed or SIR-fallback one the bare line — so forcing
+        // the gate either way reddens a cell.
         let pad = " ".repeat(25);
-        let weight_line = |name: &str, spread: &str| {
-            format!("{pad}weight = NARM  →  {spread} at NARM = 4.0000 (κ ~ N(0, {name}/NARM))")
+        let weight_line = |name: &str, spread: Option<&str>| match spread {
+            Some(spread) => format!("{pad}weight = NARM  →  {spread} (κ ~ N(0, {name}/NARM))"),
+            None => format!("{pad}weight = NARM (κ ~ N(0, {name}/NARM))"),
         };
-        for (typed, cells) in [
-            (
-                true,
-                [
-                    ("K_LN", "CV% = 11.2"),
-                    ("K_ADD", "SD = 6.2457"),
-                    ("K_LGT", "SD = 6.2457"),
-                    ("K_C", "SD = 0.2739"),
-                ],
-            ),
-            (
-                false,
-                [
-                    ("K_LN", "CV% = 11.2"),
-                    ("K_ADD", "CV% = 624.6"),
-                    ("K_LGT", "CV% = 624.6"),
-                    ("K_C", "CV% = 27.4"),
-                ],
-            ),
+        for (status, show) in [
+            (CovarianceStatus::Computed, true),
+            (CovarianceStatus::NotRequested, true),
+            (CovarianceStatus::Failed, false),
+            (CovarianceStatus::SirFallback, false),
         ] {
-            let r = mk(true, typed);
-            for (surface, text) in [
-                ("console", format_kappa_rows(&r)),
-                ("summary", format_summary(&r)),
+            for (typed, cells) in [
+                (
+                    true,
+                    [
+                        ("K_LN", Some("CV% = 11.2 at NARM = 4.0000")),
+                        ("K_ADD", Some("SD = 6.2457 at NARM = 4.0000")),
+                        ("K_LGT", Some("SD = 6.2457 at NARM = 4.0000, logit scale")),
+                        ("K_C", None),
+                    ],
+                ),
+                (
+                    false,
+                    [
+                        ("K_LN", Some("CV% = 11.2 at NARM = 4.0000")),
+                        ("K_ADD", Some("CV% = 624.6 at NARM = 4.0000")),
+                        ("K_LGT", Some("CV% = 624.6 at NARM = 4.0000")),
+                        ("K_C", Some("CV% = 27.4 at NARM = 4.0000")),
+                    ],
+                ),
             ] {
-                for (name, spread) in cells {
-                    let want = weight_line(name, spread);
-                    let got = text
-                        .lines()
-                        .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
-                        .unwrap_or_else(|| panic!("{surface}: no weight line for {name}:\n{text}"));
-                    assert_eq!(got, want, "{surface} typed={typed} {name}");
+                let mut r = mk(true, typed);
+                r.covariance_status = status.clone();
+                assert_eq!(shows_cv(&r), show, "{status:?}");
+                for (surface, text) in [
+                    ("console", format_kappa_rows(&r)),
+                    ("summary", format_summary(&r)),
+                ] {
+                    for (name, spread) in cells {
+                        let want = weight_line(name, spread.filter(|_| show));
+                        let got = text
+                            .lines()
+                            .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
+                            .unwrap_or_else(|| {
+                                panic!("{surface}: no weight line for {name}:\n{text}")
+                            });
+                        assert_eq!(got, want, "{surface} {status:?} typed={typed} {name}");
+                    }
                 }
             }
         }
-        // Unweighted: no weight line on either surface.
-        let plain = mk(false, true);
-        for (surface, text) in [
-            ("console", format_kappa_rows(&plain)),
-            ("summary", format_summary(&plain)),
-        ] {
-            assert!(!text.contains("weight = "), "{surface}:\n{text}");
+        // The other logit spelling gets the same tag.
+        assert_eq!(
+            spread_note(Some(LogitProbability), 6.245738, " at NARM = 4.0000"),
+            s("SD = 6.2457 at NARM = 4.0000, logit scale")
+        );
+        // Unweighted: no weight line on either surface, and the rows are
+        // byte-identical to before #1697 / #1698 on both sides of the gate.
+        for status in [CovarianceStatus::Computed, CovarianceStatus::Failed] {
+            let mut plain = mk(false, true);
+            plain.covariance_status = status.clone();
+            let rows = format_kappa_rows(&plain);
+            let want = if status == CovarianceStatus::Computed {
+                "  K_LN                 = 0.050133  (CV% = 22.4)  SE = N/A\n\
+                 \x20 K_ADD                = 156.036966  (SD = 12.4915)  SE = N/A\n\
+                 \x20 K_LGT                = 156.036966  (SD = 12.4915, logit scale)  SE = N/A\n\
+                 \x20 K_C                  = 0.300000  SE = N/A\n"
+            } else {
+                "  K_LN                 = 0.050133  SE = N/A\n\
+                 \x20 K_ADD                = 156.036966  SE = N/A\n\
+                 \x20 K_LGT                = 156.036966  SE = N/A\n\
+                 \x20 K_C                  = 0.300000  SE = N/A\n"
+            };
+            assert_eq!(rows, want, "{status:?}");
+            for (surface, text) in [("console", rows), ("summary", format_summary(&plain))] {
+                assert!(!text.contains("weight = "), "{surface}:\n{text}");
+            }
         }
 
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
@@ -5537,6 +5576,16 @@ mod tests {
                      sd_at_typical_weight: 0.111952\n    se: ~\n";
         assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
         assert!(!yaml.contains("cv_pct_at"), "{yaml}");
+        // #1698: the YAML does not follow the console's `show_cv` gate — a
+        // failed covariance step writes the same entry, `cv_pct` and
+        // `sd_at_typical_weight` included.
+        let mut failed = mk(true, true);
+        failed.covariance_status = CovarianceStatus::Failed;
+        let failed_yaml = yaml_of(&failed);
+        assert!(
+            failed_yaml.contains(entry),
+            "missing\n{entry}\nin\n{failed_yaml}"
+        );
         // Unweighted: byte-identical to the weighted file less its weight keys,
         // and the log-normal entry is the pre-#1666 one.
         let plain = yaml_of(&mk(false, true));
