@@ -261,3 +261,84 @@ fn analytical_model_coded_rate_without_parameter_still_errors() {
         "the ignored-doses warning is for compartment-free models only"
     );
 }
+
+/// #1677: `TAD` read in a readout `y` is an ordinary covariate (#1028 — a built-in only
+/// in `[odes]`, `[derived]` and an `[error_model]` magnitude), so the unchecked kernel
+/// (`pk::compute_predictions_with_tv`) reads it as 0.0 when the data lacks the column.
+/// The public entry points must refuse that population instead, and name the scope.
+///
+/// A differential pair straddling the check: without the column `predict()` and
+/// `fit()` must `Err` (the `check_covariates` gate fires), and with it `predict()` must
+/// return the closed form at an observation where `TAD ≠ TIME` — so forcing the check
+/// to always pass reddens the first half, always fail the second, and a predictor that
+/// substituted `TIME` (12) or 0.0 for the column reddens the value assertion.
+#[test]
+fn readout_tad_is_a_data_column_refused_when_absent_and_read_when_present() {
+    let model = parse_model_string(
+        "[parameters]\n\
+         \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+         \x20 theta TVEMAX(5.0, 0.1, 100.0)\n\
+         \x20 theta TVET50(2.0, 0.1, 100.0)\n\
+         \x20 sigma PROP ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n\
+         \x20 E0 = TVE0\n\
+         \x20 EMAX = TVEMAX\n\
+         \x20 ET50 = TVET50\n\n\
+         [structural_model]\n\
+         \x20 y = E0 + EMAX * TAD / (TAD + ET50)\n\n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP)\n",
+    )
+    .expect("a readout reading TAD parses");
+    assert!(model.is_algebraic(), "fixture must be compartment-free");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "TAD"),
+        "TAD in a readout is a covariate (#1028): {:?}",
+        model.referenced_covariates
+    );
+
+    // Doses at 0 and 6, one observation at 12: TAD = 6 ≠ TIME = 12.
+    let dose_at = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let mut without = population(vec![vec![dose_at(0.0), dose_at(6.0)]]);
+    without.subjects[0].obs_times = vec![12.0];
+    without.subjects[0].observations = vec![13.0];
+    let mut with = without.clone();
+    with.covariate_names = vec!["TAD".into()];
+    with.subjects[0].covariates.insert("TAD".into(), 6.0);
+
+    let params = &model.default_params;
+    let eval_only = crate::types::FitOptions {
+        outer_maxiter: 0,
+        ..crate::types::FitOptions::default()
+    };
+
+    // Absent: both entry points refuse, naming the column and the `[odes]` scope.
+    let predict_err = crate::api::predict(&model, &without, params)
+        .expect_err("predict(): TAD absent from the data must be an Err, not a silent 0.0");
+    let fit_err = crate::api::fit(&model, &without, params, &eval_only)
+        .err()
+        .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0");
+    for (entry, err) in [("predict", &predict_err), ("fit", &fit_err)] {
+        assert!(
+            err.contains("TAD") && err.contains("not found in data"),
+            "{entry}(): must name the missing column, got: {err}"
+        );
+        assert!(
+            err.contains("solver-injected built-in"),
+            "{entry}(): must explain TAD's `[odes]` scope, got: {err}"
+        );
+    }
+
+    // Present: the column is read at face value.
+    let rows = crate::api::predict(&model, &with, params)
+        .expect("predict(): with a TAD column the population is valid");
+    assert_eq!(rows.len(), 1);
+    let want = 10.0 + 5.0 * 6.0 / (6.0 + 2.0);
+    assert!(
+        (rows[0].pred - want).abs() < 1e-12,
+        "PRED must be the closed form at TAD = 6 ({want}), got {}",
+        rows[0].pred
+    );
+    crate::api::fit(&model, &with, params, &eval_only)
+        .expect("fit(): with a TAD column the population is valid");
+}
