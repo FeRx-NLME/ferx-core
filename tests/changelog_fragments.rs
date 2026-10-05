@@ -866,3 +866,107 @@ fn no_loop_in_the_script_reads_a_here_document() {
         assert!(s.contains("done<<"), "{shape:?} escapes the scan");
     }
 }
+
+/// `--date` is a calendar date, not just a `NNNN-NN-NN` shape.
+#[test]
+fn assemble_refuses_an_impossible_date() {
+    for bad in [
+        "2026-02-31",
+        "2026-13-01",
+        "2026-00-10",
+        "2025-02-29",
+        "2100-02-29",
+    ] {
+        let t = tree("date-bad", &[("1.fixed.md", "- x (#1).\n")]);
+        let o = run(&t, &["assemble", "0.2.0", "--date", bad]);
+        assert!(!o.status.success(), "{bad} accepted");
+        assert!(stderr(&o).contains("not a calendar date"), "{}", stderr(&o));
+        assert!(t.join("changelog.d").join("1.fixed.md").exists());
+    }
+    for good in ["2024-02-29", "2000-02-29", "2026-12-31", "2026-04-30"] {
+        let t = tree("date-good", &[("1.fixed.md", "- x (#1).\n")]);
+        let o = run(&t, &["assemble", "0.2.0", "--date", good]);
+        assert!(o.status.success(), "{good} refused: {}", stderr(&o));
+    }
+}
+
+/// A release PR must leave nothing pending — in CI its HEAD is the merge with `main`,
+/// so a fragment that landed there after assembly shows up here.
+#[test]
+fn require_fails_a_release_pr_that_leaves_a_fragment_pending() {
+    let (d, _) = git_repo("release-leftover");
+    commit_file(&d, "changelog.d/10.fixed.md", "- Fix (#10).\n");
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    let o = run(&d, &["assemble", "0.2.0", "--date", "2026-10-05"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "release"]);
+    // Twin: the clean release PR passes.
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    commit_file(&d, "changelog.d/20.fixed.md", "- Later fix (#20).\n");
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(
+        !o.status.success(),
+        "a release PR leaving #20 pending passed"
+    );
+    assert!(
+        stderr(&o).contains("changelog.d/20.fixed.md"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// The tag-time backstop run by `release.yml`.
+#[test]
+fn released_requires_the_section_and_nothing_pending() {
+    let t = tree("released-ok", &[]);
+    for tag in ["v0.1.0", "0.1.0", "refs/tags/v0.1.0"] {
+        let o = run(&t, &["released", tag]);
+        assert!(o.status.success(), "{tag}: {}", stderr(&o));
+    }
+
+    let o = run(&t, &["released", "v0.2.0"]);
+    assert!(!o.status.success(), "a tag with no section passed");
+    assert!(
+        stderr(&o).contains("no '## [0.2.0] - <date>' section"),
+        "{}",
+        stderr(&o)
+    );
+    // `.` is literal: 0x1x0 is not 0.1.0.
+    assert!(!run(&t, &["released", "v0x1x0"]).status.success());
+
+    let t = tree(
+        "released-pending",
+        &[("20.fixed.md", "- Later fix (#20).\n")],
+    );
+    let o = run(&t, &["released", "v0.1.0"]);
+    assert!(!o.status.success(), "a tag with a pending fragment passed");
+    assert!(
+        stderr(&o).contains("changelog.d/20.fixed.md"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// `release.yml` must run the backstop before it publishes anything.
+#[test]
+fn the_release_workflow_checks_the_changelog_before_publishing() {
+    let p = repo_root()
+        .join(".github")
+        .join("workflows")
+        .join("release.yml");
+    let yml = std::fs::read_to_string(&p).unwrap();
+    let check = yml
+        .find(r#"run: tools/changelog.sh released "$TAG""#)
+        .expect("release.yml does not run `tools/changelog.sh released`");
+    let publish = yml
+        .find("softprops/action-gh-release")
+        .expect("release.yml no longer publishes with action-gh-release");
+    assert!(check < publish, "the changelog check runs after publishing");
+    assert!(
+        yml.contains("TAG: ${{ github.event.inputs.tag || github.ref_name }}"),
+        "release.yml passes the wrong tag"
+    );
+}

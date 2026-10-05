@@ -518,7 +518,10 @@ Trunk-based, so a release is a **tag on `main`**:
    `tools/changelog.sh assemble X.Y.Z` writes the `changelog.d/` fragments
    into `CHANGELOG.md` under `## [X.Y.Z] - <date>`, updates the compare links
    and deletes the fragments. Add any release-level prose (upgrade notes) under
-   the new heading by hand.
+   the new heading by hand. If anything merges to `main` before the release PR
+   does, merge `main` back in and assemble again: the `Changelog fragment` check
+   fails a release PR that leaves a fragment pending, and `release.yml` refuses
+   a tag whose tree still has one (`tools/changelog.sh released <tag>`).
 2. Tag `main` with `vX.Y.Z` (e.g. `v0.3.0`). `release.yml` builds the GitHub
    release and generates notes.
 3. Point users at the **tagged release**, not an arbitrary `main` commit.

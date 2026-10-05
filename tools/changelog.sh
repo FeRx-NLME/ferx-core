@@ -60,6 +60,9 @@ instead of editing CHANGELOG.md, so concurrent PRs never conflict.
                                                user-facing code and adds no fragment,
                                                unless --opt-out true (CI passes
                                                whether the '$OPT_OUT_LABEL' label is set)
+  tools/changelog.sh released <tag>            fail unless CHANGELOG.md has the tag's
+                                               section and no fragment is pending
+                                               (release.yml runs it on every tag)
 
 Fragment: changelog.d/<N>.<category>.md, where <N> is the issue or PR number
 (append -2, -3, ... for a second entry on the same number, e.g. 1541-2.fixed.md)
@@ -301,8 +304,15 @@ cmd_assemble() {
     grep -Eq "^$num\\.$num\\.$num(-$ident(\\.$ident)*)?\$" ||
     die "assemble: '$version' is not a release version (X.Y.Z or X.Y.Z-pre, no leading zeros)"
   [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
-  printf '%s' "$date" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ||
-    die "assemble: --date '$date' is not YYYY-MM-DD"
+  # Shape, then the calendar: `2026-02-31` has the right shape and is no date.
+  printf '%s' "$date" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' &&
+    printf '%s\n' "$date" | awk -F- '{
+      y = $1 + 0; m = $2 + 0; d = $3 + 0
+      split("31 28 31 30 31 30 31 31 30 31 30 31", days, " ")
+      if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) days[2] = 29
+      exit !(m >= 1 && m <= 12 && d >= 1 && d <= days[m])
+    }' ||
+    die "assemble: --date '$date' is not a calendar date (YYYY-MM-DD)"
 
   cmd_check >/dev/null # also loads FRAGMENTS: the one manifest used below
   [ ${#FRAGMENTS[@]} -gt 0 ] || die "assemble: no fragments in changelog.d/ — nothing to release"
@@ -510,6 +520,21 @@ cmd_require() {
     exit 1
   fi
 
+  # A release PR (it assembled fragments) must leave none behind. In CI HEAD is
+  # the merge with `main`, so this also catches a fragment that landed on `main`
+  # after the release branch was assembled — its entry would miss the release.
+  load_fragments
+  if [ -n "$deleted" ] && [ ${#FRAGMENTS[@]} -gt 0 ]; then
+    {
+      echo "changelog: this release PR assembled fragments but leaves pending ones:"
+      printf '  changelog.d/%s\n' "${FRAGMENTS[@]}"
+      echo
+      echo "Merge main into the release branch and run 'tools/changelog.sh assemble'"
+      echo "again, so every entry is in the release section."
+    } >&2
+    exit 1
+  fi
+
   # A boolean the workflow computes with `contains(labels.*.name, ...)`, not a
   # joined label list: joining loses the boundaries, so a single label named
   # `x,no-changelog` would read as the opt-out.
@@ -566,6 +591,27 @@ cmd_require() {
   exit 1
 }
 
+# The tag-time backstop for `require`'s release check: a merge to `main` after
+# the release PR's last CI run (a base-only advance re-runs nothing) could still
+# leave a fragment pending at tag time.
+cmd_released() {
+  [ $# -eq 1 ] || die "released: usage: tools/changelog.sh released <tag>"
+  local version="${1#refs/tags/}"
+  version="${version#v}"
+  cmd_check >/dev/null # also loads FRAGMENTS
+  grep -Eq "^## \[$(printf '%s' "$version" | sed 's/[.]/\\./g')\] - " "$changelog" ||
+    die "released: CHANGELOG.md has no '## [$version] - <date>' section — run 'tools/changelog.sh assemble $version' before tagging"
+  if [ ${#FRAGMENTS[@]} -gt 0 ]; then
+    {
+      echo "changelog: tag $1 has pending fragments, so their entries are not in"
+      echo "the [$version] section:"
+      printf '  changelog.d/%s\n' "${FRAGMENTS[@]}"
+    } >&2
+    exit 1
+  fi
+  echo "changelog: [$version] is assembled and nothing is pending."
+}
+
 [ $# -ge 1 ] || {
   usage >&2
   exit 2
@@ -577,6 +623,7 @@ case "$sub" in
   preview) cmd_preview "$@" ;;
   assemble) cmd_assemble "$@" ;;
   require) cmd_require "$@" ;;
+  released) cmd_released "$@" ;;
   -h | --help | help) usage ;;
   *)
     echo "changelog: unknown subcommand '$sub' (try --help)" >&2
