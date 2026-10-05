@@ -2882,10 +2882,12 @@ pub(crate) fn apply_frem_prediction_override(
 /// [`compute_predictions_with_tv_into_with_schedule`] variants) runs **none** of the
 /// checks the public entry points run first. In particular, a name in
 /// [`CompiledModel::referenced_covariates`](crate::types::CompiledModel::referenced_covariates)
-/// that is absent from [`Subject::covariates`](crate::types::Subject::covariates)
-/// evaluates to `0.0` — silently. That includes `TAD`, `TAFD` and `MACHEPS` read in a
-/// readout (`y = …`) or `[scaling]`: they are solver-injected built-ins only inside
-/// `[odes]`, and an ordinary covariate everywhere else (#1028), so a readout
+/// that is absent from the subject's covariate data
+/// ([`Subject::covariates`](crate::types::Subject::covariates) and its LOCF snapshots
+/// `dose_covariates` / `obs_covariates`) evaluates to `0.0` — silently. That includes
+/// `TAD`, `TAFD` and `MACHEPS` read in a readout (`y = …`) or `[scaling]`, where #1028
+/// makes them ordinary covariates (`[odes]` and `[derived]` supply all three as
+/// built-ins, an `[error_model]` magnitude supplies `TAD` and `MACHEPS`), so a readout
 /// `E0 + EMAX * TAD / (TAD + ET50)` on data without a `TAD` column returns `E0` here.
 ///
 /// Run [`crate::check_model_data`] on the `(model, population)` pair first, or call

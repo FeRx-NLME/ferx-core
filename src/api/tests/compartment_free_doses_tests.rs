@@ -262,8 +262,8 @@ fn analytical_model_coded_rate_without_parameter_still_errors() {
     );
 }
 
-/// #1677: `TAD` read in a readout `y` is an ordinary covariate (#1028 — a solver-injected
-/// built-in only inside `[odes]`), so the unchecked kernel
+/// #1677: `TAD` read in a readout `y` is an ordinary covariate (#1028 — a built-in only
+/// in `[odes]`, `[derived]` and an `[error_model]` magnitude), so the unchecked kernel
 /// (`pk::compute_predictions_with_tv`) reads it as 0.0 when the data lacks the column.
 /// The public entry points must refuse that population instead, and name the scope.
 ///
