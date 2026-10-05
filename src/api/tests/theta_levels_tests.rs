@@ -5161,6 +5161,21 @@ mod absorption {
                 "{bounds}"
             );
         }
+        // Bounds that leave no room at all: the θ cannot step, which measures
+        // nothing, so the levels count as live and the block binds. Read as "no
+        // change", every level would be dead.
+        let pinned = cf_model(
+            "",
+            "STUDY, TIME",
+            &format!("{BASE}  E0 = TVE0 + PLACEBO\n  Z = TVE0 * exp(ETA_E0)"),
+            &format!("E0 + {EMAXY}"),
+        )
+        .replace("(0.0, -10.0, 10.0)", "(0.0, 0.0, 0.0)");
+        assert_eq!(
+            try_bind(&pinned, &pop),
+            Ok((LevelContrast::SumToZero, 17)),
+            "no room"
+        );
         // The helper itself: never onto a bound, and back to `x` only with no room.
         assert!((toward_interior(0.0, -0.1, 0.1, 0.13) - 0.05).abs() < 1e-15);
         assert!((toward_interior(0.09, -0.1, 0.1, 0.25) + 0.005).abs() < 1e-15);
