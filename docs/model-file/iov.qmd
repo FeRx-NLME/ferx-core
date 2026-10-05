@@ -169,7 +169,7 @@ puts a **variance-structure decision inside a structural expression**:
 
 The estimate stays the **unweighted** $\gamma^2$ — the quantity a published MBMA
 reports. Its SD — or, for a log-normal kappa, its CV% (#1666) — is labelled
-`at weight 1`, the figure of a one-subject arm, and the fit prints the effective SD
+`at weight 1`, the figure of a one-subject arm, and the fit prints the same figure
 at the median arm on the next line:
 
 ```
@@ -177,6 +177,17 @@ at the median arm on the next line:
   KAPPA_EMAX           = 4.145382  (SD = 2.0360 at weight 1)  SE = 0.412000
                          weight = NARM  →  SD = 0.1440 at NARM = 200.0000 (κ ~ N(0, KAPPA_EMAX/NARM))
 ```
+
+The next line is on the row's scale (#1683): under a log-normal kappa's CV% row
+it is a CV% too, so the two compare directly:
+
+```
+  KAPPA_CL             = 0.050133  (CV% = 22.4 at weight 1)  SE = 0.004100
+                         weight = NARM  →  CV% = 11.2 at NARM = 4.0000 (κ ~ N(0, KAPPA_CL/NARM))
+```
+
+An additive or logit kappa gets `SD = …` there, as above, and so does one whose
+expression gives it no label (custom).
 
 A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
 $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.
@@ -197,8 +208,10 @@ omega_iov:
 ```
 
 `variance` stays the unweighted $\gamma^2$, and its `cv_pct` (log-normal) or `sd`
-line is the weight-1 figure; the typical arm is read from `sd_at_typical_weight`
-(times 100 for a log-normal kappa's CV%). An unweighted kappa's entry is unchanged.
+line is the weight-1 figure; the typical arm is read from `sd_at_typical_weight`.
+For a log-normal kappa that key is still the log-scale SD: times 100 it is the CV%
+the console's weight line prints (0.111952 → 11.2), and no separate CV% key is
+written. An unweighted kappa's entry is unchanged.
 
 ### Rules and diagnostics
 

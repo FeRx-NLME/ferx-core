@@ -41,8 +41,8 @@ fn sd_from_var(var: f64) -> f64 {
 ///
 /// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
 /// unweighted γ², so a CV% or SD of it is that of a weight-1 arm and is
-/// labelled so (#1666) — the line after the row gives the SD at the typical
-/// weight.
+/// labelled so (#1666) — the line after the row gives the same figure at the
+/// typical weight ([`typical_weight_spread`], #1683).
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
     match t {
@@ -160,6 +160,18 @@ fn kappa_weight_facts(
     Some((w, typical))
 }
 
+/// The typical-arm spread on a weighted kappa's weight line, on the scale of
+/// the row above it (#1683): `CV% = …` where the row is a CV% (log-normal, and
+/// an unknown type as in [`variance_note`]), `SD = …` otherwise. `sd` is the
+/// typical-arm SD from [`kappa_weight_facts`], so the CV% is `100 · sd` — the
+/// YAML's `sd_at_typical_weight` times 100.
+fn typical_weight_spread(t: Option<EtaParamType>, sd: f64) -> String {
+    match t {
+        None | Some(EtaParamType::LogNormal) => format!("CV% = {:.1}", sd * 100.0),
+        Some(_) => format!("SD = {:.4}", sd),
+    }
+}
+
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
@@ -187,14 +199,8 @@ fn format_kappa_rows(result: &FitResult) -> String {
             }
         };
         let weight = kappa_weight_facts(result, i, var);
-        let note = note_suffix(
-            variance_note(
-                result.kappa_param_types.get(i).copied(),
-                var,
-                weight.is_some(),
-            ),
-            show_cv,
-        );
+        let kappa_type = result.kappa_param_types.get(i).copied();
+        let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
         // Sample-size-weighted IOV (#1031): the estimate above is the
         // *unweighted* γ² — the quantity a published MBMA reports — so
@@ -204,8 +210,14 @@ fn format_kappa_rows(result: &FitResult) -> String {
             let _ = match typical {
                 Some((n, sd)) => writeln!(
                     out,
-                    "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
-                    "", w, sd, w, n, name, w
+                    "  {:<20}   weight = {}  →  {} at {} = {:.4} (κ ~ N(0, {}/{}))",
+                    "",
+                    w,
+                    typical_weight_spread(kappa_type, sd),
+                    w,
+                    n,
+                    name,
+                    w
                 ),
                 None => writeln!(
                     out,
@@ -5460,6 +5472,61 @@ mod tests {
             let old = format_kappa_rows(&mk(weighted, false));
             let want = format!("= 156.036966  (CV% = 1249.1{w})  SE =");
             assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
+        }
+
+        // #1683: the weight line under a weighted kappa is on its row's scale —
+        // CV% under a CV% row (log-normal; unknown type), SD under an SD row
+        // (additive, logit) and under a custom row, which has no note. Exact
+        // lines, typed and untyped, on both surfaces: the LN line printing
+        // `SD =`, or the additive / logit / custom line printing `CV% =`,
+        // reddens a cell. The SD lines are byte-identical to before #1683.
+        // Typical arm n = 4, so SD = √var / 2; CV% = 100 · SD.
+        let pad = " ".repeat(25);
+        let weight_line = |name: &str, spread: &str| {
+            format!("{pad}weight = NARM  →  {spread} at NARM = 4.0000 (κ ~ N(0, {name}/NARM))")
+        };
+        for (typed, cells) in [
+            (
+                true,
+                [
+                    ("K_LN", "CV% = 11.2"),
+                    ("K_ADD", "SD = 6.2457"),
+                    ("K_LGT", "SD = 6.2457"),
+                    ("K_C", "SD = 0.2739"),
+                ],
+            ),
+            (
+                false,
+                [
+                    ("K_LN", "CV% = 11.2"),
+                    ("K_ADD", "CV% = 624.6"),
+                    ("K_LGT", "CV% = 624.6"),
+                    ("K_C", "CV% = 27.4"),
+                ],
+            ),
+        ] {
+            let r = mk(true, typed);
+            for (surface, text) in [
+                ("console", format_kappa_rows(&r)),
+                ("summary", format_summary(&r)),
+            ] {
+                for (name, spread) in cells {
+                    let want = weight_line(name, spread);
+                    let got = text
+                        .lines()
+                        .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
+                        .unwrap_or_else(|| panic!("{surface}: no weight line for {name}:\n{text}"));
+                    assert_eq!(got, want, "{surface} typed={typed} {name}");
+                }
+            }
+        }
+        // Unweighted: no weight line on either surface.
+        let plain = mk(false, true);
+        for (surface, text) in [
+            ("console", format_kappa_rows(&plain)),
+            ("summary", format_summary(&plain)),
+        ] {
+            assert!(!text.contains("weight = "), "{surface}:\n{text}");
         }
 
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
