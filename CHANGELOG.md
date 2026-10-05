@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A level block that takes a separate level at every observation now counts every random
+  effect that reaches `y`, through the states too; one that does not no longer counts a
+  time-varying one** ([#1650](https://github.com/FeRx-NLME/ferx-core/issues/1650)). With one
+  subject per study, `[STUDY, TIME]` reproduces any per-subject effect, so an η on `CL` read
+  as `central / V` now resolves `contrast = auto` to `sum_to_zero_within`, and an explicit
+  `sum_to_zero`, `ref` or `none` is refused. On a block whose last column holds several
+  observation times (`[STUDY, VISIT]`), an η reaching `y` only through a time-varying term
+  (`EMAX` in `EMAX * TIME / (TIME + ET50)`) is identified and no longer refuses a global
+  contrast. A fit saved before this change keeps its layout when re-bound from the fit.
 - **`contrast = auto` on a level block now sees the `y` readout, and a random effect reached
   through a variable** ([#1642](https://github.com/FeRx-NLME/ferx-core/issues/1642)). A block
   read in the readout next to a parameter carrying an η (`E0 = TVE0 + ETA_E0`,
@@ -143,6 +152,15 @@ section of the SDLC for the versioning policy).
   no covariance or a wrong SIR interval, and a fit with `ignore_subjects` got a wrong
   covariance or a panic. A supplied model with the wrong θ count or bindings, or a
   population whose subjects are not the fit's, is now refused instead of panicking.
+- **A sample-size-weighted log-normal kappa's CV% is labelled `at weight 1`**
+  ([#1666](https://github.com/FeRx-NLME/ferx-core/issues/1666)). The console and `ferx summary`
+  row now reads `(CV% = … at weight 1)`, as the SD rows of additive and logit kappas already
+  did; the fit YAML's `cv_pct` is unchanged and documented as the weight-1 figure. Unweighted
+  rows are unchanged.
+- **`ferx summary` reports block-kappa correlations and kappa shrinkage**
+  ([#1667](https://github.com/FeRx-NLME/ferx-core/issues/1667)). The KAPPA (IOV) section gains
+  `corr(K_i, K_j) = …` lines for a `block_kappa`, and Diagnostics gains a `Kappa shrinkage:`
+  line (plus one per occasion slot), matching what the fit prints.
 - **An additive ETA with more than one other term keeps its SD row** (#1656, #1662). An ETA was
   additive only as exactly `THETA + ETA`, so `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, or
   `E0 = TVE0 + B_FLARE * FLARE + ETA_E0`, classified as custom and printed neither `SD` nor
@@ -162,6 +180,12 @@ section of the SDLC for the versioning policy).
   and a second ETA in one `exp` (`exp(ETA_CL + ETA_V)`) a wrong one. The fallback is now used only when the
   parser has checked that every parameter is `g(θ, cov) · exp(η)` with its η written in its own
   assignment; otherwise the fit uses finite differences. No example model changes route.
+- **A one-column level block whose levels each belong to one subject is refused next to a
+  random effect it absorbs** ([#1649](https://github.com/FeRx-NLME/ferx-core/issues/1649)).
+  `theta PLACEBO[STUDY]` with one subject per study and `E0 = TVE0 + PLACEBO + ETA_E0` made
+  each level the same quantity as that subject's η under every contrast; the fit drove ω to 0
+  with a computed covariance and no warning naming the cause. It is now refused at bind time,
+  naming the expression and advising to remove the block or drop the random effect.
 - **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
   model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
   so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read

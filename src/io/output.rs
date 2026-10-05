@@ -40,12 +40,15 @@ fn sd_from_var(var: f64) -> f64 {
 /// the log-normal CV% every row printed before.
 ///
 /// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
-/// unweighted γ², so an SD of it is the SD of a weight-1 arm and is labelled so
-/// — the line after the row gives the SD at the typical weight.
+/// unweighted γ², so a CV% or SD of it is that of a weight-1 arm and is
+/// labelled so (#1666) — the line after the row gives the SD at the typical
+/// weight.
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}", cv_pct(var))),
+        None | Some(EtaParamType::LogNormal) => {
+            Some(format!("CV% = {:.1}{}", cv_pct(var), at_weight))
+        }
         Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at_weight)),
         Some(EtaParamType::Logit | EtaParamType::LogitProbability) => Some(format!(
             "SD = {:.4}{}, logit scale",
@@ -59,6 +62,11 @@ fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<St
 /// The YAML line describing a random-effect variance on its scale (#1643):
 /// `cv_pct` for log-normal (and unknown, as before), `sd` for additive and
 /// logit, nothing for custom. Indented for an `omega`/`omega_iov` entry.
+///
+/// For a weighted kappa this is the weight-1 figure, like `variance` beside it
+/// (#1666); the entry's `weight` key marks that, and `sd_at_typical_weight`
+/// carries the typical arm. No `cv_pct_at_typical_weight` is written: with
+/// `cv_pct = √var·100` it would be `100 · sd_at_typical_weight` exactly.
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
     match t {
         None | Some(EtaParamType::LogNormal) => Some(format!("    cv_pct: {:.2}", cv_pct(var))),
@@ -215,6 +223,15 @@ fn format_kappa_rows(result: &FitResult) -> String {
         }
     }
     out
+}
+
+/// The name of kappa `k`, or `"KAPPA"` when the result carries none.
+fn kappa_name(result: &FitResult, k: usize) -> &str {
+    result
+        .kappa_names
+        .get(k)
+        .map(|s| s.as_str())
+        .unwrap_or("KAPPA")
 }
 
 /// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
@@ -1048,9 +1065,34 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- KAPPA (IOV) --- the console's rows verbatim (#1657), so the two
     // cannot drift; includes the weighted-kappa line (#1031).
-    if result.omega_iov.is_some() {
+    if let Some(iov) = result.omega_iov.as_ref() {
         let _ = writeln!(out, "\n--- KAPPA (IOV) ---");
         out.push_str(&format_kappa_rows(result));
+        // Off-diagonal correlations (block_kappa, #1667), in the OMEGA style
+        // above and from the same matrix the console reads.
+        for i in 0..iov.nrows() {
+            for j in 0..i {
+                let cov = iov[(i, j)];
+                if cov.abs() <= 1e-15 {
+                    continue;
+                }
+                let corr = param_corr_fallback(
+                    result.omega_iov_param_corr.as_ref(),
+                    cov,
+                    iov[(i, i)],
+                    iov[(j, j)],
+                    i,
+                    j,
+                );
+                let _ = writeln!(
+                    out,
+                    "  corr({}, {}) = {:.4}",
+                    kappa_name(result, i),
+                    kappa_name(result, j),
+                    corr
+                );
+            }
+        }
     }
 
     // --- SIGMA ---
@@ -1131,6 +1173,32 @@ pub fn format_summary(result: &FitResult) -> String {
             .collect();
         if !parts.is_empty() {
             let _ = writeln!(out, "  Eta shrinkage: {}", parts.join(", "));
+        }
+    }
+    // Kappa shrinkage (#1667): pooled, then one line per occasion slot. Unlike
+    // the console, which prints `K NaN` and nests the slots under the pooled
+    // block, non-finite entries are dropped as for the ETAs, and each slot line
+    // names itself so it reads without a pooled parent.
+    let kappa_parts = |sh: &[f64]| -> Vec<String> {
+        sh.iter()
+            .enumerate()
+            .filter(|(_, sh)| sh.is_finite())
+            .map(|(k, sh)| format!("{} {:.1}%", kappa_name(result, k), sh * 100.0))
+            .collect()
+    };
+    let pooled = kappa_parts(&result.shrinkage_kappa);
+    if !pooled.is_empty() {
+        let _ = writeln!(out, "  Kappa shrinkage: {}", pooled.join(", "));
+    }
+    for (occ, sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+        let parts = kappa_parts(sh);
+        if !parts.is_empty() {
+            let _ = writeln!(
+                out,
+                "  Kappa shrinkage, occasion slot {}: {}",
+                occ + 1,
+                parts.join(", ")
+            );
         }
     }
     if result.shrinkage_eps.is_finite() {
@@ -5305,9 +5373,10 @@ mod tests {
         // Unknown type (old bundle / ETA without info) and log-normal: today's CV%.
         assert_eq!(note(None, ln, false), s("CV% = 22.4"));
         assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.4"));
-        // Weighted log-normal kappa: unchanged (#1031 control).
-        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.4"));
-        assert_eq!(note(None, ln, true), s("CV% = 22.4"));
+        // Weighted log-normal kappa: the CV% of a weight-1 arm, labelled so
+        // (#1666) — an unknown type prints the same CV% and gets the same label.
+        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.4 at weight 1"));
+        assert_eq!(note(None, ln, true), s("CV% = 22.4 at weight 1"));
         // Additive: SD, not a CV%; weighted says which arm size the SD is for.
         assert_eq!(note(Some(Additive), add, false), s("SD = 12.4915"));
         assert_eq!(
@@ -5360,6 +5429,138 @@ mod tests {
             variance_yaml_line(Some(Additive), -1.0),
             s("    sd: 0.000000")
         );
+
+        // #1666: the same cells on every surface that prints them — console
+        // rows (`print_results` writes `format_kappa_rows`), `format_summary`,
+        // and the fit YAML — weighted and unweighted twins side by side, so
+        // dropping the suffix and emitting it unconditionally both redden.
+        let mk = |weighted: bool, typed: bool| {
+            let mut r = classified_result();
+            r.omega_iov = Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+                ln, add, add, 0.3,
+            ])));
+            r.kappa_names = ["K_LN", "K_ADD", "K_LGT", "K_C"].map(String::from).to_vec();
+            r.kappa_fixed = vec![false; 4];
+            r.kappa_param_types = if typed {
+                vec![LogNormal, Additive, Logit, Custom]
+            } else {
+                Vec::new()
+            };
+            if weighted {
+                r.kappa_weights = vec![Some("NARM".into()); 4];
+                r.kappa_weight_typical = vec![Some(4.0); 4];
+            }
+            r
+        };
+        for weighted in [false, true] {
+            let w = if weighted { " at weight 1" } else { "" };
+            let r = mk(weighted, true);
+            for (surface, text) in [
+                ("console", format_kappa_rows(&r)),
+                ("summary", format_summary(&r)),
+            ] {
+                for (name, want) in [
+                    ("K_LN", format!("= 0.050133  (CV% = 22.4{w})  SE =")),
+                    ("K_ADD", format!("= 156.036966  (SD = 12.4915{w})  SE =")),
+                    (
+                        "K_LGT",
+                        format!("= 156.036966  (SD = 12.4915{w}, logit scale)  SE ="),
+                    ),
+                    ("K_C", "= 0.300000  SE =".to_string()),
+                ] {
+                    let row = line_with(&text, name);
+                    assert!(row.contains(&want), "{surface} weighted={weighted}: {row}");
+                }
+            }
+            // An old bundle (no types): the CV% row carries the same label.
+            let old = format_kappa_rows(&mk(weighted, false));
+            let want = format!("= 156.036966  (CV% = 1249.1{w})  SE =");
+            assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
+        }
+
+        // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
+        // entry, followed by the #1660 weight keys; no typical-arm CV% key.
+        let yaml = yaml_of(&mk(true, true));
+        let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    \
+                     weight: \"NARM\"\n    weight_typical: 4.000000\n    \
+                     sd_at_typical_weight: 0.111952\n    se: ~\n";
+        assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
+        assert!(!yaml.contains("cv_pct_at"), "{yaml}");
+        // Unweighted: byte-identical to the weighted file less its weight keys,
+        // and the log-normal entry is the pre-#1666 one.
+        let plain = yaml_of(&mk(false, true));
+        assert!(
+            plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    se: ~\n"),
+            "{plain}"
+        );
+        let stripped: String = yaml
+            .lines()
+            .filter(|l| {
+                !(l.starts_with("    weight: ")
+                    || l.starts_with("    weight_typical: ")
+                    || l.starts_with("    sd_at_typical_weight: "))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(stripped, plain);
+    }
+
+    /// #1667: `format_summary`'s KAPPA section carries a block kappa's
+    /// correlations, read from `omega_iov_param_corr` (not Ω's matrix, not the
+    /// cov/√var fallback — all three give different numbers here), and none for
+    /// a diagonal Ω_IOV; Diagnostics carries kappa shrinkage, finite entries only.
+    #[test]
+    fn format_summary_kappa_corr_and_shrinkage() {
+        let diag = classified_result();
+        let s = format_summary(&diag);
+        assert!(!s.contains("corr("), "{s}");
+        assert!(!s.contains("Kappa shrinkage"), "{s}");
+
+        let mut r = classified_result();
+        let iov = r.omega_iov.as_mut().unwrap();
+        iov[(1, 0)] = 0.5;
+        iov[(0, 1)] = 0.5;
+        let mut iov_corr = DMatrix::identity(3, 3);
+        iov_corr[(1, 0)] = 0.7;
+        iov_corr[(0, 1)] = 0.7;
+        r.omega_iov_param_corr = Some(iov_corr);
+        let mut eta_corr = DMatrix::identity(2, 2);
+        eta_corr[(1, 0)] = -0.25;
+        eta_corr[(0, 1)] = -0.25;
+        r.omega_param_corr = Some(eta_corr);
+        r.shrinkage_eta = vec![0.12, 0.08];
+        r.shrinkage_kappa = vec![0.20, f64::NAN, 0.30];
+        // The third kappa has no name: its entries fall back to "KAPPA".
+        r.kappa_names.truncate(2);
+        r.shrinkage_kappa_by_occ = vec![vec![0.10, f64::NAN, f64::INFINITY], vec![f64::NAN; 3]];
+        let s = format_summary(&r);
+
+        // Fallback cov/√(var_i·var_j) would print 0.1788; Ω's matrix -0.2500.
+        let kappa_at = s.find("--- KAPPA (IOV) ---").unwrap();
+        let corr_at = s
+            .find("\n  corr(K_ADD, K_LN) = 0.7000\n")
+            .unwrap_or_else(|| panic!("no kappa corr line in:\n{s}"));
+        assert!(
+            kappa_at < corr_at && corr_at < s.find("--- SIGMA").unwrap(),
+            "{s}"
+        );
+        assert_eq!(s.matches("corr(").count(), 1, "{s}");
+
+        let diag_at = s.find("--- Diagnostics ---").unwrap();
+        let eta_at = s
+            .find("  Eta shrinkage: eta_CL 12.0%, eta_V 8.0%\n")
+            .unwrap();
+        let pooled_at = s
+            .find("\n  Kappa shrinkage: K_LN 20.0%, KAPPA 30.0%\n")
+            .unwrap_or_else(|| panic!("no pooled kappa shrinkage in:\n{s}"));
+        assert!(diag_at < eta_at && eta_at < pooled_at, "{s}");
+        assert!(
+            s.contains("\n  Kappa shrinkage, occasion slot 1: K_LN 10.0%\n"),
+            "{s}"
+        );
+        // An occasion with nothing finite prints no line; nothing prints NaN/inf.
+        assert!(!s.contains("occasion slot 2"), "{s}");
+        assert!(!s.contains("NaN") && !s.contains("inf%"), "{s}");
     }
 
     /// A result with two ETAs whose `eta_param_info` is in the **reverse** of

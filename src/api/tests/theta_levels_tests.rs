@@ -37,6 +37,12 @@ fn mbma_model(contrast: &str) -> String {
 
 /// A factor with no random effect sharing its scale — the plain
 /// unstructured-effect case, which takes global sum-to-zero.
+///
+/// The random effect sits on `Z`, which `y` never reads. With one subject per
+/// study (`population`) the block takes a level at every observation, so a
+/// random effect reaching `y` by any route, the state included, would be
+/// absorbed (#1650): this fixture was `V = TVV * exp(ETA_V)` before, which the
+/// Jacobian oracle measures as rank 0.
 fn no_eta_model() -> String {
     r#"
 [parameters]
@@ -49,7 +55,8 @@ fn no_eta_model() -> String {
 
 [individual_parameters]
   CL = TVCL + PLACEBO
-  V  = TVV * exp(ETA_V)
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
 
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
@@ -1993,13 +2000,14 @@ mod readout_share {
         )
     }
 
-    /// T3. The readout spellings that share a scale (H4 bare η in `y`, H5
-    /// multiplicative, H6 η only on `EMAX`, S1 η on `V` read by a PK readout)
-    /// against the two that do not (S2 η reaching `y` only through the state,
-    /// H7 η `y` never reads) — both sides of the gate in one test.
+    /// T3. The readout spellings a block taking a level at every observation
+    /// absorbs (H4 bare η in `y`, H5 multiplicative, H6 η only on `EMAX`, S1 η
+    /// on `V` read by a PK readout, and since #1650 S2, η reaching `y` only
+    /// through the state) against the one it does not (H7, η `y` never reads)
+    /// — both sides of the gate in one test.
     ///
-    /// Mutations — η taint ignores `Variable` (H6, S1 red); the readout taints
-    /// the state `central` (S2 red); return `Some` unconditionally (H7 red).
+    /// Mutations — η taint ignores `Variable` (H6, S1 red); states carry no
+    /// taint (S2 red); count every declared η (H7 red).
     #[test]
     fn readout_spellings_share_a_scale() {
         let cases = [
@@ -2041,7 +2049,7 @@ mod readout_share {
             (
                 "S2",
                 scaling_model("  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0"),
-                GLOBAL,
+                WITHIN,
             ),
             ("H7", h7(""), GLOBAL),
         ];
@@ -2092,9 +2100,11 @@ mod readout_share {
     /// the gather: it is lifted into the synthetic parameter `__ferx_ro_g0`, and
     /// the readout reads that variable. On every engine, the block read in `y`
     /// next to an η on `E0` must still take within-study sum-to-zero, bit for
-    /// bit the explicit contrast's names. The control on the same engine moves
-    /// the η to `CL`, which reaches `y` only through the state, so the gather is
-    /// lifted on both sides of the gate and only the η path differs.
+    /// bit the explicit contrast's names. So must an η on `CL`, which reaches `y`
+    /// only through the state (#1650): on the ODE engine that route is read off
+    /// the `[odes]` line. The control on the same engine moves the η to `Z`,
+    /// which `y` never reads, so the gather is lifted on both sides of the gate
+    /// and only the η path differs.
     ///
     /// Each case first asserts that the desugar really ran (`__ferx_ro_g0` is an
     /// individual parameter). Without it, this would test the pre-#1636 readout.
@@ -2110,6 +2120,7 @@ mod readout_share {
         const ODE: &str = "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central";
         let share_ip = "  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0";
         let state_ip = "  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0";
+        let unread_ip = "  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)";
         let engine = |name: &str, ip: &str, contrast: &str| -> String {
             let analytic = scaling_model(ip);
             let text = match name {
@@ -2135,9 +2146,15 @@ mod readout_share {
                 WITHIN,
             ));
             cases.push((
-                format!("{name} state-only control"),
+                format!("{name} state-only"),
                 engine(name, state_ip, ""),
-                engine(name, state_ip, "sum_to_zero"),
+                engine(name, state_ip, "sum_to_zero_within"),
+                WITHIN,
+            ));
+            cases.push((
+                format!("{name} unread-η control"),
+                engine(name, unread_ip, ""),
+                engine(name, unread_ip, "sum_to_zero"),
                 GLOBAL,
             ));
         }
@@ -2940,5 +2957,1097 @@ mod bind_from_fit {
             "{err}"
         );
         assert_eq!(format!("{design:?}"), before);
+    }
+}
+
+// ── #1649 / #1650: when a level block absorbs a random effect ───────────────
+//
+// The labels of every cell come from an oracle, not from hand: the part of each
+// subject's η sensitivity that no fixed effect can reproduce, `P⊥_X Z`, with
+// `X` every θ column under the contrast and `Z` the per-subject η columns. A
+// rank of 0 where the block-free baseline is positive means ω is not informed
+// by the data at all — the case the binder must refuse.
+#[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
+mod absorption {
+    use super::readout_share::{cf_model, cf_pop, scaling_model, BASE, EMAXY, T6};
+    use super::*;
+    use crate::api::bind_theta_levels_from_fit;
+    use crate::parser::model_parser::{LevelBindings, LevelContrast};
+    use nalgebra::DMatrix;
+
+    /// Rank threshold on singular values normalised by `‖Z‖_F`; the gap it
+    /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
+    const RANK_TOL: f64 = 1e-6;
+
+    /// `[STUDY, VISIT]`: VISIT 1 holds TIME 0, 1, 2 and VISIT 2 holds 4, 8, 12,
+    /// so the block does not resolve a subject's observations.
+    pub(super) fn visit_pop(n: usize, per: usize) -> Population {
+        let mut p = cf_pop(n, per, &T6);
+        for s in p.subjects.iter_mut() {
+            s.obs_covariates = T6
+                .iter()
+                .map(|t| {
+                    let mut m = HashMap::new();
+                    m.insert("VISIT".to_string(), if *t < 3.0 { 1.0 } else { 2.0 });
+                    m
+                })
+                .collect();
+        }
+        p
+    }
+
+    /// The model shapes of the #1649 plan, plus three that hold an individual
+    /// parameter reading both the block and the η without being a funnel: the
+    /// block read again in `y` (H8), the η read again (H9), and `TIME` read
+    /// inside it (H10); two readout funnels reached through a unary function
+    /// (H11) and a power (H12); and an η scaled by `TIME` inside the funnel
+    /// candidate (H13). H6 and H13 are also the `TIME` twins of the `TAD` /
+    /// `TAFD` shapes in `the_clocks_vary_like_time`. Every one carries `ETA_E0`.
+    const SHAPES: [&str; 14] = [
+        "H1", "G", "H2", "H5", "H6", "S1", "S2", "H7", "H8", "H9", "H10", "H11", "H12", "H13",
+    ];
+
+    /// Shape `tag` with the block on `cols` and `contrast` (`""` = auto).
+    pub(super) fn shape(tag: &str, cols: &str, contrast: &str) -> String {
+        let cf = |ip: String, y: String| cf_model(contrast, cols, &ip, &y);
+        let pk = |ip: &str| {
+            let modifier = if contrast.is_empty() {
+                String::new()
+            } else {
+                format!(", contrast = {contrast}")
+            };
+            scaling_model(ip).replace(
+                "PLACEBO[STUDY, TIME]",
+                &format!("PLACEBO[{cols}{modifier}]"),
+            )
+        };
+        match tag {
+            "H1" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0"),
+                format!("E0 + {EMAXY}"),
+            ),
+            "G" => cf(
+                "  EMAX = TVEMAX + PLACEBO + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0".into(),
+                format!("E0 + {EMAXY}"),
+            ),
+            "H2" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "H5" => cf(
+                format!("{BASE}  E0 = TVE0 * exp(ETA_E0)"),
+                format!("E0 * exp(PLACEBO) + {EMAXY}"),
+            ),
+            "H6" => cf(
+                "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0".into(),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "S1" => pk("  CL = TVEMAX\n  V = TVET50 * exp(ETA_E0)\n  E0 = TVE0"),
+            "S2" => pk("  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0"),
+            "H7" => cf(
+                format!("{BASE}  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)"),
+                format!("E0 + PLACEBO + {EMAXY}"),
+            ),
+            "H8" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0"),
+                "E0 + (EMAX + PLACEBO) * TIME / (TIME + ET50)".into(),
+            ),
+            "H9" => cf(
+                "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + ETA_E0".into(),
+                format!("E0 + {EMAXY}"),
+            ),
+            "H10" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO * TIME + ETA_E0"),
+                format!("E0 + {EMAXY}"),
+            ),
+            "H11" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("exp((E0 + PLACEBO + {EMAXY}) / 10)"),
+            ),
+            "H12" => cf(
+                format!("{BASE}  E0 = TVE0 + ETA_E0"),
+                format!("(E0 + PLACEBO + {EMAXY}) ^ 2"),
+            ),
+            "H13" => cf(
+                format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0 * TIME"),
+                format!("E0 + {EMAXY}"),
+            ),
+            _ => unreachable!("{tag}"),
+        }
+    }
+
+    /// Bind `text` against a copy of `pop`: the resolved contrast and the
+    /// block's free-θ count, or the refusal.
+    pub(super) fn try_bind(text: &str, pop: &Population) -> Result<(LevelContrast, usize), String> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text)?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p)?;
+        let free = parsed
+            .model
+            .theta_names
+            .iter()
+            .filter(|n| n.starts_with("PLACEBO["))
+            .count();
+        Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
+    }
+
+    /// The Jacobian pieces at the initial θ and η = 0, by central FD of the
+    /// f64 predictor: the block's per-level columns (bound under `none`), the
+    /// other θ columns, the per-subject η columns, and the level labels.
+    ///
+    /// The layout is taken from an η-free twin bound under `none`, then imposed
+    /// on the real model with [`bind_theta_levels_from_fit`], so a model the
+    /// binder refuses can still be measured.
+    pub(super) struct Jac {
+        xb: DMatrix<f64>,
+        xo: DMatrix<f64>,
+        z: DMatrix<f64>,
+        labels: Vec<String>,
+        one_column: bool,
+    }
+
+    pub(super) fn jacobian(text: &str, eta: &str, pop0: &Population) -> Jac {
+        let twin = text
+            .replace(eta, "0.0")
+            .replace("omega 0.0", &format!("omega {eta}"));
+        let mut p_twin = pop0.clone();
+        let mut pt = parse_full_model(&twin).unwrap();
+        crate::api::bind_theta_levels(&mut pt, &twin, &mut p_twin).expect("η-free twin binds");
+        let fitted: LevelBindings = pt.bindings.levels.clone();
+        let mut pop = pop0.clone();
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, text, &mut pop, &fitted).expect("from_fit");
+        let m = &parsed.model;
+        let theta0 = m.default_params.theta.clone();
+        let eta0 = vec![0.0; m.n_eta];
+        let preds = |th: &[f64], s: usize, et: &[f64]| {
+            crate::pk::compute_predictions_with_tv(m, &pop.subjects[s], th, et)
+        };
+        let ns = pop.subjects.len();
+        let lens: Vec<usize> = (0..ns).map(|s| preds(&theta0, s, &eta0).len()).collect();
+        let nrow: usize = lens.iter().sum();
+        let offs: Vec<usize> = lens
+            .iter()
+            .scan(0, |a, n| {
+                let o = *a;
+                *a += n;
+                Some(o)
+            })
+            .collect();
+        let theta_col = |k: usize| -> Vec<f64> {
+            let h = 1e-6 * theta0[k].abs().max(1.0);
+            let (mut tp, mut tm) = (theta0.clone(), theta0.clone());
+            tp[k] += h;
+            tm[k] -= h;
+            let mut col = vec![0.0; nrow];
+            for s in 0..ns {
+                let (a, b) = (preds(&tp, s, &eta0), preds(&tm, s, &eta0));
+                for j in 0..a.len() {
+                    col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
+                }
+            }
+            col
+        };
+        let block: Vec<usize> = (0..m.n_theta)
+            .filter(|&i| m.theta_names[i].starts_with("PLACEBO["))
+            .collect();
+        let other: Vec<usize> = (0..m.n_theta).filter(|i| !block.contains(i)).collect();
+        let mat = |cols: Vec<Vec<f64>>| DMatrix::from_fn(nrow, cols.len(), |r, c| cols[c][r]);
+        let mut zc = Vec::new();
+        for e in 0..m.n_eta {
+            for s in 0..ns {
+                let h = 1e-6;
+                let (mut ep, mut em) = (eta0.clone(), eta0.clone());
+                ep[e] += h;
+                em[e] -= h;
+                let (a, b) = (preds(&theta0, s, &ep), preds(&theta0, s, &em));
+                let mut col = vec![0.0; nrow];
+                for j in 0..a.len() {
+                    col[offs[s] + j] = (a[j] - b[j]) / (2.0 * h);
+                }
+                zc.push(col);
+            }
+        }
+        let labels = fitted["PLACEBO"].labels.clone();
+        Jac {
+            xb: mat(block.iter().map(|&k| theta_col(k)).collect()),
+            xo: mat(other.iter().map(|&k| theta_col(k)).collect()),
+            z: mat(zc),
+            one_column: !labels[0].contains(','),
+            labels,
+        }
+    }
+
+    /// The coding matrix of `contrast` over the per-level columns.
+    fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
+        let l = j.labels.len();
+        // A one-column block is a single group (`assign_groups`).
+        let grp: Vec<&str> = j
+            .labels
+            .iter()
+            .map(|s| {
+                if j.one_column {
+                    ""
+                } else {
+                    s.split(',').next().unwrap()
+                }
+            })
+            .collect();
+        let unit = |k: usize, minus: Option<usize>| {
+            let mut c = vec![0.0; l];
+            c[k] = 1.0;
+            if let Some(m) = minus {
+                c[m] = -1.0;
+            }
+            c
+        };
+        let cols: Vec<Vec<f64>> = match contrast {
+            LevelContrast::Unconstrained => (0..l).map(|k| unit(k, None)).collect(),
+            LevelContrast::Ref => (1..l).map(|k| unit(k, None)).collect(),
+            LevelContrast::SumToZero => (0..l.saturating_sub(1))
+                .map(|k| unit(k, Some(l - 1)))
+                .collect(),
+            LevelContrast::SumToZeroWithin => (0..l)
+                .filter_map(|k| {
+                    let last = (0..l).rev().find(|&i| grp[i] == grp[k]).unwrap();
+                    (k != last).then(|| unit(k, Some(last)))
+                })
+                .collect(),
+            LevelContrast::Auto => unreachable!(),
+        };
+        DMatrix::from_fn(l, cols.len(), |r, c| cols[c][r])
+    }
+
+    /// Singular values of the part of `z` outside `col(x)`, normalised by `‖z‖_F`.
+    fn residual_sv(z: &DMatrix<f64>, x: &DMatrix<f64>) -> Vec<f64> {
+        let zn = z.norm();
+        assert!(zn.is_finite(), "non-finite η sensitivity");
+        if zn == 0.0 {
+            return Vec::new();
+        }
+        let r = if x.ncols() == 0 {
+            z.clone()
+        } else {
+            let svd = x.clone().svd(true, false);
+            let u = svd.u.unwrap();
+            let s = &svd.singular_values;
+            assert!(s.iter().all(|v| v.is_finite()), "non-finite θ sensitivity");
+            let mx = s.iter().copied().fold(0.0, f64::max);
+            let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > 1e-10 * mx).collect();
+            let q = DMatrix::from_fn(x.nrows(), keep.len(), |r, c| u[(r, keep[c])]);
+            z - &q * (q.transpose() * z)
+        };
+        r.svd(false, false)
+            .singular_values
+            .iter()
+            .map(|v| v / zn)
+            .collect()
+    }
+
+    fn rank(sv: &[f64]) -> usize {
+        sv.iter().filter(|&&v| v > RANK_TOL).count()
+    }
+
+    /// `(baseline rank, rank under contrast, free θ)`. The largest singular
+    /// value of each side, the one that decides "rank 0", is pushed onto `seen`
+    /// so the caller can report the gap around `RANK_TOL`.
+    pub(super) fn oracle(
+        j: &Jac,
+        contrast: LevelContrast,
+        seen: &mut Vec<f64>,
+    ) -> (usize, usize, usize) {
+        let base = residual_sv(&j.z, &j.xo);
+        let xb = &j.xb * coding(j, contrast);
+        let mut x = DMatrix::zeros(j.xo.nrows(), j.xo.ncols() + xb.ncols());
+        x.columns_mut(0, j.xo.ncols()).copy_from(&j.xo);
+        x.columns_mut(j.xo.ncols(), xb.ncols()).copy_from(&xb);
+        let under = residual_sv(&j.z, &x);
+        let largest = |sv: &[f64]| sv.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        seen.extend(
+            [largest(&base), largest(&under)]
+                .into_iter()
+                .filter(|v| v.is_finite()),
+        );
+        (rank(&base), rank(&under), xb.ncols())
+    }
+
+    /// The designs of the grid: `(tag, block columns, data)`.
+    fn designs() -> Vec<(&'static str, &'static str, Population)> {
+        vec![
+            ("1-col 1/study", "STUDY", cf_pop(3, 1, &T6)),
+            ("1-col 2/study", "STUDY", cf_pop(3, 2, &T6)),
+            ("[STUDY,TIME] 1/study", "STUDY, TIME", cf_pop(3, 1, &T6)),
+            ("[STUDY,TIME] 2/study", "STUDY, TIME", cf_pop(3, 2, &T6)),
+            ("[STUDY,VISIT] 1/study", "STUDY, VISIT", visit_pop(3, 1)),
+        ]
+    }
+
+    pub(super) const EXPLICIT: [(LevelContrast, &str); 4] = [
+        (LevelContrast::SumToZero, "sum_to_zero"),
+        (LevelContrast::SumToZeroWithin, "sum_to_zero_within"),
+        (LevelContrast::Ref, "ref"),
+        (LevelContrast::Unconstrained, "none"),
+    ];
+
+    /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
+    /// contrast exactly when the oracle says the block absorbs the random
+    /// effect under it (rank 0 against a positive baseline). Cells whose
+    /// contrast leaves no free θ are #1624's and skipped. `auto` must resolve
+    /// to a contrast that does not absorb, global whenever global does not, and
+    /// be refused only when every contrast absorbs.
+    #[test]
+    fn binder_agrees_with_the_jacobian_oracle() {
+        let mut wrong: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut seen: Vec<f64> = Vec::new();
+        let (mut absorbed_cells, mut free_cells) = (0usize, 0usize);
+        for (dtag, cols, pop) in designs() {
+            for tag in SHAPES {
+                let jac = jacobian(&shape(tag, cols, "none"), "ETA_E0", &pop);
+                // A shape that reads the block only through a factor of `TIME` (G,
+                // H10) gives a block keyed on TIME a level with no effect on `y` at
+                // TIME = 0, η or not: the oracle would measure that unidentified
+                // level, not an absorbed η. Such cells are skipped, and listed.
+                if rank(&residual_sv(&jac.xb, &DMatrix::zeros(jac.xb.nrows(), 0))) < jac.xb.ncols()
+                {
+                    skipped.push(format!("{dtag} {tag}"));
+                    continue;
+                }
+                let mut absorbs = HashMap::new();
+                for (c, token) in EXPLICIT {
+                    let (base, under, free) = oracle(&jac, c, &mut seen);
+                    if free == 0 {
+                        continue;
+                    }
+                    let absorbed = base > 0 && under == 0;
+                    absorbed_cells += usize::from(absorbed);
+                    free_cells += usize::from(!absorbed);
+                    absorbs.insert(token, absorbed);
+                    let got = try_bind(&shape(tag, cols, token), &pop);
+                    if got.is_err() != absorbed {
+                        wrong.push(format!(
+                            "{dtag} {tag} {token}: oracle rank {under} of {base} \
+                             ⇒ refuse={absorbed}, binder {got:?}"
+                        ));
+                    }
+                }
+                let all_absorb = absorbs.values().all(|a| *a);
+                match try_bind(&shape(tag, cols, ""), &pop) {
+                    Err(e) if !all_absorb => wrong.push(format!(
+                        "{dtag} {tag} auto: refused, but some contrast does not absorb: {e}"
+                    )),
+                    Err(_) => {}
+                    Ok(_) if all_absorb => wrong.push(format!(
+                        "{dtag} {tag} auto: bound, but every contrast absorbs"
+                    )),
+                    Ok((resolved, _)) => {
+                        let token = EXPLICIT.iter().find(|(c, _)| *c == resolved).unwrap().1;
+                        if absorbs.get(token).copied().unwrap_or(false) {
+                            wrong.push(format!("{dtag} {tag} auto → {token}, which absorbs"));
+                        }
+                        if absorbs.get("sum_to_zero") == Some(&false)
+                            && resolved != LevelContrast::SumToZero
+                        {
+                            wrong.push(format!(
+                                "{dtag} {tag} auto → {token}, but global does not absorb"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let zero = seen
+            .iter()
+            .copied()
+            .filter(|v| *v <= RANK_TOL)
+            .fold(0.0, f64::max);
+        let live = seen
+            .iter()
+            .copied()
+            .filter(|v| *v > RANK_TOL)
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "oracle: largest zero {zero:.3e}, smallest live {live:.3e}; \
+             {absorbed_cells} absorbed / {free_cells} identified cells"
+        );
+        assert!(
+            zero < 1e-8 && live > 1e-3,
+            "oracle gap collapsed: {zero:e} / {live:e}"
+        );
+        assert_eq!(
+            skipped,
+            [
+                "[STUDY,TIME] 1/study G",
+                "[STUDY,TIME] 1/study H10",
+                "[STUDY,TIME] 2/study G",
+                "[STUDY,TIME] 2/study H10",
+            ],
+            "cells whose block has an unidentified level"
+        );
+        // Both sides of the gate must be exercised.
+        assert!(
+            absorbed_cells >= 20 && free_cells >= 20,
+            "{absorbed_cells} absorbed / {free_cells} identified cells"
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} cells disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// T2, the differential pair. One model, one subject per study against two:
+    /// the one-column block is refused at one and binds its 2 free θ at two.
+    /// And on `[STUDY, TIME]` at one subject per study, an η that reaches `y`
+    /// only through the state (S2) takes the within-study contrast, while one
+    /// that never reaches `y` (H7) stays global. Before #1649 both one-column
+    /// sides bound and S2 was global, so the pair straddles the gate.
+    #[test]
+    fn one_subject_per_level_straddles_the_gate() {
+        let h1 = shape("H1", "STUDY", "");
+        let err = try_bind(&h1, &cf_pop(3, 1, &T6)).expect_err("1 subject/study");
+        assert!(err.starts_with("theta PLACEBO[STUDY]: "), "{err}");
+        assert_eq!(
+            try_bind(&h1, &cf_pop(3, 2, &T6)),
+            Ok((LevelContrast::SumToZero, 2)),
+            "2 subjects/study"
+        );
+
+        let one = cf_pop(3, 1, &T6);
+        assert_eq!(
+            try_bind(&shape("S2", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZeroWithin, 15)),
+            "S2: η reaches y through the state"
+        );
+        assert_eq!(
+            try_bind(&shape("H7", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZero, 17)),
+            "H7: η never reaches y"
+        );
+    }
+
+    /// The model-side half, per shape: the funnel's site and the η's route.
+    /// H1/G funnel through an individual parameter, H2/H5 through the readout;
+    /// H6/S1 (η only in a time-varying term) and S2 (η only in the state) have
+    /// none; H7's η never reaches `y`. The default readout of a model with no
+    /// `[scaling]` block (the `no_eta_model` shape) reaches `y` through `V`.
+    ///
+    /// `mbma_model` adds a parameter funnel reached only through the state.
+    #[test]
+    fn couplings_per_shape() {
+        use crate::parser::model_parser::{EtaCoupling, EtaRoute, ScaleShare};
+        fn coupling(text: &str) -> EtaCoupling {
+            let parsed = parse_full_model(text).unwrap();
+            let decl = &parsed.model.theta_blocks().level_blocks()[0];
+            assert_eq!(decl.eta_couplings.len(), 1, "one random effect");
+            decl.eta_couplings[0].clone()
+        }
+        let site = |param: Option<&str>, via: Option<&str>| ScaleShare {
+            param: param.map(str::to_string),
+            eta_via: via.map(str::to_string),
+        };
+        let via = |v: &str| Some(EtaRoute::Via(v.to_string()));
+        let cases: [(&str, Option<ScaleShare>, Option<EtaRoute>); 8] = [
+            ("H1", Some(site(Some("E0"), None)), via("E0")),
+            ("G", Some(site(Some("EMAX"), None)), via("EMAX")),
+            ("H2", Some(site(None, Some("E0"))), via("E0")),
+            ("H5", Some(site(None, Some("E0"))), via("E0")),
+            ("H6", None, via("EMAX")),
+            ("S1", None, via("V")),
+            ("S2", None, Some(EtaRoute::State)),
+            ("H7", None, None),
+        ];
+        for (tag, funnel, reach) in cases {
+            let c = coupling(&shape(tag, "STUDY", ""));
+            assert_eq!(c.eta, "ETA_E0", "{tag}");
+            assert!(!c.kappa, "{tag}");
+            assert_eq!(c.funnels.first().map(|f| f.site.clone()), funnel, "{tag}");
+            assert_eq!(c.reach, reach, "{tag}");
+        }
+
+        // No `[scaling]`: `y` is the amount over `V`. The pre-#1650 `no_eta_model`.
+        let ne = coupling(&no_eta_model().replace(
+            "  V  = TVV\n  Z  = TVV * exp(ETA_V)",
+            "  V  = TVV * exp(ETA_V)",
+        ));
+        assert_eq!((ne.funnels.len(), ne.reach), (0, via("V")), "η on V");
+        assert_eq!(coupling(&no_eta_model()).reach, None, "no_eta_model");
+        // A parameter funnel reached only through the state: `CL` carries both,
+        // and nothing else reads either.
+        let mb = coupling(&mbma_model(""));
+        assert_eq!(
+            mb.funnels
+                .iter()
+                .map(|f| f.site.clone())
+                .collect::<Vec<_>>(),
+            vec![site(Some("CL"), None)],
+            "mbma_model"
+        );
+        assert_eq!(mb.reach, Some(EtaRoute::State), "mbma_model");
+        // An ODE model whose state reads a parameter with no canonical PK name:
+        // only the `[odes]` line connects `KE` to the state.
+        let ode = shape("S2", "STUDY", "")
+            .replace("  CL = TVEMAX * exp(ETA_E0)", "  KE = TVEMAX * exp(ETA_E0)")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -KE * central",
+            );
+        assert_eq!(coupling(&ode).reach, Some(EtaRoute::State), "ODE via KE");
+        // R1-2 (#1675 review): a parameter only the engine reads by name reaches
+        // the states (an ODE model's bare `F`, an analytical `D1`); an unread one
+        // with a canonical PK name (`KA` on `one_cpt_iv`) is dead, like `ZZ`.
+        let pk_ip = |extra: &str| {
+            scaling_model(&format!(
+                "  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0\n{extra}"
+            ))
+            .replace("PLACEBO[STUDY, TIME]", "PLACEBO[STUDY]")
+        };
+        for (tag, extra, want) in [
+            ("unread KA", "  KA = TVEMAX * exp(ETA_E0)", None),
+            ("unread ZZ", "  ZZ = TVEMAX * exp(ETA_E0)", None),
+            (
+                "analytical D1",
+                "  D1 = TVEMAX * exp(ETA_E0)",
+                Some(EtaRoute::State),
+            ),
+        ] {
+            assert_eq!(coupling(&pk_ip(extra)).reach, want, "{tag}");
+        }
+        let ode_f = pk_ip("  F = TVEMAX * exp(ETA_E0)").replace(
+            "  pk one_cpt_iv(cl=CL, v=V)",
+            "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+        );
+        assert_eq!(coupling(&ode_f).reach, Some(EtaRoute::State), "ODE bare F");
+        // ... and only those: an analytical model reads `F` only through `pk(...)`,
+        // and an ODE model reads no other canonical name by itself.
+        assert_eq!(
+            coupling(&pk_ip("  F = TVEMAX * exp(ETA_E0)")).reach,
+            None,
+            "analytical unread F"
+        );
+        let ode_ka = pk_ip("  KA = TVEMAX * exp(ETA_E0)").replace(
+            "  pk one_cpt_iv(cl=CL, v=V)",
+            "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+        );
+        assert_eq!(coupling(&ode_ka).reach, None, "ODE unread KA");
+        // R1-3: across readouts the most direct route wins. One reads the η
+        // itself, the other only through the state.
+        let routes = shape("S2", "STUDY", "")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+            )
+            .replace(
+                "  y = central / V + E0 + PLACEBO",
+                "  y[CMT=1] = central / V + E0 + ETA_E0\n  y[CMT=2] = central / V + PLACEBO",
+            )
+            .replace(
+                "  DV ~ additive(ADD)",
+                "  CMT=1: DV ~ additive(ADD)\n  CMT=2: DV ~ additive(ADD)",
+            );
+        assert_eq!(
+            coupling(&routes).reach,
+            Some(EtaRoute::Direct),
+            "Direct beats State"
+        );
+        // The binder side of the KA/ZZ pair, on the saturating block.
+        let sat = |extra: &str| pk_ip(extra).replace("PLACEBO[STUDY]", "PLACEBO[STUDY, TIME]");
+        let one = cf_pop(3, 1, &T6);
+        for extra in ["  KA = TVEMAX * exp(ETA_E0)", "  ZZ = TVEMAX * exp(ETA_E0)"] {
+            assert_eq!(
+                try_bind(&sat(extra), &one),
+                Ok((LevelContrast::SumToZero, 17)),
+                "{extra}"
+            );
+        }
+        // A random effect read only by an `if` condition still reaches `y`.
+        let cond = cf_model(
+            "",
+            "STUDY",
+            &format!("{BASE}  E0 = TVE0\n  if (ETA_E0 > 0) {{ E0 = TVE0 + 1 }}"),
+            &format!("E0 + PLACEBO + {EMAXY}"),
+        );
+        assert_eq!(coupling(&cond).reach, via("E0"), "η in a condition");
+        // Two readouts (an ODE model, which per-CMT error models need): the first has a readout funnel (`E0 + PLACEBO`), the
+        // second reads the block time-varyingly, so no single expression carries
+        // every route and there is no funnel.
+        let two = scaling_model("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0")
+            .replace("PLACEBO[STUDY, TIME]", "PLACEBO[STUDY]")
+            .replace(
+                "  pk one_cpt_iv(cl=CL, v=V)",
+                "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central",
+            )
+            .replace(
+                "  y = central / V + E0 + PLACEBO",
+                "  y[CMT=1] = central / V + E0 + PLACEBO\n  y[CMT=2] = central / V + PLACEBO * TIME",
+            )
+            .replace(
+                "  DV ~ additive(ADD)",
+                "  CMT=1: DV ~ additive(ADD)\n  CMT=2: DV ~ additive(ADD)",
+            );
+        let c = coupling(&two);
+        assert_eq!((c.funnels.len(), c.reach), (0, via("E0")), "two readouts");
+        // The control: the first readout alone has the funnel.
+        let one_y = two
+            .replace("\n  y[CMT=2] = central / V + PLACEBO * TIME", "")
+            .replace("\n  CMT=2: DV ~ additive(ADD)", "");
+        assert_eq!(coupling(&one_y).funnels.len(), 1, "one readout");
+    }
+
+    fn has(err: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(err.contains(p), "missing {p:?} in: {err}");
+        }
+    }
+
+    fn lacks(err: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(!err.contains(p), "must not say {p:?}: {err}");
+        }
+    }
+
+    const ONE_COLUMN_HEAD: &str =
+        "theta PLACEBO[STUDY]: each `STUDY` level belongs to a single subject, and ";
+    const ONE_COLUMN_WHY: &str = ", so a level and that subject's random effect are the same \
+                                  quantity: the model is not identified under any contrast.";
+    const ONE_COLUMN_FIX: &str = " Remove the block, or drop the random effect.";
+    /// What a one-column refusal must not say: it has no groups, and no
+    /// contrast rescues it.
+    const ONE_COLUMN_NEVER: [&str; 5] = [
+        "sum_to_zero_within",
+        "group's mean",
+        "leading",
+        "nested",
+        "` leaves",
+    ];
+
+    /// T3 (C1, C2, C3). A one-column block with one subject per level is
+    /// refused under every contrast that leaves it a free θ, auto included,
+    /// naming the funnel: an individual parameter (C1, with the variable that
+    /// carried the η when there is one), or the readout (C2). On a single
+    /// level, the plain single-level text, with no random-effect clause (C3).
+    #[test]
+    fn the_one_column_refusal_names_its_site() {
+        let pop = cf_pop(3, 1, &T6);
+        let h3 = |c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!("{BASE}  E0 = TVE0 + ETA_E0\n  E1 = E0 + PLACEBO"),
+                &format!("E1 + {EMAXY}"),
+            )
+        };
+        for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+            let tag = if c.is_empty() { "auto" } else { c };
+            // C1: an individual parameter reads the block and the η.
+            let err = try_bind(&shape("H1", "STUDY", c), &pop).expect_err(tag);
+            has(
+                &err,
+                &[
+                    &format!(
+                        "{ONE_COLUMN_HEAD}the individual parameter `E0` reads this block and \
+                         carries a random effect{ONE_COLUMN_WHY}"
+                    ),
+                    ONE_COLUMN_FIX,
+                ],
+            );
+            lacks(&err, &ONE_COLUMN_NEVER);
+            lacks(&err, &["(through"]);
+            // C1 through a variable.
+            let err = try_bind(&h3(c), &pop).expect_err(tag);
+            has(
+                &err,
+                &[&format!(
+                    "{ONE_COLUMN_HEAD}the individual parameter `E1` reads this block and \
+                     carries a random effect (through `E0`){ONE_COLUMN_WHY}{ONE_COLUMN_FIX}"
+                )],
+            );
+            // C2: the readout.
+            let err = try_bind(&shape("H2", "STUDY", c), &pop).expect_err(tag);
+            has(
+                &err,
+                &[&format!(
+                    "{ONE_COLUMN_HEAD}the `y` readout reads this block and a random effect \
+                     (through `E0`){ONE_COLUMN_WHY}{ONE_COLUMN_FIX}"
+                )],
+            );
+            lacks(&err, &ONE_COLUMN_NEVER);
+            lacks(&err, &["individual parameter"]);
+        }
+
+        // C3: one study, so a single level; every contrast but `none` leaves it
+        // no free θ.
+        let one = cf_pop(1, 1, &T6);
+        let none = "Use `contrast = none` if a single constant is what you meant.";
+        for (c, text) in [
+            ("", "which sum-to-zero pins at 0. "),
+            ("sum_to_zero", "which sum-to-zero pins at 0. "),
+            ("ref", "which is the reference level, held at 0. "),
+            (
+                "sum_to_zero_within",
+                "which the within-group sum-to-zero pins at 0. ",
+            ),
+        ] {
+            let err = try_bind(&shape("H1", "STUDY", c), &one).expect_err(c);
+            has(
+                &err,
+                &[
+                    &format!("theta PLACEBO[STUDY]: the data carries a single level, {text}"),
+                    none,
+                ],
+            );
+            lacks(
+                &err,
+                &["random effect", "every  group", "every STUDY group"],
+            );
+        }
+    }
+
+    const USE_WITHIN: &str = " Use `contrast = sum_to_zero_within` (the default for this \
+                              shape), or drop the random effect.";
+    const SAME_QUANTITY: &str = " — the two are the same quantity, so the model is not identified.";
+    const EVERY_OBSERVATION: &str = ", and the block takes a level at every observation, so \
+                                     it can reproduce any effect that random effect has";
+
+    /// T4 (C4). On `[STUDY, TIME]` at one subject per study, a random effect that
+    /// never meets the block in one expression is still absorbed, and an
+    /// explicit global contrast is refused naming its route: through the states
+    /// (S2), through an individual parameter the readout reads (η on `V`, no
+    /// `[scaling]`), or directly. Within-group sum-to-zero binds. With every
+    /// group a single level, the zero-free refusal names the route too.
+    #[test]
+    fn a_state_route_refusal_names_the_state() {
+        let pop = cf_pop(3, 1, &T6);
+        let s2 = |c: &str| shape("S2", "STUDY, TIME", c);
+        let via_v = |c: &str| {
+            no_eta_model()
+                .replace(
+                    "  V  = TVV\n  Z  = TVV * exp(ETA_V)",
+                    "  V  = TVV * exp(ETA_V)",
+                )
+                .replace(
+                    "[STUDY, TIME]",
+                    &if c.is_empty() {
+                        "[STUDY, TIME]".to_string()
+                    } else {
+                        format!("[STUDY, TIME, contrast = {c}]")
+                    },
+                )
+        };
+        let direct = |c: &str| {
+            shape("S2", "STUDY, TIME", c)
+                .replace(
+                    "  CL = TVEMAX * exp(ETA_E0)",
+                    "  CL = TVEMAX * exp(PLACEBO)",
+                )
+                .replace(
+                    "  y = central / V + E0 + PLACEBO",
+                    "  y = central / V + E0 + ETA_E0",
+                )
+        };
+        type Text = Box<dyn Fn(&str) -> String>;
+        let cases: [(&str, Text, Population); 3] = [
+            (
+                "the random effect `ETA_E0` reaches `y` through the model's states",
+                Box::new(s2),
+                pop.clone(),
+            ),
+            (
+                "the random effect `ETA_V` reaches `y` through `V`",
+                Box::new(via_v),
+                population(3, 6),
+            ),
+            (
+                "the random effect `ETA_E0` reaches `y` directly",
+                Box::new(direct),
+                pop.clone(),
+            ),
+        ];
+        for (route, text, pop) in &cases {
+            for c in ["sum_to_zero", "ref", "none"] {
+                let err = try_bind(&text(c), pop).expect_err(c);
+                has(
+                    &err,
+                    &[
+                        &format!(
+                            "theta PLACEBO[STUDY, TIME]: `contrast = {c}` leaves each STUDY \
+                             group's mean free, but {route}{EVERY_OBSERVATION}{SAME_QUANTITY}"
+                        ),
+                        USE_WITHIN,
+                    ],
+                );
+                lacks(&err, &["reads this block", "individual parameter"]);
+            }
+            let (contrast, free) = try_bind(&text(""), pop).expect("auto binds");
+            assert_eq!(contrast, LevelContrast::SumToZeroWithin, "{route}");
+            assert!(free > 0, "{route}");
+        }
+
+        // An η that shares an expression with the block but has no funnel (H6) is
+        // named by that expression, not by its route.
+        let err = try_bind(&shape("H6", "STUDY, TIME", "sum_to_zero"), &pop).expect_err("H6");
+        has(
+            &err,
+            &[
+                "but the `y` readout reads this block and a random effect (through `EMAX`) at \
+               that grouping",
+            ],
+        );
+        lacks(&err, &["reaches `y`", EVERY_OBSERVATION]);
+
+        // Every group a single level: the zero-free refusal names the route.
+        let err = try_bind(&s2(""), &cf_pop(3, 1, &[1.0])).expect_err("single time");
+        has(
+            &err,
+            &[
+                "theta PLACEBO[STUDY, TIME]: every STUDY group has a single level, and the \
+               random effect `ETA_E0` reaches `y` through the model's states — the random \
+               effect already carries each group's value, so the block estimates nothing. \
+               Remove the block.",
+            ],
+        );
+    }
+
+    /// T5. A funnel holds only when the covariates it reads are constant within
+    /// every subject. `E0 = (TVE0 + PLACEBO) * (WT / 70) + ETA_E0` on a
+    /// one-column block: with `WT` constant per subject the η and the level are
+    /// proportional and the block is refused; with `WT` changing between a
+    /// subject's records they are not, and it binds. The oracle agrees on both
+    /// sides, in one test.
+    #[test]
+    fn a_funnel_covariate_must_be_subject_constant() {
+        let text = |c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!("{BASE}  E0 = (TVE0 + PLACEBO) * (WT / 70) + ETA_E0"),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        let mut constant = cf_pop(3, 1, &T6);
+        for (k, s) in constant.subjects.iter_mut().enumerate() {
+            s.covariates.insert("WT".into(), 60.0 + 10.0 * k as f64);
+        }
+        let mut varying = cf_pop(3, 1, &T6);
+        for (k, s) in varying.subjects.iter_mut().enumerate() {
+            s.obs_covariates = T6
+                .iter()
+                .map(|t| HashMap::from([("WT".to_string(), 60.0 + 5.0 * t + k as f64)]))
+                .collect();
+        }
+        // A covariate read only by an `if` condition counts too: the branches
+        // scale the level differently, so with `WT` crossing 65 inside a subject
+        // the level and the η stop being proportional.
+        let branch = |c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!(
+                    "{BASE}  E0 = TVE0 + PLACEBO + ETA_E0\n  \
+                     if (WT > 65) {{ E0 = TVE0 + 2 * PLACEBO + ETA_E0 }}"
+                ),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        let cases: [(&str, &dyn Fn(&str) -> String, &Population, bool); 4] = [
+            ("constant WT", &text, &constant, true),
+            ("varying WT", &text, &varying, false),
+            ("constant WT, if", &branch, &constant, true),
+            ("varying WT, if", &branch, &varying, false),
+        ];
+        for (tag, text, pop, refused) in cases {
+            let jac = jacobian(&text("none"), "ETA_E0", pop);
+            let (base, under, _) = oracle(&jac, LevelContrast::SumToZero, &mut Vec::new());
+            assert!(base > 0, "{tag}: the η is identified without the block");
+            assert_eq!(under == 0, refused, "{tag}: oracle rank {under} of {base}");
+            let got = try_bind(&text(""), pop);
+            assert_eq!(got.is_err(), refused, "{tag}: {got:?}");
+        }
+    }
+
+    /// T6. The fixtures that stand for "no random effect on the block's scale"
+    /// are identified by the oracle: `no_eta_model` on one subject per study,
+    /// and the integration fixture of `tests/theta_level_blocks.rs` on its own
+    /// design. Under every explicit contrast leaving a free θ the rank equals
+    /// the block-free baseline and the binder accepts; `auto` is global.
+    #[test]
+    fn the_no_eta_controls_are_identified() {
+        let integration = no_eta_model()
+            .replace(
+                "theta TVCL(2.0, 0.001, 10.0)",
+                "theta TVCL(2.0, 0.001, 20.0)",
+            )
+            .replace(
+                "PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                "PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)",
+            );
+        let mut design = population(2, 3);
+        for s in design.subjects.iter_mut() {
+            s.obs_times = vec![1.0, 4.0, 12.0];
+        }
+        for (tag, base_text, pop) in [
+            ("no_eta_model", no_eta_model(), population(3, 6)),
+            ("integration", integration, design),
+        ] {
+            let with = |c: &str| {
+                base_text.replace("[STUDY, TIME]", &format!("[STUDY, TIME, contrast = {c}]"))
+            };
+            let jac = jacobian(&with("none"), "ETA_V", &pop);
+            for (c, token) in EXPLICIT {
+                let (base, under, free) = oracle(&jac, c, &mut Vec::new());
+                if free == 0 {
+                    continue;
+                }
+                assert_eq!(under, base, "{tag} {token}: the block absorbs the η");
+                assert!(try_bind(&with(token), &pop).is_ok(), "{tag} {token}");
+            }
+            assert_eq!(
+                try_bind(&base_text, &pop).map(|(c, _)| c),
+                Ok(LevelContrast::SumToZero),
+                "{tag} auto"
+            );
+        }
+    }
+
+    /// T7. A fit bound before #1650 resolved S2 to global sum-to-zero (17 free
+    /// θ); bound now it is within (15). Its saved bindings still drive it:
+    /// [`bind_theta_levels_from_fit`] imposes the stored layout and never
+    /// re-resolves the contrast.
+    #[test]
+    fn a_fit_bound_before_1649_rebinds_its_own_layout() {
+        use crate::api::theta_level_values;
+        use crate::parser::model_parser::LevelBinding;
+        let text = shape("S2", "STUDY, TIME", "");
+        let today = try_bind(&text, &cf_pop(3, 1, &T6));
+        assert_eq!(today, Ok((LevelContrast::SumToZeroWithin, 15)), "today");
+        let mut p = cf_pop(3, 1, &T6);
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut p).unwrap();
+        let labels = parsed.bindings.levels["PLACEBO"].labels.clone();
+        assert_eq!(labels.len(), 18);
+        let mut old = LevelBindings::new();
+        old.insert(
+            "PLACEBO".to_string(),
+            LevelBinding {
+                labels,
+                groups: vec![0; 18],
+                contrast: LevelContrast::SumToZero,
+            },
+        );
+
+        let mut design = cf_pop(3, 1, &T6);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &text, &mut design, &old).expect("rebind");
+        assert_eq!(
+            parsed.model.n_theta, 20,
+            "TVE0, TVEMAX, TVET50 and 17 free levels"
+        );
+        let theta: Vec<f64> = (0..20).map(|k| 0.05 * k as f64 + 0.01).collect();
+        let values = theta_level_values(&parsed.model, &theta).unwrap();
+        let v = &values["PLACEBO"];
+        for (k, level) in v.iter().take(17).enumerate() {
+            assert_eq!(level.value.to_bits(), theta[k + 1].to_bits(), "level {k}");
+        }
+        let neg_sum = -theta[1..18].iter().fold(0.0, |a, t| a + t);
+        assert_eq!(v[17].value.to_bits(), neg_sum.to_bits());
+    }
+
+    /// A kappa keeps the #1642 rule (out of #1649's scope, see
+    /// `EtaCoupling::kappa`): on a nested block, an expression reading the block
+    /// and the kappa selects the within-group contrast, and a kappa reaching
+    /// `y` only through the state does not; on a one-column block nothing is
+    /// refused. The last two differ from what the same shape does with an η.
+    #[test]
+    fn a_kappa_keeps_the_1642_rule() {
+        let kappa = |t: String| {
+            t.replace("omega ETA_E0 ~ 0.1", "kappa KAPPA_E0 ~ 0.1")
+                .replace("ETA_E0", "KAPPA_E0")
+        };
+        let one = cf_pop(3, 1, &T6);
+        let cases = [
+            (
+                "H2",
+                "STUDY, TIME",
+                Ok((LevelContrast::SumToZeroWithin, 15)),
+            ),
+            ("S2", "STUDY, TIME", Ok((LevelContrast::SumToZero, 17))),
+            ("H1", "STUDY", Ok((LevelContrast::SumToZero, 2))),
+        ];
+        for (tag, cols, want) in cases {
+            let text = kappa(shape(tag, cols, ""));
+            assert!(
+                text.contains("kappa KAPPA_E0") && !text.contains("ETA_E0"),
+                "{tag}"
+            );
+            assert_eq!(try_bind(&text, &one), want, "{tag} with a kappa");
+        }
+        // The η twins of the last two differ.
+        assert_eq!(
+            try_bind(&shape("S2", "STUDY, TIME", ""), &one),
+            Ok((LevelContrast::SumToZeroWithin, 15))
+        );
+        assert!(try_bind(&shape("H1", "STUDY", ""), &one).is_err());
+    }
+
+    /// R1-1 (#1675 review). `TAD` and `TAFD` vary within a subject exactly as
+    /// `TIME` does, so a shape reading them must bind as its `TIME` twin does,
+    /// under every design and contrast of the oracle grid. With the only dose
+    /// at time 0 the three clocks are equal on these data, so the twin's oracle
+    /// cells in `binder_agrees_with_the_jacobian_oracle` (H6, H13) label these
+    /// too. The f64 predictor cannot label them directly: it reads `TAD` as 0
+    /// in a readout.
+    ///
+    /// Before the fix, `expr_constant` filed both clocks as data covariates
+    /// that were missing everywhere, so they read as constant: H6-with-`TAD`
+    /// was refused on one column and went to within on `[STUDY, VISIT]`.
+    #[test]
+    fn the_clocks_vary_like_time() {
+        let readout = |cols: &str, c: &str| {
+            cf_model(
+                c,
+                cols,
+                "  EMAX = TVEMAX + ETA_E0\n  ET50 = TVET50\n  E0 = TVE0",
+                "E0 + PLACEBO + EMAX * TAD / (TAD + ET50)",
+            )
+        };
+        let param = |cols: &str, c: &str| {
+            cf_model(
+                c,
+                cols,
+                &format!("{BASE}  E0 = TVE0 + PLACEBO + ETA_E0 * TAFD"),
+                &format!("E0 + {EMAXY}"),
+            )
+        };
+        let tad = |cols: &str, c: &str| readout(cols, c).replace("TAD", "tad");
+        type Shape<'a> = (&'a str, &'a dyn Fn(&str, &str) -> String, &'a str);
+        let cases: [Shape; 3] = [
+            ("TAD in y", &readout, "TAD"),
+            ("tad in y", &tad, "tad"),
+            ("TAFD in a parameter", &param, "TAFD"),
+        ];
+        let mut straddle = 0;
+        for (dtag, cols, pop) in designs() {
+            for (tag, text, clock) in cases {
+                for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+                    let clocked = text(cols, c);
+                    assert!(clocked.contains(clock), "{tag}");
+                    let twin = clocked.replace(clock, "TIME");
+                    let (got, want) = (try_bind(&clocked, &pop), try_bind(&twin, &pop));
+                    assert_eq!(
+                        got.is_ok(),
+                        want.is_ok(),
+                        "{dtag} {tag} {c:?}: {got:?} vs {want:?}"
+                    );
+                    if let (Ok(g), Ok(w)) = (&got, &want) {
+                        assert_eq!(g, w, "{dtag} {tag} {c:?}");
+                    }
+                    straddle += usize::from(want.is_ok());
+                }
+            }
+        }
+        // The twins bind in most cells, so a clock read as constant (refused, or
+        // pushed to within) is visible.
+        assert!(straddle >= 40, "only {straddle} twin cells bind");
     }
 }

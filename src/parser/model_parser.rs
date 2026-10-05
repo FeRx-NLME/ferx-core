@@ -3827,8 +3827,46 @@ pub fn parse_full_model_with(
                 .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
             None => Vec::new(),
         };
+        // #1649/#1650: the per-η couplings also follow the random effects into the
+        // states, which the share above does not.
+        let state_lines: Vec<&String> = ["odes", "initial_conditions"]
+            .iter()
+            .filter_map(|b| blocks.get(*b))
+            .flatten()
+            .collect();
+        let states = StateInputs::new(
+            &state_lines,
+            is_algebraic,
+            ode_spec.as_ref().map(|s| s.state_names.as_slice()),
+            pk_model,
+            &pk_param_map,
+            &indiv_var_names,
+        );
+        let readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
         for decl in level_block_decls.iter_mut() {
-            decl.scale_share = block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name);
+            decl.scale_share =
+                block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, None);
+            decl.eta_couplings = (0..eta_names.len())
+                .map(|k| {
+                    let mut c = level_block_eta_coupling(
+                        &indiv_stmts,
+                        &readout_with_states,
+                        &decl.name,
+                        k,
+                        &eta_names[k],
+                        &states,
+                    );
+                    c.share =
+                        block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, Some(k));
+                    if k >= n_eta {
+                        // Out of scope for the per-subject rule (see `EtaCoupling::kappa`).
+                        c.kappa = true;
+                        c.funnels.clear();
+                        c.reach = None;
+                    }
+                    c
+                })
+                .collect();
         }
     }
 
@@ -15530,6 +15568,7 @@ fn parse_parameters(
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 scale_share: None,
+                                eta_couplings: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                             });
                             (levels, theta_names, Some(index_covariate))
@@ -19694,11 +19733,15 @@ pub struct LevelBlockDecl {
     pub(crate) labels: Vec<String>,
     /// Set by the parse: some expression — an `[individual_parameters]`
     /// assignment or the `y` readout — reads this block *and* a random effect,
-    /// directly or through a variable (#1642). [`LevelContrast::Auto`] consumes
-    /// it — it is the "is there an η at a grouping coarser than or equal to the
-    /// block's" question, answered on the model side — and the binder's
-    /// refusals name the site from it.
+    /// directly or through a variable (#1642). States carry no taint here.
+    /// Backs [`Self::shares_scale_with_eta`]; the binder decides from
+    /// `eta_couplings`, which refines it per random effect.
     pub(crate) scale_share: Option<ScaleShare>,
+    /// Set by the parse: how each random effect the model declares relates to
+    /// this block (#1649, #1650) — the model-side half of "can the block absorb
+    /// that random effect". The binder adds the data-side half and resolves
+    /// [`LevelContrast::Auto`] and its refusals from it.
+    pub(crate) eta_couplings: Vec<EtaCoupling>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
 }
@@ -19734,6 +19777,54 @@ pub(crate) struct ScaleShare {
     /// The variable that carried the random effect into that expression, when
     /// the expression does not read the η itself.
     pub(crate) eta_via: Option<String>,
+}
+
+/// How one random effect relates to a level block (#1649, #1650), as far as
+/// the model alone can tell. Whether the block actually absorbs it also
+/// depends on the data, which only the binder sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EtaCoupling {
+    /// The random effect's declared name.
+    pub(crate) eta: String,
+    /// An IOV kappa rather than a subject-level η. A kappa varies by occasion
+    /// within a subject, so the per-subject conditions below do not describe
+    /// it; the binder keeps it on the #1642 rule (`share` on a nested block).
+    pub(crate) kappa: bool,
+    /// The first expression that reads the block and this random effect,
+    /// states not tainted (#1642). Names the site in diagnostics.
+    pub(crate) share: Option<ScaleShare>,
+    /// Expressions through which *every* route of the block and of this random
+    /// effect to `y` passes, and which are constant within a subject apart
+    /// from the block itself, in source order. Through one of them the random
+    /// effect's effect on `y` is proportional, subject by subject, to the
+    /// block's, so a block that identifies subjects reproduces it. Each holds
+    /// only if the data covariates it reads are constant within every subject.
+    pub(crate) funnels: Vec<Funnel>,
+    /// How this random effect reaches `y`, states included; `None` when it
+    /// does not. A block taking a separate level at every observation time
+    /// reproduces any per-subject effect, so for such a block any route counts.
+    pub(crate) reach: Option<EtaRoute>,
+}
+
+/// A subject-constant expression through which a block and a random effect
+/// reach `y` together (see [`EtaCoupling::funnels`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Funnel {
+    /// Where it is, in [`ScaleShare`]'s terms.
+    pub(crate) site: ScaleShare,
+    /// The data covariates it reads, which must not vary within a subject.
+    pub(crate) covariates: Vec<String>,
+}
+
+/// The most direct route by which a random effect reaches `y`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EtaRoute {
+    /// A readout reads the random effect itself.
+    Direct,
+    /// A readout reads an individual parameter that carries it.
+    Via(String),
+    /// Only through the model's states (a PK or ODE parameter).
+    State,
 }
 
 /// The observed levels of one level block, as discovered from the data.
@@ -20352,10 +20443,15 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// readout does not already have. The propagation is a fixpoint over
 /// assignment order, so a forward reference (not legal in this DSL anyway)
 /// cannot be missed by a single pass.
+///
+/// `only_eta` restricts the η taint to one slot of the extended η vector
+/// (#1649): each [`EtaCoupling::share`] is this question asked of one random
+/// effect.
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
     block: &str,
+    only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
     /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
     fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
@@ -20392,7 +20488,7 @@ fn block_shares_scale_with_eta(
             let mut eta_via: Option<&str> = None;
             visit_expr_nodes(rhs, &mut |n| match n {
                 Expression::ThetaGather { spec, .. } => reads_block |= spec.name == block,
-                Expression::Eta(_) => reads_eta = true,
+                Expression::Eta(i) => reads_eta |= only_eta.is_none_or(|k| k == *i),
                 Expression::Variable(v) => {
                     reads_block |= block_tainted.contains(&v.as_str());
                     if eta_via.is_none() {
@@ -20423,6 +20519,559 @@ fn block_shares_scale_with_eta(
         if (block_tainted.len(), eta_tainted.len()) == before {
             return None;
         }
+    }
+}
+
+/// The name a readout leaf takes for "some state" when `y` is a state by
+/// default (no `[scaling]` block). The `__ferx_` prefix is reserved, so it
+/// cannot clash with a user's name.
+const STATE_LEAF: &str = "__ferx_state";
+
+/// What the per-η coupling analysis needs to know about the model's states
+/// (#1649, #1650). The states are lumped into one node: a random effect or a
+/// block taints "the states" when anything a state reads carries it. That
+/// over-approximates, which can only make a random effect reach `y` (a route
+/// that, for the block shape it matters to, is exact anyway) and never makes a
+/// funnel exist.
+struct StateInputs {
+    /// Names that read as a state in a readout.
+    states: Vec<String>,
+    /// Individual parameters some state reads: `pk(...)` arguments, dose
+    /// attributes and canonical PK names, and every one an `[odes]` or
+    /// `[initial_conditions]` line names.
+    feeds: HashSet<String>,
+    /// Every identifier those lines contain, so a random effect or block named
+    /// there directly taints the states too.
+    tokens: HashSet<String>,
+    /// The analytical volume, which divides the state in the default readout.
+    volume: Option<String>,
+    /// The model has no states (compartment-free, #811).
+    stateless: bool,
+}
+
+impl StateInputs {
+    fn new(
+        state_lines: &[&String],
+        is_algebraic: bool,
+        ode_states: Option<&[String]>,
+        pk_model: PkModel,
+        pk_param_map: &HashMap<String, String>,
+        indiv_var_names: &[String],
+    ) -> Self {
+        if is_algebraic {
+            return Self {
+                states: Vec::new(),
+                feeds: HashSet::new(),
+                tokens: HashSet::new(),
+                volume: None,
+                stateless: true,
+            };
+        }
+        let mut states: Vec<String> = match ode_states {
+            Some(names) => names.to_vec(),
+            None => {
+                let (allowed, forbidden) = analytic_readout_state_names(pk_model);
+                allowed.into_iter().chain(forbidden).collect()
+            }
+        };
+        states.push(STATE_LEAF.to_string());
+        let tokens: HashSet<String> = state_lines
+            .iter()
+            .flat_map(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut feeds: HashSet<String> = pk_param_map.values().cloned().collect();
+        feeds.extend(
+            indiv_var_names
+                .iter()
+                .filter(|n| {
+                    // A canonical PK name is read by the engine itself only as an
+                    // ODE model's bare dose route (`F`, `ALAG`/`LAGTIME`); an
+                    // analytical model reads what `pk(...)` binds, which is
+                    // `pk_param_map`. Any other unread canonical name (`KA` on
+                    // `one_cpt_iv`) is dead (#1675 review, R1-2).
+                    tokens.contains(n.as_str())
+                        || crate::types::DoseAttr::from_indexed_name(n).is_some()
+                        || (ode_states.is_some()
+                            && matches!(
+                                PkParams::name_to_index(&n.to_lowercase()),
+                                Some(crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)
+                            ))
+                })
+                .cloned(),
+        );
+        let volume = match ode_states {
+            Some(_) => None,
+            None => pk_param_map
+                .get("v")
+                .or_else(|| pk_param_map.get("v1"))
+                .cloned(),
+        };
+        Self {
+            states,
+            feeds,
+            tokens,
+            volume,
+            stateless: false,
+        }
+    }
+
+    fn is_state(&self, name: &str) -> bool {
+        self.states.iter().any(|s| s == name)
+    }
+
+    /// The readouts to analyse: `readout` itself, or, with no `[scaling]` block
+    /// on a model with states, the default `y` — the state, over the volume
+    /// for an analytical model.
+    fn readout(&self, readout: &[Expression], has_scaling: bool) -> Vec<Expression> {
+        if has_scaling || self.stateless {
+            return readout.to_vec();
+        }
+        let state = Expression::Covariate(STATE_LEAF.to_string());
+        vec![match &self.volume {
+            Some(v) => Expression::BinOp(
+                Box::new(state),
+                BinOp::Div,
+                Box::new(Expression::Variable(v.clone())),
+            ),
+            None => state,
+        }]
+    }
+}
+
+/// One `[individual_parameters]` assignment, with the conditions of the `if`
+/// branches it sits in.
+struct CouplingAssign<'a> {
+    lhs: &'a str,
+    rhs: &'a Expression,
+    conds: Vec<&'a Condition>,
+}
+
+fn coupling_assigns<'a>(
+    stmts: &'a [Statement],
+    conds: &[&'a Condition],
+    out: &mut Vec<CouplingAssign<'a>>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(n, e) => out.push(CouplingAssign {
+                lhs: n.as_str(),
+                rhs: e,
+                conds: conds.to_vec(),
+            }),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // A later branch is reached only when the earlier conditions fail,
+                // so it reads them too.
+                let mut seen: Vec<&'a Condition> = conds.to_vec();
+                for (cond, body) in branches {
+                    seen.push(cond);
+                    coupling_assigns(body, &seen, out);
+                }
+                if let Some(eb) = else_body {
+                    coupling_assigns(eb, &seen, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The per-random-effect half of the level-block identifiability question
+/// (#1649, #1650): how random effect `k` (named `eta_name`) relates to the
+/// block `block` through the `[individual_parameters]` statements `stmts`, the
+/// readouts `readout` (`StateInputs::readout`), and the states.
+///
+/// Two answers, both read off the expression trees by name:
+///
+/// - **reach**: whether the random effect gets to `y` at all, and by its most
+///   direct route. States count: a random effect on `CL` reaches `y` through
+///   the amount.
+/// - **funnels**: subject-constant expressions through which *every* route of
+///   both the block and the random effect to `y` passes. Through such an
+///   expression `E`, `∂y/∂η = g·∂E/∂η` and `∂y/∂block = g·∂E/∂block` with the
+///   same `g`, so the two are proportional within a subject, and a block that
+///   identifies subjects reproduces the random effect exactly. Two kinds are
+///   found: an individual parameter that, taken out of the graph, cuts both
+///   from `y`; and, in the one readout that reads either, the smallest sum or
+///   product of operands collecting every read of both, when those operands
+///   are all subject-constant (the chain rule carries it through a unary
+///   function, or a power whose exponent reads neither). "Subject-constant"
+///   excludes `TIME`, states, other blocks and network outputs; the block
+///   itself is allowed, and the data covariates read are recorded for the
+///   binder to check.
+///
+/// Sufficient, not necessary: proportionality the walk does not see (an
+/// algebraic cancellation, say) is not found, and the binder stays silent.
+fn level_block_eta_coupling(
+    stmts: &[Statement],
+    readout: &[Expression],
+    block: &str,
+    k: usize,
+    eta_name: &str,
+    states: &StateInputs,
+) -> EtaCoupling {
+    let mut assigns = Vec::new();
+    coupling_assigns(stmts, &[], &mut assigns);
+    let ctx = CouplingCtx {
+        assigns: &assigns,
+        readout,
+        block,
+        states,
+    };
+    let is_block =
+        |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == block);
+    let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == k);
+    let block_src = Source {
+        node: &is_block,
+        token: states.tokens.contains(block),
+    };
+    let eta_src = Source {
+        node: &is_eta,
+        token: states.tokens.contains(eta_name),
+    };
+
+    let taint_e = ctx.taint(&eta_src, None);
+    let taint_b = ctx.taint(&block_src, None);
+    let reach = ctx.route(&eta_src, &taint_e);
+    let mut funnels = Vec::new();
+    if reach.is_some() && ctx.reaches(&block_src, None) {
+        // Individual parameters, in source order.
+        let mut seen: Vec<&str> = Vec::new();
+        for a in &assigns {
+            let v = a.lhs;
+            if seen.contains(&v) {
+                continue;
+            }
+            seen.push(v);
+            // No "carries both" pre-filter: the cut test below already rejects a
+            // parameter that carries only one, since the other still reaches `y`
+            // without it. Two gates rejecting the same inputs would each be
+            // untestable (AGENTS.md).
+            let mut covariates = Vec::new();
+            if !ctx.var_constant(v, &mut covariates, &mut Vec::new()) {
+                continue;
+            }
+            if ctx.reaches(&block_src, Some(v)) || ctx.reaches(&eta_src, Some(v)) {
+                continue;
+            }
+            let own: Vec<&CouplingAssign> = assigns.iter().filter(|a| a.lhs == v).collect();
+            let direct = own.iter().any(|a| {
+                reads_node(a.rhs, &is_eta) || a.conds.iter().any(|c| cond_reads_node(c, &is_eta))
+            });
+            let via = if direct {
+                None
+            } else {
+                own.iter().find_map(|a| first_tainted_var(a.rhs, &taint_e))
+            };
+            covariates.sort();
+            covariates.dedup();
+            funnels.push(Funnel {
+                site: ScaleShare {
+                    param: Some(v.to_string()),
+                    eta_via: via,
+                },
+                covariates,
+            });
+        }
+        // The readout: only when a single one reads either.
+        let te_states = ctx.state_tainted(&eta_src, &taint_e);
+        let tb_states = ctx.state_tainted(&block_src, &taint_b);
+        let reads_block = |e: &Expression| ctx.expr_reads(e, &block_src, &taint_b, tb_states);
+        let reads_eta = |e: &Expression| ctx.expr_reads(e, &eta_src, &taint_e, te_states);
+        let reads_any = |e: &Expression| reads_block(e) || reads_eta(e);
+        let reads_both = |e: &Expression| reads_block(e) && reads_eta(e);
+        let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
+        if let [y] = touched.as_slice() {
+            if let Some(ops) = ctx.readout_funnel(y, &reads_any, &reads_both) {
+                let direct = ops.iter().any(|o| reads_node(o, &is_eta));
+                let via = if direct {
+                    None
+                } else {
+                    ops.iter().find_map(|o| first_tainted_var(o, &taint_e))
+                };
+                let mut covariates = Vec::new();
+                for o in &ops {
+                    ctx.expr_constant(o, &mut covariates, &mut Vec::new());
+                }
+                covariates.sort();
+                covariates.dedup();
+                funnels.push(Funnel {
+                    site: ScaleShare {
+                        param: None,
+                        eta_via: via,
+                    },
+                    covariates,
+                });
+            }
+        }
+    }
+    EtaCoupling {
+        eta: eta_name.to_string(),
+        kappa: false,
+        share: None,
+        funnels,
+        reach,
+    }
+}
+
+/// A taint source: the expression node it is, and whether a state line names it.
+struct Source<'f> {
+    node: &'f dyn Fn(&Expression) -> bool,
+    token: bool,
+}
+
+fn reads_node(e: &Expression, f: &dyn Fn(&Expression) -> bool) -> bool {
+    let mut hit = false;
+    visit_expr_nodes(e, &mut |n| hit |= f(n));
+    hit
+}
+
+fn cond_reads_node(c: &Condition, f: &dyn Fn(&Expression) -> bool) -> bool {
+    let mut hit = false;
+    visit_condition_nodes(c, &mut |n| hit |= f(n));
+    hit
+}
+
+/// The first variable `e` reads that is in `tainted`, in visit order.
+fn first_tainted_var(e: &Expression, tainted: &HashSet<&str>) -> Option<String> {
+    let mut found: Option<String> = None;
+    visit_expr_nodes(e, &mut |n| {
+        if let Expression::Variable(v) = n {
+            if found.is_none() && tainted.contains(v.as_str()) {
+                found = Some(v.clone());
+            }
+        }
+    });
+    found
+}
+
+/// The model one [`level_block_eta_coupling`] call walks.
+struct CouplingCtx<'a> {
+    assigns: &'a [CouplingAssign<'a>],
+    readout: &'a [Expression],
+    block: &'a str,
+    states: &'a StateInputs,
+}
+
+impl<'a> CouplingCtx<'a> {
+    /// Whether node `n` carries the source: is it, names a tainted variable, or
+    /// is a state while the states are tainted.
+    fn node_carries(
+        &self,
+        n: &Expression,
+        src: &Source,
+        tainted: &HashSet<&str>,
+        states_tainted: bool,
+    ) -> bool {
+        (src.node)(n)
+            || match n {
+                Expression::Variable(v) | Expression::Covariate(v) => {
+                    tainted.contains(v.as_str()) || (states_tainted && self.states.is_state(v))
+                }
+                _ => false,
+            }
+    }
+
+    fn expr_reads(
+        &self,
+        e: &Expression,
+        src: &Source,
+        tainted: &HashSet<&str>,
+        states_tainted: bool,
+    ) -> bool {
+        reads_node(e, &|n| self.node_carries(n, src, tainted, states_tainted))
+    }
+
+    /// The individual parameters carrying `src`, never through `cut`. A fixpoint
+    /// over assignment order, so a forward reference cannot be missed.
+    fn taint(&self, src: &Source, cut: Option<&str>) -> HashSet<&'a str> {
+        let mut t: HashSet<&'a str> = HashSet::new();
+        loop {
+            let before = t.len();
+            for a in self.assigns {
+                if Some(a.lhs) == cut || t.contains(a.lhs) {
+                    continue;
+                }
+                let carries = |n: &Expression| self.node_carries(n, src, &t, false);
+                if reads_node(a.rhs, &carries)
+                    || a.conds.iter().any(|c| cond_reads_node(c, &carries))
+                {
+                    t.insert(a.lhs);
+                }
+            }
+            if t.len() == before {
+                return t;
+            }
+        }
+    }
+
+    fn state_tainted(&self, src: &Source, tainted: &HashSet<&str>) -> bool {
+        !self.states.stateless
+            && (src.token
+                || self
+                    .states
+                    .feeds
+                    .iter()
+                    .any(|f| tainted.contains(f.as_str())))
+    }
+
+    /// Whether `src` reaches some readout, never through `cut`.
+    fn reaches(&self, src: &Source, cut: Option<&str>) -> bool {
+        let t = self.taint(src, cut);
+        let s = self.state_tainted(src, &t);
+        self.readout.iter().any(|e| self.expr_reads(e, src, &t, s))
+    }
+
+    /// The most direct route by which `src` reaches a readout.
+    fn route(&self, src: &Source, tainted: &HashSet<&str>) -> Option<EtaRoute> {
+        let states_tainted = self.state_tainted(src, tainted);
+        let is_state_leaf = |n: &Expression| matches!(n, Expression::Variable(v) | Expression::Covariate(v) if self.states.is_state(v));
+        self.readout
+            .iter()
+            .filter_map(|e| {
+                if reads_node(e, src.node) {
+                    Some(EtaRoute::Direct)
+                } else if let Some(v) = first_tainted_var(e, tainted) {
+                    Some(EtaRoute::Via(v))
+                } else if states_tainted && reads_node(e, &is_state_leaf) {
+                    Some(EtaRoute::State)
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
+    /// Whether every assignment of individual parameter `v` is subject-constant
+    /// (see [`level_block_eta_coupling`]), recording the covariates it reads.
+    /// `stack` guards a cycle, which is treated as varying.
+    fn var_constant(&self, v: &str, covs: &mut Vec<String>, stack: &mut Vec<String>) -> bool {
+        if stack.iter().any(|s| s == v) {
+            return false;
+        }
+        stack.push(v.to_string());
+        let ok = self.assigns.iter().filter(|a| a.lhs == v).all(|a| {
+            self.expr_constant(a.rhs, covs, stack)
+                && a.conds.iter().all(|c| self.cond_constant(c, covs, stack))
+        });
+        stack.pop();
+        ok
+    }
+
+    fn cond_constant(
+        &self,
+        c: &Condition,
+        covs: &mut Vec<String>,
+        stack: &mut Vec<String>,
+    ) -> bool {
+        match c {
+            Condition::Compare(l, _, r) => {
+                self.expr_constant(l, covs, stack) && self.expr_constant(r, covs, stack)
+            }
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                self.cond_constant(l, covs, stack) && self.cond_constant(r, covs, stack)
+            }
+            Condition::Not(c) => self.cond_constant(c, covs, stack),
+            Condition::Present(e) => self.expr_constant(e, covs, stack),
+        }
+    }
+
+    fn expr_constant(
+        &self,
+        e: &Expression,
+        covs: &mut Vec<String>,
+        stack: &mut Vec<String>,
+    ) -> bool {
+        match e {
+            Expression::Literal(_) | Expression::Theta(_) | Expression::Eta(_) => true,
+            // The block's own gather is constant within a level, which is all the
+            // proportionality argument needs.
+            Expression::ThetaGather { spec, .. } => spec.name == self.block,
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                if self.states.is_state(n) {
+                    false
+                } else if scaling_intermediate_reserved(n).is_some() {
+                    // The eval-time clocks (`TAD`, `TAFD`, the `T` alias) and the
+                    // mixture index vary within a subject like `TIME` does; filed
+                    // as a data covariate they would be missing everywhere and so
+                    // read as constant (#1675 review, R1-1). `MACHEPS` is constant
+                    // but lands here too, which only costs a funnel nobody writes.
+                    false
+                } else if self.assigns.iter().any(|a| a.lhs == n.as_str()) {
+                    self.var_constant(n, covs, stack)
+                } else {
+                    covs.push(n.clone());
+                    true
+                }
+            }
+            Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                self.expr_constant(l, covs, stack) && self.expr_constant(r, covs, stack)
+            }
+            Expression::UnaryFn(_, a) => self.expr_constant(a, covs, stack),
+            Expression::Conditional(c, t, f) => {
+                self.cond_constant(c, covs, stack)
+                    && self.expr_constant(t, covs, stack)
+                    && self.expr_constant(f, covs, stack)
+            }
+            Expression::Time
+            | Expression::MixNum
+            | Expression::NnOutput { .. }
+            | Expression::VariableIdx(_)
+            | Expression::CovariateIdx(_) => false,
+        }
+    }
+
+    /// The operands of the smallest subject-constant sum or product in `e` that
+    /// collects every read of the block and of the random effect, if any.
+    fn readout_funnel<'e>(
+        &self,
+        e: &'e Expression,
+        reads_any: &dyn Fn(&Expression) -> bool,
+        reads_both: &dyn Fn(&Expression) -> bool,
+    ) -> Option<Vec<&'e Expression>> {
+        if !reads_both(e) {
+            return None;
+        }
+        if self.expr_constant(e, &mut Vec::new(), &mut Vec::new()) {
+            return Some(vec![e]);
+        }
+        let mut ops: Vec<&Expression> = Vec::new();
+        match e {
+            Expression::BinOp(_, BinOp::Add | BinOp::Sub, _) => flatten_binop(e, true, &mut ops),
+            Expression::BinOp(_, BinOp::Mul | BinOp::Div, _) => flatten_binop(e, false, &mut ops),
+            Expression::UnaryFn(_, a) => return self.readout_funnel(a, reads_any, reads_both),
+            Expression::Power(b, x) if !reads_any(x) => {
+                return self.readout_funnel(b, reads_any, reads_both)
+            }
+            _ => return None,
+        }
+        let rel: Vec<&Expression> = ops.into_iter().filter(|o| reads_any(o)).collect();
+        if let [one] = rel.as_slice() {
+            return self.readout_funnel(one, reads_any, reads_both);
+        }
+        rel.iter()
+            .all(|o| self.expr_constant(o, &mut Vec::new(), &mut Vec::new()))
+            .then_some(rel)
+    }
+}
+
+/// The operands of a chain of `+`/`-` (`sum`) or `*`/`/` (product) nodes.
+fn flatten_binop<'e>(e: &'e Expression, sum: bool, out: &mut Vec<&'e Expression>) {
+    match e {
+        Expression::BinOp(l, op, r)
+            if matches!(
+                (sum, op),
+                (true, BinOp::Add | BinOp::Sub) | (false, BinOp::Mul | BinOp::Div)
+            ) =>
+        {
+            flatten_binop(l, sum, out);
+            flatten_binop(r, sum, out);
+        }
+        _ => out.push(e),
     }
 }
 

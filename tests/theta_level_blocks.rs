@@ -47,7 +47,9 @@ const FIT_OPTIONS: &str = "
 ";
 
 /// A `[STUDY, TIME]` placebo effect with no random effect on the same
-/// scale — global sum-to-zero.
+/// scale — global sum-to-zero. The random effect sits on a parameter `y` never
+/// reads: with one subject per study, the block takes a level at every
+/// observation, so any random effect that reached `y` would be absorbed (#1650).
 fn level_block_model() -> String {
     format!(
         r#"
@@ -60,7 +62,8 @@ fn level_block_model() -> String {
 
 [individual_parameters]
   CL = TVCL + PLACEBO
-  V  = TVV * exp(ETA_V)
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
 
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
@@ -84,7 +87,8 @@ fn explicit_model(levels: usize) -> String {
 
 [individual_parameters]
   CL = TVCL + PLACEBO[PLA_IDX]
-  V  = TVV * exp(ETA_V)
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
 
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
@@ -253,7 +257,7 @@ fn the_unbound_refusal_names_every_unbound_block() {
             "theta TVV(10.0, 0.1, 500.0)",
             "theta TVV(10.0, 0.1, 500.0)\n  theta DRUG[STUDY](0.0, -5.0, 5.0)",
         )
-        .replace("V  = TVV * exp(ETA_V)", "V  = TVV * exp(ETA_V) + DRUG");
+        .replace("V  = TVV\n", "V  = TVV + DRUG\n");
     let parsed = ferx_core::parser::model_parser::parse_full_model(&model).expect("parse");
     assert_eq!(
         parsed.model.theta_blocks().unbound_level_blocks().len(),
@@ -414,7 +418,8 @@ fn a_level_block_binds_against_a_simulation_design() {
 
 [individual_parameters]
   CL = TVCL + PLACEBO
-  V  = TVV * exp(ETA_V)
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
 
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)

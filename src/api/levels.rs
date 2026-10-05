@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    eval_gather, level_index_column, parse_full_model_with, DataBindings, LevelBinding,
+    eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaRoute, LevelBinding,
     LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
 };
 use crate::types::{ParsedModel, Population, Subject};
@@ -588,23 +588,31 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     Ok(levels)
 }
 
-/// Whether the block's leading columns identify subjects one-to-one: every
-/// subject's records share one combination, and no two subjects share it.
+/// The columns that would key a block's levels to subjects: the leading ones,
+/// or for a one-column block the column itself.
+fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
+    match decl.columns().len() {
+        1 => decl.columns(),
+        n => &decl.columns()[..n - 1],
+    }
+}
+
+/// Whether the block's subject-key columns ([`subject_key_columns`]) identify
+/// subjects one-to-one: every subject's records share one combination, and no
+/// two subjects share it.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
 /// coarser than or equal to the block's". η in this engine is per subject, so
-/// only when the leading tuple identifies one subject can that subject's η
-/// carry the corresponding group mean.
-fn leading_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
-    if decl.columns().len() < 2 {
-        return false;
-    }
-    let leading = &decl.columns()[..decl.columns().len() - 1];
+/// only when the key identifies one subject can that subject's η carry the
+/// corresponding group's levels (#1064). For a one-column block it means each
+/// level is one subject's (#1649).
+fn subject_key_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
+    let key_columns = subject_key_columns(decl);
     let mut subject_keys: Vec<Vec<f64>> = Vec::with_capacity(population.subjects.len());
     for subject in &population.subjects {
         let mut first: Option<Vec<f64>> = None;
         for j in 0..subject.obs_times.len() {
-            let key: Option<Vec<f64>> = leading
+            let key: Option<Vec<f64>> = key_columns
                 .iter()
                 .map(|c| column_value(subject, c, j))
                 .collect();
@@ -624,31 +632,139 @@ fn leading_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -
     true
 }
 
+/// Whether a block of two or more columns resolves every subject's
+/// observations: no level holds two different observation times of one
+/// subject (#1650). Replicates at one time still resolve, since a random
+/// effect's effect is the same at both.
+///
+/// Such a block is a free curve per subject at the observed times, so it
+/// reproduces any per-subject effect at all, whatever route a random effect
+/// takes to `y`.
+fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool {
+    if decl.columns().len() < 2 {
+        return false;
+    }
+    population.subjects.iter().all(|subject| {
+        let mut seen: Vec<(Vec<f64>, f64)> = Vec::new();
+        (0..subject.obs_times.len()).all(|j| {
+            let level: Vec<f64> = decl
+                .columns()
+                .iter()
+                .filter_map(|c| column_value(subject, c, j))
+                .collect();
+            let t = subject.obs_times[j];
+            match seen.iter().find(|(l, _)| *l == level) {
+                Some((_, t0)) => *t0 == t,
+                None => {
+                    seen.push((level, t));
+                    true
+                }
+            }
+        })
+    })
+}
+
+/// Whether every covariate in `covariates` is constant within every subject's
+/// observation records — the data-side condition of a funnel (`EtaCoupling::funnels`).
+fn constant_within_subjects(covariates: &[String], population: &Population) -> bool {
+    population.subjects.iter().all(|subject| {
+        covariates.iter().all(|c| {
+            let mut values = (0..subject.obs_times.len()).map(|j| column_value(subject, c, j));
+            // Missing compares like any other value: a column absent from every
+            // record is constant, one present on only some records changes.
+            match values.next() {
+                None => true,
+                Some(first) => values.all(|v| v == first),
+            }
+        })
+    })
+}
+
+/// Where the binder found a random effect absorbed by a block, for its
+/// diagnostics.
+enum Absorbed<'a> {
+    /// An expression that reads the block and the random effect.
+    Site(&'a ScaleShare),
+    /// A random effect reaching `y` by a route that never meets the block, on a
+    /// block that resolves the observations.
+    Route(&'a str, &'a EtaRoute),
+}
+
+impl Absorbed<'_> {
+    fn clause(&self) -> String {
+        match self {
+            Absorbed::Site(share) => share_site(share),
+            Absorbed::Route(eta, route) => {
+                let how = match route {
+                    EtaRoute::Direct => "directly".to_string(),
+                    EtaRoute::Via(v) => format!("through `{v}`"),
+                    EtaRoute::State => "through the model's states".to_string(),
+                };
+                format!("the random effect `{eta}` reaches `y` {how}")
+            }
+        }
+    }
+}
+
+/// The first random effect the block absorbs, by the #1649 rule: the block's
+/// subject key identifies subjects one-to-one, and either a funnel holds on
+/// this data (its covariates constant within subjects) or the block resolves
+/// the observations and the random effect reaches `y` at all. A kappa keeps
+/// the #1642 rule: a nested block and a shared expression.
+fn absorbed<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Option<Absorbed<'a>> {
+    if !subject_key_identifies_subjects(decl, population) {
+        return None;
+    }
+    let nested = decl.columns().len() >= 2;
+    let resolving = resolves_observations(decl, population);
+    decl.eta_couplings.iter().find_map(|c| {
+        if c.kappa {
+            return c.share.as_ref().filter(|_| nested).map(Absorbed::Site);
+        }
+        if let Some(f) = c
+            .funnels
+            .iter()
+            .find(|f| constant_within_subjects(&f.covariates, population))
+        {
+            return Some(Absorbed::Site(&f.site));
+        }
+        let route = c.reach.as_ref().filter(|_| resolving)?;
+        Some(match &c.share {
+            Some(share) => Absorbed::Site(share),
+            None => Absorbed::Route(&c.eta, route),
+        })
+    })
+}
+
 /// Resolve [`LevelContrast::Auto`], group the levels under it, and reject the
 /// configurations that are still rank-deficient once resolved.
 ///
-/// Two refusals, in this order: a contrast that leaves a group mean free
-/// against a random effect carrying the same mean (#1064, #1642), then a block
-/// left with no free θ at all (#1624) — whatever the contrast, since a block
-/// that estimates nothing cannot be told apart from not declaring it.
+/// Two refusals, in this order: a block that absorbs a random effect
+/// ([`absorbed`]) under a contrast that leaves it free θ (#1064, #1642,
+/// #1649, #1650), then a block left with no free θ at all (#1624) — whatever
+/// the contrast, since a block that estimates nothing cannot be told apart
+/// from not declaring it.
+///
+/// A nested block (two or more columns) that absorbs a random effect resolves
+/// `auto` to the within-group contrast, which leaves each subject's mean to
+/// the random effect; an explicit global contrast is refused. A one-column
+/// block has no such rescue: each level *is* one subject's, so it is refused
+/// under every contrast.
 fn resolve_contrast(
     decl: &LevelBlockDecl,
     levels: &[Level],
     population: &Population,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
-    let nested = leading_identifies_subjects(decl, population);
-    let share = decl.scale_share.as_ref().filter(|_| nested);
+    let nested = decl.columns().len() >= 2;
+    let absorbed = absorbed(decl, population);
     let resolved = match decl.contrast() {
-        LevelContrast::Auto => {
-            if share.is_some() {
-                LevelContrast::SumToZeroWithin
-            } else {
-                LevelContrast::SumToZero
-            }
-        }
+        LevelContrast::Auto if nested && absorbed.is_some() => LevelContrast::SumToZeroWithin,
+        LevelContrast::Auto => LevelContrast::SumToZero,
         other => other,
     };
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
+    let groups = assign_groups(decl, levels, resolved);
+    let free = free_count(&groups, resolved);
 
     // The configuration the feature exists to serve — an unstructured placebo
     // effect per study × timepoint under between-study variability — is
@@ -656,12 +772,25 @@ fn resolve_contrast(
     // free: that study's η *is* the mean of its own levels. A check that only
     // looked for a fixed intercept would wave it through, which is precisely
     // the silent flat direction this codebase treats as a bug.
-    if let Some(share) = share {
-        if matches!(
-            resolved,
-            LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
-        ) {
-            let leading = decl.columns()[..decl.columns().len() - 1].join(", ");
+    if let Some(found) = absorbed.as_ref() {
+        // A one-column block with no free θ is the plain single-level case
+        // below: there is no level left for the random effect to be confused with.
+        if !nested && free > 0 {
+            return Err(format!(
+                "{block}: each `{}` level belongs to a single subject, and {}, so a level and \
+                 that subject's random effect are the same quantity: the model is not \
+                 identified under any contrast. Remove the block, or drop the random effect.",
+                decl.columns()[0],
+                found.clause(),
+            ));
+        }
+        if nested
+            && matches!(
+                resolved,
+                LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
+            )
+        {
+            let leading = subject_key_columns(decl).join(", ");
             // When every group is a single level the within-group contrast
             // would leave nothing to estimate, so it is not the advice (#1624).
             let within = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
@@ -675,27 +804,35 @@ fn resolve_contrast(
                  the random effect."
                     .to_string()
             };
+            let why = match found {
+                Absorbed::Site(_) => format!("{} at that grouping", found.clause()),
+                Absorbed::Route(..) => format!(
+                    "{}, and the block takes a level at every observation, so it can \
+                     reproduce any effect that random effect has",
+                    found.clause()
+                ),
+            };
             return Err(format!(
-                "{block}: `contrast = {}` leaves each {leading} group's mean free, but {} at \
-                 that grouping — the two are the same quantity, so the model is not \
-                 identified.{fix}",
+                "{block}: `contrast = {}` leaves each {leading} group's mean free, but {why} \
+                 — the two are the same quantity, so the model is not identified.{fix}",
                 contrast_token(resolved),
-                share_site(share),
             ));
         }
     }
 
-    let groups = assign_groups(decl, levels, resolved);
-    if free_count(&groups, resolved) == 0 {
-        let leading = decl.columns()[..decl.columns().len().saturating_sub(1)].join(", ");
+    if free == 0 {
         let single = "the data carries a single level";
         let none = "Use `contrast = none` if a single constant is what you meant.";
-        return Err(match (resolved, share) {
-            (_, Some(share)) => format!(
+        // Only a nested block has groups to name; a one-column block's single
+        // level reads as the plain single-level case.
+        let found = absorbed.filter(|_| nested);
+        let leading = subject_key_columns(decl).join(", ");
+        return Err(match (resolved, found) {
+            (_, Some(found)) => format!(
                 "{block}: every {leading} group has a single level, and {} — the random \
                  effect already carries each group's value, so the block estimates nothing. \
                  Remove the block.",
-                share_site(share),
+                found.clause(),
             ),
             (LevelContrast::Ref, None) => {
                 format!("{block}: {single}, which is the reference level, held at 0. {none}")
