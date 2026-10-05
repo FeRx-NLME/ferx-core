@@ -162,12 +162,16 @@ fn kappa_weight_facts(
 
 /// The typical-arm spread on a weighted kappa's weight line, on the scale of
 /// the row above it (#1683): `CV% = …` where the row is a CV% (log-normal, and
-/// an unknown type as in [`variance_note`]), `SD = …` otherwise. `sd` is the
-/// typical-arm SD from [`kappa_weight_facts`], so the CV% is `100 · sd` — the
-/// YAML's `sd_at_typical_weight` times 100.
+/// an unknown type as in [`variance_note`]), `SD = …` otherwise, tagged
+/// `, logit scale` where the row is (#1697). `sd` is the typical-arm SD from
+/// [`kappa_weight_facts`], so the CV% is `100 · sd` — the YAML's
+/// `sd_at_typical_weight` times 100.
 fn typical_weight_spread(t: Option<EtaParamType>, sd: f64) -> String {
     match t {
         None | Some(EtaParamType::LogNormal) => format!("CV% = {:.1}", sd * 100.0),
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
+            format!("SD = {:.4}, logit scale", sd)
+        }
         Some(_) => format!("SD = {:.4}", sd),
     }
 }
@@ -206,8 +210,12 @@ fn format_kappa_rows(result: &FitResult) -> String {
         // *unweighted* γ² — the quantity a published MBMA reports — so
         // print the effective SD at the median arm alongside it. A raw
         // γ of 2.0 on a logit scale reads as alarming until it is divided.
+        // The spread is the row's note at the typical arm, so it follows the
+        // note's `show_cv` gate (#1698): a failed or SIR-fallback covariance
+        // step leaves the bare weight line, as when no typical weight exists.
+        // The YAML's `sd_at_typical_weight` is written regardless, like `sd`.
         if let Some((w, typical)) = weight {
-            let _ = match typical {
+            let _ = match typical.filter(|_| show_cv) {
                 Some((n, sd)) => writeln!(
                     out,
                     "  {:<20}   weight = {}  →  {} at {} = {:.4} (κ ~ N(0, {}/{}))",
@@ -5479,54 +5487,94 @@ mod tests {
         // (additive, logit) and under a custom row, which has no note. Exact
         // lines, typed and untyped, on both surfaces: the LN line printing
         // `SD =`, or the additive / logit / custom line printing `CV% =`,
-        // reddens a cell. The SD lines are byte-identical to before #1683.
+        // reddens a cell. The additive and custom SD lines are byte-identical to
+        // before #1683; the logit line carries its row's `, logit scale` tag
+        // (#1697), an untyped one does not (its row is a CV%).
         // Typical arm n = 4, so SD = √var / 2; CV% = 100 · SD.
+        //
+        // #1698: the spread follows the row note's `show_cv` gate. Both sides
+        // of the gate in this one loop — a computed covariance step prints the
+        // spread, a failed or SIR-fallback one the bare `weight = NARM (κ ~ …)`
+        // line — so forcing the gate either way reddens a cell.
         let pad = " ".repeat(25);
-        let weight_line = |name: &str, spread: &str| {
-            format!("{pad}weight = NARM  →  {spread} at NARM = 4.0000 (κ ~ N(0, {name}/NARM))")
+        let weight_line = |name: &str, spread: Option<&str>| match spread {
+            Some(spread) => {
+                format!("{pad}weight = NARM  →  {spread} at NARM = 4.0000 (κ ~ N(0, {name}/NARM))")
+            }
+            None => format!("{pad}weight = NARM (κ ~ N(0, {name}/NARM))"),
         };
-        for (typed, cells) in [
-            (
-                true,
-                [
-                    ("K_LN", "CV% = 11.2"),
-                    ("K_ADD", "SD = 6.2457"),
-                    ("K_LGT", "SD = 6.2457"),
-                    ("K_C", "SD = 0.2739"),
-                ],
-            ),
-            (
-                false,
-                [
-                    ("K_LN", "CV% = 11.2"),
-                    ("K_ADD", "CV% = 624.6"),
-                    ("K_LGT", "CV% = 624.6"),
-                    ("K_C", "CV% = 27.4"),
-                ],
-            ),
+        for status in [
+            CovarianceStatus::Computed,
+            CovarianceStatus::Failed,
+            CovarianceStatus::SirFallback,
         ] {
-            let r = mk(true, typed);
-            for (surface, text) in [
-                ("console", format_kappa_rows(&r)),
-                ("summary", format_summary(&r)),
+            let show = status == CovarianceStatus::Computed;
+            for (typed, cells) in [
+                (
+                    true,
+                    [
+                        ("K_LN", "CV% = 11.2"),
+                        ("K_ADD", "SD = 6.2457"),
+                        ("K_LGT", "SD = 6.2457, logit scale"),
+                        ("K_C", "SD = 0.2739"),
+                    ],
+                ),
+                (
+                    false,
+                    [
+                        ("K_LN", "CV% = 11.2"),
+                        ("K_ADD", "CV% = 624.6"),
+                        ("K_LGT", "CV% = 624.6"),
+                        ("K_C", "CV% = 27.4"),
+                    ],
+                ),
             ] {
-                for (name, spread) in cells {
-                    let want = weight_line(name, spread);
-                    let got = text
-                        .lines()
-                        .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
-                        .unwrap_or_else(|| panic!("{surface}: no weight line for {name}:\n{text}"));
-                    assert_eq!(got, want, "{surface} typed={typed} {name}");
+                let mut r = mk(true, typed);
+                r.covariance_status = status.clone();
+                assert_eq!(shows_cv(&r), show, "{status:?}");
+                for (surface, text) in [
+                    ("console", format_kappa_rows(&r)),
+                    ("summary", format_summary(&r)),
+                ] {
+                    for (name, spread) in cells {
+                        let want = weight_line(name, Some(spread).filter(|_| show));
+                        let got = text
+                            .lines()
+                            .find(|l| l.ends_with(&format!("(κ ~ N(0, {name}/NARM))")))
+                            .unwrap_or_else(|| {
+                                panic!("{surface}: no weight line for {name}:\n{text}")
+                            });
+                        assert_eq!(got, want, "{surface} {status:?} typed={typed} {name}");
+                    }
                 }
             }
         }
-        // Unweighted: no weight line on either surface.
-        let plain = mk(false, true);
-        for (surface, text) in [
-            ("console", format_kappa_rows(&plain)),
-            ("summary", format_summary(&plain)),
-        ] {
-            assert!(!text.contains("weight = "), "{surface}:\n{text}");
+        // The other logit spelling gets the same tag.
+        assert_eq!(
+            typical_weight_spread(Some(LogitProbability), 6.245738),
+            "SD = 6.2457, logit scale"
+        );
+        // Unweighted: no weight line on either surface, and the rows are
+        // byte-identical to before #1697 / #1698 on both sides of the gate.
+        for status in [CovarianceStatus::Computed, CovarianceStatus::Failed] {
+            let mut plain = mk(false, true);
+            plain.covariance_status = status.clone();
+            let rows = format_kappa_rows(&plain);
+            let want = if status == CovarianceStatus::Computed {
+                "  K_LN                 = 0.050133  (CV% = 22.4)  SE = N/A\n\
+                 \x20 K_ADD                = 156.036966  (SD = 12.4915)  SE = N/A\n\
+                 \x20 K_LGT                = 156.036966  (SD = 12.4915, logit scale)  SE = N/A\n\
+                 \x20 K_C                  = 0.300000  SE = N/A\n"
+            } else {
+                "  K_LN                 = 0.050133  SE = N/A\n\
+                 \x20 K_ADD                = 156.036966  SE = N/A\n\
+                 \x20 K_LGT                = 156.036966  SE = N/A\n\
+                 \x20 K_C                  = 0.300000  SE = N/A\n"
+            };
+            assert_eq!(rows, want, "{status:?}");
+            for (surface, text) in [("console", rows), ("summary", format_summary(&plain))] {
+                assert!(!text.contains("weight = "), "{surface}:\n{text}");
+            }
         }
 
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
@@ -5537,6 +5585,16 @@ mod tests {
                      sd_at_typical_weight: 0.111952\n    se: ~\n";
         assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
         assert!(!yaml.contains("cv_pct_at"), "{yaml}");
+        // #1698: the YAML does not follow the console's `show_cv` gate — a
+        // failed covariance step writes the same entry, `cv_pct` and
+        // `sd_at_typical_weight` included.
+        let mut failed = mk(true, true);
+        failed.covariance_status = CovarianceStatus::Failed;
+        let failed_yaml = yaml_of(&failed);
+        assert!(
+            failed_yaml.contains(entry),
+            "missing\n{entry}\nin\n{failed_yaml}"
+        );
         // Unweighted: byte-identical to the weighted file less its weight keys,
         // and the log-normal entry is the pre-#1666 one.
         let plain = yaml_of(&mk(false, true));
