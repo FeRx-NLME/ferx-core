@@ -93,6 +93,19 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             "name must be <N>.<category>.md",
         ),
         (
+            "word-suffix",
+            ("12-foo.fixed.md", good),
+            ("12-2.fixed.md", good),
+            "name must be <N>.<category>.md",
+        ),
+        (
+            // A second entry is `-2`; `-1` / `-0` are not part of the grammar.
+            "suffix-one",
+            ("12-1.fixed.md", good),
+            ("12-10.fixed.md", good),
+            "name must be <N>.<category>.md",
+        ),
+        (
             "bad-category",
             ("12.bugfix.md", good),
             ("12.fixed.md", good),
@@ -161,6 +174,50 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             bad.0
         );
     }
+}
+
+/// A fragment is a plain file directly under `changelog.d/`. A reserved name is skipped
+/// only as a plain file, so a `.gitkeep/` directory cannot smuggle paths past `check`.
+#[cfg(unix)]
+#[test]
+fn check_rejects_directories_and_symlinks() {
+    let t = tree("nonregular-dir", &[("1.fixed.md", "- x (#1).\n")]);
+    std::fs::create_dir_all(t.join("changelog.d").join(".gitkeep")).unwrap();
+    std::fs::write(
+        t.join("changelog.d").join(".gitkeep").join("2.fixed.md"),
+        "- y (#2).\n",
+    )
+    .unwrap();
+    let o = run(&t, &["check"]);
+    assert!(!o.status.success(), "a .gitkeep/ directory passed");
+    assert!(
+        stderr(&o).contains(".gitkeep: not a regular file"),
+        "{}",
+        stderr(&o)
+    );
+
+    let t = tree("nonregular-link", &[]);
+    std::fs::write(t.join("target.md"), "- z (#3).\n").unwrap();
+    std::os::unix::fs::symlink(
+        t.join("target.md"),
+        t.join("changelog.d").join("3.fixed.md"),
+    )
+    .unwrap();
+    let o = run(&t, &["check"]);
+    assert!(!o.status.success(), "a symlinked fragment passed");
+    assert!(
+        stderr(&o).contains("3.fixed.md: not a regular file"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Twin: the same reserved name as a plain file is skipped silently.
+    let t = tree(
+        "nonregular-ok",
+        &[(".gitkeep", ""), ("1.fixed.md", "- x (#1).\n")],
+    );
+    let o = run(&t, &["check"]);
+    assert!(o.status.success(), "{}", stderr(&o));
 }
 
 /// `[Unreleased]` must stay empty: an entry added there out of habit reintroduces the
@@ -523,13 +580,29 @@ fn require_skips_changes_that_are_not_user_facing() {
         ("core-src", "src/stats/npde.rs"),
         ("cli-src", "crates/ferx-cli/src/main.rs"),
         ("tools-src", "crates/ferx-tools/src/lib.rs"),
+        // `git diff --name-only` quotes non-ASCII under the default `core.quotePath`,
+        // and always quotes a `"`: neither may hide the `src/` prefix.
+        ("unicode", "src/modèles.rs"),
+        ("quote", "src/a\"b.rs"),
     ] {
         let (d, base) = git_repo(&format!("facing-{slot}"));
         commit_file(&d, rel, "x\n");
         let o = run(&d, &["require", &base, "--pr", "5"]);
         assert!(!o.status.success(), "{rel} passed without a fragment");
-        assert!(stderr(&o).contains(rel), "{rel}: {}", stderr(&o));
+        if slot != "quote" {
+            assert!(stderr(&o).contains(rel), "{rel}: {}", stderr(&o));
+        }
     }
+}
+
+/// Only a fragment directly under `changelog.d/` counts as this PR's entry.
+#[test]
+fn require_ignores_a_path_nested_under_changelog_d() {
+    let (d, base) = git_repo("nested-fragment");
+    commit_file(&d, "src/lib.rs", "// v2\n");
+    commit_file(&d, "changelog.d/.gitkeep/5.fixed.md", "- x (#5).\n");
+    let o = run(&d, &["require", &base, "--pr", "5"]);
+    assert!(!o.status.success(), "a nested path counted as a fragment");
 }
 
 /// Deleting another PR's pending fragment drops it from the next release, so it fails
@@ -557,13 +630,48 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
         );
     }
 
-    // The release twin: the same deletion, with the entry now in CHANGELOG.md.
-    let (d, _) = git_repo("drop-assembled");
+    // Not enough: only the FIRST line of a multi-line fragment copied into the
+    // changelog, or the text already there before this PR.
+    let body = "- Someone else's fix (#10).\n  With a continuation.\n";
+    let (d, _) = git_repo("drop-partial");
+    commit_file(&d, "changelog.d/10.fixed.md", body);
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+    let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
     commit_file(
         &d,
-        "changelog.d/10.fixed.md",
-        "- Someone else's fix (#10).\n",
+        "CHANGELOG.md",
+        &cl.replace(
+            "- Old fix (#1).\n",
+            "- Old fix (#1).\n- Someone else's fix (#10).\n",
+        ),
     );
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(
+        !o.status.success(),
+        "a partially copied fragment counted as assembled"
+    );
+
+    let (d, _) = git_repo("drop-preexisting");
+    let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
+    commit_file(
+        &d,
+        "CHANGELOG.md",
+        &cl.replace("- Old fix (#1).\n", &format!("- Old fix (#1).\n{body}")),
+    );
+    commit_file(&d, "changelog.d/10.fixed.md", body);
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+    git(&d, &["commit", "-q", "-m", "drop"]);
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(
+        !o.status.success(),
+        "text already in the changelog counted as assembled"
+    );
+
+    // The release twin: the same deletion, with the entry now in CHANGELOG.md.
+    let (d, _) = git_repo("drop-assembled");
+    commit_file(&d, "changelog.d/10.fixed.md", body);
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     let o = run(&d, &["assemble", "0.2.0", "--date", "2026-10-05"]);
     assert!(o.status.success(), "{}", stderr(&o));

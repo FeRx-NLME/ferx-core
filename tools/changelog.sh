@@ -103,9 +103,15 @@ fragment_names() {
   [ -d "$frag_dir" ] || return 0
   # `find`, not a glob: every glob spelling misses some dotfile shape (`..x`),
   # and a file that `check` never sees but `require` counts is a hole in both.
+  #
+  # A reserved name (README.md, .gitkeep) is skipped only when it is a plain
+  # file: a `.gitkeep/` DIRECTORY is listed, so `check` rejects it rather than
+  # letting `require` count a path nested inside it.
   local name
   find "$frag_dir" -mindepth 1 -maxdepth 1 | sed 's#.*/##' | while IFS= read -r name; do
-    is_non_fragment "$name" && continue
+    if is_non_fragment "$name" && [ -f "$frag_dir/$name" ] && [ ! -L "$frag_dir/$name" ]; then
+      continue
+    fi
     printf '%s\n' "$name"
   done | LC_ALL=C sort -t. -k1,1n -k1,1
 }
@@ -163,13 +169,14 @@ cmd_check() {
   load_fragments
   for name in ${FRAGMENTS[@]+"${FRAGMENTS[@]}"}; do
     local path="$frag_dir/$name"
-    if [ -d "$path" ]; then
-      echo "changelog.d/$name: a directory; fragments are files directly under changelog.d/" >&2
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
+      echo "changelog.d/$name: not a regular file; fragments are plain files directly" \
+        "under changelog.d/ (no directories, no symlinks)" >&2
       errors=$((errors + 1))
       continue
     fi
-    # <N>[-<suffix>].<category>.md
-    if ! printf '%s' "$name" | grep -Eq '^[0-9]+(-[0-9a-z]+)*\.[a-z]+\.md$'; then
+    # <N>[-<k>].<category>.md, k >= 2: the second entry on one number is `-2`.
+    if ! printf '%s' "$name" | grep -Eq '^[0-9]+(-([2-9]|[1-9][0-9]+))?\.[a-z]+\.md$'; then
       echo "changelog.d/$name: name must be <N>.<category>.md (e.g. 1541.fixed.md;" \
         "1541-2.fixed.md for a second entry)" >&2
       errors=$((errors + 1))
@@ -388,13 +395,36 @@ user_facing_of() {
   set +f
 }
 
+# $1 as `git diff --name-only` prints it under `core.quotePath=false`: plain
+# for UTF-8, but a path with a quote, backslash or control character comes out
+# C-quoted (`"src/a\"b.rs"`). Dropping a leading quote is enough for the prefix
+# test, and errs toward "user-facing", which is the safe direction.
 is_user_facing() {
-  local p
-  is_test_path "$1" && return 1
+  local p path="${1#\"}"
+  is_test_path "$path" && return 1
   for p in "${USER_FACING_PREFIXES[@]}"; do
-    case "$1" in "$p"*) return 0 ;; esac
+    case "$path" in "$p"*) return 0 ;; esac
   done
   return 1
+}
+
+# 0 if every non-blank line of fragment $2, as of commit $1, is among the lines
+# this PR ADDED to CHANGELOG.md ($3) — i.e. `assemble` wrote it, continuation
+# and all. A first-line match anywhere in the file would pass a fragment whose
+# continuation was dropped, or one whose text merely already existed.
+fragment_assembled() {
+  local body line IFS=$'\n'
+  body="$(git -C "$root" show "$1:$2")" || return 1
+  set -f
+  for line in $body; do
+    # `>/dev/null`, not `-q`: grep -q exits at the first match, and under
+    # pipefail the SIGPIPE that gives printf would read as "not found".
+    if ! printf '%s\n' "$3" | grep -Fx -- "$line" >/dev/null; then
+      set +f
+      return 1
+    fi
+  done
+  set +f
 }
 
 cmd_require() {
@@ -424,20 +454,21 @@ cmd_require() {
   # Pending fragments are other PRs' entries: deleting one — or renaming it
   # away, which `--no-renames` reports as a deletion — drops it from the next
   # release. The one legitimate deletion is `assemble`'s, so a deleted fragment
-  # passes only if its first line is now in CHANGELOG.md. Checked before the
+  # passes only if this PR added all of it to CHANGELOG.md. Checked before the
   # opt-out: the label waives this PR's own entry, not anyone else's.
-  local mb deleted lost="" first
+  local mb deleted lost="" added_lines
   mb="$(git -C "$root" merge-base "$base" HEAD)" ||
     die "require: no merge base between $base and HEAD (CI needs fetch-depth: 0)"
   deleted="$(git -C "$root" diff --no-renames --name-only --diff-filter=D "$mb" HEAD -- changelog.d/ |
     grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
   if [ -n "$deleted" ]; then
+    added_lines="$(git -C "$root" diff --no-renames "$mb" HEAD -- CHANGELOG.md |
+      sed -n -e '/^+++ /d' -e 's/^+//p')"
     local IFS_SAVE="$IFS" f
     IFS=$'\n'
     set -f
     for f in $deleted; do
-      first="$(git -C "$root" show "$mb:$f" | sed -n 1p)"
-      if ! grep -Fqx -- "$first" "$changelog"; then
+      if ! fragment_assembled "$mb" "$f" "$added_lines"; then
         lost="$lost  $f"$'\n'
       fi
     done
@@ -471,7 +502,7 @@ cmd_require() {
   local changed facing="" added=""
   # `--no-renames`: a rename reports only its destination, so
   # `src/x.rs -> src/x_tests.rs` would hide the production file it removed.
-  changed="$(git -C "$root" diff --no-renames --name-only "$base"...HEAD)" ||
+  changed="$(git -C "$root" -c core.quotePath=false diff --no-renames --name-only "$base"...HEAD)" ||
     die "require: git diff $base...HEAD failed (is the base fetched? CI needs fetch-depth: 0)"
 
   facing="$(user_facing_of "$changed")"
@@ -480,8 +511,9 @@ cmd_require() {
   # another PR does not describe this one. The opposite rename setting from the
   # diff above, and deliberately: with `-M` a renamed fragment is an `R`, not an
   # `A`, so renaming someone else's entry cannot pass for adding one.
+  # Directly under changelog.d/ only: `changelog.d/.gitkeep/x.md` is no fragment.
   added="$(git -C "$root" diff -M --name-only --diff-filter=A "$base"...HEAD -- changelog.d/ |
-    grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
+    grep -E '^changelog\.d/[^/]+$' | grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
 
   if [ -z "$facing" ]; then
     echo "changelog: no user-facing paths changed — no fragment required."
