@@ -50,18 +50,27 @@ enum MuRefAnchor {
 /// multiplication tree (not inside any function call). Used by the
 /// extended Pattern 1/4 detector to recognise both
 /// `TVCL * exp(ETA)` (classical) and `TYPICAL_PK.CL * exp(ETA)` (DCM).
-fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
-    match expr {
-        Expression::Theta(i) => out.push(MuRefAnchor::Theta(*i)),
-        Expression::NnOutput { nn_idx, output_idx } => out.push(MuRefAnchor::NnOutput {
+///
+/// Only the **first two**, in walk order, are kept: the detector asks whether
+/// there is exactly one and which, and two answer that as well as all of them
+/// do. Uncapped, the list itself doubles per level of a multiplicative diamond
+/// of local definitions (#1684).
+fn mul_anchors_of<'a, V: RhsView<'a>>(v: V) -> Vec<MuRefAnchor> {
+    match v.expr() {
+        Expression::Theta(i) => vec![MuRefAnchor::Theta(*i)],
+        Expression::NnOutput { nn_idx, output_idx } => vec![MuRefAnchor::NnOutput {
             nn_idx: *nn_idx,
             output_idx: *output_idx,
-        }),
+        }],
         Expression::BinOp(l, BinOp::Mul, r) => {
-            collect_mul_anchors(l, out);
-            collect_mul_anchors(r, out);
+            let mut out = v.child(l).mul_anchors();
+            out.extend(v.child(r).mul_anchors());
+            out.truncate(2);
+            #[cfg(test)]
+            INLINED_NODES.with(|c| c.set(c.get() + out.len()));
+            out
         }
-        _ => {}
+        _ => Vec::new(),
     }
 }
 
@@ -69,20 +78,24 @@ fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
 /// returning the eta index. For the two-eta case (IIV+IOV combined pattern)
 /// returns the **minimum** index; BSV etas are numbered `0..n_eta` and kappa etas
 /// `n_eta..`, so min always selects the BSV eta regardless of expression order.
-fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
-    match expr {
+fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
+    if v.is_definition() {
+        return None; // eta-free (`InlineScope::record`)
+    }
+    match v.expr() {
         Expression::UnaryFn(name, arg) if name == "exp" => {
-            if let Expression::Eta(j) = arg.as_ref() {
+            let arg = v.child(arg);
+            if let Expression::Eta(j) = arg.expr() {
                 return Some(*j);
             }
             // exp(ETA1 + ETA2) — IIV+IOV combined pattern.
-            if let Expression::BinOp(l, BinOp::Add, r) = arg.as_ref() {
-                let li = if let Expression::Eta(j) = l.as_ref() {
+            if let Expression::BinOp(l, BinOp::Add, r) = arg.expr() {
+                let li = if let Expression::Eta(j) = arg.child(l).expr() {
                     Some(*j)
                 } else {
                     None
                 };
-                let ri = if let Expression::Eta(j) = r.as_ref() {
+                let ri = if let Expression::Eta(j) = arg.child(r).expr() {
                     Some(*j)
                 } else {
                     None
@@ -97,7 +110,7 @@ fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
             None
         }
         Expression::BinOp(l, BinOp::Mul, r) => {
-            find_exp_eta_in_mul(l).or_else(|| find_exp_eta_in_mul(r))
+            find_exp_eta_in_mul(v.child(l)).or_else(|| find_exp_eta_in_mul(v.child(r)))
         }
         _ => None,
     }
@@ -512,25 +525,26 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
 /// - Pattern 3: `THETA + ETA` or `ETA + THETA`  → additive
 /// - Pattern 4: `THETA * exp(ETA) * <const>`    → lognormal (multiplied
 ///   by a constant factor; the constant doesn't affect mu-ref detection
-///   since `collect_mul_*` walks the whole product chain).
-fn detect_pattern(expr: &Expression) -> Option<(usize, MuRefAnchor, bool)> {
-    match expr {
+///   since `mul_anchors_of` walks the whole product chain).
+fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)> {
+    match v.expr() {
         // Pattern 2: exp(log(THETA) + ETA)
         Expression::UnaryFn(name, inner) if name == "exp" => {
-            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_log_theta_eta =
-                    |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
-                        if let Expression::UnaryFn(fn_name, fn_arg) = a {
-                            if fn_name == "log" || fn_name == "ln" {
-                                if let Expression::Theta(ti) = fn_arg.as_ref() {
-                                    if let Expression::Eta(ei) = b {
-                                        return Some((*ei, *ti));
-                                    }
+            let inner = v.child(inner);
+            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.expr() {
+                let try_log_theta_eta = |a: V, b: V| -> Option<(usize, usize)> {
+                    if let Expression::UnaryFn(fn_name, fn_arg) = a.expr() {
+                        if fn_name == "log" || fn_name == "ln" {
+                            if let Expression::Theta(ti) = a.child(fn_arg).expr() {
+                                if let Expression::Eta(ei) = b.expr() {
+                                    return Some((*ei, *ti));
                                 }
                             }
                         }
-                        None
-                    };
+                    }
+                    None
+                };
+                let (lhs, rhs) = (inner.child(lhs), inner.child(rhs));
                 if let Some((ei, ti)) =
                     try_log_theta_eta(lhs, rhs).or_else(|| try_log_theta_eta(rhs, lhs))
                 {
@@ -540,7 +554,8 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, MuRefAnchor, bool)> {
             None
         }
         // Pattern 3: THETA + ETA or ETA + THETA
-        Expression::BinOp(lhs, BinOp::Add, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+        Expression::BinOp(lhs, BinOp::Add, rhs) => match (v.child(lhs).expr(), v.child(rhs).expr())
+        {
             (Expression::Theta(ti), Expression::Eta(ei)) => {
                 Some((*ei, MuRefAnchor::Theta(*ti), false))
             }
@@ -552,10 +567,9 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, MuRefAnchor, bool)> {
         // Pattern 1 / 1-NN / 4: product containing exactly one anchor
         // (Theta OR NnOutput) and `exp(Eta)` somewhere in the chain.
         _ => {
-            let mut anchors = Vec::new();
-            collect_mul_anchors(expr, &mut anchors);
+            let anchors = v.mul_anchors();
             if anchors.len() == 1 {
-                if let Some(ei) = find_exp_eta_in_mul(expr) {
+                if let Some(ei) = find_exp_eta_in_mul(v) {
                     return Some((ei, anchors[0], true));
                 }
             }
@@ -590,26 +604,24 @@ fn detect_mu_refs(
     // those forms algebraically identical to the direct ones (#918). Detection is
     // attempted on the raw expression *first* so every form recognised before this
     // fallback existed keeps producing exactly the same `MuRef`.
-    let mut assign_counts: HashMap<&str, usize> = HashMap::new();
-    count_all_assignments(stmts, &mut assign_counts);
+    //
     // Definitions are accumulated in statement order *and resolved where they
-    // sit* ([`record_inline_def`]), so a line can only be rewritten with values
+    // are written* ([`InlineScope`]), so a line can only be rewritten with values
     // that are already in scope — a forward reference reads a covariate (or
     // zero) at eval time and must not be "resolved" into a definition that
     // comes later, not even through a chain.
-    let mut inline_defs: HashMap<String, Expression> = HashMap::new();
-
-    for s in stmts {
+    let mut scope = InlineScope::new(stmts);
+    for (at, s) in stmts.iter().enumerate() {
         if let Statement::Assign(name, raw_expr) = s {
             let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
-            if found.is_none() && !inline_defs.is_empty() {
-                let inlined = inline_local_vars(raw_expr, &inline_defs);
-                found = classify_mu_ref(&inlined, theta_names, eta_names, nn_specs);
+            if found.is_none() && !scope.is_empty() {
+                let inlined = scope.view(at, raw_expr);
+                found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
             if let Some((eta_idx, mu_ref)) = found {
                 result.insert(eta_names[eta_idx].clone(), mu_ref);
             }
-            record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
+            scope.record(at, name, raw_expr);
         }
     }
     result
@@ -820,8 +832,8 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
 ///
 /// Logit forms are tried before the product/additive ones: `inv_logit(THETA + ETA)`
 /// is neither a product nor a bare sum, so `detect_pattern` cannot see it (#918).
-fn classify_mu_ref(
-    expr: &Expression,
+fn classify_mu_ref<'a, V: RhsView<'a>>(
+    expr: V,
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
@@ -870,6 +882,71 @@ fn classify_mu_ref(
     ))
 }
 
+/// True when `expr` references any ETA anywhere in its tree.
+fn expr_contains_eta(expr: &Expression) -> bool {
+    rhs_contains_eta(expr)
+}
+
+/// [`expr_contains_eta`] over a [`RhsView`]. A substituted local definition is
+/// skipped without a walk, since [`InlineScope::record`] admits only eta-free
+/// ones.
+fn rhs_contains_eta<'a, V: RhsView<'a>>(v: V) -> bool {
+    if v.is_definition() {
+        return false;
+    }
+    match v.expr() {
+        Expression::Eta(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            rhs_contains_eta(v.child(l)) || rhs_contains_eta(v.child(r))
+        }
+        Expression::UnaryFn(_, a) => rhs_contains_eta(v.child(a)),
+        Expression::Conditional(_, t, f) => {
+            rhs_contains_eta(v.child(t)) || rhs_contains_eta(v.child(f))
+        }
+        _ => false,
+    }
+}
+
+/// An `[individual_parameters]` right-hand side as the mu-reference matchers
+/// read it: either the expression as written (`&Expression`), or the same
+/// expression with the local definitions in scope substituted in
+/// ([`Inlined`]). The matchers are written once against this trait, so the
+/// raw and the inlined reading cannot drift apart.
+trait RhsView<'a>: Copy {
+    /// This node.
+    fn expr(self) -> &'a Expression;
+    /// The view of `child`, a direct child of [`Self::expr`].
+    fn child(self, child: &'a Expression) -> Self;
+    /// Whether this node is the root of a substituted local definition. Such a
+    /// subtree is eta-free and may be reached along many paths.
+    fn is_definition(self) -> bool {
+        false
+    }
+    /// The first two mu-reference anchors on the multiplication chain at this
+    /// node ([`mul_anchors_of`]).
+    fn mul_anchors(self) -> Vec<MuRefAnchor> {
+        mul_anchors_of(self)
+    }
+    /// What a typical value at this node reads ([`typical_summary_of`]).
+    fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
+        std::rc::Rc::new(typical_summary_of(self))
+    }
+    /// This subtree as an owned expression.
+    fn materialise(self) -> Expression;
+}
+
+impl<'a> RhsView<'a> for &'a Expression {
+    fn expr(self) -> &'a Expression {
+        self
+    }
+    fn child(self, child: &'a Expression) -> Self {
+        child
+    }
+    fn materialise(self) -> Expression {
+        self.clone()
+    }
+}
+
 /// Count assignments per variable name across top-level statements *and* every
 /// `if` branch, so a name that is conditionally reassigned is never inlined.
 fn count_all_assignments<'a>(stmts: &'a [Statement], out: &mut HashMap<&'a str, usize>) {
@@ -892,70 +969,39 @@ fn count_all_assignments<'a>(stmts: &'a [Statement], out: &mut HashMap<&'a str, 
     }
 }
 
-/// True when `expr` references any ETA anywhere in its tree.
-fn expr_contains_eta(expr: &Expression) -> bool {
-    match expr {
-        Expression::Eta(_) => true,
-        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
-            expr_contains_eta(l) || expr_contains_eta(r)
-        }
-        Expression::UnaryFn(_, a) => expr_contains_eta(a),
-        Expression::Conditional(_, t, f) => expr_contains_eta(t) || expr_contains_eta(f),
-        _ => false,
-    }
+#[cfg(test)]
+thread_local! {
+    /// Nodes and mu-reference anchors an [`InlineScope`] has handled on this
+    /// thread, so a test can pin that inlining is linear in the statements,
+    /// not in the paths (#1684).
+    static INLINED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The input of the last full parse's mu-reference scans on this thread
+    /// (statements, theta names, eta names, BSV eta count), so a test can
+    /// replay a real model's statements through a second inliner (#1684).
+    #[allow(clippy::type_complexity)]
+    static MU_REF_SCAN_INPUT: std::cell::RefCell<Option<(Vec<Statement>, Vec<String>, Vec<String>, usize)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Substitute `defs` into every named reference in `expr`. Names with no
-/// definition (genuine covariates, forward references) are left untouched.
+/// The local definitions a mu-reference scan substitutes into a later
+/// right-hand side ([`detect_mu_refs`], [`detect_covariate_mu_refs`]), in
+/// statement order.
 ///
-/// The substitution is **one level deep, and deliberately so**: `defs` only
-/// ever holds definitions that [`record_inline_def`] already resolved against
-/// the scope *at their own statement*, so a stored body needs no further
-/// expansion, and expanding it anyway is the #918-review defect — it would
-/// resolve a name against a definition that comes *later* in the block. See
-/// [`record_inline_def`].
+/// A right-hand side read through the scope ([`Self::view`]) is the tree you
+/// get by replacing each name defined earlier with that definition's own
+/// inlined body. Replacement descends through operators, powers and function
+/// calls, but not into a conditional or a gather index, where a name stays a
+/// name. The tree is never built: a node is resolved when a matcher looks at
+/// it. On a diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`)
+/// the inlined tree doubles per level, and building it, as the scan did before
+/// #1684, made the parse exponential in the depth. Read through the scope, each
+/// definition is stored once however many paths reach it, and the two walks
+/// that follow every path ([`RhsView::mul_anchors`],
+/// [`RhsView::typical_summary`]) are memoised per definition.
 ///
-/// Both `Variable` and `Covariate` nodes are substituted: `parse_atom` emits
-/// `Variable` for a name already assigned earlier in the block and `Covariate`
-/// otherwise, but a caller that builds statements without the surrounding
-/// `defined_vars` context (unit tests, the `[odes]` harness) yields `Covariate`
-/// for the same name. `defs` only ever holds names assigned earlier in this
-/// block, and such an assignment shadows any same-named covariate at eval time,
-/// so treating the two node kinds alike is consistent either way.
-fn inline_local_vars(expr: &Expression, defs: &HashMap<String, Expression>) -> Expression {
-    match expr {
-        Expression::Variable(name) | Expression::Covariate(name) => match defs.get(name) {
-            Some(def) => def.clone(),
-            None => expr.clone(),
-        },
-        Expression::BinOp(l, op, r) => Expression::BinOp(
-            Box::new(inline_local_vars(l, defs)),
-            *op,
-            Box::new(inline_local_vars(r, defs)),
-        ),
-        Expression::Power(b, e) => Expression::Power(
-            Box::new(inline_local_vars(b, defs)),
-            Box::new(inline_local_vars(e, defs)),
-        ),
-        Expression::UnaryFn(name, a) => {
-            Expression::UnaryFn(name.clone(), Box::new(inline_local_vars(a, defs)))
-        }
-        _ => expr.clone(),
-    }
-}
-
-/// Record `name = raw_expr` as a substitution available to the lines *below*
-/// it, with the definitions already in scope resolved into it right here.
-///
-/// Eligible as a substitution at all when the name is assigned exactly once in
-/// the whole block (so no `if` branch overrides it) and its right-hand side is
-/// eta-free (an eta-bearing definition is an individual parameter, not a
-/// typical value).
-///
-/// **Resolving at the definition, not at the use, is the correctness
-/// condition.** Storing the raw body and expanding it recursively at each use
-/// site reads the map as it stands *there*, which can contain names defined
-/// after the definition was written:
+/// **A definition resolves against the scope where it is written, not where it
+/// is used.** Resolving at the use reads the scope as it stands *there*, which
+/// can contain names defined after the definition was written:
 ///
 /// ```text
 ///   A   = FOO          # FOO is unknown here, so this reads the data covariate
@@ -963,23 +1009,190 @@ fn inline_local_vars(expr: &Expression, defs: &HashMap<String, Expression>) -> E
 ///   CL  = A * exp(ETA_CL)
 /// ```
 ///
-/// Use-site expansion walks `A → FOO → THETA_X` and records a mu-reference on
-/// `THETA_X`, a theta `CL` never reads — SAEM would then shift and pin it and
-/// re-centre `ETA_CL` by that delta. Resolving `A` when it is *recorded* freezes
-/// it as `Covariate("FOO")`, which is what the model actually evaluates (#918
-/// review). Chains that are genuinely in scope still collapse, in one step: `B =
-/// A` stores `A`'s already-resolved body.
-fn record_inline_def(
-    inline_defs: &mut HashMap<String, Expression>,
-    assign_counts: &HashMap<&str, usize>,
-    name: &str,
-    raw_expr: &Expression,
-) {
-    if assign_counts.get(name).copied().unwrap_or(0) != 1 || expr_contains_eta(raw_expr) {
-        return;
+/// Use-site resolution walks `A → FOO → THETA_X` and records a mu-reference on
+/// `THETA_X`, a theta `CL` never reads. SAEM would then shift and pin it and
+/// re-centre `ETA_CL` by that delta. Inside a definition only names defined
+/// *before it* resolve (`limit` in [`Inlined`]), so `A` stays
+/// `Covariate("FOO")`, which is what the model actually evaluates (#918
+/// review). Chains that are genuinely in scope still collapse: `B = A` reads
+/// `A`'s body.
+///
+/// Both `Variable` and `Covariate` nodes resolve: `parse_atom` emits `Variable`
+/// for a name already assigned earlier in the block and `Covariate` otherwise,
+/// but a caller that builds statements without the surrounding `defined_vars`
+/// context (unit tests, the `[odes]` harness) yields `Covariate` for the same
+/// name. The scope only ever holds names assigned earlier in this block, and
+/// such an assignment shadows any same-named covariate at eval time, so
+/// treating the two node kinds alike is consistent either way.
+struct InlineScope<'a> {
+    assign_counts: HashMap<&'a str, usize>,
+    /// Name → (statement index of its one assignment, right-hand side as written).
+    defs: HashMap<&'a str, (usize, &'a Expression)>,
+    /// [`RhsView::mul_anchors`] per definition (by statement index).
+    anchors: std::cell::RefCell<HashMap<usize, Vec<MuRefAnchor>>>,
+    /// [`RhsView::typical_summary`] per definition (by statement index).
+    summaries: std::cell::RefCell<HashMap<usize, std::rc::Rc<TypicalSummary>>>,
+}
+
+impl<'a> InlineScope<'a> {
+    fn new(stmts: &'a [Statement]) -> Self {
+        let mut assign_counts = HashMap::new();
+        count_all_assignments(stmts, &mut assign_counts);
+        Self {
+            assign_counts,
+            defs: HashMap::new(),
+            anchors: Default::default(),
+            summaries: Default::default(),
+        }
     }
-    let resolved = inline_local_vars(raw_expr, inline_defs);
-    inline_defs.insert(name.to_string(), resolved);
+
+    fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+
+    /// Make `name = raw_expr`, the top-level statement at index `at`, available
+    /// to the lines *below* it.
+    ///
+    /// Eligible at all when the name is assigned exactly once in the whole
+    /// block (so no `if` branch overrides it) and its right-hand side is
+    /// eta-free (an eta-bearing definition is an individual parameter, not a
+    /// typical value).
+    fn record(&mut self, at: usize, name: &'a str, raw_expr: &'a Expression) {
+        if self.assign_counts.get(name).copied().unwrap_or(0) != 1 || expr_contains_eta(raw_expr) {
+            return;
+        }
+        self.defs.insert(name, (at, raw_expr));
+    }
+
+    /// The right-hand side `raw_expr` of the top-level statement at index `at`,
+    /// with the definitions recorded so far substituted in.
+    fn view<'s>(&'s self, at: usize, raw_expr: &'a Expression) -> Inlined<'a, 's> {
+        Inlined::resolve(self, raw_expr, at, false)
+    }
+}
+
+/// A node of a right-hand side read through an [`InlineScope`].
+#[derive(Clone, Copy)]
+struct Inlined<'a, 's> {
+    scope: &'s InlineScope<'a>,
+    expr: &'a Expression,
+    /// Only definitions written before this statement index resolve below this
+    /// node: the use site's own index at the top, a definition's index inside
+    /// its body.
+    limit: usize,
+    /// The definition (by statement index) whose body this node is the root of.
+    def: Option<usize>,
+    /// Below a node substitution does not descend into (a conditional, a gather
+    /// index): names stay names.
+    frozen: bool,
+}
+
+impl<'a, 's> Inlined<'a, 's> {
+    fn resolve(
+        scope: &'s InlineScope<'a>,
+        mut expr: &'a Expression,
+        mut limit: usize,
+        frozen: bool,
+    ) -> Self {
+        #[cfg(test)]
+        INLINED_NODES.with(|c| c.set(c.get() + 1));
+        let mut def = None;
+        if !frozen {
+            // `limit` strictly decreases, so a self-reference (`X = X + 1`,
+            // assigned once) stops at its own index.
+            while let Expression::Variable(n) | Expression::Covariate(n) = expr {
+                match scope.defs.get(n.as_str()) {
+                    Some(&(at, body)) if at < limit => {
+                        expr = body;
+                        limit = at;
+                        def = Some(at);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Self {
+            scope,
+            expr,
+            limit,
+            def,
+            frozen,
+        }
+    }
+
+    /// Whether substitution reaches this node's children.
+    fn rewrites_children(self) -> bool {
+        !self.frozen
+            && matches!(
+                self.expr,
+                Expression::BinOp(..) | Expression::Power(..) | Expression::UnaryFn(..)
+            )
+    }
+}
+
+impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
+    fn expr(self) -> &'a Expression {
+        self.expr
+    }
+
+    fn child(self, child: &'a Expression) -> Self {
+        Inlined::resolve(self.scope, child, self.limit, !self.rewrites_children())
+    }
+
+    fn is_definition(self) -> bool {
+        self.def.is_some()
+    }
+
+    fn mul_anchors(self) -> Vec<MuRefAnchor> {
+        let Some(d) = self.def else {
+            return mul_anchors_of(self);
+        };
+        if let Some(done) = self.scope.anchors.borrow().get(&d) {
+            return done.clone();
+        }
+        let done = mul_anchors_of(self);
+        self.scope.anchors.borrow_mut().insert(d, done.clone());
+        done
+    }
+
+    fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
+        let Some(d) = self.def else {
+            return std::rc::Rc::new(typical_summary_of(self));
+        };
+        if let Some(done) = self.scope.summaries.borrow().get(&d) {
+            return done.clone();
+        }
+        let done = std::rc::Rc::new(typical_summary_of(self));
+        self.scope.summaries.borrow_mut().insert(d, done.clone());
+        done
+    }
+
+    fn materialise(self) -> Expression {
+        #[cfg(test)]
+        INLINED_NODES.with(|c| c.set(c.get() + 1));
+        if self.rewrites_children() {
+            match self.expr {
+                Expression::BinOp(l, op, r) => {
+                    return Expression::BinOp(
+                        Box::new(self.child(l).materialise()),
+                        *op,
+                        Box::new(self.child(r).materialise()),
+                    )
+                }
+                Expression::Power(b, e) => {
+                    return Expression::Power(
+                        Box::new(self.child(b).materialise()),
+                        Box::new(self.child(e).materialise()),
+                    )
+                }
+                Expression::UnaryFn(name, a) => {
+                    return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
+                }
+                _ => {}
+            }
+        }
+        self.expr.clone()
+    }
 }
 
 // ── Multi-theta (covariate) mu-referencing (#619) ────────────────────────────
@@ -992,7 +1205,7 @@ fn record_inline_def(
 /// Same statement walk and local-definition inlining as [`detect_mu_refs`]. The
 /// two scans run side by side and never edit each other's result: a typical
 /// value that also matches a single-anchor pattern (the power form, whose
-/// `collect_mul_anchors` sees only `TVCL`) keeps its `MuRef` for the inner-loop
+/// `mul_anchors_of` sees only `TVCL`) keeps its `MuRef` for the inner-loop
 /// centring and reporting consumers exactly as before, while SAEM / IMP prefer
 /// the group for the M-step. Only BSV etas (`eta_idx < n_bsv_eta`) are recorded
 /// — a kappa carries no between-subject mean to fit. The last assignment on an
@@ -1012,9 +1225,7 @@ fn detect_covariate_mu_refs(
     n_bsv_eta: usize,
     outside_idents: &HashSet<String>,
 ) -> Vec<CovariateMuRef> {
-    let mut assign_counts: HashMap<&str, usize> = HashMap::new();
-    count_all_assignments(stmts, &mut assign_counts);
-    let mut inline_defs: HashMap<String, Expression> = HashMap::new();
+    let mut scope = InlineScope::new(stmts);
     let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
     // The top-level statement that recorded each owner's surviving group. An
     // owner is retired on any later assignment to its name, so the latest
@@ -1026,13 +1237,7 @@ fn detect_covariate_mu_refs(
                 // Always classify the inlined form: the point of a group is the
                 // thetas a `TVCL = …` line hides, and the raw form of a direct
                 // write is unchanged by inlining.
-                let inlined;
-                let expr = if inline_defs.is_empty() {
-                    raw_expr
-                } else {
-                    inlined = inline_local_vars(raw_expr, &inline_defs);
-                    &inlined
-                };
+                let expr = scope.view(si, raw_expr);
                 let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
                 // Retire before recording, and retire whether or not this line is
                 // itself a group: an assignment that no longer classifies still
@@ -1042,7 +1247,7 @@ fn detect_covariate_mu_refs(
                     found.push((eta_idx, name.clone(), entry));
                     recorded_at.insert(name.clone(), si);
                 }
-                record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
+                scope.record(si, name, raw_expr);
             }
             // A branch body can overwrite a typical value recorded above it, and
             // nothing inside it may *record* one (the branch need not be taken),
@@ -1102,10 +1307,10 @@ fn detect_covariate_mu_refs(
 /// unconditional and keyed two ways: on the eta the new right-hand side carries
 /// (the same key recording uses) and on the assigned parameter name, which is
 /// the only handle left when the new line carries no eta at all (`CL = TVCL`).
-fn retire_superseded_group(
+fn retire_superseded_group<'a, V: RhsView<'a>>(
     found: &mut Vec<(usize, String, CovariateMuRef)>,
     name: &str,
-    expr: &Expression,
+    expr: V,
 ) {
     let eta = split_typical_and_eta(expr).map(|(_, e, _)| e);
     found.retain(|(e, n, _)| Some(*e) != eta && n != name);
@@ -1316,8 +1521,8 @@ fn spread_theta_taint(
 /// per-subject evaluation), a second eta, or a local variable the inliner could
 /// not resolve (assigned conditionally or later — reading it here would give
 /// 0.0, not its value).
-fn classify_covariate_mu_ref(
-    expr: &Expression,
+fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
+    expr: V,
     theta_names: &[String],
     eta_names: &[String],
     n_bsv_eta: usize,
@@ -1326,28 +1531,11 @@ fn classify_covariate_mu_ref(
     if eta_idx >= n_bsv_eta || eta_idx >= eta_names.len() {
         return None;
     }
-    let mut theta_idx: Vec<usize> = Vec::new();
-    let mut covariate_names: Vec<String> = Vec::new();
-    let mut ok = true;
-    visit_expr_nodes(&typical, &mut |n| match n {
-        Expression::Theta(i) => {
-            if !theta_idx.contains(i) {
-                theta_idx.push(*i);
-            }
-        }
-        Expression::Covariate(c) => {
-            if !covariate_names.contains(c) {
-                covariate_names.push(c.clone());
-            }
-        }
-        Expression::Literal(_)
-        | Expression::BinOp(..)
-        | Expression::UnaryFn(..)
-        | Expression::Power(..)
-        | Expression::Conditional(..) => {}
-        _ => ok = false,
-    });
-    if !ok || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
+    // Judged before the typical value is built, which a group must store but a
+    // rejected line never needs.
+    let read = typical.summary();
+    let mut theta_idx = read.thetas;
+    if read.other || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
         return None;
     }
     theta_idx.sort_unstable();
@@ -1357,16 +1545,134 @@ fn classify_covariate_mu_ref(
             eta_name: eta_names[eta_idx].clone(),
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
-            covariate_names,
+            covariate_names: read.covariates,
             // All three filled by `detect_covariate_mu_refs` once the whole block
             // (and the other blocks' identifiers) are in view; a single
             // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
             read_outside_groups: Vec::new(),
             eta_shared: false,
-            typical,
+            typical: typical.build(),
         },
     ))
+}
+
+/// What a typical value reads, as [`classify_covariate_mu_ref`] judges it:
+/// its thetas and data covariates in first-occurrence (pre-order) order, and
+/// whether it reads anything else (`TIME`, `MIXNUM`, an eta, an NN output, a
+/// θ level block, or a local variable the inliner could not resolve).
+#[derive(Default)]
+struct TypicalSummary {
+    thetas: Vec<usize>,
+    covariates: Vec<String>,
+    other: bool,
+}
+
+impl TypicalSummary {
+    fn note(&mut self, n: &Expression) {
+        match n {
+            Expression::Theta(i) => {
+                if !self.thetas.contains(i) {
+                    self.thetas.push(*i);
+                }
+            }
+            Expression::Covariate(c) => {
+                if !self.covariates.contains(c) {
+                    self.covariates.push(c.clone());
+                }
+            }
+            Expression::Literal(_)
+            | Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..)
+            | Expression::Conditional(..) => {}
+            _ => self.other = true,
+        }
+    }
+
+    /// Append what a later subtree reads, keeping first occurrences first.
+    fn merge(&mut self, later: &TypicalSummary) {
+        for i in &later.thetas {
+            if !self.thetas.contains(i) {
+                self.thetas.push(*i);
+            }
+        }
+        for c in &later.covariates {
+            if !self.covariates.contains(c) {
+                self.covariates.push(c.clone());
+            }
+        }
+        self.other |= later.other;
+    }
+}
+
+/// [`TypicalSummary`] of the subtree at `v`, in the pre-order of
+/// [`visit_expr_nodes`] over the tree `v` stands for.
+fn typical_summary_of<'a, V: RhsView<'a>>(v: V) -> TypicalSummary {
+    let mut s = TypicalSummary::default();
+    s.note(v.expr());
+    match v.expr() {
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            s.merge(&v.child(l).typical_summary());
+            s.merge(&v.child(r).typical_summary());
+        }
+        Expression::UnaryFn(_, a) => s.merge(&v.child(a).typical_summary()),
+        Expression::ThetaGather { idx, .. } => s.merge(&v.child(idx).typical_summary()),
+        Expression::Conditional(c, t, e) => {
+            // Substitution never enters a conditional, so its condition is read
+            // as written.
+            visit_condition_nodes(c, &mut |n| s.note(n));
+            s.merge(&v.child(t).typical_summary());
+            s.merge(&v.child(e).typical_summary());
+        }
+        _ => {}
+    }
+    s
+}
+
+/// The typical value `A` a split right-hand side carries
+/// ([`split_typical_and_eta`]), not yet built.
+enum TypicalParts<V> {
+    /// `A` is this subtree.
+    Whole(V),
+    /// `A` is a chain of `op` over these parts' operands
+    /// ([`flatten_chain`] through definitions), re-associated to the left.
+    Chain(BinOp, Vec<V>),
+}
+
+impl<'a, V: RhsView<'a>> TypicalParts<V> {
+    fn summary(&self) -> TypicalSummary {
+        let mut s = TypicalSummary::default();
+        match self {
+            TypicalParts::Whole(v) => s.merge(&v.typical_summary()),
+            // The chain's own `op` nodes read nothing.
+            TypicalParts::Chain(_, parts) => {
+                for p in parts {
+                    s.merge(&p.typical_summary());
+                }
+            }
+        }
+        s
+    }
+
+    fn build(self) -> Expression {
+        match self {
+            TypicalParts::Whole(v) => v.materialise(),
+            TypicalParts::Chain(op, parts) => {
+                let mut operands = Vec::new();
+                for p in parts {
+                    flatten_chain(p, op, true, &mut operands);
+                }
+                let mut operands = operands.into_iter().map(|o| o.materialise());
+                let first = operands
+                    .next()
+                    .expect("a split keeps at least one operand besides the eta");
+                operands.fold(first, |a, o| {
+                    Expression::BinOp(Box::new(a), op, Box::new(o))
+                })
+            }
+        }
+    }
 }
 
 /// Split a right-hand side into `(A, eta_idx, link)` for the three shapes a
@@ -1377,50 +1683,60 @@ fn classify_covariate_mu_ref(
 /// - `exp(log(A) + ETA)` → `Log`;
 /// - `inv_logit(A + ETA)`, `1/(1 + exp(-(A + ETA)))`, `1/(1 + exp(-A - ETA))` → `Logit`.
 ///
-/// `A` is returned as written (thetas, covariates, literals unchecked here —
+/// `A` is returned as written, product and sum chains re-associated to the
+/// left (thetas, covariates, literals unchecked here —
 /// [`classify_covariate_mu_ref`] does that); it never contains the eta.
-fn split_typical_and_eta(expr: &Expression) -> Option<(Expression, usize, MuTransform)> {
-    match expr {
+fn split_typical_and_eta<'a, V: RhsView<'a>>(
+    v: V,
+) -> Option<(TypicalParts<V>, usize, MuTransform)> {
+    match v.expr() {
         Expression::UnaryFn(name, inner) if name == "exp" => {
-            let Expression::BinOp(l, BinOp::Add, r) = inner.as_ref() else {
+            let inner = v.child(inner);
+            let Expression::BinOp(l, BinOp::Add, r) = inner.expr() else {
                 return None;
             };
+            let (l, r) = (inner.child(l), inner.child(r));
             for (a, b) in [(l, r), (r, l)] {
-                if let (Expression::UnaryFn(f, arg), Expression::Eta(e)) = (a.as_ref(), b.as_ref())
-                {
-                    if (f == "log" || f == "ln") && !expr_contains_eta(arg) {
-                        return Some((arg.as_ref().clone(), *e, MuTransform::Log));
+                if let (Expression::UnaryFn(f, arg), Expression::Eta(e)) = (a.expr(), b.expr()) {
+                    let arg = a.child(arg);
+                    if (f == "log" || f == "ln") && !rhs_contains_eta(arg) {
+                        return Some((TypicalParts::Whole(arg), *e, MuTransform::Log));
                     }
                 }
             }
             None
         }
         Expression::UnaryFn(name, inner) if name == "inv_logit" || name == "expit" => {
-            split_sum_eta(inner).map(|(a, e)| (a, e, MuTransform::Logit))
+            split_sum_eta(v.child(inner)).map(|(a, e)| (a, e, MuTransform::Logit))
         }
-        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(num) => {
-            let Expression::BinOp(l, BinOp::Add, r) = den.as_ref() else {
+        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(v.child(num).expr()) => {
+            let den = v.child(den);
+            let Expression::BinOp(l, BinOp::Add, r) = den.expr() else {
                 return None;
             };
+            let (l, r) = (den.child(l), den.child(r));
             for (one, other) in [(l, r), (r, l)] {
-                if !is_literal_one(one) {
+                if !is_literal_one(one.expr()) {
                     continue;
                 }
-                let Expression::UnaryFn(f, arg) = other.as_ref() else {
+                let Expression::UnaryFn(f, arg) = other.expr() else {
                     continue;
                 };
                 if f != "exp" {
                     continue;
                 }
+                let arg = other.child(arg);
                 // Unary minus desugars to `0 - x`.
-                let Expression::BinOp(lhs, BinOp::Sub, rhs) = arg.as_ref() else {
+                let Expression::BinOp(lhs, BinOp::Sub, rhs) = arg.expr() else {
                     return None;
                 };
-                if is_literal_zero(lhs) {
+                let (lhs, rhs) = (arg.child(lhs), arg.child(rhs));
+                if is_literal_zero(lhs.expr()) {
                     return split_sum_eta(rhs).map(|(a, e)| (a, e, MuTransform::Logit));
-                } else if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.as_ref() {
-                    if is_literal_zero(zero) {
-                        return typical_plus_eta(a, rhs).map(|(a, e)| (a, e, MuTransform::Logit));
+                } else if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.expr() {
+                    if is_literal_zero(lhs.child(zero).expr()) {
+                        return typical_plus_eta(lhs.child(a), rhs)
+                            .map(|(a, e)| (TypicalParts::Whole(a), e, MuTransform::Logit));
                     }
                 }
                 return None;
@@ -1428,14 +1744,15 @@ fn split_typical_and_eta(expr: &Expression) -> Option<(Expression, usize, MuTran
             None
         }
         _ => {
-            let mut factors: Vec<&Expression> = Vec::new();
-            flatten_mul(expr, &mut factors);
+            let mut factors = Vec::new();
+            flatten_chain(v, BinOp::Mul, false, &mut factors);
             let mut eta_factor: Option<(usize, usize)> = None;
             for (i, f) in factors.iter().enumerate() {
-                let Expression::UnaryFn(name, arg) = f else {
+                let Expression::UnaryFn(name, arg) = f.expr() else {
                     continue;
                 };
-                if name != "exp" || !expr_contains_eta(arg) {
+                let arg = f.child(arg);
+                if name != "exp" || !rhs_contains_eta(arg) {
                     continue;
                 }
                 // A second eta-bearing factor, or an exp whose argument is not a
@@ -1446,31 +1763,35 @@ fn split_typical_and_eta(expr: &Expression) -> Option<(Expression, usize, MuTran
                 eta_factor = Some((i, bare_eta_exp_arg(arg)?));
             }
             let (pos, eta_idx) = eta_factor?;
-            let mut rest = factors
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != pos)
-                .map(|(_, f)| (*f).clone());
-            let mut a = rest.next()?;
-            for f in rest {
-                a = Expression::BinOp(Box::new(a), BinOp::Mul, Box::new(f));
-            }
-            if expr_contains_eta(&a) {
-                return None;
-            }
-            Some((a, eta_idx, MuTransform::Log))
+            let rest = without(factors, pos)?;
+            Some((
+                TypicalParts::Chain(BinOp::Mul, rest),
+                eta_idx,
+                MuTransform::Log,
+            ))
         }
     }
 }
 
+/// `parts` without the eta's slot `pos`: `None` when nothing else is left, or
+/// when what is left still reads an eta.
+fn without<'a, V: RhsView<'a>>(mut parts: Vec<V>, pos: usize) -> Option<Vec<V>> {
+    parts.remove(pos);
+    if parts.is_empty() || parts.iter().any(|p| rhs_contains_eta(*p)) {
+        return None;
+    }
+    Some(parts)
+}
+
 /// A sum chain (`a + b + c`, any association) with exactly one bare-eta term:
-/// returns the remaining terms re-summed in source order and the eta index.
-fn split_sum_eta(expr: &Expression) -> Option<(Expression, usize)> {
-    let mut terms: Vec<&Expression> = Vec::new();
-    flatten_add(expr, &mut terms);
+/// returns the remaining terms, to be re-summed in source order, and the eta
+/// index.
+fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize)> {
+    let mut terms = Vec::new();
+    flatten_chain(v, BinOp::Add, false, &mut terms);
     let mut eta_term: Option<(usize, usize)> = None;
     for (i, t) in terms.iter().enumerate() {
-        if let Expression::Eta(e) = t {
+        if let Expression::Eta(e) = t.expr() {
             if eta_term.is_some() {
                 return None;
             }
@@ -1478,63 +1799,46 @@ fn split_sum_eta(expr: &Expression) -> Option<(Expression, usize)> {
         }
     }
     let (pos, eta_idx) = eta_term?;
-    let mut rest = terms
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != pos)
-        .map(|(_, t)| (*t).clone());
-    let mut a = rest.next()?;
-    for t in rest {
-        a = Expression::BinOp(Box::new(a), BinOp::Add, Box::new(t));
-    }
-    if expr_contains_eta(&a) {
-        return None;
-    }
-    Some((a, eta_idx))
+    let rest = without(terms, pos)?;
+    Some((TypicalParts::Chain(BinOp::Add, rest), eta_idx))
 }
 
-/// Flatten an `Add` chain into its terms, in source order.
-fn flatten_add<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
-    if let Expression::BinOp(l, BinOp::Add, r) = expr {
-        flatten_add(l, out);
-        flatten_add(r, out);
-    } else {
-        out.push(expr);
+/// Flatten an `op` chain into its operands, in source order.
+///
+/// With `through_definitions` false a substituted local definition is kept
+/// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
+/// definition is eta-free, so the eta's operand is never inside one, and
+/// flattening it would walk every path of a diamond. [`TypicalParts::build`]
+/// flattens through them, so the built chain is the one the full tree gives.
+fn flatten_chain<'a, V: RhsView<'a>>(v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>) {
+    match v.expr() {
+        Expression::BinOp(l, o, r) if *o == op && (through_definitions || !v.is_definition()) => {
+            flatten_chain(v.child(l), op, through_definitions, out);
+            flatten_chain(v.child(r), op, through_definitions, out);
+        }
+        _ => out.push(v),
     }
 }
 
 /// `a + b` where exactly one side is a bare eta and the other is eta-free.
-fn typical_plus_eta(a: &Expression, b: &Expression) -> Option<(Expression, usize)> {
-    match (a, b) {
-        (typical, Expression::Eta(e)) | (Expression::Eta(e), typical)
-            if !expr_contains_eta(typical) =>
-        {
-            Some((typical.clone(), *e))
-        }
+fn typical_plus_eta<'a, V: RhsView<'a>>(a: V, b: V) -> Option<(V, usize)> {
+    match (a.expr(), b.expr()) {
+        (_, Expression::Eta(e)) if !rhs_contains_eta(a) => Some((a, *e)),
+        (Expression::Eta(e), _) if !rhs_contains_eta(b) => Some((b, *e)),
         _ => None,
     }
 }
 
 /// The eta index of an `exp(...)` argument that is exactly `ETA` or
 /// `ETA + KAPPA` (the IIV+IOV product form); `None` for anything else.
-fn bare_eta_exp_arg(arg: &Expression) -> Option<usize> {
-    match arg {
+fn bare_eta_exp_arg<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
+    match v.expr() {
         Expression::Eta(j) => Some(*j),
-        Expression::BinOp(l, BinOp::Add, r) => match (l.as_ref(), r.as_ref()) {
+        Expression::BinOp(l, BinOp::Add, r) => match (v.child(l).expr(), v.child(r).expr()) {
             (Expression::Eta(a), Expression::Eta(b)) => Some(*a.min(b)),
             _ => None,
         },
         _ => None,
-    }
-}
-
-/// Flatten a `Mul` chain into its factors, in source order.
-fn flatten_mul<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
-    if let Expression::BinOp(l, BinOp::Mul, r) = expr {
-        flatten_mul(l, out);
-        flatten_mul(r, out);
-    } else {
-        out.push(expr);
     }
 }
 
@@ -1632,7 +1936,7 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // Fallback: BASE * exp(ETA[+KAPPA]) where BASE contains no bare eta
     // references. Handles derived intermediates like `KTR * exp(ETA_KA)`
     // where KTR is a variable defined earlier in [individual_parameters] and
-    // collect_mul_anchors therefore finds no direct Theta anchor.
+    // mul_anchors_of therefore finds no direct Theta anchor.
     // Only reached when detect_pattern returned None above.
     // detect_pattern already handles the Theta-anchored case, so this
     // only fires when anchors.len() != 1 but the expression is still
@@ -1725,15 +2029,15 @@ fn plain_theta_eta(a: &Expression, b: &Expression) -> Option<(usize, usize)> {
 ///
 /// `prob_scale` is `true` for `logit(THETA) + ETA` (THETA on the probability
 /// scale) and `false` for `THETA + ETA` (THETA already on the logit scale).
-fn logit_mu_sum(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+fn logit_mu_sum<'a, V: RhsView<'a>>(a: V, b: V) -> Option<(usize, usize, bool)> {
     // Form 1: THETA + ETA  (THETA on logit scale)
-    if let Some((ei, ti)) = plain_theta_eta(a, b) {
+    if let Some((ei, ti)) = plain_theta_eta(a.expr(), b.expr()) {
         return Some((ei, ti, false));
     }
     // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
+    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a.expr(), b.expr()) {
         if fn_name == "logit" {
-            if let Expression::Theta(ti) = inner_arg.as_ref() {
+            if let Expression::Theta(ti) = a.child(inner_arg).expr() {
                 return Some((*ei, *ti, true));
             }
         }
@@ -1742,7 +2046,7 @@ fn logit_mu_sum(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> 
 }
 
 /// Match a logit-scale mu-sum in either operand order.
-fn logit_mu_sum_either(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+fn logit_mu_sum_either<'a, V: RhsView<'a>>(a: V, b: V) -> Option<(usize, usize, bool)> {
     logit_mu_sum(a, b).or_else(|| logit_mu_sum(b, a))
 }
 
@@ -1754,18 +2058,19 @@ fn is_literal_one(expr: &Expression) -> bool {
 /// Match the *negation* of a logit mu-sum, i.e. the `exp` argument in
 /// `1 / (1 + exp(-(MU + ETA)))`. The parser desugars unary minus to `0 - x`,
 /// so both `-(MU + ETA)` and `-MU - ETA` are recognised.
-fn negated_logit_mu_sum(expr: &Expression) -> Option<(usize, usize, bool)> {
-    if let Expression::BinOp(lhs, BinOp::Sub, rhs) = expr {
+fn negated_logit_mu_sum<'a, V: RhsView<'a>>(v: V) -> Option<(usize, usize, bool)> {
+    if let Expression::BinOp(lhs, BinOp::Sub, rhs) = v.expr() {
+        let (lhs, rhs) = (v.child(lhs), v.child(rhs));
         // `-(MU + ETA)`  →  `0 - (MU + ETA)`
-        if matches!(lhs.as_ref(), Expression::Literal(v) if *v == 0.0) {
-            if let Expression::BinOp(a, BinOp::Add, b) = rhs.as_ref() {
-                return logit_mu_sum_either(a, b);
+        if is_literal_zero(lhs.expr()) {
+            if let Expression::BinOp(a, BinOp::Add, b) = rhs.expr() {
+                return logit_mu_sum_either(rhs.child(a), rhs.child(b));
             }
         }
         // `-MU - ETA`  →  `(0 - MU) - ETA`
-        if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.as_ref() {
-            if matches!(zero.as_ref(), Expression::Literal(v) if *v == 0.0) {
-                return logit_mu_sum_either(a, rhs);
+        if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.expr() {
+            if is_literal_zero(lhs.child(zero).expr()) {
+                return logit_mu_sum_either(lhs.child(a), rhs);
             }
         }
     }
@@ -1781,26 +2086,29 @@ fn negated_logit_mu_sum(expr: &Expression) -> Option<(usize, usize, bool)> {
 ///   - `inv_logit(logit(THETA) + ETA)`      — THETA on the probability scale (0,1)
 ///   - `1 / (1 + exp(-(THETA + ETA)))`      — the same two forms written out
 ///   - `1 / (1 + exp(-THETA - ETA))`          algebraically (#918)
-fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
-    match expr {
+fn detect_logit_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, usize, bool)> {
+    match v.expr() {
         Expression::UnaryFn(name, inner) if name == "inv_logit" || name == "expit" => {
-            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                return logit_mu_sum_either(lhs, rhs);
+            let inner = v.child(inner);
+            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.expr() {
+                return logit_mu_sum_either(inner.child(lhs), inner.child(rhs));
             }
             None
         }
         // `1 / (1 + exp(-(MU + ETA)))` — inv_logit written out by hand.
-        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(num) => {
-            let Expression::BinOp(l, BinOp::Add, r) = den.as_ref() else {
+        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(v.child(num).expr()) => {
+            let den = v.child(den);
+            let Expression::BinOp(l, BinOp::Add, r) = den.expr() else {
                 return None;
             };
+            let (l, r) = (den.child(l), den.child(r));
             for (one, other) in [(l, r), (r, l)] {
-                if !is_literal_one(one) {
+                if !is_literal_one(one.expr()) {
                     continue;
                 }
-                if let Expression::UnaryFn(fn_name, arg) = other.as_ref() {
+                if let Expression::UnaryFn(fn_name, arg) = other.expr() {
                     if fn_name == "exp" {
-                        return negated_logit_mu_sum(arg);
+                        return negated_logit_mu_sum(other.child(arg));
                     }
                 }
             }
@@ -4285,6 +4593,15 @@ pub fn parse_full_model_with(
     // declared `weight = W` form and the hand-written `K / sqrt(W)` must agree
     // on their mu-refs exactly as they agree on the objective. See the rewrite
     // site above.
+    #[cfg(test)]
+    MU_REF_SCAN_INPUT.with(|c| {
+        *c.borrow_mut() = Some((
+            indiv_stmts.clone(),
+            theta_names.clone(),
+            all_eta_names.clone(),
+            eta_names_bsv.len(),
+        ))
+    });
     let all_mu_refs = detect_mu_refs(
         &indiv_stmts,
         &theta_names,
@@ -20826,6 +21143,7 @@ fn level_block_eta_coupling(
         readout,
         block,
         states,
+        constant: Default::default(),
     };
     let is_block =
         |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == block);
@@ -20960,6 +21278,18 @@ struct CouplingCtx<'a> {
     readout: &'a [Expression],
     block: &'a str,
     states: &'a StateInputs,
+    /// [`Self::var_constant`]'s answer per variable, for this call: the
+    /// covariates it reads (sorted, deduplicated) when it is constant, `None`
+    /// when it varies. A variable reached along many paths (a diamond of
+    /// intermediates) is walked once, not once per path (#1676).
+    constant: std::cell::RefCell<HashMap<String, Option<Vec<String>>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`CouplingCtx::var_constant`] on this thread, so a test can pin
+    /// that the walk is linear in the variables, not in the paths (#1676).
+    static VAR_CONSTANT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> CouplingCtx<'a> {
@@ -21054,16 +21384,41 @@ impl<'a> CouplingCtx<'a> {
     /// Whether every assignment of individual parameter `v` is subject-constant
     /// (see [`level_block_eta_coupling`]), recording the covariates it reads.
     /// `stack` guards a cycle, which is treated as varying.
+    ///
+    /// The answer is memoised per variable (`constant`). That is sound although
+    /// the cycle guard reads `stack`: a variable that met the guard lies on a
+    /// cycle, so walked afresh it meets the guard again and varies either way;
+    /// and a variable found constant met no cycle, so the covariates it
+    /// recorded are all of them. Callers read `covs` only on a `true`.
     fn var_constant(&self, v: &str, covs: &mut Vec<String>, stack: &mut Vec<String>) -> bool {
+        #[cfg(test)]
+        VAR_CONSTANT_CALLS.with(|c| c.set(c.get() + 1));
+        if let Some(done) = self.constant.borrow().get(v) {
+            return match done {
+                Some(read) => {
+                    covs.extend(read.iter().cloned());
+                    true
+                }
+                None => false,
+            };
+        }
         if stack.iter().any(|s| s == v) {
             return false;
         }
         stack.push(v.to_string());
+        let start = covs.len();
         let ok = self.assigns.iter().filter(|a| a.lhs == v).all(|a| {
             self.expr_constant(a.rhs, covs, stack)
                 && a.conds.iter().all(|c| self.cond_constant(c, covs, stack))
         });
         stack.pop();
+        let done = ok.then(|| {
+            let mut read = covs[start..].to_vec();
+            read.sort();
+            read.dedup();
+            read
+        });
+        self.constant.borrow_mut().insert(v.to_string(), done);
         ok
     }
 
