@@ -55,10 +55,11 @@ instead of editing CHANGELOG.md, so concurrent PRs never conflict.
                                                fragments into CHANGELOG.md as
                                                ## [<version>] - <date>, update the
                                                compare links, delete the fragments
-  tools/changelog.sh require <base-ref> [--pr N] [--labels a,b,...]
+  tools/changelog.sh require <base-ref> [--pr N] [--opt-out true|false]
                                                fail if the diff base...HEAD touches
                                                user-facing code and adds no fragment,
-                                               unless the '$OPT_OUT_LABEL' label is set
+                                               unless --opt-out true (CI passes
+                                               whether the '$OPT_OUT_LABEL' label is set)
 
 Fragment: changelog.d/<N>.<category>.md, where <N> is the issue or PR number
 (append -2, -3, ... for a second entry on the same number, e.g. 1541-2.fixed.md)
@@ -100,10 +101,10 @@ heading_of() {
 # 1541.fixed.md precedes 1541-2.fixed.md).
 fragment_names() {
   [ -d "$frag_dir" ] || return 0
-  local f name
-  for f in "$frag_dir"/* "$frag_dir"/.[!.]*; do
-    [ -e "$f" ] || continue
-    name="${f##*/}"
+  # `find`, not a glob: every glob spelling misses some dotfile shape (`..x`),
+  # and a file that `check` never sees but `require` counts is a hole in both.
+  local name
+  find "$frag_dir" -mindepth 1 -maxdepth 1 | sed 's#.*/##' | while IFS= read -r name; do
     is_non_fragment "$name" && continue
     printf '%s\n' "$name"
   done | LC_ALL=C sort -t. -k1,1n -k1,1
@@ -126,8 +127,17 @@ unreleased_content() {
 }
 
 cmd_check() {
-  local errors=0 name stem cat body first bad
+  local errors=0 name stem cat body first bad headings
   [ -f "$changelog" ] || die "no CHANGELOG.md at $changelog"
+
+  # Exactly one `## [Unreleased]` heading. Without one, an empty section and a
+  # missing section look the same to everything below, and `assemble` would
+  # delete the fragments having written them nowhere.
+  headings="$(grep -c '^## \[Unreleased\][[:space:]]*$' "$changelog" || true)"
+  if [ "$headings" != "1" ]; then
+    echo "CHANGELOG.md: expected exactly one '## [Unreleased]' heading, found $headings" >&2
+    errors=$((errors + 1))
+  fi
 
   while IFS= read -r name; do
     [ -n "$name" ] || continue
@@ -163,13 +173,15 @@ cmd_check() {
       errors=$((errors + 1))
       continue
     fi
-    # Every later non-blank line must be indented: a continuation of the one
-    # bullet. A second column-0 line is a second bullet, a heading, or prose
-    # that would land outside the list.
-    bad="$(printf '%s\n' "$body" | awk 'NR > 1 && NF && !/^[ \t]/ { print NR ": " $0; exit }')"
+    # Every later non-blank line must be indented by at least two spaces (or a
+    # tab) — the content column of `- `, so Markdown keeps it inside the one
+    # bullet. A column-0 line is a second bullet, a heading, or prose outside
+    # the list; and ` - x` with ONE space is still a sibling bullet, not a
+    # nested one.
+    bad="$(printf '%s\n' "$body" | awk 'NR > 1 && NF && !/^(  |\t)/ { print NR ": " $0; exit }')"
     if [ -n "$bad" ]; then
       echo "changelog.d/$name: must be a single bullet; line $bad is not indented" \
-        "(continuation lines need leading spaces; one entry per file)" >&2
+        "by two spaces (continuation lines need at least two; one entry per file)" >&2
       errors=$((errors + 1))
       continue
     fi
@@ -244,8 +256,12 @@ cmd_assemble() {
   done
   [ -n "$version" ] || die "assemble: usage: tools/changelog.sh assemble <version> [--date YYYY-MM-DD]"
   version="${version#v}"
-  printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
-    die "assemble: '$version' is not a semantic version (X.Y.Z)"
+  # SemVer core plus an optional pre-release, no leading zeros. Build metadata
+  # (`+...`) is deliberately not accepted: it is not part of a release tag here.
+  local num='(0|[1-9][0-9]*)' ident='[0-9A-Za-z-]+'
+  printf '%s' "$version" |
+    grep -Eq "^$num\\.$num\\.$num(-$ident(\\.$ident)*)?\$" ||
+    die "assemble: '$version' is not a release version (X.Y.Z or X.Y.Z-pre, no leading zeros)"
   [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
   printf '%s' "$date" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ||
     die "assemble: --date '$date' is not YYYY-MM-DD"
@@ -261,12 +277,18 @@ cmd_assemble() {
   local link base prev
   link="$(grep -E '^\[Unreleased\]: .*/compare/[^/]+\.\.\.HEAD$' "$changelog" || true)"
   [ -n "$link" ] || die "assemble: no '[Unreleased]: <url>/compare/<tag>...HEAD' link in CHANGELOG.md"
+  [ "$(printf '%s\n' "$link" | grep -c .)" = "1" ] ||
+    die "assemble: more than one '[Unreleased]:' compare link in CHANGELOG.md"
   base="$(printf '%s' "$link" | sed -E 's#^\[Unreleased\]: (.*)/compare/[^/]+\.\.\.HEAD$#\1#')"
   prev="$(printf '%s' "$link" | sed -E 's#^.*/compare/([^/]+)\.\.\.HEAD$#\1#')"
 
-  local section tmp
+  # The rewrite goes to a copy beside CHANGELOG.md (`cp -p`, so the `mv` keeps
+  # its mode — a `mktemp` file is 0600) and replaces it only once verified.
+  # Globals, not locals: the EXIT trap runs after this function has returned.
   section="$(mktemp)"
-  tmp="$(mktemp)"
+  tmp="$changelog.assemble.$$"
+  cp -p "$changelog" "$tmp"
+  trap 'rm -f "$section" "$tmp"' EXIT
   {
     echo "## [$version] - $date"
     echo
@@ -295,10 +317,22 @@ cmd_assemble() {
       if (inside) emit_section()
     }
   ' "$changelog" >"$tmp"
-  mv "$tmp" "$changelog"
-  rm -f "$section"
 
-  local name n=0
+  # Never delete a fragment that did not make it into the file: the new heading
+  # and every fragment's first line must be present before anything is removed.
+  grep -Fqx "## [$version] - $date" "$tmp" ||
+    die "assemble: internal error: the new section was not written; nothing changed"
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -Fqx -- "$(head -n 1 "$frag_dir/$name")" "$tmp" ||
+      die "assemble: internal error: changelog.d/$name was not written; nothing changed"
+  done <<EOF
+$(fragment_names)
+EOF
+  mv "$tmp" "$changelog"
+
+  local n=0
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     rm -f "$frag_dir/$name"
@@ -330,7 +364,7 @@ is_user_facing() {
 }
 
 cmd_require() {
-  local base="" pr="" labels=""
+  local base="" pr="" opt_out="false"
   while [ $# -gt 0 ]; do
     case "$1" in
       --pr)
@@ -338,9 +372,9 @@ cmd_require() {
         pr="$2"
         shift 2
         ;;
-      --labels)
-        [ $# -ge 2 ] || die "--labels needs a value"
-        labels="$2"
+      --opt-out)
+        [ $# -ge 2 ] || die "--opt-out needs true or false"
+        opt_out="$2"
         shift 2
         ;;
       -*) die "require: unknown flag '$1'" ;;
@@ -351,17 +385,24 @@ cmd_require() {
         ;;
     esac
   done
-  [ -n "$base" ] || die "require: usage: tools/changelog.sh require <base-ref> [--pr N] [--labels a,b]"
+  [ -n "$base" ] || die "require: usage: tools/changelog.sh require <base-ref> [--pr N] [--opt-out true|false]"
 
-  case ",$labels," in
-    *",$OPT_OUT_LABEL,"*)
+  # A boolean the workflow computes with `contains(labels.*.name, ...)`, not a
+  # joined label list: joining loses the boundaries, so a single label named
+  # `x,no-changelog` would read as the opt-out.
+  case "$opt_out" in
+    true)
       echo "changelog: '$OPT_OUT_LABEL' label set — no fragment required."
       return 0
       ;;
+    false) ;;
+    *) die "require: --opt-out must be true or false, got '$opt_out'" ;;
   esac
 
   local changed facing="" added=""
-  changed="$(git -C "$root" diff --name-only "$base"...HEAD)" ||
+  # `--no-renames`: a rename reports only its destination, so
+  # `src/x.rs -> src/x_tests.rs` would hide the production file it removed.
+  changed="$(git -C "$root" diff --no-renames --name-only "$base"...HEAD)" ||
     die "require: git diff $base...HEAD failed (is the base fetched? CI needs fetch-depth: 0)"
 
   local f
@@ -374,9 +415,11 @@ cmd_require() {
 $changed
 EOF
 
-  # A fragment counts if it is ADDED or MODIFIED by this PR (a deleted one does
-  # not describe it).
-  added="$(git -C "$root" diff --name-only --diff-filter=AMR "$base"...HEAD -- changelog.d/ |
+  # Only an ADDED fragment counts: rewording one of the pending fragments from
+  # another PR does not describe this one. The opposite rename setting from the
+  # diff above, and deliberately: with `-M` a renamed fragment is an `R`, not an
+  # `A`, so renaming someone else's entry cannot pass for adding one.
+  added="$(git -C "$root" diff -M --name-only --diff-filter=A "$base"...HEAD -- changelog.d/ |
     grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
 
   if [ -z "$facing" ]; then

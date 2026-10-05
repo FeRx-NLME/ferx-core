@@ -26,10 +26,11 @@ jobs:
           # `base...HEAD` needs the merge base, so the base commit must be present.
           fetch-depth: 0
       - name: Require a fragment for user-facing changes
-        # Labels and the PR number go through `env`, never interpolated into the
-        # script: a label name is user-controlled text.
+        # Values go through `env`, never interpolated into the script. The opt-out
+        # is an exact-match boolean, not a joined label list: joining loses label
+        # boundaries, so one label named `x,no-changelog` would read as two.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR: ${{ github.event.pull_request.number }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: tools/changelog.sh require "$BASE_SHA" --pr "$PR" --labels "$LABELS"
+          NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+        run: tools/changelog.sh require "$BASE_SHA" --pr "$PR" --opt-out "$NO_CHANGELOG"

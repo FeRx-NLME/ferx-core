@@ -275,5 +275,5 @@ A `CONTRIBUTING.md` file should be created to document:
 4. **Validate**: Run example models against known datasets, compare results.
 5. **Review**: Open PR, get code review, address feedback.
 6. **Merge**: Squash-merge or merge into `main`.
-7. **Release** (when ready): Tag, update changelog, build release artifacts.
+7. **Release** (when ready): Assemble the changelog (`tools/changelog.sh assemble`), then tag and build release artifacts.
 8. **Document**: Update Quarto docs and README as needed.

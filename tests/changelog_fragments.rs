@@ -85,6 +85,14 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             "name must be <N>.<category>.md",
         ),
         (
+            // A `..`-prefixed name escaped every glob spelling, so `check` never
+            // saw it while `require` counted it as a fragment.
+            "dot-dot-name",
+            ("..12.fixed.md", good),
+            ("12.fixed.md", good),
+            "name must be <N>.<category>.md",
+        ),
+        (
             "bad-category",
             ("12.bugfix.md", good),
             ("12.fixed.md", good),
@@ -105,6 +113,14 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
         (
             "two-bullets",
             ("12.fixed.md", "- One (#12).\n- Two (#12).\n"),
+            ("12.fixed.md", "- One (#12).\n  - Two, nested (#12).\n"),
+            "must be a single bullet",
+        ),
+        (
+            // One space does not reach the content column of `- `, so Markdown
+            // reads ` - Two` as a SIBLING bullet, not a nested one.
+            "one-space-sibling",
+            ("12.fixed.md", "- One (#12).\n - Two (#12).\n"),
             ("12.fixed.md", "- One (#12).\n  - Two, nested (#12).\n"),
             "must be a single bullet",
         ),
@@ -161,6 +177,43 @@ fn check_rejects_an_entry_written_under_unreleased() {
     );
 }
 
+/// Without exactly one `## [Unreleased]` heading an empty section and a missing one look
+/// alike, and `assemble` once rewrote the links and deleted every fragment having
+/// written them nowhere.
+#[test]
+fn a_missing_or_duplicate_unreleased_heading_is_refused_before_anything_is_deleted() {
+    for (slot, changelog) in [
+        (
+            "missing",
+            format!("# Changelog\n\n## [Unreleased-typo]\n\n{TAIL}"),
+        ),
+        ("duplicate", format!("{HEAD}## [Unreleased]\n\n{TAIL}")),
+    ] {
+        let t = tree(&format!("heading-{slot}"), &[("1.fixed.md", "- x (#1).\n")]);
+        std::fs::write(t.join("CHANGELOG.md"), &changelog).unwrap();
+
+        let o = run(&t, &["check"]);
+        assert!(!o.status.success(), "{slot}: check passed");
+        assert!(
+            stderr(&o).contains("exactly one '## [Unreleased]' heading"),
+            "{slot}: {}",
+            stderr(&o)
+        );
+
+        let o = run(&t, &["assemble", "0.2.0", "--date", "2026-10-05"]);
+        assert!(!o.status.success(), "{slot}: assemble passed");
+        assert!(
+            t.join("changelog.d").join("1.fixed.md").exists(),
+            "{slot}: a refused assemble deleted the fragment"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.join("CHANGELOG.md")).unwrap(),
+            changelog,
+            "{slot}: a refused assemble modified CHANGELOG.md"
+        );
+    }
+}
+
 #[test]
 fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
     let t = tree(
@@ -173,8 +226,27 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
             ("9.added.md", "- New thing (#9).\n"),
         ],
     );
+    // A mode no default produces: the rewrite must keep it (a `mktemp` file is 0600).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            t.join("CHANGELOG.md"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+    }
     let o = run(&t, &["assemble", "v0.2.0", "--date", "2026-10-05"]);
     assert!(o.status.success(), "{}", stderr(&o));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(t.join("CHANGELOG.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640, "assemble changed CHANGELOG.md's mode");
+    }
 
     let got = std::fs::read_to_string(t.join("CHANGELOG.md")).unwrap();
     // Categories in Keep a Changelog order (Added before Fixed before Performance,
@@ -226,14 +298,29 @@ fn assemble_refuses_invalid_fragments_and_versions() {
     );
     assert!(t.join("changelog.d").join("1.bogus.md").exists());
 
-    let t = tree("assemble-version", &[("1.fixed.md", "- x (#1).\n")]);
-    let o = run(&t, &["assemble", "next"]);
-    assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("not a semantic version"),
-        "{}",
-        stderr(&o)
-    );
+    for bad in [
+        "next",
+        "01.2.3",
+        "1.02.3",
+        "1.2.3-alpha..1",
+        "1.2.3-",
+        "1.2.3+build.1",
+    ] {
+        let t = tree("assemble-version", &[("1.fixed.md", "- x (#1).\n")]);
+        let o = run(&t, &["assemble", bad]);
+        assert!(!o.status.success(), "{bad} accepted as a version");
+        assert!(
+            stderr(&o).contains("is not a release version"),
+            "{bad}: {}",
+            stderr(&o)
+        );
+        assert!(t.join("changelog.d").join("1.fixed.md").exists());
+    }
+    for good in ["0.10.0", "v1.2.3", "1.2.3-rc.1", "1.2.3-alpha-2"] {
+        let t = tree("assemble-version-ok", &[("1.fixed.md", "- x (#1).\n")]);
+        let o = run(&t, &["assemble", good, "--date", "2026-10-05"]);
+        assert!(o.status.success(), "{good} refused: {}", stderr(&o));
+    }
 }
 
 #[test]
@@ -317,23 +404,21 @@ fn require_fails_a_user_facing_change_without_a_fragment() {
         "does not name the opt-out label:\n{err}"
     );
 
-    // A different label is not the opt-out; the opt-out among others is.
+    // The opt-out is the boolean the workflow computes from the label; anything but
+    // `true`/`false` is a usage error, not a silent pass.
+    let o = run(&d, &["require", &base, "--pr", "77", "--opt-out", "false"]);
+    assert!(!o.status.success(), "--opt-out false opted out");
     let o = run(
         &d,
-        &["require", &base, "--pr", "77", "--labels", "bug,docs"],
+        &["require", &base, "--pr", "77", "--opt-out", "no-changelog"],
     );
-    assert!(!o.status.success(), "an unrelated label opted out");
-    let o = run(
-        &d,
-        &[
-            "require",
-            &base,
-            "--pr",
-            "77",
-            "--labels",
-            "bug,no-changelog",
-        ],
+    assert!(!o.status.success(), "a non-boolean --opt-out passed");
+    assert!(
+        stderr(&o).contains("must be true or false"),
+        "{}",
+        stderr(&o)
     );
+    let o = run(&d, &["require", &base, "--pr", "77", "--opt-out", "true"]);
     assert!(o.status.success(), "{}", stderr(&o));
 
     // A README edit does not count as a fragment; a fragment does.
@@ -342,6 +427,51 @@ fn require_fails_a_user_facing_change_without_a_fragment() {
     commit_file(&d, "changelog.d/77.fixed.md", "- Fixed (#77).\n");
     let o = run(&d, &["require", &base, "--pr", "77"]);
     assert!(o.status.success(), "{}", stderr(&o));
+}
+
+/// Only a fragment this PR ADDS counts: rewording or renaming another PR's pending
+/// fragment does not describe this change.
+#[test]
+fn require_counts_only_an_added_fragment() {
+    for (slot, edit) in [("modify", false), ("rename", true)] {
+        let (d, _) = git_repo(&format!("only-added-{slot}"));
+        commit_file(
+            &d,
+            "changelog.d/10.fixed.md",
+            "- Someone else's fix (#10).\n",
+        );
+        let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+        commit_file(&d, "src/lib.rs", "// v2\n");
+        if edit {
+            git(
+                &d,
+                &["mv", "changelog.d/10.fixed.md", "changelog.d/11.fixed.md"],
+            );
+            git(&d, &["commit", "-q", "-m", "rename"]);
+        } else {
+            commit_file(&d, "changelog.d/10.fixed.md", "- Reworded fix (#10).\n");
+        }
+        let o = run(&d, &["require", &base, "--pr", "11"]);
+        assert!(
+            !o.status.success(),
+            "{slot} of an existing fragment counted as this PR's own"
+        );
+    }
+}
+
+/// A rename reports only its destination, so moving production code into a test file
+/// must still count as touching user-facing code.
+#[test]
+fn require_sees_the_source_side_of_a_rename() {
+    let (d, base) = git_repo("rename-src");
+    git(&d, &["mv", "src/lib.rs", "src/lib_tests.rs"]);
+    git(&d, &["commit", "-q", "-m", "rename"]);
+    let o = run(&d, &["require", &base, "--pr", "5"]);
+    assert!(
+        !o.status.success(),
+        "src/lib.rs -> src/lib_tests.rs passed as test-only"
+    );
+    assert!(stderr(&o).contains("src/lib.rs"), "{}", stderr(&o));
 }
 
 #[test]
@@ -399,4 +529,42 @@ fn the_preflight_group_fails_when_the_fragments_do() {
         "{err}"
     );
     assert!(err.contains("CI job:   Changelog"), "{err}");
+}
+
+/// The workflow's wiring is what makes `require` a gate: each of these lines has a
+/// one-token edit (`base.sha` -> `github.sha`, dropping `unlabeled`, a shallow
+/// checkout) that leaves every test above green and the gate inert or stale.
+#[test]
+fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
+    let p = repo_root()
+        .join(".github")
+        .join("workflows")
+        .join("changelog.yml");
+    let yml = std::fs::read_to_string(&p).unwrap();
+    let lines: Vec<&str> = yml
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    for want in [
+        "types: [opened, synchronize, reopened, labeled, unlabeled]",
+        "fetch-depth: 0",
+        "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+        "PR: ${{ github.event.pull_request.number }}",
+        "NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no-changelog') }}",
+        r#"run: tools/changelog.sh require "$BASE_SHA" --pr "$PR" --opt-out "$NO_CHANGELOG""#,
+    ] {
+        assert!(
+            lines.contains(&want),
+            "changelog.yml lost `{want}` — see #1545"
+        );
+    }
+    // No step may mask the gate.
+    assert!(
+        !lines.iter().any(
+            |l| l.trim_start_matches("- ").starts_with("continue-on-error:")
+                || l.trim_start_matches("- ").starts_with("if:")
+        ),
+        "changelog.yml can skip itself or pass while red"
+    );
 }
