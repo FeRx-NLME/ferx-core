@@ -1950,7 +1950,7 @@ fn classify_theta_eta_linked(
 ///
 /// An ETA's scale is the one a kappa gets ([`classify_kappa_params`], #1656):
 /// where its leaf sits ([`leaf_scales`]), and for a leaf that only `+`/`-`
-/// separate from the root, the use of the assigned variable ([`root_scale`],
+/// separate from the root, the use of the assigned variable ([`ScaleWalk::root_scale`],
 /// with `consumers` as the stop set). So `TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`
 /// is `Additive` like `THETA + ETA`. The whole-expression patterns
 /// ([`classify_expr`]) still run first: they name the linked θ and its
@@ -1973,13 +1973,11 @@ fn classify_indiv_params(
     let n_theta = theta_names.len();
     let mut theta_transform = vec![ThetaTransform::Identity; n_theta];
     let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let walk = ScaleWalk::new(stmts, consumers);
     let cx = EtaScaleCx {
         theta_names,
         eta_names,
-        assigns: &assigns,
-        consumers,
+        walk: &walk,
     };
 
     for s in stmts {
@@ -2051,8 +2049,7 @@ fn classify_indiv_params(
 struct EtaScaleCx<'a> {
     theta_names: &'a [String],
     eta_names: &'a [String],
-    assigns: &'a [(&'a str, &'a Expression)],
-    consumers: &'a HashSet<String>,
+    walk: &'a ScaleWalk<'a>,
 }
 
 /// Push one `EtaParamInfo` per BSV ETA that `exprs` (every expression assigned
@@ -2078,7 +2075,12 @@ fn emit_eta_infos(
         let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == ei);
         let mut seen = Vec::new();
         for e in exprs {
-            resolved_leaf_scales(param_name, e, &is_eta, cx.assigns, cx.consumers, &mut seen);
+            match cx.walk.def_of(e) {
+                Some(def) => cx.walk.resolved_leaf_scales(def, &is_eta, &mut seen),
+                // Unreachable: every expression comes from the statements the
+                // walk was built from. Unknown is `Custom`, never a guess.
+                None => seen.push(EtaParamType::Custom),
+            }
         }
         common_scale(&seen)
     };
@@ -2123,18 +2125,39 @@ fn emit_eta_infos(
 
 /// Every assignment, top level and inside `if` branches, in statement order.
 fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
+}
+
+/// The `if` branches enclosing an assignment, outermost first (`[]` at top
+/// level): each is `(if statement, branch)`, the statement numbered in
+/// flattening order and the branch by position, `else` last.
+type Scope = Vec<(usize, usize)>;
+
+/// [`flatten_assigns`], also recording each assignment's [`Scope`].
+fn flatten_assigns_scoped<'a>(
+    stmts: &'a [Statement],
+    scope: &mut Scope,
+    next_if: &mut usize,
+    out: &mut Vec<(&'a str, &'a Expression)>,
+    scopes: &mut Vec<Scope>,
+) {
     for s in stmts {
         match s {
-            Statement::Assign(lhs, expr) => out.push((lhs, expr)),
+            Statement::Assign(lhs, expr) => {
+                out.push((lhs, expr));
+                scopes.push(scope.clone());
+            }
             Statement::If {
                 branches,
                 else_body,
             } => {
-                for (_, body) in branches {
-                    flatten_assigns(body, out);
-                }
-                if let Some(body) = else_body {
-                    flatten_assigns(body, out);
+                *next_if += 1;
+                let id = *next_if;
+                let bodies = branches.iter().map(|(_, b)| b).chain(else_body);
+                for (branch, body) in bodies.enumerate() {
+                    scope.push((id, branch));
+                    flatten_assigns_scoped(body, scope, next_if, out, scopes);
+                    scope.pop();
                 }
             }
             _ => {}
@@ -2142,60 +2165,143 @@ fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expre
     }
 }
 
-/// The scale of every leaf of `expr` (assigned to `lhs`) that `is_leaf` picks
-/// out, with a leaf that reached the root resolved by [`root_scale`].
-fn resolved_leaf_scales(
-    lhs: &str,
-    expr: &Expression,
-    is_leaf: &dyn Fn(&Expression) -> bool,
-    assigns: &[(&str, &Expression)],
-    consumers: &HashSet<String>,
-    out: &mut Vec<crate::types::EtaParamType>,
-) {
-    for s in leaf_scales(expr, is_leaf) {
-        match s {
-            Some(t) => out.push(t),
-            None => root_scale(lhs, assigns, consumers, &[], out),
-        }
+/// Whether two assignments sit in different branches of one `if` statement, so
+/// that no evaluation runs both. Two scopes agree up to the first `if` where
+/// they part: the same statement with different branches is that case, while a
+/// different statement (two `if`s one after the other) is not (#1687 review).
+fn in_sibling_branches(a: &Scope, b: &Scope) -> bool {
+    match a.iter().zip(b).find(|(x, y)| x != y) {
+        Some(((if_a, _), (if_b, _))) => if_a == if_b,
+        None => false,
     }
 }
 
-/// The scale(s) of a leaf that reached the root of the assignment to `var`.
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`ScaleWalk::root_scale`] on this thread, so a test can pin
+    /// that the walk is linear in the statements, not in the paths (#1674).
+    static ROOT_SCALE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The walk that resolves a random effect which reached the root of its
+/// assignment to the scale of the variable's **use**, shared by the ETA
+/// ([`classify_indiv_params`]) and kappa ([`classify_kappa_params`])
+/// classifiers.
 ///
-/// A variable a consuming block reads (`consumers`, built by
-/// [`param_consumer_identifiers`]) or that nothing else reads is a parameter,
-/// and the leaf is `Additive` on it; an intermediate that later statements read
-/// is followed into them with the same walk. `consumers` holds upper-cased
-/// identifiers, so the check is case-insensitive.
-fn root_scale(
-    var: &str,
-    assigns: &[(&str, &Expression)],
-    consumers: &HashSet<String>,
-    visiting: &[&str],
-    out: &mut Vec<crate::types::EtaParamType>,
-) {
-    use crate::types::EtaParamType;
-    let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
-    let readers: Vec<(&str, Vec<Option<EtaParamType>>)> = assigns
-        .iter()
-        .filter(|(lhs, _)| !visiting.contains(lhs))
-        .map(|(lhs, e)| (*lhs, leaf_scales(e, &is_var)))
-        .filter(|(_, scales)| !scales.is_empty())
-        .collect();
-    if consumers.contains(&var.to_ascii_uppercase()) || readers.is_empty() {
-        out.push(EtaParamType::Additive);
-        return;
+/// It runs over **definitions** (an index into the flattened assignments), not
+/// variable names: `CL = TVCL + ETA_CL` followed by `CL = CL * TVV` defines
+/// `CL` twice, and the first definition's value reaches the model only through
+/// the second (#1673). A definition's result depends on nothing but its index,
+/// so it is computed once (`memo`) however many paths reach it (#1674).
+struct ScaleWalk<'a> {
+    assigns: Vec<(&'a str, &'a Expression)>,
+    scopes: Vec<Scope>,
+    consumers: &'a HashSet<String>,
+    memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
+}
+
+impl<'a> ScaleWalk<'a> {
+    fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
+        let (mut assigns, mut scopes) = (Vec::new(), Vec::new());
+        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, &mut assigns, &mut scopes);
+        let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
+        Self {
+            assigns,
+            scopes,
+            consumers,
+            memo,
+        }
     }
-    // The variables already on this path: a reassignment (`A = A + 1`) reads
-    // its own left-hand side and would otherwise recurse forever.
-    let path: Vec<&str> = visiting.iter().copied().chain([var]).collect();
-    for (lhs, scales) in readers {
-        for s in scales {
+
+    /// The definition index of `expr`, which must be one of the assigned
+    /// expressions this walk was built from.
+    fn def_of(&self, expr: &Expression) -> Option<usize> {
+        self.assigns
+            .iter()
+            .position(|(_, e)| std::ptr::eq(*e, expr))
+    }
+
+    /// The scale of every leaf that `is_leaf` picks out in definition `def`,
+    /// with a leaf that reached the root resolved by [`Self::root_scale`].
+    fn resolved_leaf_scales(
+        &self,
+        def: usize,
+        is_leaf: &dyn Fn(&Expression) -> bool,
+        out: &mut Vec<crate::types::EtaParamType>,
+    ) {
+        for s in leaf_scales(self.assigns[def].1, is_leaf) {
             match s {
                 Some(t) => out.push(t),
-                None => root_scale(lhs, assigns, consumers, &path, out),
+                None => out.extend(self.root_scale(def)),
             }
         }
+    }
+
+    /// The distinct scale(s) of a leaf that reached the root of definition `def`.
+    ///
+    /// The definition is **in force** from the next assignment up to and
+    /// including the first later assignment to the same variable in the same or
+    /// an enclosing scope (a reassignment inside an `if`, including a later
+    /// `if`, leaves it live on the other path); an assignment in the other
+    /// branch of the `if` that holds the definition never sees it
+    /// ([`in_sibling_branches`]). Its **readers** are the assignments in that
+    /// range that read the variable.
+    ///
+    /// A variable a consuming block reads (`consumers`, built by
+    /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
+    /// it, and other readers (`K10 = CL / V`) do not change that. But a
+    /// consumer sees the variable's **last** value, so a reader that reassigns
+    /// it (`CL = CL * TVV`) is followed first, and the leaf is `Additive` only
+    /// where no reassignment replaces the definition (#1673). A variable no
+    /// consumer reads is an intermediate, followed into every reader; with none
+    /// it is a parameter too. `consumers` holds upper-cased identifiers, so the
+    /// check is case-insensitive.
+    ///
+    /// A reader is always a later definition, so the recursion terminates: an
+    /// in-place reassignment (`A = A + 1`) never reads itself.
+    fn root_scale(&self, def: usize) -> Vec<crate::types::EtaParamType> {
+        use crate::types::EtaParamType;
+        #[cfg(test)]
+        ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
+        if let Some(done) = &self.memo.borrow()[def] {
+            return done.clone();
+        }
+        let (var, _) = self.assigns[def];
+        let scope = &self.scopes[def];
+        let consumed = self.consumers.contains(&var.to_ascii_uppercase());
+        let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
+        let mut out = Vec::new();
+        let (mut read, mut replaced) = (false, false);
+        for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
+            let other = &self.scopes[j];
+            if in_sibling_branches(scope, other) {
+                continue; // the other branch of an `if` never sees this definition
+            }
+            if !consumed || *lhs == var {
+                for s in leaf_scales(e, &is_var) {
+                    read = true;
+                    match s {
+                        Some(t) => out.push(t),
+                        None => out.extend(self.root_scale(j)),
+                    }
+                }
+            }
+            if *lhs == var && scope.starts_with(other) {
+                replaced = true;
+                break;
+            }
+        }
+        if !read || (consumed && !replaced) {
+            out.push(EtaParamType::Additive);
+        }
+        let mut distinct: Vec<EtaParamType> = Vec::new();
+        for t in out {
+            if !distinct.contains(&t) {
+                distinct.push(t);
+            }
+        }
+        self.memo.borrow_mut()[def] = Some(distinct.clone());
+        distinct
     }
 }
 
@@ -2209,7 +2315,7 @@ fn common_scale(seen: &[crate::types::EtaParamType]) -> crate::types::EtaParamTy
 }
 
 /// Blocks that read an `[individual_parameters]` variable **as a parameter**:
-/// the stop set of [`root_scale`] (#1662). Every entry of `BLOCK_REGISTRY` is in
+/// the stop set of [`ScaleWalk::root_scale`] (#1662). Every entry of `BLOCK_REGISTRY` is in
 /// exactly one of this list and [`NON_PARAM_CONSUMER_BLOCKS`];
 /// `every_block_is_sorted_into_param_consumer_or_not` pins the partition, so a
 /// new block cannot be added without deciding which.
@@ -2284,7 +2390,7 @@ fn param_consumer_identifiers(
 /// the ETA patterns wherever those answer.
 ///
 /// A kappa that only `+`/`-` separate from the root of its assignment takes the
-/// scale of that assignment's **use** ([`root_scale`]): a variable a consuming
+/// scale of that assignment's **use** ([`ScaleWalk::root_scale`]): a variable a consuming
 /// block reads (`consumers`, see [`PARAM_CONSUMER_BLOCKS`]) or that nothing
 /// else reads is a parameter, and the kappa is `Additive` on it; an
 /// intermediate that later statements read (`IOVCL = KAPPA_CL`, then
@@ -2303,15 +2409,14 @@ fn classify_kappa_params(
     // skip, unlike `classify_indiv_params`: a readout may not read a kappa (#107),
     // so no `__ferx_ro_*` mirror holds one, and a `__ferx_pktime_*` line is a bare
     // `TIME`.
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let walk = ScaleWalk::new(stmts, consumers);
     (0..kappa_names.len())
         .map(|k| {
             let slot = n_eta + k;
             let is_kappa = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
             let mut seen = Vec::new();
-            for (lhs, expr) in &assigns {
-                resolved_leaf_scales(lhs, expr, &is_kappa, &assigns, consumers, &mut seen);
+            for def in 0..walk.assigns.len() {
+                walk.resolved_leaf_scales(def, &is_kappa, &mut seen);
             }
             common_scale(&seen)
         })
