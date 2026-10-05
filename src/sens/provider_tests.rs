@@ -14075,3 +14075,192 @@ fn provider_ss_record_stops_a_modeled_duration_infusion_value_and_gradient() {
         );
     }
 }
+
+/// #1669 review finding 1: the closed-form log-normal fallback
+/// (`lognormal_param_derivatives` / `lognormal_eta_derivatives_only`) computes
+/// `∂p_i/∂η_k = p_i · sel_flat[i, k]`, which is exact only when every PK
+/// parameter is `g(θ, cov) · exp(η)` with its η written directly in its own
+/// assignment. It is reached when the compiled program declines, which this
+/// fixture forces with `n_θ + n_η = 26 > 24`. Each shape below must either
+/// decline (→ FD, `None`) or match central FD of the production predictor, on
+/// both providers. The control must be *served* by the fallback (`Some`), so the
+/// fixture is known to reach the fallback at all.
+///
+/// The full provider reaches the fallback through the 24-axis cap. The light
+/// provider's `Dual1<n_eta>` program has no such cap and serves every shape
+/// exactly, so a second leg removes the compiled program: both providers then
+/// take their fallback, and each site's gate is exercised on its own.
+///
+/// Shapes 1–2 are the review's probe: ETA aliases that #1656 relabelled from
+/// `Custom` to `LogNormal`, where `sel_flat` has no entry on `CL`'s row, so the
+/// fallback returned `∂f/∂η = 0`. Shapes 3–5 are wrong at base `45ebd3c9` too.
+#[test]
+fn lognormal_fallback_declines_unless_every_eta_is_direct() {
+    let dummies: String = (1..=21)
+        .map(|i| format!("  theta D{i}(1.0, 0.5, 2.0)\n"))
+        .collect();
+    let dummy_sum: String = (1..=21).map(|i| format!(" + D{i}")).collect();
+    let model = |cl: &str| {
+        let src = format!(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n{dummies}  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n{cl}\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA * (0{dummy_sum}) / 21\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        );
+        parse_model_string(&src).unwrap_or_else(|e| panic!("{e}\n{src}"))
+    };
+    let s = oral_subject(&[0.5, 1.0, 2.0, 6.0, 12.0]);
+    let eta = [0.2, -0.1];
+    let fd_dfdeta = |m: &CompiledModel, theta: &[f64], j: usize, k: usize| {
+        let h = 1e-6;
+        let (mut ep, mut em) = (eta.to_vec(), eta.to_vec());
+        ep[k] += h;
+        em[k] -= h;
+        (compute_predictions_with_tv(m, &s, theta, &ep)[j]
+            - compute_predictions_with_tv(m, &s, theta, &em)[j])
+            / (2.0 * h)
+    };
+    let cases: [(&str, &str, bool); 11] = [
+        // #1669 review round 2: a row whose `eta_map` names an η, given an
+        // η-free value. `sel_flat` still names the η, so the chain would serve
+        // `∂CL/∂η = CL` where the truth is 0.
+        (
+            "eta-free else branch on an eta row",
+            "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL\n  }",
+            false,
+        ),
+        (
+            "eta-free reassignment of an eta row",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL",
+            false,
+        ),
+        ("control: direct", "  CL = TVCL * exp(ETA_CL)", true),
+        // Quotient and a covariate-free extra factor stay exact.
+        (
+            "control: product and quotient",
+            "  CL = 2 * TVCL * exp(ETA_CL) / 3",
+            true,
+        ),
+        ("negated eta", "  CL = TVCL * exp(-ETA_CL)", false),
+        (
+            // `eta_map` holds one η per row; the else branch (TVCL = 0.2 < 1
+            // takes it) carries another, which `sel_flat` does not see.
+            "if branches with different etas",
+            "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_V)\n  }",
+            false,
+        ),
+        ("alias", "  ECL = ETA_CL\n  CL = TVCL * exp(ECL)", false),
+        (
+            "log alias",
+            "  ECL = log(TVCL) + ETA_CL\n  CL = exp(ECL)",
+            false,
+        ),
+        ("additive offset", "  CL = TVCL * exp(ETA_CL) + 0.05", false),
+        (
+            "log-normal intermediate",
+            "  TCL = TVCL * exp(ETA_CL)\n  CL = TCL * 1.5",
+            false,
+        ),
+        (
+            "second eta in one exp",
+            "  CL = TVCL * exp(ETA_CL + ETA_V)",
+            false,
+        ),
+    ];
+    let check = |label: &str, leg: &str, m: &CompiledModel, served: bool| {
+        let theta = m.default_params.theta.clone();
+        let full = subject_sensitivities(m, &s, &theta, &eta);
+        let light = subject_eta_grad(m, &s, &theta, &eta);
+        let fd_ok = |j: usize, k: usize, got: f64| {
+            let want = fd_dfdeta(m, &theta, j, k);
+            assert!(want.is_finite() && got.is_finite(), "{label} ({leg})");
+            approx::assert_relative_eq!(got, want, max_relative = 3e-4, epsilon = 1e-7);
+        };
+        assert_eq!(
+            full.is_some(),
+            served,
+            "{label} ({leg}): full provider served?"
+        );
+        for (j, obs) in full.iter().flat_map(|f| f.obs.iter().enumerate()) {
+            (0..m.n_eta).for_each(|k| fd_ok(j, k, obs.df_deta[k]));
+        }
+        light
+    };
+    for (label, cl, served) in cases {
+        let mut m = model(cl);
+        assert!(
+            m.n_theta + m.n_eta > 24,
+            "{label}: the fixture must push the program path past its cap"
+        );
+        // Leg 1: as parsed. The light provider's program serves every shape.
+        let light = check(label, "parsed", &m, served).expect("light program serves");
+        for (j, o) in light.iter().enumerate() {
+            for k in 0..m.n_eta {
+                let want = fd_dfdeta(&m, &m.default_params.theta, j, k);
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    want,
+                    max_relative = 3e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+        // Leg 2: no compiled program, so the light provider takes its fallback too.
+        m.indiv_param_partials.indiv_param_program = None;
+        let light = check(label, "no program", &m, served);
+        assert_eq!(
+            light.is_some(),
+            served,
+            "{label} (no program): light provider served?"
+        );
+        let theta = m.default_params.theta.clone();
+        for (j, o) in light.iter().flat_map(|l| l.iter().enumerate()) {
+            for k in 0..m.n_eta {
+                let want = fd_dfdeta(&m, &theta, j, k);
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    want,
+                    max_relative = 3e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+}
+
+/// A model with no parsed statements (`lognormal_eta_chain == None`, as on a
+/// hand-built fixture) keeps the older rule, "every `eta_param_info` entry is
+/// `LogNormal`", from both sides; a parsed model's measured flag wins over its
+/// labels. Dies under: the `None` arm returning a constant, and the `Some` arm
+/// reading the labels.
+#[test]
+fn lognormal_chain_gate_uses_the_measured_flag_or_the_labels() {
+    use crate::types::EtaParamType;
+    let mut m = parse_model_string(WARFARIN).unwrap();
+    assert_eq!(m.indiv_param_partials.lognormal_eta_chain, Some(true));
+    assert!(lognormal_chain_exact(&m), "parsed, exact");
+
+    m.indiv_param_partials.lognormal_eta_chain = None;
+    assert!(
+        lognormal_chain_exact(&m),
+        "no statements, all LogNormal labels"
+    );
+    m.eta_param_info[0].param_type = EtaParamType::Custom;
+    assert!(!lognormal_chain_exact(&m), "no statements, a Custom label");
+
+    // The measured flag is not overridden by the labels, in either direction.
+    m.indiv_param_partials.lognormal_eta_chain = Some(true);
+    assert!(
+        lognormal_chain_exact(&m),
+        "measured exact beats a Custom label"
+    );
+    m.eta_param_info[0].param_type = EtaParamType::LogNormal;
+    m.indiv_param_partials.lognormal_eta_chain = Some(false);
+    assert!(
+        !lognormal_chain_exact(&m),
+        "measured inexact beats LogNormal labels"
+    );
+}

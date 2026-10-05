@@ -18,7 +18,11 @@ use std::path::Path;
 /// `iiv_on_ruv`. The `ETA_RUV` omega is the 4th declared (index 3) and is NOT
 /// referenced by any individual parameter.
 fn iiv_on_ruv_model() -> ferx_core::types::CompiledModel {
-    let src = r"
+    parse_model_string(&iiv_on_ruv_src()).expect("iiv_on_ruv model must parse")
+}
+
+fn iiv_on_ruv_src() -> String {
+    r"
 [parameters]
   theta TVCL(0.13, 0.001, 10.0)
   theta TVV(8.0, 0.1, 500.0)
@@ -45,8 +49,8 @@ fn iiv_on_ruv_model() -> ferx_core::types::CompiledModel {
 
 [fit_options]
   method = focei
-";
-    parse_model_string(src).expect("iiv_on_ruv model must parse")
+"
+    .to_string()
 }
 
 #[test]
@@ -58,6 +62,39 @@ fn iiv_on_ruv_parses_and_wires_eta() {
     assert!(model.eta_names.contains(&"ETA_RUV".to_string()));
     // It is not a structural/individual-parameter eta.
     assert!(!model.eta_param_info.iter().any(|e| e.eta_name == "ETA_RUV"));
+}
+
+/// The residual-error eta must be dedicated (#409). Read beside a structural
+/// eta inside one `exp` (`CL = TVCL * exp(ETA_CL + ETA_RUV)`), it used to have
+/// no `eta_param_info` entry, so the dual-use check could not see it and the
+/// fit ran with `ETA_RUV` doing two jobs. Every eta a statement reads now has
+/// an entry (#1656), so the fit is refused. The control, the dedicated model
+/// above, must not be refused for this reason.
+#[test]
+fn iiv_on_ruv_rejects_an_eta_shared_inside_one_exp() {
+    let src = iiv_on_ruv_src().replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL + ETA_RUV)",
+    );
+    assert_ne!(src, iiv_on_ruv_src(), "fixture must actually share the eta");
+    let shared = parse_model_string(&src).expect("parses");
+    assert!(
+        shared
+            .eta_param_info
+            .iter()
+            .any(|e| e.eta_name == "ETA_RUV" && e.individual_param_name == "CL"),
+        "ETA_RUV must be recorded on CL"
+    );
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+    let opts = FitOptions::default();
+    let err = fit(&shared, &population, &shared.default_params, &opts)
+        .expect_err("a shared iiv_on_ruv eta must be refused");
+    assert!(
+        err.contains("iiv_on_ruv = ETA_RUV")
+            && err.contains("also used in [individual_parameters]"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

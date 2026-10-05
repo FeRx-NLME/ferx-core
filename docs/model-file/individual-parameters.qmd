@@ -471,6 +471,35 @@ theta stay separate. See the SAEM page for the
 [M-step](../estimation/saem.qmd#saem-mstep-covariate-mu-ref) and its validation
 against NONMEM.
 
+## How an ETA row is labelled
+
+The patterns above decide MU-referencing. How an ETA's variance is
+**reported** — `CV%`, `SD`, or neither (see [the fit output](../output.qmd)) —
+is a separate, wider rule (#1656): walking up from the ETA through `+` and
+`-`, the first other operation decides. `exp(...)` is log-normal, `inv_logit`
+is logit, any other operation (`*`, `/`, `^`, another function) is custom, and
+reaching the top of the assignment means additive. So an ETA stays additive
+however many terms sit beside it:
+
+| Expression | ETA reported as |
+|---|---|
+| `TVV + ETA_V` | additive, `SD` |
+| `TVE0 + B_FLARE * FLARE + ETA_E0` | additive, `SD` |
+| `TVE0 + PLACEBO[STUDY] + ETA_E0 + KAPPA_ARM` | additive, `SD` |
+| `inv_logit(TH + TH_WT * WT + ETA)` | logit, `SD = …, logit scale` |
+| `TVCL * exp(ETA_CL + ETA_X)` | log-normal, `CV%`, for both |
+| `TVV + ETA_V * WT` | custom, no CV% or SD |
+
+An ETA that reaches the top of an intermediate variable is followed to where
+that variable is used, exactly as a kappa is (see
+[How a kappa row is labelled](iov.qmd#how-a-kappa-row-is-labelled)): with
+`ECL = ETA_CL` and `CL = TVCL * exp(ECL)`, `ETA_CL` is log-normal. The walk
+stops at a variable a block reads as a parameter — `[structural_model]`,
+`[odes]`, a `[scaling]` readout, `[initial_conditions]` or an endpoint block —
+and continues past one that only `[derived]` reports. So `V = TVV + ETA_V` is
+additive when the model reads `V`, but custom when only `K10 = CL / V` does.
+The row is still listed under the variable the ETA is assigned in (`ECL`).
+
 ## Covariate Detection
 
 Any uppercase identifier in the expression that does not match a theta name,

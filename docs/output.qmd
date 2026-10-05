@@ -269,9 +269,11 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   additive (`TVV + ETA`) or logit (`inv_logit(THETA + ETA)`) effect gets `sd` =
   sqrt(variance) instead, since a CV% of an effect that does not multiply its
   parameter means nothing. An effect in any other expression gets neither key.
-  An ETA's scale is its `eta_param_info` classification; a kappa's is read from
-  where it sits in its expression (see
-  [How a kappa row is labelled](model-file/iov.qmd#how-a-kappa-row-is-labelled)).
+  An ETA's and a kappa's scale are both read from where it sits in its
+  expression, so `TVE0 + PLACEBO + ETA_E0` is additive (#1656); an ETA's is
+  stored in `eta_param_info` (see
+  [How an ETA row is labelled](model-file/individual-parameters.qmd#how-an-eta-row-is-labelled)
+  and [How a kappa row is labelled](model-file/iov.qmd#how-a-kappa-row-is-labelled)).
   The console prints the same thing as `(CV% = …)`, `(SD = …)` or
   `(SD = …, logit scale)`; for a sample-size-weighted kappa the SD reads
   `(SD = … at weight 1)` (or `(SD = … at weight 1, logit scale)`), the SD of a
