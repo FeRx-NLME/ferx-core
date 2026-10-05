@@ -127,6 +127,15 @@ section of the SDLC for the versioning policy).
   the docs said "more than 20", which was off by one.
 
 ### Fixed
+- **A sample-size-weighted log-normal kappa's CV% is labelled `at weight 1`**
+  ([#1666](https://github.com/FeRx-NLME/ferx-core/issues/1666)). The console and `ferx summary`
+  row now reads `(CV% = … at weight 1)`, as the SD rows of additive and logit kappas already
+  did; the fit YAML's `cv_pct` is unchanged and documented as the weight-1 figure. Unweighted
+  rows are unchanged.
+- **`ferx summary` reports block-kappa correlations and kappa shrinkage**
+  ([#1667](https://github.com/FeRx-NLME/ferx-core/issues/1667)). The KAPPA (IOV) section gains
+  `corr(K_i, K_j) = …` lines for a `block_kappa`, and Diagnostics gains a `Kappa shrinkage:`
+  line (plus one per occasion slot), matching what the fit prints.
 - **An additive ETA with more than one other term keeps its SD row** (#1656, #1662). An ETA was
   additive only as exactly `THETA + ETA`, so `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, or
   `E0 = TVE0 + B_FLARE * FLARE + ETA_E0`, classified as custom and printed neither `SD` nor
