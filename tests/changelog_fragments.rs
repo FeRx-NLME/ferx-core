@@ -702,6 +702,12 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
             "- A (#10).\n  same.\n  same.\n",
             "- A (#10).\n  same.\n",
         ),
+        (
+            // An interior blank line around a table is Markdown, not padding.
+            "blank-dropped",
+            "- A (#10).\n  one.\n\n  | a | b |\n  |---|---|\n",
+            "- A (#10).\n  one.\n  | a | b |\n  |---|---|\n",
+        ),
     ] {
         let (d, _) = git_repo(&format!("drop-{slot}"));
         commit_file(&d, "changelog.d/10.fixed.md", frag);
@@ -742,8 +748,15 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     );
 
     // The release twin: the same deletion, with the entry now in CHANGELOG.md.
+    // A table fragment rides along: its interior blank lines must pass both checks
+    // when `assemble` wrote it.
     let (d, _) = git_repo("drop-assembled");
     commit_file(&d, "changelog.d/10.fixed.md", body);
+    commit_file(
+        &d,
+        "changelog.d/11.added.md",
+        "- Table (#11).\n\n  | a | b |\n  |---|---|\n\n  After.\n",
+    );
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     let o = run(&d, &["assemble", "0.2.0", "--date", "2026-10-05"]);
     assert!(o.status.success(), "{}", stderr(&o));

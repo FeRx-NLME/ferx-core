@@ -429,19 +429,30 @@ is_user_facing() {
 # anywhere in the file (a dropped continuation, or text that already existed,
 # would pass) and not set membership (reordered or deduplicated lines would).
 #
-# Blank lines are dropped from both sides first: git may align a blank line
-# inside the inserted section with a pre-existing one as context, which splits
-# the `+` run there without the text having changed.
+# Two checks, because each alone has a blind spot:
+#  - the `+` run: blank lines are dropped from both sides, since git may align
+#    a blank line inside the inserted section with a pre-existing one as
+#    context, splitting the run without the text having changed. That proves
+#    the lines were ADDED, in order, but is blind to a lost interior blank line
+#    (the one around a table, say);
+#  - the exact body, interior blank lines and all (trailing ones trimmed, as
+#    `assemble` renders it), must appear in the resulting CHANGELOG.md.
 fragment_assembled() {
   local body needle haystack
-  body="$(git -C "$root" show "$1:$2")" || return 1
+  body="$(git -C "$root" show "$1:$2" | awk '{ l[NR] = $0 } NF { last = NR }
+    END { for (i = 1; i <= last; i++) print l[i] }')" || return 1
+  [ -n "$body" ] || return 1
   needle="$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' || true)"
   haystack="$(printf '%s\n' "$3" | grep -v '^[[:space:]]*$' || true)"
-  [ -n "$needle" ] || return 1
   # Newline-delimited on both ends, so a match is whole lines; quoted, so the
   # needle is literal text, not a glob.
   case $'\n'"$haystack"$'\n' in
-    *$'\n'"$needle"$'\n'*) return 0 ;;
+    *$'\n'"$needle"$'\n'*) ;;
+    *) return 1 ;;
+  esac
+  haystack="$(cat "$changelog")"
+  case $'\n'"$haystack"$'\n' in
+    *$'\n'"$body"$'\n'*) return 0 ;;
   esac
   return 1
 }
