@@ -147,6 +147,13 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             "no issue/PR reference",
         ),
         (
+            // CRLF passes every other rule and would assemble CR bytes.
+            "crlf",
+            ("12.fixed.md", "- One (#12).\r\n  More.\r\n"),
+            ("12.fixed.md", "- One (#12).\n  More.\n"),
+            "CR line endings",
+        ),
+        (
             "heading",
             ("12.fixed.md", "- One (#12).\n### Fixed\n"),
             ("12.fixed.md", "- One (#12).\n"),
@@ -390,6 +397,14 @@ fn assemble_refuses_invalid_fragments_and_versions() {
             "{bad}: {}",
             stderr(&o)
         );
+        assert!(t.join("changelog.d").join("1.fixed.md").exists());
+    }
+    // grep matches per line: a line break must not let a valid line vouch for junk.
+    for (version, date) in [("junk\n1.2.3", "2026-10-05"), ("1.2.3", "x\n2026-10-05")] {
+        let t = tree("assemble-multiline", &[("1.fixed.md", "- x (#1).\n")]);
+        let o = run(&t, &["assemble", version, "--date", date]);
+        assert!(!o.status.success(), "{version:?} / {date:?} accepted");
+        assert!(stderr(&o).contains("single-line"), "{}", stderr(&o));
         assert!(t.join("changelog.d").join("1.fixed.md").exists());
     }
     for good in [
@@ -669,6 +684,58 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
         "text already in the changelog counted as assembled"
     );
 
+    // Nor are the right lines in the wrong order, or a repeated line added once:
+    // the fragment must appear as one contiguous run.
+    for (slot, frag, added) in [
+        (
+            "reordered",
+            "- A (#10).\n  one.\n  two.\n",
+            "- A (#10).\n  two.\n  one.\n",
+        ),
+        (
+            "deduplicated",
+            "- A (#10).\n  same.\n  same.\n",
+            "- A (#10).\n  same.\n",
+        ),
+    ] {
+        let (d, _) = git_repo(&format!("drop-{slot}"));
+        commit_file(&d, "changelog.d/10.fixed.md", frag);
+        let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+        git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+        let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
+        commit_file(
+            &d,
+            "CHANGELOG.md",
+            &cl.replace("- Old fix (#1).\n", &format!("- Old fix (#1).\n{added}")),
+        );
+        let o = run(&d, &["require", &base, "--pr", "12"]);
+        assert!(!o.status.success(), "{slot} copy counted as assembled");
+    }
+
+    // A rename is refused even when the old body was assembled, so the deletion
+    // half is satisfied and only the rename rule can fail it: the renamed file
+    // would be released a second time.
+    let (d, _) = git_repo("rename-assembled");
+    commit_file(&d, "changelog.d/10.fixed.md", body);
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        &d,
+        &["mv", "changelog.d/10.fixed.md", "changelog.d/11.fixed.md"],
+    );
+    let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
+    commit_file(
+        &d,
+        "CHANGELOG.md",
+        &cl.replace("- Old fix (#1).\n", &format!("- Old fix (#1).\n{body}")),
+    );
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(!o.status.success(), "a rename passed");
+    assert!(
+        stderr(&o).contains("renames pending changelog fragment"),
+        "{}",
+        stderr(&o)
+    );
+
     // The release twin: the same deletion, with the entry now in CHANGELOG.md.
     let (d, _) = git_repo("drop-assembled");
     commit_file(&d, "changelog.d/10.fixed.md", body);
@@ -754,6 +821,12 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
             "changelog.yml lost `{want}` — see #1545"
         );
     }
+    // The default checkout is the PR's merge commit. A `ref:` override (e.g. to
+    // `base.sha`) makes HEAD the base, the diff empty, and the gate inert.
+    assert!(
+        !lines.iter().any(|l| l.starts_with("ref:")),
+        "changelog.yml overrides the checkout ref"
+    );
     // No step may mask the gate.
     assert!(
         !lines.iter().any(
@@ -771,12 +844,25 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
 #[test]
 fn no_loop_in_the_script_reads_a_here_document() {
     let src = std::fs::read_to_string(script()).unwrap();
-    let hits: Vec<&str> = src
+    // Comments dropped, then every space, tab, newline and line-continuation
+    // backslash, so `done  <<EOF` and `done \` + `<<EOF` on the next line are caught
+    // too. `usage`'s `cat <<EOF` is not a loop and squeezes to `cat<<EOF`.
+    let squeezed: String = src
         .lines()
-        .filter(|l| l.trim_start().starts_with("done <<"))
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace() && *c != '\\')
         .collect();
     assert!(
-        hits.is_empty(),
-        "here-document loop(s) in tools/changelog.sh: {hits:?}"
+        !squeezed.contains("done<<"),
+        "a loop in tools/changelog.sh reads a here-document"
     );
+    // The scan itself must see the shapes it claims to.
+    for shape in ["done  <<EOF\n", "done \\\n  <<EOF\n", "done <<<\"$x\"\n"] {
+        let s: String = shape
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\\')
+            .collect();
+        assert!(s.contains("done<<"), "{shape:?} escapes the scan");
+    }
 }

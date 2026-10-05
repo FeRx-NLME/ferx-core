@@ -288,6 +288,11 @@ cmd_assemble() {
   done
   [ -n "$version" ] || die "assemble: usage: tools/changelog.sh assemble <version> [--date YYYY-MM-DD]"
   version="${version#v}"
+  # grep matches per LINE, so `$'junk\n1.2.3'` would pass the regexes below and
+  # write a split heading. Refuse any line break first.
+  case "$version$date" in
+    *$'\n'* | *$'\r'*) die "assemble: the version and date must be single-line" ;;
+  esac
   # SemVer core plus an optional pre-release, no leading zeros — in a numeric
   # pre-release identifier too (`rc.01`), per SemVer §9. Build metadata (`+...`)
   # is deliberately not accepted: it is not part of a release tag here.
@@ -408,23 +413,27 @@ is_user_facing() {
   return 1
 }
 
-# 0 if every non-blank line of fragment $2, as of commit $1, is among the lines
-# this PR ADDED to CHANGELOG.md ($3) — i.e. `assemble` wrote it, continuation
-# and all. A first-line match anywhere in the file would pass a fragment whose
-# continuation was dropped, or one whose text merely already existed.
+# 0 if fragment $2, as of commit $1, appears as ONE contiguous run — same lines,
+# same order, same multiplicity — among the lines this PR ADDED to CHANGELOG.md
+# ($3): i.e. `assemble` wrote it, continuation and all. Not a first-line match
+# anywhere in the file (a dropped continuation, or text that already existed,
+# would pass) and not set membership (reordered or deduplicated lines would).
+#
+# Blank lines are dropped from both sides first: git may align a blank line
+# inside the inserted section with a pre-existing one as context, which splits
+# the `+` run there without the text having changed.
 fragment_assembled() {
-  local body line IFS=$'\n'
+  local body needle haystack
   body="$(git -C "$root" show "$1:$2")" || return 1
-  set -f
-  for line in $body; do
-    # `>/dev/null`, not `-q`: grep -q exits at the first match, and under
-    # pipefail the SIGPIPE that gives printf would read as "not found".
-    if ! printf '%s\n' "$3" | grep -Fx -- "$line" >/dev/null; then
-      set +f
-      return 1
-    fi
-  done
-  set +f
+  needle="$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' || true)"
+  haystack="$(printf '%s\n' "$3" | grep -v '^[[:space:]]*$' || true)"
+  [ -n "$needle" ] || return 1
+  # Newline-delimited on both ends, so a match is whole lines; quoted, so the
+  # needle is literal text, not a glob.
+  case $'\n'"$haystack"$'\n' in
+    *$'\n'"$needle"$'\n'*) return 0 ;;
+  esac
+  return 1
 }
 
 cmd_require() {
@@ -456,9 +465,23 @@ cmd_require() {
   # release. The one legitimate deletion is `assemble`'s, so a deleted fragment
   # passes only if this PR added all of it to CHANGELOG.md. Checked before the
   # opt-out: the label waives this PR's own entry, not anyone else's.
-  local mb deleted lost="" added_lines
+  local mb deleted lost="" added_lines renamed
   mb="$(git -C "$root" merge-base "$base" HEAD)" ||
     die "require: no merge base between $base and HEAD (CI needs fetch-depth: 0)"
+
+  # A rename is never a release step: `assemble` deletes, it does not move. And
+  # copying the old body into CHANGELOG.md must not excuse one — the renamed
+  # file would be released a second time.
+  renamed="$(git -C "$root" diff -M --name-status --diff-filter=R "$mb" HEAD -- changelog.d/ || true)"
+  if [ -n "$renamed" ]; then
+    {
+      echo "changelog: this PR renames pending changelog fragment(s):"
+      printf '%s\n' "$renamed" | sed 's/^/  /'
+      echo
+      echo "Leave other PRs' fragments where they are (editing one to reword it is fine)."
+    } >&2
+    exit 1
+  fi
   deleted="$(git -C "$root" diff --no-renames --name-only --diff-filter=D "$mb" HEAD -- changelog.d/ |
     grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
   if [ -n "$deleted" ]; then
