@@ -110,6 +110,27 @@ fragment_names() {
   done | LC_ALL=C sort -t. -k1,1n -k1,1
 }
 
+# The fragment manifest, read ONCE per run into FRAGMENTS. Every consumer —
+# check, render, verify, delete — walks this same list, so a file appearing
+# mid-assemble is neither rendered nor deleted.
+#
+# Split on newlines with globbing off, not a `while read ... <<EOF $(...)` loop:
+# a here-document needs a temp file, and when bash cannot create one the loop
+# silently runs zero times — `check` then reports every fragment OK having read
+# none, and exits 0.
+FRAGMENTS=()
+load_fragments() {
+  local names
+  names="$(fragment_names)" || die "could not list changelog.d/"
+  FRAGMENTS=()
+  [ -n "$names" ] || return 0
+  local IFS=$'\n'
+  set -f
+  # shellcheck disable=SC2206 # word-splitting on newlines is the point
+  FRAGMENTS=($names)
+  set +f
+}
+
 # Fragment body with trailing blank lines removed and a final newline ensured.
 fragment_body() {
   awk '{ lines[NR] = $0 } NF { last = NR }
@@ -139,8 +160,8 @@ cmd_check() {
     errors=$((errors + 1))
   fi
 
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
+  load_fragments
+  for name in ${FRAGMENTS[@]+"${FRAGMENTS[@]}"}; do
     local path="$frag_dir/$name"
     if [ -d "$path" ]; then
       echo "changelog.d/$name: a directory; fragments are files directly under changelog.d/" >&2
@@ -190,9 +211,12 @@ cmd_check() {
       errors=$((errors + 1))
       continue
     fi
-  done <<EOF
-$(fragment_names)
-EOF
+    if ! printf '%s' "$body" | grep -Eq '#[0-9]+'; then
+      echo "changelog.d/$name: no issue/PR reference — cite it as (#NN)" >&2
+      errors=$((errors + 1))
+      continue
+    fi
+  done
 
   local stray
   stray="$(unreleased_content)"
@@ -210,28 +234,29 @@ EOF
     echo "changelog: $errors problem(s) found" >&2
     exit 1
   fi
-  echo "changelog: $(fragment_names | grep -c . || true) fragment(s) OK"
+  echo "changelog: ${#FRAGMENTS[@]} fragment(s) OK"
 }
 
 # The `### Category` blocks for every fragment, in category order.
 render_sections() {
-  local cat names name first=1
+  local cat name first=1 matched
   for cat in "${CATEGORIES[@]}"; do
-    names="$(fragment_names | grep -E "\.${cat}\.md$" || true)"
-    [ -n "$names" ] || continue
+    matched=()
+    for name in ${FRAGMENTS[@]+"${FRAGMENTS[@]}"}; do
+      case "$name" in *."$cat".md) matched+=("$name") ;; esac
+    done
+    [ ${#matched[@]} -gt 0 ] || continue
     [ "$first" -eq 1 ] || echo
     first=0
     echo "### $(heading_of "$cat")"
-    while IFS= read -r name; do
+    for name in "${matched[@]}"; do
       fragment_body "$frag_dir/$name"
-    done <<EOF
-$names
-EOF
+    done
   done
 }
 
 cmd_preview() {
-  cmd_check >/dev/null
+  cmd_check >/dev/null # also loads FRAGMENTS
   echo "## [Unreleased]"
   echo
   render_sections
@@ -256,9 +281,10 @@ cmd_assemble() {
   done
   [ -n "$version" ] || die "assemble: usage: tools/changelog.sh assemble <version> [--date YYYY-MM-DD]"
   version="${version#v}"
-  # SemVer core plus an optional pre-release, no leading zeros. Build metadata
-  # (`+...`) is deliberately not accepted: it is not part of a release tag here.
-  local num='(0|[1-9][0-9]*)' ident='[0-9A-Za-z-]+'
+  # SemVer core plus an optional pre-release, no leading zeros — in a numeric
+  # pre-release identifier too (`rc.01`), per SemVer §9. Build metadata (`+...`)
+  # is deliberately not accepted: it is not part of a release tag here.
+  local num='(0|[1-9][0-9]*)' ident='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
   printf '%s' "$version" |
     grep -Eq "^$num\\.$num\\.$num(-$ident(\\.$ident)*)?\$" ||
     die "assemble: '$version' is not a release version (X.Y.Z or X.Y.Z-pre, no leading zeros)"
@@ -266,8 +292,8 @@ cmd_assemble() {
   printf '%s' "$date" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ||
     die "assemble: --date '$date' is not YYYY-MM-DD"
 
-  cmd_check >/dev/null
-  [ -n "$(fragment_names)" ] || die "assemble: no fragments in changelog.d/ — nothing to release"
+  cmd_check >/dev/null # also loads FRAGMENTS: the one manifest used below
+  [ ${#FRAGMENTS[@]} -gt 0 ] || die "assemble: no fragments in changelog.d/ — nothing to release"
   if grep -Fq "## [$version]" "$changelog"; then
     die "assemble: CHANGELOG.md already has a ## [$version] section"
   fi
@@ -323,23 +349,17 @@ cmd_assemble() {
   grep -Fqx "## [$version] - $date" "$tmp" ||
     die "assemble: internal error: the new section was not written; nothing changed"
   local name
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    grep -Fqx -- "$(head -n 1 "$frag_dir/$name")" "$tmp" ||
+  for name in ${FRAGMENTS[@]+"${FRAGMENTS[@]}"}; do
+    grep -Fqx -- "$(sed -n 1p "$frag_dir/$name")" "$tmp" ||
       die "assemble: internal error: changelog.d/$name was not written; nothing changed"
-  done <<EOF
-$(fragment_names)
-EOF
+  done
   mv "$tmp" "$changelog"
 
   local n=0
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
+  for name in ${FRAGMENTS[@]+"${FRAGMENTS[@]}"}; do
     rm -f "$frag_dir/$name"
     n=$((n + 1))
-  done <<EOF
-$(fragment_names)
-EOF
+  done
   echo "changelog: assembled $n fragment(s) into ## [$version] - $date and removed them."
   echo "Review CHANGELOG.md — add any release-level prose (e.g. upgrade notes) under the"
   echo "new heading by hand — then commit it together with the deleted fragments."
@@ -352,6 +372,20 @@ is_test_path() {
     *_tests.rs | */tests/* | */benches/*) return 0 ;;
   esac
   return 1
+}
+
+# Each newline-separated path of $1 that is user-facing, indented. Same
+# newline split as `load_fragments`, for the same here-document reason; a
+# function of its own so the IFS change cannot leak into the caller.
+user_facing_of() {
+  local IFS=$'\n' f
+  set -f
+  for f in $1; do
+    if is_user_facing "$f"; then
+      printf '  %s\n' "$f"
+    fi
+  done
+  set +f
 }
 
 is_user_facing() {
@@ -387,6 +421,41 @@ cmd_require() {
   done
   [ -n "$base" ] || die "require: usage: tools/changelog.sh require <base-ref> [--pr N] [--opt-out true|false]"
 
+  # Pending fragments are other PRs' entries: deleting one — or renaming it
+  # away, which `--no-renames` reports as a deletion — drops it from the next
+  # release. The one legitimate deletion is `assemble`'s, so a deleted fragment
+  # passes only if its first line is now in CHANGELOG.md. Checked before the
+  # opt-out: the label waives this PR's own entry, not anyone else's.
+  local mb deleted lost="" first
+  mb="$(git -C "$root" merge-base "$base" HEAD)" ||
+    die "require: no merge base between $base and HEAD (CI needs fetch-depth: 0)"
+  deleted="$(git -C "$root" diff --no-renames --name-only --diff-filter=D "$mb" HEAD -- changelog.d/ |
+    grep -Ev '^changelog\.d/(README\.md|\.gitkeep)$' || true)"
+  if [ -n "$deleted" ]; then
+    local IFS_SAVE="$IFS" f
+    IFS=$'\n'
+    set -f
+    for f in $deleted; do
+      first="$(git -C "$root" show "$mb:$f" | sed -n 1p)"
+      if ! grep -Fqx -- "$first" "$changelog"; then
+        lost="$lost  $f"$'\n'
+      fi
+    done
+    set +f
+    IFS="$IFS_SAVE"
+  fi
+  if [ -n "$lost" ]; then
+    {
+      echo "changelog: this PR deletes pending changelog fragment(s) that are not in"
+      echo "CHANGELOG.md, so their entries would be missing from the next release:"
+      printf '%s' "$lost"
+      echo
+      echo "Restore them (edit one to reword it). Only 'tools/changelog.sh assemble'"
+      echo "removes fragments, at release time."
+    } >&2
+    exit 1
+  fi
+
   # A boolean the workflow computes with `contains(labels.*.name, ...)`, not a
   # joined label list: joining loses the boundaries, so a single label named
   # `x,no-changelog` would read as the opt-out.
@@ -405,15 +474,7 @@ cmd_require() {
   changed="$(git -C "$root" diff --no-renames --name-only "$base"...HEAD)" ||
     die "require: git diff $base...HEAD failed (is the base fetched? CI needs fetch-depth: 0)"
 
-  local f
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    if is_user_facing "$f"; then
-      facing="$facing  $f"$'\n'
-    fi
-  done <<EOF
-$changed
-EOF
+  facing="$(user_facing_of "$changed")"
 
   # Only an ADDED fragment counts: rewording one of the pending fragments from
   # another PR does not describe this one. The opposite rename setting from the
@@ -445,7 +506,7 @@ EOF
     echo "'$OPT_OUT_LABEL' label to the PR instead."
     echo
     echo "User-facing paths changed:"
-    printf '%s' "$facing"
+    printf '%s\n' "$facing"
   } >&2
   exit 1
 }

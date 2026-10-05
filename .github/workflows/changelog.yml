@@ -6,12 +6,14 @@ name: Changelog fragment
 # `unlabeled` on `ci.yml` would re-run the whole test matrix on every label.
 #
 # The fragment's *shape* is checked separately, by `tools/preflight.sh changelog`
-# in `ci.yml`'s `Changelog` job; this one only asks whether there is one.
+# in `ci.yml`'s `Changelog` job; this one asks whether the PR adds one, and that
+# it deletes no other PR's pending fragment. `edited` covers a PR retargeted onto
+# `main` from another base, which fires no other event.
 
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
   contents: read

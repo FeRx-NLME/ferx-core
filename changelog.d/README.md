@@ -12,9 +12,12 @@ merge back-to-back without a rebase round-trip.
   `security`, `performance`.
 
 **Body:** exactly one Markdown bullet, as it should read in `CHANGELOG.md` —
-user-facing language, with the `#NN` reference. The first line starts with `- `;
-every further line is blank or indented (a continuation of that bullet, tables
-included).
+user-facing language, with the `#NN` reference (required). The first line starts
+with `- `; every further line is blank or indented by at least two spaces (a
+continuation of that bullet, tables included).
+
+Never delete or rename another PR's fragment — CI refuses it, since the entry
+would vanish from the release. Rewording one is fine.
 
 ```markdown
 - **`simulate()` now honours `block_sigma`** (#672): paired rows are drawn from

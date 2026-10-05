@@ -125,6 +125,15 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             "must be a single bullet",
         ),
         (
+            "no-reference",
+            ("12.fixed.md", "- Fixed the crash.\n"),
+            (
+                "12.fixed.md",
+                "- Fixed the crash ([#12](https://example.org/issues/12)).\n",
+            ),
+            "no issue/PR reference",
+        ),
+        (
             "heading",
             ("12.fixed.md", "- One (#12).\n### Fixed\n"),
             ("12.fixed.md", "- One (#12).\n"),
@@ -224,6 +233,10 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
             ("3-2.fixed.md", "- Another for #3.\n"),
             ("7.performance.md", "- Faster (#7).\n"),
             ("9.added.md", "- New thing (#9).\n"),
+            ("40.security.md", "- Patched (#40).\n"),
+            ("41.removed.md", "- Gone (#41).\n"),
+            ("42.deprecated.md", "- Old (#42).\n"),
+            ("43.changed.md", "- Different (#43).\n"),
         ],
     );
     // A mode no default produces: the rewrite must keep it (a `mktemp` file is 0600).
@@ -249,12 +262,16 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
     }
 
     let got = std::fs::read_to_string(t.join("CHANGELOG.md")).unwrap();
-    // Categories in Keep a Changelog order (Added before Fixed before Performance,
-    // regardless of file order); within one, by number — 3 < 3-2 < 20, numerically.
+    // Every category, in Keep a Changelog order (+ Performance) regardless of file
+    // order; within one, by number — 3 < 3-2 < 20, numerically.
     let want = "# Changelog\n\nIntro.\n\n## [Unreleased]\n\n\
 ## [0.2.0] - 2026-10-05\n\n\
 ### Added\n- New thing (#9).\n\n\
+### Changed\n- Different (#43).\n\n\
+### Deprecated\n- Old (#42).\n\n\
+### Removed\n- Gone (#41).\n\n\
 ### Fixed\n- First fix (#3).\n  Continued.\n- Another for #3.\n- Second fix (#20).\n\n\
+### Security\n- Patched (#40).\n\n\
 ### Performance\n- Faster (#7).\n\n\
 ## [0.1.0] - 2026-01-01\n\n### Fixed\n- Old fix (#1).\n\n\
 [Unreleased]: https://example.org/r/compare/v0.2.0...HEAD\n\
@@ -305,6 +322,8 @@ fn assemble_refuses_invalid_fragments_and_versions() {
         "1.2.3-alpha..1",
         "1.2.3-",
         "1.2.3+build.1",
+        "1.2.3-01",
+        "1.2.3-rc.01",
     ] {
         let t = tree("assemble-version", &[("1.fixed.md", "- x (#1).\n")]);
         let o = run(&t, &["assemble", bad]);
@@ -316,7 +335,14 @@ fn assemble_refuses_invalid_fragments_and_versions() {
         );
         assert!(t.join("changelog.d").join("1.fixed.md").exists());
     }
-    for good in ["0.10.0", "v1.2.3", "1.2.3-rc.1", "1.2.3-alpha-2"] {
+    for good in [
+        "0.10.0",
+        "v1.2.3",
+        "1.2.3-rc.1",
+        "1.2.3-alpha-2",
+        "1.2.3-0",
+        "1.2.3-0a",
+    ] {
         let t = tree("assemble-version-ok", &[("1.fixed.md", "- x (#1).\n")]);
         let o = run(&t, &["assemble", good, "--date", "2026-10-05"]);
         assert!(o.status.success(), "{good} refused: {}", stderr(&o));
@@ -492,10 +518,63 @@ fn require_skips_changes_that_are_not_user_facing() {
             stderr(&o)
         );
     }
-    // The twin: a member's source IS user-facing.
-    let (d, base) = git_repo("member-src");
-    commit_file(&d, "crates/ferx-tools/src/lib.rs", "x\n");
-    assert!(!run(&d, &["require", &base, "--pr", "5"]).status.success());
+    // The twins: production source under EVERY configured prefix is user-facing.
+    for (slot, rel) in [
+        ("core-src", "src/stats/npde.rs"),
+        ("cli-src", "crates/ferx-cli/src/main.rs"),
+        ("tools-src", "crates/ferx-tools/src/lib.rs"),
+    ] {
+        let (d, base) = git_repo(&format!("facing-{slot}"));
+        commit_file(&d, rel, "x\n");
+        let o = run(&d, &["require", &base, "--pr", "5"]);
+        assert!(!o.status.success(), "{rel} passed without a fragment");
+        assert!(stderr(&o).contains(rel), "{rel}: {}", stderr(&o));
+    }
+}
+
+/// Deleting another PR's pending fragment drops it from the next release, so it fails
+/// even alongside this PR's own fragment and even under the opt-out — unless the entry
+/// was assembled into CHANGELOG.md, which is what a release PR does.
+#[test]
+fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
+    let (d, _) = git_repo("drop-pending");
+    commit_file(
+        &d,
+        "changelog.d/10.fixed.md",
+        "- Someone else's fix (#10).\n",
+    );
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+    commit_file(&d, "changelog.d/11.fixed.md", "- Mine (#11).\n");
+    commit_file(&d, "src/lib.rs", "// v2\n");
+    for opt_out in ["false", "true"] {
+        let o = run(&d, &["require", &base, "--pr", "11", "--opt-out", opt_out]);
+        assert!(!o.status.success(), "opt-out {opt_out}: dropped #10 passed");
+        assert!(
+            stderr(&o).contains("changelog.d/10.fixed.md"),
+            "{}",
+            stderr(&o)
+        );
+    }
+
+    // The release twin: the same deletion, with the entry now in CHANGELOG.md.
+    let (d, _) = git_repo("drop-assembled");
+    commit_file(
+        &d,
+        "changelog.d/10.fixed.md",
+        "- Someone else's fix (#10).\n",
+    );
+    let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
+    let o = run(&d, &["assemble", "0.2.0", "--date", "2026-10-05"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "release"]);
+    let o = run(&d, &["require", &base, "--pr", "12"]);
+    assert!(
+        o.status.success(),
+        "a release PR was refused: {}",
+        stderr(&o)
+    );
 }
 
 /// `preflight.sh changelog` must propagate the script's failure, not just print it.
@@ -546,8 +625,16 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
         .collect();
+    // Context-bearing, indentation and all: `pull_request_target:` (base-branch code,
+    // an empty diff) or another target branch must not keep these lines green.
     for want in [
-        "types: [opened, synchronize, reopened, labeled, unlabeled]",
+        "\non:\n  pull_request:\n    branches: [main]\n    \
+         types: [opened, synchronize, reopened, edited, labeled, unlabeled]\n",
+        "\npermissions:\n  contents: read\n",
+    ] {
+        assert!(yml.contains(want), "changelog.yml lost:\n{want}");
+    }
+    for want in [
         "fetch-depth: 0",
         "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
         "PR: ${{ github.event.pull_request.number }}",
@@ -566,5 +653,22 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
                 || l.trim_start_matches("- ").starts_with("if:")
         ),
         "changelog.yml can skip itself or pass while red"
+    );
+}
+
+/// No loop in the script may read a here-document. Bash writes one to a temp file, and
+/// when it cannot, the loop runs zero times and `set -e` does not notice: `check`
+/// reported every fragment OK having read none. Lists are split in-process instead
+/// (`load_fragments`, `user_facing_of`).
+#[test]
+fn no_loop_in_the_script_reads_a_here_document() {
+    let src = std::fs::read_to_string(script()).unwrap();
+    let hits: Vec<&str> = src
+        .lines()
+        .filter(|l| l.trim_start().starts_with("done <<"))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "here-document loop(s) in tools/changelog.sh: {hits:?}"
     );
 }

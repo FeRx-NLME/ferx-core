@@ -582,7 +582,9 @@ shape and fails if anything is written under `## [Unreleased]`; and the
 `Changelog fragment` workflow fails a PR that changes `src/`,
 `crates/ferx-cli/` or `crates/ferx-tools/` (test files excluded) without adding
 a fragment. A PR that only touches internal refactors, tests, or CI needs no
-fragment — apply the **`no-changelog`** label.
+fragment — apply the **`no-changelog`** label. The same workflow fails a PR that
+deletes (or renames away) another PR's pending fragment, label or not; rewording
+one is fine. Only `assemble` removes fragments.
 
 At release time (not per-PR), `tools/changelog.sh assemble <version>` renders
 the fragments under a new `## [<version>] - <date>` heading in category order,
