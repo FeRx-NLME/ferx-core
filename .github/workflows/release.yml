@@ -19,6 +19,13 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.tag || github.ref }}
+      # The tagged tree must carry this version's CHANGELOG section and no pending
+      # `changelog.d/` fragment (#1545): a fragment merged after the release PR was
+      # assembled would otherwise ship without its entry.
+      - name: Changelog is assembled for this tag
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: tools/changelog.sh released "$TAG"
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}

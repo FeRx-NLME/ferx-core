@@ -3095,11 +3095,12 @@ mod absorption {
         Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
     }
 
-    /// The Jacobian pieces at the initial θ and η = κ = 0, by central FD of
-    /// the f64 predictor: the block's per-level columns (bound under `none`),
-    /// the other θ columns, the per-subject η columns, the per-unit columns of
-    /// each random effect (a subject for an η, an occasion group of a subject
-    /// for a kappa), and the level labels.
+    /// The Jacobian pieces at the initial θ and η = κ = 0 ([`jacobian_at`] for
+    /// another point), by central FD of the f64 predictor: the block's
+    /// per-level columns (bound under `none`), the other θ columns, the
+    /// per-subject η columns, the per-unit columns of each random effect (a
+    /// subject for an η, an occasion group of a subject for a kappa), and the
+    /// level labels.
     ///
     /// The layout is the `none` layout of the levels the data shows
     /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],
@@ -3135,13 +3136,42 @@ mod absorption {
     }
 
     pub(super) fn jacobian(text: &str, pop0: &Population) -> Jac {
+        jacobian_at(text, pop0, Point::ZERO)
+    }
+
+    /// Where [`jacobian_at`] evaluates the random effects: η_{s,e} =
+    /// `scale`·`EV[(s + 2e) % 6]` and, when `per_occasion`, κ_{s,g,q} =
+    /// `scale`·`CV[(3s + g + q) % 5]`, which differs between the occasion
+    /// groups `g` of a subject; otherwise κ_{s,g,q} = `scale`·`CV[(3s + q) % 5]`,
+    /// one nonzero value on every occasion of the subject.
+    #[derive(Clone, Copy)]
+    pub(super) struct Point {
+        scale: f64,
+        per_occasion: bool,
+    }
+
+    impl Point {
+        pub(super) const ZERO: Point = Point {
+            scale: 0.0,
+            per_occasion: false,
+        };
+    }
+
+    /// [`jacobian`] at the random effects of `at`, the θ still at its initial value.
+    pub(super) fn jacobian_at(text: &str, pop0: &Population, at: Point) -> Jac {
+        const EV: [f64; 6] = [0.4, -0.3, 0.7, -0.6, 0.2, 0.5];
+        const CV: [f64; 5] = [0.6, -0.9, 0.3, 1.0, -0.4];
         let fitted = none_layout(text, pop0);
         let mut pop = pop0.clone();
         let mut parsed = parse_full_model(text).unwrap();
         bind_theta_levels_from_fit(&mut parsed, text, &mut pop, &fitted).expect("from_fit");
         let m = &parsed.model;
         let theta0 = m.default_params.theta.clone();
-        let eta0 = vec![0.0; m.n_eta];
+        let eta0 = |s: usize| -> Vec<f64> {
+            (0..m.n_eta)
+                .map(|e| at.scale * EV[(s + 2 * e) % 6])
+                .collect()
+        };
         let n_kappa = m.n_kappa;
         let groups: Vec<usize> = pop
             .subjects
@@ -3152,7 +3182,16 @@ mod absorption {
                     .max(1)
             })
             .collect();
-        let kappa0 = |s: usize| vec![vec![0.0; n_kappa]; groups[s]];
+        let kappa0 = |s: usize| -> Vec<Vec<f64>> {
+            (0..groups[s])
+                .map(|g| {
+                    let g = if at.per_occasion { g } else { 0 };
+                    (0..n_kappa)
+                        .map(|q| at.scale * CV[(3 * s + g + q) % 5])
+                        .collect()
+                })
+                .collect()
+        };
         let preds = |th: &[f64], s: usize, et: &[f64], ka: &[Vec<f64>]| {
             if n_kappa > 0 {
                 crate::pk::predict_iov(m, &pop.subjects[s], th, et, ka)
@@ -3162,7 +3201,7 @@ mod absorption {
         };
         let ns = pop.subjects.len();
         let lens: Vec<usize> = (0..ns)
-            .map(|s| preds(&theta0, s, &eta0, &kappa0(s)).len())
+            .map(|s| preds(&theta0, s, &eta0(s), &kappa0(s)).len())
             .collect();
         let nrow: usize = lens.iter().sum();
         let offs: Vec<usize> = lens
@@ -3194,8 +3233,8 @@ mod absorption {
                 None,
                 &|s| {
                     (
-                        preds(&tp, s, &eta0, &kappa0(s)),
-                        preds(&tm, s, &eta0, &kappa0(s)),
+                        preds(&tp, s, &eta0(s), &kappa0(s)),
+                        preds(&tm, s, &eta0(s), &kappa0(s)),
                     )
                 },
                 h,
@@ -3210,14 +3249,14 @@ mod absorption {
         let mut res = Vec::new();
         let mut zc = Vec::new();
         for e in 0..m.n_eta {
-            let (mut ep, mut em) = (eta0.clone(), eta0.clone());
-            ep[e] += h;
-            em[e] -= h;
             let cols: Vec<Vec<f64>> = (0..ns)
                 .map(|s| {
                     fd(
                         Some(s),
                         &|s| {
+                            let (mut ep, mut em) = (eta0(s), eta0(s));
+                            ep[e] += h;
+                            em[e] -= h;
                             (
                                 preds(&theta0, s, &ep, &kappa0(s)),
                                 preds(&theta0, s, &em, &kappa0(s)),
@@ -3239,7 +3278,12 @@ mod absorption {
                     km[g][q] -= h;
                     cols.push(fd(
                         Some(s),
-                        &|s| (preds(&theta0, s, &eta0, &kp), preds(&theta0, s, &eta0, &km)),
+                        &|s| {
+                            (
+                                preds(&theta0, s, &eta0(s), &kp),
+                                preds(&theta0, s, &eta0(s), &km),
+                            )
+                        },
                         h,
                     ));
                 }
@@ -4087,6 +4131,11 @@ mod absorption {
     /// effects at a coarser-or-equal unit (every η for a kappa; the other η for
     /// an η), and — under `Some(contrast)` — the block coded by `contrast`.
     pub(super) fn unit_rank(j: &Jac, name: &str, contrast: Option<LevelContrast>) -> usize {
+        rank(&unit_sv(j, name, contrast))
+    }
+
+    /// The singular values behind [`unit_rank`], normalised by `‖Z_name‖_F`.
+    fn unit_sv(j: &Jac, name: &str, contrast: Option<LevelContrast>) -> Vec<f64> {
         let (r, (_, kappa, zr)) = j
             .res
             .iter()
@@ -4103,7 +4152,7 @@ mod absorption {
                 .filter(|(i, (_, k, _))| *i != r && (*kappa || !*k))
                 .map(|(_, (.., z))| z),
         );
-        rank(&residual_sv(zr, &hcat(&parts)))
+        residual_sv(zr, &hcat(&parts))
     }
 
     /// The joint oracle (#1678, #1696): the random effects `contrast` absorbs —
@@ -5440,5 +5489,106 @@ mod absorption {
         // The twins bind in most cells, so a clock read as constant (refused, or
         // pushed to within) is visible.
         assert!(straddle >= 40, "only {straddle} twin cells bind");
+    }
+
+    /// T1 (#1708). A kappa inside an η's shared expression is read as constant
+    /// within the subject (`expr_constant`'s `Eta(_)` arm). Two shapes on the
+    /// MBMA arms layout pin both sides of what that reading means, against the
+    /// joint oracle evaluated away from η = κ = 0 ([`jacobian_at`]):
+    ///
+    /// - **R1**, `(TVE0 + PLACEBO) * exp(KAPPA_E0) / (1 + ETA_E0 * 0.5)` (the
+    ///   issue's example): `exp(KAPPA_E0)` is a common factor and cancels, so
+    ///   the block absorbs `ETA_E0` at every κ and the refusal is exact.
+    /// - **M**, `TVE0 + PLACEBO * exp(KAPPA_E0) + ETA_E0`: the kappa does not
+    ///   separate from the block. The block absorbs `ETA_E0` wherever each
+    ///   subject's kappas are equal — κ = 0, or one nonzero κ on every occasion —
+    ///   and does not once they differ between a subject's occasions; the
+    ///   separating singular value grows with that spread. The binder refuses
+    ///   as if the spread were zero: an over-refusal, never a bind the oracle
+    ///   would refuse.
+    ///
+    /// A future κ-aware funnel that lets M bind is expected to redden the M
+    /// half; update this test with the docs (`#### Kappas` in
+    /// `docs/model-file/parameters.qmd`).
+    ///
+    /// Mutations — `Eta(_)` read as varying in `expr_constant` (R1 binds); the
+    /// evaluation point ignored by `jacobian_at` (M per-occasion absorbs, the
+    /// straddle collapses).
+    #[test]
+    fn a_kappa_in_an_eta_funnel_is_read_as_constant_within_the_subject() {
+        let model = |e0: &str, c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!("{BASE}  E0 = {e0}"),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+            )
+        };
+        let r1 = "(TVE0 + PLACEBO) * exp(KAPPA_E0) / (1 + ETA_E0 * 0.5)";
+        let mm = "TVE0 + PLACEBO * exp(KAPPA_E0) + ETA_E0";
+        let pop = occ_pop(4, 1, &T6, 3, true);
+        let global = LevelContrast::SumToZero;
+        let constant = Point {
+            scale: 0.1,
+            per_occasion: false,
+        };
+        let per_occ = Point {
+            scale: 0.1,
+            per_occasion: true,
+        };
+        let top = |j: &Jac| {
+            let sv = unit_sv(j, "ETA_E0", Some(global));
+            assert!(sv.iter().all(|v| v.is_finite()), "non-finite σ: {sv:?}");
+            sv.iter().copied().fold(0.0, f64::max)
+        };
+        for (tag, e0) in [("R1", r1), ("M", mm)] {
+            // The binder refuses under every contrast, and under auto, naming the η.
+            for c in ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"] {
+                match try_bind(&model(e0, c), &pop) {
+                    Err(e) => assert!(
+                        e.contains("`E0` reads this block and carries a random effect"),
+                        "{tag} {c:?}: {e}"
+                    ),
+                    Ok(r) => panic!("{tag} {c:?}: bound {r:?}"),
+                }
+            }
+            // Where each subject's kappas are equal, the oracle absorbs the η.
+            for (ptag, at) in [("κ = 0", Point::ZERO), ("κ constant", constant)] {
+                let j = jacobian_at(&model(e0, "none"), &pop, at);
+                // Four subjects, less the direction `TVE0` shares with them.
+                assert_eq!(unit_rank(&j, "ETA_E0", None), 3, "{tag} {ptag}: baseline");
+                assert_eq!(
+                    joint_oracle(&j, global).0,
+                    ["ETA_E0"],
+                    "{tag} {ptag}: σ {:.1e}",
+                    top(&j)
+                );
+            }
+        }
+        // R1 is exact: the common factor cancels at every κ.
+        let j = jacobian_at(&model(r1, "none"), &pop, per_occ);
+        assert_eq!(
+            joint_oracle(&j, global).0,
+            ["ETA_E0"],
+            "R1 per occasion: σ {:.1e}",
+            top(&j)
+        );
+        // M is not: the spread of a subject's kappas identifies the η.
+        let jp = jacobian_at(&model(mm, "none"), &pop, per_occ);
+        let jc = jacobian_at(&model(mm, "none"), &pop, constant);
+        let (sp, sc) = (top(&jp), top(&jc));
+        eprintln!("M: σ per occasion {sp:.3e}, constant within subject {sc:.3e}");
+        assert!(
+            joint_oracle(&jp, global).0.is_empty(),
+            "M per occasion absorbs: σ {sp:.1e}"
+        );
+        assert!(sp > 1e-3, "M per occasion: σ {sp:.1e}");
+        // The straddle itself: the separating direction is the κ spread, not
+        // the κ magnitude.
+        assert!(sp >= 100.0 * sc, "M straddle: {sp:.1e} vs {sc:.1e}");
     }
 }
