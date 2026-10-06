@@ -9,6 +9,10 @@
 //! test, so a check that rejects everything (or nothing) cannot pass.
 //!
 //! Not feature-gated: must run in the base `--features ci` job.
+//!
+//! Scratch-tree paths are spelled `concat!("changelog.d", "/x")`, never as one literal:
+//! `tests/slow_test_path_filter.rs` harvests repo-relative path literals in `tests/` as
+//! inputs of the heavy fit suite, and these trees are not inputs of anything.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -543,9 +547,13 @@ fn require_fails_a_user_facing_change_without_a_fragment() {
     assert!(o.status.success(), "{}", stderr(&o));
 
     // A README edit does not count as a fragment; a fragment does.
-    commit_file(&d, "changelog.d/README.md", "edited\n");
+    commit_file(&d, concat!("changelog.d", "/README.md"), "edited\n");
     assert!(!run(&d, &["require", &base, "--pr", "77"]).status.success());
-    commit_file(&d, "changelog.d/77.fixed.md", "- Fixed (#77).\n");
+    commit_file(
+        &d,
+        concat!("changelog.d", "/77.fixed.md"),
+        "- Fixed (#77).\n",
+    );
     let o = run(&d, &["require", &base, "--pr", "77"]);
     assert!(o.status.success(), "{}", stderr(&o));
 }
@@ -558,7 +566,7 @@ fn require_counts_only_an_added_fragment() {
         let (d, _) = git_repo(&format!("only-added-{slot}"));
         commit_file(
             &d,
-            "changelog.d/10.fixed.md",
+            concat!("changelog.d", "/10.fixed.md"),
             "- Someone else's fix (#10).\n",
         );
         let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
@@ -566,11 +574,19 @@ fn require_counts_only_an_added_fragment() {
         if edit {
             git(
                 &d,
-                &["mv", "changelog.d/10.fixed.md", "changelog.d/11.fixed.md"],
+                &[
+                    "mv",
+                    concat!("changelog.d", "/10.fixed.md"),
+                    concat!("changelog.d", "/11.fixed.md"),
+                ],
             );
             git(&d, &["commit", "-q", "-m", "rename"]);
         } else {
-            commit_file(&d, "changelog.d/10.fixed.md", "- Reworded fix (#10).\n");
+            commit_file(
+                &d,
+                concat!("changelog.d", "/10.fixed.md"),
+                "- Reworded fix (#10).\n",
+            );
         }
         let o = run(&d, &["require", &base, "--pr", "11"]);
         assert!(
@@ -601,7 +617,7 @@ fn require_skips_changes_that_are_not_user_facing() {
         ("tests-sibling", "src/stats/npde_tests.rs"),
         ("tests-dir", "src/api/tests/fit_tests.rs"),
         ("root-tests", "tests/foo.rs"),
-        ("docs", "docs/index.qmd"),
+        ("docs", concat!("docs", "/index.qmd")),
         ("member-tests", "crates/ferx-cli/tests/cli.rs"),
     ] {
         let (d, base) = git_repo(&format!("skip-{slot}"));
@@ -638,7 +654,11 @@ fn require_skips_changes_that_are_not_user_facing() {
 fn require_ignores_a_path_nested_under_changelog_d() {
     let (d, base) = git_repo("nested-fragment");
     commit_file(&d, "src/lib.rs", "// v2\n");
-    commit_file(&d, "changelog.d/.gitkeep/5.fixed.md", "- x (#5).\n");
+    commit_file(
+        &d,
+        concat!("changelog.d", "/.gitkeep/5.fixed.md"),
+        "- x (#5).\n",
+    );
     let o = run(&d, &["require", &base, "--pr", "5"]);
     assert!(!o.status.success(), "a nested path counted as a fragment");
 }
@@ -651,18 +671,22 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     let (d, _) = git_repo("drop-pending");
     commit_file(
         &d,
-        "changelog.d/10.fixed.md",
+        concat!("changelog.d", "/10.fixed.md"),
         "- Someone else's fix (#10).\n",
     );
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
-    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
-    commit_file(&d, "changelog.d/11.fixed.md", "- Mine (#11).\n");
+    git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
+    commit_file(
+        &d,
+        concat!("changelog.d", "/11.fixed.md"),
+        "- Mine (#11).\n",
+    );
     commit_file(&d, "src/lib.rs", "// v2\n");
     for opt_out in ["false", "true"] {
         let o = run(&d, &["require", &base, "--pr", "11", "--opt-out", opt_out]);
         assert!(!o.status.success(), "opt-out {opt_out}: dropped #10 passed");
         assert!(
-            stderr(&o).contains("changelog.d/10.fixed.md"),
+            stderr(&o).contains(concat!("changelog.d", "/10.fixed.md")),
             "{}",
             stderr(&o)
         );
@@ -672,9 +696,9 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     // changelog, or the text already there before this PR.
     let body = "- Someone else's fix (#10).\n  With a continuation.\n";
     let (d, _) = git_repo("drop-partial");
-    commit_file(&d, "changelog.d/10.fixed.md", body);
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), body);
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
-    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+    git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
     let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
     commit_file(
         &d,
@@ -697,9 +721,9 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
         "CHANGELOG.md",
         &cl.replace("- Old fix (#1).\n", &format!("- Old fix (#1).\n{body}")),
     );
-    commit_file(&d, "changelog.d/10.fixed.md", body);
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), body);
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
-    git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+    git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
     git(&d, &["commit", "-q", "-m", "drop"]);
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(
@@ -728,9 +752,9 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
         ),
     ] {
         let (d, _) = git_repo(&format!("drop-{slot}"));
-        commit_file(&d, "changelog.d/10.fixed.md", frag);
+        commit_file(&d, concat!("changelog.d", "/10.fixed.md"), frag);
         let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
-        git(&d, &["rm", "-q", "changelog.d/10.fixed.md"]);
+        git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
         let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
         commit_file(
             &d,
@@ -745,11 +769,15 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     // half is satisfied and only the rename rule can fail it: the renamed file
     // would be released a second time.
     let (d, _) = git_repo("rename-assembled");
-    commit_file(&d, "changelog.d/10.fixed.md", body);
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), body);
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     git(
         &d,
-        &["mv", "changelog.d/10.fixed.md", "changelog.d/11.fixed.md"],
+        &[
+            "mv",
+            concat!("changelog.d", "/10.fixed.md"),
+            concat!("changelog.d", "/11.fixed.md"),
+        ],
     );
     let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
     commit_file(
@@ -769,10 +797,10 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     // A table fragment rides along: its interior blank lines must pass both checks
     // when `assemble` wrote it.
     let (d, _) = git_repo("drop-assembled");
-    commit_file(&d, "changelog.d/10.fixed.md", body);
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), body);
     commit_file(
         &d,
-        "changelog.d/11.added.md",
+        concat!("changelog.d", "/11.added.md"),
         "- Table (#11).\n\n  | a | b |\n  |---|---|\n\n  After.\n",
     );
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
@@ -938,7 +966,7 @@ fn assemble_refuses_an_impossible_date() {
 #[test]
 fn require_fails_a_release_pr_that_leaves_a_fragment_pending() {
     let (d, _) = git_repo("release-leftover");
-    commit_file(&d, "changelog.d/10.fixed.md", "- Fix (#10).\n");
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Fix (#10).\n");
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     let o = run(&d, &["assemble", "0.2.0", "--date", "2026-10-05"]);
     assert!(o.status.success(), "{}", stderr(&o));
@@ -948,14 +976,18 @@ fn require_fails_a_release_pr_that_leaves_a_fragment_pending() {
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(o.status.success(), "{}", stderr(&o));
 
-    commit_file(&d, "changelog.d/20.fixed.md", "- Later fix (#20).\n");
+    commit_file(
+        &d,
+        concat!("changelog.d", "/20.fixed.md"),
+        "- Later fix (#20).\n",
+    );
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(
         !o.status.success(),
         "a release PR leaving #20 pending passed"
     );
     assert!(
-        stderr(&o).contains("changelog.d/20.fixed.md"),
+        stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")),
         "{}",
         stderr(&o)
     );
@@ -987,7 +1019,7 @@ fn released_requires_the_section_and_nothing_pending() {
     let o = run(&t, &["released", "v0.1.0"]);
     assert!(!o.status.success(), "a tag with a pending fragment passed");
     assert!(
-        stderr(&o).contains("changelog.d/20.fixed.md"),
+        stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")),
         "{}",
         stderr(&o)
     );
@@ -1122,16 +1154,20 @@ fn assemble_refuses_a_duplicate_unreleased_link() {
 #[test]
 fn require_verifies_every_deleted_fragment() {
     let (d, _) = git_repo("two-deletions");
-    commit_file(&d, "changelog.d/10.fixed.md", "- Ten (#10).\n");
-    commit_file(&d, "changelog.d/20.fixed.md", "- Twenty (#20).\n");
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Ten (#10).\n");
+    commit_file(
+        &d,
+        concat!("changelog.d", "/20.fixed.md"),
+        "- Twenty (#20).\n",
+    );
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     git(
         &d,
         &[
             "rm",
             "-q",
-            "changelog.d/10.fixed.md",
-            "changelog.d/20.fixed.md",
+            concat!("changelog.d", "/10.fixed.md"),
+            concat!("changelog.d", "/20.fixed.md"),
         ],
     );
     let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
@@ -1146,9 +1182,12 @@ fn require_verifies_every_deleted_fragment() {
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(!o.status.success(), "#20 was dropped and the PR passed");
     let err = stderr(&o);
-    assert!(err.contains("changelog.d/20.fixed.md"), "{err}");
     assert!(
-        !err.contains("changelog.d/10.fixed.md"),
+        err.contains(concat!("changelog.d", "/20.fixed.md")),
+        "{err}"
+    );
+    assert!(
+        !err.contains(concat!("changelog.d", "/10.fixed.md")),
         "#10 was assembled:\n{err}"
     );
 }
