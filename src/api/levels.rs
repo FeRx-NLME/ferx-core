@@ -227,9 +227,9 @@ pub fn bind_from_fit(
 /// model without one (`run_sir` / `run_covariance`, #1622) need not copy it. `None`
 /// on a model that declares a level block is refused.
 ///
-/// Every step that can refuse — validation, the re-parse, the bound assert and the
-/// unseen-level tables — runs before anything is written, so a refusal leaves both
-/// `parsed` and the population as they were. The first three are
+/// Every step that can refuse — validation, the re-parse and the unseen-level
+/// tables — runs before anything is written, so a refusal leaves both
+/// `parsed` and the population as they were. The first two are
 /// [`layout_from_fit`]'s, run by the same function.
 pub(crate) fn bind_from_fit_on(
     parsed: &mut ParsedModel,
@@ -265,8 +265,7 @@ pub(crate) fn bind_from_fit_on(
 /// `FitResult` for SIR or a standalone covariance step, for instance.
 ///
 /// This is the model half of [`bind_from_fit`], and `bind_from_fit` runs it: the
-/// same refusals, the same re-parse, the same check that no `[covariate_model]`
-/// relation is left unresolved. What it leaves out is the population half, so
+/// same refusals and the same re-parse. What it leaves out is the population half, so
 /// nothing is written to any population and a level absent from the fit is not
 /// looked for. Before running the model on data, bind that data with
 /// [`bind_from_fit`] instead: a level block reads its index columns from the
@@ -308,8 +307,7 @@ impl FitLayout {
 }
 
 /// The one implementation of the model half of [`bind_from_fit`] and
-/// [`layout_from_fit`]: validate `fitted` against the model, re-parse on it, and
-/// assert the result bound. `None` when the model declares nothing data-derived and
+/// [`layout_from_fit`]: validate `fitted` against the model and re-parse on it. `None` when the model declares nothing data-derived and
 /// the fit carries nothing, which leaves `parsed` as it is. Reads `parsed` only for
 /// its non-data bindings and name, and writes nothing.
 fn lay_out_on_fit(
@@ -318,21 +316,29 @@ fn lay_out_on_fit(
     fitted: &DataBindings,
 ) -> Result<Option<FitLayout>, String> {
     // What the model needs comes from its text, parsed with no data-derived binding
-    // (#1686). `parsed.model` may have been bound to other data already, and then
-    // its relations are resolved and ask for nothing.
+    // (#1686). A `parsed.model` bound to other data already has its relations
+    // resolved and its `auto` contrasts stamped, so it asks for nothing. An unbound
+    // one *is* that parse, and is read as it stands: no second parse, and no second
+    // read of a `[priors] from_fit` file.
     let unbound = ParseBindings {
         levels: LevelBindings::new(),
         covariate_stats: Default::default(),
         ..parsed.bindings.clone()
     };
-    let declared = parse_full_model_with(model_text, &unbound)?.model;
+    let reparsed;
+    let declared = if parsed.model.data_bindings().is_empty() {
+        &parsed.model
+    } else {
+        reparsed = parse_full_model_with(model_text, &unbound)?.model;
+        &reparsed
+    };
     let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
+    let symbolic = crate::api::covariate_stats::symbolic_covariates(declared);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(no_fit_bindings_message(&decls, &symbolic));
     }
     validate_fitted_levels(&decls, &fitted.levels)?;
-    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)?;
+    crate::api::covariate_stats::validate_fitted_stats(declared, &fitted.covariate_stats)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(None);
     }
@@ -340,7 +346,16 @@ fn lay_out_on_fit(
     bindings.levels = fitted.levels.clone();
     bindings.covariate_stats = fitted.covariate_stats.clone();
     let model = parse_full_model_with(model_text, &bindings)?.model;
-    crate::api::assert_covariate_model_bound(&model)?;
+    // Not a gate (#1728 review): `validate_fitted_stats` has already required a
+    // statistic for every covariate a symbolic relation reads, and given one, the
+    // parser resolves the relation or refuses it. Asserted on every from-fit fixture
+    // so that claim is measured; it would fire if a relation came to need more
+    // than a `CovariateSummary` to resolve.
+    debug_assert!(
+        crate::api::assert_covariate_model_bound(&model).is_ok(),
+        "a from-fit layout left a relation unresolved: {:?}",
+        crate::api::assert_covariate_model_bound(&model)
+    );
     Ok(Some(FitLayout {
         decls,
         model,

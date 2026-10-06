@@ -428,7 +428,7 @@ two cannot disagree on a layout. It also refuses everything `bind_from_fit`
 refuses, except a level the fit never observed, since there is no population
 to look for one in
 ([#1703](https://github.com/FeRx-NLME/ferx-core/issues/1703)). The model it
-returns is not ready to run on data with a level block: the block reads its
+leaves in `parsed` is not ready to run on data with a level block: the block reads its
 index columns from the population, and only `bind_from_fit` writes them.
 
 #### The θ vector's length
