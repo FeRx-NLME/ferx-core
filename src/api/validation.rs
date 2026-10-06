@@ -2656,7 +2656,26 @@ fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
 /// silently modelled as the reference rather than flagged. That changes the
 /// fitted model with nothing in the output to say so, which is exactly the
 /// class of silent-covariate-drop this block exists to prevent.
-fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+///
+/// Called by `fit()` and `ferx check` (through `check_model_data`), the
+/// `simulate*` and adaptive entry points (through `check_simulation_data`), and
+/// directly by `predict_diag` / `predict_survival` / `predict_categorical`,
+/// `compute_npde_npd` and `resolve_fit_inputs` (`run_sir`, `run_covariance`)
+/// (#1740). The per-method estimators that `fit()` dispatches to (`run_saem`,
+/// `run_bayes`, `optimize_population`, …) do not call it; they rely on `fit()`
+/// having checked first. A missing value is not a level and passes: it takes the
+/// documented neutral branch.
+///
+/// The advice depends on where the levels came from. A model laid out on a fit
+/// (`bound_from_fit()`) has the fit's θ vector, so the repairs are to drop or
+/// recode the rows or to refit. `bound_from_fit()` is model-wide, though — any
+/// data-derived relation lays the model out — so the from-fit advice also covers
+/// a relation whose levels are written out, which needs the value added to
+/// `levels = [...]` before that refit (review of #1742).
+pub(crate) fn check_covariate_levels(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
     let Some(spec) = model.covariate_model.as_ref() else {
         return Vec::new();
     };
@@ -2686,22 +2705,37 @@ fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec
         }
         unknown.sort_by(f64::total_cmp);
         declared.sort_by(f64::total_cmp);
+        let (cov, from_fit) = (&rel.covariate, model.bound_from_fit());
+        let whose = if from_fit {
+            "the fit's levels"
+        } else {
+            "levels"
+        };
+        let facts = format!(
+            "[covariate_model]: `{} ~ {cov} {}(...)` has {whose} {declared:?} (reference \
+             {reference}), but `{cov}` takes {unknown:?} in this data.",
+            rel.parameter,
+            rel.form.label(),
+        );
+        let consequence = "A value outside the levels has no θ of its own and takes the \
+                           reference level's factor, so it would be modelled as the reference \
+                           with nothing to say so.";
+        let advice = if from_fit {
+            "The fit estimated no θ for these values: drop or recode those rows, or refit on \
+             data that carries them, adding them to `levels = [...]` first if the levels are \
+             written out."
+                .to_string()
+        } else {
+            format!(
+                "Add the value to `{cov} categorical(levels = [...])` (and refit), or use \
+                 `levels = auto` to read the levels off the data; otherwise drop or recode those \
+                 rows."
+            )
+        };
         diags.push(
             Diagnostic::error(
                 "E_COV_LEVEL_UNKNOWN",
-                format!(
-                    "[covariate_model]: `{} ~ {} {}(...)` declares levels {declared:?} \
-                     (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
-                     undeclared value takes the same factor as the reference level, so the fit \
-                     would silently model it as reference. List every level \
-                     (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
-                     the data, or filter the rows out.",
-                    rel.parameter,
-                    rel.covariate,
-                    rel.form.label(),
-                    rel.covariate,
-                    rel.covariate
-                ),
+                format!("{facts} {consequence} {advice}"),
             )
             .with_block("covariate_model"),
         );
@@ -6854,16 +6888,31 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 {
                     diags.push(Diagnostic::warning(reader_warning_code(w), w.clone()));
                 }
+                // The two binders fail for unrelated reasons and point at different
+                // blocks, so each keeps its own code (#1739): a `[covariate_model]`
+                // statistic with nothing to estimate is not a level-block error.
                 let binding = std::fs::read_to_string(model_path)
-                    .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
+                    .map_err(|e| {
+                        Diagnostic::error(
+                            "E_THETA_LEVEL_BINDING",
+                            format!("Failed to re-read model file for level binding: {e}"),
+                        )
+                        .with_block("parameters")
+                    })
                     .and_then(|model_text| {
-                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+                            .map_err(|e| {
+                                Diagnostic::error("E_THETA_LEVEL_BINDING", e)
+                                    .with_block("parameters")
+                            })?;
                         crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
+                            .map_err(|e| {
+                                Diagnostic::error("E_COVARIATE_STATS_BINDING", e)
+                                    .with_block("covariate_model")
+                            })
                     });
-                if let Err(e) = binding {
-                    diags.push(
-                        Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"),
-                    );
+                if let Err(d) = binding {
+                    diags.push(d);
                 } else {
                     diags.extend(check_model_data_rule(
                         &parsed.model,

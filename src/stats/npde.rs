@@ -98,13 +98,21 @@ pub struct SubjectNpde {
 /// the R bridge) gets the κ = 0 reference instead of a panic — a post-fit
 /// diagnostic is the wrong place to abort a completed fit. Use
 /// `fitted_params_from_result` to keep the IOV block.
+///
+/// # Errors
+///
+/// A categorical covariate value outside its `[covariate_model]` relation's levels
+/// (#1740) is an `Err` carrying `E_COV_LEVEL_UNKNOWN`'s message: the simulated
+/// reference distribution would score it as the reference level. Reached from
+/// `fit()`'s post-fit step this cannot fire, since the fit already refused it.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     nsim: usize,
     seed: Option<u64>,
-) -> Vec<SubjectNpde> {
+) -> Result<Vec<SubjectNpde>, String> {
+    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
     let base_seed = effective_seed(seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -112,7 +120,7 @@ pub fn compute_npde_npd(
     // A standalone caller (R, a script) is not on a Rayon worker, so this would run on
     // Rayon's global pool at machine width rather than the engine's declared count
     // (#1460); reached from inside `fit()`'s post-fit step it is a no-op.
-    crate::api::install_on_engine_pool(|| {
+    Ok(crate::api::install_on_engine_pool(|| {
         population
             .subjects
             .par_iter()
@@ -225,7 +233,7 @@ pub fn compute_npde_npd(
                 SubjectNpde { npd, npde }
             })
             .collect()
-    })
+    }))
 }
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Rows
@@ -366,6 +374,53 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// #1740 T6. `compute_npde_npd` refuses a categorical value outside the
+    /// relation's levels — the simulated reference would draw that subject under
+    /// the reference level's factor and score its observations against it. The
+    /// twin, whose third subject is the reference level 2 instead of 4, runs.
+    #[test]
+    fn compute_npde_refuses_a_categorical_value_outside_the_levels() {
+        let text = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
+            omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n[individual_parameters]\n  \
+            CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+            [covariates]\n  GRP categorical(levels = [1, 2, 3])\n[covariate_model]\n  \
+            CL ~ GRP categorical(ref = 2)\n[error_model]\n  DV ~ proportional(PROP)\n";
+        let model = crate::parser::model_parser::parse_full_model(text)
+            .expect("parse")
+            .model;
+        let pop = |grp: [f64; 3]| Population {
+            subjects: grp
+                .iter()
+                .enumerate()
+                .map(|(i, g)| crate::types::Subject {
+                    id: format!("{}", i + 1),
+                    doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    obs_times: vec![1.0, 6.0],
+                    observations: vec![2.0, 1.0],
+                    obs_cmts: vec![1, 1],
+                    cens: vec![0, 0],
+                    covariates: std::collections::HashMap::from([("GRP".to_string(), *g)]),
+                    ..Default::default()
+                })
+                .collect(),
+            covariate_names: vec!["GRP".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let params = model.default_params.clone();
+
+        let ok = compute_npde_npd(&model, &pop([1.0, 2.0, 2.0]), &params, 200, Some(1740))
+            .expect("listed levels only");
+        assert_eq!(ok.len(), 3);
+        assert!(ok.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
+
+        let e = compute_npde_npd(&model, &pop([1.0, 2.0, 4.0]), &params, 200, Some(1740))
+            .expect_err("an unlisted level must be refused");
+        assert!(e.contains("`GRP` takes [4.0] in this data"), "{e}");
+    }
+
     /// Regression for #506: NPDE/NPD must simulate against the time-varying
     /// covariate snapshots, like `simulate()`/`predict()`, not the baseline-only
     /// `pk_param_fn(subject.covariates)`. Each observation is placed exactly on
@@ -387,7 +442,7 @@ mod tests {
             exclusions: None,
             warnings: Vec::new(),
         };
-        let out = compute_npde_npd(&model, &population, &params, 1000, Some(506));
+        let out = compute_npde_npd(&model, &population, &params, 1000, Some(506)).expect("npde");
         assert_eq!(out.len(), 1);
         for (j, &npd) in out[0].npd.iter().enumerate() {
             assert!(
@@ -693,7 +748,7 @@ mod tests {
         let nsim = 20_000;
         let seed = Some(734);
 
-        let with_iov = compute_npde_npd(&model, &population, &params, nsim, seed);
+        let with_iov = compute_npde_npd(&model, &population, &params, nsim, seed).expect("npde");
         let sd_with = implied_reference_sd(&with_iov);
 
         // Control: Ω_IOV forced to zero. The per-occasion κ draws still happen
@@ -704,7 +759,8 @@ mod tests {
             om.chol.fill(0.0);
             om.matrix.fill(0.0);
         }
-        let without_iov = compute_npde_npd(&model, &population, &zero_iov, nsim, seed);
+        let without_iov =
+            compute_npde_npd(&model, &population, &zero_iov, nsim, seed).expect("npde");
         let sd_without = implied_reference_sd(&without_iov);
 
         eprintln!(
@@ -736,7 +792,7 @@ mod tests {
         let (model, population) = iov_npde_model_and_population();
         let mut params = model.default_params.clone();
         params.omega_iov = None;
-        let out = compute_npde_npd(&model, &population, &params, 20_000, Some(734));
+        let out = compute_npde_npd(&model, &population, &params, 20_000, Some(734)).expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,
@@ -763,7 +819,8 @@ mod tests {
             &model.default_params,
             20_000,
             Some(734),
-        );
+        )
+        .expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,

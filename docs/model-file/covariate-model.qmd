@@ -331,9 +331,27 @@ Reaching a fit with one still unbound is a hard error
 A `categorical` factor is an `if (COV == l₁) 1 + θ₁ else … else 1` chain whose
 trailing `1` *is* the reference level's factor, so an undeclared code would be
 modelled as the reference with nothing in the output to say so. A value in the
-data that is not one of the relation's declared levels is therefore refused
-before the fit starts (`E_COV_LEVEL_UNKNOWN`). List every level, use
-`categorical(levels = auto)` to read them off the data, or filter the rows out.
+data that is not one of the relation's levels is therefore refused
+(`E_COV_LEVEL_UNKNOWN`) by `fit()` and `ferx check`, the `simulate*` and adaptive entry points,
+`predict()` / `predict_diag()` / `predict_survival()` / `predict_categorical()`,
+`compute_npde_npd()`, and `run_sir()` / `run_covariance()` on a supplied
+population (the same subject IDs with a recoded column used to pass). The
+per-method estimators `fit()` dispatches to (`run_saem`, `run_bayes`, …) rely on
+`fit()` having checked first. For a model with literal levels, add the value to the levels and refit, use
+`categorical(levels = auto)` to read them off the data, or drop or recode the
+rows.
+
+A model laid out on a fit (`bind_from_fit`, `layout_from_fit`) has the fit's θ
+vector, which holds no θ for the new value. The repairs are to drop or recode
+those rows, or to refit on data that carries the value. If the relation's levels
+are written out, add the value to `levels = [...]` before refitting; with
+`levels = auto` the refit discovers it. Any data-derived relation lays a model
+out on a fit, so this applies to a written-out relation in a model that also has
+a `center = median`, say. The message says which case it is.
+
+A **missing** value (`.`) is not a level and is not refused: it takes the neutral
+branch described under [Missing covariate values](#missing-covariate-values),
+which for a categorical factor is the reference level's factor.
 
 ## Where the factor is inserted
 

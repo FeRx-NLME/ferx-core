@@ -5999,6 +5999,21 @@ pub fn parse_full_model_with(
     // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
     // now carries its direct-θ channel), just never seen by `indiv_stmts`.
     event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // A θ a `[covariate_model]` relation declares (`=> THETA_CL_WT(...)`) while the
+    // relation still waits on a data statistic (#1738): the relation emits no
+    // expression until it is bound, so nothing in `indiv_stmts` reads the θ yet —
+    // but binding is what puts it there, so it is not unused. Every relation is
+    // walked, not just `unresolved()`: a bound relation's θ is already in its
+    // expression, so filtering would be a predicate no input can observe.
+    if let Some(cm) = &model.covariate_model {
+        for rel in &cm.relations {
+            event_model_used_thetas.extend(
+                rel.thetas
+                    .iter()
+                    .filter_map(|t| model.theta_names.iter().position(|n| *n == t.name)),
+            );
+        }
+    }
     // Every θ/η a Form-C `y` readout reads directly (#1636). The #486/#1636 desugaring
     // moves most of them into `indiv_stmts` already; this covers the ones it leaves in
     // the readout (a state-indexed gather, or a synth set that overflowed the slot

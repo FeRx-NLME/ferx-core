@@ -438,6 +438,271 @@ fn the_echoed_relation_table_keeps_level_and_expression() {
     assert!(expr.thetas.is_empty());
 }
 
+// ── #1740: an unlisted categorical level at every entry point ───────────────
+
+/// `CL ~ GRP categorical`, levels `[1, 2, 3]`, reference 2, written literally.
+fn grp_literal() -> String {
+    model(
+        "  GRP categorical(levels = [1, 2, 3])",
+        "  CL ~ GRP categorical(ref = 2)",
+    )
+}
+
+/// The same relation with the levels and reference read off the data.
+fn grp_auto() -> String {
+    model(
+        "  GRP categorical(levels = auto)",
+        "  CL ~ GRP categorical(ref = mode)",
+    )
+}
+
+/// The model's default parameters with every `THETA_CL_GRP_*` contrast set to
+/// 0.5, so each non-reference level has a factor visibly different from the
+/// reference's 1 — at the default `0.0` every level predicts alike and no
+/// bit-equality below could tell a level from the reference.
+fn live_params(m: &CompiledModel) -> crate::types::ModelParameters {
+    let mut p = m.default_params.clone();
+    let mut n = 0;
+    for (i, name) in m.theta_names.iter().enumerate() {
+        if name.starts_with("THETA_CL_GRP_") {
+            p.theta[i] = 0.5;
+            n += 1;
+        }
+    }
+    assert_eq!(n, 2, "two contrasts: {:?}", m.theta_names);
+    p
+}
+
+/// PRED per subject, one observation each.
+fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, String> {
+    let p = live_params(m);
+    crate::api::predict(m, pop, &p).map(|r| {
+        let v: Vec<f64> = r.iter().map(|r| r.pred).collect();
+        assert!(v.iter().all(|x| x.is_finite()), "{v:?}");
+        v
+    })
+}
+
+/// #1740 T1. `predict` refuses a categorical value outside the relation's levels
+/// instead of scoring it as the reference. The differential pair straddles the
+/// gate: subject 3 is `4` in one design and `2` (the reference) in its twin.
+/// Without the gate both are `Ok` with the same PRED bits (measured on `202bea5e`),
+/// so the twin must stay `Ok` and the `4` design must turn `Err`.
+///
+/// The message is the literal-levels cell: each sentence is asserted — the facts
+/// (relation, levels, reference, the unseen value), the consequence, and the advice
+/// a literal model can act on — and the from-fit wording is asserted absent.
+#[test]
+fn predict_refuses_a_categorical_value_outside_the_levels() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    assert!(!m.bound_from_fit());
+    let twin = population("GRP", &[1.0, 2.0, 2.0]);
+    let unseen = population("GRP", &[1.0, 2.0, 4.0]);
+
+    let ok = preds(&m, &twin).expect("listed levels only must predict");
+    // The pair is live: level 1 has its own factor, so a level is not the reference.
+    assert_ne!(ok[0].to_bits(), ok[1].to_bits(), "{ok:?}");
+    assert_eq!(ok[1].to_bits(), ok[2].to_bits(), "{ok:?}");
+
+    let e = preds(&m, &unseen).expect_err("an unlisted level must be refused");
+    for needle in [
+        "`CL ~ GRP categorical(...)` has levels [1.0, 2.0, 3.0] (reference 2)",
+        "`GRP` takes [4.0] in this data",
+        "has no θ of its own and takes the reference level's factor",
+        "modelled as the reference",
+        "Add the value to `GRP categorical(levels = [...])` (and refit)",
+        "`levels = auto`",
+        "drop or recode those rows",
+    ] {
+        assert!(e.contains(needle), "missing {needle:?}: {e}");
+    }
+    for absent in ["the fit's levels", "The fit estimated no θ"] {
+        assert!(!e.contains(absent), "{absent:?} is the from-fit cell: {e}");
+    }
+}
+
+/// #1740 T2. Both sides of the advice's `bound_from_fit()` gate in one test. A
+/// model laid out on an `auto` fit's bindings has the fit's θ vector, so the
+/// literal advice ("Add the value", `levels = auto`) is not the repair there — the
+/// message must say the fit estimated no θ for the value and leave it out. (A
+/// written-out relation in a from-fit model is T2b.) The literal model on the
+/// same design gets the literal advice. Forcing the branch either way reddens one
+/// half.
+#[test]
+fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit() {
+    let text = grp_auto();
+    // The fit's data: levels [1, 2, 3], mode 2.
+    let fit_pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    let bindings = bind(&text, &fit_pop).expect("bind").data_bindings().clone();
+    let mut parsed = parse_full_model(&text).expect("parse");
+    let mut design = population("GRP", &[1.0, 2.0, 4.0]);
+    crate::api::bind_from_fit(&mut parsed, &text, &mut design, &bindings).expect("from fit");
+    let from_fit = parsed.model;
+    assert!(from_fit.bound_from_fit());
+
+    let e = preds(&from_fit, &design).expect_err("from fit: unlisted level refused");
+    for needle in [
+        "has the fit's levels [1.0, 2.0, 3.0] (reference 2)",
+        "`GRP` takes [4.0] in this data",
+        "modelled as the reference",
+        "The fit estimated no θ for these values",
+        "drop or recode those rows, or refit on data that carries them",
+    ] {
+        assert!(e.contains(needle), "from fit, missing {needle:?}: {e}");
+    }
+    for absent in ["levels = auto", "Add the value"] {
+        assert!(
+            !e.contains(absent),
+            "from fit, {absent:?} is wrong here: {e}"
+        );
+    }
+
+    let literal = parse_full_model(&grp_literal()).expect("parse").model;
+    let e = preds(&literal, &design).expect_err("literal: unlisted level refused");
+    assert!(e.contains("has levels [1.0, 2.0, 3.0]"), "{e}");
+    assert!(e.contains("`levels = auto`"), "{e}");
+    assert!(!e.contains("The fit estimated no θ"), "{e}");
+
+    // The listed twin of the design predicts from the fit's layout.
+    let mut twin = population("GRP", &[1.0, 2.0, 2.0]);
+    let mut parsed = parse_full_model(&text).expect("parse");
+    crate::api::bind_from_fit(&mut parsed, &text, &mut twin, &bindings).expect("from fit");
+    preds(&parsed.model, &twin).expect("from fit: listed levels predict");
+}
+
+/// #1740 T2b (review r1 #1/#3). `bound_from_fit()` is model-wide: a model is laid
+/// out on a fit because of *any* data-derived relation — here `V ~ WT power(center =
+/// median)` — so a relation whose levels are **written out** is in the from-fit
+/// cell too. There, refitting on data that carries the value is not enough on its
+/// own: the refit is refused the same way until the value is added to `levels =
+/// [...]`, so the from-fit advice has to say so. Asserted from both ends: the
+/// from-fit message names that repair, and the refit it would otherwise send the
+/// reader to is refused, with the literal advice.
+#[test]
+fn the_from_fit_advice_covers_a_relation_whose_levels_are_written_out() {
+    let text = model(
+        "  GRP categorical(levels = [1, 2, 3])\n  WT continuous",
+        "  CL ~ GRP categorical(ref = 2)\n  V ~ WT power(center = median)",
+    );
+    let with_wt = |grp: &[f64]| {
+        let mut pop = population("GRP", grp);
+        for (i, s) in pop.subjects.iter_mut().enumerate() {
+            s.covariates
+                .insert("WT".to_string(), 50.0 + 10.0 * i as f64);
+        }
+        pop.covariate_names.push("WT".to_string());
+        pop
+    };
+    let bindings = bind(&text, &with_wt(&[1.0, 2.0, 2.0, 3.0]))
+        .expect("bind")
+        .data_bindings()
+        .clone();
+    let mut parsed = parse_full_model(&text).expect("parse");
+    let mut design = with_wt(&[1.0, 2.0, 4.0]);
+    crate::api::bind_from_fit(&mut parsed, &text, &mut design, &bindings).expect("from fit");
+    assert!(
+        parsed.model.bound_from_fit(),
+        "the WT relation lays the model out"
+    );
+
+    let e = preds(&parsed.model, &design).expect_err("from fit: unlisted level refused");
+    assert!(e.contains("The fit estimated no θ for these values"), "{e}");
+    assert!(
+        e.contains("adding them to `levels = [...]` first if the levels are written out"),
+        "the written-out case needs its repair: {e}"
+    );
+
+    // The refit on the design, as the advice's "refit" half would have it.
+    let refit = bind(&text, &design).expect("the design binds its own WT median");
+    let diags = crate::api::check_model_data(&refit, &design);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_COV_LEVEL_UNKNOWN")
+        .unwrap_or_else(|| panic!("the refit is refused too: {diags:?}"));
+    assert!(hit.message.contains("Add the value"), "{}", hit.message);
+}
+
+/// #1740 T3. The check reads every record a value can arrive on, the same set the
+/// summary does. A literal model whose unlisted `4` exists **only on a dose
+/// record** is refused — a check reading the static covariates alone would pass
+/// it, and the dose would be given under the reference factor. The `auto` twin on
+/// the same population discovers `4` from that dose record and binds a θ for it,
+/// so its check is clean: the "auto bound on the data at hand" cell cannot reach
+/// the refusal.
+#[test]
+fn a_level_seen_only_on_a_dose_record_is_checked_like_any_other() {
+    let mut pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    pop.subjects[0].dose_covariates = vec![HashMap::from([("GRP".to_string(), 4.0)])];
+
+    let literal = parse_full_model(&grp_literal()).expect("parse").model;
+    let hit = crate::api::check_covariate_levels(&literal, &pop);
+    assert_eq!(hit.len(), 1, "{hit:?}");
+    assert!(hit[0].message.contains("[4.0]"), "{}", hit[0].message);
+
+    let auto = bind(&grp_auto(), &pop).expect("auto binds 4 from the dose record");
+    let levels: Vec<f64> = auto.covariate_model.as_ref().unwrap().relations[0]
+        .thetas
+        .iter()
+        .filter_map(|t| t.level)
+        .collect();
+    assert!(levels.contains(&4.0), "{levels:?}");
+    assert!(
+        crate::api::check_covariate_levels(&auto, &pop).is_empty(),
+        "auto on its own data has no unseen level"
+    );
+}
+
+/// #1740 T4. A missing value is not a level: it keeps the documented neutral
+/// branch, which is numerically the reference factor, and is not refused. The
+/// NaN subject's PRED is bit-equal to its reference twin's, and level 1 is not —
+/// so the equality is the neutral branch, not a flat model.
+#[test]
+fn a_missing_categorical_value_is_neutral_not_refused() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    let pop = population("GRP", &[1.0, 2.0, f64::NAN]);
+    assert!(crate::api::check_covariate_levels(&m, &pop).is_empty());
+    let p = preds(&m, &pop).expect("a missing value predicts");
+    assert_eq!(p[2].to_bits(), p[1].to_bits(), "{p:?}");
+    assert_ne!(p[0].to_bits(), p[1].to_bits(), "{p:?}");
+}
+
+/// #1740 T5. `run_covariance` and `run_sir` with a supplied population: the same
+/// subject IDs pass `check_subjects`, so a recoded covariate column reached the
+/// re-scored objective as the reference level. Both now refuse it, prefixed by the
+/// entry point. The control: the fit's own population runs `run_covariance` to
+/// `Ok`, so the refusal is the level, not the call.
+#[test]
+fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    let fit_pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    let opts = crate::types::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..crate::types::FitOptions::default()
+    };
+    let fit = crate::api::fit(&m, &fit_pop, &m.default_params, &opts).expect("fit");
+    let recoded = population("GRP", &[1.0, 2.0, 2.0, 4.0]);
+
+    for (entry, err) in [
+        (
+            "run_covariance",
+            crate::run_covariance(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
+        ),
+        (
+            "run_sir",
+            crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
+        ),
+    ] {
+        assert!(err.starts_with(&format!("{entry}: ")), "{err}");
+        assert!(
+            err.contains("`GRP` takes [4.0] in this data"),
+            "{entry}: {err}"
+        );
+    }
+    crate::run_covariance(&fit, Some(&m), Some(&fit_pop), &opts)
+        .expect("the fit's own population is not refused");
+}
+
 #[test]
 fn a_constant_covariate_is_rejected_rather_than_given_infinite_bounds() {
     let text = model("  WT continuous", "  CL ~ WT linear(center = median)");
@@ -663,6 +928,169 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
         });
     assert!(cl.contains("present(WT)"), "{cl}");
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
+}
+
+/// One covariate column written as a NONMEM CSV, one dose and one observation per
+/// subject, for the entry points that read a data file. A `None` cell is `.`.
+fn temp_cov_csv(name: &str, values: &[Option<f64>]) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .expect("create temp data");
+    writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV,{name}").unwrap();
+    for (i, v) in values.iter().enumerate() {
+        let g = v.map_or(".".to_string(), |v| format!("{v}"));
+        writeln!(f, "{},0,.,1,100,1,1,{g}", i + 1).unwrap();
+        writeln!(f, "{},1,2.0,0,.,1,0,{g}", i + 1).unwrap();
+    }
+    f.flush().expect("flush temp data");
+    f
+}
+
+/// #1739 T9. A `[covariate_model]` statistic the data cannot bind is reported as
+/// `E_COVARIATE_STATS_BINDING` on block `covariate_model` — not as the level-block
+/// code `E_THETA_LEVEL_BINDING` on `parameters`, which sent the reader to the wrong
+/// block. Two binder sources, so the code cannot depend on which one fired: an
+/// `auto` relation whose data carry one level ("nothing to estimate"), and a
+/// covariate with no non-missing value. The level-block side keeps its code; that
+/// is `tests/theta_level_blocks.rs::check_reports_level_binding_errors_directly`.
+#[test]
+fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
+    let text = model(
+        "  GRP categorical(levels = auto)",
+        "  CL ~ GRP categorical(ref = mode)",
+    );
+    let m = temp_model(&text);
+    for (label, values, needle) in [
+        ("single level", vec![Some(2.0); 4], "nothing to estimate"),
+        ("all missing", vec![None; 4], "no non-missing value"),
+    ] {
+        let d = temp_cov_csv("GRP", &values);
+        let report = crate::api::validate_model_file(
+            m.path().to_str().expect("utf-8 temp path"),
+            Some(d.path().to_str().expect("utf-8 temp path")),
+        );
+        assert!(!report.valid, "{label}: {:?}", report.diagnostics);
+        let binds: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.ends_with("_BINDING"))
+            .collect();
+        assert_eq!(binds.len(), 1, "{label}: {:?}", report.diagnostics);
+        let hit = binds[0];
+        assert_eq!(hit.code, "E_COVARIATE_STATS_BINDING", "{label}: {hit:?}");
+        assert_eq!(
+            hit.block.as_deref(),
+            Some("covariate_model"),
+            "{label}: {hit:?}"
+        );
+        assert!(hit.message.contains(needle), "{label}: {}", hit.message);
+    }
+}
+
+/// The #1738 fixture: `CL ~ WT power` with an explicit `=> THETA_CL_WT(...)`,
+/// centred on `center`, plus a genuinely unused `UNUSED_T` as the control.
+fn unused_census_model(center: &str) -> String {
+    model(
+        "  WT continuous",
+        &format!("  CL ~ WT power(center = {center}) => THETA_CL_WT(0.6, 0.01, 5.0)"),
+    )
+    .replace(
+        "  theta TVV(",
+        "  theta UNUSED_T(1.0, 0.1, 10.0)\n  theta TVV(",
+    )
+}
+
+/// WT 55, 58, …, 88: twelve subjects, median 71.5.
+fn census_weights() -> Vec<f64> {
+    (0..12).map(|i| 55.0 + 3.0 * f64::from(i)).collect()
+}
+
+/// The θ names a parse warns about as "not referenced", in warning order.
+fn unreferenced(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|w| w.contains("not referenced"))
+        .map(|w| w.split('\'').nth(1).unwrap_or(w).to_string())
+        .collect()
+}
+
+/// #1738 T10. A θ that only a not-yet-resolved relation reads is not unused: the
+/// relation emits its expression as soon as it is bound, and the census must not
+/// say otherwise in the meantime. The symbolic model, unbound and bound, warns
+/// about exactly what the literal twin centred on the same value (the data's
+/// median, 71.5) warns about — `UNUSED_T`, the control, and nothing else. The
+/// control is what keeps the fix from being "count every `[covariate_model]` θ"
+/// or "stop warning": `UNUSED_T` must keep warning in every cell.
+#[test]
+fn a_theta_read_only_by_an_unresolved_relation_is_not_reported_unused() {
+    let pop = population("WT", &census_weights());
+    let literal = parse_full_model(&unused_census_model("71.5")).expect("parse");
+    let symbolic_text = unused_census_model("median");
+    let symbolic = parse_full_model(&symbolic_text).expect("parse");
+    // The fixture is the unresolved case, or it tests nothing.
+    assert_eq!(
+        symbolic
+            .model
+            .covariate_model
+            .as_ref()
+            .expect("block recorded")
+            .unresolved()
+            .len(),
+        1
+    );
+    let bound = bind(&symbolic_text, &pop).expect("bind");
+    assert_eq!(
+        bound.covariate_model.as_ref().unwrap().relations[0].resolved_center,
+        Some(71.5),
+        "the literal twin must sit on the bound centre"
+    );
+
+    let want = vec!["UNUSED_T".to_string()];
+    assert_eq!(unreferenced(&literal.model.parse_warnings), want, "literal");
+    assert_eq!(
+        unreferenced(&symbolic.model.parse_warnings),
+        want,
+        "symbolic, unbound"
+    );
+    assert_eq!(unreferenced(&bound.parse_warnings), want, "symbolic, bound");
+}
+
+/// #1738 T11. The same through `ferx check`, with and without `--data`: the
+/// symbolic and the literal model report the same `W_UNUSED_PARAM` set.
+#[test]
+fn check_reports_the_same_unused_parameters_for_a_symbolic_and_a_literal_centre() {
+    let unused = |center: &str, with_data: bool| -> Vec<String> {
+        let m = temp_model(&unused_census_model(center));
+        let d = temp_cov_csv(
+            "WT",
+            &census_weights().into_iter().map(Some).collect::<Vec<_>>(),
+        );
+        let report = crate::api::validate_model_file(
+            m.path().to_str().expect("utf-8 temp path"),
+            with_data.then(|| d.path().to_str().expect("utf-8 temp path")),
+        );
+        let mut hits: Vec<String> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W_UNUSED_PARAM")
+            .map(|d| {
+                d.message
+                    .split('\'')
+                    .nth(1)
+                    .unwrap_or(&d.message)
+                    .to_string()
+            })
+            .collect();
+        hits.sort();
+        hits
+    };
+    for with_data in [false, true] {
+        let literal = unused("71.5", with_data);
+        assert_eq!(literal, vec!["UNUSED_T".to_string()], "data = {with_data}");
+        assert_eq!(unused("median", with_data), literal, "data = {with_data}");
+    }
 }
 
 /// #1729 T6. The comparator behind the empty-bindings check names the first field

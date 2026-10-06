@@ -193,6 +193,9 @@ fn check_lent_stats(
 ///
 /// The population must be the fit's subjects in the fit's order, checked before any
 /// binding, and the model must have the fit's θ count. Both were panics (#1622).
+/// Last, a categorical covariate value outside the model's levels is refused
+/// (`E_COV_LEVEL_UNKNOWN`'s text, #1740): the subject IDs can match while a
+/// covariate column was recoded.
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult,
     model: Option<&'a CompiledModel>,
@@ -329,6 +332,13 @@ pub(crate) fn resolve_fit_inputs<'a>(
             fit.theta.len()
         ));
     }
+    // The same subjects can carry a recoded covariate: a categorical value outside
+    // the model's levels would be scored as the reference level (#1740).
+    crate::diagnostics::first_error(&crate::api::check_covariate_levels(
+        inputs.model(),
+        &inputs.population,
+    ))
+    .map_err(prefix)?;
     Ok(inputs)
 }
 

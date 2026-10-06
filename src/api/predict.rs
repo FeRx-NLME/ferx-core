@@ -119,7 +119,7 @@ pub struct PredictionOutput {
 /// A model/data precondition failure is an `Err` carrying the bare check message — the text
 /// `fit()` gives for that precondition (#898): a dose the model cannot route or honour, a
 /// covariate the data does not carry, an unrouted non-Gaussian endpoint, an unbound
-/// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
+/// `[covariate_model]` or a categorical value outside its relation's levels, an unsupported absorption / readout / survival combination, or (under
 /// `markov`) a CTMM-only model, which has no predictor yet. An unbound `theta NAME[...]` level
 /// block is the one exception to `fit()`'s text: it reports `E_THETA_LEVELS_UNBOUND`'s message,
 /// as the simulate paths do, followed by that diagnostic's suggestion for `predict` (#1644).
@@ -165,6 +165,10 @@ pub fn predict_diag(
     // simply is not in the compiled expression, and a dropped covariate effect
     // is invisible in a prediction.
     crate::api::assert_covariate_model_bound(model)?;
+    // …and that no categorical covariate takes a value outside its relation's
+    // levels, which the generated chain would score as the reference with nothing
+    // to say so (#1740). `fit()` and `simulate()` refuse it through their bundles.
+    first_error(&check_covariate_levels(model, population))?;
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
@@ -298,9 +302,10 @@ pub struct PredictionResult {
 ///
 /// # Errors
 ///
-/// A time-varying covariate on the linear predictor, or a population loaded without endpoint
-/// routing, is an `Err` carrying the text `fit()` gives for that precondition (#898). These
-/// are the only two it checks.
+/// A time-varying covariate on the linear predictor, a population loaded without endpoint
+/// routing, or a categorical covariate value outside its `[covariate_model]` relation's
+/// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// These are the only three it checks.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
@@ -317,6 +322,9 @@ pub fn predict_categorical(
     // Gaussian grid — would come back empty, indistinguishable from a model with no
     // binary endpoint.
     first_error(&check_endpoint_routing(model, population, false))?;
+    // A categorical value outside its relation's levels takes the reference factor
+    // on the linear predictor too (#1740).
+    first_error(&check_covariate_levels(model, population))?;
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {
@@ -405,9 +413,10 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 ///
 /// # Errors
 ///
-/// A time-varying covariate on a hazard, or a dose into a compartment the model cannot
-/// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// These are the only two it checks.
+/// A time-varying covariate on a hazard, a dose into a compartment the model cannot
+/// deliver into, or a categorical covariate value outside its `[covariate_model]` relation's
+/// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// These are the only three it checks.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,
@@ -435,6 +444,9 @@ pub fn predict_survival(
     // the `predict`/`simulate` family missing the guard (#899); it is a no-op for a
     // pure-TTE model, where nothing asks the PK predictor for a value.
     first_error(&check_dose_compartments(model, population))?;
+    // A categorical value outside its relation's levels takes the reference factor
+    // on the hazard too (#1740).
+    first_error(&check_covariate_levels(model, population))?;
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
