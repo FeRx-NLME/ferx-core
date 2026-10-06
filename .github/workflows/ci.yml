@@ -304,6 +304,19 @@ jobs:
       - name: cargo fmt (via tools/preflight.sh)
         run: tools/preflight.sh fmt
 
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Fragment shape + an empty `[Unreleased]` (#1545). No toolchain: the group
+      # is a shell walk over `changelog.d/`. Through `tools/preflight.sh` for the
+      # same reason as `Check` / `Format` (#1157). Whether the PR *needs* a
+      # fragment is the separate `changelog.yml` workflow, which re-runs on label
+      # changes — this file deliberately does not.
+      - name: Validate changelog.d fragments (via tools/preflight.sh)
+        run: tools/preflight.sh changelog
+
   docs-lint:
     name: Docs lint
     runs-on: ubuntu-latest
