@@ -149,15 +149,22 @@ fn check_lent_stats(
          `model_path`), so a `[data_selection]` in it was not applied: if the model \
          has one, pass `population = Some(&pop)` with the fit's population."
     };
+    // `bind_covariate_stats` binds the statistics only: on a model with a level block
+    // it leaves the layout unbound, and the call is then refused on its θ count.
+    let fix = if m.theta_blocks().level_blocks().is_empty() {
+        "`prepare_run` on the fit's model and data files, or `bind_covariate_stats` on a \
+         freshly parsed model with the fit's population."
+    } else {
+        "`prepare_run` on the fit's model and data files. The model has a theta level \
+         block, which `bind_covariate_stats` does not bind."
+    };
     Err(format!(
         "{entry}: this fit records no data-derived bindings (an older `.fitrx`), so the \
          supplied model's covariate statistics were checked against {against}, and they \
          differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
          was bound on other data, and scoring the fit's θ with it would centre the \
          relations on that data, not on the data the θ was estimated from. Re-parse the \
-         model and bind it on the fit's data: `prepare_run` on the fit's model and data \
-         files, or `bind_covariate_stats` on a freshly parsed model with the fit's \
-         population.{routed}",
+         model and bind it on the fit's data: {fix}{routed}",
         field = d.field,
         cov = d.covariate,
         mv = d.model,
@@ -165,7 +172,7 @@ fn check_lent_stats(
     ))
 }
 
-/// Resolve the model and population `entry`(`"run_sir"` / `"run_covariance"`)
+/// Resolve the model and population `entry` (`"run_sir"` / `"run_covariance"`)
 /// runs on, refusing every input that would evaluate the fit's θ against a model
 /// or population other than the fitted ones.
 ///

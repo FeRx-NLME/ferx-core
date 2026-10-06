@@ -1248,8 +1248,16 @@ mod from_fit_bindings {
     }
 
     /// The #1729 refusal, spelled out in full so deleting any sentence of it in
-    /// `check_lent_stats` (or swapping a source clause) fails the equality.
-    fn stats_refusal(source: Source, model_median: f64, data_median: f64) -> String {
+    /// `check_lent_stats` (or swapping a source clause) fails the equality. `levels`:
+    /// the model has a theta level block, so only `prepare_run` is advised.
+    fn stats_refusal(source: Source, model_median: f64, data_median: f64, levels: bool) -> String {
+        let fix = if levels {
+            "`prepare_run` on the fit's model and data files. The model has a theta level \
+             block, which `bind_covariate_stats` does not bind."
+        } else {
+            "`prepare_run` on the fit's model and data files, or `bind_covariate_stats` on \
+             a freshly parsed model with the fit's population."
+        };
         let (against, there) = match source {
             Source::Supplied => ("the supplied population", "the supplied population"),
             _ => ("the fit's data, re-read from `fit.data_path`", "the data"),
@@ -1268,8 +1276,7 @@ mod from_fit_bindings {
              {data_median} in {there}. The model was bound on other data, and scoring the \
              fit's θ with it would centre the relations on that data, not on the data the θ \
              was estimated from. Re-parse the model and bind it on the fit's data: \
-             `prepare_run` on the fit's model and data files, or `bind_covariate_stats` on \
-             a freshly parsed model with the fit's population.{routed}"
+             {fix}{routed}"
         )
     }
 
@@ -1322,7 +1329,7 @@ mod from_fit_bindings {
             let err = run_covariance(&fit, Some(lent), pop, &c.opts)
                 .map(|_| ())
                 .expect_err("a design-bound model is refused");
-            assert_eq!(err, stats_refusal(source, mm, dm), "{source:?}");
+            assert_eq!(err, stats_refusal(source, mm, dm, false), "{source:?}");
         }
     }
 
@@ -1345,7 +1352,7 @@ mod from_fit_bindings {
         let err = run_covariance(&fit, Some(lent), Some(&c.prep.population), &c.opts)
             .map(|_| ())
             .expect_err("refused");
-        assert_eq!(err, stats_refusal(Source::Supplied, mm, dm));
+        assert_eq!(err, stats_refusal(Source::Supplied, mm, dm, true));
 
         let err = run_covariance(&fit, Some(lent), None, &c.opts)
             .map(|_| ())
@@ -1390,12 +1397,12 @@ mod from_fit_bindings {
             let err = run_covariance(f, Some(lent), pop, &c.opts)
                 .map(|_| ())
                 .expect_err("refused");
-            assert_eq!(err, stats_refusal(source, mm, dm), "{source:?}");
+            assert_eq!(err, stats_refusal(source, mm, dm, false), "{source:?}");
         }
         // The supplied and re-read texts differ, so neither equality is the other's.
         assert_ne!(
-            stats_refusal(Source::Supplied, mm, dm),
-            stats_refusal(Source::ReRead, mm, dm)
+            stats_refusal(Source::Supplied, mm, dm, false),
+            stats_refusal(Source::ReRead, mm, dm, false)
         );
 
         let got = run_covariance(&routed, Some(fitted), None, &c.opts)
@@ -1434,23 +1441,63 @@ mod from_fit_bindings {
         );
     }
 
-    /// #1729 T4, the escape the refusal advises: a freshly parsed model bound with
-    /// `bind_covariate_stats` on the fit's population runs bit-identical to the
-    /// as-fitted call. (`bind_covariate_stats` on the design's already-bound parse is a
-    /// no-op, which is why the message says "freshly parsed".)
+    /// #1729 T4, the escape the refusal advises, on both sides of its level-block
+    /// gate (#1734 review r1, finding 1). Per kind: the design-bound model's refusal
+    /// advises the routes for that kind, and each advised route runs bit-identical to
+    /// the as-fitted call. `prepare_run` on the fit's files is advised for both; a
+    /// freshly parsed model bound with `bind_covariate_stats` only for `Median`. On
+    /// `LevelMedian` that route is refused on its θ count, because the level block
+    /// stays unbound, which is why the message does not offer it there.
+    /// (`bind_covariate_stats` on the design's already-bound parse is a no-op, which
+    /// is why the message says "freshly parsed".)
+    ///
+    /// Mutations — advise `bind_covariate_stats` for a level model too, or for no
+    /// model: one kind's text equality dies.
     #[test]
-    fn a_freshly_parsed_model_bound_on_the_fit_data_runs() {
-        let c = case(Kind::Median);
-        let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
-        let mut fit = c.fit.clone();
-        fit.data_bindings = Default::default();
+    fn the_advised_route_runs() {
+        for (kind, levels) in [(Kind::Median, false), (Kind::LevelMedian, true)] {
+            let c = case(kind);
+            let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
+            let mut fit = c.fit.clone();
+            fit.data_bindings = Default::default();
+            let pop = Some(&c.prep.population);
 
-        let text = std::fs::read_to_string(&c.model_path).unwrap();
-        let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
-        crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
-        let got = run_covariance(&fit, Some(&parsed.model), Some(&c.prep.population), &c.opts)
-            .expect("the advised route runs");
-        assert_same_covariance(&got, &want, "freshly parsed / empty / Some");
+            let design = design(&c);
+            let lent = &design.parsed.model;
+            let err = run_covariance(&fit, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("refused");
+            let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
+            assert_eq!(
+                err,
+                stats_refusal(Source::Supplied, mm, dm, levels),
+                "{kind:?}"
+            );
+
+            // `prepare_run` on the fit's files: advised for both kinds.
+            let got = run_covariance(&fit, Some(&c.prep.parsed.model), pop, &c.opts)
+                .unwrap_or_else(|e| panic!("{kind:?} prepare_run: {e}"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} prepare_run"));
+
+            // A fresh parse bound with `bind_covariate_stats`: advised only without levels.
+            let text = std::fs::read_to_string(&c.model_path).unwrap();
+            let mut parsed =
+                crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
+            crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
+            let fresh = run_covariance(&fit, Some(&parsed.model), pop, &c.opts);
+            if levels {
+                let err = fresh
+                    .map(|_| ())
+                    .expect_err("the level block stays unbound");
+                assert!(
+                    err.starts_with("run_covariance: the model has n_theta = 6 but the fit has 8"),
+                    "{err}"
+                );
+            } else {
+                let got = fresh.unwrap_or_else(|e| panic!("{kind:?} fresh parse: {e}"));
+                assert_same_covariance(&got, &want, &format!("{kind:?} fresh parse"));
+            }
+        }
     }
 
     /// #1680 review r1, finding 2: with a supplied model and no population, the model
