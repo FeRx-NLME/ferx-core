@@ -39,8 +39,10 @@ go, in the form NONMEM models use — the transform inside the `exp`:
   V  = TVV  * exp(tdist(ETA_V, NU))
 ```
 
-Each function takes exactly two arguments, and a random effect takes one shape:
-`boxcox(tdist(ETA_CL, NU), LAMBDA)` is a parse error. The shape argument is an
+Each function takes exactly two arguments. A shape applied directly to a shaped
+expression, `boxcox(tdist(ETA_CL, NU), LAMBDA)`, is a parse error; the check
+looks inside the call only, so stacking two shapes through an intermediate
+variable is not caught — don't. The shape argument is an
 ordinary expression, usually a θ; a literal (`boxcox(ETA_CL, 0.5)`) fixes it.
 
 `boxcox` is exact through `λ = 0`, where it is `η` itself. The hand-written
@@ -88,9 +90,8 @@ The transforms keep a model on ferx's analytic sensitivities: the kernel is one
 generic function, differentiated exactly by the same `Dual2` machinery as the
 closed-form PK, so FOCE/FOCEI get exact `∂/∂η` and `∂/∂θ` — including `∂/∂λ` —
 with no finite-difference fallback. A shaped ETA is not mu-referenced
-(`log CL = log TVCL + h(η)` has no closed-form typical-value shift), so SAEM and
-importance sampling update its typical value and the shape θ in the numerical
-M-step.
+(`log CL = log TVCL + h(η)` has no closed-form typical-value shift), so SAEM
+updates its typical value and the shape θ in the numerical M-step.
 
 A shaped ETA's omega row is labelled **custom** and prints no `CV%`: `exp(h(η))`
 is not log-normal, and `100·√ω` is not its CV. A shape-aware spread (the CV and

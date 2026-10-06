@@ -28194,22 +28194,6 @@ fn parse_atom(
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
                 let is_clamp = func_name == "clamp";
-                // Reject an unrecognised name here — *before* any argument is
-                // parsed (#1332). An unrecognised name used to become
-                // `UnaryFn(name, arg)`, which every consumer evaluated as the
-                // identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted,
-                // converged and computed `TVCL * ETA_CL`. This is the single site
-                // that builds the node, so the check covers every block whose
-                // expressions go through `parse_atom`, not one block's path.
-                //
-                // Placed above the argument loop rather than next to the `UnaryFn`
-                // return so the *name* is judged before the *arity*: a
-                // two-argument `pow(x, y)` would otherwise fall into the comma
-                // branch below and be reported as "`pow` takes 1 argument", which
-                // sends the reader looking for an arity bug in a function ferx
-                // does not have. `min`/`max`/`clamp` are exempt because they are
-                // desugared below and never reach `UnaryFn`; they keep their own
-                // arity diagnostics.
                 // A shape transform `boxcox(η, λ)` / `tdist(η, ν)` /
                 // `johndraper(η, λ)` (#1716): exactly two arguments, built as the
                 // `BinOp::Shape` its kernel evaluates.
@@ -28244,6 +28228,22 @@ fn parse_atom(
                     let op = BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value);
                     return Ok((Expression::BinOp(Box::new(arg), op, Box::new(shape)), p + 1));
                 }
+                // Reject an unrecognised name here — *before* any argument is
+                // parsed (#1332). An unrecognised name used to become
+                // `UnaryFn(name, arg)`, which every consumer evaluated as the
+                // identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted,
+                // converged and computed `TVCL * ETA_CL`. This is the single site
+                // that builds the node, so the check covers every block whose
+                // expressions go through `parse_atom`, not one block's path.
+                //
+                // Placed above the argument loop rather than next to the `UnaryFn`
+                // return so the *name* is judged before the *arity*: a
+                // two-argument `pow(x, y)` would otherwise fall into the comma
+                // branch below and be reported as "`pow` takes 1 argument", which
+                // sends the reader looking for an arity bug in a function ferx
+                // does not have. `min`/`max`/`clamp` are exempt because they are
+                // desugared below and never reach `UnaryFn`; they keep their own
+                // arity diagnostics. The shape transforms have returned above.
                 if !is_min_max && !is_clamp && !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
                     if func_name == "present" {
                         return Err(format!(
