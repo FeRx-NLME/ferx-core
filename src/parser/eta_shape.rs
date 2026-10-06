@@ -77,6 +77,10 @@ const EXPM1_SERIES_BELOW: f64 = 0.1;
 /// exactly 0 and carries the jets.
 fn expm1_g<T: PkNum>(x: T) -> T {
     let e = x.exp();
+    if !e.val().is_finite() {
+        // `inf − inf` would be NaN; past the overflow `expm1 = exp` (#1721 r1).
+        return e;
+    }
     (e - T::from_f64(e.val())) + T::from_f64(x.val().exp_m1())
 }
 

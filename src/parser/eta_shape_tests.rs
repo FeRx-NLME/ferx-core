@@ -562,3 +562,136 @@ fn a_shaped_eta_read_raw_in_a_named_block_is_refused() {
         .expect("refused");
     assert!(err.contains("[event_model] reads it directly"), "{err}");
 }
+
+/// #1721 review r1, finding 1: the absorption ODE twin carries the shape.
+/// Subjects with time-varying covariates route to the twin, so an unshaped twin
+/// would silently predict with the unshaped CL. The twin's CL must equal the
+/// primary's, and differ from the unshaped one (measured: 7.785347 vs 7.459123
+/// at η_CL = 0.4, λ = 0.5).
+///
+/// Two mechanisms deliver the shape today, and each alone suffices (measured):
+/// the desugar runs before the twin source is built, and the twin source
+/// re-emits every unnamed block — a not-yet-desugared `[eta_shape]` included —
+/// so the twin's own parse desugars it again. Moving the call alone, or dropping
+/// `eta_shape` from the re-emit alone, kills nothing.
+/// Dies under: both at once (call moved after `absorption_ode_equivalent_source`
+/// **and** `"eta_shape"` added to the re-emit's skip list).
+#[test]
+fn the_absorption_twin_carries_the_shape() {
+    let m = parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         theta TVMTT(1.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  theta L(0.5, -3.0, 3.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+         MTT = TVMTT\n  NTR = TVN\n\n\
+         [eta_shape]\n  ETA_CL ~ boxcox(L)\n\n\
+         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("transit model parses");
+    let twin = m
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("a plain transit model carries its ODE twin")
+        .built();
+    assert_eq!(twin.theta_names, m.theta_names, "same θ layout, L included");
+    let th = m.default_params.theta.clone();
+    let eta = [0.4, -0.2];
+    let none = std::collections::HashMap::new();
+    let cl = |model: &CompiledModel| (model.pk_param_fn)(&th, &eta, &none, 0.0).values[0];
+    let unshaped = 5.0 * 0.4f64.exp();
+    assert_eq!(cl(twin), cl(&m), "twin CL == primary CL");
+    assert!(
+        (cl(&m) - unshaped).abs() > 0.1,
+        "the shape is live: {} vs {unshaped}",
+        cl(&m)
+    );
+}
+
+/// #1721 review r1, finding 1: `[eta_shape]` composes with `[covariate_model]`,
+/// giving the same CL as the model written out inline,
+/// `TVCL * (WT/70)^THETA_CL_WT * exp(boxcox(ETA_CL, L))` — and not the unshaped
+/// covariate model. The order of the two desugars does not matter (measured:
+/// running `[eta_shape]` first passes too), so this pins the composition, not an
+/// order.
+/// Dies under: the rewrite's argument order swapped.
+#[test]
+fn eta_shape_composes_with_the_covariate_model() {
+    let src = |indiv: &str, covmodel: &str, eta_shape: &str| {
+        parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(2.0, 0.01, 100.0)\n  theta TVV(20.0, 0.1, 1000.0)\n  \
+             theta L(0.5, -3.0, 3.0)\n{}  omega ETA_CL ~ 0.2\n  omega ETA_V ~ 0.1\n  \
+             sigma EPS ~ 0.01\n\n[covariates]\n  WT continuous\n\n\
+             [individual_parameters]\n{indiv}\n  V = TVV * exp(ETA_V)\n\n{covmodel}{eta_shape}\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n[error_model]\n  \
+             DV ~ proportional(EPS)\n",
+            if covmodel.is_empty() {
+                "  theta THETA_CL_WT(0.75, 0.01, 5.0)\n"
+            } else {
+                ""
+            }
+        ))
+        .unwrap_or_else(|e| panic!("parse: {e}"))
+    };
+    let covmodel =
+        "[covariate_model]\n  CL ~ WT power(center = 70) => THETA_CL_WT(0.75, 0.01, 5.0)\n\n";
+    let block = src(
+        "  CL = TVCL * exp(ETA_CL)",
+        covmodel,
+        "[eta_shape]\n  ETA_CL ~ boxcox(L)\n\n",
+    );
+    let unshaped = src("  CL = TVCL * exp(ETA_CL)", covmodel, "");
+    let inline = src(
+        "  CL = TVCL * (WT / 70)^THETA_CL_WT * exp(boxcox(ETA_CL, L))",
+        "",
+        "",
+    );
+    let cov = std::collections::HashMap::from([("WT".to_string(), 85.0)]);
+    let cl = |m: &CompiledModel, eta: &[f64]| {
+        let mut th = vec![0.0; m.theta_names.len()];
+        for (i, n) in m.theta_names.iter().enumerate() {
+            th[i] = match n.as_str() {
+                "TVCL" => 2.0,
+                "TVV" => 20.0,
+                "L" => 0.5,
+                "THETA_CL_WT" => 0.75,
+                other => panic!("unexpected θ {other}"),
+            };
+        }
+        (m.pk_param_fn)(&th, eta, &cov, 0.0).values[0]
+    };
+    for eta in [[0.4, -0.2], [-0.6, 0.3]] {
+        let (b, i, u) = (cl(&block, &eta), cl(&inline, &eta), cl(&unshaped, &eta));
+        assert!(
+            (b - i).abs() <= 1e-14 * i.abs(),
+            "η {eta:?}: block {b} vs inline {i}"
+        );
+        assert!(
+            (b - u).abs() > 1e-3,
+            "η {eta:?}: the shape is live ({b} vs unshaped {u})"
+        );
+    }
+}
+
+/// Past `exp`'s overflow Box-Cox is `+inf`, the limit, not `NaN` from
+/// `inf − inf` in the value/jet split (#1721 review r1, finding 5). A `NaN`
+/// would poison an objective that an `inf` lets a line search back away from.
+/// Dies under: removing the overflow arm of `expm1_g`.
+#[test]
+fn box_cox_overflows_to_infinity_not_nan() {
+    let v = shape_g(ShapeKind::BoxCox, 800.0, 1.0);
+    assert!(v.is_infinite() && v > 0.0, "boxcox(800, 1) = {v}");
+    let d = shape_g(
+        ShapeKind::BoxCox,
+        Dual2::<2>::var(800.0, 0),
+        Dual2::<2>::var(1.0, 1),
+    );
+    assert!(
+        d.value.is_infinite() && d.value > 0.0,
+        "dual value {}",
+        d.value
+    );
+    // Just below the overflow the split still holds: finite and exact.
+    let x: f64 = 700.0;
+    assert_eq!(shape_g(ShapeKind::BoxCox, x, 1.0), x.exp_m1());
+}
