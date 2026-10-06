@@ -1780,10 +1780,7 @@ fn fit_inner(
                     stage_opts.min_obs_for_convergence_check as usize,
                     stage_opts.inner_restarts,
                     crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
-                    crate::estimation::inner_optimizer::EbeVariance::for_options(
-                        &stage_opts,
-                        model,
-                    ),
+                    &stage_opts,
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,
@@ -1870,8 +1867,10 @@ fn fit_inner(
                     &stage_params.theta,
                     stage_opts.mu_referencing,
                 );
+                // Scored by `pop_nll(.., stage_opts.interaction)` below, so the EBEs follow
+                // that marginal's residual-variance convention (#1722).
                 let (eta_hats, h_matrices, _stats, kappas) =
-                    crate::estimation::inner_optimizer::run_inner_loop_warm(
+                    crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
                         model,
                         population,
                         &stage_params,
@@ -1881,6 +1880,8 @@ fn fit_inner(
                         Some(&mu_k),
                         stage_opts.min_obs_for_convergence_check as usize,
                         stage_opts.inner_restarts,
+                        crate::estimation::inner_optimizer::InnerHessianSeed::None,
+                        &stage_opts,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,

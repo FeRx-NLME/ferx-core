@@ -10,7 +10,6 @@ use crate::estimation::covariate_mu_ref::GroupStepInput;
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
 };
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
@@ -6069,17 +6068,23 @@ pub fn run_saem(
                 .map(|e| DVector::from_column_slice(e))
                 .collect();
             let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &final_params,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&warm_etas),
-                Some(&saem_final_mu_k),
-                0, // SAEM: no EBE convergence tracking
-                0, // SAEM final EBE is warm-started; no inner multi-start
-            );
+            // These EBEs feed `pop_nll(.., options.interaction)`: under interaction off
+            // that is the Sheiner–Beal marginal, whose EBEs hold the residual variance
+            // at f(η = 0) (#1722); the stage options carry that convention.
+            let (eta_hats, h_matrices, _, final_kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+                    model,
+                    population,
+                    &final_params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(&warm_etas),
+                    Some(&saem_final_mu_k),
+                    0, // SAEM: no EBE convergence tracking
+                    0, // SAEM final EBE is warm-started; no inner multi-start
+                    crate::estimation::inner_optimizer::InnerHessianSeed::None,
+                    options,
+                );
             let ofv = 2.0
                 * pop_nll(
                     model,

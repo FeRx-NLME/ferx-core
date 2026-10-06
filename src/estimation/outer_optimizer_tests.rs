@@ -5628,13 +5628,33 @@ mod outer_fd_fallback {
     fn follows_the_interaction_flag() {
         let (model, analytic, _) = analytic_and_declining();
         let x = pack_params(&model.default_params);
-        let zeros = vec![0.0; model.n_eta];
+        // A FOCE EBE, not η = 0: the FOCE gradient's EBE response is the frozen-variance
+        // objective's (#1722), whose inner Hessian is only guaranteed SPD at its mode — at
+        // η = 0 on this fixture it is not, and the FOCE entry point declines.
+        let foce_stage = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            ..FitOptions::default()
+        };
+        let eta = crate::estimation::inner_optimizer::find_ebe_for_stage(
+            &model,
+            &analytic,
+            &model.default_params,
+            200,
+            1e-10,
+            None,
+            None,
+            0,
+            &foce_stage,
+        )
+        .eta;
+        let eta = eta.as_slice();
         let focei = crate::estimation::sens_outer_gradient::subject_packed_gradient(
             &model,
             &analytic,
             &model.default_params,
             &x,
-            &zeros,
+            eta,
         )
         .expect("FOCEI entry point serves the in-scope subject");
         let foce = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
@@ -5642,7 +5662,7 @@ mod outer_fd_fallback {
             &analytic,
             &model.default_params,
             &x,
-            &zeros,
+            eta,
         )
         .expect("FOCE entry point serves the in-scope subject");
         assert!(
@@ -5660,7 +5680,7 @@ mod outer_fd_fallback {
                 &analytic,
                 &model.default_params,
                 &x,
-                &zeros,
+                eta,
                 true
             ),
             Some(focei),
@@ -5672,7 +5692,7 @@ mod outer_fd_fallback {
                 &analytic,
                 &model.default_params,
                 &x,
-                &zeros,
+                eta,
                 false
             ),
             Some(foce),

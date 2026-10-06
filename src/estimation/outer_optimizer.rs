@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
-    find_ebe_with_variance, run_inner_loop_warm_map, run_inner_loop_warm_seeded, EbeVariance,
-    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed,
+    InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
@@ -360,7 +360,7 @@ fn freeze_flat_thetas(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
-        EbeVariance::for_options(options, model),
+        options,
     );
     let mut grad_eval_idx = 0usize;
     let grad = population_gradient(
@@ -434,7 +434,7 @@ fn freeze_flat_thetas(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
-            EbeVariance::for_options(options, model),
+            options,
         );
         2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
     };
@@ -553,7 +553,7 @@ fn evaluate_at_initial_params(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
-            EbeVariance::for_options(options, model),
+            options,
         );
         let ofv = 2.0
             * pop_nll_opts(
@@ -977,12 +977,9 @@ fn agq_inner_solve_policy(
     fused_gradient: bool,
 ) -> InnerSolvePolicy {
     InnerSolvePolicy {
-        seed: InnerHessianSeed::for_options(options),
-        // `Conditional` for every AGQ stage; read from the one helper all the same.
-        ebe_variance: EbeVariance::for_options(options, model),
         capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture() || !fused_gradient)
             && matches!(options.hessian_anchor(), HessianAnchor::Exact),
-        accelerate_exact_outer: false,
+        ..InnerSolvePolicy::for_stage(options, model)
     }
 }
 
@@ -1105,10 +1102,8 @@ fn run_inner_loop_and_nll_prepared(
         return (etas, h_matrices, stats, kappas, nll, evaluation, Vec::new());
     }
     let policy = InnerSolvePolicy {
-        seed: InnerHessianSeed::for_options(options),
-        ebe_variance: EbeVariance::for_options(options, model),
-        capture_terminal_hessian: false,
         accelerate_exact_outer: true,
+        ..InnerSolvePolicy::for_stage(options, model)
     };
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
@@ -3536,7 +3531,7 @@ fn optimize_nlopt_once(
                     options.min_obs_for_convergence_check as usize,
                     options.inner_restarts,
                     InnerHessianSeed::for_options(options),
-                    EbeVariance::for_options(options, model),
+                    options,
                 );
                 score(ehs, hms, kappas)
             };
@@ -4327,7 +4322,7 @@ fn optimize_bfgs(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
-        EbeVariance::for_options(options, model),
+        options,
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -4443,7 +4438,7 @@ fn reconverged_fd_gradient(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
-            EbeVariance::for_options(options, model),
+            options,
         );
         let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if !raw.is_finite()
@@ -4523,7 +4518,7 @@ fn reporting_fd_gradient(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 InnerHessianSeed::for_options(options),
-                EbeVariance::for_options(options, model),
+                options,
             );
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (2.0 * nll, ebe_stats)
@@ -4867,7 +4862,7 @@ fn subject_reconverged_fd_gradient(
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe_with_variance(
+        let ebe = find_ebe_for_stage(
             model,
             subject,
             &params,
@@ -4876,7 +4871,7 @@ fn subject_reconverged_fd_gradient(
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
-            EbeVariance::for_options(options, model),
+            options,
         );
         fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll(
             model,
@@ -4914,7 +4909,7 @@ fn subject_reconverged_fd_gradient_iov(
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe_with_variance(
+        let ebe = find_ebe_for_stage(
             model,
             subject,
             &params,
@@ -4923,7 +4918,7 @@ fn subject_reconverged_fd_gradient_iov(
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
-            EbeVariance::for_options(options, model),
+            options,
         );
         crate::stats::likelihood::foce_subject_nll_iov(
             model,

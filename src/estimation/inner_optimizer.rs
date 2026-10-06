@@ -517,7 +517,9 @@ fn analytic_inner_seed_hessian(
     exact: bool,
     // Non-interaction FOCE's frozen variance point (#1722). The light path's fused first
     // gradient must be the gradient of the objective BFGS minimises, so under a frozen
-    // variance the metric and the fused gradient are both taken at `R⁰` with `∂R/∂f = 0`.
+    // variance it is taken at `R⁰` with `∂R/∂f = 0`. The metric stays the conditional
+    // Gauss–Newton one: any SPD start reaches the same mode (measured: taking it at `R⁰`
+    // too changes no test outcome), while a wrong *gradient* sends the first step astray.
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
@@ -578,28 +580,13 @@ fn analytic_inner_seed_hessian(
                     break;
                 }
                 let mult_row = mult.and_then(|rows| rows.get(j)).map(Vec::as_slice);
-                let f_frozen = frozen_var_preds.map(|f0| f0[j]);
-                let (r, d, d2) = match f_frozen {
-                    Some(f0) => (
-                        crate::stats::residual_error::residual_rd2(
-                            &model.error_spec,
-                            err_keys[j],
-                            f0,
-                            &params.sigma.values,
-                            mult_row,
-                        )
-                        .0,
-                        0.0,
-                        0.0,
-                    ),
-                    None => crate::stats::residual_error::residual_rd2(
-                        &model.error_spec,
-                        err_keys[j],
-                        obs.f,
-                        &params.sigma.values,
-                        mult_row,
-                    ),
-                };
+                let (r, d, d2) = crate::stats::residual_error::residual_rd2(
+                    &model.error_spec,
+                    err_keys[j],
+                    obs.f,
+                    &params.sigma.values,
+                    mult_row,
+                );
                 if !(r.is_finite() && r > 0.0) {
                     valid = false;
                     break;
@@ -621,7 +608,7 @@ fn analytic_inner_seed_hessian(
                     1.0,
                     false,
                     cens,
-                    f_frozen,
+                    frozen_var_preds.map(|f0| f0[j]),
                 ) else {
                     valid = false;
                     break;
@@ -668,10 +655,8 @@ fn analytic_inner_seed_hessian(
             }
         }
     }
-    // The full-provider seed is a metric only (no fused gradient), so the conditional
-    // Gauss–Newton curvature is a valid BFGS start under a frozen variance too; its
-    // `H̃` is not the frozen objective's, but BFGS reaches the frozen mode from any SPD
-    // start — what it must never be handed is the wrong *gradient* (#1722).
+    // The full-provider seed is a metric only (no fused gradient), valid under a frozen
+    // variance for the reason given at `frozen_var_preds` above.
     let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
     crate::estimation::sens_outer_gradient::score_core(
         model,
@@ -823,7 +808,7 @@ impl InnerHessianSeed {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum EbeVariance {
     /// `V` at the conditional prediction `f(η)` — FOCEI, Laplace/AGQ, SAEM, IMP/IMPMAP,
-    /// Bayes, VI, and every caller outside an estimation stage.
+    /// Bayes and VI under interaction, and every caller outside an estimation stage.
     #[default]
     Conditional,
     /// `V` held at `R⁰ = V(f(η = 0))` for the whole search — non-interaction FOCE with a
@@ -836,30 +821,24 @@ impl EbeVariance {
     /// **single** decision every FOCE-path caller reads, so the EBE search and the
     /// marginal it feeds cannot disagree about it.
     ///
-    /// `Population` exactly when the stage's marginal is the Sheiner–Beal one — the
-    /// FOCE family with interaction off and no quadrature — and the error model's
-    /// variance depends on the prediction. Keyed on the `interaction` flag the
-    /// marginal itself reads (`foce_subject_nll`'s `interaction`), not on the method
-    /// name alone: `method = foce` with a caller-supplied `interaction = true` scores
-    /// the FOCEI marginal, and its EBEs must then be FOCEI's too. Additive error is
-    /// `Conditional`: its variance is constant in `f`, so the two conventions are the
-    /// same objective and the conditional path stays bit-identical.
+    /// `Population` exactly when the marginal these EBEs feed is the Sheiner–Beal one —
+    /// interaction off and no quadrature — and the error model's variance depends on the
+    /// prediction. Keyed on the **marginal**, not on the estimator: the `interaction`
+    /// flag is what `foce_subject_nll` reads, so `method = foce` with a caller-supplied
+    /// `interaction = true` scores (and must solve EBEs for) the FOCEI marginal, while a
+    /// non-interaction SAEM, IMP, Bayes or VI fit reports its OFV, covariance and SIR
+    /// weights through the Sheiner–Beal one and needs the frozen EBEs for those (the
+    /// estimators' own E-steps sample the conditional posterior and never come here).
+    /// Additive error is `Conditional`: its variance is constant in `f`, so the two
+    /// conventions are the same objective and the conditional path stays bit-identical.
     pub(crate) fn for_stage(
         method: crate::types::EstimationMethod,
         interaction: bool,
         n_agq: usize,
         model: &CompiledModel,
     ) -> Self {
-        use crate::types::EstimationMethod;
-        let sheiner_beal = !interaction
-            && crate::types::FitOptions::agq_nodes_for(method, n_agq).is_none()
-            && matches!(
-                method,
-                EstimationMethod::Foce
-                    | EstimationMethod::FoceI
-                    | EstimationMethod::FoceGn
-                    | EstimationMethod::FoceGnHybrid
-            );
+        let sheiner_beal =
+            !interaction && crate::types::FitOptions::agq_nodes_for(method, n_agq).is_none();
         if sheiner_beal && model.error_spec.has_f_dependent_variance() {
             Self::Population
         } else {
@@ -888,6 +867,22 @@ pub(crate) struct InnerSolvePolicy {
     /// at the requested tolerance. Diagnostic, covariance, ODE/FREM, FD, and AGQ/Laplace
     /// solves keep strict behaviour.
     pub(crate) accelerate_exact_outer: bool,
+}
+
+impl InnerSolvePolicy {
+    /// The policy of a stage running `options`: its BFGS seed
+    /// ([`InnerHessianSeed::for_options`]) and its residual-variance convention
+    /// ([`EbeVariance::for_options`]), with the historical strict solve otherwise. Callers
+    /// override only the work flags, so neither stage-derived field is ever a value a call
+    /// site chooses (#1722).
+    pub(crate) fn for_stage(options: &crate::types::FitOptions, model: &CompiledModel) -> Self {
+        Self {
+            seed: InnerHessianSeed::for_options(options),
+            ebe_variance: EbeVariance::for_options(options, model),
+            capture_terminal_hessian: false,
+            accelerate_exact_outer: false,
+        }
+    }
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -1365,6 +1360,33 @@ pub(crate) fn find_ebe_with_variance(
             ebe_variance,
             ..InnerSolvePolicy::default()
         },
+    )
+}
+
+/// [`find_ebe_with_variance`] under the convention of the stage `options` describe — what
+/// every production caller uses, so the convention is never a value a call site picks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_for_stage(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    stage: &crate::types::FitOptions,
+) -> EbeResult {
+    find_ebe_with_variance(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        EbeVariance::for_options(stage, model),
     )
 }
 
@@ -4523,7 +4545,7 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
-    run_inner_loop_warm_seeded(
+    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
         params,
@@ -4533,9 +4555,10 @@ pub fn run_inner_loop_warm(
         mu_k,
         min_obs,
         restarts,
-        InnerHessianSeed::None,
-        EbeVariance::Conditional,
-    )
+        InnerSolvePolicy::default(),
+        |_, _| (),
+    );
+    (etas, h_matrices, stats, kappas)
 }
 
 /// [`run_inner_loop_warm`] with the stage's BFGS seed ([`InnerHessianSeed::for_options`]).
@@ -4552,7 +4575,10 @@ pub(crate) fn run_inner_loop_warm_seeded(
     min_obs: usize,
     restarts: usize,
     seed: InnerHessianSeed,
-    ebe_variance: EbeVariance,
+    // The stage whose marginal these EBEs feed. The residual-variance convention is
+    // derived from it here ([`EbeVariance::for_options`]) rather than handed in, so no
+    // caller can pass a convention that disagrees with its own options (#1722).
+    stage: &crate::types::FitOptions,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -4571,7 +4597,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
         restarts,
         InnerSolvePolicy {
             seed,
-            ebe_variance,
+            ebe_variance: EbeVariance::for_options(stage, model),
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
         },

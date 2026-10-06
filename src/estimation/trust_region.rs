@@ -7,9 +7,7 @@ use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
-use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_seeded, EbeVariance, InnerHessianSeed,
-};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::{
     gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
@@ -72,7 +70,7 @@ impl FoceiProblem<'_> {
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
             InnerHessianSeed::for_options(self.options),
-            EbeVariance::for_options(self.options, self.model),
+            self.options,
         );
         *self.cached_etas.lock().unwrap() = etas.clone();
         (etas, h_mats)
@@ -809,7 +807,7 @@ pub fn optimize_trust_region(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
-        EbeVariance::for_options(options, model),
+        options,
     );
 
     let final_ofv = 2.0

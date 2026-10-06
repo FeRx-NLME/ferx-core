@@ -2280,6 +2280,18 @@ pub(crate) fn subject_packed_cov_hessian_foce(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<DMatrix<f64>> {
+    // Scope gap, declined loudly to the FD stencil (#1722). The mode responses this
+    // assembly carries (`inner_eta_responses`: `∂η̂/∂ζ` and `∂²η̂/∂ξ∂ζ`) are those of the
+    // conditional inner objective, built on per-row scalars `α(f)` in which θ reaches the
+    // residual variance only through `f`. A FOCE EBE with a prediction-dependent variance is
+    // the mode of the frozen objective, whose `R⁰` moves with θ through `f(η=0; θ)` — a
+    // channel the second-order response has no term for, measured as a 0.4–0.9% error on
+    // `H[0,0]` against reconverged FD. The covariance step's FD stencil re-solves those
+    // EBEs (`find_ebe_for_stage`) and is exact. Additive error has one inner objective and
+    // stays analytic.
+    if model.error_spec.has_f_dependent_variance() {
+        return None;
+    }
     let params = unpack_params(x, template);
     let sens = covariance_sensitivities(model, subject, &params.theta, eta_hat)?;
     let zeros = vec![0.0; eta_hat.len()];
@@ -2497,8 +2509,33 @@ mod tests {
         subject
     }
 
+    /// The additive-error twin of a proportional fixture. The analytic FOCE covariance
+    /// Hessian serves only a prediction-independent residual variance (#1722: under a
+    /// prediction-dependent one the FOCE EBE is the frozen-variance mode, whose second-order
+    /// response this assembly does not carry, so it declines to the FD stencil — pinned by
+    /// `foce_cov_hessian_declines_under_a_prediction_dependent_variance`). FOCE-arm checks of
+    /// the analytic assembly therefore run on this twin.
+    fn additive(src: &str) -> String {
+        let out = src.replace("DV ~ proportional(PROP_ERR)", "DV ~ additive(PROP_ERR)");
+        assert_ne!(out, src, "fixture has no proportional error line to swap");
+        out
+    }
+
     fn iov_cov_fixture(occasions: usize, block: bool) -> (CompiledModel, Subject) {
-        let mut source = WARFARIN
+        iov_cov_fixture_with(occasions, block, false)
+    }
+
+    fn iov_cov_fixture_with(
+        occasions: usize,
+        block: bool,
+        additive_error: bool,
+    ) -> (CompiledModel, Subject) {
+        let base = if additive_error {
+            additive(WARFARIN)
+        } else {
+            WARFARIN.to_string()
+        };
+        let mut source = base
             .replace(
                 "sigma PROP_ERR ~ 0.04",
                 "kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.15",
@@ -2594,11 +2631,12 @@ mod tests {
             subject_packed_gradient_foce_iov, subject_packed_gradient_iov,
         };
         for (occasions, block) in [(1, false), (2, false), (2, true)] {
-            let (model, s) = iov_cov_fixture(occasions, block);
-            let p = &model.default_params;
-            let x = pack_params(p);
-            let b = precise_iov_mode(&model, &s, p);
             for interaction in [false, true] {
+                // The FOCE arm runs on the additive twin; see `additive`.
+                let (model, s) = iov_cov_fixture_with(occasions, block, !interaction);
+                let p = &model.default_params;
+                let x = pack_params(p);
+                let b = precise_iov_mode(&model, &s, p);
                 let h = if interaction {
                     subject_packed_cov_hessian(&model, &s, p, &x, &b)
                 } else {
@@ -2637,14 +2675,15 @@ mod tests {
         use crate::estimation::sens_outer_gradient::{
             subject_packed_gradient_foce_iov, subject_packed_gradient_iov,
         };
-        let (mut model, mut subject) = iov_cov_fixture(2, false);
-        model.bloq_method = BloqMethod::M3;
-        subject.cens[6] = 1;
-        subject.cens[7] = -1;
-        let p = &model.default_params;
-        let x = pack_params(p);
-        let b = precise_iov_mode(&model, &subject, p);
         for interaction in [false, true] {
+            // The FOCE arm runs on the additive twin; see `additive`.
+            let (mut model, mut subject) = iov_cov_fixture_with(2, false, !interaction);
+            model.bloq_method = BloqMethod::M3;
+            subject.cens[6] = 1;
+            subject.cens[7] = -1;
+            let p = &model.default_params;
+            let x = pack_params(p);
+            let b = precise_iov_mode(&model, &subject, p);
             let h = if interaction {
                 subject_packed_cov_hessian(&model, &subject, p, &x, &b)
             } else {
@@ -2761,7 +2800,9 @@ mod tests {
     #[test]
     fn iov_cov_hessian_preserves_scope_exclusions() {
         use crate::estimation::agq_cov_hessian::prepare_mode;
-        let (mut model, mut subject) = iov_cov_fixture(2, false);
+        // Additive: the FOCE entry point declines every prediction-dependent variance (#1722),
+        // which would make each exclusion below vacuous on its FOCE half.
+        let (mut model, mut subject) = iov_cov_fixture_with(2, false, true);
         let params = model.default_params.clone();
         let x = pack_params(&params);
         let b = vec![0.1; model.n_eta + 2 * model.n_kappa];
@@ -2807,43 +2848,58 @@ mod tests {
         use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
         use crate::estimation::covariance::{analytic_cov_assembly, AnalyticCovAssembly};
         use crate::types::{EstimationMethod, FitOptions, Population};
-        let (model, s2) = iov_cov_fixture(2, false);
-        let (_, mut s1) = iov_cov_fixture(1, false);
-        s1.id = "one-occasion".into();
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
+        // The FOCE arm runs on the additive twin, which the analytic FOCE assembly serves
+        // (#1722); the FOCEI and quadrature arms keep the proportional fixture (the IOV AGQ
+        // assembly declines an additive one).
+        #[allow(clippy::type_complexity)]
+        let setup = |additive_error: bool| -> (
+            CompiledModel,
+            Population,
+            Vec<Vec<f64>>,
+            Vec<DVector<f64>>,
+            Vec<Vec<DVector<f64>>>,
+        ) {
+            let (model, s2) = iov_cov_fixture_with(2, false, additive_error);
+            let (_, mut s1) = iov_cov_fixture_with(1, false, additive_error);
+            s1.id = "one-occasion".into();
+            let pop = Population {
+                subjects: vec![s1, s2],
+                covariate_names: vec![],
+                dv_column: "DV".into(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
+            };
+            let at = unpack_params(&pack_params(&model.default_params), &model.default_params);
+            let modes: Vec<_> = pop
+                .subjects
+                .iter()
+                .map(|s| precise_iov_mode(&model, s, &at))
+                .collect();
+            let eta: Vec<_> = modes
+                .iter()
+                .map(|b| DVector::from_column_slice(&b[..model.n_eta]))
+                .collect();
+            let kap: Vec<Vec<_>> = modes
+                .iter()
+                .map(|b| {
+                    b[model.n_eta..]
+                        .chunks(model.n_kappa)
+                        .map(DVector::from_column_slice)
+                        .collect()
+                })
+                .collect();
+            (model, pop, modes, eta, kap)
         };
-        let p = &model.default_params;
-        let x = pack_params(p);
-        let at = unpack_params(&x, p);
-        let modes: Vec<_> = pop
-            .subjects
-            .iter()
-            .map(|s| precise_iov_mode(&model, s, &at))
-            .collect();
-        let eta: Vec<_> = modes
-            .iter()
-            .map(|b| DVector::from_column_slice(&b[..model.n_eta]))
-            .collect();
-        let kap: Vec<Vec<_>> = modes
-            .iter()
-            .map(|b| {
-                b[model.n_eta..]
-                    .chunks(model.n_kappa)
-                    .map(DVector::from_column_slice)
-                    .collect()
-            })
-            .collect();
         for (method, n_agq, interaction) in [
             (EstimationMethod::Foce, 1, false),
             (EstimationMethod::FoceI, 1, true),
             (EstimationMethod::FoceI, 3, true),
         ] {
+            let (model, pop, modes, eta, kap) = setup(!interaction);
+            let p = &model.default_params;
+            let x = pack_params(p);
+            let at = unpack_params(&x, p);
             let opts = FitOptions {
                 method,
                 n_agq,
@@ -2852,7 +2908,7 @@ mod tests {
             };
             let actual = analytic_cov_assembly(&model, &pop, p, &x, &eta, &kap, &opts)
                 .full()
-                .expect("IOV route must be used");
+                .unwrap_or_else(|| panic!("IOV route must be used: {method:?} n_agq {n_agq}"));
             let mut expected = DMatrix::zeros(x.len(), x.len());
             for (s, b) in pop.subjects.iter().zip(&modes) {
                 let h = if n_agq > 1 {
@@ -2883,6 +2939,9 @@ mod tests {
                 "missing joint modes must decline"
             );
         }
+        let (model, pop, _, eta, kap) = setup(false);
+        let p = &model.default_params;
+        let x = pack_params(p);
         for n_agq in [1, 3] {
             let opts = FitOptions {
                 method: EstimationMethod::Laplace,
@@ -3232,6 +3291,62 @@ mod tests {
         }
     }
 
+    /// #1722 routing: the analytic FOCE covariance Hessian declines exactly when the FOCE EBE
+    /// is the frozen-variance mode — a prediction-dependent residual variance — and serves
+    /// additive error; FOCEI is unaffected. Non-IOV and IOV, proportional and combined, so a
+    /// gate keyed on one error model, one entry point or one random-effect layout fails here.
+    #[test]
+    fn foce_cov_hessian_declines_under_a_prediction_dependent_variance() {
+        let combined = WARFARIN
+            .replace(
+                "sigma PROP_ERR ~ 0.04",
+                "sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 0.5",
+            )
+            .replace(
+                "DV ~ proportional(PROP_ERR)",
+                "DV ~ combined(PROP_ERR, ADD_ERR)",
+            );
+        for (label, src, frozen) in [
+            ("proportional", WARFARIN.to_string(), true),
+            ("combined", combined, true),
+            ("additive", additive(WARFARIN), false),
+        ] {
+            let model = parse_model_string(&src).expect("parse");
+            assert_eq!(
+                model.error_spec.has_f_dependent_variance(),
+                frozen,
+                "{label}"
+            );
+            let theta = vec![0.2, 10.0, 1.5];
+            let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+            let mut params = model.default_params.clone();
+            params.theta = theta;
+            let eta = precise_ebe(&model, &subject, &params);
+            let x = pack_params(&params);
+            assert!(
+                subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_some(),
+                "{label}: FOCEI stays analytic"
+            );
+            assert_eq!(
+                subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_none(),
+                frozen,
+                "{label}: FOCE declines iff the variance depends on the prediction"
+            );
+        }
+        for additive_error in [false, true] {
+            let (model, s) = iov_cov_fixture_with(2, false, additive_error);
+            let p = &model.default_params;
+            let x = pack_params(p);
+            let b = precise_iov_mode(&model, &s, p);
+            assert!(subject_packed_cov_hessian(&model, &s, p, &x, &b).is_some());
+            assert_eq!(
+                subject_packed_cov_hessian_foce(&model, &s, p, &x, &b).is_none(),
+                !additive_error,
+                "IOV, additive = {additive_error}"
+            );
+        }
+    }
+
     /// Validate the full FOCE (Sheiner–Beal) natural Hessian — fixed part **plus**
     /// the η̂-mode response — by chaining it to packed space and comparing against a
     /// reconverged precise-EBE FD of the exact FOCE packed gradient.
@@ -3457,7 +3572,7 @@ mod tests {
     /// reconverged FD of the FOCE packed gradient.
     #[test]
     fn cov_hessian_foce_full_matches_reconverged_fd_diagonal() {
-        let model = parse_model_string(WARFARIN).expect("parse");
+        let model = parse_model_string(&additive(WARFARIN)).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
         let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
         let mut params = model.default_params.clone();
@@ -3467,7 +3582,7 @@ mod tests {
 
     #[test]
     fn cov_hessian_foce_m3_matches_reconverged_gradient() {
-        let mut model = parse_model_string(WARFARIN).expect("parse");
+        let mut model = parse_model_string(&additive(WARFARIN)).expect("parse");
         model.bloq_method = BloqMethod::M3;
         let theta = vec![0.2, 10.0, 1.5];
         let mut subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
@@ -3498,7 +3613,7 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
-        let model = parse_model_string(BLOCK).expect("parse");
+        let model = parse_model_string(&additive(BLOCK)).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
         let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
         let mut params = model.default_params.clone();
@@ -4517,7 +4632,9 @@ mod tests {
         };
         use crate::types::{EstimationMethod, FitOptions, Population};
 
-        let model = parse_model_string(WARFARIN).expect("parse");
+        // Additive, so both entry points are served analytically (#1722); the wiring and the
+        // OFV scaling under test do not depend on the error model.
+        let model = parse_model_string(&additive(WARFARIN)).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
         let mut params = model.default_params.clone();
         params.theta = theta.clone();
@@ -5568,7 +5685,8 @@ mod tests {
     /// an admitted path with separate FOCE and FOCEI assemblies.
     #[test]
     fn analytic_cov_hessian_gates_out_of_scope() {
-        let mut model = parse_model_string(WARFARIN).expect("parse");
+        // Additive, so "in scope" holds for both entry points (#1722).
+        let mut model = parse_model_string(&additive(WARFARIN)).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
         let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
         let mut params = model.default_params.clone();

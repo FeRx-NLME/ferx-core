@@ -3776,7 +3776,11 @@ mod frozen_ebe_variance {
             0,
             0,
             InnerHessianSeed::GaussNewton,
-            EbeVariance::Population,
+            &crate::types::FitOptions {
+                method: EstimationMethod::Foce,
+                interaction: false,
+                ..Default::default()
+            },
         );
         assert_eq!(
             stats.n_fallback, 0,
@@ -3810,8 +3814,23 @@ mod frozen_ebe_variance {
             !add.error_spec.has_f_dependent_variance(),
             "fixture: additive"
         );
+        // Keyed on the marginal, not the estimator: every method whose EBEs feed the
+        // Sheiner–Beal marginal (interaction off, no quadrature) — including a
+        // non-interaction SAEM/IMP/Bayes/VI fit's OFV, covariance and SIR evaluations —
+        // takes the frozen variance; interaction on, or a quadrature anchor, never does.
+        let all = [
+            Foce,
+            FoceI,
+            FoceGn,
+            FoceGnHybrid,
+            Saem,
+            Imp,
+            Impmap,
+            Bayes,
+            Vi,
+        ];
         for m in [&prop, &comb] {
-            for method in [Foce, FoceGn, FoceGnHybrid] {
+            for method in all {
                 assert_eq!(
                     EbeVariance::for_stage(method, false, 1, m),
                     EbeVariance::Population,
@@ -3823,29 +3842,19 @@ mod frozen_ebe_variance {
                     "{method:?} + interaction"
                 );
             }
-            // FOCEI, quadrature (Laplace, and FOCEI with n_agq > 1) and every sampling
-            // estimator keep the conditional variance even with interaction off.
-            assert_eq!(
-                EbeVariance::for_stage(FoceI, true, 1, m),
-                EbeVariance::Conditional
-            );
-            assert_eq!(
-                EbeVariance::for_stage(Laplace, false, 1, m),
-                EbeVariance::Conditional
-            );
-            assert_eq!(
-                EbeVariance::for_stage(FoceI, false, 3, m),
-                EbeVariance::Conditional
-            );
-            for method in [Saem, Imp, Impmap, Bayes, Vi] {
-                assert_eq!(
-                    EbeVariance::for_stage(method, false, 1, m),
-                    EbeVariance::Conditional,
-                    "{method:?}"
-                );
+            // Quadrature (Laplace at any node count, FOCEI with n_agq > 1) scores its own
+            // marginal at the conditional mode, interaction flag or not.
+            for (method, n_agq) in [(Laplace, 1), (Laplace, 3), (FoceI, 3)] {
+                for interaction in [false, true] {
+                    assert_eq!(
+                        EbeVariance::for_stage(method, interaction, n_agq, m),
+                        EbeVariance::Conditional,
+                        "{method:?} n_agq {n_agq} interaction {interaction}"
+                    );
+                }
             }
         }
-        for method in [Foce, FoceGn, FoceGnHybrid] {
+        for method in all {
             assert_eq!(
                 EbeVariance::for_stage(method, false, 1, &add),
                 EbeVariance::Conditional,

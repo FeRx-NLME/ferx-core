@@ -13,9 +13,7 @@
 ///
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
-use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_seeded, EbeVariance, InnerHessianSeed,
-};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -137,7 +135,7 @@ pub fn run_foce_gn(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
-        EbeVariance::for_options(options, model),
+        options,
     );
 
     let mut ofv_clean = 2.0
@@ -302,7 +300,7 @@ pub fn run_foce_gn(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
-            EbeVariance::for_options(options, model),
+            options,
         );
         let ofv_try_clean = 2.0
             * pop_nll(
