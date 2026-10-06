@@ -27257,6 +27257,13 @@ pub struct IndivParamPartials {
     /// Written only by `parse_full_model_with`; read through
     /// [`crate::CompiledModel::data_bindings`]. Empty for hand-built fixtures.
     pub(crate) data_bindings: DataBindings,
+    /// Whether this model was laid out on a **fit's** data-derived bindings
+    /// (#1730): set by `FitLayout::apply` (`bind_from_fit`, `layout_from_fit`) and
+    /// the deprecated `bind_theta_levels_from_fit`, never by the parse. Read through
+    /// [`crate::CompiledModel::bound_from_fit`]: such a model keeps the fit's
+    /// bindings, so `bind_covariate_stats` leaves it as it is and `bind_theta_levels`
+    /// refuses it, where a model bound to data is re-bound from its declaration.
+    pub(crate) bound_from_fit: bool,
     /// Whether the closed-form log-normal η chain (`pk · sel_flat`) is exact
     /// for this model, computed by `lognormal_eta_chain_exact`. `None` for
     /// hand-built fixtures, which have no statements to measure: the providers
@@ -27278,6 +27285,7 @@ impl IndivParamPartials {
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
             data_bindings: DataBindings::default(),
+            bound_from_fit: false,
             lognormal_eta_chain: None,
         }
     }
@@ -27385,6 +27393,7 @@ fn build_indiv_param_partials(
         theta_blocks: ThetaBlocks::empty(),
         const_pk_slots: Vec::new(),
         data_bindings: DataBindings::default(),
+        bound_from_fit: false,
         lognormal_eta_chain: None,
     }
 }
