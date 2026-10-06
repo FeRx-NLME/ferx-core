@@ -9,7 +9,7 @@ use crate::estimation::cov_diagnostics::{
     format_offdiag_nan_warning, format_regularized_warning, format_salvage_note, CovHessianSource,
     CovRegularizationFacts, CovScopeDecline, OdeToleranceFacts,
 };
-use crate::estimation::inner_optimizer::find_ebe;
+use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::types::*;
@@ -621,6 +621,14 @@ fn analytic_cov_declines(
     if options.agq_nodes().is_some() && options.hessian_anchor() != HessianAnchor::GaussNewton {
         out.push(CovScopeDecline::ExactHessianAnchor);
     }
+    // Mirrors the FOCE assembly's bail (#1722): `analytic_cov_assembly` takes the FOCE entry
+    // point exactly when there is no quadrature and interaction is off.
+    if options.agq_nodes().is_none()
+        && !options.interaction
+        && crate::estimation::sens_cov_hessian::foce_cov_declines_frozen_variance(model)
+    {
+        out.push(CovScopeDecline::FoceFrozenResidualVariance);
+    }
     let iov = model.n_kappa > 0;
     for subject in &population.subjects {
         for decline in crate::sens::provider::covariance_scope_declines(model, subject, iov) {
@@ -1115,7 +1123,7 @@ pub(super) fn reconverge_population(
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
     for i in 0..n {
-        let ebe = find_ebe(
+        let ebe = find_ebe_for_stage(
             model,
             &pop.subjects[i],
             &params,
@@ -1124,6 +1132,7 @@ pub(super) fn reconverge_population(
             Some(warm[i].as_slice()),
             Some(&mu_k),
             0,
+            options,
         );
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
@@ -2263,6 +2272,108 @@ mod tests {
     };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
+
+    /// #1722: a FOCE fit with a prediction-dependent residual variance declines the analytic
+    /// covariance in `subject_packed_cov_hessian_foce`, and the walk that names the declining
+    /// clause must say so rather than fall through to `PerSubjectBail` ("genuine drift"). Both
+    /// sides of the gate in one test — FOCE + proportional names it; FOCEI + proportional and
+    /// FOCE + additive do not, and neither does a quadrature fit — so a walk clause stuck on
+    /// either branch fails here. And the assembly agrees: every subject declines exactly when
+    /// the clause is named.
+    #[test]
+    fn the_decline_walk_names_the_frozen_variance_foce_bail() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::types::{EstimationMethod, FitOptions};
+        // Single-dose warfarin: inside every other analytic-covariance clause (the IOV data's
+        // multi-dose subjects route to the event walk, which would decline FOCEI too).
+        let src = std::fs::read_to_string("examples/warfarin.ferx").expect("model file");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        let prop = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        let add = crate::parser::model_parser::parse_model_string(
+            &src.replace("DV ~ proportional(PROP_ERR)", "DV ~ additive(PROP_ERR)"),
+        )
+        .expect("parse");
+        let opts = |method, interaction, n_agq| FitOptions {
+            method,
+            interaction,
+            n_agq,
+            ..FitOptions::default()
+        };
+        for (label, model, o, named) in [
+            (
+                "foce+prop",
+                &prop,
+                opts(EstimationMethod::Foce, false, 1),
+                true,
+            ),
+            (
+                "focei+prop",
+                &prop,
+                opts(EstimationMethod::FoceI, true, 1),
+                false,
+            ),
+            (
+                "foce+add",
+                &add,
+                opts(EstimationMethod::Foce, false, 1),
+                false,
+            ),
+            (
+                "agq+prop",
+                &prop,
+                opts(EstimationMethod::FoceI, true, 3),
+                false,
+            ),
+            // Quadrature with interaction off: the AGQ clause alone keeps it out.
+            (
+                "laplace+prop, interaction off",
+                &prop,
+                opts(EstimationMethod::Laplace, false, 1),
+                false,
+            ),
+        ] {
+            let declines = super::analytic_cov_declines(model, &pop, &o, false);
+            assert_eq!(
+                declines.contains(&CovScopeDecline::FoceFrozenResidualVariance),
+                named,
+                "{label}: {declines:?}"
+            );
+            if named {
+                assert!(
+                    !declines.contains(&CovScopeDecline::PerSubjectBail),
+                    "{label}: the walk must name the clause, not report drift: {declines:?}"
+                );
+            }
+            // The assembly itself: with frozen EBEs it declines every subject. (The quadrature
+            // arm differentiates the grid, not this entry point — walk half only.)
+            if o.agq_nodes().is_some() {
+                continue;
+            }
+            let p = model.default_params.clone();
+            let x = crate::estimation::parameterization::pack_params(&p);
+            let etas: Vec<nalgebra::DVector<f64>> = pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    crate::estimation::inner_optimizer::find_ebe_for_stage(
+                        model, s, &p, 200, 1e-8, None, None, 0, &o,
+                    )
+                    .eta
+                })
+                .collect();
+            let assembly = super::analytic_cov_assembly(model, &pop, &p, &x, &etas, &[], &o);
+            assert_eq!(
+                matches!(assembly, super::AnalyticCovAssembly::Unavailable),
+                named,
+                "{label}: the assembly declines iff the walk names the clause ({declines:?})"
+            );
+        }
+    }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
 

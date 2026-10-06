@@ -274,7 +274,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     use crate::parser::model_parser::parse_model_string;
     const ANALYTICAL: &str = r#"
 [parameters]
-  theta TVCL(5.0, 0.1, 50.0)
+  theta TVCL(2.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
@@ -292,7 +292,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
 "#;
     const ODE: &str = r#"
 [parameters]
-  theta TVCL(5.0, 0.1, 50.0)
+  theta TVCL(2.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
@@ -336,6 +336,15 @@ fn test_iov_ode_fit_matches_analytical_twin() {
         Optimizer::NloptLbfgs,
         "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
     );
+    // Start TVCL = 2.0, not the 5.0 this test used before #1722. #1722 froze the FOCE EBE
+    // search's residual variance at f(η = 0), which moved this FOCE optimum onto the ω²_CL
+    // lower rail (OFV 148.170689, ω²_CL = 6.1e-6, TVV on its bound). Measured on macOS
+    // arm64, both engines reach that point from TVCL = 2.0, 1.0 and 0.5 (OFV equal to
+    // 2e-9, TVCL 0.37698 on both); from 5.0 the closed form still does but the ODE twin's
+    // L-BFGS path stops at 148.549 (TVCL 2.44, ω² 3.15) — the far-start basin capture the
+    // comment above describes for built-in BFGS. Scored at each other's stopping points
+    // the two engines agree to 4e-10, so the objective is one function; the start is what
+    // differs. 2.0 keeps the start far from the optimum on the log scale (×5.3).
     let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
     opts.outer_maxiter = 200;
 

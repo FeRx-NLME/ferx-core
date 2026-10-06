@@ -23,7 +23,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::estimation::inner_optimizer::{find_ebe, InnerLoopStats};
+use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{omega_packed_len, pack_params, theta_packs_log};
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{eval_mixing_log_probs, mixing_logp_grad, MixtureClassGuard};
@@ -153,7 +153,7 @@ pub fn mixture_ofv(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
-            let ebe = find_ebe(
+            let ebe = find_ebe_for_stage(
                 model,
                 subject,
                 &cp,
@@ -162,6 +162,7 @@ pub fn mixture_ofv(
                 warm_i,
                 None,
                 options.inner_restarts,
+                options,
             );
             // Inter-occasion variability (#985): `find_ebe` already routes to the
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base
@@ -705,6 +706,71 @@ mod tests {
         assert!(
             (o_iov - o_no).abs() > 1e-6,
             "IOV marginal must change the OFV: iov {o_iov} vs no-iov {o_no}"
+        );
+    }
+
+    /// #1722 review finding 1: each class's EBE solve follows the stage's residual-variance
+    /// convention — under a non-interaction stage with a proportional error, bit-identical to
+    /// the frozen-variance solve of that class (under its `MIXNUM` guard), under interaction
+    /// to the conditional one; the two differ on this fixture.
+    #[test]
+    fn mixture_class_solves_follow_the_stage_convention() {
+        use crate::estimation::inner_optimizer::{find_ebe_with_variance, EbeVariance};
+        let model = crate::parser::model_parser::parse_model_string(
+            &MIX_FIT_MODEL.replace("sigma EPS ~ 0.01", "sigma EPS ~ 0.09"),
+        )
+        .unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let params = &model.default_params;
+        let mut sep = 0.0_f64;
+        for interaction in [false, true] {
+            let opts = crate::types::FitOptions {
+                method: if interaction {
+                    crate::types::EstimationMethod::FoceI
+                } else {
+                    crate::types::EstimationMethod::Foce
+                },
+                interaction,
+                ..Default::default()
+            };
+            let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+            for (cls, etas) in eval.etas_by_class.iter().enumerate() {
+                let _guard = crate::parser::model_parser::MixtureClassGuard::enter(cls + 1);
+                let cp = super::class_params(params, cls);
+                for (s, got) in pop.subjects.iter().zip(etas) {
+                    let solve = |v| {
+                        find_ebe_with_variance(
+                            &model,
+                            s,
+                            &cp,
+                            opts.inner_maxiter,
+                            opts.inner_tol,
+                            None,
+                            None,
+                            opts.inner_restarts,
+                            v,
+                        )
+                        .eta
+                    };
+                    let (frozen, cond) = (
+                        solve(EbeVariance::Population),
+                        solve(EbeVariance::Conditional),
+                    );
+                    let want = if interaction { &cond } else { &frozen };
+                    for (a, b) in got.iter().zip(want.iter()) {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "interaction {interaction}, class {cls}"
+                        );
+                    }
+                    sep = sep.max((&frozen - &cond).amax());
+                }
+            }
+        }
+        assert!(
+            sep > 1e-3,
+            "the conventions must separate on this fixture ({sep:e})"
         );
     }
 

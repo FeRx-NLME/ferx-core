@@ -241,6 +241,37 @@ fn sigma_fd_step_keeps_minus_side_positive() {
 /// would be meaningless (the Eq. 46 EBE-response identity only holds at the
 /// actual stationary point).
 fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> Vec<f64> {
+    precise_ebe_with(model, subject, params, false)
+}
+
+/// [`precise_ebe`] of the **FOCE** inner objective (#1722): the residual variance held at
+/// the population prediction `f(η = 0)` for the whole search, so `∂R/∂f = 0` in the
+/// Newton (NONMEM `METHOD=1` without `INTER`). For additive error there is no frozen point
+/// (`population_variance_preds` is `None`) and this is [`precise_ebe`].
+fn precise_ebe_foce(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+) -> Vec<f64> {
+    precise_ebe_with(model, subject, params, true)
+}
+
+fn precise_ebe_with(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    foce: bool,
+) -> Vec<f64> {
+    let f0 = foce
+        .then(|| {
+            crate::stats::likelihood::population_variance_preds(
+                model,
+                subject,
+                &params.theta,
+                model.n_eta,
+            )
+        })
+        .flatten();
     let warm = find_ebe(model, subject, params, 80, 1e-10, None, None, 0);
     let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
     let n_eta = model.n_eta;
@@ -263,6 +294,7 @@ fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameter
                 .collect::<Vec<_>>(),
         );
         let mut hess = omega_inv.clone();
+        let mut gauss_newton = omega_inv.clone();
         let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
         for (j, obs) in sens.obs.iter().enumerate() {
             let f = obs.f;
@@ -272,6 +304,25 @@ fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameter
             let frem_var = frem_r.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
             let (r, d, d2) = match (frem_var, mult_row) {
                 (Some(v), _) => (v, 0.0, 0.0),
+                // FOCE: the variance at the frozen f(η=0), constant in η (#1722).
+                (None, Some(m)) if f0.is_some() => (
+                    model.error_spec.variance_at_scaled(
+                        cmt,
+                        f0.as_ref().unwrap()[j],
+                        sigma,
+                        &[],
+                        m,
+                    ),
+                    0.0,
+                    0.0,
+                ),
+                (None, None) if f0.is_some() => (
+                    model
+                        .error_spec
+                        .variance_at(cmt, f0.as_ref().unwrap()[j], sigma),
+                    0.0,
+                    0.0,
+                ),
                 (None, Some(m)) => (
                     model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m),
                     model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
@@ -297,10 +348,18 @@ fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameter
                 grad[k] += g1 * a[k];
                 for l in 0..n_eta {
                     hess[(k, l)] += g2 * a[k] * a[l] + g1 * obs.d2f_deta2[k * n_eta + l];
+                    gauss_newton[(k, l)] += g2 * a[k] * a[l];
                 }
             }
         }
-        let step = hess.cholesky().unwrap().solve(&grad);
+        // The fixed point is the gradient root whatever the metric; Gauss–Newton is the
+        // fallback when the full Hessian is not SPD — measured on the #1498 fixture under
+        // the FOCE objective, whose `R⁰` sits on the 1e-12 variance floor and makes
+        // `g1·∂²f/∂η²` a 1e12-weighted indefinite term (#1722).
+        let step = match hess.cholesky() {
+            Some(c) => c.solve(&grad),
+            None => gauss_newton.cholesky().unwrap().solve(&grad),
+        };
         for k in 0..n_eta {
             eta[k] -= step[k];
         }
@@ -396,9 +455,9 @@ fn marginal_nll_foce_at(
     )
 }
 
-/// Reconverged FOCE marginal NLL at the precisely-located (shared) EBE.
+/// Reconverged FOCE marginal NLL at the precisely-located FOCE (frozen-variance) EBE.
 fn marginal_nll_foce(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> f64 {
-    let eta = precise_ebe(model, subject, params);
+    let eta = precise_ebe_foce(model, subject, params);
     marginal_nll_foce_at(model, subject, params, &eta)
 }
 
@@ -418,7 +477,7 @@ fn run_packed_check_foce(model: &CompiledModel, theta: &[f64]) {
     let ehs: Vec<DVector<f64>> = pop
         .subjects
         .iter()
-        .map(|s| DVector::from_vec(precise_ebe(model, s, &params)))
+        .map(|s| DVector::from_vec(precise_ebe_foce(model, s, &params)))
         .collect();
 
     let analytic =
@@ -830,6 +889,40 @@ fn precise_ebe_corr(
     subject: &Subject,
     params: &ModelParameters,
 ) -> Vec<f64> {
+    precise_ebe_corr_with(model, subject, params, false)
+}
+
+/// FOCE twin of [`precise_ebe_corr`]: the correlation-aware variance held at `f(η=0)`
+/// (#1722).
+fn precise_ebe_corr_foce(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+) -> Vec<f64> {
+    precise_ebe_corr_with(model, subject, params, true)
+}
+
+fn precise_ebe_corr_with(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    foce: bool,
+) -> Vec<f64> {
+    let frozen_rv = foce.then(|| {
+        let zeros = vec![0.0; model.n_eta];
+        let sens0 =
+            crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &zeros)
+                .unwrap();
+        corr_residual_diag(
+            model,
+            subject,
+            &sens0,
+            &params.sigma.values,
+            &params.residual_correlations,
+        )
+        .unwrap()
+        .0
+    });
     let warm = find_ebe(model, subject, params, 80, 1e-12, None, None, 0);
     let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
     let n_eta = model.n_eta;
@@ -842,9 +935,11 @@ fn precise_ebe_corr(
         // The **live** correlations (#847). Reading them off `model` here would
         // reconverge every FD-perturbed EBE at the *declared* ρ, so the FD
         // reference would silently omit the ρ coordinate's EBE-response term.
-        let (rv, dv, d2v) =
-            corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
-                .unwrap();
+        let (rv, dv, d2v) = match &frozen_rv {
+            Some(r0) => (r0.clone(), vec![0.0; r0.len()], vec![0.0; r0.len()]),
+            None => corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
+                .unwrap(),
+        };
         let mut grad = DVector::<f64>::from_column_slice(
             &(omega_inv * DVector::from_column_slice(&eta))
                 .iter()
@@ -973,7 +1068,7 @@ fn population_packed_gradient_block_sigma_foce_matches_fd() {
     let ehs: Vec<DVector<f64>> = pop
         .subjects
         .iter()
-        .map(|s| DVector::from_vec(precise_ebe_corr(&model, s, &params)))
+        .map(|s| DVector::from_vec(precise_ebe_corr_foce(&model, s, &params)))
         .collect();
 
     let analytic = population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
@@ -985,7 +1080,7 @@ fn population_packed_gradient_block_sigma_foce_matches_fd() {
             .subjects
             .iter()
             .map(|s| {
-                let eta = precise_ebe_corr(&model, s, &p);
+                let eta = precise_ebe_corr_foce(&model, s, &p);
                 marginal_nll_foce_at(&model, s, &p, &eta)
             })
             .sum::<f64>()
@@ -1261,8 +1356,22 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
         // The production per-subject objective with the EBE re-solved at `p`: the
         // reference both the analytic subject's exact gradient and the paired subject's
         // reconverged salvage are gradients of.
-        let solve =
-            |s: &Subject, p: &ModelParameters| find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
+        // The EBE the stage's own marginal is linearised around (#1722).
+        let ebe_variance =
+            crate::estimation::inner_optimizer::EbeVariance::for_options(&options, &model);
+        let solve = |s: &Subject, p: &ModelParameters| {
+            crate::estimation::inner_optimizer::find_ebe_with_variance(
+                &model,
+                s,
+                p,
+                200,
+                1e-12,
+                None,
+                None,
+                0,
+                ebe_variance,
+            )
+        };
         let nll = |s: &Subject, p: &ModelParameters| -> f64 {
             let e = solve(s, p);
             foce_subject_nll(
@@ -1808,6 +1917,48 @@ fn eta_dx_matches_fd() {
     }
 }
 
+/// T5 (#1722): the FOCE EBE response is that of the frozen-variance inner objective.
+/// Checked coordinate by coordinate against FD of the re-solved FOCE EBE, at σ ≈ 20% where
+/// the two conventions' responses differ — and asserted to differ, so a response that
+/// fell back to the conditional one cannot pass.
+#[test]
+fn foce_eta_dx_matches_fd_of_reconverged_frozen_ebe() {
+    use crate::estimation::parameterization::pack_params;
+    // WARFARIN's proportional σ² = 0.04: σ = 20%.
+    let model = parse_model_string(WARFARIN).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4];
+    let subject = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+    let mut template = model.default_params.clone();
+    template.theta = theta.clone();
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+    let eta_hat = precise_ebe_foce(&model, &subject, &params);
+
+    let jac = subject_eta_dx_foce(&model, &subject, &template, &x, &eta_hat).expect("supported");
+    let cond = subject_eta_dx(&model, &subject, &template, &x, &eta_hat).expect("supported");
+    let n_eta = model.n_eta;
+    let mut sep = 0.0_f64;
+    for k in 0..x.len() {
+        let h = 1e-5 * (1.0 + x[k].abs());
+        let mut xp = x.clone();
+        xp[k] += h;
+        let mut xm = x.clone();
+        xm[k] -= h;
+        let ep = precise_ebe_foce(&model, &subject, &unpack_params(&xp, &template));
+        let em = precise_ebe_foce(&model, &subject, &unpack_params(&xm, &template));
+        for l in 0..n_eta {
+            let fd = (ep[l] - em[l]) / (2.0 * h);
+            assert!(jac[k][l].is_finite() && fd.is_finite());
+            approx::assert_relative_eq!(jac[k][l], fd, max_relative = 2e-3, epsilon = 1e-6);
+            sep = sep.max((jac[k][l] - cond[k][l]).abs());
+        }
+    }
+    assert!(
+        sep > 1e-2,
+        "frozen and conditional responses must differ here ({sep:e})"
+    );
+}
+
 #[test]
 fn eta_dx_reused_base_jet_matches_wrapper_bit_exactly() {
     let model = parse_model_string(WARFARIN).expect("parse");
@@ -2190,11 +2341,17 @@ fn population_packed_gradient_reset_matches_fd() {
         .collect();
 
     // Both FOCEI (Almquist Laplace) and FOCE (Sheiner–Beal) paths.
+    // FOCE is linearised around its own (frozen-variance) EBE, #1722.
+    let ehs_foce: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
+        .collect();
     for interaction in [true, false] {
         let analytic = if interaction {
             population_gradient_sens(&model, &pop, &template, &x, &ehs)
         } else {
-            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs_foce)
         }
         .expect("reset subject supported by analytic gradient");
 
@@ -2255,11 +2412,17 @@ fn ss_reset_subject_is_analytic_and_matches_fd() {
         .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
         .collect();
 
+    // FOCE is linearised around its own (frozen-variance) EBE, #1722.
+    let ehs_foce: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
+        .collect();
     for interaction in [true, false] {
         let analytic = if interaction {
             population_gradient_sens(&model, &pop, &template, &x, &ehs)
         } else {
-            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs_foce)
         }
         .expect("SS+reset population must take the all-or-nothing analytic path");
 
@@ -2603,11 +2766,17 @@ fn population_packed_gradient_tvcov_matches_fd() {
         .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
         .collect();
 
+    // FOCE is linearised around its own (frozen-variance) EBE, #1722.
+    let ehs_foce: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
+        .collect();
     for interaction in [true, false] {
         let analytic = if interaction {
             population_gradient_sens(&model, &pop, &template, &x, &ehs)
         } else {
-            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs_foce)
         }
         .expect("TV-cov subject supported by analytic gradient");
 
@@ -2714,11 +2883,17 @@ fn population_packed_gradient_init_matches_fd() {
         .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
         .collect();
 
+    // FOCE is linearised around its own (frozen-variance) EBE, #1722.
+    let ehs_foce: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
+        .collect();
     for interaction in [true, false] {
         let analytic = if interaction {
             population_gradient_sens(&model, &pop, &template, &x, &ehs)
         } else {
-            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs_foce)
         }
         .expect("init subject supported by analytic gradient");
 
@@ -3252,7 +3427,7 @@ fn population_packed_gradient_m3_foce_matches_fd() {
     let ehs: Vec<DVector<f64>> = pop
         .subjects
         .iter()
-        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
         .collect();
 
     let analytic =
@@ -3353,7 +3528,7 @@ fn population_packed_gradient_foce_init_infusion_matches_fd() {
     let ehs: Vec<DVector<f64>> = pop
         .subjects
         .iter()
-        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+        .map(|s| DVector::from_vec(precise_ebe_foce(&model, s, &params)))
         .collect();
     let analytic =
         population_gradient_sens_foce(&model, &pop, &template, &x, &ehs).expect("supported");
@@ -3554,7 +3729,37 @@ fn precise_ebe_iov(
     subject: &Subject,
     params: &ModelParameters,
 ) -> (Vec<f64>, DVector<f64>, Vec<DVector<f64>>, DMatrix<f64>) {
+    precise_ebe_iov_with(model, subject, params, false)
+}
+
+/// FOCE twin of [`precise_ebe_iov`]: the variance held at `f(η=0, κ=0)` (#1722).
+fn precise_ebe_iov_foce(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+) -> (Vec<f64>, DVector<f64>, Vec<DVector<f64>>, DMatrix<f64>) {
+    precise_ebe_iov_with(model, subject, params, true)
+}
+
+fn precise_ebe_iov_with(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    foce: bool,
+) -> (Vec<f64>, DVector<f64>, Vec<DVector<f64>>, DMatrix<f64>) {
     let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let f0 = foce
+        .then(|| {
+            crate::stats::likelihood::population_variance_preds_iov(
+                model,
+                subject,
+                &params.theta,
+                model.n_eta,
+                model.n_kappa,
+                k,
+            )
+        })
+        .flatten();
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
     let n_st = n_eta + k * n_kappa;
@@ -3604,6 +3809,26 @@ fn precise_ebe_iov(
             let mult_row: Option<&[f64]> =
                 mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
             let (r, d, d2) = match mult_row {
+                // FOCE: the variance at the frozen f(η=0, κ=0), constant in the search
+                // (#1722; FOCE has no `iiv_on_ruv`, so no scale).
+                Some(m) if f0.is_some() => (
+                    model.error_spec.variance_at_scaled(
+                        cmt,
+                        f0.as_ref().unwrap()[j],
+                        sigma,
+                        &[],
+                        m,
+                    ),
+                    0.0,
+                    0.0,
+                ),
+                None if f0.is_some() => (
+                    model
+                        .error_spec
+                        .variance_at(cmt, f0.as_ref().unwrap()[j], sigma),
+                    0.0,
+                    0.0,
+                ),
                 Some(m) => (
                     model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m) * ruv_scale,
                     model.error_spec.dvar_df_scaled(cmt, f, sigma, m) * ruv_scale,
@@ -3719,7 +3944,8 @@ fn marginal_nll_iov_inter(
     params: &ModelParameters,
     interaction: bool,
 ) -> f64 {
-    let (_stacked, eta, kappas, hm) = precise_ebe_iov(model, subject, params);
+    // The FOCE marginal is linearised around the FOCE (frozen-variance) EBE, #1722.
+    let (_stacked, eta, kappas, hm) = precise_ebe_iov_with(model, subject, params, !interaction);
     crate::stats::likelihood::foce_subject_nll_iov(
         model,
         subject,
@@ -4059,7 +4285,7 @@ fn check_iov_outer_packed_matches_fd(
     params.theta = theta.to_vec();
     let template = params.clone();
     let x = pack_params(&params);
-    let (stacked, _e, _k, _h) = precise_ebe_iov(model, subject, &params);
+    let (stacked, _e, _k, _h) = precise_ebe_iov_with(model, subject, &params, !interaction);
     let analytic = if interaction {
         subject_packed_gradient_iov(model, subject, &template, &x, &stacked)
     } else {
@@ -4418,7 +4644,7 @@ fn iov_m3_foce_ode_packed_gradient_matches_reconverged_fd() {
     let template = params.clone();
     let x = pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov_foce(&model, &subject, &params);
     let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
         .expect("FOCE-ODE-IOV-M3 packed gradient supported");
 
@@ -4800,7 +5026,7 @@ fn iov_m3_foce_packed_gradient_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov_foce(&model, &subject, &params);
     let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
         .expect("FOCE-IOV-M3 packed gradient now supported (censored SB term)");
 
@@ -4894,7 +5120,7 @@ fn iov_m3_foce_right_censored_packed_gradient_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov_foce(&model, &subject, &params);
     let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
         .expect("FOCE-IOV-M3 packed gradient supported");
 
@@ -4933,7 +5159,7 @@ fn iov_packed_gradient_foce_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov_foce(&model, &subject, &params);
     let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
         .expect("IOV FOCE packed gradient supported");
 
@@ -4994,10 +5220,11 @@ fn iov_packed_gradient_reset_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
-
     // FOCEI (Almquist Laplace) and FOCE (Sheiner–Beal) over the reset subject.
     for interaction in [true, false] {
+        // Each marginal at its own EBE: FOCE's is the frozen-variance mode (#1722).
+        let (stacked, _eta, _kappas, _hm) =
+            precise_ebe_iov_with(&model, &subject, &params, !interaction);
         let analytic = if interaction {
             subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
         } else {
@@ -5129,9 +5356,10 @@ fn iov_tvcov_packed_gradient_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
-
     for interaction in [true, false] {
+        // Each marginal at its own EBE: FOCE's is the frozen-variance mode (#1722).
+        let (stacked, _eta, _kappas, _hm) =
+            precise_ebe_iov_with(&model, &subject, &params, !interaction);
         let analytic = if interaction {
             subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
         } else {
@@ -5213,9 +5441,10 @@ fn iov_expression_scale_packed_gradient_matches_reconverged_fd() {
     let template = params.clone();
     let x = crate::estimation::parameterization::pack_params(&params);
 
-    let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
-
     for interaction in [true, false] {
+        // Each marginal at its own EBE: FOCE's is the frozen-variance mode (#1722).
+        let (stacked, _eta, _kappas, _hm) =
+            precise_ebe_iov_with(&model, &subject, &params, !interaction);
         let analytic = if interaction {
             subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
         } else {
@@ -5698,7 +5927,7 @@ fn check_magnitude_foce_packed_matches_fd(model: &CompiledModel, theta: &[f64], 
     template.theta = theta.to_vec();
     let x = pack_params(&template);
     let params = unpack_params(&x, &template);
-    let eta_hat = precise_ebe(model, subject, &params);
+    let eta_hat = precise_ebe_foce(model, subject, &params);
     let analytic = subject_packed_gradient_foce(model, subject, &template, &x, &eta_hat)
         .expect("FOCE magnitude packed gradient supported");
     assert!(
@@ -5783,7 +6012,7 @@ fn magnitude_foce_iov_packed_matches_fd() {
     let subject = iov_subject_outer(&model, &theta);
     let template = params.clone();
     let x = pack_params(&params);
-    let (stacked, _e, _k, _h) = precise_ebe_iov(&model, &subject, &params);
+    let (stacked, _e, _k, _h) = precise_ebe_iov_foce(&model, &subject, &params);
     let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
         .expect("FOCE-IOV magnitude packed gradient supported");
     assert!(
@@ -6440,7 +6669,7 @@ fn ss_oral_floored_r0_foce_packed_gradient_matches_fd() {
     // Certify the fixture reaches the ill-conditioned branch at all: without this a
     // future change to the initial θ could move it onto the fast path, and the parity
     // assertion below would then pass while testing nothing about #1498.
-    let eta_hat = precise_ebe(&model, &subject, &params);
+    let eta_hat = precise_ebe_foce(&model, &subject, &params);
     let sens =
         crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
             .expect("analytic sensitivities in scope");

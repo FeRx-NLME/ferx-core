@@ -168,6 +168,7 @@ mod ctmm_inner {
                 &mut Vec::new(),
                 &mut nalgebra::DVector::zeros(model.n_eta),
                 &mut nalgebra::DVector::zeros(model.n_eta),
+                None,
             )
             .expect("endpoint-only CTMM is in analytic scope");
 
@@ -1607,6 +1608,7 @@ fn light_seed_gradient_applies_cens_only_under_m3() {
             &err_keys,
             &mut Vec::new(),
             false,
+            None,
         )
         .expect("fixture supports the light seed");
         let ordinary = analytic_eta_nll_gradient(
@@ -1676,6 +1678,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             &err_keys,
             &mut Vec::new(),
             exact,
+            None,
         )
     };
     assert!(
@@ -1701,6 +1704,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             None,
             InnerSolvePolicy {
                 seed,
+                ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
             },
@@ -1760,6 +1764,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
             None,
             InnerSolvePolicy {
                 seed,
+                ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
             },
@@ -1783,6 +1788,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
             schedule.as_ref(),
             InnerSolvePolicy {
                 seed: kind,
+                ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
             },
@@ -1849,6 +1855,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
     .expect("warfarin_if data loads");
     let policy = |seed| InnerSolvePolicy {
         seed,
+        ebe_variance: EbeVariance::Conditional,
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
     };
@@ -2496,6 +2503,7 @@ fn light_seed_matches_full_provider_and_fuses_the_ordinary_gradient() {
         &err_keys,
         &mut Vec::new(),
         false,
+        None,
     )
     .expect("fixture supports the light seed");
     let ordinary_gradient = analytic_eta_nll_gradient(
@@ -2536,6 +2544,7 @@ fn light_seed_matches_full_provider_and_fuses_the_ordinary_gradient() {
         &err_keys,
         &mut Vec::new(),
         true,
+        None,
     )
     .expect("fixture supports the exact Laplace seed");
     assert_eq!(exact_gradient, None);
@@ -3136,5 +3145,1042 @@ fn a_solve_that_crosses_the_flip_flop_abscissa_mid_search_still_stalls() {
             "TVCL = {tvcl}: the crossing solve landed {worst:e} from the forced-stall-on \
              reference (realised on this fixture: 3.708e-7 and 2.660e-6)"
         );
+    }
+}
+
+/// Non-interaction FOCE EBE search: the residual variance held at `f(η = 0)` (#1722).
+mod frozen_ebe_variance {
+    use super::*;
+    use crate::stats::likelihood::{
+        individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen,
+        population_variance_preds, population_variance_preds_iov,
+    };
+    use crate::types::EstimationMethod;
+
+    /// `warfarin_iov` at NONMEM's FOCE estimates (σ ≈ 19%, `nonmem_anchor/foce_ebe_freeze_iov`).
+    pub(crate) fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let mut p = prep.init_params.clone();
+        p.theta = vec![0.315410, 8.38248, 2.64431];
+        p.omega =
+            OmegaMatrix::from_diagonal(&[0.446654, 0.0125169, 1.07769], p.omega.eta_names.clone());
+        let names = p.omega_iov.as_ref().unwrap().eta_names.clone();
+        p.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04258], names));
+        p.sigma.values = vec![0.0370648_f64.sqrt()];
+        (prep.parsed.model, prep.population, p)
+    }
+
+    /// The non-IOV twin (`nonmem_anchor/foce_ebe_freeze_noiov_fit.ferx`), at NONMEM's
+    /// estimates (σ ≈ 21%), optionally with the error model swapped.
+    pub(crate) fn noiov_fixture(
+        error: Option<&str>,
+    ) -> (CompiledModel, Population, ModelParameters) {
+        let mut src = std::fs::read_to_string("nonmem_anchor/foce_ebe_freeze_noiov_fit.ferx")
+            .expect("model file");
+        if let Some(e) = error {
+            let sigmas = if e.contains("additive") {
+                "sigma ADD_ERR ~ 0.8 (sd)"
+            } else {
+                "sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 0.3 (sd)"
+            };
+            src = src
+                .replace("DV ~ proportional(PROP_ERR)", e)
+                .replace("sigma PROP_ERR ~ 0.2 (sd)", sigmas);
+        }
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_iov.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        let mut p = model.default_params.clone();
+        p.theta = vec![0.143657, 8.83827, 1.22791];
+        p.omega = OmegaMatrix::from_diagonal(
+            &[0.0831907, 0.00812141, 0.0233209],
+            p.omega.eta_names.clone(),
+        );
+        p.sigma.values[0] = 0.0450339_f64.sqrt();
+        (model, pop, p)
+    }
+
+    fn nll(
+        model: &CompiledModel,
+        s: &Subject,
+        p: &ModelParameters,
+        eta: &[f64],
+        frozen: Option<&[f64]>,
+    ) -> f64 {
+        let keys = model.error_spec.obs_keys(s);
+        let mult = model.ruv_obs_mult(s, &p.theta);
+        individual_nll_into_prepared_with_schedule_frozen(
+            model,
+            s,
+            &p.theta,
+            eta,
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            &mut pk::EventPkParams::default(),
+            None,
+            keys.as_ref(),
+            mult.as_deref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(eta.len()),
+            &mut DVector::zeros(eta.len()),
+            frozen,
+        )
+    }
+
+    /// Stacked `[η, κ₁, κ₂]` for an IOV subject.
+    fn nll_iov(
+        model: &CompiledModel,
+        s: &Subject,
+        p: &ModelParameters,
+        b: &[f64],
+        frozen: Option<&[f64]>,
+    ) -> f64 {
+        let (n_eta, n_k) = (model.n_eta, model.n_kappa);
+        let kappas: Vec<Vec<f64>> = b[n_eta..].chunks(n_k).map(|c| c.to_vec()).collect();
+        individual_nll_iov_frozen(
+            model,
+            s,
+            &p.theta,
+            &b[..n_eta],
+            &kappas,
+            &p.omega,
+            p.omega_iov.as_ref(),
+            &p.sigma.values,
+            &mut pk::EventPkParams::default(),
+            None,
+            frozen,
+        )
+    }
+
+    fn fd(f: impl Fn(&[f64]) -> f64, x: &[f64]) -> Vec<f64> {
+        (0..x.len())
+            .map(|k| {
+                let h = 1e-6 * (1.0 + x[k].abs());
+                let (mut a, mut b) = (x.to_vec(), x.to_vec());
+                a[k] += h;
+                b[k] -= h;
+                (f(&a) - f(&b)) / (2.0 * h)
+            })
+            .collect()
+    }
+
+    fn assert_close(label: &str, got: &[f64], want: &[f64], rel: f64) {
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        for (k, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(g.is_finite() && w.is_finite(), "{label}[{k}]: {g} / {w}");
+            assert!(
+                (g - w).abs() <= rel * (1.0 + w.abs()),
+                "{label}[{k}]: analytic {g} vs FD {w}"
+            );
+        }
+    }
+
+    /// T3 (objective): the frozen objective is the closed form
+    /// `½[ηᵀΩ⁻¹η + log|Ω| + Σ (y − f(η))²/V⁰ + log V⁰]` with `V⁰ = (f(0)·σ)²`; it equals
+    /// the conditional objective at `η = 0` (where `f(η) = f(0)`) and differs from it away
+    /// from zero. Both halves in one test, so neither "ignore the frozen point" nor "freeze
+    /// unconditionally" can pass it.
+    #[test]
+    fn frozen_objective_is_the_closed_form_and_straddles_the_conditional() {
+        let (model, pop, p) = noiov_fixture(None);
+        let s = &pop.subjects[9];
+        let f0 = population_variance_preds(&model, s, &p.theta, 3).expect("proportional ⇒ Some");
+        let zero = [0.0; 3];
+        let at0 = (
+            nll(&model, s, &p, &zero, Some(&f0)),
+            nll(&model, s, &p, &zero, None),
+        );
+        assert!(
+            (at0.0 - at0.1).abs() <= 1e-12 * at0.1.abs(),
+            "η = 0: frozen {} vs conditional {}",
+            at0.0,
+            at0.1
+        );
+        let eta = [0.3, -0.2, 0.4];
+        let frozen = nll(&model, s, &p, &eta, Some(&f0));
+        let cond = nll(&model, s, &p, &eta, None);
+        let preds = crate::pk::compute_predictions_with_tv(&model, s, &p.theta, &eta);
+        let sig = p.sigma.values[0];
+        let mut data = 0.0;
+        for ((y, f), f0j) in s.observations.iter().zip(&preds).zip(&f0) {
+            let v0 = (f0j * sig).powi(2);
+            data += (y - f).powi(2) / v0 + v0.ln();
+        }
+        let prior: f64 = (0..3)
+            .map(|k| eta[k] * eta[k] / p.omega.matrix[(k, k)])
+            .sum();
+        let want = 0.5 * (prior + p.omega.log_det + data);
+        assert!(
+            (frozen - want).abs() <= 1e-10 * want.abs(),
+            "frozen objective {frozen} vs closed form {want}"
+        );
+        assert!(
+            (frozen - cond).abs() > 1e-2,
+            "fixture must separate the conventions at η ≠ 0 (frozen {frozen}, conditional {cond})"
+        );
+        // IOV twin: same straddle on the stacked [η, κ₁, κ₂].
+        let (model, pop, p) = iov_fixture();
+        let s = &pop.subjects[9];
+        let f0 = population_variance_preds_iov(&model, s, &p.theta, 3, 1, 2).expect("Some");
+        let zero = [0.0; 5];
+        let (a, b) = (
+            nll_iov(&model, s, &p, &zero, Some(&f0)),
+            nll_iov(&model, s, &p, &zero, None),
+        );
+        assert!((a - b).abs() <= 1e-12 * b.abs(), "IOV η = 0: {a} vs {b}");
+        let bvec = [0.3, -0.05, -0.6, 0.15, -0.1];
+        let (a, b) = (
+            nll_iov(&model, s, &p, &bvec, Some(&f0)),
+            nll_iov(&model, s, &p, &bvec, None),
+        );
+        assert!(
+            (a - b).abs() > 1e-2,
+            "IOV fixture must separate the conventions ({a}, {b})"
+        );
+    }
+
+    /// T3 (solve): under `Population` every subject's EBE is a stationary point of the
+    /// *frozen* objective, and the policy moves it against the conditional solve. A policy
+    /// that never reaches the solve leaves the two EBE sets identical; a solve that ignores
+    /// the frozen point stops at the conditional mode, where the frozen gradient is O(1).
+    #[test]
+    fn population_policy_solves_the_frozen_objective() {
+        for (label, (model, pop, p)) in [("noiov", noiov_fixture(None)), ("iov", iov_fixture())] {
+            let mut moved = 0.0_f64;
+            for s in &pop.subjects {
+                let solve = |v| find_ebe_with_variance(&model, s, &p, 500, 1e-10, None, None, 0, v);
+                let (pop_e, cond_e) = (
+                    solve(EbeVariance::Population),
+                    solve(EbeVariance::Conditional),
+                );
+                assert!(pop_e.converged, "{label} {}: frozen solve converged", s.id);
+                let stack = |e: &EbeResult| {
+                    let mut b = e.eta.as_slice().to_vec();
+                    for k in &e.kappas {
+                        b.extend_from_slice(k.as_slice());
+                    }
+                    b
+                };
+                let (bp, bc) = (stack(&pop_e), stack(&cond_e));
+                for (x, y) in bp.iter().zip(&bc) {
+                    assert!(x.is_finite() && y.is_finite());
+                    moved = moved.max((x - y).abs());
+                }
+                let g = if model.n_kappa > 0 {
+                    let f0 = population_variance_preds_iov(&model, s, &p.theta, 3, 1, 2).unwrap();
+                    fd(|b| nll_iov(&model, s, &p, b, Some(&f0)), &bp)
+                } else {
+                    let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+                    fd(|b| nll(&model, s, &p, b, Some(&f0)), &bp)
+                };
+                let gmax = g.iter().fold(0.0_f64, |m, v| {
+                    assert!(v.is_finite());
+                    m.max(v.abs())
+                });
+                eprintln!("MEASURE {label} {}: frozen |g|max at EBE {gmax:.3e}", s.id);
+                assert!(
+                    gmax < 1e-4,
+                    "{label} {}: frozen-objective gradient {gmax:e} at the EBE",
+                    s.id
+                );
+            }
+            eprintln!("MEASURE {label}: max |EBE Population − Conditional| {moved:.3e}");
+            assert!(
+                moved > 1e-2,
+                "{label}: Population EBEs must differ from Conditional ({moved:e})"
+            );
+        }
+    }
+
+    /// T4: the frozen analytic η-gradient against central FD of the frozen objective —
+    /// proportional, combined, and IOV — at a point where it differs from the conditional
+    /// gradient, so dropping the `∂V/∂η` freeze (or the frozen point) cannot pass.
+    #[test]
+    fn frozen_analytic_inner_gradient_matches_fd() {
+        for (label, err) in [
+            ("proportional", None),
+            ("combined", Some("DV ~ combined(PROP_ERR, ADD_ERR)")),
+        ] {
+            let (model, pop, p) = noiov_fixture(err);
+            assert!(model.error_spec.has_f_dependent_variance());
+            for s in pop.subjects.iter().take(4) {
+                let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+                let eta = [0.25, -0.15, 0.35];
+                let keys = model.error_spec.obs_keys(s);
+                let grad = |frozen: Option<&[f64]>| {
+                    analytic_eta_nll_gradient_with_schedule(
+                        &model,
+                        s,
+                        &p.theta,
+                        &eta,
+                        &p.omega,
+                        &p.sigma.values,
+                        &p.residual_correlations,
+                        None,
+                        None,
+                        keys.as_ref(),
+                        &mut Vec::new(),
+                        &mut DVector::zeros(3),
+                        &mut DVector::zeros(3),
+                        frozen,
+                    )
+                    .expect("in scope")
+                };
+                let (g, gc) = (grad(Some(&f0)), grad(None));
+                assert_close(
+                    label,
+                    &g,
+                    &fd(|e| nll(&model, s, &p, e, Some(&f0)), &eta),
+                    1e-5,
+                );
+                let sep = g
+                    .iter()
+                    .zip(&gc)
+                    .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+                assert!(
+                    sep > 1e-2,
+                    "{label} {}: frozen vs conditional gradient {sep:e}",
+                    s.id
+                );
+            }
+        }
+        let (model, pop, p) = iov_fixture();
+        let omega_iov = p.omega_iov.as_ref().unwrap();
+        for s in pop.subjects.iter().take(4) {
+            let f0 = population_variance_preds_iov(&model, s, &p.theta, 3, 1, 2).unwrap();
+            let b = [0.25, -0.05, -0.4, 0.12, -0.08];
+            let grad = |frozen: Option<&[f64]>| {
+                analytic_eta_nll_gradient_iov_frozen(
+                    &model,
+                    s,
+                    &p.theta,
+                    &b,
+                    &p.omega,
+                    omega_iov,
+                    &p.sigma.values,
+                    3,
+                    1,
+                    2,
+                    None,
+                    frozen,
+                )
+                .expect("IOV in scope")
+            };
+            let (g, gc) = (grad(Some(&f0)), grad(None));
+            assert_close(
+                "iov",
+                &g,
+                &fd(|x| nll_iov(&model, s, &p, x, Some(&f0)), &b),
+                1e-5,
+            );
+            let sep = g
+                .iter()
+                .zip(&gc)
+                .fold(0.0_f64, |m, (a, c)| m.max((a - c).abs()));
+            assert!(
+                sep > 1e-2,
+                "iov {}: frozen vs conditional gradient {sep:e}",
+                s.id
+            );
+        }
+    }
+
+    /// T4, dense-`R` branch (`block_sigma`, #627): under a frozen `R` the gradient is
+    /// `−aₖᵀR⁻¹r + Ω⁻¹η` — no `∂R/∂η` trace term.
+    #[test]
+    fn frozen_dense_residual_inner_gradient_matches_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = foce\n",
+        )
+        .expect("parse");
+        assert!(!model.residual_correlations.is_empty());
+        let mut s = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 5],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let p = model.default_params.clone();
+        let preds = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.1]);
+        s.observations = preds.iter().map(|v| v * 1.15 + 0.3).collect();
+        let f0 = population_variance_preds(&model, &s, &p.theta, 1).unwrap();
+        let eta = [-0.2];
+        let keys = model.error_spec.obs_keys(&s);
+        let grad = |frozen: Option<&[f64]>| {
+            analytic_eta_nll_gradient_with_schedule(
+                &model,
+                &s,
+                &p.theta,
+                &eta,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                None,
+                None,
+                keys.as_ref(),
+                &mut Vec::new(),
+                &mut DVector::zeros(1),
+                &mut DVector::zeros(1),
+                frozen,
+            )
+            .expect("dense in scope")
+        };
+        let (g, gc) = (grad(Some(&f0)), grad(None));
+        assert_close(
+            "dense",
+            &g,
+            &fd(|e| nll(&model, &s, &p, e, Some(&f0)), &eta),
+            1e-5,
+        );
+        assert!(
+            (g[0] - gc[0]).abs() > 1e-3,
+            "dense: frozen {} vs conditional {}",
+            g[0],
+            gc[0]
+        );
+    }
+
+    /// T4, M3-censored rows: the censored kernel at `dv_df = 0` and `V = V⁰`.
+    #[test]
+    fn frozen_m3_inner_gradient_matches_fd() {
+        let src = std::fs::read_to_string("examples/warfarin_bloq.ferx")
+            .unwrap()
+            .replace("sigma PROP_ERR ~ 0.02 (sd)", "sigma PROP_ERR ~ 0.2 (sd)");
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_bloq.csv"),
+            None,
+            None,
+        )
+        .unwrap();
+        let s = pop
+            .subjects
+            .iter()
+            .find(|s| s.cens.iter().any(|&c| c != 0))
+            .unwrap();
+        let p = model.default_params.clone();
+        let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+        let eta = [0.12, -0.05, 0.2];
+        let keys = model.error_spec.obs_keys(s);
+        let grad = |frozen: Option<&[f64]>| {
+            analytic_eta_nll_gradient_with_schedule(
+                &model,
+                s,
+                &p.theta,
+                &eta,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                None,
+                None,
+                keys.as_ref(),
+                &mut Vec::new(),
+                &mut DVector::zeros(3),
+                &mut DVector::zeros(3),
+                frozen,
+            )
+            .expect("M3 in scope")
+        };
+        let (g, gc) = (grad(Some(&f0)), grad(None));
+        assert_close(
+            "m3",
+            &g,
+            &fd(|e| nll(&model, s, &p, e, Some(&f0)), &eta),
+            1e-4,
+        );
+        let sep = g
+            .iter()
+            .zip(&gc)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(sep > 1e-3, "m3: frozen vs conditional gradient {sep:e}");
+    }
+
+    /// `R⁰` is the variance at every random effect zero, `η_ruv` included (`fit` refuses
+    /// `iiv_on_ruv` under a non-interaction stage, so this guards the convention, not a
+    /// reachable fit): under a frozen variance `η_ruv` moves only the prior — objective
+    /// and analytic gradient alike — while the conditional objective's data term moves.
+    #[test]
+    fn frozen_variance_carries_no_ruv_eta_data_term() {
+        let src = std::fs::read_to_string("nonmem_anchor/foce_ebe_freeze_noiov_fit.ferx")
+            .unwrap()
+            .replace(
+                "omega ETA_KA ~ 0.30",
+                "omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10",
+            )
+            .replace(
+                "DV ~ proportional(PROP_ERR)",
+                "DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+            );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert_eq!(
+            model.residual_error_eta,
+            Some(3),
+            "fixture: η_ruv is the 4th eta"
+        );
+        let (_, pop, base) = noiov_fixture(None);
+        let mut p = model.default_params.clone();
+        p.theta = base.theta.clone();
+        p.sigma.values = base.sigma.values.clone();
+        let s = &pop.subjects[2];
+        let f0 = population_variance_preds(&model, s, &p.theta, 4).unwrap();
+        let (lo, hi) = ([0.1, -0.1, 0.2, 0.0], [0.1, -0.1, 0.2, 0.3]);
+        let prior = 0.5 * 0.3 * 0.3 / p.omega.matrix[(3, 3)];
+        let frozen = nll(&model, s, &p, &hi, Some(&f0)) - nll(&model, s, &p, &lo, Some(&f0));
+        assert!(
+            (frozen - prior).abs() < 1e-9,
+            "frozen: Δ {frozen} vs prior-only {prior}"
+        );
+        let cond = nll(&model, s, &p, &hi, None) - nll(&model, s, &p, &lo, None);
+        assert!(
+            (cond - prior).abs() > 1e-2,
+            "conditional data term must move ({cond})"
+        );
+        let keys = model.error_spec.obs_keys(s);
+        let g = analytic_eta_nll_gradient_with_schedule(
+            &model,
+            s,
+            &p.theta,
+            &hi,
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            None,
+            None,
+            keys.as_ref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(4),
+            &mut DVector::zeros(4),
+            Some(&f0),
+        )
+        .expect("in scope");
+        assert_close(
+            "ruv",
+            &g,
+            &fd(|e| nll(&model, s, &p, e, Some(&f0)), &hi),
+            1e-5,
+        );
+    }
+
+    /// The production FOCE path is the **seeded** one (`InnerHessianSeed::GaussNewton`), and
+    /// its light seed fuses BFGS's first gradient. That gradient must be the frozen
+    /// objective's: handing BFGS the conditional one sent its first step the wrong way, and
+    /// on `warfarin_iov` at a mid-fit point 4–8 of 10 subjects then failed BFGS and fell back
+    /// to Nelder–Mead at every outer evaluation — noise the outer L-BFGS stalled on, 1.15
+    /// OFV above NONMEM's optimum. The unseeded solve (the tests above) cannot see this.
+    #[test]
+    fn seeded_population_solve_fuses_the_frozen_gradient() {
+        let (model, pop, _) = noiov_fixture(None);
+        // ferx's stall point before the fix (θ = 0.13736, 8.73095, 1.64160; ω² = 0.099555,
+        // 0.006699, 0.233339; σ = 0.193088).
+        let mut p = model.default_params.clone();
+        p.theta = vec![0.137360, 8.730946, 1.641600];
+        p.omega =
+            OmegaMatrix::from_diagonal(&[0.099555, 0.006699, 0.233339], p.omega.eta_names.clone());
+        p.sigma.values = vec![0.193088];
+        let s = &pop.subjects[0];
+        let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+        let keys = model.error_spec.obs_keys(s);
+        let eta = [0.2, -0.1, 0.3];
+        let fused = |frozen: Option<&[f64]>| {
+            analytic_inner_seed_hessian(
+                &model,
+                s,
+                &p,
+                &eta,
+                None,
+                None,
+                keys.as_ref(),
+                &mut Vec::new(),
+                false,
+                frozen,
+            )
+            .expect("light seed in scope")
+            .1
+            .expect("light seed fuses a gradient")
+        };
+        let want = analytic_eta_nll_gradient_with_schedule(
+            &model,
+            s,
+            &p.theta,
+            &eta,
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            None,
+            None,
+            keys.as_ref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(3),
+            &mut DVector::zeros(3),
+            Some(&f0),
+        )
+        .unwrap();
+        let (gf, gc) = (fused(Some(&f0)), fused(None));
+        assert_close("fused", &gf, &want, 1e-12);
+        let sep = gf
+            .iter()
+            .zip(&gc)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(sep > 1e-2, "frozen vs conditional fused gradient {sep:e}");
+
+        // The production warm, seeded solve: warm-started from the conditional modes, as an
+        // outer evaluation after a step is. Every subject converges on the frozen mode, and
+        // none falls back.
+        let warm: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                find_ebe_with_variance(
+                    &model,
+                    s,
+                    &p,
+                    200,
+                    1e-8,
+                    None,
+                    None,
+                    0,
+                    EbeVariance::Conditional,
+                )
+                .eta
+            })
+            .collect();
+        let (etas, _, stats, _) = run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            &p,
+            200,
+            1e-6,
+            Some(&warm),
+            None,
+            0,
+            0,
+            InnerHessianSeed::GaussNewton,
+            &crate::types::FitOptions {
+                method: EstimationMethod::Foce,
+                interaction: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            stats.n_fallback, 0,
+            "no frozen solve may fall back to Nelder–Mead"
+        );
+        assert_eq!(stats.n_unconverged, 0, "every frozen solve converges");
+        for (s, e) in pop.subjects.iter().zip(&etas) {
+            let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+            let g = fd(|b| nll(&model, s, &p, b, Some(&f0)), e.as_slice());
+            let gmax = g.iter().fold(0.0_f64, |m, v| {
+                assert!(v.is_finite());
+                m.max(v.abs())
+            });
+            assert!(
+                gmax < 1e-4,
+                "{}: frozen gradient {gmax:e} at the seeded EBE",
+                s.id
+            );
+        }
+    }
+
+    /// T7: the EBEs every estimator *reports* under `interaction = false` are modes of the
+    /// frozen objective — the Sheiner–Beal marginal they are scored under — and under
+    /// `interaction = true` modes of the conditional one. One fixture, one fit per stage, each
+    /// asserted separately so a failure names the path: the FOCE final inner loop, the
+    /// Gauss–Newton driver, SAEM's final OFV pass, VI's final EBE pass, and the standalone
+    /// IMP evaluation stage. Both sides of the gate per method where the method takes both,
+    /// so a path that ignores the convention fails one half whichever way it is wired.
+    #[test]
+    fn reported_ebes_follow_the_marginal_of_every_stage() {
+        let (model, pop, p) = noiov_fixture(None);
+        let base = crate::types::FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            verbose: false,
+            saem_n_exploration: 2,
+            saem_n_convergence: 0,
+            saem_n_mh_steps: 1,
+            saem_seed: Some(7),
+            vi_iters: 5,
+            ..Default::default()
+        };
+        let cases: Vec<(&str, crate::types::FitOptions)> = vec![
+            (
+                "foce",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Foce,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "focei",
+                crate::types::FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "gn",
+                crate::types::FitOptions {
+                    method: EstimationMethod::FoceGn,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "saem",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Saem,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "saem+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Saem,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "vi",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Vi,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "vi+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Vi,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "imp-eval",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Imp,
+                    imp_eval_only: true,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "imp-eval+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Imp,
+                    imp_eval_only: true,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (label, opts) in cases {
+            let r = crate::fit(&model, &pop, &p, &opts).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let fp = r_params(&model, &r);
+            let frozen_expected = !opts.interaction;
+            let (mut worst_own, mut worst_other) = (0.0_f64, f64::INFINITY);
+            for (s, sr) in pop.subjects.iter().zip(&r.subjects) {
+                let eta = sr.eta.as_slice();
+                let f0 = population_variance_preds(&model, s, &fp.theta, 3).unwrap();
+                let gmax = |frozen: Option<&[f64]>| {
+                    fd(|e| nll(&model, s, &fp, e, frozen), eta)
+                        .iter()
+                        .fold(0.0_f64, |m, v| {
+                            assert!(v.is_finite(), "{label}: non-finite gradient");
+                            m.max(v.abs())
+                        })
+                };
+                let (gf, gc) = (gmax(Some(&f0)), gmax(None));
+                let (own, other) = if frozen_expected { (gf, gc) } else { (gc, gf) };
+                worst_own = worst_own.max(own);
+                worst_other = worst_other.min(other);
+            }
+            eprintln!(
+                "MEASURE {label}: own-objective |g| {worst_own:.2e}, other {worst_other:.2e}"
+            );
+            assert!(
+                worst_own < 1e-3,
+                "{label}: reported EBEs are not modes of the {} objective (|g| {worst_own:e})",
+                if frozen_expected {
+                    "frozen"
+                } else {
+                    "conditional"
+                }
+            );
+            assert!(
+                worst_other > 1e-2,
+                "{label}: the two objectives must separate here (|g| {worst_other:e})"
+            );
+        }
+    }
+
+    /// `find_ebe_for_stage` — the covariance stencil's, the per-subject FD salvage's and the
+    /// mixture class solve's entry point — solves under its stage's convention: bit-identical
+    /// to the explicit `Population` solve for a FOCE stage and to the `Conditional` one for a
+    /// FOCEI stage, which differ on this fixture.
+    #[test]
+    fn find_ebe_for_stage_reads_the_stage() {
+        let (model, pop, p) = noiov_fixture(None);
+        let s = &pop.subjects[9];
+        let stage = |interaction: bool| crate::types::FitOptions {
+            method: if interaction {
+                EstimationMethod::FoceI
+            } else {
+                EstimationMethod::Foce
+            },
+            interaction,
+            ..Default::default()
+        };
+        let solve = |v| find_ebe_with_variance(&model, s, &p, 200, 1e-10, None, None, 0, v);
+        let (pop_e, cond_e) = (
+            solve(EbeVariance::Population),
+            solve(EbeVariance::Conditional),
+        );
+        assert!(
+            (&pop_e.eta - &cond_e.eta).amax() > 1e-2,
+            "fixture must separate the modes"
+        );
+        for (interaction, want) in [(false, &pop_e), (true, &cond_e)] {
+            let got = find_ebe_for_stage(
+                &model,
+                s,
+                &p,
+                200,
+                1e-10,
+                None,
+                None,
+                0,
+                &stage(interaction),
+            );
+            for (a, b) in got.eta.iter().zip(want.eta.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "interaction = {interaction}");
+            }
+        }
+    }
+
+    /// T7, covariance FD stencil (#1722 review finding 1): the EBEs `reconverge_population`
+    /// re-solves at every stencil point are the stage's convention — bit-identical to the
+    /// frozen solve under a FOCE stage and to the conditional one under FOCEI, which differ
+    /// here. Every FOCE + proportional/combined covariance step now runs this stencil.
+    #[test]
+    fn covariance_stencil_reconverges_the_stage_convention() {
+        let (model, pop, p) = noiov_fixture(None);
+        let x = crate::estimation::parameterization::pack_params(&p);
+        // The stencil solves at the unpacked point, which round-trips θ/Ω by ~1 ULP.
+        let p = crate::estimation::parameterization::unpack_params(&x, &p);
+        let warm: Vec<DVector<f64>> = pop.subjects.iter().map(|_| DVector::zeros(3)).collect();
+        let mut sep = 0.0_f64;
+        for interaction in [false, true] {
+            let stage = crate::types::FitOptions {
+                method: if interaction {
+                    EstimationMethod::FoceI
+                } else {
+                    EstimationMethod::Foce
+                },
+                interaction,
+                ..Default::default()
+            };
+            let (_, ehs, _, _) = crate::estimation::covariance::reconverge_population(
+                &x, &model, &pop, &p, &warm, &stage, 1e-8,
+            );
+            let want = if interaction {
+                EbeVariance::Conditional
+            } else {
+                EbeVariance::Population
+            };
+            let other = if interaction {
+                EbeVariance::Population
+            } else {
+                EbeVariance::Conditional
+            };
+            let mu = crate::estimation::parameterization::compute_mu_k(
+                &model,
+                &p.theta,
+                stage.mu_referencing,
+            );
+            for (i, s) in pop.subjects.iter().enumerate() {
+                let solve = |v| {
+                    find_ebe_with_variance(
+                        &model,
+                        s,
+                        &p,
+                        stage.inner_maxiter,
+                        1e-8,
+                        Some(warm[i].as_slice()),
+                        Some(&mu),
+                        0,
+                        v,
+                    )
+                    .eta
+                };
+                let (w, o) = (solve(want), solve(other));
+                for (a, b) in ehs[i].iter().zip(w.iter()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "interaction {interaction}, subject {}",
+                        s.id
+                    );
+                }
+                sep = sep.max((&w - &o).amax());
+            }
+        }
+        assert!(
+            sep > 1e-2,
+            "the conventions must separate on this fixture ({sep:e})"
+        );
+    }
+
+    /// The fitted parameters of `r` on `model`'s template.
+    fn r_params(model: &CompiledModel, r: &crate::types::FitResult) -> ModelParameters {
+        let mut p = model.default_params.clone();
+        p.theta = r.theta.clone();
+        p.omega =
+            OmegaMatrix::from_matrix(r.omega.clone(), p.omega.eta_names.clone(), p.omega.diagonal);
+        p.sigma.values = r.sigma.clone();
+        p
+    }
+
+    /// T6: the one decision. `Population` exactly for a Sheiner–Beal stage (FOCE family,
+    /// interaction off, no quadrature) with a prediction-dependent error model.
+    #[test]
+    fn ebe_variance_truth_table() {
+        use EstimationMethod::*;
+        let (prop, _, _) = noiov_fixture(None);
+        let (comb, _, _) = noiov_fixture(Some("DV ~ combined(PROP_ERR, ADD_ERR)"));
+        let (add, _, _) = noiov_fixture(Some("DV ~ additive(ADD_ERR)"));
+        assert!(
+            !add.error_spec.has_f_dependent_variance(),
+            "fixture: additive"
+        );
+        // Keyed on the marginal, not the estimator: every method whose EBEs feed the
+        // Sheiner–Beal marginal (interaction off, no quadrature) — including a
+        // non-interaction SAEM/IMP/Bayes/VI fit's OFV, covariance and SIR evaluations —
+        // takes the frozen variance; interaction on, or a quadrature anchor, never does.
+        let all = [
+            Foce,
+            FoceI,
+            FoceGn,
+            FoceGnHybrid,
+            Saem,
+            Imp,
+            Impmap,
+            Bayes,
+            Vi,
+        ];
+        for m in [&prop, &comb] {
+            for method in all {
+                assert_eq!(
+                    EbeVariance::for_stage(method, false, 1, m),
+                    EbeVariance::Population,
+                    "{method:?}"
+                );
+                assert_eq!(
+                    EbeVariance::for_stage(method, true, 1, m),
+                    EbeVariance::Conditional,
+                    "{method:?} + interaction"
+                );
+            }
+            // Quadrature (Laplace at any node count, FOCEI with n_agq > 1) scores its own
+            // marginal at the conditional mode, interaction flag or not.
+            for (method, n_agq) in [(Laplace, 1), (Laplace, 3), (FoceI, 3)] {
+                for interaction in [false, true] {
+                    assert_eq!(
+                        EbeVariance::for_stage(method, interaction, n_agq, m),
+                        EbeVariance::Conditional,
+                        "{method:?} n_agq {n_agq} interaction {interaction}"
+                    );
+                }
+            }
+        }
+        for method in all {
+            assert_eq!(
+                EbeVariance::for_stage(method, false, 1, &add),
+                EbeVariance::Conditional,
+                "additive {method:?}"
+            );
+        }
+        let opts = crate::types::FitOptions {
+            method: Foce,
+            interaction: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            EbeVariance::for_options(&opts, &prop),
+            EbeVariance::Population
+        );
+        assert_eq!(
+            EbeVariance::for_options(
+                &crate::types::FitOptions {
+                    interaction: true,
+                    ..opts
+                },
+                &prop
+            ),
+            EbeVariance::Conditional
+        );
+    }
+
+    /// T6: additive error has no frozen point (`population_variance_preds` is `None`), so a
+    /// `Population` solve is the conditional solve bit for bit.
+    #[test]
+    fn additive_population_solve_is_bit_identical() {
+        let (model, pop, mut p) = noiov_fixture(Some("DV ~ additive(ADD_ERR)"));
+        p.sigma.values = vec![0.8];
+        for s in &pop.subjects {
+            assert!(population_variance_preds(&model, s, &p.theta, 3).is_none());
+            let a = find_ebe_with_variance(
+                &model,
+                s,
+                &p,
+                200,
+                1e-8,
+                None,
+                None,
+                0,
+                EbeVariance::Population,
+            );
+            let b = find_ebe_with_variance(
+                &model,
+                s,
+                &p,
+                200,
+                1e-8,
+                None,
+                None,
+                0,
+                EbeVariance::Conditional,
+            );
+            assert_eq!(a.nll.to_bits(), b.nll.to_bits(), "{}", s.id);
+            for (x, y) in a.eta.iter().zip(b.eta.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "{}", s.id);
+            }
+        }
     }
 }

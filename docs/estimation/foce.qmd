@@ -34,6 +34,33 @@ $$
 
 The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
+#### Where the residual variance is taken {#inner-loop-residual-variance}
+
+Under **FOCEI** (and Laplace/AGQ) $V_{ij} = V(f_{ij}(\eta_i))$, the variance at the
+individual's own prediction. Wherever the EBEs feed the
+[Sheiner–Beal marginal](#standard-foce) — **non-interaction FOCE** (`method = foce`, or
+Gauss–Newton with `interaction = false`), and the OFV, covariance step and SIR weights of
+any fit run with `interaction = false` — the variance is held at the population prediction
+for the whole search: $V_{ij} = R^0_{ij} = V(f_{ij}(\eta{=}0))$, the same $R^0$ that marginal
+uses, so it is linearised around the mode of the objective it was built for. This is NONMEM `METHOD=1` without `INTER`. With IOV
+the population prediction has every κ at zero too. Additive error is unaffected ($V$ does
+not depend on $f$); for proportional and combined error the EBEs, and with them the FOCE
+OFV, estimates and CWRES, depend on the choice. Until #1722 ferx used $V(f(\hat\eta))$ in
+the FOCE search as well: on `warfarin_iov` at NONMEM's own estimates (σ ≈ 20%) that
+put the OFV 0.74 below NONMEM without IOV and 1.28 below it with IOV. Both now agree to
+1e-6 (`tests/foce_ebe_variance_nonmem_anchor.rs`).
+
+The analytic covariance Hessian does not yet carry the second-order response of this
+frozen-variance mode, so a FOCE fit with proportional or combined error computes its
+covariance step by finite differences of the OFV (re-solving the EBEs at each stencil
+point); additive-error FOCE and FOCEI keep the analytic Hessian.
+
+One consequence: a row whose population prediction sits on the variance floor (a
+proportional error at $f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE
+search with weight $1/R^0$ at that floor (`1e-12`), so the search fits that row almost
+exactly. Add an additive component to the error model when the typical prediction can be
+zero at an observation.
+
 ## Gradient route (analytic vs FD) {#gradient-route-analytic-vs-fd}
 
 The BFGS gradient is the **exact analytic η-gradient** computed from hand-rolled forward sensitivities (the `Dual2` type over the closed-form PK solutions) when the model is in scope, and central **finite differences (FD)** otherwise.
@@ -471,19 +498,19 @@ On `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NON
 | ω²(V)     | 0.00403 | 0.00431   | −6.4% |
 | ω²(KA)    | 0.1530  | 0.1504    | +1.8% |
 
-and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already match NONMEM (OFV −280.17 vs −280.36) and, after the #243 covariance fix, the omega SEs do too:
+and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV equals NONMEM's (−280.3595 for both since #1722 froze the EBE search's residual variance at $f(\eta{=}0)$; −280.3640 before) and so do the standard errors:
 
 | Parameter | ferx SE | NONMEM SE | rel. diff |
 |-----------|---------|-----------|-----------|
-| TVCL      | 0.00661 | 0.00663   | −0.3% |
-| TVV       | 0.2375  | 0.2340    | +1.5% |
-| TVKA      | 0.1209  | 0.1245    | −2.8% |
-| PROP_ERR (SD) | 0.000922 | 0.000941 | −2.0% |
-| ω²(CL)    | 0.01312 | 0.01280   | +2.5% |
-| ω²(V)     | 0.00454 | 0.00430   | +5.7% |
-| ω²(KA)    | 0.1510  | 0.1607    | −6.1% |
+| TVCL      | 0.006630 | 0.006627 | +0.04% |
+| TVV       | 0.2341  | 0.2340    | +0.01% |
+| TVKA      | 0.1245  | 0.1245    | 0.00% |
+| PROP_ERR (SD) | 0.000942 | 0.000941 | +0.04% |
+| ω²(CL)    | 0.01280 | 0.01280   | +0.01% |
+| ω²(V)     | 0.004297 | 0.004297 | −0.01% |
+| ω²(KA)    | 0.1608  | 0.1606    | +0.09% |
 
-(Analytic-Jacobian route; the FD-Jacobian fallback agrees to within ~10% on the ω block.) Both are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
+(macOS arm64. Before #1722 the FOCE column was off by up to 6% — ω²(KA) 0.1510 — because the covariance step linearised around EBEs NONMEM does not use. A FOCE fit with proportional or combined error now takes the FD covariance stencil; see [Where the residual variance is taken](#inner-loop-residual-variance).) Both are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
 ### Covariance estimator: R, S, or sandwich
 

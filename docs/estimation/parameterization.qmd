@@ -171,7 +171,7 @@ could be reached at all:
 | start | packs to | outcome |
 |---|---|---|
 | `omega ETA_CL ~ 6.144212353328210e-6` | $-6.0$ exactly | **trapped** — the coordinate is bit-identical for the whole run, ending at the rail with TVV 10x high and $\sigma$ at 42% |
-| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3640$, $\omega^2_{CL}$ 0.028595) |
+| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3595$, $\omega^2_{CL}$ 0.028597 — measured as $-280.3640$ / 0.028595 before #1722 froze the FOCE EBE search's residual variance; the trap and the recovery are unchanged) |
 | `omega ETA_CL ~ 162754.79141900392` | $+6.0$ exactly | recovers the base optimum, under `lbfgs` and under `bobyqa` |
 | `omega ETA_CL ~ 1e8` | $+9.21$, clamped onto $+6.0$ | recovers the base optimum |
 

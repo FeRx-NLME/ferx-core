@@ -133,6 +133,12 @@ pub(crate) enum CovScopeDecline {
     EventWalkSubject,
     /// The individual-parameter program does not cover the required PK slots.
     IndivParamProgram,
+    /// Non-interaction FOCE with a prediction-dependent residual variance (#1722): the FOCE
+    /// EBE is then the mode of the frozen-variance objective, whose second-order response
+    /// the analytic assembly does not carry. One predicate,
+    /// [`crate::estimation::sens_cov_hessian::foce_cov_declines_frozen_variance`], is read
+    /// both by the assembly's own bail and by the walk that names it.
+    FoceFrozenResidualVariance,
     /// Every model-level clause passed but the per-subject assembly still bailed (a per-point
     /// provider decline, a non-finite block, an occasion/κ length mismatch, …).
     PerSubjectBail,
@@ -145,7 +151,7 @@ impl CovScopeDecline {
     /// in production enumerates the enum — without it the lib target reports it dead and
     /// `preflight.sh`'s `-Dunused` turns that into a hard error.
     #[cfg(test)]
-    pub(crate) const ALL: [CovScopeDecline; 19] = [
+    pub(crate) const ALL: [CovScopeDecline; 20] = [
         CovScopeDecline::Disabled,
         CovScopeDecline::Mixture,
         CovScopeDecline::ExactHessianAnchor,
@@ -164,6 +170,7 @@ impl CovScopeDecline {
         CovScopeDecline::CustomRuvMagnitude,
         CovScopeDecline::EventWalkSubject,
         CovScopeDecline::IndivParamProgram,
+        CovScopeDecline::FoceFrozenResidualVariance,
         CovScopeDecline::PerSubjectBail,
     ];
 
@@ -200,6 +207,10 @@ impl CovScopeDecline {
             }
             CovScopeDecline::IndivParamProgram => {
                 "the individual-parameter program does not cover the required PK slots"
+            }
+            CovScopeDecline::FoceFrozenResidualVariance => {
+                "the fit is non-interaction FOCE with a prediction-dependent residual variance, \
+                 whose frozen-variance EBE response the analytic assembly does not yet carry"
             }
             CovScopeDecline::PerSubjectBail => {
                 "at least one subject fell outside the analytic assembly"

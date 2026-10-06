@@ -75,6 +75,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         4,
                         opts.inner_restarts,
                         seed,
+                        &opts,
                     );
                     for warm in [None, Some(reference.0.as_slice())] {
                         let separate = run_inner_loop_warm_seeded(
@@ -88,6 +89,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             4,
                             opts.inner_restarts,
                             seed,
+                            &opts,
                         );
                         let expected_nll = if iov {
                             crate::stats::likelihood::foce_population_nll_iov(
@@ -171,6 +173,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             opts.min_obs_for_convergence_check as usize,
             opts.inner_restarts,
             InnerHessianSeed::for_options(&opts),
+            &opts,
         );
         let expected = pop_nll_opts(
             &model,

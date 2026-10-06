@@ -689,6 +689,103 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>,
 ) -> f64 {
+    individual_nll_into_prepared_with_schedule_frozen(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        residual_correlations,
+        scratch,
+        schedule,
+        err_keys,
+        ruv_mult,
+        pred_recycle,
+        eta_work,
+        prior_work,
+        None,
+    )
+}
+
+/// The population predictions `f(η = 0)` at which a non-interaction FOCE subject's
+/// residual variance is held, or `None` when the error model's variance does not
+/// depend on the prediction (additive), where holding it changes nothing.
+///
+/// This is the **one** definition of `R⁰`'s evaluation point: the Sheiner–Beal
+/// marginal ([`foce_subject_nll`]) scores `R⁰` here, and the FOCE EBE search
+/// (`inner_optimizer`, `EbeVariance::Population`) holds its variance here, so the
+/// mode the inner loop finds is the mode of the objective the marginal linearises
+/// around — NONMEM `METHOD=1` without `INTER` (#319, #1722).
+pub(crate) fn population_variance_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    n_eta: usize,
+) -> Option<Vec<f64>> {
+    if !model.error_spec.has_f_dependent_variance() {
+        return None;
+    }
+    let zeros = vec![0.0_f64; n_eta];
+    Some(model_predictions(model, subject, theta, &zeros))
+}
+
+/// IOV twin of [`population_variance_preds`]: the prediction with every random
+/// effect at zero (η = 0 and κ = 0 on each of the subject's `k_occasions`), the
+/// point the augmented Sheiner–Beal marginal ([`foce_subject_nll_iov`]) scores
+/// `R⁰` at.
+pub(crate) fn population_variance_preds_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+) -> Option<Vec<f64>> {
+    if !model.error_spec.has_f_dependent_variance() {
+        return None;
+    }
+    let zeros_eta = vec![0.0_f64; n_eta];
+    let zero_kappas: Vec<Vec<f64>> = vec![vec![0.0_f64; n_kappa]; k_occasions];
+    Some(pk::predict_iov(
+        model,
+        subject,
+        theta,
+        &zeros_eta,
+        &zero_kappas,
+    ))
+}
+
+/// [`individual_nll_into_prepared_with_schedule`] with an optional frozen residual
+/// variance (#1722).
+///
+/// `frozen_var_preds = Some(f₀)` scores every Gaussian row's residual variance at
+/// `f₀[j]` (from [`population_variance_preds`]) instead of at the row's own
+/// prediction — the non-interaction FOCE EBE objective, whose variance is a constant
+/// of the search. The residual itself, the prior and every non-Gaussian term keep
+/// the conditional `f(η)`. The `iiv_on_ruv` scale is not applied under a frozen
+/// variance: `R⁰` is the variance at *every* random effect zero, `η_ruv` included,
+/// exactly as the marginal builds it (and `fit` refuses `iiv_on_ruv` under a
+/// non-interaction stage anyway). `None` is the conditional objective, bit-identical
+/// to the function above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    err_keys: &[usize],
+    ruv_mult: Option<&[Vec<f64>]>,
+    pred_recycle: &mut Vec<f64>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
+    frozen_var_preds: Option<&[f64]>,
+) -> f64 {
     // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
     // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
     // times per subject per outer iter — recomputing Cholesky+inverse
@@ -747,7 +844,11 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     // (`EPS·EXP(ETA)` → V·exp(2·η_ruv)). 1.0 when no `iiv_on_ruv` is set.
     // Does not touch FREM covariate pseudo-observations (handled below before
     // this factor is applied) or the EKF process noise `p_obs`.
-    let ruv_scale = model.residual_var_scale(eta);
+    let ruv_scale = if frozen_var_preds.is_some() {
+        1.0
+    } else {
+        model.residual_var_scale(eta)
+    };
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_method.has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
@@ -756,6 +857,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
             model,
             subject,
             &preds,
+            frozen_var_preds.unwrap_or(&preds[..]),
             sigma_values,
             residual_correlations,
             ruv_scale,
@@ -798,9 +900,10 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
                     }
                 }
             }
+            let f_var = frozen_var_preds.map_or(f_pred, |f0| f0[j]);
             let v_resid = model.residual_variance_at_scaled(
                 err_keys[j],
-                f_pred,
+                f_var,
                 sigma_values,
                 ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
             ) * ruv_scale;
@@ -863,6 +966,9 @@ fn dense_residual_data_term(
     model: &CompiledModel,
     subject: &Subject,
     preds: &[f64],
+    // The predictions `R` is built at: `preds` for the conditional objective, or the
+    // frozen `f(η = 0)` of a non-interaction FOCE EBE search (#1722).
+    var_preds: &[f64],
     sigma_values: &[f64],
     residual_correlations: &[ResidualCorrelation],
     ruv_scale: f64,
@@ -873,7 +979,7 @@ fn dense_residual_data_term(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
         &model.error_spec,
-        preds,
+        var_preds,
         err_keys.as_ref(),
         subject,
         sigma_values,
@@ -1042,6 +1148,7 @@ fn obs_nll_subject_from_preds_with_semantics(
         match dense_residual_data_term(
             model,
             subject,
+            preds,
             preds,
             sigma_values,
             residual_correlations,
@@ -1500,12 +1607,7 @@ pub fn foce_subject_nll(
         // f(η=0) is the physically sensible typical-individual prediction
         // (always ≥0). Skipped for additive error (variance is f-independent,
         // so f0 and f(η=0) give the same R) to keep that path bit-identical.
-        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
-            let zeros = vec![0.0_f64; eta_hat.len()];
-            Some(model_predictions(model, subject, theta, &zeros))
-        } else {
-            None
-        };
+        let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
         foce_subject_nll_standard(
             subject,
             &ipreds,
@@ -2418,22 +2520,8 @@ pub fn foce_subject_nll_iov(
         // all random effects zero (η=0, κ=0), matching the non-IOV marginal so
         // the zero-κ / Ω_iov→0 reduction collapses exactly to the BSV marginal.
         // Additive error keeps f0 (bit-identical).
-        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
-            let zeros_eta = vec![0.0_f64; n_eta];
-            let zero_kappas: Vec<Vec<f64>> = kappa_slices
-                .iter()
-                .map(|k| vec![0.0_f64; k.len()])
-                .collect();
-            Some(pk::predict_iov(
-                model,
-                subject,
-                theta,
-                &zeros_eta,
-                &zero_kappas,
-            ))
-        } else {
-            None
-        };
+        // `kappas` has one length-`n_iov` vector per occasion (checked above).
+        let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
         foce_subject_nll_standard(
             subject,
             &ipreds,
@@ -2880,6 +2968,40 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    individual_nll_iov_frozen(
+        model,
+        subject,
+        theta,
+        eta,
+        kappas,
+        omega,
+        omega_iov,
+        sigma_values,
+        pk_scratch,
+        schedule,
+        None,
+    )
+}
+
+/// [`individual_nll_iov_with_scratch_and_schedule`] with an optional frozen residual
+/// variance — the IOV twin of [`individual_nll_into_prepared_with_schedule_frozen`]
+/// (#1722). `frozen_var_preds = Some(f₀)` (from [`population_variance_preds_iov`])
+/// scores each non-FREM row's variance at `f₀[j]`, without the `iiv_on_ruv` scale;
+/// `None` is bit-identical to the conditional objective.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[K],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    frozen_var_preds: Option<&[f64]>,
+) -> f64 {
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -2922,8 +3044,13 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).
     let frem_ov =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
-    // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`.
-    let ruv_scale = model.residual_var_scale(eta);
+    // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`. A frozen
+    // variance is `R⁰`, taken at every random effect zero (see the doc above).
+    let ruv_scale = if frozen_var_preds.is_some() {
+        1.0
+    } else {
+        model.residual_var_scale(eta)
+    };
     // #484/#1029: per-observation residual-magnitude multiplier, so the IOV
     // individual NLL (SAEM's E-step, the Bayes MH target, the IOV IS weights)
     // scores the same variance the non-IOV path and FOCE/FOCEI do.
@@ -2937,7 +3064,7 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             None => {
                 model.residual_variance_at_scaled(
                     err_keys[j],
-                    f_pred,
+                    frozen_var_preds.map_or(f_pred, |f0| f0[j]),
                     sigma_values,
                     ruv_mult.as_ref().map(|m| m[j].as_slice()),
                 ) * ruv_scale

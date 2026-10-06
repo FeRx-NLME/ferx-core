@@ -135,6 +135,7 @@ pub fn run_foce_gn(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
+        options,
     );
 
     let mut ofv_clean = 2.0
@@ -299,6 +300,7 @@ pub fn run_foce_gn(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
+            options,
         );
         let ofv_try_clean = 2.0
             * pop_nll(

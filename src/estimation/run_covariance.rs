@@ -237,6 +237,7 @@ fn run_covariance_scoped(
             // different η̂ at a loose `inner_tol` (measured 1.5e-11 on the warfarin
             // covariance, against the 1e-12 bit-parity bound).
             crate::estimation::inner_optimizer::InnerHessianSeed::for_options(options),
+            options,
         );
 
     // --- Run the covariance step (UNGATED: calling `run_covariance` IS the

@@ -88,7 +88,8 @@ were taken while a model-file `method = foce` still weighted SIR's draws with th
 **FOCEI** objective, a different marginal from the one the proposal was centred on. With
 the same seed, those weights gave ESS 238 at 1000 draws here, and 4.9 of 1000 on warfarin_iov.
 
-The full fit + SIR runs in ~0.1s.
+Re-measured after #1722 (FOCE EBEs with the residual variance held at $f(\eta{=}0)$; macOS arm64): ESS 497 / 833 / 1730 and the 2000-sample θ CIs to the printed digits; the PROP_ERR upper limit reads 0.0136. Warfarin's σ ≈ 1% puts the two EBE conventions close, so the benchmark barely moves. The FOCE fit + covariance + SIR (2000 draws) runs in ~0.3 s
+(macOS arm64, release); the covariance step is now the FD stencil, ~0.1 s before #1722.
 
 ### Rank-deficient and non-identified proposals
 

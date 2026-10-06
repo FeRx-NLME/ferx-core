@@ -15,6 +15,7 @@ use crate::estimation::parameterization::{compute_bounds, pack_params};
 /// each other's policy.
 #[test]
 fn concurrent_laplace_evaluations_keep_opposing_capture_policies() {
+    let model = make_model();
     let mut options = FitOptions::default();
     options.method = EstimationMethod::Laplace;
     let barrier = std::sync::Barrier::new(2);
@@ -22,11 +23,13 @@ fn concurrent_laplace_evaluations_keep_opposing_capture_policies() {
     std::thread::scope(|scope| {
         let objective = scope.spawn(|| {
             barrier.wait();
-            (0..1_000).all(|_| agq_inner_solve_policy(&options, false).capture_terminal_hessian)
+            (0..1_000)
+                .all(|_| agq_inner_solve_policy(&model, &options, false).capture_terminal_hessian)
         });
         let gradient = scope.spawn(|| {
             barrier.wait();
-            (0..1_000).all(|_| !agq_inner_solve_policy(&options, true).capture_terminal_hessian)
+            (0..1_000)
+                .all(|_| !agq_inner_solve_policy(&model, &options, true).capture_terminal_hessian)
         });
 
         assert!(objective.join().expect("objective policy thread"));
@@ -5585,6 +5588,84 @@ mod outer_fd_fallback {
         assert_eq!(salvage(&h_usable), unguarded);
     }
 
+    /// #1722 review finding 1: the per-subject FD salvage re-solves the subject's EBE under
+    /// the stage's convention, so for a FOCE stage with proportional error it is a central
+    /// difference of the *frozen-variance* FOCE objective — and therefore agrees with the
+    /// analytic FOCE packed gradient at the frozen EBE, non-IOV and IOV. Re-solving
+    /// conditionally instead differentiates a different function. Measured (macOS arm64):
+    /// worst relative error 4.1e-5 non-IOV / 2.5e-6 IOV; with either call site re-solving
+    /// conditionally, 9.4e-3 / 1.7e-2. The bound `3e-4` sits 7× above the first and 31×
+    /// below the second.
+    #[test]
+    fn foce_fd_salvage_differentiates_the_frozen_objective() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let stage = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            ..FitOptions::default()
+        };
+        let worst_rel = |a: &[f64], b: &[f64]| {
+            a.iter().zip(b).fold(0.0_f64, |m, (x, y)| {
+                assert!(x.is_finite() && y.is_finite(), "{x} / {y}");
+                m.max((x - y).abs() / (1.0 + y.abs()))
+            })
+        };
+        // Non-IOV.
+        let prep = crate::prepare_run(
+            "nonmem_anchor/foce_ebe_freeze_noiov_fit.ferx",
+            Some("data/warfarin_iov.csv"),
+        )
+        .expect("prepare");
+        let (model, s) = (&prep.parsed.model, &prep.population.subjects[0]);
+        let p = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(p);
+        let at = unpack_params(&x, p);
+        let eta = find_ebe_for_stage(model, s, &at, 500, 1e-12, None, None, 0, &stage).eta;
+        let salvage = subject_reconverged_fd_gradient(&x, p, model, s, &eta, &bounds, &stage);
+        let analytic = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+            model,
+            s,
+            p,
+            &x,
+            eta.as_slice(),
+        )
+        .expect("in scope");
+        let err = worst_rel(&salvage, &analytic);
+        eprintln!("MEASURE non-IOV salvage vs analytic FOCE gradient: {err:.3e}");
+        assert!(
+            err < 3e-4,
+            "non-IOV FD salvage vs analytic FOCE gradient: {err:e}"
+        );
+        // IOV.
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let (model, s) = (&prep.parsed.model, &prep.population.subjects[0]);
+        let p = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(p);
+        let at = unpack_params(&x, p);
+        let ebe = find_ebe_for_stage(model, s, &at, 500, 1e-12, None, None, 0, &stage);
+        let mut stacked = ebe.eta.as_slice().to_vec();
+        for k in &ebe.kappas {
+            stacked.extend_from_slice(k.as_slice());
+        }
+        let warm = DVector::from_column_slice(&stacked);
+        let salvage = subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, &stage);
+        let analytic = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
+            model, s, p, &x, &stacked,
+        )
+        .expect("in scope");
+        let err = worst_rel(&salvage, &analytic);
+        eprintln!("MEASURE IOV salvage vs analytic FOCE gradient: {err:.3e}");
+        assert!(
+            err < 3e-4,
+            "IOV FD salvage vs analytic FOCE gradient: {err:e}"
+        );
+    }
+
     /// #1537 review: the sentinel is finite, so a central difference with one repelled side
     /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
     /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
@@ -5625,13 +5706,33 @@ mod outer_fd_fallback {
     fn follows_the_interaction_flag() {
         let (model, analytic, _) = analytic_and_declining();
         let x = pack_params(&model.default_params);
-        let zeros = vec![0.0; model.n_eta];
+        // A FOCE EBE, not η = 0: the FOCE gradient's EBE response is the frozen-variance
+        // objective's (#1722), whose inner Hessian is only guaranteed SPD at its mode — at
+        // η = 0 on this fixture it is not, and the FOCE entry point declines.
+        let foce_stage = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            ..FitOptions::default()
+        };
+        let eta = crate::estimation::inner_optimizer::find_ebe_for_stage(
+            &model,
+            &analytic,
+            &model.default_params,
+            200,
+            1e-10,
+            None,
+            None,
+            0,
+            &foce_stage,
+        )
+        .eta;
+        let eta = eta.as_slice();
         let focei = crate::estimation::sens_outer_gradient::subject_packed_gradient(
             &model,
             &analytic,
             &model.default_params,
             &x,
-            &zeros,
+            eta,
         )
         .expect("FOCEI entry point serves the in-scope subject");
         let foce = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
@@ -5639,7 +5740,7 @@ mod outer_fd_fallback {
             &analytic,
             &model.default_params,
             &x,
-            &zeros,
+            eta,
         )
         .expect("FOCE entry point serves the in-scope subject");
         assert!(
@@ -5657,7 +5758,7 @@ mod outer_fd_fallback {
                 &analytic,
                 &model.default_params,
                 &x,
-                &zeros,
+                eta,
                 true
             ),
             Some(focei),
@@ -5669,7 +5770,7 @@ mod outer_fd_fallback {
                 &analytic,
                 &model.default_params,
                 &x,
-                &zeros,
+                eta,
                 false
             ),
             Some(foce),

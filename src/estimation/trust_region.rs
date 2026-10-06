@@ -70,6 +70,7 @@ impl FoceiProblem<'_> {
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
             InnerHessianSeed::for_options(self.options),
+            self.options,
         );
         *self.cached_etas.lock().unwrap() = etas.clone();
         (etas, h_mats)
@@ -806,6 +807,7 @@ pub fn optimize_trust_region(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
+        options,
     );
 
     let final_ofv = 2.0

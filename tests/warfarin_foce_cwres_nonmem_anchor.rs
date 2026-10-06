@@ -19,6 +19,11 @@
 //! resolves too; it survives either single revert by design and pins the file path end
 //! to end.
 //!
+//! It is also the low-σ anchor of #1722 (the FOCE EBE search holds the residual variance at
+//! f(η = 0)). At σ ≈ 1% the two conventions put the EBEs close, but not on top of each other:
+//! the 4.5e-3 OFV and 6.1e-3 CWRES gaps this test tolerated before #1722 were that
+//! convention, and the fix closed both to ~3e-9.
+//!
 //! Engine: analytic `Dual2` (warfarin one-compartment oral is in scope; asserted below by
 //! the absence of the finite-difference fallback warning).
 
@@ -39,18 +44,18 @@ const NM_OMEGA: [f64; 3] = [
 ];
 const NM_OFV: f64 = -280.35950111582304;
 
-/// Bounds, from the realised errors (macOS arm64 and Linux aarch64 agree in every printed digit):
-/// - CWRES: worst |Δ| 6.057e-3 under the fix, 0.6787 with the post-fit resolution
-///   reverted. 2e-2 is 3.3× above the first and 34× below the second. The residual is
-///   NONMEM's POSTHOC η̂ against ferx's, each from its own inner optimizer, and CWRES
-///   carries the η̂-dependent linearisation, which is where the 6e-3 lives.
-/// - OFV: |Δ| 4.454e-3 (ferx −280.3639550 vs NONMEM −280.3595011), with 2.2× headroom.
-///   The leak does not move it — the estimation stage always set its own flag — so this
-///   bound pins the point, not the fix.
+/// Bounds, from the realised errors since #1722 (macOS arm64; the PR's Linux CI runs this
+/// test at these bounds):
+/// - CWRES: worst |Δ| 3.929e-9. Without #1722's frozen-variance EBE search, 6.057e-3;
+///   with #1710's post-fit resolution reverted, 0.6787. `1e-7` is 25× above the first and
+///   6e4× / 7e6× below the other two.
+/// - OFV: |Δ| 3.024e-9 (ferx −280.3595011188 vs NONMEM −280.3595011158); without #1722,
+///   4.454e-3 (ferx −280.3639550). `1e-7` is 33× above the first and 4e4× below the second.
+///   The #1710 leak does not move the OFV — the estimation stage always set its own flag.
 /// - PRED: θ-only population predictions, worst relative |Δ| 3.96e-16. A miss here means
 ///   the parameter decoding or the row order is wrong, not the residual pass.
-const CWRES_TOL: f64 = 2e-2;
-const OFV_TOL: f64 = 1e-2;
+const CWRES_TOL: f64 = 1e-7;
+const OFV_TOL: f64 = 1e-7;
 const PRED_TOL: f64 = 1e-12;
 
 /// `(ID, CWRES, PRED)` for every observation row (`EVID = 0`), in file order.

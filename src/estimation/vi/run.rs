@@ -31,7 +31,6 @@
 
 use nalgebra::DVector;
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::nn_reg::NnRegularizer;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
@@ -995,17 +994,21 @@ pub fn run_vi(
     // produces both. It is cheap: warm-starting from `μ` lands the EBE search
     // essentially on top of its answer.
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm),
-        Some(&final_mu_k),
-        0,
-        0,
-    );
+    // The convention of the marginal the post-fit diagnostics score (#1722).
+    let (eta_hats, h_matrices, _, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            population,
+            &final_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm),
+            Some(&final_mu_k),
+            0,
+            0,
+            crate::estimation::inner_optimizer::InnerHessianSeed::None,
+            options,
+        );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
     // early stopping those differ, and windowing a 900-iteration trace as though it were
