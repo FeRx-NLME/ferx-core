@@ -816,7 +816,7 @@ mod tests {
 #[cfg(test)]
 mod from_fit_bindings {
     use super::*;
-    use crate::estimation::fit_inputs::test_fixtures::{sir_case, Kind};
+    use crate::estimation::fit_inputs::test_fixtures::{design, sir_case, Kind};
 
     /// Every kind, `sir_ess` and `sir_ci_theta` `to_bits`. The ESS is asserted above
     /// 10 on every arm first: on a degenerate proposal (ESS ≈ 1, measured with the
@@ -874,5 +874,34 @@ mod from_fit_bindings {
             assert!(ci(&want).is_some(), "{kind:?}");
             assert_eq!(ci(&got), ci(&want), "{kind:?}: sir_ci_theta bits");
         }
+    }
+
+    /// #1729 T5: SIR shares the resolver's empty-bindings check. A fit that records
+    /// no bindings, lent the `Median` model bound on a design (WT × 1.3), is refused
+    /// under SIR's own prefix rather than weighting draws centred on the design.
+    ///
+    /// Mutation — bypass the resolver's check: the call returns `Ok`.
+    #[test]
+    fn an_empty_bindings_fit_refuses_a_design_bound_model() {
+        let c = sir_case(Kind::Median);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let err = run_sir(
+            &fit,
+            Some(&design.parsed.model),
+            Some(&c.prep.population),
+            &c.opts,
+        )
+        .map(|_| ())
+        .expect_err("refused");
+        assert!(
+            err.starts_with(
+                "run_sir: this fit records no data-derived bindings (an older `.fitrx`), so \
+                 the supplied model's covariate statistics were checked against the supplied \
+                 population, and they differ: the median of `WT` is "
+            ),
+            "{err}"
+        );
     }
 }

@@ -171,6 +171,76 @@ pub(crate) fn validate_fitted_stats(
     Ok(())
 }
 
+/// The first covariate statistic of `model` that `population` does not reproduce
+/// (#1729): which covariate, which field, and both values.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatMismatch {
+    pub(crate) covariate: String,
+    /// `median`, `mean`, `min`, `max`, `mode` or `levels`.
+    pub(crate) field: &'static str,
+    /// The model's value, formatted.
+    pub(crate) model: String,
+    /// The population's value, formatted.
+    pub(crate) data: String,
+}
+
+/// Check that `model`'s bound covariate statistics are the ones `population`
+/// summarises to (#1729): `Ok(None)` when every statistic matches, `Ok(Some(..))`
+/// naming the first that does not, `Err` when a covariate cannot be summarised.
+///
+/// For a fit that recorded no bindings (an older `.fitrx`) this is the one way to
+/// tell a lent model bound on the fit's data from one bound on a simulation
+/// design. It re-summarises with `summarize` itself, so the fitted model passes
+/// bit for bit (same function, same data, sorted-order summation), and the values
+/// are compared exactly: a tolerance would accept a design whose median sits
+/// within it. Covariates are visited in name order, so the one named is
+/// reproducible.
+pub(crate) fn check_stats_on(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<Option<StatMismatch>, String> {
+    let stats = &model.data_bindings().covariate_stats;
+    let mut names: Vec<&String> = stats.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let data = summarize(name, population)?;
+        if let Some((field, model, data)) = first_difference(&stats[name], &data) {
+            return Ok(Some(StatMismatch {
+                covariate: name.clone(),
+                field,
+                model,
+                data,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// The first field, in the order median, mean, min, max, mode, levels, where two
+/// summaries differ, with both values formatted.
+fn first_difference(
+    model: &CovariateSummary,
+    data: &CovariateSummary,
+) -> Option<(&'static str, String, String)> {
+    let scalars = [
+        ("median", model.median, data.median),
+        ("mean", model.mean, data.mean),
+        ("min", model.min, data.min),
+        ("max", model.max, data.max),
+        ("mode", model.mode, data.mode),
+    ];
+    if let Some((field, m, d)) = scalars.into_iter().find(|(_, m, d)| m != d) {
+        return Some((field, m.to_string(), d.to_string()));
+    }
+    (model.levels != data.levels).then(|| {
+        (
+            "levels",
+            format!("{:?}", model.levels),
+            format!("{:?}", data.levels),
+        )
+    })
+}
+
 fn backticked(names: &[String]) -> String {
     names
         .iter()
