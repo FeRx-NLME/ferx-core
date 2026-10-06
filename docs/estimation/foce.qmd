@@ -36,18 +36,24 @@ The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
 #### Where the residual variance is taken {#inner-loop-residual-variance}
 
-Under **FOCEI** (and Laplace/AGQ, SAEM, IMP, Bayes and VI) $V_{ij} = V(f_{ij}(\eta_i))$, the
-variance at the individual's own prediction. Under **non-interaction FOCE**
-(`method = foce`, or Gauss–Newton with `interaction = false`) it is held at the population
-prediction for the whole search: $V_{ij} = R^0_{ij} = V(f_{ij}(\eta{=}0))$ — the same $R^0$
-the [Sheiner–Beal marginal](#standard-foce) uses, so the marginal is linearised around the
-mode of the objective it was built for. This is NONMEM `METHOD=1` without `INTER`. With IOV
+Under **FOCEI** (and Laplace/AGQ) $V_{ij} = V(f_{ij}(\eta_i))$, the variance at the
+individual's own prediction. Wherever the EBEs feed the
+[Sheiner–Beal marginal](#standard-foce) — **non-interaction FOCE** (`method = foce`, or
+Gauss–Newton with `interaction = false`), and the OFV, covariance step and SIR weights of
+any fit run with `interaction = false` — the variance is held at the population prediction
+for the whole search: $V_{ij} = R^0_{ij} = V(f_{ij}(\eta{=}0))$, the same $R^0$ that marginal
+uses, so it is linearised around the mode of the objective it was built for. This is NONMEM `METHOD=1` without `INTER`. With IOV
 the population prediction has every κ at zero too. Additive error is unaffected ($V$ does
 not depend on $f$); for proportional and combined error the EBEs, and with them the FOCE
 OFV, estimates and CWRES, depend on the choice. Until #1722 ferx used $V(f(\hat\eta))$ in
 the FOCE search as well: on `warfarin_iov` at NONMEM's own estimates (σ ≈ 20%) that
 put the OFV 0.74 below NONMEM without IOV and 1.28 below it with IOV. Both now agree to
 1e-6 (`tests/foce_ebe_variance_nonmem_anchor.rs`).
+
+The analytic covariance Hessian does not yet carry the second-order response of this
+frozen-variance mode, so a FOCE fit with proportional or combined error computes its
+covariance step by finite differences of the OFV (re-solving the EBEs at each stencil
+point); additive-error FOCE and FOCEI keep the analytic Hessian.
 
 One consequence: a row whose population prediction sits on the variance floor (a
 proportional error at $f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE
