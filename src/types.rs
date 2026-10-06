@@ -9115,6 +9115,25 @@ pub enum ViKl {
     Mc,
 }
 
+/// The η–ε interaction flag a stage running `method` scores under: FOCEI on, FOCE off,
+/// every other method `inherited` (the caller's `interaction`, which Gauss-Newton reads
+/// and the Monte-Carlo / Laplace estimators ignore).
+///
+/// The **single copy** of that rule (#1710). The stage loop in `crate::api::fit` sets
+/// each stage's flag with it, the `method =` parser arms set the file's flag with it,
+/// the post-fit block (SIR, CWRES, the M3 warning, `FitResult::interaction`) resolves it
+/// from the last estimating stage, and the standalone SIR / covariance entries resolve it
+/// from the fit. Before this, the post-fit block read the top-level flag, whose default
+/// is `true`, so a model-file `method = foce` scored its SIR weights and CWRES under the
+/// FOCEI marginal while the estimates came from the FOCE one.
+pub(crate) fn interaction_for(method: EstimationMethod, inherited: bool) -> bool {
+    match method {
+        EstimationMethod::FoceI => true,
+        EstimationMethod::Foce => false,
+        _ => inherited,
+    }
+}
+
 impl FitOptions {
     /// The ODE solver fields this caller moved away from their defaults (#1212).
     ///

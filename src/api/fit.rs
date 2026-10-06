@@ -1693,11 +1693,7 @@ fn fit_inner(
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
         // Per-stage interaction flag: FOCEI=on, FOCE=off, others inherit from user options.
-        match method {
-            EstimationMethod::FoceI => stage_opts.interaction = true,
-            EstimationMethod::Foce => stage_opts.interaction = false,
-            _ => {}
-        }
+        stage_opts.interaction = crate::types::interaction_for(method, options.interaction);
         // AGQ resolves `auto` to L-BFGS, because it *has* a gradient: the analytic
         // posterior-weighted score over the quadrature nodes (`estimation::agq`), with the
         // reconverged-FD gradient as the always-correct fallback.
@@ -2207,7 +2203,29 @@ fn fit_inner(
         .mixture_posteriors
         .as_ref()
         .map(|mp| mp.mixest.clone());
-    //
+    // Report the last estimating stage using the same evaluator classification as
+    // covariance and diagnostics. Neither evaluation-only IMP nor an AGQ readout
+    // changes the estimator that produced the parameters. Preserve the full chain.
+    let final_method = chain
+        .iter()
+        .rev()
+        .copied()
+        .find(|m| !eval_only_methods.contains(m))
+        .unwrap_or(*chain.last().expect("chain non-empty"));
+    // Every post-fit computation scores the marginal the last estimating stage optimised
+    // (#1710): sdtab CWRES, the M3 warning, SIR and its fallback, and the recorded
+    // `FitResult::interaction`. The stage loop set each stage's flag from its method; the
+    // top-level `options.interaction` is only what non-FOCE stages inherit, and it defaults
+    // to `true`, so reading it here scored a `method = foce` fit's SIR weights under the
+    // FOCEI objective — 151 units away from the FOCE one at warfarin_iov's estimates, and an
+    // SIR ESS of 4.9 / 1000 where the fitted marginal gives 396. Shadowed, so no reader below
+    // can reach the unresolved flag.
+    let post_opts = FitOptions {
+        interaction: crate::types::interaction_for(final_method, options.interaction),
+        ..options.clone()
+    };
+    let options = &post_opts;
+
     // ODE models run this pass under solver-statistics collection (#1080 Part B): it is the one
     // production sweep that integrates every subject at the final estimates through the
     // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
@@ -2556,15 +2574,6 @@ fn fit_inner(
         }
     }
 
-    // Report the last estimating stage using the same evaluator classification as
-    // covariance and diagnostics. Neither evaluation-only IMP nor an AGQ readout
-    // changes the estimator that produced the parameters. Preserve the full chain.
-    let final_method = chain
-        .iter()
-        .rev()
-        .copied()
-        .find(|m| !eval_only_methods.contains(m))
-        .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
     let grad_outer = crate::build_info::gradient_method_outer(

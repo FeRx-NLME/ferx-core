@@ -3639,6 +3639,28 @@ fn test_parse_method_chain_final_foce() {
     assert!(!opts.interaction);
 }
 
+/// #1710: the single-method `method = foce` clears the interaction flag, as the chain
+/// form `[saem, foce]` does. It used to leave the `true` default, so a file FOCE fit
+/// handed its post-fit block (SIR, CWRES, the M3 warning) the FOCEI marginal. A method
+/// the rule passes through (`saem`) keeps the default, and `focei` still sets it.
+#[test]
+fn test_parse_single_method_foce_clears_interaction() {
+    let foce = parse_fit_options(&["method = foce".to_string()]).unwrap();
+    assert_eq!(foce.method, EstimationMethod::Foce);
+    assert!(!foce.interaction, "method = foce must clear interaction");
+    assert!(
+        parse_fit_options(&["method = saem".to_string()])
+            .unwrap()
+            .interaction,
+        "a pass-through method keeps the default"
+    );
+    assert!(
+        parse_fit_options(&["method = focei".to_string()])
+            .unwrap()
+            .interaction
+    );
+}
+
 /// #1415: a chain whose final stage is neither `foce` nor `focei` keeps the
 /// default interaction flag, exactly as the single-method form does. The chain
 /// form used to clear it, so `[saem, imp]` published a no-interaction FOCE

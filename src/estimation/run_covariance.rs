@@ -81,15 +81,20 @@ use crate::types::*;
 ///   joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: covariance-relevant fields read are `covariance_method`,
-///   `fd_hessian_step`, `cov_inner_tol`, `interaction`, `mu_referencing`, the
-///   inner-loop settings, and `cancel`. `run_covariance_step` on `options` is
+///   `fd_hessian_step`, `cov_inner_tol`, `mu_referencing`, the inner-loop
+///   settings, and `cancel`. `run_covariance_step` on `options` is
 ///   **ignored** — calling this function is itself the request to run the step.
+///   `interaction` is not read from `options` either: it comes from the fit
+///   (`fit.method`, then `fit.interaction`), so the Hessian is taken of the
+///   objective the estimates minimise (#1710).
 pub fn run_covariance(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // #1710: differentiate the fit's own marginal, whatever `interaction` the caller carries.
+    let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
     // reach the integrator, and the spec they would otherwise be read off carries the
     // parse-time values. It matters more here than almost anywhere else — the covariance step
