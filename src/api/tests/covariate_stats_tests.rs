@@ -438,6 +438,218 @@ fn the_echoed_relation_table_keeps_level_and_expression() {
     assert!(expr.thetas.is_empty());
 }
 
+// ── #1740: an unlisted categorical level at every entry point ───────────────
+
+/// `CL ~ GRP categorical`, levels `[1, 2, 3]`, reference 2, written literally.
+fn grp_literal() -> String {
+    model(
+        "  GRP categorical(levels = [1, 2, 3])",
+        "  CL ~ GRP categorical(ref = 2)",
+    )
+}
+
+/// The same relation with the levels and reference read off the data.
+fn grp_auto() -> String {
+    model(
+        "  GRP categorical(levels = auto)",
+        "  CL ~ GRP categorical(ref = mode)",
+    )
+}
+
+/// The model's default parameters with every `THETA_CL_GRP_*` contrast set to
+/// 0.5, so each non-reference level has a factor visibly different from the
+/// reference's 1 — at the default `0.0` every level predicts alike and no
+/// bit-equality below could tell a level from the reference.
+fn live_params(m: &CompiledModel) -> crate::types::ModelParameters {
+    let mut p = m.default_params.clone();
+    let mut n = 0;
+    for (i, name) in m.theta_names.iter().enumerate() {
+        if name.starts_with("THETA_CL_GRP_") {
+            p.theta[i] = 0.5;
+            n += 1;
+        }
+    }
+    assert_eq!(n, 2, "two contrasts: {:?}", m.theta_names);
+    p
+}
+
+/// PRED per subject, one observation each.
+fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, String> {
+    let p = live_params(m);
+    crate::api::predict(m, pop, &p).map(|r| {
+        let v: Vec<f64> = r.iter().map(|r| r.pred).collect();
+        assert!(v.iter().all(|x| x.is_finite()), "{v:?}");
+        v
+    })
+}
+
+/// #1740 T1. `predict` refuses a categorical value outside the relation's levels
+/// instead of scoring it as the reference. The differential pair straddles the
+/// gate: subject 3 is `4` in one design and `2` (the reference) in its twin.
+/// Without the gate both are `Ok` with the same PRED bits (measured on `202bea5e`),
+/// so the twin must stay `Ok` and the `4` design must turn `Err`.
+///
+/// The message is the literal-levels cell: each sentence is asserted — the facts
+/// (relation, levels, reference, the unseen value), the consequence, and the advice
+/// a literal model can act on — and the from-fit wording is asserted absent.
+#[test]
+fn predict_refuses_a_categorical_value_outside_the_levels() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    assert!(!m.bound_from_fit());
+    let twin = population("GRP", &[1.0, 2.0, 2.0]);
+    let unseen = population("GRP", &[1.0, 2.0, 4.0]);
+
+    let ok = preds(&m, &twin).expect("listed levels only must predict");
+    // The pair is live: level 1 has its own factor, so a level is not the reference.
+    assert_ne!(ok[0].to_bits(), ok[1].to_bits(), "{ok:?}");
+    assert_eq!(ok[1].to_bits(), ok[2].to_bits(), "{ok:?}");
+
+    let e = preds(&m, &unseen).expect_err("an unlisted level must be refused");
+    for needle in [
+        "`CL ~ GRP categorical(...)` has levels [1.0, 2.0, 3.0] (reference 2)",
+        "`GRP` takes [4.0] in this data",
+        "has no θ of its own and takes the reference level's factor",
+        "modelled as the reference",
+        "Add the value to `GRP categorical(levels = [...])` (and refit)",
+        "`levels = auto`",
+        "drop or recode those rows",
+    ] {
+        assert!(e.contains(needle), "missing {needle:?}: {e}");
+    }
+    for absent in ["the fit's levels", "The fit estimated no θ"] {
+        assert!(!e.contains(absent), "{absent:?} is the from-fit cell: {e}");
+    }
+}
+
+/// #1740 T2. Both sides of the advice's `bound_from_fit()` gate in one test. A
+/// model laid out on an `auto` fit's bindings has the fit's θ vector, so "list the
+/// level" and `levels = auto` are not repairs there — the message must say the
+/// fit estimated no θ for the value and leave those out. The literal model on the
+/// same design gets the literal advice. Forcing the branch either way reddens one
+/// half.
+#[test]
+fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit() {
+    let text = grp_auto();
+    // The fit's data: levels [1, 2, 3], mode 2.
+    let fit_pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    let bindings = bind(&text, &fit_pop).expect("bind").data_bindings().clone();
+    let mut parsed = parse_full_model(&text).expect("parse");
+    let mut design = population("GRP", &[1.0, 2.0, 4.0]);
+    crate::api::bind_from_fit(&mut parsed, &text, &mut design, &bindings).expect("from fit");
+    let from_fit = parsed.model;
+    assert!(from_fit.bound_from_fit());
+
+    let e = preds(&from_fit, &design).expect_err("from fit: unlisted level refused");
+    for needle in [
+        "has the fit's levels [1.0, 2.0, 3.0] (reference 2)",
+        "`GRP` takes [4.0] in this data",
+        "modelled as the reference",
+        "The fit estimated no θ for these values",
+        "drop or recode those rows, or refit on data that carries them",
+    ] {
+        assert!(e.contains(needle), "from fit, missing {needle:?}: {e}");
+    }
+    for absent in ["levels = auto", "Add the value"] {
+        assert!(
+            !e.contains(absent),
+            "from fit, {absent:?} is wrong here: {e}"
+        );
+    }
+
+    let literal = parse_full_model(&grp_literal()).expect("parse").model;
+    let e = preds(&literal, &design).expect_err("literal: unlisted level refused");
+    assert!(e.contains("has levels [1.0, 2.0, 3.0]"), "{e}");
+    assert!(e.contains("`levels = auto`"), "{e}");
+    assert!(!e.contains("The fit estimated no θ"), "{e}");
+
+    // The listed twin of the design predicts from the fit's layout.
+    let mut twin = population("GRP", &[1.0, 2.0, 2.0]);
+    let mut parsed = parse_full_model(&text).expect("parse");
+    crate::api::bind_from_fit(&mut parsed, &text, &mut twin, &bindings).expect("from fit");
+    preds(&parsed.model, &twin).expect("from fit: listed levels predict");
+}
+
+/// #1740 T3. The check reads every record a value can arrive on, the same set the
+/// summary does. A literal model whose unlisted `4` exists **only on a dose
+/// record** is refused — a check reading the static covariates alone would pass
+/// it, and the dose would be given under the reference factor. The `auto` twin on
+/// the same population discovers `4` from that dose record and binds a θ for it,
+/// so its check is clean: the "auto bound on the data at hand" cell cannot reach
+/// the refusal.
+#[test]
+fn a_level_seen_only_on_a_dose_record_is_checked_like_any_other() {
+    let mut pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    pop.subjects[0].dose_covariates = vec![HashMap::from([("GRP".to_string(), 4.0)])];
+
+    let literal = parse_full_model(&grp_literal()).expect("parse").model;
+    let hit = crate::api::check_covariate_levels(&literal, &pop);
+    assert_eq!(hit.len(), 1, "{hit:?}");
+    assert!(hit[0].message.contains("[4.0]"), "{}", hit[0].message);
+
+    let auto = bind(&grp_auto(), &pop).expect("auto binds 4 from the dose record");
+    let levels: Vec<f64> = auto.covariate_model.as_ref().unwrap().relations[0]
+        .thetas
+        .iter()
+        .filter_map(|t| t.level)
+        .collect();
+    assert!(levels.contains(&4.0), "{levels:?}");
+    assert!(
+        crate::api::check_covariate_levels(&auto, &pop).is_empty(),
+        "auto on its own data has no unseen level"
+    );
+}
+
+/// #1740 T4. A missing value is not a level: it keeps the documented neutral
+/// branch, which is numerically the reference factor, and is not refused. The
+/// NaN subject's PRED is bit-equal to its reference twin's, and level 1 is not —
+/// so the equality is the neutral branch, not a flat model.
+#[test]
+fn a_missing_categorical_value_is_neutral_not_refused() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    let pop = population("GRP", &[1.0, 2.0, f64::NAN]);
+    assert!(crate::api::check_covariate_levels(&m, &pop).is_empty());
+    let p = preds(&m, &pop).expect("a missing value predicts");
+    assert_eq!(p[2].to_bits(), p[1].to_bits(), "{p:?}");
+    assert_ne!(p[0].to_bits(), p[1].to_bits(), "{p:?}");
+}
+
+/// #1740 T5. `run_covariance` and `run_sir` with a supplied population: the same
+/// subject IDs pass `check_subjects`, so a recoded covariate column reached the
+/// re-scored objective as the reference level. Both now refuse it, prefixed by the
+/// entry point. The control: the fit's own population runs `run_covariance` to
+/// `Ok`, so the refusal is the level, not the call.
+#[test]
+fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() {
+    let m = parse_full_model(&grp_literal()).expect("parse").model;
+    let fit_pop = population("GRP", &[1.0, 2.0, 2.0, 3.0]);
+    let opts = crate::types::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..crate::types::FitOptions::default()
+    };
+    let fit = crate::api::fit(&m, &fit_pop, &m.default_params, &opts).expect("fit");
+    let recoded = population("GRP", &[1.0, 2.0, 2.0, 4.0]);
+
+    for (entry, err) in [
+        (
+            "run_covariance",
+            crate::run_covariance(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
+        ),
+        (
+            "run_sir",
+            crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
+        ),
+    ] {
+        assert!(err.starts_with(&format!("{entry}: ")), "{err}");
+        assert!(
+            err.contains("`GRP` takes [4.0] in this data"),
+            "{entry}: {err}"
+        );
+    }
+    crate::run_covariance(&fit, Some(&m), Some(&fit_pop), &opts)
+        .expect("the fit's own population is not refused");
+}
+
 #[test]
 fn a_constant_covariate_is_rejected_rather_than_given_infinite_bounds() {
     let text = model("  WT continuous", "  CL ~ WT linear(center = median)");

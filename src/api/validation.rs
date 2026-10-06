@@ -2656,7 +2656,22 @@ fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
 /// silently modelled as the reference rather than flagged. That changes the
 /// fitted model with nothing in the output to say so, which is exactly the
 /// class of silent-covariate-drop this block exists to prevent.
-fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+///
+/// Every entry point that evaluates a model on a population calls this — fit and
+/// `ferx check` through `check_model_data`, simulate and adaptive through
+/// `check_simulation_data`, and predict, npde, SIR and covariance directly
+/// (#1740) — so a design recoded to a level the model has no θ for is refused
+/// wherever it arrives. A missing value is not a level and passes: it takes the
+/// documented neutral branch.
+///
+/// The advice depends on where the levels came from. A model laid out on a fit
+/// (`bound_from_fit()`) has the fit's θ vector, so adding a level or switching
+/// to `levels = auto` is not a repair there — the only ones are to drop or
+/// recode the rows, or refit.
+pub(crate) fn check_covariate_levels(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
     let Some(spec) = model.covariate_model.as_ref() else {
         return Vec::new();
     };
@@ -2686,22 +2701,36 @@ fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec
         }
         unknown.sort_by(f64::total_cmp);
         declared.sort_by(f64::total_cmp);
+        let (cov, from_fit) = (&rel.covariate, model.bound_from_fit());
+        let whose = if from_fit {
+            "the fit's levels"
+        } else {
+            "levels"
+        };
+        let facts = format!(
+            "[covariate_model]: `{} ~ {cov} {}(...)` has {whose} {declared:?} (reference \
+             {reference}), but `{cov}` takes {unknown:?} in this data.",
+            rel.parameter,
+            rel.form.label(),
+        );
+        let consequence = "A value outside the levels has no θ of its own and takes the \
+                           reference level's factor, so it would be modelled as the reference \
+                           with nothing to say so.";
+        let advice = if from_fit {
+            "The fit estimated no θ for these values: drop or recode those rows, or refit on \
+             data that carries them."
+                .to_string()
+        } else {
+            format!(
+                "Add the value to `{cov} categorical(levels = [...])` (and refit), or use \
+                 `levels = auto` to read the levels off the data; otherwise drop or recode those \
+                 rows."
+            )
+        };
         diags.push(
             Diagnostic::error(
                 "E_COV_LEVEL_UNKNOWN",
-                format!(
-                    "[covariate_model]: `{} ~ {} {}(...)` declares levels {declared:?} \
-                     (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
-                     undeclared value takes the same factor as the reference level, so the fit \
-                     would silently model it as reference. List every level \
-                     (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
-                     the data, or filter the rows out.",
-                    rel.parameter,
-                    rel.covariate,
-                    rel.form.label(),
-                    rel.covariate,
-                    rel.covariate
-                ),
+                format!("{facts} {consequence} {advice}"),
             )
             .with_block("covariate_model"),
         );

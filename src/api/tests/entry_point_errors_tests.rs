@@ -202,6 +202,13 @@ const UNBOUND_COVARIATE_MODEL: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.
     pk one_cpt_iv(cl=CL, v=V)\n[covariates]\n  WT continuous\n[covariate_model]\n  \
     CL ~ WT power(center = median)\n[error_model]\n  DV ~ proportional(PROP)\n";
 
+/// `CL ~ GRP categorical`, levels `[1, 2, 3]`, reference 2 — the #1740 fixture.
+const GRP_LEVELS_123: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
+    theta TVV(40.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
+    [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  \
+    pk one_cpt_iv(cl=CL, v=V)\n[covariates]\n  GRP categorical(levels = [1, 2, 3])\n\
+    [covariate_model]\n  CL ~ GRP categorical(ref = 2)\n[error_model]\n  DV ~ proportional(PROP)\n";
+
 const READS_WT: &str = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  \
     theta TVV(20.0, 0.001, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n\
     [individual_parameters]\n  CL = TVCL * (WT / 70) * exp(ETA_CL)\n  V  = TVV\n\
@@ -245,6 +252,17 @@ fn families() -> Vec<Family> {
                 let mut s = subject_with(vec![bolus()], 1);
                 s.covariates = HashMap::from([("WT".to_string(), 70.0)]);
                 population_of(vec![s], &["WT"])
+            },
+            theta: None,
+        },
+        Family {
+            name: "categorical level outside the levels (#1740)",
+            phrase: "`GRP` takes [4.0] in this data",
+            model: parse_full_model(GRP_LEVELS_123).expect("parse").model,
+            pop: {
+                let mut s = subject_with(vec![bolus()], 1);
+                s.covariates = HashMap::from([("GRP".to_string(), 4.0)]);
+                population_of(vec![s], &["GRP"])
             },
             theta: None,
         },
@@ -352,7 +370,7 @@ fn survival_families() -> Vec<Family> {
     ]
 }
 
-/// Ten precondition families, ten `?` lines in `predict_diag`. Each fixture trips one of them,
+/// Eleven precondition families, eleven `?` lines in `predict_diag`. Each fixture trips one of them,
 /// and each must come back as that family's own message — which is also what `fit()` says.
 ///
 /// Regression this catches: a family's check dropped from `predict_diag`, so the input reaches
@@ -363,8 +381,8 @@ fn survival_families() -> Vec<Family> {
 fn each_precondition_family_is_an_err_carrying_its_own_message() {
     let families = families();
     #[cfg(feature = "survival")]
-    assert_eq!(families.len(), 10, "one fixture per `?` in predict_diag");
-    // Without `survival` two of the ten `?` lines cannot fire at all, so no fixture can exist
+    assert_eq!(families.len(), 11, "one fixture per `?` in predict_diag");
+    // Without `survival` two of the eleven `?` lines cannot fire at all, so no fixture can exist
     // for them: the time-varying-covariate one is `#[cfg]`-gated at the call, and the
     // endpoint-routing one is *not* gated but calls `check_endpoint_routing`, whose
     // non-`survival` definition returns an empty list. Deleting either `?` is invisible to a
@@ -372,7 +390,7 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
     #[cfg(not(feature = "survival"))]
     assert_eq!(
         families.len(),
-        8,
+        9,
         "the two families whose checks are inert without `survival`"
     );
 
@@ -408,6 +426,7 @@ fn checked_by(family: &str) -> [Option<bool>; 4] {
         "modeled dose rates (#324)" => [Y, Y, N, N],
         "covariates present (#1028)" => [Y, N, N, N],
         "covariate model bound (#1111)" => [Y, N, N, N],
+        "categorical level outside the levels (#1740)" => [Y, N, Y, Y],
         "dose compartments (#375)" => [Y, Y, Y, N],
         "absorption closed-form support" => [Y, N, N, N],
         "flip-flop, no twin (#776)" => [Y, N, N, N],
