@@ -103,7 +103,8 @@ fn generate_npde_iov_anchor() {
         &model.default_params,
         NSIM,
         Some(NPDE_SEED),
-    );
+    )
+    .expect("npde");
 
     // One row per observation, in dataset order, for the row-by-row comparison
     // against the NONMEM `$TABLE`.

@@ -2088,7 +2088,7 @@ pub mod ferx_core::stats::npde
 pub struct ferx_core::stats::npde::SubjectNpde
 pub ferx_core::stats::npde::SubjectNpde::npd: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npde: alloc::vec::Vec<f64>
-pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>) -> alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>
+pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>) -> core::result::Result<alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::string::String>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
 pub mod ferx_core::stats::residual_error
 pub fn ferx_core::stats::residual_error::compute_d2r_df2_matrices(error_spec: &ferx_core::ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64], correlations: &[ferx_core::ResidualCorrelation], mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>>

@@ -2307,7 +2307,7 @@ fn fit_inner(
             &result.params,
             options.npde_nsim,
             options.npde_seed,
-        );
+        )?;
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
