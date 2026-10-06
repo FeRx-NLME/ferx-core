@@ -665,6 +665,65 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
 }
 
+/// The `GRP` column written as a NONMEM CSV, one dose and one observation per
+/// subject, for the entry points that read a data file. A `None` cell is `.`.
+fn temp_grp_csv(values: &[Option<f64>]) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .expect("create temp data");
+    writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV,GRP").unwrap();
+    for (i, v) in values.iter().enumerate() {
+        let g = v.map_or(".".to_string(), |v| format!("{v}"));
+        writeln!(f, "{},0,.,1,100,1,1,{g}", i + 1).unwrap();
+        writeln!(f, "{},1,2.0,0,.,1,0,{g}", i + 1).unwrap();
+    }
+    f.flush().expect("flush temp data");
+    f
+}
+
+/// #1739 T9. A `[covariate_model]` statistic the data cannot bind is reported as
+/// `E_COVARIATE_STATS_BINDING` on block `covariate_model` — not as the level-block
+/// code `E_THETA_LEVEL_BINDING` on `parameters`, which sent the reader to the wrong
+/// block. Two binder sources, so the code cannot depend on which one fired: an
+/// `auto` relation whose data carry one level ("nothing to estimate"), and a
+/// covariate with no non-missing value. The level-block side keeps its code; that
+/// is `tests/theta_level_blocks.rs::check_reports_level_binding_errors_directly`.
+#[test]
+fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
+    let text = model(
+        "  GRP categorical(levels = auto)",
+        "  CL ~ GRP categorical(ref = mode)",
+    );
+    let m = temp_model(&text);
+    for (label, values, needle) in [
+        ("single level", vec![Some(2.0); 4], "nothing to estimate"),
+        ("all missing", vec![None; 4], "no non-missing value"),
+    ] {
+        let d = temp_grp_csv(&values);
+        let report = crate::api::validate_model_file(
+            m.path().to_str().expect("utf-8 temp path"),
+            Some(d.path().to_str().expect("utf-8 temp path")),
+        );
+        assert!(!report.valid, "{label}: {:?}", report.diagnostics);
+        let binds: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.ends_with("_BINDING"))
+            .collect();
+        assert_eq!(binds.len(), 1, "{label}: {:?}", report.diagnostics);
+        let hit = binds[0];
+        assert_eq!(hit.code, "E_COVARIATE_STATS_BINDING", "{label}: {hit:?}");
+        assert_eq!(
+            hit.block.as_deref(),
+            Some("covariate_model"),
+            "{label}: {hit:?}"
+        );
+        assert!(hit.message.contains(needle), "{label}: {}", hit.message);
+    }
+}
+
 /// #1729 T6. The comparator behind the empty-bindings check names the first field
 /// that differs, in the order median, mean, min, max, mode, levels. Each row makes
 /// its field **and every later one** differ, so the earliest is the one named:

@@ -6854,16 +6854,31 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 {
                     diags.push(Diagnostic::warning(reader_warning_code(w), w.clone()));
                 }
+                // The two binders fail for unrelated reasons and point at different
+                // blocks, so each keeps its own code (#1739): a `[covariate_model]`
+                // statistic with nothing to estimate is not a level-block error.
                 let binding = std::fs::read_to_string(model_path)
-                    .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
+                    .map_err(|e| {
+                        Diagnostic::error(
+                            "E_THETA_LEVEL_BINDING",
+                            format!("Failed to re-read model file for level binding: {e}"),
+                        )
+                        .with_block("parameters")
+                    })
                     .and_then(|model_text| {
-                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+                            .map_err(|e| {
+                                Diagnostic::error("E_THETA_LEVEL_BINDING", e)
+                                    .with_block("parameters")
+                            })?;
                         crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
+                            .map_err(|e| {
+                                Diagnostic::error("E_COVARIATE_STATS_BINDING", e)
+                                    .with_block("covariate_model")
+                            })
                     });
-                if let Err(e) = binding {
-                    diags.push(
-                        Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"),
-                    );
+                if let Err(d) = binding {
+                    diags.push(d);
                 } else {
                     diags.extend(check_model_data_rule(
                         &parsed.model,
