@@ -25,6 +25,8 @@ The resampled vectors approximate the true parameter uncertainty distribution. C
 
 A probability-scale theta (`inv_logit(logit(THETA) + ETA)`) is proposed on the logit scale rather than on its packed $\log\theta$ scale, whose proposal has no ceiling at 1. The covariance is carried over by the delta method, and each importance weight includes the Jacobian $|dx / d\operatorname{logit}\theta|$ of its packed coordinate $x$: $1 - \theta$ for the usual $x = \log\theta$, $\theta(1 - \theta)$ when a negative lower bound packs it as $x = \theta$. Only the proposal changes; the target is still the likelihood over the packed parameter box, now without the region $\theta \ge 1$ where `logit` is clamped ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)).
 
+"The likelihood" needs a scale to be flat on. By default that is the packed scale: log-sd for a variance, $\log\theta$ for a positive θ. `sir_scale = natural` makes it the reported scale instead; see [Choosing the target scale](#choosing-the-target-scale).
+
 ## Enabling SIR
 
 Add `sir = true` to the `[fit_options]` block. The covariance step must also be enabled (it provides the proposal distribution):
@@ -46,6 +48,7 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
 | `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5. |
+| `sir_scale` | `packed` | The scale the target is flat on: `packed` (log-sd for variances) or `natural` (variances, the PsN convention). See [Choosing the target scale](#choosing-the-target-scale) |
 
 ## Output
 
@@ -60,7 +63,7 @@ The effective sample size (ESS) is the primary diagnostic:
 
 - **ESS > m** (resamples): excellent — the proposal distribution is well-matched
 - **ESS between 100 and m**: adequate for most purposes
-- **ESS < 100**: the proposal may be a poor fit; consider a different estimation method or increasing `sir_samples`
+- **ESS < 100**: the proposal may be a poor fit; consider a different estimation method or increasing `sir_samples`. SIR warns below this threshold; see [When the ESS is below 100](#when-the-ess-is-below-100)
 
 A well-behaved proposal has an ESS that **scales linearly with `sir_samples`** at a roughly constant efficiency, and **confidence intervals that are stable as `sir_samples` grows**. Degenerate SIR shows the opposite: ESS plateaus or collapses toward a handful of dominant weights, and CIs jump between runs.
 
@@ -178,6 +181,105 @@ variances (sigma and the omega and kappa diagonals) must be positive
 The fit-time counterpart of this diagnosis is the covariance step's own
 `Covariance step regularized: eigenvalue floor applied to FD Hessian ...`
 warning, which fires whenever the free-block Hessian had eigenvalues clipped.
+
+### When the ESS is below 100
+
+Below an ESS of 100 the intervals rest on a few draws, and SIR says so with a
+`SIR:` warning rather than returning them silently
+([#1723](https://github.com/FeRx-NLME/ferx-core/issues/1723)). The warning names
+the draw the intervals hinge on: its share of the weight, the coordinate it moves
+furthest (in proposal standard deviations), and that coordinate's value on the
+reported scale.
+
+Under the default `sir_scale = packed` it then checks each free Ω and κ variance.
+Each one is moved alone to its lower bound in the parameter box, with the EBEs
+re-solved, and the OFV is compared with the fit's. A rise below
+χ²₁(0.95) = 3.84 means zero is inside that variance's likelihood-ratio interval:
+the conditional ΔOFV is an upper bound on the profile ΔOFV. That variance's SIR
+lower limit then reflects the parameter box rather than the data, and the warning
+names it. The check costs one inner loop per variance and runs only on a low-ESS
+run. It does not run the other way: a rise above 3.84 does not prove the variance
+is bounded away from zero, and the warning does not say it is.
+
+`warfarin_iov` fitted with FOCEI is the bundled example:
+
+```
+SIR: effective sample size is 3.5 of 1000 draws, below the 100 at which the
+proposal is adequate, so these intervals rest on few draws. The heaviest draw
+carries 52.9% of the weight; it moves ETA_CL by -6.36 proposal standard
+deviations, to 4.585e-4 on the reported scale. Increase `sir_samples` for more
+stable intervals. The data do not bound ETA_KA (ΔOFV 1.56 at variance 6.14e-6)
+away from zero: each, moved alone to its lower bound in the parameter box,
+raises the OFV by less than χ²₁(0.95) = 3.84, so its SIR lower limit reflects the
+parameter box rather than the data. `sir_scale = natural` makes these lower
+limits independent of the box.
+```
+
+#### Variances the data do not bound away from zero
+
+The proposal is not at fault on that fit. An independent finite-difference
+Hessian reproduces the covariance step to about four digits. The *target* is
+flat. ΔOFV with one packed log-sd moved toward the floor, the others at their
+estimates (Linux aarch64; identical on macOS arm64):
+
+| coordinate | Δ = −1 | −2 | −3 | −5 | at the floor |
+|---|---|---|---|---|---|
+| ETA_CL | 5.15 | 8.58 | 9.21 | 9.31 | 9.31 |
+| ETA_V | 8.41 | 16.11 | 17.80 | 18.08 | 18.09 |
+| **ETA_KA** | **1.05** | **1.48** | **1.55** | **1.56** | **1.56** |
+| KAPPA_CL | 23.15 | 64.82 | 75.02 | 76.75 | 76.78 |
+
+ETA_KA's likelihood is a shelf that runs down to the floor at ω² = e⁻¹² ≈ 6e-6.
+No proposal centred on the estimate covers it, so a few far-tail draws carry the
+weight. ESS grows super-linearly with the draw count: 3.5, 8.3, 22.3 and 214 at
+1000, 2000, 4000 and 40 000 draws. Under the packed target the ω²_KA lower limit
+follows the floor: 4.9e-4, 1.2e-4 and 1.0e-4 with the floor at −4, −6 and −9.
+A 500-replicate bootstrap puts ω²_KA below 1e-4 in 30% of replicates.
+
+What to do: do not read that SIR lower limit as a property of the data. Profile
+the variance, bootstrap, or use `sir_scale = natural`.
+
+### Choosing the target scale
+
+SIR's target is the likelihood times a flat prior, and the two scales differ only
+where the likelihood is flat, which is where a variance's interval comes from.
+
+- **`packed`** (default): flat in log-sd (`ln L_kk`) for an Ω / κ / σ, in
+  $\log\theta$ for a positive θ, and in θ for one whose lower bound is negative.
+  A variance the data do not bound away from zero has a shelf down to the box
+  floor, as above.
+- **`natural`**: flat on the reported scale. That is Ω and κ variances and
+  covariances (`vech Σ`), σ as a **variance** whatever its declaration (NONMEM's
+  natural σ), θ as declared, and a `block_sigma` ρ as a correlation. This is the
+  PsN convention. Each draw's weight gains $\log\lvert\partial n / \partial x\rvert$,
+  and the proposal is re-centred on the tilted target's Laplace mode,
+  $\hat x + C\,\nabla\log\lvert J\rvert$, clamped into the box. The proposal's
+  shape is unchanged.
+
+Neither is right everywhere. The natural target has a heavy *upper* tail wherever
+a variance is informed by few groups, such as a between-study variance over six
+studies. ESS, `sir_resamples = 250`, seed 1705, ν = 5 (Linux aarch64; identical
+on macOS arm64):
+
+| fixture | target | 1000 draws | 4000 draws |
+|---|---|---|---|
+| `warfarin_iov`, FOCEI | packed | 3.5 | 22.3 |
+| | natural | 139.8 | 813.7 |
+| `mbma_placebo` (6 studies, BTAV κ) | packed | 143.2 | 820.6 |
+| | natural | 35.2 | 252.6 |
+
+`packed` stays the default because the MBMA shape is the one ferx is built for.
+Under `natural`, a low-ESS warning points back to `packed` instead of probing the
+floors: the natural target's lower limits do not depend on the box. With the
+ω / κ floors moved from −4 to −9 at 40 000 draws, the ω²_KA lower limit moves
+5.05e-4 → 1.01e-4 under `packed` and 5.04e-3 → 5.30e-3 under `natural`. Under
+`natural` that difference is Monte Carlo noise.
+
+There is no external reference for the natural intervals here (PsN is not
+available). They are validated by the exact Jacobian (checked against a
+finite-difference determinant), by the box independence above, and by
+agreement with the un-re-centred natural target at 40 000 draws: re-centring
+changes efficiency, not the target.
 
 ## Computational Cost
 

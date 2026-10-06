@@ -541,6 +541,7 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain resampled parameter vectors for `simulate_with_uncertainty()` |
 | `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal; higher values approach a normal proposal |
+| `sir_scale` | `packed` | Scale the SIR target is flat on: `packed` (log-sd for variances) or `natural` (variances; the PsN convention). See [SIR](../estimation/sir.qmd#choosing-the-target-scale) |
 
 ### When the covariance step fails
 
