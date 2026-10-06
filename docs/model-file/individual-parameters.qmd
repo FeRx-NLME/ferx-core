@@ -529,7 +529,8 @@ printed `100·√ω`, which is not the CV of `V`: at `ω = 0.1` the printed 31.6
 against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or fix
 `LAMBDA` at exactly 0: the transform is then `0 / 0`, which ferx evaluates as
 0, so `ETAT` carries no variability at all rather than tending to `ETA_V`.
-Start it slightly away from zero, e.g. 0.01, as PsN does. A built-in
+Start it slightly away from zero, e.g. 0.01 — the initial λ Pharmpy's
+`transform_etas_boxcox` declares (bounds −3 to 3). A built-in
 `boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
 
 ## Covariate Detection
