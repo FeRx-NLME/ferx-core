@@ -4,7 +4,7 @@
 //! * `warfarin_iov` fitted with **FOCEI** is the degenerate case: ESS 3.5 of
 //!   1000, one draw holding 53% of the weight, and ETA_KA's variance on a
 //!   likelihood shelf down to the box floor (conditional ΔOFV 1.56 there).
-//! * `warfarin_iov` fitted with FOCE (ESS 396) and the `mbma_placebo` BTAV shape
+//! * `warfarin_iov` fitted with FOCE (ESS 405) and the `mbma_placebo` BTAV shape
 //!   (ESS 143, `tests/data/mbma_placebo/`) are the healthy controls: no warning.
 //! * Under `sir_scale = natural` the two swap: `warfarin_iov` FOCEI samples well
 //!   (ESS 140) and `mbma_placebo` trips the warning (ESS 35), which then points
@@ -171,7 +171,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 396.21243679014765)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 404.5921602730343 since #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -185,7 +185,7 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
         |_| {},
     );
     report(&[("FOCE packed", f.sir_ess)]);
-    assert_ess(f.sir_ess, 396.212_436_790_147_65, "FOCE packed");
+    assert_ess(f.sir_ess, 404.592_160_273_034_3, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 

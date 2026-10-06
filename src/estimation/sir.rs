@@ -110,8 +110,8 @@ const DIRECTION_LOADING_MIN: f64 = 0.15;
 /// The effective sample size below which SIR's intervals carry a warning
 /// (#1723) — the threshold `docs/estimation/sir.qmd` already names as a poor
 /// proposal. Measured margin: healthy fixtures at 1000 draws sit at 143 (the
-/// MBMA placebo shape), 293, 396 and 497; the degenerate `warfarin_iov` FOCEI
-/// run at 3.5.
+/// MBMA placebo shape), 293, 405 (`warfarin_iov` FOCE, since #1722) and 497;
+/// the degenerate `warfarin_iov` FOCEI run at 3.5.
 pub(crate) const SIR_LOW_ESS: f64 = 100.0;
 
 /// χ²₁(0.95). A free variance whose **conditional** ΔOFV at its packed lower
