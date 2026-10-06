@@ -389,14 +389,25 @@ fn packed_sir_is_unchanged_from_before_1723() {
     assert_eq!(FitOptions::default().sir_scale, SirScale::Packed);
     let (ess, hash) = packed_fixture_digest();
     let want = f64::from_bits(PACKED_ESS_BITS);
-    assert!(
-        ess.is_finite() && ((ess - want) / want).abs() < 1e-12,
-        "ESS {ess}, before #1723 {want}"
+    let rel = ((ess - want) / want).abs();
+    // Both halves in one message, so a platform failure reports both.
+    let what = format!("ESS {ess} (before #1723 {want}, rel {rel:e}); hash {hash}");
+    assert!(ess.is_finite() && rel < ESS_PLATFORM_TOL, "{what}");
+    assert_eq!(
+        hash, PACKED_RESAMPLE_HASH,
+        "resampled vectors moved: {what}"
     );
-    assert_eq!(hash, PACKED_RESAMPLE_HASH, "resampled vectors moved");
 }
-// Measured on `202bea5e` and on this branch, macOS arm64 and Linux (see the
-// PR); the four fit-level fixtures (`warfarin`, `warfarin_iov` FOCEI and FOCE,
+
+/// The ESS is a ratio of `exp`'d log-weights, and on this fixture (ESS 1.5)
+/// one draw carries almost all of it, so a platform's libm moves it in the
+/// 11th digit. Measured: CI Linux x86_64 1.5272301060238522 against macOS
+/// arm64 1.5272301060063003, rel 1.15e-11. The bound gives ~90× headroom; every
+/// mutation of this PR's packed path moves the ESS or the hash in its leading
+/// digits.
+const ESS_PLATFORM_TOL: f64 = 1e-9;
+// Measured on `202bea5e` and on this branch (macOS arm64, bit-identical); the
+// four fit-level fixtures (`warfarin`, `warfarin_iov` FOCEI and FOCE,
 // `mbma_placebo`) were compared the same way, ESS / resample-hash / CI bits.
 const PACKED_ESS_BITS: u64 = 4_609_556_852_108_965_889;
 const PACKED_RESAMPLE_HASH: u64 = 4_345_404_384_744_949_393;
