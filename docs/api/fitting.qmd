@@ -342,13 +342,15 @@ are kept only when the new population summarises to the same values. The level
 layout is kept only when the population carries the level index columns and
 shows exactly the bound levels, so the columns were written for that layout.
 Otherwise that half is dropped, and the other binder binds it on the new data
-([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A layout that
-`bind_covariate_stats` keeps also keeps its contrast. A block declared `auto`
-can resolve differently on data with the same levels, for example with more
-subjects per study, and the statistics binder does not re-resolve it. To
-re-bind both halves on new data, call `bind_theta_levels` first, as the example
-does ([#1736](https://github.com/FeRx-NLME/ferx-core/issues/1736)). A model
-bound against a fit, described next, is the exception.
+([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A model bound
+against a fit, described next, is the exception to all of this.
+
+A layout that `bind_covariate_stats` keeps also keeps its contrast. A block
+declared `auto` can resolve differently on data with the same levels, for
+example with more subjects per study, and the statistics binder does not
+re-resolve it. To re-bind both halves on new data, call `bind_theta_levels`
+first, as the example does
+([#1736](https://github.com/FeRx-NLME/ferx-core/issues/1736)).
 
 The other three steps are what the file entry points do besides binding. The
 `[data_selection]` filter and the IOV column go to the reader. The gradient
