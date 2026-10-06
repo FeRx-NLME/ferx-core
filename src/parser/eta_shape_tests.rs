@@ -290,7 +290,7 @@ fn box_cox_at_zero_is_the_log_normal_model() {
     }
 }
 
-/// Empty parentheses declare the shape θ at PsN's defaults, named
+/// Empty parentheses declare the shape θ at `ShapeKind::default_theta`, named
 /// `LAMBDA_<ETA>` (Box-Cox, John-Draper) or `NU_<ETA>` (t-dist).
 #[test]
 fn empty_parentheses_declare_the_shape_theta() {

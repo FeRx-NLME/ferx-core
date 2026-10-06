@@ -1,8 +1,8 @@
 //! Random-effect shape transforms on the η scale (#1716, tracker #359):
 //! `boxcox(η, λ)`, `tdist(η, ν)` and `johndraper(η, λ)`, after Petersson et
-//! al. 2009 (*Pharm Res* 26:2174) — the transforms PsN `transform` and Pharmpy
-//! `transform_etas_*` implement. η stays `N(0, ω)`; the model reads `h(η)`
-//! where it read η, the NONMEM/PsN spelling `CL = TVCL * EXP(ETATR)`.
+//! al. 2009 (*Pharm Res* 26:2174) — the formulas Pharmpy's `transform_etas_*`
+//! generate. η stays `N(0, ω)`; the model reads `h(η)` where it read η, the
+//! NONMEM spelling `CL = TVCL * EXP(ETATR)`.
 //!
 //! Each transform is written **once**, as [`shape_g`] over [`PkNum`]: `T = f64`
 //! is the value every evaluator computes, and `T = Dual2` gives the exact
@@ -44,8 +44,10 @@ impl ShapeKind {
         Self::ALL.into_iter().find(|k| k.name() == name)
     }
 
-    /// `(init, lower, upper)` of an auto-declared shape θ: PsN's / Pharmpy's
-    /// defaults, so a model built with `[eta_shape]` starts where theirs does.
+    /// `(init, lower, upper)` of an auto-declared shape θ. Box-Cox and t-dist
+    /// are Pharmpy's (`_create_new_thetas` in `modeling/parameter_variability.py`:
+    /// λ `(0.01, −3, 3)`, ν `(80, 3, 100)`). John-Draper starts at its identity
+    /// λ = 1, so a fit starts at the unshaped model; Pharmpy starts it at 0.01.
     pub(crate) fn default_theta(self) -> (f64, f64, f64) {
         match self {
             ShapeKind::BoxCox => (0.01, -3.0, 3.0),

@@ -1,7 +1,7 @@
 //! NONMEM anchor for the random-effect shape transforms (#1716).
 //!
 //! `boxcox(η, λ)` and `tdist(η, ν)` are Petersson et al. 2009's transforms as
-//! PsN `transform` writes them in `$PK` — `ETATR = (EXP(ETA(1))**λ − 1)/λ`, the
+//! they are hand-coded in `$PK` (and as Pharmpy generates them) — `ETATR = (EXP(ETA(1))**λ − 1)/λ`, the
 //! third-order t series — so this is an ordinary anchored comparison against
 //! the same arithmetic in NONMEM. Four control streams, all
 //! `$EST METHOD=1 INTERACTION MAXEVAL=0 POSTHOC` on one multi-dose dataset
@@ -26,8 +26,8 @@
 //!
 //! The transform is live in every arm: the shaped objectives move by −1.39,
 //! +13.27 and −0.72 against the null, and `the_shape_is_what_is_being_anchored`
-//! states that as a test. John-Draper has no NONMEM anchor: PsN's spelling
-//! `((ABS(η)+1)**λ − 1)·(ABS(η)/η)/λ` is `0/0` at η = 0, where NONMEM's inner
+//! states that as a test. John-Draper has no NONMEM anchor: spelled in
+//! NM-TRAN as `((ABS(η)+1)**λ − 1)·(ABS(η)/η)/λ` its sign factor is `0/0` at η = 0, where NONMEM's inner
 //! search starts. It is checked against external closed-form values and by
 //! `Dual2`-vs-FD parity in `src/parser/eta_shape_tests.rs`.
 //!
