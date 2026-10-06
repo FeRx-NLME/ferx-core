@@ -10,10 +10,15 @@
 //!   (ESS 140) and `mbma_placebo` trips the warning (ESS 35), which then points
 //!   back to `packed`.
 //!
-//! Every ESS below was measured at this branch on macOS arm64 **and** Linux
-//! (`tools/linux-test.sh`), identical in every printed digit; the packed ones
-//! are also bit-identical to `202bea5e`. `ESS_REL_TOL` is round-off headroom,
-//! not noise: the seed is fixed, so a changed ESS is a changed computation.
+//! Every ESS literal below is the **Linux** value (AGENTS.md: Linux is the
+//! reference platform for fit numbers), measured on Linux aarch64
+//! (`tools/linux-test.sh`) and, for the three packed ones, identical in all
+//! printed digits on the CI x86_64 `slow-tests.yml` dispatch. `ESS_REL_TOL` is
+//! round-off headroom, not noise: the seed is fixed, so a changed ESS is a
+//! changed computation. Native macOS arm64 stops its fits at slightly
+//! different points (the OS libm, #1688) and differs by up to 1.04e-6 relative
+//! (FOCEI packed: 3.5482961137825115), so these tests are red on macOS by
+//! design; the regressions they exist for move the ESS by ≥ 12%.
 //!
 //! The per-PR tests of the same objects are in `estimation::sir::low_ess_tests`
 //! (the message's input space, the probe's coordinates and floors, the
@@ -24,6 +29,14 @@ use ferx_core::{fit, prepare_run, run_sir, PreparedRun};
 use std::path::PathBuf;
 
 const ESS_REL_TOL: f64 = 1e-9;
+
+/// Print every ESS a test computes before any assertion can stop it, so one
+/// run on a new platform reports all of them.
+fn report(values: &[(&str, Option<f64>)]) {
+    for (what, v) in values {
+        eprintln!("MEASURED {what}: ESS {v:?}");
+    }
+}
 
 fn assert_ess(got: Option<f64>, want: f64, what: &str) {
     let got = got.unwrap_or_else(|| panic!("{what}: no ESS"));
@@ -98,14 +111,14 @@ fn rerun(f: &FitResult, opts: &FitOptions, prep: &PreparedRun, scale: SirScale) 
 
 /// S3 + the natural half on the same fit.
 ///
-/// Packed (the default): exactly one low-ESS warning, ESS 3.5482961137825115.
+/// Packed (the default): exactly one low-ESS warning, ESS 3.5482998071095064.
 /// It names the heaviest draw's move (ETA_CL, −6.36 sd) and flags **only**
 /// ETA_KA (ΔOFV 1.56): ETA_CL 9.31, ETA_V 18.09 and KAPPA_CL 76.78 are above
 /// χ²₁(0.95) and must not be named in the shelf sentence. Mutations: drop the
 /// warning push → `expect` dies; flag by the heaviest draw's coordinate instead
 /// of the floor ΔOFV → "ETA_CL (ΔOFV" appears.
 ///
-/// Natural, through `run_sir` on the fitted result: ESS 139.7846551577257 and
+/// Natural, through `run_sir` on the fitted result: ESS 139.78474460042662 and
 /// no low-ESS warning — the packed run's is replaced, not kept beside it. Dropping the re-centre
 /// reads 57.3 (#1723 amendment A0), so the ESS assertion is the re-centre's
 /// run-level kill.
@@ -120,7 +133,11 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
             o.method = EstimationMethod::FoceI;
             o.interaction = true;
         });
-    assert_ess(f.sir_ess, 3.548_296_113_782_511_5, "FOCEI packed");
+    // `run_sir` on the fitted result replaces the packed run's warning rather
+    // than keeping it beside the new ESS.
+    let nat = rerun(&f, &opts, &prep, SirScale::Natural);
+    report(&[("FOCEI packed", f.sir_ess), ("FOCEI natural", nat.sir_ess)]);
+    assert_ess(f.sir_ess, 3.548_299_807_109_506_4, "FOCEI packed");
     let w = low_ess(&f).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", f.warnings));
     assert_eq!(
         f.warnings
@@ -150,14 +167,11 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
 
     assert_structured_sir(&f);
 
-    // `run_sir` on the fitted result replaces the packed run's warning rather
-    // than keeping it beside the new ESS.
-    let nat = rerun(&f, &opts, &prep, SirScale::Natural);
-    assert_ess(nat.sir_ess, 139.784_655_157_725_7, "FOCEI natural");
+    assert_ess(nat.sir_ess, 139.784_744_600_426_62, "FOCEI natural");
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 396.2124381483536, #1710's T6)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 396.21243679014765)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -170,15 +184,16 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
         "data/warfarin_iov.csv",
         |_| {},
     );
-    assert_ess(f.sir_ess, 396.212_438_148_353_6, "FOCE packed");
+    report(&[("FOCE packed", f.sir_ess)]);
+    assert_ess(f.sir_ess, 396.212_436_790_147_65, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
 /// S4 + S10 on the MBMA BTAV shape, both halves in one test.
 ///
-/// Packed (default): ESS 143.2245028940596, 1.43× the threshold, and no SIR
+/// Packed (default): ESS 143.22450068255318, 1.43× the threshold, and no SIR
 /// warning — the closest healthy fixture to the threshold, so moving it to
-/// `sir_resamples` (250) reddens this half. Natural: ESS 35.188868505106896,
+/// `sir_resamples` (250) reddens this half. Natural: ESS 35.188868814200404,
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
@@ -192,11 +207,12 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
         "tests/data/mbma_placebo/mbma_placebo.csv",
         |_| {},
     );
-    assert_ess(f.sir_ess, 143.224_502_894_059_6, "MBMA packed");
+    let nat = rerun(&f, &opts, &prep, SirScale::Natural);
+    report(&[("MBMA packed", f.sir_ess), ("MBMA natural", nat.sir_ess)]);
+    assert_ess(f.sir_ess, 143.224_500_682_553_18, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    let nat = rerun(&f, &opts, &prep, SirScale::Natural);
-    assert_ess(nat.sir_ess, 35.188_868_505_106_896, "MBMA natural");
+    assert_ess(nat.sir_ess, 35.188_868_814_200_404, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),
