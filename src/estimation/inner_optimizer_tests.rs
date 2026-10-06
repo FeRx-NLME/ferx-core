@@ -3984,6 +3984,79 @@ mod frozen_ebe_variance {
         }
     }
 
+    /// T7, covariance FD stencil (#1722 review finding 1): the EBEs `reconverge_population`
+    /// re-solves at every stencil point are the stage's convention — bit-identical to the
+    /// frozen solve under a FOCE stage and to the conditional one under FOCEI, which differ
+    /// here. Every FOCE + proportional/combined covariance step now runs this stencil.
+    #[test]
+    fn covariance_stencil_reconverges_the_stage_convention() {
+        let (model, pop, p) = noiov_fixture(None);
+        let x = crate::estimation::parameterization::pack_params(&p);
+        // The stencil solves at the unpacked point, which round-trips θ/Ω by ~1 ULP.
+        let p = crate::estimation::parameterization::unpack_params(&x, &p);
+        let warm: Vec<DVector<f64>> = pop.subjects.iter().map(|_| DVector::zeros(3)).collect();
+        let mut sep = 0.0_f64;
+        for interaction in [false, true] {
+            let stage = crate::types::FitOptions {
+                method: if interaction {
+                    EstimationMethod::FoceI
+                } else {
+                    EstimationMethod::Foce
+                },
+                interaction,
+                ..Default::default()
+            };
+            let (_, ehs, _, _) = crate::estimation::covariance::reconverge_population(
+                &x, &model, &pop, &p, &warm, &stage, 1e-8,
+            );
+            let want = if interaction {
+                EbeVariance::Conditional
+            } else {
+                EbeVariance::Population
+            };
+            let other = if interaction {
+                EbeVariance::Population
+            } else {
+                EbeVariance::Conditional
+            };
+            let mu = crate::estimation::parameterization::compute_mu_k(
+                &model,
+                &p.theta,
+                stage.mu_referencing,
+            );
+            for (i, s) in pop.subjects.iter().enumerate() {
+                let solve = |v| {
+                    find_ebe_with_variance(
+                        &model,
+                        s,
+                        &p,
+                        stage.inner_maxiter,
+                        1e-8,
+                        Some(warm[i].as_slice()),
+                        Some(&mu),
+                        0,
+                        v,
+                    )
+                    .eta
+                };
+                let (w, o) = (solve(want), solve(other));
+                for (a, b) in ehs[i].iter().zip(w.iter()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "interaction {interaction}, subject {}",
+                        s.id
+                    );
+                }
+                sep = sep.max((&w - &o).amax());
+            }
+        }
+        assert!(
+            sep > 1e-2,
+            "the conventions must separate on this fixture ({sep:e})"
+        );
+    }
+
     /// The fitted parameters of `r` on `model`'s template.
     fn r_params(model: &CompiledModel, r: &crate::types::FitResult) -> ModelParameters {
         let mut p = model.default_params.clone();
