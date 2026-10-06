@@ -2937,6 +2937,220 @@ mod bind_from_fit {
         assert!(parsed.bindings.levels.is_empty(), "nor its bindings");
     }
 
+    /// `text` parsed and bound to `design` the way `prepare_run` binds a model to its
+    /// own data: every level block and every symbolic statistic resolved there.
+    fn pre_bound(text: &str, design: &mut Population) -> ParsedModel {
+        let mut parsed = parse_full_model(text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, text, design).unwrap();
+        crate::api::bind_covariate_stats(&mut parsed, text, design).unwrap();
+        parsed
+    }
+
+    /// #1686: a model already bound to other data still needs the fit's bindings.
+    /// The pre-bound twin's relations are resolved (on the design's median, 90), so
+    /// a gate that reads `parsed.model` sees nothing to refuse; the unbound twin's
+    /// are not. The straddle is asserted, then both twins must give the same
+    /// empty-bindings refusal, with nothing written.
+    ///
+    /// Mutation — compute `symbolic` from `parsed.model` again, the pre-#1686 gate:
+    /// the pre-bound `Median`-only twin binds `Ok` on the design's median.
+    #[test]
+    fn a_model_bound_to_other_data_still_needs_the_fits_bindings() {
+        use crate::api::covariate_stats::symbolic_covariates;
+        for (level, median) in [(false, true), (true, true), (true, false)] {
+            let text = model(level, median);
+            let cell = format!("level {level} median {median}");
+            let mut design = weighed(3, 2, 80.0);
+            let mut prebound = pre_bound(&text, &mut design);
+            let unbound = parse_full_model(&text).unwrap();
+            // The straddle: the old gate read the resolution state.
+            assert_eq!(
+                symbolic_covariates(&unbound.model).is_empty(),
+                !median,
+                "{cell}"
+            );
+            assert!(
+                symbolic_covariates(&prebound.model).is_empty(),
+                "{cell}: pre-binding resolves every relation"
+            );
+            if median {
+                assert_eq!(prebound.bindings.covariate_stats["WT"].median, 90.0);
+            }
+            // The level half reads declarations, which binding keeps: reading the
+            // blocks from `parsed.model` instead of the text is an equivalent mutant.
+            assert_eq!(
+                format!("{:?}", prebound.model.theta_blocks().level_blocks()),
+                format!("{:?}", unbound.model.theta_blocks().level_blocks()),
+                "{cell}"
+            );
+
+            let want = refusal(&text, &DataBindings::default());
+            let before_model = prebound.model.data_bindings().clone();
+            let before = format!("{design:?}");
+            let err = bind_from_fit(&mut prebound, &text, &mut design, &DataBindings::default())
+                .expect_err(&cell);
+            assert_eq!(err, want, "{cell}: the twins refuse alike");
+            assert_eq!(format!("{design:?}"), before, "{cell}");
+            assert_eq!(prebound.model.data_bindings(), &before_model, "{cell}");
+        }
+
+        // The bound cell: full bindings rebind a pre-bound model on the fit's
+        // median, not the design's.
+        let text = model(true, true);
+        let b = fitted(&text);
+        let mut design = weighed(3, 2, 80.0);
+        let mut prebound = pre_bound(&text, &mut design);
+        let mut fresh = weighed(3, 2, 80.0);
+        bind_from_fit(&mut prebound, &text, &mut fresh, &b).unwrap();
+        assert_eq!(prebound.model.data_bindings(), &b);
+        assert_eq!(prebound.bindings.covariate_stats["WT"].median, 70.0);
+    }
+
+    /// #1686, the partial cell: a pre-bound model given a fit whose statistics lack
+    /// `WT` hears the statistics refusal, as the unbound model does, not the
+    /// generic unbound-model one the re-parse would otherwise end in.
+    ///
+    /// Mutation — validate the statistics against `parsed.model`: the pre-bound
+    /// model finds nothing missing and is refused by `assert_covariate_model_bound`.
+    #[test]
+    fn a_pre_bound_model_names_the_statistic_the_fit_lacks() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        b.covariate_stats.clear();
+        let mut design = weighed(3, 2, 80.0);
+        let mut prebound = pre_bound(&text, &mut design);
+        let err = bind_from_fit(&mut prebound, &text, &mut design, &b).unwrap_err();
+        assert_eq!(err, refusal(&text, &b));
+        assert!(
+            err.starts_with("[covariate_model] relations state a statistic of `WT`"),
+            "{err}"
+        );
+    }
+
+    /// The shape of a model: what `layout_from_fit` promises to match.
+    type Shape = (
+        usize,
+        Vec<String>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<bool>,
+        DataBindings,
+    );
+
+    fn shape(m: &crate::types::CompiledModel) -> Shape {
+        let p = &m.default_params;
+        (
+            m.n_theta,
+            p.theta_names.clone(),
+            p.theta.clone(),
+            p.theta_lower.clone(),
+            p.theta_upper.clone(),
+            p.theta_fixed.clone(),
+            m.data_bindings().clone(),
+        )
+    }
+
+    /// #1703: `layout_from_fit` lays the model out exactly as `bind_from_fit` does on
+    /// the fit's own data — θ count, names, inits, bounds, `FIX` flags and recorded
+    /// bindings — with no population, on every (level, median) cell and under a
+    /// `ref` contrast.
+    ///
+    /// Mutations — drop the statistics from the re-parse's bindings in
+    /// `lay_out_on_fit`: the `Median` cells' recorded bindings lose `WT` here, and
+    /// `both_halves_come_from_the_fit` dies on the same edit through `bind_from_fit`.
+    /// Skip `apply` in `layout_from_fit`: every cell keeps the unbound layout.
+    #[test]
+    fn layout_from_fit_is_bind_from_fit_without_the_population() {
+        let ref_text = model(true, true).replace(
+            "theta PLACEBO[STUDY, TIME](",
+            "theta PLACEBO[STUDY, TIME, contrast = ref](",
+        );
+        for text in [
+            model(true, true),
+            model(false, true),
+            model(true, false),
+            ref_text,
+        ] {
+            let b = fitted(&text);
+            let mut own = weighed(3, 2, 60.0);
+            let bound = bind(&text, &mut own, &b).unwrap();
+            let mut laid = parse_full_model(&text).unwrap();
+            crate::api::layout_from_fit(&mut laid, &text, &b).unwrap();
+            assert_eq!(shape(&laid.model), shape(&bound.model), "{text}");
+            assert_eq!(laid.model.name, bound.model.name);
+            assert_ne!(
+                shape(&laid.model),
+                shape(&parse_full_model(&text).unwrap().model),
+                "the layout moved: {text}"
+            );
+        }
+        // A plain model with empty bindings is laid out as itself.
+        let text = model(false, false);
+        let mut laid = parse_full_model(&text).unwrap();
+        crate::api::layout_from_fit(&mut laid, &text, &DataBindings::default()).unwrap();
+        assert_eq!(
+            shape(&laid.model),
+            shape(&parse_full_model(&text).unwrap().model)
+        );
+    }
+
+    /// #1703: `layout_from_fit` refuses what `bind_from_fit` refuses, word for word,
+    /// and leaves `parsed` as it was: a repeated label, a split (non-contiguous)
+    /// group, missing statistics, empty bindings — on an unbound and on a pre-bound
+    /// model (#1686).
+    ///
+    /// Mutation — delete `validate_fitted_levels` or `validate_fitted_stats` from
+    /// `lay_out_on_fit`: the repeated label lays out `Ok`, or the split group and
+    /// the missing statistics are refused by the parser or the bound assert in
+    /// other words.
+    #[test]
+    fn layout_from_fit_refuses_what_bind_from_fit_refuses() {
+        let text = model(true, true);
+        let repeated = {
+            let mut b = fitted(&text);
+            let p = b.levels.get_mut("PLACEBO").unwrap();
+            p.labels[1] = p.labels[0].clone();
+            b
+        };
+        let split = {
+            let mut b = fitted(&text);
+            b.levels.get_mut("PLACEBO").unwrap().groups = vec![0, 0, 1, 1, 0, 0];
+            b
+        };
+        let no_stats = {
+            let mut b = fitted(&text);
+            b.covariate_stats.clear();
+            b
+        };
+        let cases = [
+            ("repeated", repeated, "level(s) more than once"),
+            ("split", split, "are split"),
+            ("no stats", no_stats, "carry no entry for it"),
+            (
+                "empty",
+                DataBindings::default(),
+                "carries no data-derived bindings",
+            ),
+        ];
+        for (what, b, says) in cases {
+            let want = refusal(&text, &b);
+            assert!(want.contains(says), "{what}: {want}");
+            for pre in [false, true] {
+                let mut parsed = if pre {
+                    pre_bound(&text, &mut weighed(3, 2, 80.0))
+                } else {
+                    parse_full_model(&text).unwrap()
+                };
+                let before = shape(&parsed.model);
+                let err = crate::api::layout_from_fit(&mut parsed, &text, &b)
+                    .expect_err(&format!("{what} pre {pre}"));
+                assert_eq!(err, want, "{what} pre {pre}");
+                assert_eq!(shape(&parsed.model), before, "{what} pre {pre}: untouched");
+            }
+        }
+    }
+
     /// R4 and the unseen-level refusal pass through unchanged, and still write
     /// nothing.
     #[test]

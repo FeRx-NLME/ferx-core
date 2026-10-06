@@ -387,6 +387,10 @@ to 17%. After `bind_from_fit`, a `bind_covariate_stats` call on the same model
 changes nothing, because no relation is left for it to resolve. A fit that
 carries no bindings, such as a `.fitrx` saved before they were recorded, is
 refused rather than re-bound on the design. Refit the model to record them.
+This holds for a model already bound to other data too, such as one
+`prepare_run` bound to a design. What the model needs is read from its text, so
+the design's centres cannot stand in for the fit's
+([#1686](https://github.com/FeRx-NLME/ferx-core/issues/1686)).
 `bind_theta_levels_from_fit`, the earlier levels-only binder, is deprecated.
 
 Each design record gets its level's index in the fit, and the model is re-parsed
@@ -410,6 +414,23 @@ contrast other than the one the block declares (`ref` and `sum_to_zero` free
 the same number of θ, so a swap would otherwise read the fitted values under
 the wrong convention), a missing covariate statistic, and one that no relation
 reads.
+
+#### The fit's layout without a population: `layout_from_fit` {#layout-from-fit}
+
+`layout_from_fit(&mut parsed, &model_text, &result.data_bindings)` is the
+model half of `bind_from_fit`. It lays the model out on the fit's bindings:
+the same θ count, names, initial values, bounds and `FIX` flags. It writes
+nothing to any population. Use it when you need the model's shape but have no
+data to bind, for example to size a skeleton `FitResult` for SIR or a
+standalone covariance step. `bind_from_fit` runs the same function, so the
+two cannot disagree on a layout. It also refuses everything `bind_from_fit`
+refuses, except a level the fit never observed, since there is no population
+to look for one in
+([#1703](https://github.com/FeRx-NLME/ferx-core/issues/1703)). The model it
+returns is not ready to run on data with a level block: the block reads its
+index columns from the population, and only `bind_from_fit` writes them.
+
+#### The θ vector's length
 
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
