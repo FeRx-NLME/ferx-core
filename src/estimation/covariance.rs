@@ -2329,6 +2329,13 @@ mod tests {
                 opts(EstimationMethod::FoceI, true, 3),
                 false,
             ),
+            // Quadrature with interaction off: the AGQ clause alone keeps it out.
+            (
+                "laplace+prop, interaction off",
+                &prop,
+                opts(EstimationMethod::Laplace, false, 1),
+                false,
+            ),
         ] {
             let declines = super::analytic_cov_declines(model, &pop, &o, false);
             assert_eq!(
