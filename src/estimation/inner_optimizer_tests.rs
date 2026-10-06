@@ -168,6 +168,7 @@ mod ctmm_inner {
                 &mut Vec::new(),
                 &mut nalgebra::DVector::zeros(model.n_eta),
                 &mut nalgebra::DVector::zeros(model.n_eta),
+                None,
             )
             .expect("endpoint-only CTMM is in analytic scope");
 
@@ -3800,6 +3801,197 @@ mod frozen_ebe_variance {
                 s.id
             );
         }
+    }
+
+    /// T7: the EBEs every estimator *reports* under `interaction = false` are modes of the
+    /// frozen objective — the Sheiner–Beal marginal they are scored under — and under
+    /// `interaction = true` modes of the conditional one. One fixture, one fit per stage, each
+    /// asserted separately so a failure names the path: the FOCE final inner loop, the
+    /// Gauss–Newton driver, SAEM's final OFV pass, VI's final EBE pass, and the standalone
+    /// IMP evaluation stage. Both sides of the gate per method where the method takes both,
+    /// so a path that ignores the convention fails one half whichever way it is wired.
+    #[test]
+    fn reported_ebes_follow_the_marginal_of_every_stage() {
+        let (model, pop, p) = noiov_fixture(None);
+        let base = crate::types::FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            verbose: false,
+            saem_n_exploration: 2,
+            saem_n_convergence: 0,
+            saem_n_mh_steps: 1,
+            saem_seed: Some(7),
+            vi_iters: 5,
+            ..Default::default()
+        };
+        let cases: Vec<(&str, crate::types::FitOptions)> = vec![
+            (
+                "foce",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Foce,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "focei",
+                crate::types::FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "gn",
+                crate::types::FitOptions {
+                    method: EstimationMethod::FoceGn,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "saem",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Saem,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "saem+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Saem,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "vi",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Vi,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "vi+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Vi,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "imp-eval",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Imp,
+                    imp_eval_only: true,
+                    interaction: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "imp-eval+inter",
+                crate::types::FitOptions {
+                    method: EstimationMethod::Imp,
+                    imp_eval_only: true,
+                    interaction: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (label, opts) in cases {
+            let r = crate::fit(&model, &pop, &p, &opts).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let fp = r_params(&model, &r);
+            let frozen_expected = !opts.interaction;
+            let (mut worst_own, mut worst_other) = (0.0_f64, f64::INFINITY);
+            for (s, sr) in pop.subjects.iter().zip(&r.subjects) {
+                let eta = sr.eta.as_slice();
+                let f0 = population_variance_preds(&model, s, &fp.theta, 3).unwrap();
+                let gmax = |frozen: Option<&[f64]>| {
+                    fd(|e| nll(&model, s, &fp, e, frozen), eta)
+                        .iter()
+                        .fold(0.0_f64, |m, v| {
+                            assert!(v.is_finite(), "{label}: non-finite gradient");
+                            m.max(v.abs())
+                        })
+                };
+                let (gf, gc) = (gmax(Some(&f0)), gmax(None));
+                let (own, other) = if frozen_expected { (gf, gc) } else { (gc, gf) };
+                worst_own = worst_own.max(own);
+                worst_other = worst_other.min(other);
+            }
+            eprintln!(
+                "MEASURE {label}: own-objective |g| {worst_own:.2e}, other {worst_other:.2e}"
+            );
+            assert!(
+                worst_own < 1e-3,
+                "{label}: reported EBEs are not modes of the {} objective (|g| {worst_own:e})",
+                if frozen_expected {
+                    "frozen"
+                } else {
+                    "conditional"
+                }
+            );
+            assert!(
+                worst_other > 1e-2,
+                "{label}: the two objectives must separate here (|g| {worst_other:e})"
+            );
+        }
+    }
+
+    /// `find_ebe_for_stage` — the covariance stencil's, the per-subject FD salvage's and the
+    /// mixture class solve's entry point — solves under its stage's convention: bit-identical
+    /// to the explicit `Population` solve for a FOCE stage and to the `Conditional` one for a
+    /// FOCEI stage, which differ on this fixture.
+    #[test]
+    fn find_ebe_for_stage_reads_the_stage() {
+        let (model, pop, p) = noiov_fixture(None);
+        let s = &pop.subjects[9];
+        let stage = |interaction: bool| crate::types::FitOptions {
+            method: if interaction {
+                EstimationMethod::FoceI
+            } else {
+                EstimationMethod::Foce
+            },
+            interaction,
+            ..Default::default()
+        };
+        let solve = |v| find_ebe_with_variance(&model, s, &p, 200, 1e-10, None, None, 0, v);
+        let (pop_e, cond_e) = (
+            solve(EbeVariance::Population),
+            solve(EbeVariance::Conditional),
+        );
+        assert!(
+            (&pop_e.eta - &cond_e.eta).amax() > 1e-2,
+            "fixture must separate the modes"
+        );
+        for (interaction, want) in [(false, &pop_e), (true, &cond_e)] {
+            let got = find_ebe_for_stage(
+                &model,
+                s,
+                &p,
+                200,
+                1e-10,
+                None,
+                None,
+                0,
+                &stage(interaction),
+            );
+            for (a, b) in got.eta.iter().zip(want.eta.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "interaction = {interaction}");
+            }
+        }
+    }
+
+    /// The fitted parameters of `r` on `model`'s template.
+    fn r_params(model: &CompiledModel, r: &crate::types::FitResult) -> ModelParameters {
+        let mut p = model.default_params.clone();
+        p.theta = r.theta.clone();
+        p.omega =
+            OmegaMatrix::from_matrix(r.omega.clone(), p.omega.eta_names.clone(), p.omega.diagonal);
+        p.sigma.values = r.sigma.clone();
+        p
     }
 
     /// T6: the one decision. `Population` exactly for a Sheiner–Beal stage (FOCE family,
