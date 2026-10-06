@@ -1607,6 +1607,7 @@ fn light_seed_gradient_applies_cens_only_under_m3() {
             &err_keys,
             &mut Vec::new(),
             false,
+            None,
         )
         .expect("fixture supports the light seed");
         let ordinary = analytic_eta_nll_gradient(
@@ -1676,6 +1677,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             &err_keys,
             &mut Vec::new(),
             exact,
+            None,
         )
     };
     assert!(
@@ -2500,6 +2502,7 @@ fn light_seed_matches_full_provider_and_fuses_the_ordinary_gradient() {
         &err_keys,
         &mut Vec::new(),
         false,
+        None,
     )
     .expect("fixture supports the light seed");
     let ordinary_gradient = analytic_eta_nll_gradient(
@@ -2540,6 +2543,7 @@ fn light_seed_matches_full_provider_and_fuses_the_ordinary_gradient() {
         &err_keys,
         &mut Vec::new(),
         true,
+        None,
     )
     .expect("fixture supports the exact Laplace seed");
     assert_eq!(exact_gradient, None);
@@ -3610,6 +3614,188 @@ mod frozen_ebe_variance {
             .zip(&gc)
             .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         assert!(sep > 1e-3, "m3: frozen vs conditional gradient {sep:e}");
+    }
+
+    /// `R⁰` is the variance at every random effect zero, `η_ruv` included (`fit` refuses
+    /// `iiv_on_ruv` under a non-interaction stage, so this guards the convention, not a
+    /// reachable fit): under a frozen variance `η_ruv` moves only the prior — objective
+    /// and analytic gradient alike — while the conditional objective's data term moves.
+    #[test]
+    fn frozen_variance_carries_no_ruv_eta_data_term() {
+        let src = std::fs::read_to_string("nonmem_anchor/foce_ebe_freeze_noiov_fit.ferx")
+            .unwrap()
+            .replace(
+                "omega ETA_KA ~ 0.30",
+                "omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10",
+            )
+            .replace(
+                "DV ~ proportional(PROP_ERR)",
+                "DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+            );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert_eq!(
+            model.residual_error_eta,
+            Some(3),
+            "fixture: η_ruv is the 4th eta"
+        );
+        let (_, pop, base) = noiov_fixture(None);
+        let mut p = model.default_params.clone();
+        p.theta = base.theta.clone();
+        p.sigma.values = base.sigma.values.clone();
+        let s = &pop.subjects[2];
+        let f0 = population_variance_preds(&model, s, &p.theta, 4).unwrap();
+        let (lo, hi) = ([0.1, -0.1, 0.2, 0.0], [0.1, -0.1, 0.2, 0.3]);
+        let prior = 0.5 * 0.3 * 0.3 / p.omega.matrix[(3, 3)];
+        let frozen = nll(&model, s, &p, &hi, Some(&f0)) - nll(&model, s, &p, &lo, Some(&f0));
+        assert!(
+            (frozen - prior).abs() < 1e-9,
+            "frozen: Δ {frozen} vs prior-only {prior}"
+        );
+        let cond = nll(&model, s, &p, &hi, None) - nll(&model, s, &p, &lo, None);
+        assert!(
+            (cond - prior).abs() > 1e-2,
+            "conditional data term must move ({cond})"
+        );
+        let keys = model.error_spec.obs_keys(s);
+        let g = analytic_eta_nll_gradient_with_schedule(
+            &model,
+            s,
+            &p.theta,
+            &hi,
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            None,
+            None,
+            keys.as_ref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(4),
+            &mut DVector::zeros(4),
+            Some(&f0),
+        )
+        .expect("in scope");
+        assert_close(
+            "ruv",
+            &g,
+            &fd(|e| nll(&model, s, &p, e, Some(&f0)), &hi),
+            1e-5,
+        );
+    }
+
+    /// The production FOCE path is the **seeded** one (`InnerHessianSeed::GaussNewton`), and
+    /// its light seed fuses BFGS's first gradient. That gradient must be the frozen
+    /// objective's: handing BFGS the conditional one sent its first step the wrong way, and
+    /// on `warfarin_iov` at a mid-fit point 4–8 of 10 subjects then failed BFGS and fell back
+    /// to Nelder–Mead at every outer evaluation — noise the outer L-BFGS stalled on, 1.15
+    /// OFV above NONMEM's optimum. The unseeded solve (the tests above) cannot see this.
+    #[test]
+    fn seeded_population_solve_fuses_the_frozen_gradient() {
+        let (model, pop, _) = noiov_fixture(None);
+        // ferx's stall point before the fix (θ = 0.13736, 8.73095, 1.64160; ω² = 0.099555,
+        // 0.006699, 0.233339; σ = 0.193088).
+        let mut p = model.default_params.clone();
+        p.theta = vec![0.137360, 8.730946, 1.641600];
+        p.omega =
+            OmegaMatrix::from_diagonal(&[0.099555, 0.006699, 0.233339], p.omega.eta_names.clone());
+        p.sigma.values = vec![0.193088];
+        let s = &pop.subjects[0];
+        let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+        let keys = model.error_spec.obs_keys(s);
+        let eta = [0.2, -0.1, 0.3];
+        let fused = |frozen: Option<&[f64]>| {
+            analytic_inner_seed_hessian(
+                &model,
+                s,
+                &p,
+                &eta,
+                None,
+                None,
+                keys.as_ref(),
+                &mut Vec::new(),
+                false,
+                frozen,
+            )
+            .expect("light seed in scope")
+            .1
+            .expect("light seed fuses a gradient")
+        };
+        let want = analytic_eta_nll_gradient_with_schedule(
+            &model,
+            s,
+            &p.theta,
+            &eta,
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            None,
+            None,
+            keys.as_ref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(3),
+            &mut DVector::zeros(3),
+            Some(&f0),
+        )
+        .unwrap();
+        let (gf, gc) = (fused(Some(&f0)), fused(None));
+        assert_close("fused", &gf, &want, 1e-12);
+        let sep = gf
+            .iter()
+            .zip(&gc)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(sep > 1e-2, "frozen vs conditional fused gradient {sep:e}");
+
+        // The production warm, seeded solve: warm-started from the conditional modes, as an
+        // outer evaluation after a step is. Every subject converges on the frozen mode, and
+        // none falls back.
+        let warm: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                find_ebe_with_variance(
+                    &model,
+                    s,
+                    &p,
+                    200,
+                    1e-8,
+                    None,
+                    None,
+                    0,
+                    EbeVariance::Conditional,
+                )
+                .eta
+            })
+            .collect();
+        let (etas, _, stats, _) = run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            &p,
+            200,
+            1e-6,
+            Some(&warm),
+            None,
+            0,
+            0,
+            InnerHessianSeed::GaussNewton,
+            EbeVariance::Population,
+        );
+        assert_eq!(
+            stats.n_fallback, 0,
+            "no frozen solve may fall back to Nelder–Mead"
+        );
+        assert_eq!(stats.n_unconverged, 0, "every frozen solve converges");
+        for (s, e) in pop.subjects.iter().zip(&etas) {
+            let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
+            let g = fd(|b| nll(&model, s, &p, b, Some(&f0)), e.as_slice());
+            let gmax = g.iter().fold(0.0_f64, |m, v| {
+                assert!(v.is_finite());
+                m.max(v.abs())
+            });
+            assert!(
+                gmax < 1e-4,
+                "{}: frozen gradient {gmax:e} at the seeded EBE",
+                s.id
+            );
+        }
     }
 
     /// T6: the one decision. `Population` exactly for a Sheiner–Beal stage (FOCE family,

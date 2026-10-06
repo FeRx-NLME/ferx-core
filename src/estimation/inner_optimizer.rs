@@ -515,6 +515,10 @@ fn analytic_inner_seed_hessian(
     err_keys: &[usize],
     obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
     exact: bool,
+    // Non-interaction FOCE's frozen variance point (#1722). The light path's fused first
+    // gradient must be the gradient of the objective BFGS minimises, so under a frozen
+    // variance the metric and the fused gradient are both taken at `R⁰` with `∂R/∂f = 0`.
+    frozen_var_preds: Option<&[f64]>,
 ) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return None;
@@ -574,13 +578,28 @@ fn analytic_inner_seed_hessian(
                     break;
                 }
                 let mult_row = mult.and_then(|rows| rows.get(j)).map(Vec::as_slice);
-                let (r, d, d2) = crate::stats::residual_error::residual_rd2(
-                    &model.error_spec,
-                    err_keys[j],
-                    obs.f,
-                    &params.sigma.values,
-                    mult_row,
-                );
+                let f_frozen = frozen_var_preds.map(|f0| f0[j]);
+                let (r, d, d2) = match f_frozen {
+                    Some(f0) => (
+                        crate::stats::residual_error::residual_rd2(
+                            &model.error_spec,
+                            err_keys[j],
+                            f0,
+                            &params.sigma.values,
+                            mult_row,
+                        )
+                        .0,
+                        0.0,
+                        0.0,
+                    ),
+                    None => crate::stats::residual_error::residual_rd2(
+                        &model.error_spec,
+                        err_keys[j],
+                        obs.f,
+                        &params.sigma.values,
+                        mult_row,
+                    ),
+                };
                 if !(r.is_finite() && r > 0.0) {
                     valid = false;
                     break;
@@ -602,10 +621,7 @@ fn analytic_inner_seed_hessian(
                     1.0,
                     false,
                     cens,
-                    // The seed is a BFGS start metric, not the objective: a FOCE search
-                    // under a frozen variance (#1722) still reaches its own mode from
-                    // this conditional metric, as every seed reaches the optimiser's.
-                    None,
+                    f_frozen,
                 ) else {
                     valid = false;
                     break;
@@ -652,6 +668,10 @@ fn analytic_inner_seed_hessian(
             }
         }
     }
+    // The full-provider seed is a metric only (no fused gradient), so the conditional
+    // Gauss–Newton curvature is a valid BFGS start under a frozen variance too; its
+    // `H̃` is not the frozen objective's, but BFGS reaches the frozen mode from any SPD
+    // start — what it must never be handed is the wrong *gradient* (#1722).
     let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
     crate::estimation::sens_outer_gradient::score_core(
         model,
@@ -1716,6 +1736,7 @@ fn find_ebe_solve(
                     err_keys.as_ref(),
                     &mut obs_grad_recycle.borrow_mut(),
                     seed_kind == InnerHessianSeed::Exact,
+                    frozen,
                 )
             })
             .flatten();
