@@ -17,7 +17,8 @@
 //! perturbed coherently (they share one packed vector).
 
 use crate::estimation::parameterization::{
-    pack_with_bounds, theta_packs_log, unpack_params, PackedBounds, PackedStart,
+    lower_tri_iter, pack_with_bounds, packed_segments, theta_packs_log, unpack_params,
+    PackedBounds, PackedStart,
 };
 use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector, ThetaTransform};
 use nalgebra::{DMatrix, DVector};
@@ -316,6 +317,76 @@ pub(crate) fn from_draw_scale(y: &mut [f64], coords: &[LogitThetaCoord]) {
 /// logit scale changes the proposal but not the target (#1548).
 pub(crate) fn log_abs_jacobian(x: &[f64], coords: &[LogitThetaCoord]) -> f64 {
     coords.iter().map(|c| c.dx_dy(x[c.index]).abs().ln()).sum()
+}
+
+/// `ln |det ∂n/∂x|` over the **free** packed coordinates, where `n` is the
+/// reported (natural) scale `SirScale::Natural` puts its flat prior on (#1723):
+///
+/// * θ as declared — `ln θ` packing gives `x`, linear packing `0`. A logit θ
+///   follows the same rule; its draw-scale `|dx/dy|` is a separate term
+///   ([`log_abs_jacobian`]).
+/// * Ω / Ω_IOV: `vech Σ` of `Σ = L Lᵀ`, packed as `ln L_kk` and raw `L_jk`. In
+///   column-major `vech` order `∂vech Σ/∂vech L` is lower triangular with
+///   diagonal `2 L_kk` on `(k, k)` and `L_kk` on `(j, k)`; the log packing
+///   multiplies each `(k, k)` column by `L_kk`. So a free diagonal contributes
+///   `ln 2 + 2 x_kk`, and every free off-diagonal in column `k` another `x_kk`
+///   — `n ln 2 + Σᵢ (n − i + 2) ln Lᵢᵢ` for a full `n`-block. Held entries (FIX,
+///   structural zeros) drop out of the free sub-Jacobian, which stays
+///   triangular.
+/// * σ as a **variance** whatever its declaration (the stored value is an sd,
+///   so `ln 2 + 2x`), as are the `[mixture]` Ω / Σ overrides.
+/// * a `block_sigma` ρ on the correlation scale: `ln(1 − tanh² z)`.
+///
+/// Constant terms are kept so the value is the exact log-determinant; SIR uses
+/// it relative to the estimate, where they cancel.
+pub(crate) fn log_abs_jacobian_natural(
+    x: &[f64],
+    template: &ModelParameters,
+    fixed: &[bool],
+) -> f64 {
+    let seg = packed_segments(template);
+    let free = |i: usize| !fixed[i];
+    let ln2 = std::f64::consts::LN_2;
+    let mut out = 0.0;
+    for i in 0..seg.theta {
+        if free(i) && theta_packs_log(template.theta_lower[i]) {
+            out += x[i];
+        }
+    }
+    let mut omega_block = |start: usize, om: &OmegaMatrix| {
+        // Packed index of each Cholesky diagonal, so an off-diagonal can read
+        // the `x_kk` of its column.
+        let mut diag_idx = vec![0usize; om.dim()];
+        for (off, (r, c)) in lower_tri_iter(om.dim(), om.diagonal).enumerate() {
+            let i = start + off;
+            if r == c {
+                diag_idx[c] = i;
+                if free(i) {
+                    out += ln2 + 2.0 * x[i];
+                }
+            } else if free(i) {
+                out += x[diag_idx[c]];
+            }
+        }
+    };
+    omega_block(seg.omega_start(), &template.omega);
+    if let Some(ref iov) = template.omega_iov {
+        omega_block(seg.iov_start(), iov);
+    }
+    let variance_like =
+        (seg.sigma_start()..seg.iov_start()).chain(seg.mixture_omega_start()..seg.rho_start());
+    for i in variance_like {
+        if free(i) {
+            out += ln2 + 2.0 * x[i];
+        }
+    }
+    for i in seg.rho_start()..seg.total() {
+        if free(i) {
+            let rho = x[i].tanh();
+            out += (1.0 - rho * rho).ln();
+        }
+    }
+    out
 }
 
 /// Clamp packed indices flagged as FIX to their pinned packed value (taken
@@ -1297,5 +1368,120 @@ mod tests {
                 assert!(t.is_finite() && t > 0.0, "lower {lower}: θ = {t} at {end}");
             }
         }
+    }
+
+    /// A template exercising every term of [`log_abs_jacobian_natural`]: a
+    /// log-packed θ, a linear θ, a FIX θ; an Ω with a lone diagonal η (FIX), a
+    /// 2-block and a 3-block (so structural zeros between them); a 2×2 κ block;
+    /// two σ and their `block_sigma` ρ.
+    fn natural_template() -> ModelParameters {
+        use crate::types::ResidualCorrelation;
+        let mut om = DMatrix::zeros(6, 6);
+        om[(0, 0)] = 0.09;
+        let b2 = [[0.04, 0.012], [0.012, 0.05]];
+        let b3 = [[0.10, 0.02, -0.01], [0.02, 0.08, 0.03], [-0.01, 0.03, 0.12]];
+        for r in 0..2 {
+            for c in 0..2 {
+                om[(1 + r, 1 + c)] = b2[r][c];
+            }
+        }
+        for r in 0..3 {
+            for c in 0..3 {
+                om[(3 + r, 3 + c)] = b3[r][c];
+            }
+        }
+        let names = |p: &str, n: usize| (0..n).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
+        let iov = DMatrix::from_row_slice(2, 2, &[0.03, 0.01, 0.01, 0.06]);
+        ModelParameters {
+            theta: vec![2.0, -0.5, 0.3, 4.0],
+            theta_names: names("TH", 4),
+            theta_lower: vec![0.01, -5.0, 0.001, 0.01],
+            theta_upper: vec![100.0, 5.0, 0.999, 100.0],
+            theta_fixed: vec![false, false, false, true],
+            omega: OmegaMatrix::from_matrix(om, names("ETA", 6), false),
+            omega_fixed: vec![true, false, false, false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.2, 0.5],
+                names: names("EPS", 2),
+            },
+            sigma_fixed: vec![false, false],
+            residual_correlations: vec![ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.3,
+            }],
+            residual_correlation_fixed: vec![false],
+            omega_iov: Some(OmegaMatrix::from_matrix(iov, names("KAPPA", 2), false)),
+            kappa_fixed: vec![false, false],
+            mixture: None,
+        }
+    }
+
+    /// The reported-scale vector `log_abs_jacobian_natural` differentiates,
+    /// built independently from `unpack_params`: θ, `vech Ω`, σ², `vech Ω_IOV`,
+    /// ρ — index-aligned with the packed vector.
+    fn natural_vector(x: &[f64], template: &ModelParameters) -> Vec<f64> {
+        let p = unpack_params(x, template);
+        let mut n = p.theta.clone();
+        for (r, c) in lower_tri_iter(p.omega.dim(), p.omega.diagonal) {
+            n.push(p.omega.matrix[(r, c)]);
+        }
+        n.extend(p.sigma.values.iter().map(|s| s * s));
+        let iov = p.omega_iov.as_ref().unwrap();
+        for (r, c) in lower_tri_iter(iov.dim(), iov.diagonal) {
+            n.push(iov.matrix[(r, c)]);
+        }
+        n.extend(p.residual_correlations.iter().map(|c| c.rho));
+        n
+    }
+
+    /// S8 (#1723): `log_abs_jacobian_natural` is `ln|det|` of the free block of
+    /// the FD Jacobian of the reported-scale map, at the estimate and at a
+    /// point moved off it (so a term that is constant at one point cannot hide).
+    /// Measured worst FD error 8.2e-10 (macOS arm64); the tolerance 1e-6
+    /// leaves 1000× headroom and sits 94 000× under the smallest mutation.
+    /// Mutations, each killed, with the worst error they produce: block
+    /// exponent `n − i + 2 → n − i + 1` (drop the off-diagonal `x_kk`) 7.25;
+    /// drop the Ω `ln 2` 4.85; Ω diagonal `2x → x` 10.5; drop the log-θ term
+    /// 0.51; σ taken as an sd (`ln 2 + 2x → x`) 0.92; drop the ρ term 0.094;
+    /// count held coordinates too 16.7.
+    #[test]
+    fn log_abs_jacobian_natural_matches_the_fd_log_determinant() {
+        let t = natural_template();
+        let PackedStart { packed, fixed, .. } = pack_with_bounds(&t);
+        let free: Vec<usize> = (0..packed.len()).filter(|&i| !fixed[i]).collect();
+        // Structural zeros and the FIX η / θ are held: the free count is
+        // 3 θ + (2-block 3 + 3-block 6) Ω + 2 σ + 3 κ + 1 ρ.
+        assert_eq!(free.len(), 3 + 9 + 2 + 3 + 1, "{fixed:?}");
+        let mut worst = 0.0f64;
+        for shift in [0.0, 0.3] {
+            let x0: Vec<f64> = packed
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    if fixed[i] {
+                        v
+                    } else {
+                        v + shift * ((i % 3) as f64 - 1.0)
+                    }
+                })
+                .collect();
+            let h = 1e-6;
+            let mut jac = DMatrix::zeros(free.len(), free.len());
+            for (b, &j) in free.iter().enumerate() {
+                let (mut xp, mut xm) = (x0.clone(), x0.clone());
+                xp[j] += h;
+                xm[j] -= h;
+                let (np, nm) = (natural_vector(&xp, &t), natural_vector(&xm, &t));
+                for (a, &i) in free.iter().enumerate() {
+                    jac[(a, b)] = (np[i] - nm[i]) / (2.0 * h);
+                }
+            }
+            let want = jac.determinant().abs().ln();
+            let got = log_abs_jacobian_natural(&x0, &t, &fixed);
+            assert!(want.is_finite() && got.is_finite(), "{want} {got}");
+            worst = worst.max((got - want).abs());
+        }
+        assert!(worst < 1e-6, "worst |Δ ln|det|| = {worst:e}");
     }
 }

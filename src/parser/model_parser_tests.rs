@@ -4468,6 +4468,28 @@ fn test_sir_df_valid_and_invalid() {
     assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
 }
 
+/// #1723: `sir_scale` takes `packed` or `natural` (any case), defaults to
+/// `packed`, and refuses anything else with the two accepted spellings named.
+#[test]
+fn test_sir_scale_valid_and_invalid() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.sir_scale, SirScale::Packed);
+    assert!(apply_fit_option(&mut opts, "sir_scale", "natural").is_ok());
+    assert_eq!(opts.sir_scale, SirScale::Natural);
+    assert!(apply_fit_option(&mut opts, "sir_scale", "Packed").is_ok());
+    assert_eq!(opts.sir_scale, SirScale::Packed);
+    let err = apply_fit_option(&mut opts, "sir_scale", "variance").unwrap_err();
+    assert!(
+        err.contains("`packed` or `natural`") && err.contains("`variance`"),
+        "{err}"
+    );
+    assert_eq!(
+        opts.sir_scale,
+        SirScale::Packed,
+        "a refused value left a change"
+    );
+}
+
 #[test]
 fn test_apply_fit_option_bool_variants() {
     let mut opts = FitOptions::default();

@@ -10175,6 +10175,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
         "sir_df" => opts.sir_df = parse_f64_min("sir_df", 1.0)?,
+        "sir_scale" => {
+            opts.sir_scale = match value.trim().to_lowercase().as_str() {
+                "packed" => SirScale::Packed,
+                "natural" => SirScale::Natural,
+                other => {
+                    return Err(format!(
+                        "sir_scale must be `packed` or `natural`, got `{other}`"
+                    ))
+                }
+            }
+        }
         "n_agq" => {
             let v = parse_usize("n_agq")?;
             if v < 1 {

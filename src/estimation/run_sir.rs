@@ -20,21 +20,22 @@ use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::types::*;
 use nalgebra::DVector;
 
-/// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
-/// skipping any that are already there.
+/// Put this SIR run's notes on a fit's warnings **in place of** any earlier
+/// run's.
 ///
-/// `run_sir` clones its input fit, and that fit may already carry identical
-/// `SIR:` lines — it was produced with `sir = true` (the inline path in
-/// `fit_inner` pushes the same text), or its own `run_sir` output is being piped
-/// back in. Without the dedupe the same line accumulates and is printed once per
-/// pass (#1037).
-fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
-    for w in sir_warnings {
-        let line = format!("SIR: {}", w);
-        if !warnings.contains(&line) {
-            warnings.push(line);
-        }
-    }
+/// `run_sir` clones its input fit, and that fit may already carry `SIR:` lines
+/// — it was produced with `sir = true` (the inline path in `fit_inner` pushes
+/// the same prefix), or its own `run_sir` output is being piped back in. Those
+/// lines describe the SIR result this call replaces: appending would print the
+/// same line once per pass (#1037), and a re-run under different settings
+/// would keep the old run's diagnosis beside the new numbers — the low-ESS
+/// warning's own advice, re-running with `sir_scale = natural`, would leave
+/// "ESS 3.5" next to an ESS of 140 (#1723). Only the kernel's own `SIR: ` lines
+/// are replaced; `SIR failed` / `SIR requested` / `SIR fallback:` lines are a
+/// different run's story and stay.
+fn replace_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
+    warnings.retain(|w| !w.starts_with("SIR: "));
+    warnings.extend(sir_warnings.iter().map(|w| format!("SIR: {w}")));
 }
 
 /// The **data** −2 log L of a completed fit — what `sir::run_sir_core` takes as
@@ -197,7 +198,8 @@ fn run_sir_scoped(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
-    push_sir_warnings(&mut out.warnings, &sir.warnings);
+    replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    crate::api::rebuild_warnings_structured(&mut out);
     out.sir_ci_kappa = sir.kappa_ci();
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
@@ -217,7 +219,7 @@ mod tests {
     /// fitted with `sir = true`, or because its `run_sir` output is being piped
     /// back in — must not collect a second copy.
     #[test]
-    fn push_sir_warnings_does_not_duplicate() {
+    fn replace_sir_warnings_does_not_duplicate() {
         let mut warnings = vec![
             "Covariance step: matrix was not positive definite".to_string(),
             "SIR: proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
@@ -226,7 +228,7 @@ mod tests {
             "proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
             "proposal was shrunk in 1 direction(s) [KA +1.00]".to_string(),
         ];
-        push_sir_warnings(&mut warnings, &sir);
+        replace_sir_warnings(&mut warnings, &sir);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings[2].starts_with("SIR: proposal was shrunk"),
@@ -234,16 +236,30 @@ mod tests {
         );
 
         // Idempotent: a second pass over the same kernel output adds nothing.
-        push_sir_warnings(&mut warnings, &sir);
+        replace_sir_warnings(&mut warnings, &sir);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
     }
 
-    /// A clean SIR run leaves the fit's warnings untouched.
+    /// #1723: a re-run's notes replace the earlier run's — a stale low-ESS line
+    /// is dropped when the new run is healthy — while every non-kernel line,
+    /// including the other `SIR …` phrasings, stays where it was.
     #[test]
-    fn push_sir_warnings_is_a_no_op_when_the_proposal_was_clean() {
-        let mut warnings = vec!["Minimization terminated".to_string()];
-        push_sir_warnings(&mut warnings, &[]);
-        assert_eq!(warnings, vec!["Minimization terminated".to_string()]);
+    fn replace_sir_warnings_drops_the_replaced_runs_notes_only() {
+        let mut warnings = vec![
+            "Minimization terminated".to_string(),
+            "SIR: effective sample size is 3.5 of 1000 draws".to_string(),
+            "SIR fallback: proposal was shrunk in 1 direction(s).".to_string(),
+            "SIR failed: covariance not positive definite".to_string(),
+        ];
+        replace_sir_warnings(&mut warnings, &[]);
+        assert_eq!(
+            warnings,
+            [
+                "Minimization terminated",
+                "SIR fallback: proposal was shrunk in 1 direction(s).",
+                "SIR failed: covariance not positive definite",
+            ]
+        );
     }
 
     // Use the in-tree warfarin example + data. They live at repo paths
