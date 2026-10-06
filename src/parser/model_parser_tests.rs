@@ -29116,6 +29116,33 @@ fn an_exp_reaches_its_parameter_only_through_products() {
             "V = if (WT > 70) TVV * exp(ETA_V) else 2 * TVV * exp(ETA_V)",
             LogNormal,
         ),
+        // An `if` below the root, so the path above it is non-empty and the
+        // fold must carry it into both arms (review round 1, finding 1). The
+        // last two rows put the deciding operator ABOVE the `if` (`+`, `^`):
+        // they die under the `Conditional` arm resetting the path, which reads
+        // each arm as a bare `TVV * exp(ETA_V)`. The first two keep it inside
+        // or keep a product above, so they pin the pass-through not turning a
+        // plain product into `Custom`.
+        (
+            "if under a product, one arm powered",
+            "V = TVV * (if (WT > 70) exp(ETA_V)^2 else exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "if under a product, both arms plain",
+            "V = TVV * (if (WT > 70) exp(ETA_V) else exp(ETA_V))",
+            LogNormal,
+        ),
+        (
+            "if under a shift, both arms plain",
+            "V = TVCL + (if (WT > 70) TVV * exp(ETA_V) else TVV * exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "if under a power, both arms plain",
+            "V = (if (WT > 70) TVV * exp(ETA_V) else TVV * exp(ETA_V))^2",
+            Custom,
+        ),
         (
             "(b) Box-Cox inline (was LogNormal)",
             "V = TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT)",
