@@ -2824,6 +2824,10 @@ fn fit_inner(
             .as_ref()
             .or(sir_fallback_result.as_ref())
             .map(|s| s.ci_sigma.clone()),
+        sir_ci_kappa: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .and_then(|s| s.kappa_ci()),
         sir_ess: sir_result
             .as_ref()
             .or(sir_fallback_result.as_ref())

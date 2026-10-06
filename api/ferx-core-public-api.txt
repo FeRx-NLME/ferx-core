@@ -513,6 +513,7 @@ pub fn ferx_core::estimation::sens_outer_gradient::subject_theta_gradient(model:
 pub fn ferx_core::estimation::sens_outer_gradient::subject_theta_gradient_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, params: &ferx_core::ModelParameters, stacked_eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub mod ferx_core::estimation::sir
 pub struct ferx_core::estimation::sir::SirResult
+pub ferx_core::estimation::sir::SirResult::ci_kappa: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::estimation::sir::SirResult::ci_omega: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::estimation::sir::SirResult::ci_sigma: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::estimation::sir::SirResult::ci_theta: alloc::vec::Vec<(f64, f64)>
@@ -3097,6 +3098,7 @@ pub ferx_core::types::FitResult::sigma_init: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::sigma_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::sigma_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::sigma_types: alloc::vec::Vec<ferx_core::SigmaType>
+pub ferx_core::types::FitResult::sir_ci_kappa: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::types::FitResult::sir_ci_omega: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::types::FitResult::sir_ci_sigma: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::types::FitResult::sir_ci_theta: core::option::Option<alloc::vec::Vec<(f64, f64)>>
@@ -4555,6 +4557,7 @@ pub ferx_core::FitResult::sigma_init: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::sigma_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::sigma_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::sigma_types: alloc::vec::Vec<ferx_core::SigmaType>
+pub ferx_core::FitResult::sir_ci_kappa: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::FitResult::sir_ci_omega: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::FitResult::sir_ci_sigma: core::option::Option<alloc::vec::Vec<(f64, f64)>>
 pub ferx_core::FitResult::sir_ci_theta: core::option::Option<alloc::vec::Vec<(f64, f64)>>

@@ -824,6 +824,11 @@ pub fn print_results(result: &FitResult) {
                 eprintln!("  {} : [{:.6}, {:.6}]", name, lo, hi);
             }
         }
+        if let Some(ref ci) = result.sir_ci_kappa {
+            for (k, (lo, hi)) in ci.iter().enumerate() {
+                eprintln!("  {} : [{:.6}, {:.6}]", kappa_name(result, k), lo, hi);
+            }
+        }
     }
 
     // Shrinkage
@@ -2861,6 +2866,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
         }
+        if let Some(ref ci) = result.sir_ci_kappa {
+            writeln!(f, "  ci_kappa:").map_err(|e| e.to_string())?;
+            for (k, (lo, hi)) in ci.iter().enumerate() {
+                let key = result
+                    .kappa_names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("kappa_{}", k + 1));
+                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
+                writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
+            }
+        }
     }
 
     if let Some(excl) = &result.exclusions {
@@ -3069,6 +3087,7 @@ mod tests {
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
+            sir_ci_kappa: None,
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
@@ -3870,6 +3889,7 @@ mod tests {
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
+            sir_ci_kappa: None,
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
@@ -4748,6 +4768,7 @@ mod tests {
         r.sir_ci_theta = Some(vec![(1.8, 2.2), (-0.1, 0.1)]);
         r.sir_ci_omega = Some(vec![(0.07, 0.11), (0.03, 0.05)]);
         r.sir_ci_sigma = Some(vec![(0.08, 0.12), (0.4, 0.6)]);
+        r.sir_ci_kappa = Some(vec![(0.04, 0.07), (0.02, 0.04)]);
         // Shrinkage (a NaN entry exercises the is_finite guard).
         r.shrinkage_eta = vec![0.12, f64::NAN];
         r.shrinkage_eps = 0.05;
@@ -4778,6 +4799,41 @@ mod tests {
             draws: None,
         });
         r
+    }
+
+    /// The `sir:` section of a fit YAML, through the line before the next
+    /// top-level key.
+    fn yaml_sir_section(r: &FitResult) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        let mut lines = yaml.lines().skip_while(|l| *l != "sir:");
+        assert_eq!(lines.next(), Some("sir:"), "a sir: section");
+        lines
+            .take_while(|l| l.starts_with(' '))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// #1705: the fit YAML's `sir:` section gains a `ci_kappa:` block keyed by
+    /// `kappa_names`, in order, appended after `ci_sigma:` — and **only** that.
+    /// The section without a kappa interval must be the section with it minus
+    /// exactly that block, so a fit with no kappa writes the bytes it wrote
+    /// before #1705. Mutations: drop the block or swap the name lookup → the
+    /// expected block is missing; print the header for `None` → the
+    /// no-kappa section gains a line.
+    #[test]
+    fn write_estimates_yaml_sir_ci_kappa_is_one_appended_block() {
+        let with = comprehensive_result();
+        let mut without = with.clone();
+        without.sir_ci_kappa = None;
+        let kappa_block = "  ci_kappa:\n    KAPPA_CL:\n      lower: 0.040000\n      upper: 0.070000\n    KAPPA_V:\n      lower: 0.020000\n      upper: 0.040000\n";
+        let a = yaml_sir_section(&with);
+        let b = yaml_sir_section(&without);
+        assert!(!b.contains("ci_kappa"), "no κ interval, no key:\n{b}");
+        assert!(b.contains("  ci_sigma:"), "{b}");
+        assert_eq!(a, format!("{b}{kappa_block}"), "with:\n{a}\nwithout:\n{b}");
     }
 
     #[test]

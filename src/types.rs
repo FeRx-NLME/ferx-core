@@ -6842,6 +6842,13 @@ pub struct FitResult {
     pub sir_ci_theta: Option<Vec<(f64, f64)>>,
     pub sir_ci_omega: Option<Vec<(f64, f64)>>,
     pub sir_ci_sigma: Option<Vec<(f64, f64)>>,
+    /// SIR 95% CI for each IOV kappa variance (the `omega_iov` diagonal, in
+    /// `kappa_names` order) — the counterpart of `sir_ci_omega` for the
+    /// between-occasion / between-arm block (#1705). `None` when SIR did not
+    /// run or the model declares no kappa; absent in `.fitrx` bundles written
+    /// before #1705, which load as `None`.
+    #[serde(default)]
+    pub sir_ci_kappa: Option<Vec<(f64, f64)>>,
     pub sir_ess: Option<f64>,
     /// Resampled packed parameter vectors retained from the SIR step, available
     /// when `FitOptions.sir_keep_samples = true`. Each `Vec<f64>` is a draw in

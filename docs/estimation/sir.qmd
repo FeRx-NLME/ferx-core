@@ -51,7 +51,7 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 
 SIR adds the following to the estimation output:
 
-- **95% CI** for each theta, omega, and sigma parameter (2.5th and 97.5th percentiles)
+- **95% CI** for each theta, omega, and sigma parameter, and for each IOV kappa variance (2.5th and 97.5th percentiles; omega and kappa: the diagonal variances). The fit YAML's `sir:` block is laid out in [Output Files](../output.qmd#sir-intervals-sir)
 - **Effective sample size (ESS)**: a diagnostic indicating how well the proposal distribution matches the true uncertainty. ESS close to M indicates a good match; ESS much less than m suggests the proposal is a poor fit
 
 ## Diagnostics
@@ -207,7 +207,7 @@ opts.sir_resamples = 500;
 let fit_with_sir = run_sir(&fit, None, None, &opts)?;
 ```
 
-`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
+`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (IOV models), `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
 
 ### Caller-supplied vs. re-read inputs
 
