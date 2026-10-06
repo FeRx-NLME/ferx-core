@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use crate::api::apply_iov_occasion_rule;
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
-    LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ScaleShare,
+    LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
+    ScaleShare,
 };
 use crate::types::{CompiledModel, IovOccasionRule, ParsedModel, Population, Subject};
 
@@ -192,6 +193,9 @@ pub fn bind_theta_levels_from_fit(
 ///   subjects than the fit's has a higher median weight, and centring on it would
 ///   move every covariate factor the fitted θ was estimated against.
 ///
+/// [`layout_from_fit`] is the same call without the population: it lays the model
+/// out and writes nothing.
+///
 /// After this call, [`bind_covariate_stats`](crate::api::bind_covariate_stats) on the
 /// same model is a no-op: no relation is left unresolved for it to re-centre.
 ///
@@ -200,7 +204,9 @@ pub fn bind_theta_levels_from_fit(
 /// - empty `fitted` on a model with a level block or a symbolic statistic: a fit
 ///   made before ferx recorded its bindings, or an older `.fitrx`. The bindings are
 ///   not re-discovered from the data, since a layout resolved today need not be the
-///   one the fit was estimated with;
+///   one the fit was estimated with. What the model needs is read from `model_text`,
+///   so this holds for a `parsed` already bound to other data too (#1686), whose
+///   relations would otherwise keep that data's centres;
 /// - level bindings that lack a block the model declares or carry one it does not,
 ///   list a level twice, split a contrast group, record `auto` as the contrast, or
 ///   whose labels and groups are not parallel;
@@ -221,53 +227,140 @@ pub fn bind_from_fit(
 /// model without one (`run_sir` / `run_covariance`, #1622) need not copy it. `None`
 /// on a model that declares a level block is refused.
 ///
-/// Every step that can refuse — validation, the unseen-level tables, the re-parse
-/// and the bound assert — runs before anything is written, so a refusal leaves both
-/// `parsed` and the population as they were.
+/// Every step that can refuse — validation, the re-parse and the unseen-level
+/// tables — runs before anything is written, so a refusal leaves both
+/// `parsed` and the population as they were. The first two are
+/// [`layout_from_fit`]'s, run by the same function.
 pub(crate) fn bind_from_fit_on(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: Option<&mut Population>,
     fitted: &DataBindings,
 ) -> Result<(), String> {
-    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(&parsed.model);
+    let Some(layout) = lay_out_on_fit(parsed, model_text, fitted)? else {
+        return Ok(());
+    };
+    let tables = match (&population, layout.decls.is_empty()) {
+        (_, true) => Vec::new(),
+        (Some(p), false) => fitted_level_tables(&layout.decls, p, &fitted.levels)?,
+        (None, false) => {
+            return Err(format!(
+                "theta {}: a level block needs the population its index columns are written to",
+                layout.decls[0].name()
+            ))
+        }
+    };
+    if let Some(population) = population {
+        for (decl, table) in layout.decls.iter().zip(&tables) {
+            write_index_column(decl, table, population)?;
+        }
+    }
+    layout.apply(parsed);
+    Ok(())
+}
+
+/// Lay a model out on a **fit's** data-derived bindings (#1703), with no population:
+/// the θ vector, names and `FIX` flags the fit was estimated with, for a caller that
+/// needs the model's shape but holds no data to bind — sizing a skeleton
+/// `FitResult` for SIR or a standalone covariance step, for instance.
+///
+/// This is the model half of [`bind_from_fit`], and `bind_from_fit` runs it: the
+/// same refusals and the same re-parse. What it leaves out is the population half, so
+/// nothing is written to any population and a level absent from the fit is not
+/// looked for. Before running the model on data, bind that data with
+/// [`bind_from_fit`] instead: a level block reads its index columns from the
+/// population, and only `bind_from_fit` writes them.
+///
+/// Whether the model needs the fit's bindings is decided from `model_text`, not from
+/// `parsed`, so a model already bound to other data (a simulation design, by
+/// [`prepare_run`](crate::api::prepare_run) or
+/// [`bind_covariate_stats`](crate::api::bind_covariate_stats)) is laid out on the
+/// fit's statistics, or refused when the fit carries none (#1686). Refused, with
+/// `parsed` left as it was: everything [`bind_from_fit`] refuses except a level the
+/// fit never observed.
+pub fn layout_from_fit(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    fitted: &DataBindings,
+) -> Result<(), String> {
+    if let Some(layout) = lay_out_on_fit(parsed, model_text, fitted)? {
+        layout.apply(parsed);
+    }
+    Ok(())
+}
+
+/// A model re-parsed on a fit's bindings, not yet installed in its `ParsedModel`.
+struct FitLayout {
+    /// The level blocks `model_text` declares.
+    decls: Vec<LevelBlockDecl>,
+    model: CompiledModel,
+    bindings: ParseBindings,
+}
+
+impl FitLayout {
+    fn apply(self, parsed: &mut ParsedModel) {
+        let mut model = self.model;
+        model.name = parsed.model.name.clone();
+        parsed.model = model;
+        parsed.bindings = self.bindings;
+    }
+}
+
+/// The one implementation of the model half of [`bind_from_fit`] and
+/// [`layout_from_fit`]: validate `fitted` against the model and re-parse on it. `None` when the model declares nothing data-derived and
+/// the fit carries nothing, which leaves `parsed` as it is. Reads `parsed` only for
+/// its non-data bindings and name, and writes nothing.
+fn lay_out_on_fit(
+    parsed: &ParsedModel,
+    model_text: &str,
+    fitted: &DataBindings,
+) -> Result<Option<FitLayout>, String> {
+    // What the model needs comes from its text, parsed with no data-derived binding
+    // (#1686). A `parsed.model` bound to other data already has its relations
+    // resolved and its `auto` contrasts stamped, so it asks for nothing. An unbound
+    // one *is* that parse, and is read as it stands: no second parse, and no second
+    // read of a `[priors] from_fit` file.
+    let unbound = ParseBindings {
+        levels: LevelBindings::new(),
+        covariate_stats: Default::default(),
+        ..parsed.bindings.clone()
+    };
+    let reparsed;
+    let declared = if parsed.model.data_bindings().is_empty() {
+        &parsed.model
+    } else {
+        reparsed = parse_full_model_with(model_text, &unbound)?.model;
+        &reparsed
+    };
+    let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
+    let symbolic = crate::api::covariate_stats::symbolic_covariates(declared);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(no_fit_bindings_message(&decls, &symbolic));
     }
     validate_fitted_levels(&decls, &fitted.levels)?;
-    crate::api::covariate_stats::validate_fitted_stats(&parsed.model, &fitted.covariate_stats)?;
+    crate::api::covariate_stats::validate_fitted_stats(declared, &fitted.covariate_stats)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let tables = match (&population, decls.is_empty()) {
-        (_, true) => Vec::new(),
-        (Some(p), false) => fitted_level_tables(&decls, p, &fitted.levels)?,
-        (None, false) => {
-            return Err(format!(
-                "theta {}: a level block needs the population its index columns are written to",
-                decls[0].name()
-            ))
-        }
-    };
-
-    // The re-parse reads no population, so it runs first: a refusal from it (or from
-    // the bound assert) must not leave index columns behind.
-    let mut bindings = parsed.bindings.clone();
+    let mut bindings = unbound;
     bindings.levels = fitted.levels.clone();
     bindings.covariate_stats = fitted.covariate_stats.clone();
-    let mut rebound = parse_full_model_with(model_text, &bindings)?.model;
-    crate::api::assert_covariate_model_bound(&rebound)?;
-
-    if let Some(population) = population {
-        for (decl, table) in decls.iter().zip(&tables) {
-            write_index_column(decl, table, population)?;
-        }
-    }
-    rebound.name = parsed.model.name.clone();
-    parsed.model = rebound;
-    parsed.bindings = bindings;
-    Ok(())
+    let model = parse_full_model_with(model_text, &bindings)?.model;
+    // Not a gate (#1728 review): `validate_fitted_stats` has already required a
+    // statistic for every covariate a symbolic relation reads, and given one, the
+    // parser resolves the relation or refuses it. Asserted on every from-fit fixture
+    // so that claim is measured; it would fire if a relation came to need more
+    // than a `CovariateSummary` to resolve.
+    debug_assert!(
+        crate::api::assert_covariate_model_bound(&model).is_ok(),
+        "a from-fit layout left a relation unresolved: {:?}",
+        crate::api::assert_covariate_model_bound(&model)
+    );
+    Ok(Some(FitLayout {
+        decls,
+        model,
+        bindings,
+    }))
 }
 
 /// Write the level index columns of a model **already** bound to a fit's level
