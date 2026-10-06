@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use crate::io::hash::{sha256_bytes, sha256_file};
-use crate::types::{CompiledModel, FitResult, ParsedModel, Population};
+use crate::types::{CompiledModel, FitOptions, FitResult, ParsedModel, Population};
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
 /// Not a `Cow`, since `CompiledModel` (closures) is not `Clone`.
@@ -267,6 +267,26 @@ pub(crate) fn resolve_fit_inputs<'a>(
         ));
     }
     Ok(inputs)
+}
+
+/// The caller's options with `interaction` set to the marginal `fit` was estimated
+/// under (#1710), for a post-hoc step that re-scores the objective at the fit's
+/// estimates.
+///
+/// Keyed on `fit.method` first, through the same [`interaction_for`] rule the stage
+/// loop uses, and on the stored `fit.interaction` only for a method the rule passes
+/// through (Gauss-Newton). So a `.fitrx` written before #1710 — whose FOCE fits carry
+/// the leaked `interaction: true` — still re-scores under FOCE, and a caller passing
+/// `FitOptions::default()` (`interaction = true`) to `run_sir` on a FOCE fit no longer
+/// weights its draws with the FOCEI objective: on warfarin_iov that was an SIR ESS of
+/// 4.9 / 1000 and a covariance step reporting SE(TVKA) = 7576 against the fit's 0.74.
+///
+/// [`interaction_for`]: crate::types::interaction_for
+pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    FitOptions {
+        interaction: crate::types::interaction_for(fit.method, fit.interaction),
+        ..options.clone()
+    }
 }
 
 /// The #1619 / #1622 fixture, shared by the `run_covariance` and `run_sir` tests:

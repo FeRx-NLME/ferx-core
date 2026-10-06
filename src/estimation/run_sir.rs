@@ -101,14 +101,19 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
 ///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
-///   (`inner_maxiter`, `inner_tol`, `interaction`, `mu_referencing`,
-///   `verbose`, `cancel`). Other fields (e.g. `method`) are ignored.
+///   (`inner_maxiter`, `inner_tol`, `mu_referencing`, `verbose`, `cancel`).
+///   `interaction` is **not** read from `options`: it comes from the fit
+///   (`fit.method`, then `fit.interaction`), so the draws are weighted with the
+///   objective the estimates minimise (#1710). Other fields (e.g. `method`) are
+///   ignored.
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // #1710: score the fit's own marginal, whatever `interaction` the caller carries.
+    let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
     // SIR sample re-solves the inner loop, so without this a caller-supplied `ode_reltol` /
     // `ode_method` would be ignored and the sampled OFVs would come from a different

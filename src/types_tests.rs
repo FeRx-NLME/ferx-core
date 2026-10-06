@@ -3559,3 +3559,29 @@ fn each_covariance_estimator_prints_a_distinct_matrix_expression() {
     assert_eq!(CovarianceMethod::Hessian.formula(), "R⁻¹");
     assert_eq!(CovarianceMethod::Sandwich.formula(), "R⁻¹SR⁻¹");
 }
+
+/// #1710: `interaction_for` is the one copy of the per-method interaction rule — FOCEI
+/// on, FOCE off, every other method the caller's flag — under both inherited values, so
+/// a helper that returned `inherited`, or that hard-wired a pass-through method, fails.
+#[test]
+fn interaction_for_truth_table() {
+    use EstimationMethod::*;
+    for inherited in [true, false] {
+        assert!(
+            interaction_for(FoceI, inherited),
+            "FoceI, inherited {inherited}"
+        );
+        assert!(
+            !interaction_for(Foce, inherited),
+            "Foce, inherited {inherited}"
+        );
+        // Every other variant of the enum, so no pass-through method can be hard-wired.
+        for m in [FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes, Laplace, Vi] {
+            assert_eq!(
+                interaction_for(m, inherited),
+                inherited,
+                "{m:?} must pass the inherited flag through"
+            );
+        }
+    }
+}

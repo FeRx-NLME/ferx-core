@@ -9587,20 +9587,18 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
                 // built on that number compared two different objectives. A
                 // `foce` / `focei` *stage* still sets its own flag per stage in
                 // `api::fit` (FOCEI on, FOCE off).
-                match *chain.last().unwrap() {
-                    EstimationMethod::FoceI => opts.interaction = true,
-                    EstimationMethod::Foce => opts.interaction = false,
-                    _ => {}
-                }
+                opts.interaction =
+                    crate::types::interaction_for(*chain.last().unwrap(), opts.interaction);
                 opts.method = *chain.last().unwrap();
                 opts.methods = chain;
             } else {
                 let m = parse_method_token(raw)?;
                 opts.method = m;
                 opts.methods.clear();
-                if m == EstimationMethod::FoceI {
-                    opts.interaction = true;
-                }
+                // `foce` clears the flag as `focei` sets it (#1710): left at the `true`
+                // default, a file `method = foce` scored its SIR weights and CWRES under
+                // the FOCEI marginal while estimating under the FOCE one.
+                opts.interaction = crate::types::interaction_for(m, opts.interaction);
             }
             opts.user_set_keys.push("method".to_string());
             continue;
