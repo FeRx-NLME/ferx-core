@@ -30,8 +30,8 @@
 
 use ferx_core::{fit, prepare_run, EstimationMethod, FitOptions, FitResult, OmegaMatrix};
 
-/// Bounds, from the realised errors after the fix (macOS arm64; see the README row for
-/// Linux). Each is ~10× above what the fix leaves and far below what the old conditional
+/// Bounds, from the realised errors after the fix (Linux aarch64 and macOS arm64 agree in
+/// every printed digit). Each is ~10× above what the fix leaves and far below what the old conditional
 /// search produced at the same point:
 /// - OFV: |Δ| 1.4e-8 (non-IOV) / 2.3e-7 (IOV); before the fix 0.740 / 1.284.
 /// - η̂ vs `.phi`: 6.2e-7 / 4.9e-6; before the fix up to 0.73 (IOV subject 10's ETA_KA:
