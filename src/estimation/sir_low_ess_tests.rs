@@ -343,10 +343,12 @@ fn natural_centre_is_the_laplace_shift_clamped_into_the_box() {
     assert_eq!(got[2], 0.05, "shift 0.11 past the 0.05 upper bound");
 }
 
-/// ESS bits and an FNV hash of every resampled packed vector of a 400-draw
-/// packed run on the probe fixture — through `run_sir_core` with default
-/// options, i.e. the API and the default that existed before #1723.
-fn packed_fixture_bits() -> (u64, u64) {
+/// The ESS and an FNV hash of every resampled packed vector (each value to 12
+/// significant digits) of a 400-draw packed run on the probe fixture — through
+/// `run_sir_core` with default options, i.e. the API and the default that
+/// existed before #1723. Rounded so an ULP of a platform's `exp` / `ln` cannot
+/// move it; every mutation below moves values in their leading digits.
+fn packed_fixture_digest() -> (f64, u64) {
     let (model, pop) = probe_fixture();
     let params = model.default_params.clone();
     let n = crate::estimation::parameterization::packed_len(&params);
@@ -368,29 +370,36 @@ fn packed_fixture_bits() -> (u64, u64) {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for v in r.resamples_packed.as_ref().unwrap() {
         for x in v {
-            h = (h ^ x.to_bits()).wrapping_mul(0x0100_0000_01b3);
+            for b in format!("{x:.11e};").bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
         }
     }
-    (r.effective_sample_size.to_bits(), h)
+    (r.effective_sample_size, h)
 }
 
-/// S9, packed half: the default is byte-for-byte the SIR that shipped before
-/// #1723. The literals were measured by this same function on `202bea5e`
-/// (macOS arm64). Re-centring under `Packed`, adding the natural weight under
-/// `Packed`, or flipping the default each move the hash.
+/// S9, packed half: the default is the SIR that shipped before #1723. The ESS
+/// is `f64::from_bits` of the value this fixture produced on `202bea5e` (macOS
+/// arm64), where its resampled vectors were also bit-identical to this
+/// branch's; the hash is of those same vectors. Re-centring under `Packed`,
+/// adding the natural weight under `Packed`, or flipping the default each
+/// move the hash.
 #[test]
-fn packed_sir_is_bit_identical_to_before_1723() {
+fn packed_sir_is_unchanged_from_before_1723() {
     assert_eq!(FitOptions::default().sir_scale, SirScale::Packed);
-    assert_eq!(
-        packed_fixture_bits(),
-        (PACKED_ESS_BITS, PACKED_RESAMPLE_HASH)
+    let (ess, hash) = packed_fixture_digest();
+    let want = f64::from_bits(PACKED_ESS_BITS);
+    assert!(
+        ess.is_finite() && ((ess - want) / want).abs() < 1e-12,
+        "ESS {ess}, before #1723 {want}"
     );
+    assert_eq!(hash, PACKED_RESAMPLE_HASH, "resampled vectors moved");
 }
 // Measured on `202bea5e` and on this branch, macOS arm64 and Linux (see the
 // PR); the four fit-level fixtures (`warfarin`, `warfarin_iov` FOCEI and FOCE,
 // `mbma_placebo`) were compared the same way, ESS / resample-hash / CI bits.
 const PACKED_ESS_BITS: u64 = 4_609_556_852_108_965_889;
-const PACKED_RESAMPLE_HASH: u64 = 14_913_232_331_265_381_408;
+const PACKED_RESAMPLE_HASH: u64 = 4_345_404_384_744_949_393;
 
 /// S7 (#1723): under `natural` the ω²_KA lower limit does not depend on the
 /// box floor; under `packed` it does. `warfarin_iov` FOCEI, where ETA_KA's
