@@ -22,8 +22,9 @@
 //! NONMEM with the variance frozen (390.913057 / 205.090543) and the old ferx without it
 //! (390.173258 / 203.806424), so the two conventions are the whole difference.
 //!
-//! `warfarin.ferx` (σ ≈ 1%, `warfarin_foce_cwres_nonmem_anchor.rs`) cannot see this: at
-//! that σ both conventions give the same mode to the printed digits.
+//! `warfarin.ferx` (σ ≈ 1%, `warfarin_foce_cwres_nonmem_anchor.rs`) is the low-σ third
+//! anchor: there the old convention was off by 4.5e-3 OFV and 6.1e-3 CWRES — small enough
+//! to have passed as "optimizer noise" — and the fix closes both to ~3e-9.
 //!
 //! Engine: analytic `Dual2` inner gradients on both (one-compartment oral, and its IOV
 //! twin, are in scope) — asserted by the absence of the finite-difference fallback warning.
