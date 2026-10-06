@@ -2500,6 +2500,21 @@ pub fn subject_packed_gradient_foce(
         None
     };
 
+    // `R⁰` and its derivatives at f(η=0), every row — built once and shared with the
+    // frozen-variance EBE response below (#1722), so the two cannot disagree about `R⁰`.
+    let rows = foce_r0_rows(
+        model,
+        subject,
+        &sens0,
+        sigma,
+        &err_keys,
+        mult.as_deref(),
+        mult_grad.as_deref(),
+        corr,
+        corr_rd0.as_ref(),
+        n_theta,
+    );
+
     // J = ∂f/∂η (nq×n_eta), ρ = y − f0 = ε + J·η̂, R⁰ and d⁰ at f(η=0) — quant rows.
     // `dr0_dtheta[i]` is the magnitude's direct-θ derivative of `R⁰ᵢ` (empty when no
     // magnitude), consumed by the θ-block below.
@@ -2516,60 +2531,13 @@ pub fn subject_packed_gradient_foce(
             jeta += obs.df_deta[k] * eta_hat[k];
         }
         rho[i] = subject.observations[j] - (obs.f - jeta);
-        let cmt = err_keys[j];
-        let f0act = sens0.obs[j].f;
-        let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-        // FREM covariate pseudo-observation (`fremtype > 0`): the Sheiner–Beal marginal
-        // still needs an `R⁰ⱼ` for this row, but the objective scores it against the
-        // dedicated `EPSCOV` variance, not `error_spec.variance_at`. `R⁰ = EPSCOV²` is
-        // constant in `f`, hence `d⁰ = 0`, and it takes neither the correlation-aware
-        // nor the magnitude-scaled branch below (#251 review #3 — `method = foce` had
-        // no FREM branch at all, unlike FOCEI's `score_core`).
-        let frem_r0 = crate::stats::likelihood::build_frem_r_override(
-            model.frem_config.as_ref(),
-            &subject.fremtype,
-            sigma,
-        )
-        .as_ref()
-        .and_then(|o| o.get(j))
-        .and_then(|x| *x);
-        // Correlated residual (`block_sigma`, #627): correlation-aware `(R⁰, ∂R⁰/∂f)`.
-        // block_sigma is mutually exclusive with custom magnitude and M3, so `mult_row`
-        // and the censored (`cg`) path are inactive whenever `corr_rd0` is set.
-        let (r, dd) = match (frem_r0, &corr_rd0) {
-            (Some(v), _) => (v, 0.0),
-            (None, Some((rv, dv, _))) => (rv[j], dv[j]),
-            (None, None) => residual_rd(&model.error_spec, cmt, f0act, sigma, mult_row),
-        };
+        let r = rows.r[j];
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
         r0[i] = r;
-        d0[i] = dd;
-        // The magnitude direct-θ channel is a PK-error-spec derivative and does not
-        // apply to a FREM row's dedicated `EPSCOV` variance (#251 review #6's
-        // principle): `dr0_dtheta[i]` stays empty there, exactly as for a censored or
-        // correlated row.
-        if frem_r0.is_none() {
-            if let (Some(mm), Some(mg_row)) =
-                (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j)))
-            {
-                // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path); the
-                // Sheiner–Beal marginal only needs `∂R/∂θ`, so skip the `∂d/∂θ` accumulation.
-                let dr = mag_variance_dtheta(
-                    &model.error_spec,
-                    cmt,
-                    f0act,
-                    sigma,
-                    mm,
-                    mg_row,
-                    n_theta,
-                    1.0,
-                    None,
-                );
-                dr0_dtheta[i] = dr;
-            }
-        }
+        d0[i] = rows.d[j];
+        dr0_dtheta[i] = rows.dr_dtheta_direct[j].clone();
     }
 
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
@@ -2638,72 +2606,9 @@ pub fn subject_packed_gradient_foce(
     // closed-form variance at f(η=0) — works for FOCE here and FOCEI in sigma_block.
     let sigma_start = omega_start + entries.len();
     for k in 0..n_sigma {
-        let hsig = sigma_fd_step(sigma[k]);
-        let mut sp = sigma.clone();
-        sp[k] += hsig;
-        let mut sm = sigma.clone();
-        sm[k] -= hsig;
         let mut nat = 0.0;
         for (i, &j) in quant.iter().enumerate() {
-            let cmt = err_keys[j];
-            let f0act = sens0.obs[j].f;
-            // FREM covariate pseudo-observation: `R⁰ = EPSCOV²`, so `∂R⁰/∂σ` comes from
-            // the dedicated covariate σ, not the PK error model (#251 review #3). Without
-            // this branch `dr0` FD's the PK variance's (zero) dependence on `EPSCOV`,
-            // leaving `grad[EPSCOV] ≡ 0` under `method = foce` too.
-            let frem_vp = crate::stats::likelihood::build_frem_r_override(
-                model.frem_config.as_ref(),
-                &subject.fremtype,
-                &sp,
-            )
-            .as_ref()
-            .and_then(|o| o.get(j))
-            .and_then(|x| *x);
-            let frem_vm = crate::stats::likelihood::build_frem_r_override(
-                model.frem_config.as_ref(),
-                &subject.fremtype,
-                &sm,
-            )
-            .as_ref()
-            .and_then(|o| o.get(j))
-            .and_then(|x| *x);
-            if let (Some(vp), Some(vm)) = (frem_vp, frem_vm) {
-                let dr0 = (vp - vm) / (2.0 * hsig);
-                nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
-                continue;
-            }
-            // Correlation-aware `∂R⁰/∂σ` when block_sigma present (within-obs cross
-            // term); otherwise ∂R⁰/∂σ carries the magnitude multiplier (`mult` scales
-            // the σ loading), so FD the *scaled* variance when a magnitude is active
-            // (#576/#486). block_sigma and magnitude are mutually exclusive.
-            let mult_row: Option<&[f64]> =
-                mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-            let (vp, vm) = if correlated {
-                (
-                    model
-                        .error_spec
-                        .variance_at_with_correlations(cmt, f0act, &sp, corr),
-                    model
-                        .error_spec
-                        .variance_at_with_correlations(cmt, f0act, &sm, corr),
-                )
-            } else {
-                match mult_row {
-                    Some(mm) => (
-                        model
-                            .error_spec
-                            .variance_at_scaled(cmt, f0act, &sp, &[], mm),
-                        model
-                            .error_spec
-                            .variance_at_scaled(cmt, f0act, &sm, &[], mm),
-                    ),
-                    None => (
-                        model.error_spec.variance_at(cmt, f0act, &sp),
-                        model.error_spec.variance_at(cmt, f0act, &sm),
-                    ),
-                }
-            };
-            let dr0 = (vp - vm) / (2.0 * hsig);
+            let dr0 = rows.dr_dsigma[j][k];
             nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
         nat += cg.sigma[k];
@@ -2751,14 +2656,465 @@ pub fn subject_packed_gradient_foce(
         coupling[k] = ck;
     }
 
-    // Total: dFᵢ/dx_k = ∂Fᵢ/∂x_k|_η̂ + c·(dη̂/dx_k). dη̂/dx is interaction-
-    // independent (shared inner objective, M3-aware), so it is reused as-is.
-    let eta_dx = subject_eta_dx_from_sens(model, subject, &params, template, x, eta_hat, &sens)?;
+    // Total: dFᵢ/dx_k = ∂Fᵢ/∂x_k|_η̂ + c·(dη̂/dx_k). The EBE response is that of the
+    // objective the FOCE search minimises: with the residual variance held at `R⁰`
+    // (#1722) when it depends on the prediction; for additive error the two inner
+    // objectives coincide and the conditional response is kept bit-identical.
+    let eta_dx = if model.error_spec.has_f_dependent_variance() {
+        let resp = frozen_eta_response(
+            subject,
+            m3,
+            &sens,
+            &sens0,
+            &rows,
+            &params.omega.inv,
+            eta_hat,
+        )?;
+        let rho_terms = (!params.residual_correlations.is_empty())
+            .then(|| rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations));
+        frozen_eta_dx_assemble(
+            &resp,
+            &sens,
+            &params,
+            template,
+            eta_hat,
+            x.len(),
+            rho_terms.as_deref(),
+        )
+    } else {
+        subject_eta_dx_from_sens(model, subject, &params, template, x, eta_hat, &sens)?
+    };
     let mut g = vec![0.0f64; x.len()];
     for k in 0..x.len() {
         g[k] = fixed[k] + coupling.dot(&eta_dx[k]);
     }
     Some(g)
+}
+
+/// Per-row `R⁰ = V(f(η = 0))` of the FOCE Sheiner–Beal marginal and its derivatives —
+/// every row of the subject, quantified and censored alike.
+///
+/// The **one** builder of `R⁰` for the analytic FOCE outer gradient: the marginal's θ/σ
+/// blocks (`subject_packed_gradient_foce{,_iov}`) read it, and so does the EBE response
+/// of the frozen-variance inner objective (#1722), whose variance *is* `R⁰`. Before
+/// #1722 the marginal built these inline; the frozen response needs exactly the same
+/// numbers, and two copies is how a convention drifts.
+pub(crate) struct FoceR0Rows {
+    /// `R⁰ⱼ`. A FREM covariate pseudo-observation's is `EPSCOV²`.
+    pub(crate) r: Vec<f64>,
+    /// `∂R⁰ⱼ/∂f` at `f(η=0)` (`0` on a FREM row), so `∂R⁰ⱼ/∂θ = dⱼ·∂f0ⱼ/∂θ + direct`.
+    pub(crate) d: Vec<f64>,
+    /// The custom magnitude's *direct*-θ `∂R⁰ⱼ/∂θ` (#576/#486); empty without one, and on
+    /// a FREM row.
+    pub(crate) dr_dtheta_direct: Vec<Vec<f64>>,
+    /// `∂R⁰ⱼ/∂σₖ` by central FD of the closed-form variance at `f(η=0)` — FREM rows on
+    /// the covariate σ, correlation-aware under `block_sigma`, magnitude-scaled when a
+    /// magnitude is active.
+    pub(crate) dr_dsigma: Vec<Vec<f64>>,
+}
+
+impl FoceR0Rows {
+    /// `∂R⁰ⱼ/∂θₘ`: through the population prediction, plus the magnitude's direct term.
+    fn dtheta(&self, j: usize, m: usize, sens0: &SubjectSens) -> f64 {
+        let mut dr0 = self.d[j] * sens0.obs[j].df_dtheta[m];
+        if !self.dr_dtheta_direct[j].is_empty() {
+            dr0 += self.dr_dtheta_direct[j][m];
+        }
+        dr0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_r0_rows(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens0: &SubjectSens,
+    sigma: &[f64],
+    err_keys: &[usize],
+    mult: Option<&[Vec<f64>]>,
+    mult_grad: Option<&[Vec<Vec<f64>>]>,
+    corr: &[ResidualCorrelation],
+    corr_rd0: Option<&(Vec<f64>, Vec<f64>, Vec<f64>)>,
+    n_theta: usize,
+) -> FoceR0Rows {
+    let n_obs = sens0.obs.len();
+    let frem = |sv: &[f64], j: usize| {
+        crate::stats::likelihood::build_frem_r_override(
+            model.frem_config.as_ref(),
+            &subject.fremtype,
+            sv,
+        )
+        .as_ref()
+        .and_then(|o| o.get(j))
+        .and_then(|x| *x)
+    };
+    let mut rows = FoceR0Rows {
+        r: vec![0.0; n_obs],
+        d: vec![0.0; n_obs],
+        dr_dtheta_direct: vec![Vec::new(); n_obs],
+        dr_dsigma: vec![vec![0.0; sigma.len()]; n_obs],
+    };
+    for j in 0..n_obs {
+        let cmt = err_keys[j];
+        let f0act = sens0.obs[j].f;
+        let mult_row: Option<&[f64]> = mult.and_then(|m| m.get(j)).map(|v| v.as_slice());
+        // FREM covariate pseudo-observation (`fremtype > 0`): the Sheiner–Beal marginal
+        // still needs an `R⁰ⱼ` for this row, but the objective scores it against the
+        // dedicated `EPSCOV` variance, not `error_spec.variance_at`. `R⁰ = EPSCOV²` is
+        // constant in `f`, hence `d⁰ = 0`, and it takes neither the correlation-aware
+        // nor the magnitude-scaled branch below (#251 review #3 — `method = foce` had
+        // no FREM branch at all, unlike FOCEI's `score_core`).
+        let frem_r0 = frem(sigma, j);
+        // Correlated residual (`block_sigma`, #627): correlation-aware `(R⁰, ∂R⁰/∂f)`.
+        // block_sigma is mutually exclusive with custom magnitude and M3, so `mult_row`
+        // and the censored (`cg`) path are inactive whenever `corr_rd0` is set.
+        let (r, dd) = match (frem_r0, corr_rd0) {
+            (Some(v), _) => (v, 0.0),
+            (None, Some((rv, dv, _))) => (rv[j], dv[j]),
+            (None, None) => residual_rd(&model.error_spec, cmt, f0act, sigma, mult_row),
+        };
+        rows.r[j] = r;
+        rows.d[j] = dd;
+        // The magnitude direct-θ channel is a PK-error-spec derivative and does not
+        // apply to a FREM row's dedicated `EPSCOV` variance (#251 review #6's
+        // principle): it stays empty there, exactly as for a correlated row.
+        if frem_r0.is_none() {
+            if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.and_then(|mg| mg.get(j))) {
+                // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path); the
+                // Sheiner–Beal marginal only needs `∂R/∂θ`, so skip the `∂d/∂θ` accumulation.
+                rows.dr_dtheta_direct[j] = mag_variance_dtheta(
+                    &model.error_spec,
+                    cmt,
+                    f0act,
+                    sigma,
+                    mm,
+                    mg_row,
+                    n_theta,
+                    1.0,
+                    None,
+                );
+            }
+        }
+        for k in 0..sigma.len() {
+            let hsig = sigma_fd_step(sigma[k]);
+            let mut sp = sigma.to_vec();
+            sp[k] += hsig;
+            let mut sm = sigma.to_vec();
+            sm[k] -= hsig;
+            // FREM covariate pseudo-observation: `R⁰ = EPSCOV²`, so `∂R⁰/∂σ` comes from
+            // the dedicated covariate σ, not the PK error model (#251 review #3). Without
+            // this branch `dr0` FD's the PK variance's (zero) dependence on `EPSCOV`,
+            // leaving `grad[EPSCOV] ≡ 0` under `method = foce` too.
+            if let (Some(vp), Some(vm)) = (frem(&sp, j), frem(&sm, j)) {
+                rows.dr_dsigma[j][k] = (vp - vm) / (2.0 * hsig);
+                continue;
+            }
+            // Correlation-aware `∂R⁰/∂σ` when block_sigma present (within-obs cross
+            // term); otherwise ∂R⁰/∂σ carries the magnitude multiplier (`mult` scales
+            // the σ loading), so FD the *scaled* variance when a magnitude is active
+            // (#576/#486). block_sigma and magnitude are mutually exclusive.
+            let (vp, vm) = if corr_rd0.is_some() {
+                (
+                    model
+                        .error_spec
+                        .variance_at_with_correlations(cmt, f0act, &sp, corr),
+                    model
+                        .error_spec
+                        .variance_at_with_correlations(cmt, f0act, &sm, corr),
+                )
+            } else {
+                match mult_row {
+                    Some(mm) => (
+                        model
+                            .error_spec
+                            .variance_at_scaled(cmt, f0act, &sp, &[], mm),
+                        model
+                            .error_spec
+                            .variance_at_scaled(cmt, f0act, &sm, &[], mm),
+                    ),
+                    None => (
+                        model.error_spec.variance_at(cmt, f0act, &sp),
+                        model.error_spec.variance_at(cmt, f0act, &sm),
+                    ),
+                }
+            };
+            rows.dr_dsigma[j][k] = (vp - vm) / (2.0 * hsig);
+        }
+    }
+    rows
+}
+
+/// The EBE response of the **frozen-variance** inner objective (#1722), before the
+/// packed-coordinate chain rule: `H⁻¹` and the mixed blocks `∂g/∂θₘ`, `∂g/∂σₖ`, with
+/// `g = ∂l/∂b` the inner gradient over the (possibly stacked) random effects `b`.
+///
+/// Non-interaction FOCE searches
+/// `l(b) = Σⱼ cⱼ(fⱼ(b); R⁰ⱼ) + ½bᵀΩ⁻¹b`, with `R⁰ⱼ` a constant of the search
+/// ([`crate::estimation::inner_optimizer::EbeVariance::Population`]). Per row, with
+/// `g1 = ∂c/∂f` and `g2 = ∂²c/∂f²` at fixed `R⁰` (Gaussian: `g1 = −ε/R⁰`, `g2 = 1/R⁰`;
+/// M3-censored: the tail kernel at `∂R/∂f = 0`) and `aⱼ = ∂fⱼ/∂b`, `Aⱼ = ∂²fⱼ/∂b²`,
+/// `bⱼₘ = ∂fⱼ/∂θₘ`, `Bⱼ = ∂²fⱼ/∂b∂θ`:
+///
+/// ```text
+///   H        = Σⱼ (g2 aⱼaⱼᵀ + g1 Aⱼ) + Ω⁻¹
+///   ∂g/∂θₘ   = Σⱼ (g2 bⱼₘ aⱼ + g1 Bⱼ[:,m] + ∂g1/∂R · ∂R⁰ⱼ/∂θₘ · aⱼ)
+///   ∂g/∂σₖ   = Σⱼ ∂g1/∂R · ∂R⁰ⱼ/∂σₖ · aⱼ
+/// ```
+///
+/// Unlike the conditional response (`prepare`'s `α`, `α'`), no `∂R/∂f` enters: `R⁰`
+/// moves with θ only through `f(0; θ)` and with σ directly. `None` when `H` is not SPD.
+pub(crate) struct FrozenEtaResponse {
+    h_inv: DMatrix<f64>,
+    m_theta: Vec<DVector<f64>>,
+    m_sigma: Vec<DVector<f64>>,
+    /// Per-row `∂g1/∂R` and `aⱼ` — the ρ block reuses them with `∂R⁰/∂ρ`.
+    dg1_dr: Vec<f64>,
+}
+
+pub(crate) fn frozen_eta_response(
+    subject: &Subject,
+    m3: bool,
+    sens: &SubjectSens,
+    sens0: &SubjectSens,
+    rows: &FoceR0Rows,
+    omega_inv: &DMatrix<f64>,
+    b_hat: &[f64],
+) -> Option<FrozenEtaResponse> {
+    let n_b = b_hat.len();
+    let n_obs = sens.obs.len();
+    if n_obs == 0 || sens0.obs.len() != n_obs || rows.r.len() != n_obs {
+        return None;
+    }
+    let n_theta = sens.obs[0].df_dtheta.len();
+    let n_sigma = rows.dr_dsigma.first().map_or(0, |v| v.len());
+    let mut h = omega_inv.clone();
+    let mut m_theta = vec![DVector::<f64>::zeros(n_b); n_theta];
+    let mut m_sigma = vec![DVector::<f64>::zeros(n_b); n_sigma];
+    let mut dg1_dr = vec![0.0; n_obs];
+    for (j, obs) in sens.obs.iter().enumerate() {
+        let r = rows.r[j];
+        if !(r.is_finite() && r > 0.0) {
+            return None;
+        }
+        let y = subject.observations[j];
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        // A `CENS` flag is the censored kernel only under M3 (`m3` is the caller's
+        // `bloq_method == M3 && any censored row`); otherwise the row scores Gaussian.
+        let censored = m3 && cens != 0;
+        let (g1, g2, dg1) = if censored {
+            let (g1, g2, _, _) = m3_censored_outer(y, obs.f, r, 0.0, 0.0, cens);
+            let hr = 1e-6 * r;
+            let (gp, _, _, _) = m3_censored_outer(y, obs.f, r + hr, 0.0, 0.0, cens);
+            let (gm, _, _, _) = m3_censored_outer(y, obs.f, r - hr, 0.0, 0.0, cens);
+            (g1, g2, (gp - gm) / (2.0 * hr))
+        } else {
+            let eps = y - obs.f;
+            (-eps / r, 1.0 / r, eps / (r * r))
+        };
+        dg1_dr[j] = dg1;
+        let a = &obs.df_deta;
+        for p in 0..n_b {
+            for q in 0..n_b {
+                h[(p, q)] += g2 * a[p] * a[q] + g1 * obs.d2f_deta2[p * n_b + q];
+            }
+        }
+        for m in 0..n_theta {
+            let bjm = obs.df_dtheta[m];
+            let dr0 = rows.dtheta(j, m, sens0);
+            for p in 0..n_b {
+                m_theta[m][p] +=
+                    g2 * bjm * a[p] + g1 * obs.d2f_deta_dtheta[p * n_theta + m] + dg1 * dr0 * a[p];
+            }
+        }
+        for k in 0..n_sigma {
+            let drs = rows.dr_dsigma[j][k];
+            for p in 0..n_b {
+                m_sigma[k][p] += dg1 * drs * a[p];
+            }
+        }
+    }
+    let h_inv = h.cholesky()?.inverse();
+    Some(FrozenEtaResponse {
+        h_inv,
+        m_theta,
+        m_sigma,
+        dg1_dr,
+    })
+}
+
+/// Packed-coordinate `dη̂/dx` from a [`FrozenEtaResponse`] — the non-IOV twin of the
+/// chain rule in [`subject_eta_dx_from_sens`]: θ through `theta_dx_chain`, the Ω Cholesky
+/// entries through the prior term alone, σ by `σₖ`, ρ (#847) through `∂R⁰/∂ρ` and the
+/// Fisher-z chain.
+fn frozen_eta_dx_assemble(
+    resp: &FrozenEtaResponse,
+    sens: &SubjectSens,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    eta_hat: &[f64],
+    x_len: usize,
+    rho_terms: Option<&[Vec<(f64, f64)>]>,
+) -> Vec<DVector<f64>> {
+    let n_eta = eta_hat.len();
+    let n_theta = params.theta.len();
+    let mut out: Vec<DVector<f64>> = vec![DVector::zeros(n_eta); x_len];
+    for m in 0..n_theta {
+        out[m] = -(&resp.h_inv * &resp.m_theta[m]) * theta_dx_chain(template, &params.theta, m);
+    }
+    // Ω coords: the prior is the only Ω-dependent term of the inner objective, so this is
+    // the conditional response's Ω block with the frozen `H⁻¹`.
+    let omega_inv = &params.omega.inv;
+    let z = omega_inv * DVector::from_column_slice(eta_hat);
+    let l = &params.omega.chol;
+    let entries = lower_tri_entries(n_eta, params.omega.diagonal);
+    let omega_start = n_theta;
+    for (ko, &(row, col)) in entries.iter().enumerate() {
+        let v = DVector::from_iterator(n_eta, (0..n_eta).map(|r| l[(r, col)]));
+        let vz = v.dot(&z);
+        let oinv_v = omega_inv * &v;
+        let oinv_col_row: DVector<f64> = omega_inv.column(row).into_owned();
+        let m_l = -(oinv_col_row * vz + oinv_v * z[row]);
+        let chain = if row == col { l[(row, row)] } else { 1.0 };
+        out[omega_start + ko] = -(&resp.h_inv * m_l) * chain;
+    }
+    let sigma_start = omega_start + entries.len();
+    for (k, mk) in resp.m_sigma.iter().enumerate() {
+        out[sigma_start + k] = -(&resp.h_inv * mk) * params.sigma.values[k];
+    }
+    if let Some(terms) = rho_terms {
+        let rho_start = rho_packed_start(template);
+        for (k, per_obs) in terms.iter().enumerate() {
+            let mut mvec = DVector::<f64>::zeros(n_eta);
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let (dr0, _) = per_obs[j];
+                for p in 0..n_eta {
+                    mvec[p] += resp.dg1_dr[j] * dr0 * obs.df_deta[p];
+                }
+            }
+            out[rho_start + k] =
+                -(&resp.h_inv * mvec) * rho_chain(params.residual_correlations[k].rho);
+        }
+    }
+    out
+}
+
+/// The frozen-variance `dη̂/dx` of a non-IOV FOCE subject, assembled from scratch — the
+/// test-side handle on the response `subject_packed_gradient_foce` builds inline from the
+/// same [`foce_r0_rows`] / [`frozen_eta_response`] / [`frozen_eta_dx_assemble`]. The
+/// packed-gradient tests pin that wiring; this one pins the response itself against FD of
+/// re-solved EBEs, coordinate by coordinate (#1722).
+#[cfg(test)]
+pub(crate) fn subject_eta_dx_foce(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+) -> Option<Vec<DVector<f64>>> {
+    let params = unpack_params(x, template);
+    let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    let sens0 = subject_sensitivities(model, subject, &params.theta, &vec![0.0; model.n_eta])?;
+    let sigma = &params.sigma.values;
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mult = model.ruv_obs_mult(subject, &params.theta);
+    let mult_grad = match mult {
+        Some(_) => Some(model.ruv_obs_mult_theta_grad(subject, &params.theta)?),
+        None => None,
+    };
+    let corr = &params.residual_correlations;
+    let corr_rd0 = match corr.is_empty() {
+        true => None,
+        false => Some(corr_residual_diag(model, subject, &sens0, sigma, corr)?),
+    };
+    let rows = foce_r0_rows(
+        model,
+        subject,
+        &sens0,
+        sigma,
+        &err_keys,
+        mult.as_deref(),
+        mult_grad.as_deref(),
+        corr,
+        corr_rd0.as_ref(),
+        params.theta.len(),
+    );
+    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && subject.cens.iter().any(|&c| c != 0);
+    let resp = frozen_eta_response(
+        subject,
+        m3,
+        &sens,
+        &sens0,
+        &rows,
+        &params.omega.inv,
+        eta_hat,
+    )?;
+    let rho_terms = (!corr.is_empty()).then(|| rho_rd_terms(model, subject, &sens0, sigma, corr));
+    Some(frozen_eta_dx_assemble(
+        &resp,
+        &sens,
+        &params,
+        template,
+        eta_hat,
+        x.len(),
+        rho_terms.as_deref(),
+    ))
+}
+
+/// IOV twin of [`frozen_eta_dx_assemble`] over the stacked `[η_bsv, κ₁..κ_K]`, in
+/// `pack_params` order `[θ, Ω_bsv, σ, Ω_iov]` — the chain rule of
+/// [`subject_eta_dx_iov`] with the frozen `H⁻¹` and mixed blocks.
+fn frozen_eta_dx_assemble_iov(
+    resp: &FrozenEtaResponse,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    omega_inv: &DMatrix<f64>,
+    l_full: &DMatrix<f64>,
+    b_hat: &[f64],
+    x_len: usize,
+    k_occ: usize,
+) -> Option<Vec<DVector<f64>>> {
+    let n_st = b_hat.len();
+    let n_theta = params.theta.len();
+    let n_eta_bsv = params.omega.matrix.nrows();
+    let omega_iov = params.omega_iov.as_ref()?;
+    let n_iov = omega_iov.matrix.nrows();
+    let mut out: Vec<DVector<f64>> = vec![DVector::zeros(n_st); x_len];
+    for m in 0..n_theta {
+        out[m] = -(&resp.h_inv * &resp.m_theta[m]) * theta_dx_chain(template, &params.theta, m);
+    }
+    let z = omega_inv * DVector::from_column_slice(b_hat);
+    let m_l_response = |row: usize, col: usize| -> DVector<f64> {
+        let v = l_full.column(col).into_owned();
+        let vz = v.dot(&z);
+        let oinv_v = omega_inv * &v;
+        let oinv_col_row: DVector<f64> = omega_inv.column(row).into_owned();
+        let m_l = -(oinv_col_row * vz + oinv_v * z[row]);
+        -(&resp.h_inv * m_l)
+    };
+    let l_bsv = &params.omega.chol;
+    let l_iov = &omega_iov.chol;
+    let omega_start = n_theta;
+    let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
+    for (e, &(row, col)) in bsv_entries.iter().enumerate() {
+        let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
+        out[omega_start + e] = m_l_response(row, col) * chain;
+    }
+    let sigma_start = omega_start + bsv_entries.len();
+    for (k, mk) in resp.m_sigma.iter().enumerate() {
+        out[sigma_start + k] = -(&resp.h_inv * mk) * params.sigma.values[k];
+    }
+    let iov_start = sigma_start + resp.m_sigma.len();
+    let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
+    for (e, &(i, j)) in iov_entries.iter().enumerate() {
+        let mut r = DVector::zeros(n_st);
+        for kk in 0..k_occ {
+            r += m_l_response(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+        }
+        let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
+        out[iov_start + e] = r * chain;
+    }
+    Some(out)
 }
 
 /// The exact analytic **FOCE** population gradient `d(OFV)/dx = 2·Σᵢ dFᵢ/dx` in
@@ -3039,6 +3395,22 @@ pub fn subject_packed_gradient_foce_iov(
         None
     };
 
+    // `R⁰` and its derivatives at f(all-zero), every row — shared with the frozen EBE
+    // response below (#1722). IOV rejects FREM and `block_sigma`, so the builder takes
+    // its plain (magnitude-aware) branch here.
+    let rows = foce_r0_rows(
+        model,
+        subject,
+        &sens0,
+        sigma,
+        &err_keys,
+        mult.as_deref(),
+        mult_grad.as_deref(),
+        &[],
+        None,
+        n_theta,
+    );
+
     // J = ∂f/∂[η,κ] (nq×n_st), ρ = ε + J·b̂, R⁰ and d⁰ at f(all-zero) — quant rows.
     let mut jmat = DMatrix::<f64>::zeros(nq, n_st);
     let mut rho = DVector::<f64>::zeros(nq);
@@ -3053,30 +3425,13 @@ pub fn subject_packed_gradient_foce_iov(
             jeta += obs.df_deta[kk] * stacked_eta_hat[kk];
         }
         rho[i] = subject.observations[j] - (obs.f - jeta);
-        let cmt = err_keys[j];
-        let f0act = sens0.obs[j].f;
-        let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-        let (r, d) = residual_rd(&model.error_spec, cmt, f0act, sigma, mult_row);
+        let r = rows.r[j];
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
         r0[i] = r;
-        d0[i] = d;
-        if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
-            // Sheiner–Beal marginal only needs `∂R/∂θ` → skip the `∂d/∂θ` accumulation.
-            let dr = mag_variance_dtheta(
-                &model.error_spec,
-                cmt,
-                f0act,
-                sigma,
-                mm,
-                mg_row,
-                n_theta,
-                1.0,
-                None,
-            );
-            dr0_dtheta[i] = dr;
-        }
+        d0[i] = rows.d[j];
+        dr0_dtheta[i] = rows.dr_dtheta_direct[j].clone();
     }
 
     let jo = &jmat * &omega_full;
@@ -3163,33 +3518,10 @@ pub fn subject_packed_gradient_foce_iov(
     // (`cg.sigma`; ∂R̃ⱼⱼ/∂σ = ∂R⁰/∂σ — #646). ∂R⁰/∂σ by central FD of the closed-form
     // variance at f(η=0, κ=0).
     for kk in 0..n_sigma {
-        let hsig = sigma_fd_step(sigma[kk]);
-        let mut sp = sigma.clone();
-        sp[kk] += hsig;
-        let mut sm = sigma.clone();
-        sm[kk] -= hsig;
         let mut nat = 0.0;
         for (i, &j) in quant.iter().enumerate() {
-            let cmt = err_keys[j];
-            let f0act = sens0.obs[j].f;
             // Magnitude-aware ∂R⁰/∂σ (the multiplier scales the σ loading) — #576/#486.
-            let mult_row: Option<&[f64]> =
-                mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-            let (vp, vm) = match mult_row {
-                Some(mm) => (
-                    model
-                        .error_spec
-                        .variance_at_scaled(cmt, f0act, &sp, &[], mm),
-                    model
-                        .error_spec
-                        .variance_at_scaled(cmt, f0act, &sm, &[], mm),
-                ),
-                None => (
-                    model.error_spec.variance_at(cmt, f0act, &sp),
-                    model.error_spec.variance_at(cmt, f0act, &sm),
-                ),
-            };
-            let dr0 = (vp - vm) / (2.0 * hsig);
+            let dr0 = rows.dr_dsigma[j][kk];
             nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
         nat += cg.sigma[kk];
@@ -3232,7 +3564,33 @@ pub fn subject_packed_gradient_foce_iov(
         coupling[kk] = ck;
     }
 
-    let eta_dx = subject_eta_dx_iov(model, subject, template, x, stacked_eta_hat)?;
+    // The EBE response of the objective the FOCE search minimises (#1722): residual
+    // variance held at `R⁰` when it depends on the prediction; additive error keeps the
+    // conditional response, bit-identical (the two objectives coincide there).
+    let eta_dx = if model.error_spec.has_f_dependent_variance() {
+        let omega_inv = omega_full.clone().cholesky()?.inverse();
+        let resp = frozen_eta_response(
+            subject,
+            m3,
+            &sens,
+            &sens0,
+            &rows,
+            &omega_inv,
+            stacked_eta_hat,
+        )?;
+        frozen_eta_dx_assemble_iov(
+            &resp,
+            &params,
+            template,
+            &omega_inv,
+            &l_full,
+            stacked_eta_hat,
+            x.len(),
+            k,
+        )?
+    } else {
+        subject_eta_dx_iov(model, subject, template, x, stacked_eta_hat)?
+    };
     let mut g = vec![0.0f64; x.len()];
     for kk in 0..x.len() {
         g[kk] = fixed[kk] + coupling.dot(&eta_dx[kk]);
