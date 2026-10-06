@@ -6124,8 +6124,13 @@ mod rebind {
     /// the unbound statistics-only twin. Control, in the same test: levels bound on
     /// B itself (the `prepare_run` order) survive a statistics bind on B.
     ///
+    /// The third cell (#1735 review r1, finding 1): B's subjects carry index columns,
+    /// but written for B's own levels, which are not A's (`STUDY=1,TIME=3` is B's
+    /// index 3, A's `STUDY=2,TIME=1`). A's layout is dropped there too.
+    ///
     /// Mutations — always keep the levels: the first arm keeps A's layout. Always
-    /// drop them: the control loses B's.
+    /// drop them: the control loses B's. Check only that the columns are present:
+    /// the third cell keeps A's layout over B's columns.
     #[test]
     fn a_statistics_bind_keeps_the_levels_only_while_they_are_written_on_the_data() {
         let text = model(true, true);
@@ -6144,6 +6149,29 @@ mod rebind {
         both(&mut parsed, &text, &mut on_b);
         assert!(parsed.bindings.levels.contains_key("PLACEBO"));
         assert_eq!(parsed.bindings.covariate_stats["WT"].median, 70.0);
+
+        // Columns present, written for other levels: 2 studies × 3 times.
+        let mut other = weighed(2, 3, 60.0);
+        let mut own = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut own, &text, &mut other).unwrap();
+        let mut prebound = pre_bound(&text, &mut weighed(3, 2, 80.0));
+        // The straddle: same level count, so only the labels tell them apart.
+        assert_eq!(
+            own.bindings.levels["PLACEBO"].labels.len(),
+            prebound.bindings.levels["PLACEBO"].labels.len()
+        );
+        assert_ne!(
+            own.bindings.levels["PLACEBO"].labels,
+            prebound.bindings.levels["PLACEBO"].labels
+        );
+        bind_covariate_stats(&mut prebound, &text, &other).unwrap();
+        let mut unbound = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut unbound, &text, &other).unwrap();
+        assert!(
+            prebound.bindings.levels.is_empty(),
+            "A's layout over B's columns"
+        );
+        assert_eq!(twin(&prebound), twin(&unbound));
     }
 
     /// T4: provenance, both arms in one test. The two models carry the **same**
@@ -6301,6 +6329,53 @@ mod rebind {
         );
         assert_eq!(twin(&prebound), twin(&by_hand));
         assert_eq!(canon(&got), canon(&want));
+    }
+
+    /// #1735 review r1, finding 2: a model laid out by the deprecated binder with no
+    /// statistics installed carries the fit's levels but no fit centre. A
+    /// `bind_covariate_stats` on the design then refuses, naming the relation and
+    /// what to do, rather than returning `Ok` with the relation unresolved (the
+    /// failure would surface later, at `simulate` or `fit`) or centring on the
+    /// design (#1619). Straddle, same test: with the fit's statistics installed
+    /// first, the same call is the no-op that keeps the fit's median.
+    ///
+    /// Mutations — return `Ok` on every fit-bound model: the first arm binds `Ok`.
+    /// Drop the flag check: the first arm centres on the design, and the second
+    /// re-centres on it. Delete either sentence of the message: the text differs.
+    #[test]
+    fn a_fit_bound_model_without_the_fits_statistics_is_refused() {
+        let text = model(true, true);
+        let b = fitted(&text);
+        let mut design = weighed(3, 2, 80.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &text, &mut design, &b.levels).unwrap();
+        assert!(parsed.model.bound_from_fit());
+        assert_eq!(symbolic_covariates(&parsed.model), vec!["WT".to_string()]);
+        let before = twin(&parsed);
+        let err = bind_covariate_stats(&mut parsed, &text, &design)
+            .expect_err("no fit centre to keep, and the design's is not the fit's");
+        assert_eq!(
+            err,
+            "[covariate_model] relations still need data-derived statistics:\n  \
+             V ~ WT power(center = median) => THETA_V_WT(0.6, 0.01, 5.0)\n\
+             This model is laid out on a fit's levels, so its centres must be the \
+             fit's too, not those of the data at hand. Bind it with `bind_from_fit` \
+             and the fit's `data_bindings`, which carry both, or install the fit's \
+             covariate statistics before binding its levels."
+        );
+        assert_eq!(twin(&parsed), before, "parsed untouched");
+
+        // The fit's statistics installed first: the no-op that keeps them.
+        let mut design = weighed(3, 2, 80.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        parsed.bindings.covariate_stats = b.covariate_stats.clone();
+        parsed.model = crate::parser::model_parser::parse_full_model_with(&text, &parsed.bindings)
+            .unwrap()
+            .model;
+        bind_theta_levels_from_fit(&mut parsed, &text, &mut design, &b.levels).unwrap();
+        bind_covariate_stats(&mut parsed, &text, &design).unwrap();
+        assert_eq!(parsed.bindings.covariate_stats["WT"].median, 70.0);
+        assert!(symbolic_covariates(&parsed.model).is_empty());
     }
 
     /// T7: re-binding on the data a model is already bound to changes nothing —

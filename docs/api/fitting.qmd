@@ -339,7 +339,8 @@ first data resolved it to: a level block declared `auto` takes the contrast the
 new data resolves, and a `center = median` takes the new data's median. A binder
 keeps the other half only while it still holds on the new data. The statistics
 are kept only when the new population summarises to the same values. The level
-layout is kept only when the population carries the level index columns.
+layout is kept only when the population carries the level index columns and
+shows exactly the bound levels, so the columns were written for that layout.
 Otherwise that half is dropped, and the other binder binds it on the new data
 ([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A model bound
 against a fit, described next, is the exception.

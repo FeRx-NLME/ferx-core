@@ -27,9 +27,9 @@
 
 use std::collections::HashSet;
 
-use crate::api::levels::{declared_model, unbound_bindings, Reads};
+use crate::api::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
 use crate::parser::covariate_model::CovariateStatBindings;
-use crate::parser::model_parser::{level_index_column, parse_full_model_with, LevelBindings};
+use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
 
 /// Resolve every symbolic statistic in `parsed`'s `[covariate_model]` block
@@ -43,23 +43,38 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// **Re-binding** (#1730). The relations are read from what `model_text`
 /// declares, so a `parsed` already bound to other data is re-centred on
 /// `population` exactly as a fresh parse would be. Level bindings `parsed` was
-/// bound with are kept only when every subject of `population` carries each
-/// block's index column, which [`bind_theta_levels`](crate::api::bind_theta_levels)
-/// writes. Otherwise they are dropped, and the blocks are left for
+/// bound with are kept only when they are `population`'s: every subject carries
+/// each block's index column, which [`bind_theta_levels`](crate::api::bind_theta_levels)
+/// writes, and `population` shows exactly the bound levels, so the column was
+/// written for this layout. Otherwise they are dropped, and the blocks are left for
 /// `bind_theta_levels` to bind on `population`.
 ///
 /// Also a no-op on a model laid out on a fit's bindings
 /// ([`bind_from_fit`](crate::api::bind_from_fit),
 /// [`layout_from_fit`](crate::api::layout_from_fit)): its centres are the fit's,
 /// which the fitted θ was estimated against, and are never re-taken from the data
-/// at hand.
+/// at hand. A model the deprecated `bind_theta_levels_from_fit` laid out without
+/// the fit's statistics has no fit centre to keep, and is refused.
 pub fn bind_covariate_stats(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &Population,
 ) -> Result<(), String> {
     if parsed.model.bound_from_fit() {
-        return Ok(());
+        // The fit's centres, when it gave any, are the ones to keep. A model laid out
+        // by the deprecated binder without them has none, and the data's would be the
+        // #1619 defect (#1735 review r1, finding 2).
+        return match unresolved_lines(&parsed.model) {
+            None => Ok(()),
+            Some(lines) => Err(format!(
+                "[covariate_model] relations still need data-derived statistics:\n\
+                 {lines}\n\
+                 This model is laid out on a fit's levels, so its centres must be the \
+                 fit's too, not those of the data at hand. Bind it with `bind_from_fit` \
+                 and the fit's `data_bindings`, which carry both, or install the fit's \
+                 covariate statistics before binding its levels."
+            )),
+        };
     }
     let declared = declared_model(parsed, model_text, Reads::Stats)?;
     let Some(spec) = declared.covariate_model.as_ref() else {
@@ -83,7 +98,7 @@ pub fn bind_covariate_stats(
     drop(declared);
 
     let mut bindings = unbound_bindings(parsed);
-    if levels_written_on(&parsed.bindings.levels, population) {
+    if levels_hold_on(&parsed.model, &parsed.bindings.levels, population) {
         bindings.levels = parsed.bindings.levels.clone();
     }
     bindings.covariate_stats = stats;
@@ -105,19 +120,6 @@ pub(crate) fn stats_hold_on(stats: &CovariateStatBindings, population: &Populati
         .all(|(name, held)| summarize(name, population).is_ok_and(|s| &s == held))
 }
 
-/// Whether level bindings a model was bound with are written on `population`
-/// (#1730): every subject carries each block's index column, which
-/// `bind_theta_levels` and `bind_from_fit` always write on the subject.
-fn levels_written_on(levels: &LevelBindings, population: &Population) -> bool {
-    levels.keys().all(|block| {
-        let column = level_index_column(block);
-        population
-            .subjects
-            .iter()
-            .all(|s| s.covariates.contains_key(&column))
-    })
-}
-
 /// Reject a model whose `[covariate_model]` still carries a relation waiting on
 /// data-derived statistics.
 ///
@@ -127,17 +129,9 @@ fn levels_written_on(levels: &LevelBindings, population: &Population) -> bool {
 /// divides to `0.0` rather than `inf` in this engine, so nothing downstream
 /// would have complained.)
 pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String> {
-    let Some(spec) = model.covariate_model.as_ref() else {
+    let Some(lines) = unresolved_lines(model) else {
         return Ok(());
     };
-    let unresolved = spec.unresolved();
-    if unresolved.is_empty() {
-        return Ok(());
-    }
-    let lines: Vec<String> = unresolved
-        .iter()
-        .map(|r| format!("  {}", r.source_line))
-        .collect();
     Err(format!(
         "[covariate_model] relations still need data-derived statistics:\n\
          {}\n\
@@ -152,8 +146,22 @@ pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String>
          with `ferx_core::api::bind_from_fit` and the fit's `data_bindings`: statistics \
          taken from the data at hand would centre the relations on that data, not on the \
          data the θ was estimated from.",
-        lines.join("\n")
+        lines
     ))
+}
+
+/// The source line of every relation of `model` still waiting on data-derived
+/// statistics, one per line and indented; `None` when there is none.
+fn unresolved_lines(model: &CompiledModel) -> Option<String> {
+    let unresolved = model.covariate_model.as_ref()?.unresolved();
+    if unresolved.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = unresolved
+        .iter()
+        .map(|r| format!("  {}", r.source_line))
+        .collect();
+    Some(lines.join("\n"))
 }
 
 /// The covariates the model's still-unresolved relations read, sorted and

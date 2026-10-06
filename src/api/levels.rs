@@ -403,6 +403,36 @@ pub(crate) fn declared_model<'a>(
     Ok(Declared::Reparsed(Box::new(model)))
 }
 
+/// Whether level bindings `model` was bound with are still `population`'s
+/// (#1730, #1735 review r1 finding 1): for every block, each subject carries the
+/// index column, and the levels `population` shows are exactly the bound labels.
+/// A level's index is its position in that sorted list, so equal labels mean the
+/// column was written for this layout. A column present but written for other
+/// levels, or a block `population` cannot show, counts as differing.
+pub(crate) fn levels_hold_on(
+    model: &CompiledModel,
+    levels: &LevelBindings,
+    population: &Population,
+) -> bool {
+    let decls = model.theta_blocks().level_blocks();
+    levels.iter().all(|(name, binding)| {
+        let Some(decl) = decls.iter().find(|d| d.name() == name) else {
+            return false;
+        };
+        let column = level_index_column(name);
+        population
+            .subjects
+            .iter()
+            .all(|s| s.covariates.contains_key(&column))
+            && discover_levels(decl, population).is_ok_and(|found| {
+                found
+                    .iter()
+                    .map(|l| l.label(decl.columns()))
+                    .eq(binding.labels.iter().cloned())
+            })
+    })
+}
+
 /// A model re-parsed on a fit's bindings, not yet installed in its `ParsedModel`.
 struct FitLayout {
     /// The level blocks `model_text` declares.
