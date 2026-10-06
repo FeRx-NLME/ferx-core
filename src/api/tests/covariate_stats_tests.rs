@@ -665,15 +665,15 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
 }
 
-/// The `GRP` column written as a NONMEM CSV, one dose and one observation per
+/// One covariate column written as a NONMEM CSV, one dose and one observation per
 /// subject, for the entry points that read a data file. A `None` cell is `.`.
-fn temp_grp_csv(values: &[Option<f64>]) -> tempfile::NamedTempFile {
+fn temp_cov_csv(name: &str, values: &[Option<f64>]) -> tempfile::NamedTempFile {
     use std::io::Write;
     let mut f = tempfile::Builder::new()
         .suffix(".csv")
         .tempfile()
         .expect("create temp data");
-    writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV,GRP").unwrap();
+    writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV,{name}").unwrap();
     for (i, v) in values.iter().enumerate() {
         let g = v.map_or(".".to_string(), |v| format!("{v}"));
         writeln!(f, "{},0,.,1,100,1,1,{g}", i + 1).unwrap();
@@ -701,7 +701,7 @@ fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
         ("single level", vec![Some(2.0); 4], "nothing to estimate"),
         ("all missing", vec![None; 4], "no non-missing value"),
     ] {
-        let d = temp_grp_csv(&values);
+        let d = temp_cov_csv("GRP", &values);
         let report = crate::api::validate_model_file(
             m.path().to_str().expect("utf-8 temp path"),
             Some(d.path().to_str().expect("utf-8 temp path")),
@@ -721,6 +721,110 @@ fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
             "{label}: {hit:?}"
         );
         assert!(hit.message.contains(needle), "{label}: {}", hit.message);
+    }
+}
+
+/// The #1738 fixture: `CL ~ WT power` with an explicit `=> THETA_CL_WT(...)`,
+/// centred on `center`, plus a genuinely unused `UNUSED_T` as the control.
+fn unused_census_model(center: &str) -> String {
+    model(
+        "  WT continuous",
+        &format!("  CL ~ WT power(center = {center}) => THETA_CL_WT(0.6, 0.01, 5.0)"),
+    )
+    .replace(
+        "  theta TVV(",
+        "  theta UNUSED_T(1.0, 0.1, 10.0)\n  theta TVV(",
+    )
+}
+
+/// WT 55, 58, …, 88: twelve subjects, median 71.5.
+fn census_weights() -> Vec<f64> {
+    (0..12).map(|i| 55.0 + 3.0 * f64::from(i)).collect()
+}
+
+/// The θ names a parse warns about as "not referenced", in warning order.
+fn unreferenced(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|w| w.contains("not referenced"))
+        .map(|w| w.split('\'').nth(1).unwrap_or(w).to_string())
+        .collect()
+}
+
+/// #1738 T10. A θ that only a not-yet-resolved relation reads is not unused: the
+/// relation emits its expression as soon as it is bound, and the census must not
+/// say otherwise in the meantime. The symbolic model, unbound and bound, warns
+/// about exactly what the literal twin centred on the same value (the data's
+/// median, 71.5) warns about — `UNUSED_T`, the control, and nothing else. The
+/// control is what keeps the fix from being "count every `[covariate_model]` θ"
+/// or "stop warning": `UNUSED_T` must keep warning in every cell.
+#[test]
+fn a_theta_read_only_by_an_unresolved_relation_is_not_reported_unused() {
+    let pop = population("WT", &census_weights());
+    let literal = parse_full_model(&unused_census_model("71.5")).expect("parse");
+    let symbolic_text = unused_census_model("median");
+    let symbolic = parse_full_model(&symbolic_text).expect("parse");
+    // The fixture is the unresolved case, or it tests nothing.
+    assert_eq!(
+        symbolic
+            .model
+            .covariate_model
+            .as_ref()
+            .expect("block recorded")
+            .unresolved()
+            .len(),
+        1
+    );
+    let bound = bind(&symbolic_text, &pop).expect("bind");
+    assert_eq!(
+        bound.covariate_model.as_ref().unwrap().relations[0].resolved_center,
+        Some(71.5),
+        "the literal twin must sit on the bound centre"
+    );
+
+    let want = vec!["UNUSED_T".to_string()];
+    assert_eq!(unreferenced(&literal.model.parse_warnings), want, "literal");
+    assert_eq!(
+        unreferenced(&symbolic.model.parse_warnings),
+        want,
+        "symbolic, unbound"
+    );
+    assert_eq!(unreferenced(&bound.parse_warnings), want, "symbolic, bound");
+}
+
+/// #1738 T11. The same through `ferx check`, with and without `--data`: the
+/// symbolic and the literal model report the same `W_UNUSED_PARAM` set.
+#[test]
+fn check_reports_the_same_unused_parameters_for_a_symbolic_and_a_literal_centre() {
+    let unused = |center: &str, with_data: bool| -> Vec<String> {
+        let m = temp_model(&unused_census_model(center));
+        let d = temp_cov_csv(
+            "WT",
+            &census_weights().into_iter().map(Some).collect::<Vec<_>>(),
+        );
+        let report = crate::api::validate_model_file(
+            m.path().to_str().expect("utf-8 temp path"),
+            with_data.then(|| d.path().to_str().expect("utf-8 temp path")),
+        );
+        let mut hits: Vec<String> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W_UNUSED_PARAM")
+            .map(|d| {
+                d.message
+                    .split('\'')
+                    .nth(1)
+                    .unwrap_or(&d.message)
+                    .to_string()
+            })
+            .collect();
+        hits.sort();
+        hits
+    };
+    for with_data in [false, true] {
+        let literal = unused("71.5", with_data);
+        assert_eq!(literal, vec!["UNUSED_T".to_string()], "data = {with_data}");
+        assert_eq!(unused("median", with_data), literal, "data = {with_data}");
     }
 }
 
