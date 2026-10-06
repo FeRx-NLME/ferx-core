@@ -6231,6 +6231,20 @@ mod rebind {
                 both(&mut unbound, &text, &mut want_pop);
                 crate::api::bind_theta_levels(&mut prebound, &text, &mut b.clone()).unwrap();
                 assert_eq!(twin(&prebound), twin(&unbound), "{cell}: the remedy");
+
+                // The order the docs give (#1745 review r1, finding 3): from the
+                // A-bound model, levels first, then statistics, both on B.
+                let mut a = with_wt(cf_pop(3, 1, &T6), 80.0);
+                let mut ordered = parse_full_model(&text).unwrap();
+                crate::api::bind_theta_levels(&mut ordered, &text, &mut a).unwrap();
+                if pair {
+                    bind_covariate_stats(&mut ordered, &text, &a).unwrap();
+                }
+                assert_eq!(twin(&ordered).7, vec![LevelContrast::SumToZeroWithin]);
+                both(&mut ordered, &text, &mut b.clone());
+                let got = twin(&ordered);
+                assert_eq!(got.7, vec![LevelContrast::SumToZero], "{cell}: in order");
+                assert_eq!(got, twin(&unbound), "{cell}: in order");
             }
         }
     }
