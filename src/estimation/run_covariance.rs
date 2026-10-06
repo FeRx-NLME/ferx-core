@@ -950,7 +950,7 @@ mod tests {
 #[cfg(test)]
 mod from_fit_bindings {
     use super::*;
-    use crate::estimation::fit_inputs::test_fixtures::{case, unbound, Case, Kind};
+    use crate::estimation::fit_inputs::test_fixtures::{case, design, unbound, Case, Kind};
 
     fn bits(m: &nalgebra::DMatrix<f64>) -> Vec<u64> {
         m.iter().map(|x| x.to_bits()).collect()
@@ -1245,6 +1245,212 @@ mod from_fit_bindings {
             ),
             "{err}"
         );
+    }
+
+    /// The #1729 refusal, spelled out in full so deleting any sentence of it in
+    /// `check_lent_stats` (or swapping a source clause) fails the equality.
+    fn stats_refusal(source: Source, model_median: f64, data_median: f64) -> String {
+        let (against, there) = match source {
+            Source::Supplied => ("the supplied population", "the supplied population"),
+            _ => ("the fit's data, re-read from `fit.data_path`", "the data"),
+        };
+        let routed = if source == Source::Routed {
+            " The data was re-read without the model file (the fit records no \
+             `model_path`), so a `[data_selection]` in it was not applied: if the model \
+             has one, pass `population = Some(&pop)` with the fit's population."
+        } else {
+            ""
+        };
+        format!(
+            "run_covariance: this fit records no data-derived bindings (an older `.fitrx`), \
+             so the supplied model's covariate statistics were checked against {against}, \
+             and they differ: the median of `WT` is {model_median} in the model but \
+             {data_median} in {there}. The model was bound on other data, and scoring the \
+             fit's θ with it would centre the relations on that data, not on the data the θ \
+             was estimated from. Re-parse the model and bind it on the fit's data: \
+             `prepare_run` on the fit's model and data files, or `bind_covariate_stats` on \
+             a freshly parsed model with the fit's population.{routed}"
+        )
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Source {
+        Supplied,
+        /// Re-read with the model file's reader settings.
+        ReRead,
+        /// Re-read routed by the model (the fit records no `model_path`).
+        Routed,
+    }
+
+    fn wt_median(m: &CompiledModel) -> f64 {
+        m.data_bindings().covariate_stats["WT"].median
+    }
+
+    /// #1729 T1, the differential pair. A fit that records no bindings (an older
+    /// `.fitrx`; here a live fit with `data_bindings` cleared), lent the `Median`
+    /// model two ways: bound on the fit's own data, it runs bit-identical to the
+    /// as-fitted `None, None` call, with the population supplied and re-read; bound on
+    /// a design (WT × 1.3), it is refused in both cells. Before #1729 the design cells
+    /// returned `Ok` with SE(THETA_CL_WT) −64% (measured on the plan).
+    ///
+    /// Mutations — delete the check: the design cells return `Ok`; make it always
+    /// refuse: the fitted cells fail; compare the model's statistics with themselves:
+    /// the design cells return `Ok`.
+    #[test]
+    fn an_empty_bindings_fit_scores_a_lent_model_only_on_its_own_statistics() {
+        let c = case(Kind::Median);
+        let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+
+        let fitted = &c.prep.parsed.model;
+        for (pop, what) in [(Some(&c.prep.population), "Some"), (None, "None")] {
+            let got = run_covariance(&fit, Some(fitted), pop, &c.opts)
+                .unwrap_or_else(|e| panic!("fitted/{what}: {e}"));
+            assert_same_covariance(&got, &want, &format!("fitted/empty/{what}"));
+        }
+
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        // Live: the design's WT median is not the fit's.
+        let (mm, dm) = (wt_median(lent), wt_median(fitted));
+        assert_ne!(mm, dm);
+        for (pop, source) in [
+            (Some(&c.prep.population), Source::Supplied),
+            (None, Source::ReRead),
+        ] {
+            let err = run_covariance(&fit, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("a design-bound model is refused");
+            assert_eq!(err, stats_refusal(source, mm, dm), "{source:?}");
+        }
+    }
+
+    /// #1729 T2. `LevelMedian` on a design with a study the fit never saw: with the
+    /// population supplied (the fit's index columns), the new check refuses it — it
+    /// returned `Ok` with SE(TVCL) +90% before. Re-read, the unseen-level refusal
+    /// still comes first: the check sits after the level index write.
+    ///
+    /// Mutations — delete the check: the `Some` cell returns `Ok`; move the check
+    /// before the level index write: the `None` cell's text changes.
+    #[test]
+    fn a_design_bound_level_model_is_refused_on_its_statistics_after_its_levels() {
+        let c = case(Kind::LevelMedian);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
+
+        let err = run_covariance(&fit, Some(lent), Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(err, stats_refusal(Source::Supplied, mm, dm));
+
+        let err = run_covariance(&fit, Some(lent), None, &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            err.starts_with(
+                "run_covariance: theta SHIFT[STUDY]: the design has 1 level(s) the fit \
+                 estimated no theta for: `STUDY=3`."
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1729 T3, the refusal's input space in one test: the supplied, re-read and
+    /// routed wordings (each must name its own source; the routed one adds the
+    /// `[data_selection]` caveat), the routed re-read passing the fitted model (the
+    /// legitimate path with no model file), a fit with recorded bindings left to them,
+    /// and a supplied population that lacks the covariate, refused with the
+    /// summariser's text behind the prefix.
+    ///
+    /// Mutations — swap the source clauses, drop either, or drop the routed caveat:
+    /// one equality dies; delete any sentence of the message: every equality dies;
+    /// drop the `data_bindings.is_empty()` gate: the recorded-bindings cell is refused.
+    #[test]
+    fn the_stats_refusal_names_where_the_population_came_from() {
+        let c = case(Kind::Median);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        let fitted = &c.prep.parsed.model;
+        let (mm, dm) = (wt_median(lent), wt_median(fitted));
+
+        let mut routed = fit.clone();
+        routed.model_path = None;
+        let cells = [
+            (&fit, Some(&c.prep.population), Source::Supplied),
+            (&fit, None, Source::ReRead),
+            (&routed, None, Source::Routed),
+        ];
+        for (f, pop, source) in cells {
+            let err = run_covariance(f, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("refused");
+            assert_eq!(err, stats_refusal(source, mm, dm), "{source:?}");
+        }
+        // The supplied and re-read texts differ, so neither equality is the other's.
+        assert_ne!(
+            stats_refusal(Source::Supplied, mm, dm),
+            stats_refusal(Source::ReRead, mm, dm)
+        );
+
+        let got = run_covariance(&routed, Some(fitted), None, &c.opts)
+            .expect("the fitted model passes on the routed re-read");
+        assert!(got.covariance_matrix.is_some(), "{:?}", got.warnings);
+
+        // A fit that records its bindings decides by them, not by the population:
+        // the fitted model on a supplied population with other WT values is not
+        // re-summarised (which population a caller supplies is #1685's question).
+        let got = run_covariance(&c.fit, Some(fitted), Some(&design.population), &c.opts)
+            .expect("recorded bindings are not re-checked against the population");
+        assert!(got.covariance_matrix.is_some(), "{:?}", got.warnings);
+
+        let mut absent = c.prep.population.clone();
+        for s in &mut absent.subjects {
+            s.covariates.remove("WT");
+            for snap in s
+                .obs_covariates
+                .iter_mut()
+                .chain(&mut s.dose_covariates)
+                .chain(&mut s.pk_only_covariates)
+                .chain(&mut s.reset_covariates)
+            {
+                snap.remove("WT");
+            }
+        }
+        let err = run_covariance(&fit, Some(fitted), Some(&absent), &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            err.starts_with(
+                "run_covariance: [covariate_model] needs summary statistics for covariate \
+                 `WT`, but the dataset carries no non-missing value for it"
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1729 T4, the escape the refusal advises: a freshly parsed model bound with
+    /// `bind_covariate_stats` on the fit's population runs bit-identical to the
+    /// as-fitted call. (`bind_covariate_stats` on the design's already-bound parse is a
+    /// no-op, which is why the message says "freshly parsed".)
+    #[test]
+    fn a_freshly_parsed_model_bound_on_the_fit_data_runs() {
+        let c = case(Kind::Median);
+        let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+
+        let text = std::fs::read_to_string(&c.model_path).unwrap();
+        let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
+        crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
+        let got = run_covariance(&fit, Some(&parsed.model), Some(&c.prep.population), &c.opts)
+            .expect("the advised route runs");
+        assert_same_covariance(&got, &want, "freshly parsed / empty / Some");
     }
 
     /// #1680 review r1, finding 2: with a supplied model and no population, the model

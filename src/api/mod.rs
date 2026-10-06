@@ -46,6 +46,7 @@ pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
     AdaptiveSimulationResult,
 };
+pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.

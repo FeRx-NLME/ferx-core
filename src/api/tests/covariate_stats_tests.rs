@@ -664,3 +664,107 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
     assert!(cl.contains("present(WT)"), "{cl}");
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
 }
+
+/// #1729 T6. The comparator behind the empty-bindings check names the first field
+/// that differs, in the order median, mean, min, max, mode, levels. Each row makes
+/// its field **and every later one** differ, so the earliest is the one named:
+/// reordering two fields, or dropping one from the comparison, names the wrong
+/// field (or none) on some row.
+#[test]
+fn the_stat_comparison_names_the_first_field_that_differs() {
+    use crate::types::CovariateSummary;
+    let base = CovariateSummary {
+        median: 70.0,
+        mean: 71.5,
+        min: 50.0,
+        max: 95.0,
+        mode: 60.0,
+        levels: vec![50.0, 60.0, 95.0],
+    };
+    assert_eq!(super::first_difference(&base, &base.clone()), None);
+
+    let fields = ["median", "mean", "min", "max", "mode", "levels"];
+    for (i, want) in fields.iter().enumerate() {
+        let mut other = base.clone();
+        for f in &fields[i..] {
+            match *f {
+                "median" => other.median += 1.0,
+                "mean" => other.mean += 1.0,
+                "min" => other.min += 1.0,
+                "max" => other.max += 1.0,
+                "mode" => other.mode += 1.0,
+                _ => other.levels.push(99.0),
+            }
+        }
+        let (field, model, data) =
+            super::first_difference(&base, &other).unwrap_or_else(|| panic!("{want}: no diff"));
+        assert_eq!(field, *want);
+        if *want == "levels" {
+            // A categorical `levels = auto` can differ in its level set alone.
+            assert_eq!(model, "[50.0, 60.0, 95.0]");
+            assert_eq!(data, "[50.0, 60.0, 95.0, 99.0]");
+        } else {
+            assert_ne!(model, data, "{want}: both values are reported");
+        }
+    }
+    // The values are the model's then the data's, formatted plainly.
+    let mut shifted = base.clone();
+    shifted.median = 92.105;
+    assert_eq!(
+        super::first_difference(&base, &shifted),
+        Some(("median", "70".to_string(), "92.105".to_string()))
+    );
+}
+
+/// #1729 T6. `check_stats_on` re-summarises with the binder's own `summarize`, so a
+/// model bound on a population passes on that population bit for bit, fails on
+/// another naming the first covariate in name order, and carries a covariate the
+/// population lacks as the summariser's error.
+///
+/// Mutations — compare against the model's own statistics: the second population
+/// passes; drop the name sort: the named covariate follows `HashMap` order.
+#[test]
+fn check_stats_on_re_summarises_the_population() {
+    let text = model(
+        "  WT continuous\n  AGE continuous",
+        "  CL ~ WT power(center = median)\n  CL ~ AGE linear(center = median)",
+    );
+    let mut pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    for (s, age) in pop.subjects.iter_mut().zip([20.0, 30.0, 40.0, 50.0, 60.0]) {
+        s.covariates.insert("AGE".to_string(), age);
+    }
+    pop.covariate_names.push("AGE".to_string());
+    let bound = bind(&text, &pop).expect("binds");
+    assert_eq!(super::check_stats_on(&bound, &pop), Ok(None));
+
+    let mut other = pop.clone();
+    for s in &mut other.subjects {
+        *s.covariates.get_mut("WT").unwrap() *= 1.3;
+        *s.covariates.get_mut("AGE").unwrap() += 1.0;
+    }
+    // Each bind builds a fresh `HashMap` with its own random hasher, so without the
+    // sort `WT` comes first in about half of these and the run fails with
+    // probability 1 − 2⁻⁸.
+    for _ in 0..8 {
+        let bound = bind(&text, &pop).expect("binds");
+        let got = super::check_stats_on(&bound, &other)
+            .unwrap()
+            .expect("differs");
+        assert_eq!(
+            (
+                got.covariate.as_str(),
+                got.field,
+                got.model.as_str(),
+                got.data.as_str()
+            ),
+            ("AGE", "median", "40", "41")
+        );
+    }
+
+    let mut absent = pop.clone();
+    for s in &mut absent.subjects {
+        s.covariates.remove("AGE");
+    }
+    let err = super::check_stats_on(&bound, &absent).unwrap_err();
+    assert!(err.contains("covariate `AGE`"), "{err}");
+}

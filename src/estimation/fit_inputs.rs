@@ -120,7 +120,52 @@ fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Resu
     Ok(())
 }
 
-/// Resolve the model and population `entry` (`"run_sir"` / `"run_covariance"`)
+/// #1729: refuse a lent model whose covariate statistics the population it will be
+/// scored on does not reproduce, for a fit that records no bindings to compare. The
+/// fitted model passes bit for bit (`check_stats_on` re-summarises with the binder's
+/// own function); one bound on a simulation design is refused rather than scoring
+/// the fit's θ centred on the design.
+fn check_lent_stats(
+    m: &CompiledModel,
+    population: &Population,
+    supplied: bool,
+    with_model_file: bool,
+    entry: &str,
+) -> Result<(), String> {
+    let mismatch =
+        crate::api::check_stats_on(m, population).map_err(|e| format!("{entry}: {e}"))?;
+    let Some(d) = mismatch else {
+        return Ok(());
+    };
+    let (against, there) = if supplied {
+        ("the supplied population", "the supplied population")
+    } else {
+        ("the fit's data, re-read from `fit.data_path`", "the data")
+    };
+    let routed = if supplied || with_model_file {
+        ""
+    } else {
+        " The data was re-read without the model file (the fit records no \
+         `model_path`), so a `[data_selection]` in it was not applied: if the model \
+         has one, pass `population = Some(&pop)` with the fit's population."
+    };
+    Err(format!(
+        "{entry}: this fit records no data-derived bindings (an older `.fitrx`), so the \
+         supplied model's covariate statistics were checked against {against}, and they \
+         differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
+         was bound on other data, and scoring the fit's θ with it would centre the \
+         relations on that data, not on the data the θ was estimated from. Re-parse the \
+         model and bind it on the fit's data: `prepare_run` on the fit's model and data \
+         files, or `bind_covariate_stats` on a freshly parsed model with the fit's \
+         population.{routed}",
+        field = d.field,
+        cov = d.covariate,
+        mv = d.model,
+        dv = d.data,
+    ))
+}
+
+/// Resolve the model and population `entry`(`"run_sir"` / `"run_covariance"`)
 /// runs on, refusing every input that would evaluate the fit's θ against a model
 /// or population other than the fitted ones.
 ///
@@ -131,7 +176,9 @@ fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Resu
 ///   `.fitrx`) is refused when the model needs them; a plain model is unaffected.
 /// - `model = Some(m)`: used as supplied, but refused when `m` is not bound with
 ///   the fit's (non-empty) bindings, or still has a relation waiting on statistics.
-///   A re-read population gets `m`'s level index columns.
+///   A re-read population gets `m`'s level index columns. When the fit records no
+///   bindings, `m`'s covariate statistics must be the ones the population summarises
+///   to (#1729): the fitted model passes, one bound on other data is refused.
 /// - `population = None`: re-read from `fit.data_path` (hash-verified) the way the
 ///   fit read it, `[data_selection]` included. With `Some(model)` that needs the
 ///   (hash-verified) model file for its reader settings; a fit that recorded none
@@ -160,6 +207,9 @@ pub(crate) fn resolve_fit_inputs<'a>(
             ));
         }
     }
+
+    // Where the population comes from, for the #1729 refusal's wording.
+    let supplied = population.is_some();
 
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
@@ -252,6 +302,12 @@ pub(crate) fn resolve_fit_inputs<'a>(
                     .map_err(prefix)?;
             }
             crate::api::assert_covariate_model_bound(m).map_err(prefix)?;
+            // No recorded bindings to compare (an older `.fitrx`): the population
+            // decides. After the level index write, so a population with a level the
+            // model never saw keeps that refusal.
+            if fit.data_bindings.is_empty() && !m.data_bindings().covariate_stats.is_empty() {
+                check_lent_stats(m, &population, supplied, file.is_some(), entry)?;
+            }
             ModelRef::Lent(m)
         }
     };
@@ -451,6 +507,33 @@ pub(crate) mod test_fixtures {
             opts,
         }
     }
+    /// The fixture model bound on a simulation design (#1729): the fit's data with
+    /// `WT × 1.3` and `STUDY 3 → 4`, through `prepare_run`. Same subjects, so it
+    /// passes the subject check; its WT statistics and its level set are not the fit's.
+    pub(crate) fn design(case: &Case) -> crate::api::PreparedRun {
+        let mut out = String::new();
+        for (i, line) in data_text().lines().enumerate() {
+            if i == 0 {
+                assert!(line.starts_with("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,"));
+                out.push_str(line);
+            } else {
+                let mut cols: Vec<String> = line.split(',').map(str::to_string).collect();
+                let wt: f64 = cols[8].parse().unwrap();
+                cols[8] = format!("{}", wt * 1.3);
+                if cols[10] == "3" {
+                    cols[10] = "4".to_string();
+                }
+                out.push_str(&cols.join(","));
+            }
+            out.push('\n');
+        }
+        let dir = case.model_path.parent().unwrap();
+        let path = dir.join("design.csv");
+        std::fs::write(&path, out).unwrap();
+        crate::api::prepare_run(case.model_path.to_str().unwrap(), path.to_str())
+            .expect("the design binds")
+    }
+
     /// The model parsed from the fixture file and never bound.
     pub(crate) fn unbound(case: &Case) -> crate::types::CompiledModel {
         crate::parser::model_parser::parse_full_model_file(&case.model_path)
