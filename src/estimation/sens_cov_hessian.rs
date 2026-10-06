@@ -2268,6 +2268,17 @@ pub(crate) fn pack_natural_hessian_with_params(
     hpack
 }
 
+/// Whether the FOCE covariance assembly declines `model` because its FOCE EBEs are
+/// frozen-variance modes (#1722) — the one predicate the assembly's bail
+/// ([`subject_packed_cov_hessian_foce`]) and the decline walk
+/// (`covariance::analytic_cov_declines`, [`CovScopeDecline::FoceFrozenResidualVariance`])
+/// both read.
+///
+/// [`CovScopeDecline::FoceFrozenResidualVariance`]: crate::estimation::cov_diagnostics::CovScopeDecline::FoceFrozenResidualVariance
+pub(crate) fn foce_cov_declines_frozen_variance(model: &CompiledModel) -> bool {
+    model.error_spec.has_f_dependent_variance()
+}
+
 /// The exact per-subject **FOCE** (Sheiner–Beal) covariance Hessian `∂²Fᵢ/∂x²` in
 /// packed space — the FOCE counterpart of [`subject_packed_cov_hessian`]. `None`
 /// outside analytic scope. The
@@ -2289,7 +2300,7 @@ pub(crate) fn subject_packed_cov_hessian_foce(
     // `H[0,0]` against reconverged FD. The covariance step's FD stencil re-solves those
     // EBEs (`find_ebe_for_stage`) and is exact. Additive error has one inner objective and
     // stays analytic.
-    if model.error_spec.has_f_dependent_variance() {
+    if foce_cov_declines_frozen_variance(model) {
         return None;
     }
     let params = unpack_params(x, template);
