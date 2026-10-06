@@ -1092,6 +1092,7 @@ fn a_model_file_gone_by_the_rebind_is_its_own_error() {
             .status()
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo");
+        let (done, wrote) = std::sync::mpsc::channel();
         let writer = {
             let (fifo, model, rows) = (fifo.clone(), model.clone(), rows.clone());
             std::thread::spawn(move || {
@@ -1101,10 +1102,21 @@ fn a_model_file_gone_by_the_rebind_is_its_own_error() {
                     std::fs::remove_file(&model).unwrap();
                 }
                 f.write_all(rows.as_bytes()).unwrap();
+                done.send(()).unwrap();
             })
         };
         let report =
             crate::api::validate_model_file(model.to_str().unwrap(), Some(fifo.to_str().unwrap()));
+        // A check that never opens the data leaves the writer blocked in `open`: fail
+        // rather than hang (#1745 review r1, finding 1). Opening the read end releases
+        // it, so the thread is not left behind.
+        if wrote
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err()
+        {
+            drop(std::fs::File::open(&fifo));
+            panic!("the writer is still blocked: the check never opened the data");
+        }
         writer.join().unwrap();
         let hits = binding_codes(&report);
         if gone {
