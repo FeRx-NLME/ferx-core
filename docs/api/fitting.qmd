@@ -333,6 +333,17 @@ estimates, bind a design the same way, on the population from
 the fit instead, as described in
 [the next section](#simulate-with-fit-theta).
 
+A model already bound can be bound again, to other data, and binds as a fresh
+parse of its text would. Each binder reads what the text declares, not what the
+first data resolved it to: a level block declared `auto` takes the contrast the
+new data resolves, and a `center = median` takes the new data's median. A binder
+keeps the other half only while it still holds on the new data. The statistics
+are kept only when the new population summarises to the same values. The level
+layout is kept only when the population carries the level index columns.
+Otherwise that half is dropped, and the other binder binds it on the new data
+([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A model bound
+against a fit, described next, is the exception.
+
 The other three steps are what the file entry points do besides binding. The
 `[data_selection]` filter and the IOV column go to the reader. The gradient
 stamp makes a file's `gradient = fd` take effect, and forces finite
@@ -383,8 +394,12 @@ let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200
 One call binds both halves. On the measured case, a design of the fit's
 heavier half (WT median 80.6 against the fit's 70.85) simulates bit for bit
 like the fitted model. Centred on its own median it moves the predictions by up
-to 17%. After `bind_from_fit`, a `bind_covariate_stats` call on the same model
-changes nothing, because no relation is left for it to resolve. A fit that
+to 17%. After `bind_from_fit` or `layout_from_fit`, the model records that its
+bindings are the fit's. A `bind_covariate_stats` call on it then changes
+nothing, since the fitted θ was estimated against the fit's centres, not the
+design's. `bind_theta_levels` refuses it, since the design's own levels would
+read the fitted θ at other positions
+([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A fit that
 carries no bindings, such as a `.fitrx` saved before they were recorded, is
 refused rather than re-bound on the design. Refit the model to record them.
 This holds for a model already bound to other data too, such as one

@@ -4599,6 +4599,13 @@ impl CompiledModel {
         &self.indiv_param_partials.data_bindings
     }
 
+    /// Whether this model was laid out on a fit's data-derived bindings (#1730),
+    /// by `bind_from_fit`, `layout_from_fit` or the deprecated
+    /// `bind_theta_levels_from_fit`, rather than bound to data or never bound.
+    pub(crate) fn bound_from_fit(&self) -> bool {
+        self.indiv_param_partials.bound_from_fit
+    }
+
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()

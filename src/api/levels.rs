@@ -39,14 +39,42 @@ const TIME_COLUMN: &str = "TIME";
 ///
 /// A no-op (and no re-parse) for the overwhelming majority of models, which
 /// declare no level block at all.
+///
+/// **Re-binding** (#1730). The blocks are read from what `model_text` declares, so
+/// a `parsed` already bound to other data binds on `population` exactly as a fresh
+/// parse would: the contrast an `auto` block resolved to there is not carried over.
+/// Covariate statistics `parsed` was bound with are kept only when `population`
+/// gives the same summary of every covariate they cover. Otherwise they are dropped,
+/// and the relations are left for [`bind_covariate_stats`](crate::api::bind_covariate_stats)
+/// to bind on `population`.
+///
+/// Refused, with nothing written, on a model laid out on a fit's bindings
+/// ([`bind_from_fit`], [`layout_from_fit`]): binding it to this data's own levels
+/// would read the fitted θ at other positions.
 pub fn bind_theta_levels(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &mut Population,
 ) -> Result<(), String> {
-    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
+    // Every level-block name and column is the declared one, whatever contrast a
+    // binding stamped: the refusal reads them before a re-parse is spent.
+    if parsed.model.bound_from_fit() && !parsed.model.theta_blocks().level_blocks().is_empty() {
+        return Err(fit_bound_message(
+            parsed.model.theta_blocks().level_blocks(),
+        ));
+    }
+    let decls: Vec<LevelBlockDecl> = declared_model(parsed, model_text, Reads::Levels)?
+        .theta_blocks()
+        .level_blocks()
+        .to_vec();
     if decls.is_empty() {
         return Ok(());
+    }
+    // The bindings this layout is re-parsed on: no level binding of `parsed`'s,
+    // and its statistics only while they are still `population`'s.
+    let mut base = unbound_bindings(parsed);
+    if crate::api::covariate_stats::stats_hold_on(&parsed.bindings.covariate_stats, population) {
+        base.covariate_stats = parsed.bindings.covariate_stats.clone();
     }
 
     // Pass 1: discover every block and write its index column. A level's index
@@ -88,7 +116,7 @@ pub fn bind_theta_levels(
     // Rule 1 (#1679): measure which levels the likelihood never reads. Whether
     // that costs the model anything depends on the contrast, so the verdict is
     // the contrast resolution's.
-    let dead = measure_dead_levels(parsed, model_text, &decls, &discovered, with_occasions)?;
+    let dead = measure_dead_levels(&base, model_text, &decls, &discovered, with_occasions)?;
 
     let mut bindings = LevelBindings::new();
     for ((decl, levels), dead) in decls.iter().zip(&discovered).zip(&dead) {
@@ -110,11 +138,11 @@ pub fn bind_theta_levels(
     }
 
     let model_name = parsed.model.name.clone();
-    // Re-parse with *every* binding this model has been given, not just the
-    // level ones: a model that also declares `[covariate_model]` statistics
-    // (#1111) may have had those bound already, and re-parsing with the level
+    // Re-parse with the statistics kept above, not just the level bindings: a
+    // model that also declares `[covariate_model]` statistics (#1111) may have
+    // had those bound on this data already, and re-parsing with the level
     // bindings alone would drop them.
-    let mut all = parsed.bindings.clone();
+    let mut all = base;
     all.levels = bindings;
     let rebound = parse_full_model_with(model_text, &all)?;
     parsed.bindings = all;
@@ -150,6 +178,11 @@ pub fn bind_theta_levels(
 /// Also refused: `fitted` lacking a block the model declares, or carrying one it does
 /// not, or listing a level of a block more than once. Nothing is written to `population`
 /// unless every block binds.
+///
+/// The blocks are read from what `model_text` declares (#1730), so a `parsed` bound
+/// to other data takes the fit's layout as a fresh parse would. Its covariate
+/// statistics are kept as `parsed` holds them: this binder takes none from the fit,
+/// so install the fit's first, or use [`bind_from_fit`], which binds both.
 #[deprecated(
     since = "0.4.1",
     note = "use `bind_from_fit` with the fit's `data_bindings`, which also binds the \
@@ -161,7 +194,10 @@ pub fn bind_theta_levels_from_fit(
     population: &mut Population,
     fitted: &LevelBindings,
 ) -> Result<(), String> {
-    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
+    let decls: Vec<LevelBlockDecl> = declared_model(parsed, model_text, Reads::Levels)?
+        .theta_blocks()
+        .level_blocks()
+        .to_vec();
     validate_fitted_levels(&decls, fitted)?;
     if decls.is_empty() {
         return Ok(());
@@ -171,10 +207,17 @@ pub fn bind_theta_levels_from_fit(
         write_index_column(decl, table, population)?;
     }
     let model_name = parsed.model.name.clone();
-    parsed.bindings.levels = fitted.clone();
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    // The statistics are the caller's, as they always were for this binder: the
+    // sequence it was documented with installs the fit's statistics by hand, and
+    // nothing tells those apart from statistics bound to other data.
+    let mut bindings = unbound_bindings(parsed);
+    bindings.covariate_stats = parsed.bindings.covariate_stats.clone();
+    bindings.levels = fitted.clone();
+    let rebound = parse_full_model_with(model_text, &bindings)?;
+    parsed.bindings = bindings;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
+    parsed.model.indiv_param_partials.bound_from_fit = true;
     Ok(())
 }
 
@@ -196,8 +239,11 @@ pub fn bind_theta_levels_from_fit(
 /// [`layout_from_fit`] is the same call without the population: it lays the model
 /// out and writes nothing.
 ///
-/// After this call, [`bind_covariate_stats`](crate::api::bind_covariate_stats) on the
-/// same model is a no-op: no relation is left unresolved for it to re-centre.
+/// After this call the model records that its bindings are the fit's (#1730), so
+/// [`bind_covariate_stats`](crate::api::bind_covariate_stats) on it is a no-op — the
+/// fitted θ was estimated against the fit's centres — and [`bind_theta_levels`]
+/// refuses it, since the population's own levels would read the fitted θ at other
+/// positions.
 ///
 /// Refused, with nothing written to `population`:
 ///
@@ -289,6 +335,74 @@ pub fn layout_from_fit(
     Ok(())
 }
 
+/// The half of a model's data-derived bindings a binder reads the declaration of.
+#[derive(Clone, Copy)]
+pub(crate) enum Reads {
+    /// The level blocks: their columns and declared contrast.
+    Levels,
+    /// The `[covariate_model]` relations: which are symbolic, and on what.
+    Stats,
+    /// Both halves.
+    Both,
+}
+
+/// What a model declares, as one of [`declared_model`]'s two sources.
+pub(crate) enum Declared<'a> {
+    /// `parsed.model` itself: nothing was bound that changes what is read.
+    Borrowed(&'a CompiledModel),
+    /// An unbound re-parse of the model text.
+    Reparsed(Box<CompiledModel>),
+}
+
+impl std::ops::Deref for Declared<'_> {
+    type Target = CompiledModel;
+    fn deref(&self) -> &CompiledModel {
+        match self {
+            Declared::Borrowed(m) => m,
+            Declared::Reparsed(m) => m,
+        }
+    }
+}
+
+/// `parsed`'s bindings with every data-derived half removed: its `[priors]`
+/// directory kept, its levels and covariate statistics empty.
+pub(crate) fn unbound_bindings(parsed: &ParsedModel) -> ParseBindings {
+    ParseBindings {
+        levels: LevelBindings::new(),
+        covariate_stats: Default::default(),
+        ..parsed.bindings.clone()
+    }
+}
+
+/// What `model_text` declares for the half `reads` (#1686, #1730), the one source
+/// every binder reads its declaration from. A model bound to data already has its
+/// relations resolved and its `auto` contrasts stamped, so read as it stands it
+/// "declares" that data's resolution. Such a model is parsed again with no
+/// data-derived binding.
+///
+/// A model with that half unbound *is* the unbound parse for it, and is borrowed:
+/// no second parse, and no second read of a `[priors] from_fit` file. The halves
+/// are independent — a level binding resolves no relation and a statistics binding
+/// stamps no contrast — so the second binder of `prepare_run`'s pair (levels, then
+/// statistics) borrows too.
+pub(crate) fn declared_model<'a>(
+    parsed: &'a ParsedModel,
+    model_text: &str,
+    reads: Reads,
+) -> Result<Declared<'a>, String> {
+    let bound = parsed.model.data_bindings();
+    let unbound = match reads {
+        Reads::Levels => bound.levels.is_empty(),
+        Reads::Stats => bound.covariate_stats.is_empty(),
+        Reads::Both => bound.is_empty(),
+    };
+    if unbound {
+        return Ok(Declared::Borrowed(&parsed.model));
+    }
+    let model = parse_full_model_with(model_text, &unbound_bindings(parsed))?.model;
+    Ok(Declared::Reparsed(Box::new(model)))
+}
+
 /// A model re-parsed on a fit's bindings, not yet installed in its `ParsedModel`.
 struct FitLayout {
     /// The level blocks `model_text` declares.
@@ -301,6 +415,7 @@ impl FitLayout {
     fn apply(self, parsed: &mut ParsedModel) {
         let mut model = self.model;
         model.name = parsed.model.name.clone();
+        model.indiv_param_partials.bound_from_fit = true;
         parsed.model = model;
         parsed.bindings = self.bindings;
     }
@@ -316,33 +431,19 @@ fn lay_out_on_fit(
     fitted: &DataBindings,
 ) -> Result<Option<FitLayout>, String> {
     // What the model needs comes from its text, parsed with no data-derived binding
-    // (#1686). A `parsed.model` bound to other data already has its relations
-    // resolved and its `auto` contrasts stamped, so it asks for nothing. An unbound
-    // one *is* that parse, and is read as it stands: no second parse, and no second
-    // read of a `[priors] from_fit` file.
-    let unbound = ParseBindings {
-        levels: LevelBindings::new(),
-        covariate_stats: Default::default(),
-        ..parsed.bindings.clone()
-    };
-    let reparsed;
-    let declared = if parsed.model.data_bindings().is_empty() {
-        &parsed.model
-    } else {
-        reparsed = parse_full_model_with(model_text, &unbound)?.model;
-        &reparsed
-    };
+    // (#1686): both halves are read here.
+    let declared = declared_model(parsed, model_text, Reads::Both)?;
     let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(declared);
+    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(no_fit_bindings_message(&decls, &symbolic));
     }
     validate_fitted_levels(&decls, &fitted.levels)?;
-    crate::api::covariate_stats::validate_fitted_stats(declared, &fitted.covariate_stats)?;
+    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(None);
     }
-    let mut bindings = unbound;
+    let mut bindings = unbound_bindings(parsed);
     bindings.levels = fitted.levels.clone();
     bindings.covariate_stats = fitted.covariate_stats.clone();
     let model = parse_full_model_with(model_text, &bindings)?.model;
@@ -414,6 +515,24 @@ fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> Str
          it was fitted: {}. The fit is an older `.fitrx` bundle, or was made before ferx \
          recorded these bindings with a fit. Refit the model to record them.",
         needs.join(", and ")
+    )
+}
+
+/// The refusal of [`bind_theta_levels`] on a model laid out on a fit's bindings
+/// (#1730). It names actions, not functions, since a wrapper passes it through
+/// verbatim; it does not say the data's levels differ from the fit's, which is not
+/// checked and is false on the fit's own data.
+fn fit_bound_message(decls: &[LevelBlockDecl]) -> String {
+    format!(
+        "{}: this model is laid out on a fit's levels, so binding it to the levels of \
+         this data would read the fitted theta at other positions. To run this data on \
+         the fit's theta, bind it from the fit's bindings instead; to use this data's \
+         own levels, parse the model again and bind the new parse.",
+        decls
+            .iter()
+            .map(|d| format!("theta {}[{}]", d.name(), d.columns().join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -1183,13 +1302,13 @@ fn dead_levels(
 /// check does not compare is not measured: every block comes back with no dead
 /// level.
 fn measure_dead_levels(
-    parsed: &ParsedModel,
+    base: &ParseBindings,
     model_text: &str,
     decls: &[LevelBlockDecl],
     discovered: &[Vec<Level>],
     population: &Population,
 ) -> Result<Vec<DeadLevels>, String> {
-    let mut none = parsed.bindings.clone();
+    let mut none = base.clone();
     none.levels = decls
         .iter()
         .zip(discovered)

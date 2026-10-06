@@ -2533,7 +2533,7 @@ mod from_fit_repeated_labels {
 
     /// Two level blocks: `PLACEBO[STUDY, TIME]` is block 1 (declared first),
     /// `EFF[STUDY]` block 2.
-    fn two_block_model() -> String {
+    pub(super) fn two_block_model() -> String {
         no_eta_model()
             .replace(
                 "theta TVV(10.0, 0.1, 500.0)",
@@ -2653,7 +2653,7 @@ mod bind_from_fit {
 
     /// `no_eta_model`, with and without its level block, with and without a
     /// `center = median` relation on `WT`.
-    fn model(level: bool, median: bool) -> String {
+    pub(super) fn model(level: bool, median: bool) -> String {
         let mut text = no_eta_model();
         if !level {
             text = text
@@ -2670,7 +2670,7 @@ mod bind_from_fit {
     }
 
     /// [`population`] with a subject-level `WT` of `base + 10·study`.
-    fn weighed(n_studies: usize, n_times: usize, base: f64) -> Population {
+    pub(super) fn weighed(n_studies: usize, n_times: usize, base: f64) -> Population {
         let mut pop = population(n_studies, n_times);
         for (s, subject) in pop.subjects.iter_mut().enumerate() {
             subject
@@ -2682,7 +2682,7 @@ mod bind_from_fit {
     }
 
     /// The bindings a fit of `text` on `weighed(3, 2, 60)` records.
-    fn fitted(text: &str) -> DataBindings {
+    pub(super) fn fitted(text: &str) -> DataBindings {
         let mut pop = weighed(3, 2, 60.0);
         let mut parsed = parse_full_model(text).unwrap();
         crate::api::bind_theta_levels(&mut parsed, text, &mut pop).unwrap();
@@ -2939,7 +2939,7 @@ mod bind_from_fit {
 
     /// `text` parsed and bound to `design` the way `prepare_run` binds a model to its
     /// own data: every level block and every symbolic statistic resolved there.
-    fn pre_bound(text: &str, design: &mut Population) -> ParsedModel {
+    pub(super) fn pre_bound(text: &str, design: &mut Population) -> ParsedModel {
         let mut parsed = parse_full_model(text).unwrap();
         crate::api::bind_theta_levels(&mut parsed, text, design).unwrap();
         crate::api::bind_covariate_stats(&mut parsed, text, design).unwrap();
@@ -5831,5 +5831,505 @@ mod absorption {
         // The straddle itself: the separating direction is the κ spread, not
         // the κ magnitude.
         assert!(sp >= 100.0 * sc, "M straddle: {sp:.1e} vs {sc:.1e}");
+    }
+}
+
+// ── #1730: re-binding a model already bound ─────────────────────────────────
+//
+// No fit runs: these are binder states, so the oracle is the **unbound twin** — a
+// fresh parse bound once on the same data, which is what the declaration means.
+#[allow(deprecated)] // the deprecated binder is one of the provenance setters
+mod rebind {
+    use super::absorption::shape as absorption_shape;
+    use super::bind_from_fit::{fitted, model, pre_bound, weighed};
+    use super::from_fit_repeated_labels::two_block_model;
+    use super::readout_share::{cf_pop, T6};
+    use super::*;
+    use crate::api::covariate_stats::symbolic_covariates;
+    use crate::api::{bind_covariate_stats, bind_from_fit, bind_theta_levels_from_fit};
+    use crate::parser::model_parser::{DataBindings, LevelContrast};
+    use crate::types::ParsedModel;
+
+    /// Everything a binder decides: θ count, names, inits, bounds and `FIX` flags,
+    /// the recorded bindings, each block's contrast, and the provenance.
+    type Twin = (
+        usize,
+        Vec<String>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<bool>,
+        DataBindings,
+        Vec<LevelContrast>,
+        bool,
+    );
+
+    fn twin(p: &ParsedModel) -> Twin {
+        let m = &p.model;
+        let d = &m.default_params;
+        assert_eq!(&p.bindings.levels, &m.data_bindings().levels);
+        assert_eq!(
+            &p.bindings.covariate_stats,
+            &m.data_bindings().covariate_stats
+        );
+        (
+            m.n_theta,
+            d.theta_names.clone(),
+            d.theta.clone(),
+            d.theta_lower.clone(),
+            d.theta_upper.clone(),
+            d.theta_fixed.clone(),
+            m.data_bindings().clone(),
+            m.theta_blocks()
+                .level_blocks()
+                .iter()
+                .map(|b| b.contrast())
+                .collect(),
+            m.bound_from_fit(),
+        )
+    }
+
+    /// `pop` with every covariate map sorted, so two populations compare by content:
+    /// their `Debug` lists a `HashMap` in its own iteration order.
+    fn canon(pop: &Population) -> String {
+        use std::collections::BTreeMap;
+        let sorted =
+            |m: &HashMap<String, f64>| format!("{:?}", m.iter().collect::<BTreeMap<_, _>>());
+        let all = |v: &[HashMap<String, f64>]| v.iter().map(sorted).collect::<Vec<_>>();
+        let mut p = pop.clone();
+        let maps: Vec<_> = p
+            .subjects
+            .iter_mut()
+            .map(|s| {
+                let m = (
+                    sorted(&s.covariates),
+                    all(&s.dose_covariates),
+                    all(&s.obs_covariates),
+                    all(&s.pk_only_covariates),
+                    all(&s.reset_covariates),
+                );
+                s.covariates.clear();
+                s.dose_covariates.clear();
+                s.obs_covariates.clear();
+                s.pk_only_covariates.clear();
+                s.reset_covariates.clear();
+                m
+            })
+            .collect();
+        format!("{p:?} {maps:?}")
+    }
+
+    /// The `prepare_run` pair: levels, then statistics.
+    fn both(parsed: &mut ParsedModel, text: &str, pop: &mut Population) {
+        crate::api::bind_theta_levels(parsed, text, pop).unwrap_or_else(|e| panic!("{e}"));
+        bind_covariate_stats(parsed, text, pop).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `pop` with a subject-level `WT` of `base + 10·k` on subject `k`.
+    fn with_wt(mut pop: Population, base: f64) -> Population {
+        for (k, s) in pop.subjects.iter_mut().enumerate() {
+            s.covariates
+                .insert("WT".to_string(), base + 10.0 * k as f64);
+        }
+        pop.covariate_names.push("WT".to_string());
+        pop
+    }
+
+    /// Shape `tag` on `[STUDY, TIME]` with `auto`, plus a `center = median`
+    /// relation on `WT` for a parameter the shape reads.
+    fn shape_with_median(tag: &str) -> String {
+        let param = if tag == "S2" { "V" } else { "ET50" };
+        format!(
+            "{}\n[covariates]\n  WT continuous\n\n[covariate_model]\n  {param} ~ WT \
+             power(center = median) => THETA_WT(0.6, 0.01, 5.0)\n",
+            absorption_shape(tag, "STUDY, TIME", "")
+        )
+    }
+
+    /// T1 (M1–M6): a model bound to data A and re-bound on B by the `prepare_run`
+    /// pair is the unbound model bound on B — both halves, both directions of the
+    /// `auto` flip (one subject per study ↔ two), on a PK shape (S2) and a
+    /// compartment-free one (H1). The straddle is asserted: A's stamped contrast and
+    /// median both differ from B's, so a binder reading either from `parsed.model`
+    /// lands on A's.
+    ///
+    /// Mutations — read `decls` from `parsed.model` in `bind_theta_levels`: the
+    /// A = 1/study cells keep `SumToZeroWithin`, the A = 2/study cells are refused for
+    /// a contrast nobody wrote. (The statistics half of the pair is pinned by T2:
+    /// here the level bind drops A's median first, so the statistics bind finds the
+    /// relation unresolved either way.)
+    #[test]
+    fn a_pre_bound_pair_rebinds_as_the_unbound_pair() {
+        for tag in ["S2", "H1"] {
+            let text = shape_with_median(tag);
+            for (a_per, b_per) in [(1, 2), (2, 1)] {
+                let cell = format!("{tag} A {a_per}/study → B {b_per}/study");
+                let a = with_wt(cf_pop(3, a_per, &T6), 80.0);
+                let b = with_wt(cf_pop(3, b_per, &T6), 60.0);
+
+                let mut on_a = a.clone();
+                let mut prebound = parse_full_model(&text).unwrap();
+                both(&mut prebound, &text, &mut on_a);
+
+                let mut want_pop = b.clone();
+                let mut unbound = parse_full_model(&text).unwrap();
+                both(&mut unbound, &text, &mut want_pop);
+
+                // The straddle.
+                let (ta, tb) = (twin(&prebound), twin(&unbound));
+                assert_ne!(ta.7, tb.7, "{cell}: the contrast flips between A and B");
+                assert!(ta.7.iter().all(|c| *c != LevelContrast::Auto), "{cell}");
+                assert_ne!(
+                    ta.6.covariate_stats["WT"].median, tb.6.covariate_stats["WT"].median,
+                    "{cell}: the median differs between A and B"
+                );
+
+                let mut got_pop = b.clone();
+                both(&mut prebound, &text, &mut got_pop);
+                assert_eq!(twin(&prebound), tb, "{cell}");
+                assert_eq!(canon(&got_pop), canon(&want_pop), "{cell}");
+            }
+        }
+    }
+
+    /// T1b: the dead-level check runs on the statistics the level bind keeps, not
+    /// on `parsed`'s. Under `linear(center = c)` at θ = 0.05 the factor on `CL` is
+    /// exactly 0 for a subject 20 below `c`, so that subject's levels are dead.
+    /// Straddle: statistics bound on C (WT 60, 80, 100; median 80) reach the check,
+    /// and the level bind on C is refused. A model bound to A (WT 70, 80, 90; median
+    /// 80, no subject 20 below) and re-bound on B (WT 60, 70, 80; median 70) drops
+    /// A's median and binds as the unbound model does.
+    ///
+    /// Mutation — measure the dead levels on `parsed.bindings`: A's median kills B's
+    /// WT-60 subject, and the re-bind is refused.
+    #[test]
+    fn the_dead_level_check_reads_the_statistics_the_bind_keeps() {
+        let text = format!(
+            "{}\n[covariates]\n  WT continuous\n\n[covariate_model]\n  CL ~ WT \
+             linear(center = median) => THETA_CL_WT(0.05, -1.0, 1.0)\n",
+            model(true, false).replace("CL = TVCL + PLACEBO", "CL = TVCL * exp(PLACEBO)")
+        );
+        let weights = |w: [f64; 3]| {
+            let mut pop = weighed(3, 2, 0.0);
+            for (s, wt) in pop.subjects.iter_mut().zip(w) {
+                s.covariates.insert("WT".to_string(), wt);
+            }
+            pop
+        };
+        let mut c = weights([60.0, 80.0, 100.0]);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut parsed, &text, &c).unwrap();
+        let err = crate::api::bind_theta_levels(&mut parsed, &text, &mut c)
+            .expect_err("C's own median makes its WT-60 subject's levels dead");
+        assert!(
+            err.contains("each of these levels has no effect on the predictions"),
+            "{err}"
+        );
+
+        let mut prebound = pre_bound(&text, &mut weights([70.0, 80.0, 90.0]));
+        assert_eq!(prebound.bindings.covariate_stats["WT"].median, 80.0);
+        let mut got = weights([60.0, 70.0, 80.0]);
+        crate::api::bind_theta_levels(&mut prebound, &text, &mut got)
+            .unwrap_or_else(|e| panic!("A's median is not B's: {e}"));
+        let mut want = weights([60.0, 70.0, 80.0]);
+        let mut unbound = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut unbound, &text, &mut want).unwrap();
+        assert_eq!(twin(&prebound), twin(&unbound));
+        assert_eq!(canon(&got), canon(&want));
+    }
+
+    /// M8: binding once — `prepare_run`'s pair, levels then statistics — reads each
+    /// declaration from the model in hand, with no parse beyond the two re-parses it
+    /// always made. Straddle: the same model, asked for a half it has bound,
+    /// re-parses.
+    ///
+    /// Mutation — key the `Stats` read on every binding (`data_bindings().is_empty()`,
+    /// the plan's first draft): the statistics bind after a level bind re-parses on
+    /// every fit of a model with both halves.
+    #[test]
+    fn binding_once_reads_the_declaration_without_a_parse() {
+        use crate::api::levels::{declared_model, Declared, Reads};
+        let text = model(true, true);
+        let borrowed = |p: &ParsedModel, r: Reads| {
+            matches!(declared_model(p, &text, r).unwrap(), Declared::Borrowed(_))
+        };
+        let mut pop = weighed(3, 2, 60.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        assert!(borrowed(&parsed, Reads::Levels), "fresh: the level bind");
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut pop).unwrap();
+        assert!(
+            borrowed(&parsed, Reads::Stats),
+            "levels bound: the statistics bind"
+        );
+        assert!(
+            !borrowed(&parsed, Reads::Levels),
+            "the bound half re-parses"
+        );
+        assert!(!borrowed(&parsed, Reads::Both), "the bound half re-parses");
+    }
+
+    /// T2 (M5): `bind_covariate_stats` alone on a model bound to A's median (90)
+    /// re-centres it on B's (70), as on the unbound model.
+    ///
+    /// Mutation — gate on `parsed.model`'s relations: the A-bound model sees nothing
+    /// unresolved and keeps 90.
+    #[test]
+    fn statistics_alone_rebind_on_the_new_data() {
+        let text = model(false, true);
+        let a = weighed(3, 2, 80.0);
+        let b = weighed(3, 2, 60.0);
+        let mut prebound = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut prebound, &text, &a).unwrap();
+        assert_eq!(prebound.bindings.covariate_stats["WT"].median, 90.0);
+
+        let mut unbound = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut unbound, &text, &b).unwrap();
+        assert_eq!(unbound.bindings.covariate_stats["WT"].median, 70.0);
+
+        bind_covariate_stats(&mut prebound, &text, &b).unwrap();
+        assert_eq!(twin(&prebound), twin(&unbound));
+    }
+
+    /// T3a: `bind_theta_levels` alone on B drops A's statistics, which are no
+    /// longer the data's, leaving the relation for `bind_covariate_stats`: the
+    /// unbound levels-only twin. Control, in the same test: statistics bound on B
+    /// itself survive a level bind on B.
+    ///
+    /// Mutations — always keep the statistics: the first arm keeps A's median.
+    /// Always drop them: the control loses B's.
+    #[test]
+    fn a_level_bind_keeps_the_statistics_only_while_they_are_the_datas() {
+        let text = model(true, true);
+        let mut prebound = pre_bound(&text, &mut weighed(3, 2, 80.0));
+        let mut got = weighed(3, 2, 60.0);
+        crate::api::bind_theta_levels(&mut prebound, &text, &mut got).unwrap();
+        let mut want = weighed(3, 2, 60.0);
+        let mut unbound = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut unbound, &text, &mut want).unwrap();
+        assert_eq!(symbolic_covariates(&prebound.model), vec!["WT".to_string()]);
+        assert_eq!(twin(&prebound), twin(&unbound));
+        assert_eq!(canon(&got), canon(&want));
+
+        // Control: statistics first, on B, then levels on B.
+        let mut on_b = weighed(3, 2, 60.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut parsed, &text, &on_b).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut on_b).unwrap();
+        assert_eq!(parsed.bindings.covariate_stats["WT"].median, 70.0);
+        assert!(symbolic_covariates(&parsed.model).is_empty());
+    }
+
+    /// T3b: `bind_covariate_stats` alone on B, whose subjects carry no level index
+    /// column, drops A's level layout, leaving the block for `bind_theta_levels`:
+    /// the unbound statistics-only twin. Control, in the same test: levels bound on
+    /// B itself (the `prepare_run` order) survive a statistics bind on B.
+    ///
+    /// Mutations — always keep the levels: the first arm keeps A's layout. Always
+    /// drop them: the control loses B's.
+    #[test]
+    fn a_statistics_bind_keeps_the_levels_only_while_they_are_written_on_the_data() {
+        let text = model(true, true);
+        let mut prebound = pre_bound(&text, &mut weighed(3, 2, 80.0));
+        assert!(!prebound.bindings.levels.is_empty());
+        let b = weighed(3, 2, 60.0);
+        bind_covariate_stats(&mut prebound, &text, &b).unwrap();
+        let mut unbound = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut unbound, &text, &b).unwrap();
+        assert!(prebound.bindings.levels.is_empty());
+        assert_eq!(twin(&prebound), twin(&unbound));
+
+        // Control: levels first, on B, then statistics on B.
+        let mut on_b = weighed(3, 2, 60.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        both(&mut parsed, &text, &mut on_b);
+        assert!(parsed.bindings.levels.contains_key("PLACEBO"));
+        assert_eq!(parsed.bindings.covariate_stats["WT"].median, 70.0);
+    }
+
+    /// T4: provenance, both arms in one test. The two models carry the **same**
+    /// bindings — the fit's, median 70 — and differ only in where those came from.
+    /// Laid out on the fit, a statistics bind on a design (median 90) is a no-op:
+    /// the fitted θ was estimated against the fit's centres (#1619's T3). Bound to
+    /// the fit's data, the same call re-centres on the design.
+    ///
+    /// Mutations — drop the flag check in `bind_covariate_stats`: the first arm
+    /// re-centres on 90 (and so do `both_halves_come_from_the_fit` and the Tier-2
+    /// `bind_from_fit_keeps_the_fits_covariate_centres_on_a_design`). Treat every
+    /// model as fit-bound: the second arm keeps 70.
+    #[test]
+    fn the_fits_centres_stay_and_a_datas_centres_move() {
+        let text = model(false, true);
+        let b = fitted(&text);
+        let design = weighed(3, 2, 80.0);
+
+        let mut from_fit = parse_full_model(&text).unwrap();
+        bind_from_fit(&mut from_fit, &text, &mut design.clone(), &b).unwrap();
+        let mut from_data = parse_full_model(&text).unwrap();
+        bind_covariate_stats(&mut from_data, &text, &weighed(3, 2, 60.0)).unwrap();
+        // The straddle: the bindings are the same; only the provenance differs.
+        assert_eq!(from_fit.model.data_bindings(), &b);
+        assert_eq!(from_data.model.data_bindings(), &b);
+        assert!(from_fit.model.bound_from_fit() && !from_data.model.bound_from_fit());
+
+        bind_covariate_stats(&mut from_fit, &text, &design).unwrap();
+        assert_eq!(from_fit.bindings.covariate_stats["WT"].median, 70.0);
+        bind_covariate_stats(&mut from_data, &text, &design).unwrap();
+        assert_eq!(from_data.bindings.covariate_stats["WT"].median, 90.0);
+    }
+
+    fn fit_bound_refusal(blocks: &str) -> String {
+        format!(
+            "{blocks}: this model is laid out on a fit's levels, so binding it to the \
+             levels of this data would read the fitted theta at other positions. To run \
+             this data on the fit's theta, bind it from the fit's bindings instead; to use \
+             this data's own levels, parse the model again and bind the new parse."
+        )
+    }
+
+    /// T5: `bind_theta_levels` on a model laid out by **each** provenance setter —
+    /// `bind_from_fit`, `layout_from_fit` and the deprecated binder — is refused with
+    /// the same text, and writes nothing to the population or to `parsed`. Every
+    /// block is named once. A fit-bound model with no level block binds `Ok` and
+    /// stays as it is.
+    ///
+    /// Mutations — skip the flag in `FitLayout::apply`: the `bind_from_fit` and
+    /// `layout_from_fit` cells bind. Skip it in the deprecated binder: that cell
+    /// binds. Delete any sentence of the message: every cell's text differs.
+    #[test]
+    fn a_model_laid_out_on_a_fit_refuses_its_datas_own_levels() {
+        type Setter = fn(&mut ParsedModel, &str, &DataBindings);
+        let setters: [(&str, Setter); 3] = [
+            ("bind_from_fit", |p, t, b| {
+                bind_from_fit(p, t, &mut weighed(3, 2, 80.0), b).unwrap()
+            }),
+            ("layout_from_fit", |p, t, b| {
+                crate::api::layout_from_fit(p, t, b).unwrap()
+            }),
+            ("bind_theta_levels_from_fit", |p, t, b| {
+                bind_theta_levels_from_fit(p, t, &mut weighed(3, 2, 80.0), &b.levels).unwrap()
+            }),
+        ];
+        let cases = [
+            (model(true, true), "theta PLACEBO[STUDY, TIME]"),
+            (
+                two_block_model(),
+                "theta PLACEBO[STUDY, TIME], theta EFF[STUDY]",
+            ),
+        ];
+        for (text, blocks) in &cases {
+            let want = fit_bound_refusal(blocks);
+            for (name, set) in setters {
+                let cell = format!("{name}, {blocks}");
+                let b = if text.contains("WT") {
+                    fitted(text)
+                } else {
+                    let mut pop = population(3, 2);
+                    let mut p = parse_full_model(text).unwrap();
+                    crate::api::bind_theta_levels(&mut p, text, &mut pop).unwrap();
+                    p.model.data_bindings().clone()
+                };
+                let mut parsed = parse_full_model(text).unwrap();
+                set(&mut parsed, text, &b);
+                let before = twin(&parsed);
+                let mut pop = weighed(3, 2, 60.0);
+                let before_pop = format!("{pop:?}");
+                let err = crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
+                    .expect_err(&format!("{cell}: must be refused"));
+                assert_eq!(err, want, "{cell}");
+                for absent in ["differ", "bound to data", "_from_fit"] {
+                    assert!(!err.contains(absent), "{cell}: `{absent}` in {err}");
+                }
+                assert_eq!(twin(&parsed), before, "{cell}: parsed untouched");
+                assert_eq!(
+                    format!("{pop:?}"),
+                    before_pop,
+                    "{cell}: population untouched"
+                );
+            }
+        }
+
+        // No level block: nothing to refuse.
+        let text = model(false, true);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_from_fit(&mut parsed, &text, &mut weighed(3, 2, 80.0), &fitted(&text)).unwrap();
+        let before = twin(&parsed);
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut weighed(3, 2, 60.0)).unwrap();
+        assert_eq!(twin(&parsed), before);
+    }
+
+    /// T6 (M7): the deprecated binder on a model bound to data A takes the fit's
+    /// layout as the unbound model does — here a `sum_to_zero_within` the fit
+    /// resolved, where A's `auto` stamped `sum_to_zero`. Its statistics stay the
+    /// caller's, as they always were for this binder: the twin is the sequence it
+    /// was documented with, a fresh parse with the same statistics installed by
+    /// hand (the Tier-2 `a_fits_data_bindings_survive_fitrx_*` runs it on the fit's).
+    ///
+    /// Mutations — read `decls` from `parsed.model`: refused for a contrast the block
+    /// does not declare. Drop `parsed`'s statistics: the median is gone, and the
+    /// Tier-2 test's simulate is refused for an unbound relation.
+    #[test]
+    fn the_deprecated_binder_reads_the_declaration_too() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        let placebo = b.levels.get_mut("PLACEBO").unwrap();
+        placebo.groups = vec![0, 0, 0, 1, 1, 1];
+        placebo.contrast = LevelContrast::SumToZeroWithin;
+
+        let mut prebound = pre_bound(&text, &mut weighed(3, 2, 80.0));
+        assert_eq!(
+            prebound.model.theta_blocks().level_blocks()[0].contrast(),
+            LevelContrast::SumToZero
+        );
+        assert_eq!(prebound.bindings.covariate_stats["WT"].median, 90.0);
+
+        let mut got = weighed(3, 2, 80.0);
+        bind_theta_levels_from_fit(&mut prebound, &text, &mut got, &b.levels)
+            .unwrap_or_else(|e| panic!("the pre-bound model binds: {e}"));
+        let mut want = weighed(3, 2, 80.0);
+        let mut by_hand = parse_full_model(&text).unwrap();
+        by_hand.bindings.covariate_stats = prebound.bindings.covariate_stats.clone();
+        by_hand.model =
+            crate::parser::model_parser::parse_full_model_with(&text, &by_hand.bindings)
+                .unwrap()
+                .model;
+        bind_theta_levels_from_fit(&mut by_hand, &text, &mut want, &b.levels).unwrap();
+        assert_eq!(prebound.bindings.covariate_stats["WT"].median, 90.0);
+        assert!(symbolic_covariates(&prebound.model).is_empty());
+        assert_eq!(
+            prebound.model.theta_blocks().level_blocks()[0].contrast(),
+            LevelContrast::SumToZeroWithin
+        );
+        assert_eq!(twin(&prebound), twin(&by_hand));
+        assert_eq!(canon(&got), canon(&want));
+    }
+
+    /// T7: re-binding on the data a model is already bound to changes nothing —
+    /// each binder alone and the pair — so the "keep the other half" predicates are
+    /// not over-eager.
+    ///
+    /// Mutations — drop the statistics in `bind_theta_levels` or the levels in
+    /// `bind_covariate_stats` unconditionally: that binder's cell loses a half.
+    #[test]
+    fn re_binding_on_the_same_data_is_idempotent() {
+        let text = model(true, true);
+        let mut once_pop = weighed(3, 2, 80.0);
+        let once = pre_bound(&text, &mut once_pop);
+        type Rebind = fn(&mut ParsedModel, &str, &mut Population);
+        let rebinds: [(&str, Rebind); 3] = [
+            ("levels", |p, t, pop| {
+                crate::api::bind_theta_levels(p, t, pop).unwrap()
+            }),
+            ("statistics", |p, t, pop| {
+                bind_covariate_stats(p, t, pop).unwrap()
+            }),
+            ("pair", both),
+        ];
+        for (name, rebind) in rebinds {
+            let mut pop = weighed(3, 2, 80.0);
+            let mut parsed = pre_bound(&text, &mut pop);
+            rebind(&mut parsed, &text, &mut pop);
+            assert_eq!(twin(&parsed), twin(&once), "{name}");
+            assert_eq!(canon(&pop), canon(&once_pop), "{name}");
+        }
     }
 }
