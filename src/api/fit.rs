@@ -1780,6 +1780,10 @@ fn fit_inner(
                     stage_opts.min_obs_for_convergence_check as usize,
                     stage_opts.inner_restarts,
                     crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
+                    crate::estimation::inner_optimizer::EbeVariance::for_options(
+                        &stage_opts,
+                        model,
+                    ),
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,

@@ -64,6 +64,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                     // The fused pass runs the stage's BFGS seed (#1389); the separate
                     // reference must run the same one, so what is compared is fusion alone.
                     let seed = InnerHessianSeed::for_options(&opts);
+                    let ebe_variance = EbeVariance::for_options(&opts, &model);
                     let reference = run_inner_loop_warm_seeded(
                         &model,
                         &pop,
@@ -75,6 +76,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         4,
                         opts.inner_restarts,
                         seed,
+                        ebe_variance,
                     );
                     for warm in [None, Some(reference.0.as_slice())] {
                         let separate = run_inner_loop_warm_seeded(
@@ -88,6 +90,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             4,
                             opts.inner_restarts,
                             seed,
+                            ebe_variance,
                         );
                         let expected_nll = if iov {
                             crate::stats::likelihood::foce_population_nll_iov(
@@ -171,6 +174,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             opts.min_obs_for_convergence_check as usize,
             opts.inner_restarts,
             InnerHessianSeed::for_options(&opts),
+            EbeVariance::for_options(&opts, &model),
         );
         let expected = pop_nll_opts(
             &model,

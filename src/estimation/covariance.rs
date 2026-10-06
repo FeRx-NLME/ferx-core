@@ -9,7 +9,7 @@ use crate::estimation::cov_diagnostics::{
     format_offdiag_nan_warning, format_regularized_warning, format_salvage_note, CovHessianSource,
     CovRegularizationFacts, CovScopeDecline, OdeToleranceFacts,
 };
-use crate::estimation::inner_optimizer::find_ebe;
+use crate::estimation::inner_optimizer::{find_ebe_with_variance, EbeVariance};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::types::*;
@@ -1114,8 +1114,9 @@ pub(super) fn reconverge_population(
     let mut ehs = Vec::with_capacity(n);
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
+    let ebe_variance = EbeVariance::for_options(options, model);
     for i in 0..n {
-        let ebe = find_ebe(
+        let ebe = find_ebe_with_variance(
             model,
             &pop.subjects[i],
             &params,
@@ -1124,6 +1125,7 @@ pub(super) fn reconverge_population(
             Some(warm[i].as_slice()),
             Some(&mu_k),
             0,
+            ebe_variance,
         );
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);

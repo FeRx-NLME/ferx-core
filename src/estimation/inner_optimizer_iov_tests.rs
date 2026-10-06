@@ -3597,7 +3597,16 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
     );
 
     // `max_iter = 1`: BFGS cannot certify convergence, so the fallback fires.
-    let ebe = find_ebe_iov(&model, &subject, &params, 1, 1e-5, None, None);
+    let ebe = find_ebe_iov(
+        &model,
+        &subject,
+        &params,
+        1,
+        1e-5,
+        None,
+        None,
+        EbeVariance::Conditional,
+    );
     assert!(
         !ebe.converged && ebe.used_fallback,
         "fixture must trip the NM fallback (converged={}, fallback={})",
@@ -3611,7 +3620,16 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
     // (gap 3.0); the unconditionally-adopted 5-iteration NM from the zero seed 500.98
     // (gap 505). The bound is ~3× the realised gap of the kept partial and 50× below the
     // old policy's, so it fails on exactly the mutation it exists to catch and nothing else.
-    let full = find_ebe_iov(&model, &subject, &params, 200, 1e-5, None, None);
+    let full = find_ebe_iov(
+        &model,
+        &subject,
+        &params,
+        200,
+        1e-5,
+        None,
+        None,
+        EbeVariance::Conditional,
+    );
     assert!(full.converged, "reference solve must converge");
     assert!(
         ebe.nll >= full.nll - 1e-9,
@@ -3738,7 +3756,16 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     };
     let params = model.default_params.clone();
     let solve = |tol: f64| {
-        let r = find_ebe_iov(&model, &subject, &params, 200, tol, None, None);
+        let r = find_ebe_iov(
+            &model,
+            &subject,
+            &params,
+            200,
+            tol,
+            None,
+            None,
+            EbeVariance::Conditional,
+        );
         let mut stacked: Vec<f64> = r.eta.as_slice().to_vec();
         for k in &r.kappas {
             stacked.extend_from_slice(k.as_slice());

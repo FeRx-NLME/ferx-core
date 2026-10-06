@@ -1,6 +1,6 @@
 use crate::pk;
 use crate::stats::likelihood::{
-    individual_nll_into_prepared_with_schedule, individual_nll_iov_with_scratch,
+    individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen,
     iov_occasion_groups,
 };
 #[cfg(test)]
@@ -602,6 +602,10 @@ fn analytic_inner_seed_hessian(
                     1.0,
                     false,
                     cens,
+                    // The seed is a BFGS start metric, not the objective: a FOCE search
+                    // under a frozen variance (#1722) still reaches its own mode from
+                    // this conditional metric, as every seed reaches the optimiser's.
+                    None,
                 ) else {
                     valid = false;
                     break;
@@ -785,11 +789,77 @@ impl InnerHessianSeed {
     }
 }
 
+/// Where an EBE search evaluates the residual variance (#1722, #319).
+///
+/// The individual objective an inner solve minimises is
+/// `½[Σⱼ (yⱼ − fⱼ(η))²/Vⱼ + log Vⱼ] + ½ηᵀΩ⁻¹η`. Every estimator except one scores `Vⱼ`
+/// at the conditional prediction `fⱼ(η)`. Non-interaction FOCE (NONMEM `METHOD=1`
+/// without `INTER`) does not: its Sheiner–Beal marginal takes the residual variance at
+/// the population prediction `f(η = 0)` — `R⁰` — and so does its EBE search, holding
+/// `Vⱼ = R⁰ⱼ` constant while `η` moves. Scoring `V` at `f(η)` in the search while the
+/// marginal uses `R⁰` linearises the marginal around the mode of a *different*
+/// objective: on `warfarin_iov` (σ ≈ 21%) that put ferx's FOCE OFV 0.74 below NONMEM's
+/// without IOV and 1.28 below it with IOV, with every subject's EBEs off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EbeVariance {
+    /// `V` at the conditional prediction `f(η)` — FOCEI, Laplace/AGQ, SAEM, IMP/IMPMAP,
+    /// Bayes, VI, and every caller outside an estimation stage.
+    #[default]
+    Conditional,
+    /// `V` held at `R⁰ = V(f(η = 0))` for the whole search — non-interaction FOCE with a
+    /// prediction-dependent error model.
+    Population,
+}
+
+impl EbeVariance {
+    /// The variance convention for a stage running `method` with `interaction`: the
+    /// **single** decision every FOCE-path caller reads, so the EBE search and the
+    /// marginal it feeds cannot disagree about it.
+    ///
+    /// `Population` exactly when the stage's marginal is the Sheiner–Beal one — the
+    /// FOCE family with interaction off and no quadrature — and the error model's
+    /// variance depends on the prediction. Keyed on the `interaction` flag the
+    /// marginal itself reads (`foce_subject_nll`'s `interaction`), not on the method
+    /// name alone: `method = foce` with a caller-supplied `interaction = true` scores
+    /// the FOCEI marginal, and its EBEs must then be FOCEI's too. Additive error is
+    /// `Conditional`: its variance is constant in `f`, so the two conventions are the
+    /// same objective and the conditional path stays bit-identical.
+    pub(crate) fn for_stage(
+        method: crate::types::EstimationMethod,
+        interaction: bool,
+        n_agq: usize,
+        model: &CompiledModel,
+    ) -> Self {
+        use crate::types::EstimationMethod;
+        let sheiner_beal = !interaction
+            && crate::types::FitOptions::agq_nodes_for(method, n_agq).is_none()
+            && matches!(
+                method,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+            );
+        if sheiner_beal && model.error_spec.has_f_dependent_variance() {
+            Self::Population
+        } else {
+            Self::Conditional
+        }
+    }
+
+    /// [`Self::for_stage`] for a stage's resolved options.
+    pub(crate) fn for_options(options: &crate::types::FitOptions, model: &CompiledModel) -> Self {
+        Self::for_stage(options.method, options.interaction, options.n_agq, model)
+    }
+}
+
 /// Per-call inner-solve policy: the BFGS seed and whether to retain the terminal exact
 /// Hessian (see `find_ebe_impl`). `Default` is the historical solve.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InnerSolvePolicy {
     pub(crate) seed: InnerHessianSeed,
+    /// Where the search scores the residual variance ([`EbeVariance`], #1722).
+    pub(crate) ebe_variance: EbeVariance,
     /// Retain `EbeResult::terminal_hessian` — a full second-order provider pass per subject.
     /// Only the objective-only Laplace/AGQ evaluation under the exact anchor reads it.
     pub(crate) capture_terminal_hessian: bool,
@@ -1241,6 +1311,43 @@ pub fn find_ebe(
     )
 }
 
+/// [`find_ebe`] under a stage's residual-variance convention ([`EbeVariance`], #1722).
+///
+/// The public [`find_ebe`] is the generic conditional EBE search and stays that way; a
+/// caller that scores the result with a FOCE marginal — a covariance stencil, a
+/// per-subject FD salvage, a mixture class solve — reads the convention from
+/// [`EbeVariance::for_options`] and passes it here, so the EBE it re-solves is the mode
+/// of the objective that marginal is linearised around.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_with_variance(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    ebe_variance: EbeVariance,
+) -> EbeResult {
+    let schedule = cacheable_schedule(model, subject);
+    find_ebe_impl(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        schedule.as_ref(),
+        InnerSolvePolicy {
+            ebe_variance,
+            ..InnerSolvePolicy::default()
+        },
+    )
+}
+
 /// Same as [`find_ebe`], but takes an already-resolved [`EventSchedule`](pk::event_driven::EventSchedule)
 /// instead of rebuilding one via [`cacheable_schedule`] on every call.
 ///
@@ -1308,7 +1415,16 @@ fn find_ebe_impl(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        return find_ebe_iov(model, subject, params, max_iter, tol, eta_init, mu_k);
+        return find_ebe_iov(
+            model,
+            subject,
+            params,
+            max_iter,
+            tol,
+            eta_init,
+            mu_k,
+            policy.ebe_variance,
+        );
     }
 
     let solve = |cold_seed: bool| {
@@ -1460,11 +1576,24 @@ fn find_ebe_solve(
     // re-entrant.
     let grad_eta_work = RefCell::new(DVector::zeros(n_eta));
     let grad_prior_work = RefCell::new(DVector::zeros(n_eta));
+    // Non-interaction FOCE (#1722): the residual variance is held at the population
+    // prediction `f(η = 0)` for the whole search — computed once here, η-independent.
+    // `None` (every other estimator, and additive error) is the conditional objective.
+    let frozen_var_preds: Option<Vec<f64>> = match policy.ebe_variance {
+        EbeVariance::Population => crate::stats::likelihood::population_variance_preds(
+            model,
+            subject,
+            &params.theta,
+            n_eta,
+        ),
+        EbeVariance::Conditional => None,
+    };
+    let frozen = frozen_var_preds.as_deref();
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
-        individual_nll_into_prepared_with_schedule(
+        individual_nll_into_prepared_with_schedule_frozen(
             model,
             subject,
             &params.theta,
@@ -1483,6 +1612,7 @@ fn find_ebe_solve(
             &mut pred_recycle.borrow_mut(),
             &mut eta_work.borrow_mut(),
             &mut prior_work.borrow_mut(),
+            frozen,
         )
     };
 
@@ -1534,6 +1664,7 @@ fn find_ebe_solve(
             &mut obs_grad_recycle.borrow_mut(),
             &mut grad_eta_work.borrow_mut(),
             &mut grad_prior_work.borrow_mut(),
+            frozen,
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -1899,6 +2030,7 @@ fn find_ebe_solve(
 /// When `mu_k` is provided the BSV block is optimised in psi-space
 /// (`psi = eta_true + mu_k`) so mu-referencing benefits also apply to the BSV
 /// etas when IOV is active.  The returned `EbeResult.eta` is always `eta_true`.
+#[allow(clippy::too_many_arguments)]
 fn find_ebe_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1907,6 +2039,7 @@ fn find_ebe_iov(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    ebe_variance: EbeVariance,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -1925,6 +2058,20 @@ fn find_ebe_iov(
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
     // probes. Each probe rewrites every event; no parameter values are cached.
     let pk_scratch = RefCell::new(pk::EventPkParams::default());
+    // Non-interaction FOCE (#1722): residual variance held at f(η = 0, κ = 0) — the
+    // augmented marginal's `R⁰` — for the whole search. See `find_ebe_solve`.
+    let frozen_var_preds: Option<Vec<f64>> = match ebe_variance {
+        EbeVariance::Population => crate::stats::likelihood::population_variance_preds_iov(
+            model,
+            subject,
+            &params.theta,
+            n_eta,
+            n_kappa,
+            k_occasions,
+        ),
+        EbeVariance::Conditional => None,
+    };
+    let frozen = frozen_var_preds.as_deref();
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -1936,7 +2083,7 @@ fn find_ebe_iov(
         let kappas: Vec<Vec<f64>> = (0..k_occasions)
             .map(|k| p[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa].to_vec())
             .collect();
-        individual_nll_iov_with_scratch(
+        individual_nll_iov_frozen(
             model,
             subject,
             &params.theta,
@@ -1946,6 +2093,8 @@ fn find_ebe_iov(
             omega_iov_ref,
             &params.sigma.values,
             &mut pk_scratch.borrow_mut(),
+            None,
+            frozen,
         )
     };
 
@@ -2007,7 +2156,7 @@ fn find_ebe_iov(
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
         }
-        match analytic_eta_nll_gradient_iov(
+        match analytic_eta_nll_gradient_iov_frozen(
             model,
             subject,
             &params.theta,
@@ -2019,6 +2168,7 @@ fn find_ebe_iov(
             n_kappa,
             k_occasions,
             mult.as_deref(),
+            frozen,
         ) {
             Some(g) => g,
             None => gradient_fd(&obj, p, n_flat),
@@ -2808,7 +2958,13 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
 /// η-independent, so this is the *entire* inner-loop change it needs: no new η
 /// term, just the scale on `v`/`dv_df` (the direct-θ dependence is a separate,
 /// outer-only gradient channel — see `sens_outer_gradient::prepare_stacked`).
+///
+/// `f_frozen = Some(f₀)` is the non-interaction FOCE objective (#1722): the variance is
+/// taken at `f₀` and is a constant of the search, so `dv_df = 0` and the coefficient
+/// reduces to the weighted residual `−ε/v` (or the censored `h·m` at `dv_df = 0`).
+/// Callers pass `ruv_active = false` with it — `R⁰` carries no `η_ruv` scale.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn residual_inner_obs(
     model: &CompiledModel,
     cmt: usize,
@@ -2819,14 +2975,17 @@ fn residual_inner_obs(
     ruv_scale: f64,
     ruv_active: bool,
     cens: i8,
+    f_frozen: Option<f64>,
 ) -> Option<(f64, f64)> {
+    let f_var = f_frozen.unwrap_or(f);
     let mut v = match mult {
-        Some(m) => model.residual_variance_at_scaled(cmt, f, sigma, Some(m)),
-        None => model.residual_variance_at(cmt, f, sigma),
+        Some(m) => model.residual_variance_at_scaled(cmt, f_var, sigma, Some(m)),
+        None => model.residual_variance_at(cmt, f_var, sigma),
     };
-    let mut dv_df = match mult {
-        Some(m) => model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
-        None => model.error_spec.dvar_df(cmt, f, sigma),
+    let mut dv_df = match (f_frozen, mult) {
+        (Some(_), _) => 0.0,
+        (None, Some(m)) => model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
+        (None, None) => model.error_spec.dvar_df(cmt, f, sigma),
     };
     if ruv_active {
         v *= ruv_scale;
@@ -2901,6 +3060,7 @@ pub(crate) fn analytic_eta_nll_gradient(
         &mut Vec::new(),
         &mut DVector::zeros(model.n_eta),
         &mut DVector::zeros(model.n_eta),
+        None,
     )
 }
 
@@ -2943,6 +3103,9 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
     eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>,
+    // Non-interaction FOCE's frozen variance point `f(η = 0)` (#1722), or `None` for
+    // the conditional objective. See [`EbeVariance`].
+    frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
     // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
     // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
@@ -3019,6 +3182,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             err_keys,
             eta_work,
             prior_work,
+            frozen_var_preds,
         )
         .map(add_nongaussian);
         *obs_grad_recycle = sens;
@@ -3033,7 +3197,12 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // `Σ_j (1 − ε²/v)`, plus the `Ω⁻¹η` prior added below — not the shared
     // `coef·∂f/∂η` loop. (M3 censoring + `iiv_on_ruv` routes to FD upstream, so the
     // residual-eta column is only ever formed on quantified rows here.)
-    let ruv_idx = model.residual_error_eta;
+    // A frozen variance is `R⁰` at every random effect zero, `η_ruv` included, so the
+    // residual eta carries no data term under it (and `fit` refuses `iiv_on_ruv` under a
+    // non-interaction stage anyway) — #1722.
+    let ruv_idx = model
+        .residual_error_eta
+        .filter(|_| frozen_var_preds.is_none());
     let ruv_active = ruv_idx.is_some();
     let ruv_scale = if ruv_active {
         model.residual_var_scale(eta)
@@ -3075,6 +3244,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             ruv_scale,
             ruv_active,
             cens,
+            frozen_var_preds.map(|f0| f0[j]),
         )?;
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
@@ -3125,6 +3295,7 @@ fn dense_residual_inner_gradient(
     err_keys: &[usize],
     eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>,
+    frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n_eta = model.n_eta;
@@ -3135,11 +3306,14 @@ fn dense_residual_inner_gradient(
         return Some(prior_work.as_slice().to_vec());
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
+    // Non-interaction FOCE (#1722): `R` is built at the frozen `f(η = 0)` and is a
+    // constant of the search, so `∂R/∂η = 0` and only the `−a_kᵀs` term survives.
+    let var_preds: &[f64] = frozen_var_preds.unwrap_or(&ipreds);
     let corr = residual_correlations;
     let r = match mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
-            &ipreds,
+            var_preds,
             err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
@@ -3151,7 +3325,7 @@ fn dense_residual_inner_gradient(
         ),
         None => crate::stats::residual_error::compute_r_matrix_with_correlations(
             &model.error_spec,
-            &ipreds,
+            var_preds,
             err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
@@ -3172,6 +3346,15 @@ fn dense_residual_inner_gradient(
             .map(|(&y, &f)| y - f),
     );
     let s = chol.solve(&residuals); // R⁻¹ r
+    if frozen_var_preds.is_some() {
+        let grad = (0..n_eta)
+            .map(|k| {
+                let term_a: f64 = (0..n_obs).map(|m| sens[m].df_deta[k] * s[m]).sum();
+                -term_a + prior_work[k]
+            })
+            .collect();
+        return Some(grad);
+    }
     let dr = crate::stats::residual_error::compute_dr_df_matrices(
         &model.error_spec,
         &ipreds,
@@ -3243,6 +3426,41 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
     k_occasions: usize,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_gradient_iov_frozen(
+        model,
+        subject,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        n_eta,
+        n_kappa,
+        k_occasions,
+        mult,
+        None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov`] of the frozen-variance objective (#1722):
+/// `frozen_var_preds = Some(f₀)` (the augmented marginal's `f(η = 0, κ = 0)`) takes each
+/// row's variance at `f₀[j]` with `∂V/∂(η, κ) = 0` and no `η_ruv` column; `None` is the
+/// conditional gradient, bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_true: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix,
+    sigma: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+    mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>,
+) -> Option<Vec<f64>> {
     let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
     let n_stacked = n_eta + k_occasions * n_kappa;
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
@@ -3255,7 +3473,9 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
     // Only pay the `exp(2·η_ruv)` scaling + the `η_ruv` column when `iiv_on_ruv` is
     // active; a plain IOV model runs the original op count (no per-obs ×1.0 multiplies
     // and no residual-eta accumulation — #474 review).
-    let ruv_idx = model.residual_error_eta;
+    let ruv_idx = model
+        .residual_error_eta
+        .filter(|_| frozen_var_preds.is_none());
     let ruv_active = ruv_idx.is_some();
     let ruv_scale = if ruv_active {
         model.residual_var_scale(stacked_true)
@@ -3294,6 +3514,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
             ruv_scale,
             ruv_active,
             cens,
+            frozen_var_preds.map(|f0| f0[j]),
         )?;
         for (p, g) in grad.iter_mut().enumerate() {
             *g += coef * obs.df_deta[p];
@@ -4292,6 +4513,7 @@ pub fn run_inner_loop_warm(
         min_obs,
         restarts,
         InnerHessianSeed::None,
+        EbeVariance::Conditional,
     )
 }
 
@@ -4309,6 +4531,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
     min_obs: usize,
     restarts: usize,
     seed: InnerHessianSeed,
+    ebe_variance: EbeVariance,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -4327,6 +4550,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
         restarts,
         InnerSolvePolicy {
             seed,
+            ebe_variance,
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
         },

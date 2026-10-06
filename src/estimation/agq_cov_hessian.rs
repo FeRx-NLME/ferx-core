@@ -725,6 +725,7 @@ pub(crate) fn node_jet(
             obs_grad_recycle,
             eta_work,
             prior_work,
+            None,
         )?
     };
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);

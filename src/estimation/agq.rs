@@ -2662,6 +2662,8 @@ fn node_nll_gradient(
             obs_grad_recycle,
             eta_work,
             prior_work,
+            // AGQ integrates the conditional likelihood (#1722: only FOCE freezes V).
+            None,
         )
     }
 }

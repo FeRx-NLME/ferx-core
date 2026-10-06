@@ -15,6 +15,7 @@ use crate::estimation::parameterization::{compute_bounds, pack_params};
 /// each other's policy.
 #[test]
 fn concurrent_laplace_evaluations_keep_opposing_capture_policies() {
+    let model = make_model();
     let mut options = FitOptions::default();
     options.method = EstimationMethod::Laplace;
     let barrier = std::sync::Barrier::new(2);
@@ -22,11 +23,13 @@ fn concurrent_laplace_evaluations_keep_opposing_capture_policies() {
     std::thread::scope(|scope| {
         let objective = scope.spawn(|| {
             barrier.wait();
-            (0..1_000).all(|_| agq_inner_solve_policy(&options, false).capture_terminal_hessian)
+            (0..1_000)
+                .all(|_| agq_inner_solve_policy(&model, &options, false).capture_terminal_hessian)
         });
         let gradient = scope.spawn(|| {
             barrier.wait();
-            (0..1_000).all(|_| !agq_inner_solve_policy(&options, true).capture_terminal_hessian)
+            (0..1_000)
+                .all(|_| !agq_inner_solve_policy(&model, &options, true).capture_terminal_hessian)
         });
 
         assert!(objective.join().expect("objective policy thread"));

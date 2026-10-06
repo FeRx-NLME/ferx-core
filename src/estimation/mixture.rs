@@ -23,7 +23,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::estimation::inner_optimizer::{find_ebe, InnerLoopStats};
+use crate::estimation::inner_optimizer::{find_ebe_with_variance, EbeVariance, InnerLoopStats};
 use crate::estimation::parameterization::{omega_packed_len, pack_params, theta_packs_log};
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{eval_mixing_log_probs, mixing_logp_grad, MixtureClassGuard};
@@ -153,7 +153,7 @@ pub fn mixture_ofv(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
-            let ebe = find_ebe(
+            let ebe = find_ebe_with_variance(
                 model,
                 subject,
                 &cp,
@@ -162,6 +162,7 @@ pub fn mixture_ofv(
                 warm_i,
                 None,
                 options.inner_restarts,
+                EbeVariance::for_options(options, model),
             );
             // Inter-occasion variability (#985): `find_ebe` already routes to the
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base

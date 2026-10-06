@@ -7,7 +7,9 @@
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{
+    run_inner_loop_warm_seeded, EbeVariance, InnerHessianSeed,
+};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -730,7 +732,7 @@ fn run_sir_core_scoped(
 
             // Run inner loop warm-started from ML EBEs
             let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (ehs, hms, _, _kappas) = run_inner_loop_warm(
+            let (ehs, hms, _, _kappas) = run_inner_loop_warm_seeded(
                 model,
                 population,
                 &params_k,
@@ -740,6 +742,10 @@ fn run_sir_core_scoped(
                 Some(&sir_mu_k),
                 0, // SIR: no EBE convergence tracking
                 0, // SIR: warm-started; no inner multi-start
+                InnerHessianSeed::None,
+                // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are
+                // the frozen-variance mode that marginal linearises around (#1722).
+                EbeVariance::for_options(options, model),
             );
 
             // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come
