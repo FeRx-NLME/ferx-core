@@ -389,7 +389,8 @@ carries no bindings, such as a `.fitrx` saved before they were recorded, is
 refused rather than re-bound on the design. Refit the model to record them.
 This holds for a model already bound to other data too, such as one
 `prepare_run` bound to a design. What the model needs is read from its text, so
-the design's centres cannot stand in for the fit's
+the design's centres cannot stand in for the fit's, and a level block declared
+`auto` takes the contrast the fit resolved, not the design's
 ([#1686](https://github.com/FeRx-NLME/ferx-core/issues/1686)).
 `bind_theta_levels_from_fit`, the earlier levels-only binder, is deprecated.
 

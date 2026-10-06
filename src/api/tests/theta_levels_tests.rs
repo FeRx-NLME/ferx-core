@@ -2976,13 +2976,6 @@ mod bind_from_fit {
             if median {
                 assert_eq!(prebound.bindings.covariate_stats["WT"].median, 90.0);
             }
-            // The level half reads declarations, which binding keeps: reading the
-            // blocks from `parsed.model` instead of the text is an equivalent mutant.
-            assert_eq!(
-                format!("{:?}", prebound.model.theta_blocks().level_blocks()),
-                format!("{:?}", unbound.model.theta_blocks().level_blocks()),
-                "{cell}"
-            );
 
             let want = refusal(&text, &DataBindings::default());
             let before_model = prebound.model.data_bindings().clone();
@@ -3025,6 +3018,40 @@ mod bind_from_fit {
             err.starts_with("[covariate_model] relations state a statistic of `WT`"),
             "{err}"
         );
+    }
+
+    /// #1686, the level half: binding stamps the contrast `auto` resolved to on the
+    /// block's declaration, so a model pre-bound to a design "declares" the design's
+    /// contrast. A fit whose `auto` resolved otherwise on its own data (here
+    /// `sum_to_zero_within`, against the design's `sum_to_zero`) is the fit's
+    /// layout, and must bind on the pre-bound model as on the unbound one. The
+    /// straddle — the pre-bound declaration is no longer `auto` — is asserted.
+    ///
+    /// Mutation — read the level blocks from `parsed.model`: the pre-bound model is
+    /// refused, told the block "declares `contrast = sum_to_zero`", which it does not.
+    #[test]
+    fn a_pre_bound_model_takes_the_contrast_auto_resolved_to_on_the_fit() {
+        let text = model(true, false);
+        let mut b = fitted(&text);
+        let placebo = b.levels.get_mut("PLACEBO").unwrap();
+        placebo.groups = vec![0, 0, 0, 1, 1, 1];
+        placebo.contrast = LevelContrast::SumToZeroWithin;
+
+        let mut design = weighed(3, 2, 80.0);
+        let mut prebound = pre_bound(&text, &mut design);
+        let declared = |p: &ParsedModel| p.model.theta_blocks().level_blocks()[0].contrast();
+        assert_eq!(declared(&prebound), LevelContrast::SumToZero);
+        assert_eq!(
+            declared(&parse_full_model(&text).unwrap()),
+            LevelContrast::Auto
+        );
+
+        let mut own = weighed(3, 2, 80.0);
+        let unbound = bind(&text, &mut own, &b).expect("the unbound model binds");
+        let mut fresh = weighed(3, 2, 80.0);
+        bind_from_fit(&mut prebound, &text, &mut fresh, &b)
+            .unwrap_or_else(|e| panic!("the pre-bound model binds: {e}"));
+        assert_eq!(shape(&prebound.model), shape(&unbound.model));
     }
 
     /// The shape of a model: what `layout_from_fit` promises to match.
