@@ -1,0 +1,38 @@
+name: Changelog fragment
+
+# A PR that changes user-facing code must carry a `changelog.d/` fragment, or the
+# `no-changelog` label (#1545). Its own workflow, not a job in `ci.yml`, because it
+# has to re-run when a label is added or removed — and putting `labeled` /
+# `unlabeled` on `ci.yml` would re-run the whole test matrix on every label.
+#
+# The fragment's *shape* is checked separately, by `tools/preflight.sh changelog`
+# in `ci.yml`'s `Changelog` job; this one asks whether the PR adds one, and that
+# it deletes no other PR's pending fragment. `edited` covers a PR retargeted onto
+# `main` from another base, which fires no other event.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  require:
+    name: Changelog fragment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `base...HEAD` needs the merge base, so the base commit must be present.
+          fetch-depth: 0
+      - name: Require a fragment for user-facing changes
+        # Values go through `env`, never interpolated into the script. The opt-out
+        # is an exact-match boolean, not a joined label list: joining loses label
+        # boundaries, so one label named `x,no-changelog` would read as two.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+        run: tools/changelog.sh require "$BASE_SHA" --pr "$PR" --opt-out "$NO_CHANGELOG"

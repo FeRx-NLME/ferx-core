@@ -86,7 +86,7 @@
 ## Docs
 - [ ] `docs/` updated for user-visible changes
 - [ ] New pages linked in `docs/_quarto.yml` (do **not** commit `docs/_site/` — it is git-ignored; CI builds & deploys it)
-- [ ] `CHANGELOG.md` `[Unreleased]` entry added (user-facing change), or N/A (internal/refactor/CI)
+- [ ] Changelog fragment `changelog.d/<N>.<category>.md` added (user-facing change), or the `no-changelog` label applied (internal/refactor/CI) — do not edit `CHANGELOG.md` directly (#1545)
 - [ ] No user-visible change
 
 ## Checklist

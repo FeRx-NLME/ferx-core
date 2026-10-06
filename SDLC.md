@@ -132,7 +132,7 @@ The project uses [Semantic Versioning](https://semver.org/) (currently `0.1.0`).
 ### Release process (recommended)
 
 1. Update version in `Cargo.toml`.
-2. Update `CHANGELOG.md` with notable changes.
+2. Assemble `CHANGELOG.md` from the `changelog.d/` fragments: `tools/changelog.sh assemble <version>`.
 3. Create a git tag: `git tag -a v0.2.0 -m "Release v0.2.0"`.
 4. Push tag: `git push origin v0.2.0`.
 5. CI builds release binaries and creates a GitHub Release (when CI is implemented).
@@ -275,5 +275,5 @@ A `CONTRIBUTING.md` file should be created to document:
 4. **Validate**: Run example models against known datasets, compare results.
 5. **Review**: Open PR, get code review, address feedback.
 6. **Merge**: Squash-merge or merge into `main`.
-7. **Release** (when ready): Tag, update changelog, build release artifacts.
+7. **Release** (when ready): Assemble the changelog (`tools/changelog.sh assemble`), then tag and build release artifacts.
 8. **Document**: Update Quarto docs and README as needed.
