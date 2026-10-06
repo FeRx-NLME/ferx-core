@@ -30,11 +30,11 @@ use nalgebra::DVector;
 /// same line once per pass (#1037), and a re-run under different settings
 /// would keep the old run's diagnosis beside the new numbers — the low-ESS
 /// warning's own advice, re-running with `sir_scale = natural`, would leave
-/// "ESS 3.5" next to an ESS of 140 (#1723). Only the kernel's own `SIR: ` lines
-/// are replaced; `SIR failed` / `SIR requested` / `SIR fallback:` lines are a
-/// different run's story and stay.
+/// "ESS 3.5" next to an ESS of 140 (#1723). The in-fit SIR's `SIR failed: `
+/// line goes too — this run succeeded in its place. `SIR requested` and every
+/// `SIR fallback…` line are a different step's story and stay.
 fn replace_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
-    warnings.retain(|w| !w.starts_with("SIR: "));
+    warnings.retain(|w| !w.starts_with("SIR: ") && !w.starts_with("SIR failed: "));
     warnings.extend(sir_warnings.iter().map(|w| format!("SIR: {w}")));
 }
 
@@ -55,11 +55,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 }
 
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated. Proposal-conditioning
-/// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
-/// to the returned fit's `warnings` as `SIR: …` lines, deduplicated against
-/// what the input fit already carried; `sir_ess` remains the quantitative
-/// signal for a poorly-matched proposal.
+/// of `fit` with the `sir_*` fields populated. This run's diagnostics — the
+/// proposal conditioning (#1021) and the low-ESS warning (#1723) — **replace**
+/// the input fit's `SIR: …` and `SIR failed: …` lines rather than being
+/// appended to them, and `warnings_structured` is rebuilt; `sir_ess` remains
+/// the quantitative signal for a poorly-matched proposal.
 ///
 /// # Notes on integrity
 ///
@@ -101,7 +101,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   a joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
-///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
+///   `sir_seed`, `sir_keep_samples`, `sir_df`, `sir_scale`, plus the inner-loop settings
 ///   (`inner_maxiter`, `inner_tol`, `mu_referencing`, `verbose`, `cancel`).
 ///   `interaction` is **not** read from `options`: it comes from the fit
 ///   (`fit.method`, then `fit.interaction`), so the draws are weighted with the
@@ -250,6 +250,8 @@ mod tests {
             "SIR: effective sample size is 3.5 of 1000 draws".to_string(),
             "SIR fallback: proposal was shrunk in 1 direction(s).".to_string(),
             "SIR failed: covariance not positive definite".to_string(),
+            "SIR fallback failed: proposal could not be made PD".to_string(),
+            "SIR requested but no covariance".to_string(),
         ];
         replace_sir_warnings(&mut warnings, &[]);
         assert_eq!(
@@ -257,7 +259,8 @@ mod tests {
             [
                 "Minimization terminated",
                 "SIR fallback: proposal was shrunk in 1 direction(s).",
-                "SIR failed: covariance not positive definite",
+                "SIR fallback failed: proposal could not be made PD",
+                "SIR requested but no covariance",
             ]
         );
     }
