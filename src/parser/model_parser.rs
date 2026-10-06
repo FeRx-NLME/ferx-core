@@ -20388,9 +20388,17 @@ pub(crate) struct EtaCoupling {
     /// binder measures them on. A kappa varies by occasion, so "within a
     /// subject" reads "within an occasion of one subject": the block's levels
     /// must nest in occasions, and a funnel's covariates be constant within
-    /// each. Other random effects in a funnel candidate count as constant, which
-    /// is exact for a kappa added to its parameter; a kappa inside a nonlinear
-    /// ratio is judged at kappa = 0.
+    /// each. Other random effects in a funnel candidate count as constant
+    /// (`expr_constant`'s `Eta(_)` arm). That is exact for another η, for a
+    /// kappa in a kappa's funnel on the same occasions, and for a kappa that
+    /// enters an η's funnel separably: added to it, or a factor of all of it, as
+    /// in `(TVE0 + PLACEBO) * exp(KAPPA) / (1 + ETA * X)`, where the factor
+    /// cancels. A kappa that does not separate from the block
+    /// (`TVE0 + PLACEBO * exp(KAPPA) + ETA`) varies within the η's unit, and
+    /// the η is then judged as if each subject's kappas were equal. That can
+    /// only over-refuse — the η is identified solely through the spread of a
+    /// subject's kappas, by a singular value that grows with that spread — and
+    /// reading a kappa as constant never turns a refusal into a bind (#1708).
     pub(crate) kappa: bool,
     /// The first expression that reads the block and this random effect,
     /// states not tainted (#1642). Names the site in diagnostics.
@@ -21636,6 +21644,9 @@ impl<'a> CouplingCtx<'a> {
         stack: &mut Vec<String>,
     ) -> bool {
         match e {
+            // A random effect is constant within its own unit. The one inexact
+            // case is a kappa inside an η's funnel that does not separate from
+            // the block; it can only over-refuse (`EtaCoupling::kappa`, #1708).
             Expression::Literal(_) | Expression::Theta(_) | Expression::Eta(_) => true,
             // The block's own gather is constant within a level, which is all the
             // proportionality argument needs.

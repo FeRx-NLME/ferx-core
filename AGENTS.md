@@ -565,15 +565,31 @@ User-facing changes are tracked in `CHANGELOG.md` at the repo root, in
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format with
 [semantic versioning](https://semver.org/).
 
-**In the same PR as any user-facing change, add a one-line entry under the
-`## [Unreleased]` heading** in the correct category (`Added`, `Changed`,
-`Deprecated`, `Removed`, `Fixed`, `Security`, or `Performance`). Write it in
-user-facing language and reference the issue/PR number (`#NN`). A PR that only
-touches internal refactors, tests, or CI does not need an entry.
+**In the same PR as any user-facing change, add a fragment under
+`changelog.d/`** — never edit `CHANGELOG.md` itself (#1545). The file is
+`changelog.d/<N>.<category>.md`: `<N>` the issue or PR number (`-2`, `-3`, … for
+a second entry on one number), `<category>` one of `added`, `changed`,
+`deprecated`, `removed`, `fixed`, `security`, `performance`. Its body is exactly
+one bullet as it should read in the changelog — user-facing language, the
+`#NN` reference, continuation lines indented. Every PR used to append to
+`## [Unreleased]` at the same insertion point, so merging one green PR made
+every other open one conflict; separate files cannot. `changelog.d/README.md`
+has an example.
 
-At release time (not per-PR), `## [Unreleased]` is renamed to the new version
-with a date, a fresh empty `## [Unreleased]` is started, and the compare links
-at the bottom are updated. The R wrapper (`../ferx-r`) tracks its own
+Two gates: `tools/changelog.sh check` (the `changelog` group of
+`tools/preflight.sh`, CI job `Changelog`) validates every fragment's name and
+shape and fails if anything is written under `## [Unreleased]`; and the
+`Changelog fragment` workflow fails a PR that changes `src/`,
+`crates/ferx-cli/` or `crates/ferx-tools/` (test files excluded) without adding
+a fragment. A PR that only touches internal refactors, tests, or CI needs no
+fragment — apply the **`no-changelog`** label. The same workflow fails a PR that
+deletes (or renames away) another PR's pending fragment, label or not; rewording
+one is fine. Only `assemble` removes fragments.
+
+At release time (not per-PR), `tools/changelog.sh assemble <version>` renders
+the fragments under a new `## [<version>] - <date>` heading in category order,
+updates the compare links and deletes the fragments; `tools/changelog.sh
+preview` shows what is pending. The R wrapper (`../ferx-r`) tracks its own
 user-facing changes in `NEWS.md`, so a cross-repo change may need an entry in
 both.
 
