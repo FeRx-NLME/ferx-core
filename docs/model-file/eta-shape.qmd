@@ -1,0 +1,118 @@
+---
+pagetitle: "Random-effect shape transforms in ferx"
+description-meta: "Box-Cox, heavy-tailed (t-distribution) and John-Draper shapes for an ETA, written inline or declared in the [eta_shape] block — the Petersson 2009 parameterisation that NONMEM users hand-code and Pharmpy generates."
+---
+
+# Random-effect shapes
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+A random effect is normal on the scale it is written on: `CL = TVCL * exp(ETA_CL)`
+makes `CL` log-normal. When the empirical Bayes estimates are visibly skewed or
+heavy-tailed, a **shape transform** bends that distribution while `ETA_CL` itself
+stays `N(0, ω)`: the model reads `h(ETA_CL)` where it read `ETA_CL`. ferx has the
+three transforms of Petersson et al. (2009, *Pharm Res* 26:2174), the formulas
+Pharmpy's `transform_etas_*` generate, each with one estimated shape
+parameter ([#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)).
+
+## The transforms
+
+| Function | `h(η)` | Identity at | Default θ (init, bounds) |
+|---|---|---|---|
+| `boxcox(η, λ)` | `(exp(η)^λ − 1) / λ` | `λ = 0` | `0.01, (−3, 3)` |
+| `tdist(η, ν)` | `η·(1 + (η²+1)/(4ν) + (5η⁴+16η²+3)/(96ν²) + (3η⁶+19η⁴+17η²−15)/(384ν³))` | `ν → ∞` | `80, (3, 100)` |
+| `johndraper(η, λ)` | `sign(η)·((\|η\| + 1)^λ − 1) / λ` | `λ = 1` | `1, (−3, 3)` |
+
+The Box-Cox and t-distribution defaults are Pharmpy's. John-Draper starts at
+its identity `λ = 1`, so a fit starts at the unshaped model; Pharmpy starts it
+at 0.01.
+
+Each is `0` at `η = 0`, so the population prediction is unchanged, and each is
+monotone in `η`. Box-Cox skews the distribution (`λ > 0` to the right of a
+log-normal, `λ < 0` to the left), the t-distribution adds heavy tails (small `ν`),
+and John-Draper changes the tails symmetrically. Write them where the ETA would
+go, in the form NONMEM models use — the transform inside the `exp`:
+
+```
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V  = TVV  * exp(tdist(ETA_V, NU))
+```
+
+Each function takes exactly two arguments. A shape applied directly to a shaped
+expression, `boxcox(tdist(ETA_CL, NU), LAMBDA)`, is a parse error; the check
+looks inside the call only, so stacking two shapes through an intermediate
+variable is not caught — don't. The shape argument is an
+ordinary expression, usually a θ; a literal (`boxcox(ETA_CL, 0.5)`) fixes it.
+
+`boxcox` is exact through `λ = 0`, where it is `η` itself. The hand-written
+`(exp(ETA_CL)^LAMBDA - 1)/LAMBDA` is not: at `λ = 0` it is `0 / 0`, which ferx
+evaluates as 0, removing the variability (see
+[How an ETA row is labelled](individual-parameters.qmd#how-an-eta-row-is-labelled)).
+Prefer the function.
+
+## The `[eta_shape]` block
+
+The same shapes can be declared apart from the model, which makes trying one a
+one-line change:
+
+```
+[eta_shape]
+  ETA_CL ~ boxcox(LAMBDA)
+  ETA_V  ~ tdist()
+```
+
+Each line names a declared ETA and a shape. With a θ (or any expression) inside
+the parentheses, every read of that ETA in `[individual_parameters]` becomes
+`boxcox(ETA_CL, LAMBDA)`. With **empty** parentheses the shape θ is declared for
+you at the defaults in the table above, named `LAMBDA_<ETA>` for `boxcox` and
+`johndraper` and `NU_<ETA>` for `tdist` — here `NU_ETA_V(80, 3, 100)`. The block
+is rewritten into the inline form before anything else reads the model, so the
+two spellings give the same model, the same θ layout and the same fit.
+
+The block refuses, by name:
+
+- an ETA that is not declared, or one shaped twice;
+- an ETA that `[individual_parameters]` *also* shapes inline (it would be
+  transformed twice);
+- an IOV kappa — shaping a kappa is not supported yet
+  ([#1717](https://github.com/FeRx-NLME/ferx-core/issues/1717));
+- an ETA that a prediction block reads directly (`[error_model]`'s
+  `iiv_on_ruv = ETA_RUV`, an `[odes]` line, a hazard in a named
+  `[event_model NAME]`): the shape applies in
+  `[individual_parameters]` only, so read it through an individual parameter;
+- an auto-declared θ name that `[parameters]` already uses — name the θ inside
+  the parentheses instead.
+
+## Estimation and reporting
+
+The transforms keep a model on ferx's analytic sensitivities: the kernel is one
+generic function, differentiated exactly by the same `Dual2` machinery as the
+closed-form PK, so FOCE/FOCEI get exact `∂/∂η` and `∂/∂θ` — including `∂/∂λ` —
+with no finite-difference fallback. A shaped ETA is not mu-referenced
+(`log CL = log TVCL + h(η)` has no closed-form typical-value shift), so SAEM
+updates its typical value and the shape θ in the numerical M-step.
+
+A shaped ETA's omega row is labelled **custom** and prints no `CV%`: `exp(h(η))`
+is not log-normal, and `100·√ω` is not its CV. A shape-aware spread (the CV and
+quantiles of the transformed parameter) is planned.
+
+## Validation against NONMEM
+
+`tests/eta_shape_nonmem_anchor.rs` evaluates a multi-dose 1-cpt model with CL
+log-normal, Box-Cox at `λ = ±0.5` and t-distributed at `ν = 5` against the same
+models in NONMEM 7.6 (`$EST METHOD=1 INTERACTION MAXEVAL=0 POSTHOC`), whose
+`$PK` is the usual hand-coded form:
+
+```
+ETATR = (EXP(ETA(1))**THETA(3) - 1)/THETA(3)
+CL    = THETA(1)*EXP(ETATR)
+```
+
+The shapes move NONMEM's objective by −1.39, +13.27 and −0.72 from the
+log-normal model. ferx matches each objective to 2e-7, every posthoc η to 3e-8
+and every `IPRED` to 5e-8 relative, and the `[eta_shape]` spelling reproduces the
+inline one exactly. John-Draper has no NONMEM anchor (spelled in NM-TRAN
+with `ABS(η)/η`, its sign factor is `0/0` at `η = 0` where the inner search
+starts); it is
+checked against independently computed values and finite differences.

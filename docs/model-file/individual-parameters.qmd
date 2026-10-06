@@ -54,6 +54,7 @@ name from quietly reading as zero and collapsing the formula.
 | `inv_logit()`, `expit()` | `inv_logit(logit(THETA_F) + ETA_F)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
+| `boxcox(η, λ)`, `tdist(η, ν)`, `johndraper(η, λ)` | `TVCL * exp(boxcox(ETA_CL, LAMBDA))` — see [Random-effect shapes](eta-shape.qmd) |
 | `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
 | Parentheses | `TVCL * (WT/70)^0.75` |
 | Comparisons (in `if` conditions) | `WT > 70`, `SEX == 1`, `AGE != 0` |
@@ -82,6 +83,7 @@ naming the call and listing what is available:
 ```
 unknown function `tanh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
 logit, inv_logit, expit, min(a, b), max(a, b), clamp(x, lo, hi),
+boxcox(eta, lambda), tdist(eta, nu), johndraper(eta, lambda),
 present(x) (conditions only)
 ```
 
@@ -530,8 +532,10 @@ against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or f
 `LAMBDA` at exactly 0: the transform is then `0 / 0`, which ferx evaluates as
 0, so `ETAT` carries no variability at all rather than tending to `ETA_V`.
 Start it slightly away from zero, e.g. 0.01 — the initial λ Pharmpy's
-`transform_etas_boxcox` declares (bounds −3 to 3). A built-in
-`boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
+`transform_etas_boxcox` declares (bounds −3 to 3) — or use the built-in
+`boxcox(ETA_V, LAMBDA)`, which is exact through `λ = 0` (see
+[Random-effect shapes](eta-shape.qmd), #1716). It is labelled custom too, until
+a shape-aware spread is reported.
 
 ## Covariate Detection
 

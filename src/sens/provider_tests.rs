@@ -14264,3 +14264,115 @@ fn lognormal_chain_gate_uses_the_measured_flag_or_the_labels() {
         "measured inexact beats LogNormal labels"
     );
 }
+
+// ── #1716: random-effect shape transforms ───────────────────────────────────
+
+/// A 2-cpt IV model whose three ETAs enter through `boxcox`, `tdist` and
+/// `johndraper`, each with its own shape θ.
+const SHAPED_2CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta LAMBDA(0.5, -3.0, 3.0)
+  theta NU(4.0, 3.0, 100.0)
+  theta LJD(0.6, -3.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_V2 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V1 = TVV1 * exp(tdist(ETA_V1, NU))
+  V2 = TVV2 * exp(johndraper(ETA_V2, LJD))
+  Q = CL * 0.5
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1716: the analytic provider's `∂f/∂(θ, η)` and second derivatives through
+/// every shape transform match central FD of production. Multi-dose, so the
+/// second dose lands on residual drug; η ≠ 0 and shapes away from their
+/// identity points, so each transform is live. The fixture routes to the
+/// **analytic** provider (asserted), so the dual path is what is checked.
+/// Dies under: a kernel step that drops its jet (e.g. lifting the Box-Cox value
+/// as a constant), or the generic VM not dispatching `Op::Shape` over `T`.
+#[test]
+fn shape_transforms_match_fd_of_production() {
+    let m = parse_model_string(SHAPED_2CPT).expect("parse shaped model");
+    assert!(
+        tvcov_analytical_supported(&m),
+        "a shaped individual parameter stays on the analytic provider"
+    );
+    let s = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[1.0, 4.0, 11.0, 13.0, 16.0, 24.0, 48.0],
+        Vec::new(),
+    );
+    let theta = [10.0, 50.0, 100.0, 0.5, 4.0, 0.6];
+    for eta in [[0.25, -0.3, 0.4], [-0.35, 0.2, -0.15]] {
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+    }
+    // λ through 0 on the Box-Cox series arm, and the John-Draper odd branch.
+    check_full_provider_vs_fd(
+        &m,
+        &s,
+        &[10.0, 50.0, 100.0, 0.0, 4.0, -0.5],
+        &[0.2, 0.1, -0.3],
+    );
+}
+
+/// #1716 review r1, finding 2: the **IOV** provider through shape transforms.
+/// `boxcox(ETA_CL + KAPPA_CL, LAMBDA)` puts the occasion κ inside the transform,
+/// so ∂/∂κ runs through h′ too; `tdist` on V. Value, gradient and Hessian over
+/// `[η_bsv, κ_g0, κ_g1]` + θ (the shape θs included) must match FD of
+/// `predict_iov`. The fixture is asserted onto the IOV provider, not FD.
+/// Dies under: the generic VM lifting `Op::Shape` as a constant.
+#[test]
+fn iov_provider_through_shape_transforms_matches_fd_of_predict_iov() {
+    const IOV_SHAPED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta LAMBDA(0.5, -3.0, 3.0)
+  theta NU(5.0, 3.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL + KAPPA_CL, LAMBDA))
+  V  = TVV  * exp(tdist(ETA_V, NU))
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+    let model = parse_model_string(IOV_SHAPED).expect("parse shaped IOV");
+    assert_eq!(model.n_kappa, 1);
+    assert!(
+        iov_analytical_supported(&model),
+        "a shaped IOV model stays on the IOV provider"
+    );
+    check_iov_provider_vs_fd(
+        &model,
+        &iov_subject(),
+        &[0.2, 10.0, 0.5, 20.0, 1.5, 0.5, 5.0],
+        &[0.25, -0.18, 0.20, 0.15, -0.20],
+    );
+}
