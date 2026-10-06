@@ -49,6 +49,14 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// written for this layout. Otherwise they are dropped, and the blocks are left for
 /// `bind_theta_levels` to bind on `population`.
 ///
+/// A kept layout keeps its contrast too (#1736). The binder does not re-resolve
+/// a block declared `auto`, and `population` can resolve it differently while
+/// showing the same levels. With more subjects per study, for example, a block
+/// on `[STUDY, TIME]` resolves to `sum_to_zero` where one subject per study
+/// gave `sum_to_zero_within`, and the kept layout has fewer free θ. To re-bind
+/// both halves on new data, call `bind_theta_levels` first, which resolves the
+/// contrast on `population`.
+///
 /// Also a no-op on a model laid out on a fit's bindings
 /// ([`bind_from_fit`](crate::api::bind_from_fit),
 /// [`layout_from_fit`](crate::api::layout_from_fit)): its centres are the fit's,

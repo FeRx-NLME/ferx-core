@@ -6174,6 +6174,81 @@ mod rebind {
         assert_eq!(twin(&prebound), twin(&unbound));
     }
 
+    /// #1736, the documented scope of a statistics-only re-bind: a kept level layout
+    /// keeps its contrast. A (one subject per study) resolves the `auto` block on
+    /// `[STUDY, TIME]` to `SumToZeroWithin`. B (two per study) shows the same 18
+    /// levels and carries their index columns, but resolves `SumToZero`, two more
+    /// free θ. `bind_covariate_stats` on B keeps A's coding; `bind_theta_levels` on B
+    /// (the documented remedy) then gives the unbound twin. Measured on S2 and H1:
+    /// kept 19 θ, B's own 21; PRED agrees at the default θ (every level init is 0).
+    ///
+    /// Two cells per shape: A bound by levels alone (the statistics bind then borrows
+    /// the stamped model, as in `prepare_run`), and by both halves (it re-parses the
+    /// declaration). The straddle is asserted: same labels, different contrast.
+    ///
+    /// Mutations — always drop the levels in `bind_covariate_stats`: the levels-only
+    /// cell's `kept` assertion sees `Auto`. Read `decls` from `parsed.model` in
+    /// `bind_theta_levels`: the remedy keeps `SumToZeroWithin`.
+    #[test]
+    fn a_statistics_only_rebind_keeps_the_contrast_and_a_level_bind_resolves_it() {
+        for tag in ["S2", "H1"] {
+            let text = shape_with_median(tag);
+            // B's own resolution, with its index columns written: levels alone, so
+            // the reference does not lean on the statistics binder under test.
+            let mut b = with_wt(cf_pop(3, 2, &T6), 60.0);
+            let mut own = parse_full_model(&text).unwrap();
+            crate::api::bind_theta_levels(&mut own, &text, &mut b).unwrap();
+            let mut stats_on_b = parse_full_model(&text).unwrap();
+            bind_covariate_stats(&mut stats_on_b, &text, &b).unwrap();
+            for pair in [false, true] {
+                let cell = format!("{tag}, A bound by {}", if pair { "both" } else { "levels" });
+                let mut a = with_wt(cf_pop(3, 1, &T6), 80.0);
+                let mut prebound = parse_full_model(&text).unwrap();
+                crate::api::bind_theta_levels(&mut prebound, &text, &mut a).unwrap();
+                if pair {
+                    bind_covariate_stats(&mut prebound, &text, &a).unwrap();
+                }
+                // The straddle.
+                let (kept, theirs) = (
+                    &prebound.bindings.levels["PLACEBO"],
+                    &own.bindings.levels["PLACEBO"],
+                );
+                assert_eq!(kept.labels, theirs.labels, "{cell}: B shows A's levels");
+                assert_eq!(kept.contrast, LevelContrast::SumToZeroWithin, "{cell}");
+                assert_eq!(theirs.contrast, LevelContrast::SumToZero, "{cell}");
+
+                bind_covariate_stats(&mut prebound, &text, &b).unwrap();
+                let got = twin(&prebound);
+                assert_eq!(got.7, vec![LevelContrast::SumToZeroWithin], "{cell}: kept");
+                assert_eq!(
+                    got.6.covariate_stats, stats_on_b.bindings.covariate_stats,
+                    "{cell}: B's statistics"
+                );
+                assert_eq!((got.0, own.model.n_theta), (19, 21), "{cell}: θ count");
+
+                let mut want_pop = b.clone();
+                let mut unbound = parse_full_model(&text).unwrap();
+                both(&mut unbound, &text, &mut want_pop);
+                crate::api::bind_theta_levels(&mut prebound, &text, &mut b.clone()).unwrap();
+                assert_eq!(twin(&prebound), twin(&unbound), "{cell}: the remedy");
+
+                // The order the docs give (#1745 review r1, finding 3): from the
+                // A-bound model, levels first, then statistics, both on B.
+                let mut a = with_wt(cf_pop(3, 1, &T6), 80.0);
+                let mut ordered = parse_full_model(&text).unwrap();
+                crate::api::bind_theta_levels(&mut ordered, &text, &mut a).unwrap();
+                if pair {
+                    bind_covariate_stats(&mut ordered, &text, &a).unwrap();
+                }
+                assert_eq!(twin(&ordered).7, vec![LevelContrast::SumToZeroWithin]);
+                both(&mut ordered, &text, &mut b.clone());
+                let got = twin(&ordered);
+                assert_eq!(got.7, vec![LevelContrast::SumToZero], "{cell}: in order");
+                assert_eq!(got, twin(&unbound), "{cell}: in order");
+            }
+        }
+    }
+
     /// T4: provenance, both arms in one test. The two models carry the **same**
     /// bindings — the fit's, median 70 — and differ only in where those came from.
     /// Laid out on the fit, a statistics bind on a design (median 90) is a no-op:

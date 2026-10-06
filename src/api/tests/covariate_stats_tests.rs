@@ -989,6 +989,146 @@ fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
     }
 }
 
+/// #1743. The three ways the check's binding step fails each carry their own code
+/// and block, asserted in one test so no arm can borrow another's: a failed
+/// re-read of the model file is `E_MODEL_REREAD` with **no** block, even on a
+/// model with no level block (the arm was `E_THETA_LEVEL_BINDING` on
+/// `parameters`); a level block that cannot bind keeps `E_THETA_LEVEL_BINDING` on
+/// `parameters`; a statistic that cannot bind keeps `E_COVARIATE_STATS_BINDING`
+/// on `covariate_model`.
+///
+/// Mutations — restore the old code or block on the re-read arm: the first cell.
+/// Delete either sentence of its message: the `contains` on that sentence.
+/// Swap the two binders' codes: the second and third cells.
+#[test]
+fn each_binding_failure_of_the_check_carries_its_own_code() {
+    use crate::api::validation::bind_for_check;
+    let bind = |text: &str, read: std::io::Result<String>, pop: &mut Population| {
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_for_check(&mut parsed, "m.ferx", read, pop).expect_err("the bind fails")
+    };
+    // No level block: the re-read arm is no level-block error.
+    let text = grp_auto();
+    let reread = bind(
+        &text,
+        Err(std::io::Error::other("gone")),
+        &mut population("GRP", &[1.0, 2.0]),
+    );
+    assert_eq!(reread.code, "E_MODEL_REREAD", "{reread:?}");
+    assert_eq!(reread.block, None, "{reread:?}");
+    assert!(
+        reread
+            .message
+            .contains("Failed to re-read the model file `m.ferx` to bind it to the data: gone."),
+        "{}",
+        reread.message
+    );
+    assert!(
+        reread.message.contains(
+            "The check had already read it, so it was moved, deleted or made unreadable \
+             while the check ran."
+        ),
+        "{}",
+        reread.message
+    );
+
+    let level = text
+        .replace(
+            "  theta TVV(40.0, 1.0, 500.0)",
+            "  theta TVV(40.0, 1.0, 500.0)\n  theta PLACEBO[GRP](0.5, -5.0, 5.0)",
+        )
+        .replace("V  = TVV", "V  = TVV * exp(PLACEBO)");
+    let levels = bind(
+        &level,
+        Ok(level.clone()),
+        &mut population("GRP", &[1.0, 2.0]),
+    );
+    assert_eq!(levels.code, "E_THETA_LEVEL_BINDING", "{levels:?}");
+    assert_eq!(levels.block.as_deref(), Some("parameters"), "{levels:?}");
+
+    let stats = bind(&text, Ok(text.clone()), &mut population("GRP", &[2.0, 2.0]));
+    assert_eq!(stats.code, "E_COVARIATE_STATS_BINDING", "{stats:?}");
+    assert_eq!(stats.block.as_deref(), Some("covariate_model"), "{stats:?}");
+    assert!(
+        stats.message.contains("nothing to estimate"),
+        "{}",
+        stats.message
+    );
+}
+
+/// #1743, end to end: a `validate_model_file` run whose model file is deleted
+/// after the parse, while the data are read, reports `E_MODEL_REREAD` with no
+/// block, and no binding code. The data file is a FIFO, so the writer controls
+/// when the read finishes: it deletes the model while the reader blocks on the
+/// pipe, then writes the rows. Control, in the same test: the same files with the
+/// model left in place validate clean of every binding code.
+///
+/// Mutations — restore the old code on the re-read arm: the `code` assertion.
+/// Restore its `parameters` block: the `block` assertion.
+#[cfg(unix)]
+#[test]
+fn a_model_file_gone_by_the_rebind_is_its_own_error() {
+    use std::io::Write;
+    let text = grp_auto();
+    let rows = {
+        let d = temp_cov_csv("GRP", &[Some(1.0), Some(2.0), Some(1.0), Some(2.0)]);
+        std::fs::read_to_string(d.path()).unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let model = dir.path().join("m.ferx");
+    let binding_codes = |r: &crate::diagnostics::CheckReport| -> Vec<_> {
+        r.diagnostics
+            .iter()
+            .filter(|d| d.code.ends_with("_BINDING") || d.code == "E_MODEL_REREAD")
+            .cloned()
+            .collect()
+    };
+
+    for gone in [true, false] {
+        std::fs::write(&model, &text).unwrap();
+        let fifo = dir.path().join(format!("data-{gone}.csv"));
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo");
+        let (done, wrote) = std::sync::mpsc::channel();
+        let writer = {
+            let (fifo, model, rows) = (fifo.clone(), model.clone(), rows.clone());
+            std::thread::spawn(move || {
+                // Opening blocks until the check opens the data: the parse is done.
+                let mut f = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                if gone {
+                    std::fs::remove_file(&model).unwrap();
+                }
+                f.write_all(rows.as_bytes()).unwrap();
+                done.send(()).unwrap();
+            })
+        };
+        let report =
+            crate::api::validate_model_file(model.to_str().unwrap(), Some(fifo.to_str().unwrap()));
+        // A check that never opens the data leaves the writer blocked in `open`: fail
+        // rather than hang (#1745 review r1, finding 1). Opening the read end releases
+        // it, so the thread is not left behind.
+        if wrote
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err()
+        {
+            drop(std::fs::File::open(&fifo));
+            panic!("the writer is still blocked: the check never opened the data");
+        }
+        writer.join().unwrap();
+        let hits = binding_codes(&report);
+        if gone {
+            assert_eq!(hits.len(), 1, "{:?}", report.diagnostics);
+            assert_eq!(hits[0].code, "E_MODEL_REREAD", "{:?}", hits[0]);
+            assert_eq!(hits[0].block, None, "{:?}", hits[0]);
+        } else {
+            assert!(hits.is_empty(), "control: {:?}", report.diagnostics);
+        }
+    }
+}
+
 /// The #1738 fixture: `CL ~ WT power` with an explicit `=> THETA_CL_WT(...)`,
 /// centred on `center`, plus a genuinely unused `UNUSED_T` as the control.
 fn unused_census_model(center: &str) -> String {

@@ -6888,29 +6888,12 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 {
                     diags.push(Diagnostic::warning(reader_warning_code(w), w.clone()));
                 }
-                // The two binders fail for unrelated reasons and point at different
-                // blocks, so each keeps its own code (#1739): a `[covariate_model]`
-                // statistic with nothing to estimate is not a level-block error.
-                let binding = std::fs::read_to_string(model_path)
-                    .map_err(|e| {
-                        Diagnostic::error(
-                            "E_THETA_LEVEL_BINDING",
-                            format!("Failed to re-read model file for level binding: {e}"),
-                        )
-                        .with_block("parameters")
-                    })
-                    .and_then(|model_text| {
-                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
-                            .map_err(|e| {
-                                Diagnostic::error("E_THETA_LEVEL_BINDING", e)
-                                    .with_block("parameters")
-                            })?;
-                        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
-                            .map_err(|e| {
-                                Diagnostic::error("E_COVARIATE_STATS_BINDING", e)
-                                    .with_block("covariate_model")
-                            })
-                    });
+                let binding = bind_for_check(
+                    &mut parsed,
+                    model_path,
+                    std::fs::read_to_string(model_path),
+                    &mut population,
+                );
                 if let Err(d) = binding {
                     diags.push(d);
                 } else {
@@ -6991,6 +6974,36 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
     report
+}
+
+/// The binding step of [`validate_model_file`]: bind `parsed` to `population`
+/// from `model_text`, the model file read again from `model_path`.
+///
+/// Each failure keeps its own code, since each points somewhere else (#1739,
+/// #1743): a failed re-read is about the file, not about any block, so it
+/// carries no block; a level block that cannot bind is a `[parameters]` error;
+/// a statistic that cannot bind is a `[covariate_model]` one.
+pub(crate) fn bind_for_check(
+    parsed: &mut crate::types::ParsedModel,
+    model_path: &str,
+    model_text: std::io::Result<String>,
+    population: &mut Population,
+) -> Result<(), Diagnostic> {
+    let model_text = model_text.map_err(|e| {
+        Diagnostic::error(
+            "E_MODEL_REREAD",
+            format!(
+                "Failed to re-read the model file `{model_path}` to bind it to the data: {e}. \
+                 The check had already read it, so it was moved, deleted or made unreadable \
+                 while the check ran."
+            ),
+        )
+    })?;
+    crate::api::bind_theta_levels(parsed, &model_text, population)
+        .map_err(|e| Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"))?;
+    crate::api::bind_covariate_stats(parsed, &model_text, population).map_err(|e| {
+        Diagnostic::error("E_COVARIATE_STATS_BINDING", e).with_block("covariate_model")
+    })
 }
 
 /// Validate `model.output_columns` against known quantities, emitting
