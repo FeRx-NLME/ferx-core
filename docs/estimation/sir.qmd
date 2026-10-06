@@ -193,12 +193,15 @@ reported scale.
 
 Under the default `sir_scale = packed` it then checks each free Ω and κ variance.
 Each one is moved alone to its lower bound in the parameter box, with the EBEs
-re-solved, and the OFV is compared with the fit's. A rise below
+re-solved, and the OFV is compared with the OFV recomputed at the estimates. For
+an η inside a `block_omega` or block κ, its covariances with the earlier ηs of
+the block are set to 0 as well, so its variance itself reaches the floor rather
+than only its correlation reaching ±1. A rise below
 χ²₁(0.95) = 3.84 means zero is inside that variance's likelihood-ratio interval:
 the conditional ΔOFV is an upper bound on the profile ΔOFV. That variance's SIR
 lower limit then reflects the parameter box rather than the data, and the warning
-names it. The check costs one inner loop per variance and runs only on a low-ESS
-run. It does not run the other way: a rise above 3.84 does not prove the variance
+names it. The check costs one inner loop per variance, plus one at the estimates, and
+runs only on a low-ESS run. It does not run the other way: a rise above 3.84 does not prove the variance
 is bounded away from zero, and the warning does not say it is.
 
 `warfarin_iov` fitted with FOCEI is the bundled example:
@@ -207,13 +210,16 @@ is bounded away from zero, and the warning does not say it is.
 SIR: effective sample size is 3.5 of 1000 draws, below the 100 at which the
 proposal is adequate, so these intervals rest on few draws. The heaviest draw
 carries 52.9% of the weight; it moves ETA_CL by -6.36 proposal standard
-deviations, to 4.585e-4 on the reported scale. Increase `sir_samples` for more
-stable intervals. The data do not bound ETA_KA (ΔOFV 1.56 at variance 6.14e-6)
-away from zero: each, moved alone to its lower bound in the parameter box,
-raises the OFV by less than χ²₁(0.95) = 3.84, so its SIR lower limit reflects the
-parameter box rather than the data. `sir_scale = natural` makes these lower
-limits independent of the box.
+deviations from the proposal centre, to 4.585e-4 on the reported scale. Increase
+`sir_samples` for more stable intervals. The data do not bound ETA_KA (ΔOFV 1.56
+at variance 6.14e-6) away from zero: each, moved alone to its lower bound in the
+parameter box, costs less than χ²₁(0.95) = 3.84 in OFV, so its SIR lower limit
+reflects the parameter box rather than the data. `sir_scale = natural` makes
+these lower limits independent of the box.
 ```
+
+With fewer than 100 draws the ESS cannot reach 100 at all, so the first
+sentence says that instead.
 
 #### Variances the data do not bound away from zero
 
@@ -267,6 +273,10 @@ on macOS arm64):
 | | natural | 139.8 | 813.7 |
 | `mbma_placebo` (6 studies, BTAV κ) | packed | 143.2 | 820.6 |
 | | natural | 35.2 | 252.6 |
+
+`natural` is refused for a model with a `prior(...)`: a declared prior is a
+density on the packed scale, so the target is already the likelihood times that
+prior, and there is no flat prior to move to the reported scale.
 
 `packed` stays the default because the MBMA shape is the one ferx is built for.
 Under `natural`, a low-ESS warning points back to `packed` instead of probing the
