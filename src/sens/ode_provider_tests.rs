@@ -13128,3 +13128,52 @@ fn ode_wide_theta_only_model_is_analytic_without_an_fd_warning() {
         "an η-free model has no inner gradient to fall back from"
     );
 }
+
+/// #1716 review r1, finding 2: the **ODE** provider through shape transforms.
+/// The ODE provider assembles `∂p/∂(θ, η)` from the same `IndivParamProgram`, so
+/// a shaped parameter must keep its exact jets there too: value + ∂ + ∂² vs FD of
+/// production, multi-dose (the 12 h dose lands on residual drug), η ≠ 0 and the
+/// shapes away from their identity points. Asserted onto the analytic ODE
+/// provider, not FD.
+/// Dies under: the generic VM lifting `Op::Shape` as a constant.
+#[test]
+fn ode_provider_through_shape_transforms_matches_fd() {
+    const ODE_SHAPED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LAMBDA(0.5, -3.0, 3.0)
+  theta LJD(0.6, -3.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V  = TVV * exp(johndraper(ETA_V, LJD))
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(ODE_SHAPED).expect("parse shaped ODE");
+    assert!(
+        ode_analytical_supported(&model),
+        "a shaped ODE model stays on the analytic ODE provider"
+    );
+    let mut subject = bolus_subject(&[0.5, 2.0, 6.0, 11.5, 12.5, 16.0, 24.0]);
+    subject
+        .doses
+        .push(DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0));
+    let theta = [0.2, 10.0, 0.5, 0.6];
+    for eta in [[0.25, -0.3], [-0.35, 0.2]] {
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    }
+}
