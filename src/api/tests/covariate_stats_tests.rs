@@ -522,9 +522,10 @@ fn predict_refuses_a_categorical_value_outside_the_levels() {
 }
 
 /// #1740 T2. Both sides of the advice's `bound_from_fit()` gate in one test. A
-/// model laid out on an `auto` fit's bindings has the fit's θ vector, so "list the
-/// level" and `levels = auto` are not repairs there — the message must say the
-/// fit estimated no θ for the value and leave those out. The literal model on the
+/// model laid out on an `auto` fit's bindings has the fit's θ vector, so the
+/// literal advice ("Add the value", `levels = auto`) is not the repair there — the
+/// message must say the fit estimated no θ for the value and leave it out. (A
+/// written-out relation in a from-fit model is T2b.) The literal model on the
 /// same design gets the literal advice. Forcing the branch either way reddens one
 /// half.
 #[test]
@@ -567,6 +568,58 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
     let mut parsed = parse_full_model(&text).expect("parse");
     crate::api::bind_from_fit(&mut parsed, &text, &mut twin, &bindings).expect("from fit");
     preds(&parsed.model, &twin).expect("from fit: listed levels predict");
+}
+
+/// #1740 T2b (review r1 #1/#3). `bound_from_fit()` is model-wide: a model is laid
+/// out on a fit because of *any* data-derived relation — here `V ~ WT power(center =
+/// median)` — so a relation whose levels are **written out** is in the from-fit
+/// cell too. There, refitting on data that carries the value is not enough on its
+/// own: the refit is refused the same way until the value is added to `levels =
+/// [...]`, so the from-fit advice has to say so. Asserted from both ends: the
+/// from-fit message names that repair, and the refit it would otherwise send the
+/// reader to is refused, with the literal advice.
+#[test]
+fn the_from_fit_advice_covers_a_relation_whose_levels_are_written_out() {
+    let text = model(
+        "  GRP categorical(levels = [1, 2, 3])\n  WT continuous",
+        "  CL ~ GRP categorical(ref = 2)\n  V ~ WT power(center = median)",
+    );
+    let with_wt = |grp: &[f64]| {
+        let mut pop = population("GRP", grp);
+        for (i, s) in pop.subjects.iter_mut().enumerate() {
+            s.covariates
+                .insert("WT".to_string(), 50.0 + 10.0 * i as f64);
+        }
+        pop.covariate_names.push("WT".to_string());
+        pop
+    };
+    let bindings = bind(&text, &with_wt(&[1.0, 2.0, 2.0, 3.0]))
+        .expect("bind")
+        .data_bindings()
+        .clone();
+    let mut parsed = parse_full_model(&text).expect("parse");
+    let mut design = with_wt(&[1.0, 2.0, 4.0]);
+    crate::api::bind_from_fit(&mut parsed, &text, &mut design, &bindings).expect("from fit");
+    assert!(
+        parsed.model.bound_from_fit(),
+        "the WT relation lays the model out"
+    );
+
+    let e = preds(&parsed.model, &design).expect_err("from fit: unlisted level refused");
+    assert!(e.contains("The fit estimated no θ for these values"), "{e}");
+    assert!(
+        e.contains("adding them to `levels = [...]` first if the levels are written out"),
+        "the written-out case needs its repair: {e}"
+    );
+
+    // The refit on the design, as the advice's "refit" half would have it.
+    let refit = bind(&text, &design).expect("the design binds its own WT median");
+    let diags = crate::api::check_model_data(&refit, &design);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_COV_LEVEL_UNKNOWN")
+        .unwrap_or_else(|| panic!("the refit is refused too: {diags:?}"));
+    assert!(hit.message.contains("Add the value"), "{}", hit.message);
 }
 
 /// #1740 T3. The check reads every record a value can arrive on, the same set the

@@ -2657,17 +2657,21 @@ fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
 /// fitted model with nothing in the output to say so, which is exactly the
 /// class of silent-covariate-drop this block exists to prevent.
 ///
-/// Every entry point that evaluates a model on a population calls this — fit and
-/// `ferx check` through `check_model_data`, simulate and adaptive through
-/// `check_simulation_data`, and predict, npde, SIR and covariance directly
-/// (#1740) — so a design recoded to a level the model has no θ for is refused
-/// wherever it arrives. A missing value is not a level and passes: it takes the
+/// Called by `fit()` and `ferx check` (through `check_model_data`), the
+/// `simulate*` and adaptive entry points (through `check_simulation_data`), and
+/// directly by `predict_diag` / `predict_survival` / `predict_categorical`,
+/// `compute_npde_npd` and `resolve_fit_inputs` (`run_sir`, `run_covariance`)
+/// (#1740). The per-method estimators that `fit()` dispatches to (`run_saem`,
+/// `run_bayes`, `optimize_population`, …) do not call it; they rely on `fit()`
+/// having checked first. A missing value is not a level and passes: it takes the
 /// documented neutral branch.
 ///
 /// The advice depends on where the levels came from. A model laid out on a fit
-/// (`bound_from_fit()`) has the fit's θ vector, so adding a level or switching
-/// to `levels = auto` is not a repair there — the only ones are to drop or
-/// recode the rows, or refit.
+/// (`bound_from_fit()`) has the fit's θ vector, so the repairs are to drop or
+/// recode the rows or to refit. `bound_from_fit()` is model-wide, though — any
+/// data-derived relation lays the model out — so the from-fit advice also covers
+/// a relation whose levels are written out, which needs the value added to
+/// `levels = [...]` before that refit (review of #1742).
 pub(crate) fn check_covariate_levels(
     model: &CompiledModel,
     population: &Population,
@@ -2718,7 +2722,8 @@ pub(crate) fn check_covariate_levels(
                            with nothing to say so.";
         let advice = if from_fit {
             "The fit estimated no θ for these values: drop or recode those rows, or refit on \
-             data that carries them."
+             data that carries them, adding them to `levels = [...]` first if the levels are \
+             written out."
                 .to_string()
         } else {
             format!(
