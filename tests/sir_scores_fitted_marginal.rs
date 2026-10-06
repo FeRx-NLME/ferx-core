@@ -173,6 +173,76 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
     assert_eq!(cov.se_kappa, r.se_kappa);
 }
 
+/// NONMEM's FOCE optimum on `examples/warfarin.ferx` (the `warfarin_foce_cwres` anchor's
+/// `.ext`), so the GN fixture below scores a converged point without a loop.
+const WARF_THETA: [f64; 3] = [
+    1.3296190773543662E-01,
+    7.7305172240926252E+00,
+    7.2537506677117802E-01,
+];
+const WARF_OMEGA: [f64; 3] = [
+    2.8596520575084699E-02,
+    9.5781911176013226E-03,
+    3.4881225592887283E-01,
+];
+const WARF_SIGMA_VAR: f64 = 1.1548425869877831E-04;
+
+/// The pass-through branch of `fitted_marginal_options`: for a method the rule does not
+/// fix (here Gauss-Newton), the standalone entries take the flag the **fit** recorded,
+/// not the caller's. A `FoceGn` fit with `interaction = false`, re-run through
+/// `run_covariance` with `interaction = true` options, must reproduce the in-fit SEs bit
+/// for bit — reading the caller's flag instead differentiates the interaction marginal
+/// (#1725 review round 1, finding 1).
+#[test]
+fn standalone_covariance_keeps_a_gn_fits_own_interaction() {
+    let prep = prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("warfarin must prepare");
+    let mut init = prep.init_params.clone();
+    init.theta = WARF_THETA.to_vec();
+    init.omega = OmegaMatrix::from_diagonal(&WARF_OMEGA, init.omega.eta_names.clone());
+    init.sigma.values = vec![WARF_SIGMA_VAR.sqrt()];
+    let opts = FitOptions {
+        method: EstimationMethod::FoceGn,
+        interaction: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..FitOptions::default()
+    };
+    let r = fit(&prep.parsed.model, &prep.population, &init, &opts).expect("GN fit must run");
+    assert_analytic(&r);
+    assert_eq!(r.method, EstimationMethod::FoceGn);
+    assert!(
+        !r.interaction,
+        "a GN fit keeps the caller's interaction = false"
+    );
+    let caller = FitOptions {
+        interaction: true,
+        ..opts.clone()
+    };
+    let cov = run_covariance(
+        &r,
+        Some(&prep.parsed.model),
+        Some(&prep.population),
+        &caller,
+    )
+    .expect("standalone run_covariance must run");
+    let (a, b) = (
+        cov.se_theta.as_ref().expect("standalone SE"),
+        r.se_theta.as_ref().expect("in-fit SE"),
+    );
+    eprintln!("MEASURE GN se_theta standalone={a:?} in-fit={b:?}");
+    for (k, (x, y)) in a.iter().zip(b).enumerate() {
+        assert!(x.is_finite() && y.is_finite(), "SE(theta[{k}]) not finite");
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "SE(theta[{k}]): standalone {x} vs in-fit {y}"
+        );
+    }
+    assert_eq!(cov.se_omega, r.se_omega);
+    assert_eq!(cov.se_sigma, r.se_sigma);
+}
+
 /// T5. The M3 non-interaction warning fires for an API-built FOCE fit with censored
 /// observations (its gate read the leaked `true` and never opened), and stays silent
 /// for FOCEI on the same data. Both sides in one test, so a gate stuck either way fails.

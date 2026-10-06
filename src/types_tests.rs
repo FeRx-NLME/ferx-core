@@ -3575,7 +3575,8 @@ fn interaction_for_truth_table() {
             !interaction_for(Foce, inherited),
             "Foce, inherited {inherited}"
         );
-        for m in [Saem, Imp, FoceGn, FoceGnHybrid, Laplace] {
+        // Every other variant of the enum, so no pass-through method can be hard-wired.
+        for m in [FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes, Laplace, Vi] {
             assert_eq!(
                 interaction_for(m, inherited),
                 inherited,

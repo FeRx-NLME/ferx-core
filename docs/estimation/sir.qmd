@@ -86,7 +86,7 @@ FOCE fit (`method = foce`, no interaction), proposal = ML covariance matrix, def
 Measured on Linux aarch64 (#1710). Earlier versions of this table (ESS 310 / 587 / 1097)
 were taken while a model-file `method = foce` still weighted SIR's draws with the
 **FOCEI** objective, a different marginal from the one the proposal was centred on. With
-the same seed that gave ESS 238 at 1000 draws here, and 4.9 of 1000 on warfarin_iov.
+the same seed, those weights gave ESS 238 at 1000 draws here, and 4.9 of 1000 on warfarin_iov.
 
 The full fit + SIR runs in ~0.1s.
 
