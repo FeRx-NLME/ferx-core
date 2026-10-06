@@ -10,8 +10,8 @@
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
-    compute_mu_k, coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds,
-    packed_segments, unpack_params, PackedBounds, PackedCoordKind, PackedStart,
+    compute_mu_k, coordinate_names, coordinate_values, pack_with_bounds, packed_segments,
+    unpack_params, PackedBounds, PackedStart,
 };
 use crate::estimation::uncertainty_samples::{
     admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian,
@@ -158,13 +158,24 @@ pub(crate) fn low_ess_warning(
     if ess >= SIR_LOW_ESS {
         return None;
     }
-    let mut msg = format!(
-        "effective sample size is {ess:.1} of {n_samples} draws, below the {SIR_LOW_ESS:.0} \
-         at which the proposal is adequate, so these intervals rest on few draws."
-    );
+    // Rounded down, so an ESS just under the threshold never prints as "100.0".
+    let shown = (ess * 10.0).floor() / 10.0;
+    let mut msg = if (n_samples as f64) < SIR_LOW_ESS {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws; with fewer than \
+             {SIR_LOW_ESS:.0} draws it cannot reach the {SIR_LOW_ESS:.0} at which the proposal \
+             is adequate, so these intervals rest on few draws."
+        )
+    } else {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws, below the \
+             {SIR_LOW_ESS:.0} at which the proposal is adequate, so these intervals rest on \
+             few draws."
+        )
+    };
     msg.push_str(&format!(
         " The heaviest draw carries {:.1}% of the weight; it moves {} by {:+.2} proposal \
-         standard deviations, to {:.3e} on the reported scale.",
+         standard deviations from the proposal centre, to {:.3e} on the reported scale.",
         100.0 * heaviest.share,
         heaviest.name,
         heaviest.sd_units,
@@ -188,9 +199,9 @@ pub(crate) fn low_ess_warning(
                     .join(", ");
                 msg.push_str(&format!(
                     " The data do not bound {listed} away from zero: each, moved alone to \
-                     its lower bound in the parameter box, raises the OFV by less than \
-                     χ²₁(0.95) = 3.84, so its SIR lower limit reflects the parameter box \
-                     rather than the data."
+                     its lower bound in the parameter box, costs less than χ²₁(0.95) = 3.84 in \
+                     OFV, so its SIR lower limit reflects the parameter box rather than the \
+                     data."
                 ));
                 msg.push_str(
                     " `sir_scale = natural` makes these lower limits independent of the box.",
@@ -207,15 +218,65 @@ pub(crate) fn low_ess_warning(
     Some(msg)
 }
 
-/// The free Ω / Ω_IOV Cholesky-diagonal coordinates the floor probe moves —
-/// never a FIX one, a θ, a σ or a `[mixture]` override.
-pub(crate) fn floor_probe_coords(params: &ModelParameters, fixed: &[bool]) -> Vec<usize> {
+/// One variance the floor probe moves: the packed index of its Cholesky
+/// diagonal `ln L_ii`, and those of the off-diagonals `L_ik` (k < i) in the
+/// same row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloorProbeCoord {
+    pub diag: usize,
+    pub row_off: Vec<usize>,
+}
+
+/// The free Ω / Ω_IOV variances the floor probe moves — never a FIX one, a θ,
+/// a σ or a `[mixture]` override. In a `block_omega` / block κ an η's variance
+/// is `Σ_ii = Σ_k L_ik²`, so flooring `ln L_ii` alone leaves `Σ_ii ≈ Σ_{k<i}
+/// L_ik²` and only drives the η's correlation towards ±1; the probe point
+/// therefore also zeroes the row's off-diagonals ([`floor_probe_point`]).
+pub(crate) fn floor_probe_coords(params: &ModelParameters, fixed: &[bool]) -> Vec<FloorProbeCoord> {
     let seg = packed_segments(params);
-    let kinds = coordinate_kinds(params);
-    (seg.omega_start()..seg.sigma_start())
-        .chain(seg.iov_start()..seg.mixture_omega_start())
-        .filter(|&i| !fixed[i] && kinds[i] == PackedCoordKind::OmegaDiagonal)
-        .collect()
+    let mut out = Vec::new();
+    let mut block = |start: usize, om: &OmegaMatrix| {
+        let mut rows: Vec<FloorProbeCoord> = (0..om.dim())
+            .map(|_| FloorProbeCoord {
+                diag: usize::MAX,
+                row_off: Vec::new(),
+            })
+            .collect();
+        for (off, (r, c)) in
+            crate::estimation::parameterization::lower_tri_iter(om.dim(), om.diagonal).enumerate()
+        {
+            if r == c {
+                rows[r].diag = start + off;
+            } else {
+                rows[r].row_off.push(start + off);
+            }
+        }
+        out.extend(rows.into_iter().filter(|c| !fixed[c.diag]));
+    };
+    block(seg.omega_start(), &params.omega);
+    if let Some(ref iov) = params.omega_iov {
+        block(seg.iov_start(), iov);
+    }
+    out
+}
+
+/// The packed point a floor probe scores: the estimate with the variance's
+/// Cholesky diagonal at its own packed lower bound and its row's off-diagonals
+/// at 0, so `Σ_ii = e^{2·lower}`. Any point on that constraint is a valid
+/// upper bound for the profile ΔOFV there. A held non-zero off-diagonal is set
+/// to 0 too; the bounds screen then rejects the point and the variance is not
+/// flagged — the conservative outcome.
+pub(crate) fn floor_probe_point(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    c: &FloorProbeCoord,
+) -> Vec<f64> {
+    let mut x = x_hat.to_vec();
+    x[c.diag] = bounds.lower[c.diag];
+    for &j in &c.row_off {
+        x[j] = 0.0;
+    }
+    x
 }
 
 /// The proposal centre under [`SirScale::Natural`], on the draw scale: the
@@ -808,6 +869,17 @@ fn run_sir_in_box(
     // about whether the prior is in.
     let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
     let ofv_hat = ofv_hat + priors.penalty(&x_hat);
+    // #1723: a declared prior is a density on the packed scale, so the target is
+    // already `L · p(x)` with no flat prior left to move to the reported scale;
+    // the natural Jacobian would tilt the prior the fit was estimated under.
+    if options.sir_scale == SirScale::Natural && priors.is_active() {
+        return Err(
+            "sir_scale = natural is not defined for a model with prior(...): the SIR \
+             target is already the likelihood times the declared prior on the packed scale, \
+             so there is no flat prior to move to the reported scale. Use sir_scale = packed."
+                .to_string(),
+        );
+    }
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
         return Err(format!(
@@ -1079,13 +1151,21 @@ fn run_sir_in_box(
             params,
         );
         let probe = || {
+            // The baseline is `ofv_at` at the estimate, not the caller's
+            // `ofv_hat`: an offset between the two cancels in the normalised
+            // weights, but here it would shift an absolute ΔOFV compared against
+            // 3.84 (e.g. a Laplace `fit.ofv` against FOCEI-scored draws).
+            let base = match screen_draw(&x_hat, &bounds, params) {
+                Ok(p) => ofv_at(&p, &x_hat),
+                Err(_) => return Vec::new(),
+            };
             floor_probe_coords(params, &fixed_mask)
                 .into_iter()
-                .filter_map(|i| {
-                    let mut x = x_hat.clone();
-                    x[i] = bounds.lower[i];
+                .filter_map(|c| {
+                    let x = floor_probe_point(&x_hat, &bounds, &c);
                     let p = screen_draw(&x, &bounds, params).ok()?;
-                    let dofv = ofv_at(&p, &x) - ofv_hat;
+                    let i = c.diag;
+                    let dofv = ofv_at(&p, &x) - base;
                     dofv.is_finite().then(|| FloorProbe {
                         name: coord_names[i].clone(),
                         dofv,

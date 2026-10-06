@@ -10,7 +10,7 @@ const S_THRESHOLD: &str =
     "below the 100 at which the proposal is adequate, so these intervals rest on few draws.";
 const S_HEAVIEST: &str =
     "heaviest draw carries 52.9% of the weight; it moves ETA_CL by -6.36 proposal standard \
-     deviations, to 4.585e-4 on the reported scale.";
+     deviations from the proposal centre, to 4.585e-4 on the reported scale.";
 const S_MORE: &str = "Increase `sir_samples` for more stable intervals.";
 const S_SHELF_HEAD: &str = "The data do not bound ";
 const S_SHELF_TAIL: &str = "its SIR lower limit reflects the parameter box rather than the data.";
@@ -72,7 +72,7 @@ fn low_ess_warning_gate_straddles_the_threshold_and_skips_the_probe_above_it() {
     };
     let msg = low_ess_warning(below, 1000, SirScale::Packed, &heaviest(), probe).expect("warns");
     assert_eq!(calls.get(), 1);
-    assert!(has(&msg, "effective sample size is 100.0 of 1000"), "{msg}");
+    assert!(has(&msg, "effective sample size is 99.9 of 1000"), "{msg}");
 }
 
 /// Row "ESS < 100, no flagged variance": ESS, draw and more-samples sentences;
@@ -118,7 +118,8 @@ fn low_ess_warning_names_each_flagged_variance_and_only_those() {
         S_SHELF_TAIL,
         S_TO_NATURAL,
         "ETA_KA (ΔOFV 1.56 at variance 6.14e-6) away from zero",
-        "raises the OFV by less than χ²₁(0.95) = 3.84",
+        "costs less than χ²₁(0.95) = 3.84 in OFV",
+        "its SIR lower limit reflects the parameter box rather than the data.",
     ] {
         assert!(has(&msg, s), "missing {s:?} in {msg}");
     }
@@ -250,19 +251,69 @@ fn probe_fixture() -> (CompiledModel, Population) {
     (model, pop)
 }
 
-/// S2: the probe moves the free Ω / κ Cholesky diagonals only — never the FIX
-/// `ETA_KA`, a θ, the σ, or a `block_omega` off-diagonal.
+/// S2: the probe moves the free Ω / κ variances only — never the FIX `ETA_KA`,
+/// a θ, the σ — and each carries exactly its own row's off-diagonals, which
+/// for the second η of the `block_omega` includes `ETA_Q~ETA_V`.
 #[test]
 fn floor_probe_coords_are_the_free_variance_diagonals() {
     let (model, _) = probe_fixture();
     let p = &model.default_params;
     let PackedStart { fixed, .. } = pack_with_bounds(p);
     let names = coordinate_names(p);
-    let got: Vec<&str> = floor_probe_coords(p, &fixed)
+    let got: Vec<(&str, Vec<&str>)> = floor_probe_coords(p, &fixed)
         .into_iter()
-        .map(|i| names[i].as_str())
+        .map(|c| {
+            (
+                names[c.diag].as_str(),
+                c.row_off.iter().map(|&j| names[j].as_str()).collect(),
+            )
+        })
         .collect();
-    assert_eq!(got, ["ETA_CL", "ETA_V", "ETA_Q", "KAPPA_CL"], "{names:?}");
+    let diags: Vec<&str> = got.iter().map(|g| g.0).collect();
+    assert_eq!(diags, ["ETA_CL", "ETA_V", "ETA_Q", "KAPPA_CL"], "{names:?}");
+    let q = &got[2].1;
+    // Ω is one mixed block + diagonal matrix here, so every row lists all of
+    // its lower-triangle entries; the structural zeros among them are already 0.
+    assert!(q.contains(&"ETA_Q~ETA_V"), "{got:?}");
+    assert_eq!(got[0].1, Vec::<&str>::new(), "{got:?}");
+    assert_eq!(got[3].1, Vec::<&str>::new(), "{got:?}");
+}
+
+/// #1749 r1 #1: the probe point puts the variance itself at the floor. For the
+/// second η of a block, flooring `ln L_QQ` alone leaves `Σ_QQ = L_QV² +
+/// e^{-12} = 2.5e-3` — 5% of the estimate 0.05, at correlation 0.9988 —
+/// which is not "zero"; with its row zeroed `Σ_QQ = e^{2·lower}` exactly and
+/// its covariance with `ETA_V` is 0. `ETA_V` (the block's first η) and the
+/// other rows are untouched.
+#[test]
+fn floor_probe_point_puts_a_block_variance_at_its_floor() {
+    let (model, _) = probe_fixture();
+    let p = &model.default_params;
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+        ..
+    } = pack_with_bounds(p);
+    let coords = floor_probe_coords(p, &fixed);
+    let names = coordinate_names(p);
+    let q = coords
+        .iter()
+        .find(|c| names[c.diag] == "ETA_Q")
+        .expect("ETA_Q probed");
+    let at = unpack_params(&floor_probe_point(&packed, &bounds, q), p);
+    let iq = p.omega.eta_names.iter().position(|n| n == "ETA_Q").unwrap();
+    let iv = p.omega.eta_names.iter().position(|n| n == "ETA_V").unwrap();
+    let floor = (2.0 * bounds.lower[q.diag]).exp();
+    let s = &at.omega.matrix;
+    assert!(
+        ((s[(iq, iq)] - floor) / floor).abs() < 1e-9,
+        "Σ_QQ {} vs floor {floor}",
+        s[(iq, iq)]
+    );
+    assert_eq!(s[(iq, iv)], 0.0, "ETA_Q~ETA_V left live");
+    let est = &p.omega.matrix;
+    assert!((s[(iv, iv)] - est[(iv, iv)]).abs() < 1e-12, "ETA_V moved");
 }
 
 /// A SIR run on the probe fixture with only 40 draws, so the ESS is below the
@@ -271,7 +322,19 @@ fn run_probe_fixture(
     scale: SirScale,
     adjust_box: impl FnOnce(&mut PackedBounds),
 ) -> Result<SirResult, String> {
-    let (model, pop) = probe_fixture();
+    run_probe_fixture_with(scale, 0.0, PROBE_MODEL, adjust_box)
+}
+
+/// [`run_probe_fixture`] on `model_src`, with `ofv_offset` added to the
+/// `ofv_hat` handed to SIR.
+fn run_probe_fixture_with(
+    scale: SirScale,
+    ofv_offset: f64,
+    model_src: &str,
+    adjust_box: impl FnOnce(&mut PackedBounds),
+) -> Result<SirResult, String> {
+    let (_, pop) = probe_fixture();
+    let model = crate::parser::model_parser::parse_model_string(model_src).expect("parse");
     let params = model.default_params.clone();
     let n = crate::estimation::parameterization::packed_len(&params);
     let PackedStart { fixed, .. } = pack_with_bounds(&params);
@@ -302,7 +365,124 @@ fn run_probe_fixture(
         );
         2.0 * pop_nll_opts(&model, &pop, &params, &ehs, &hms, &kp, &opts)
     };
-    run_sir_in_box(&model, &pop, &params, &etas, &cov, ofv, &opts, adjust_box)
+    run_sir_in_box(
+        &model,
+        &pop,
+        &params,
+        &etas,
+        &cov,
+        ofv + ofv_offset,
+        &opts,
+        adjust_box,
+    )
+}
+
+/// #1749 r1 #3: the probe's ΔOFV is measured from `ofv_at` at the estimate,
+/// not from the caller's `ofv_hat`. An offset in `ofv_hat` cancels in the
+/// normalised weights, so ESS and the heaviest draw are unchanged and only the
+/// probe could see it; a baseline read from `ofv_hat` turns +50 into ΔOFV −50
+/// for every variance. Both runs in one test: the warning text, ΔOFVs
+/// included, must be identical.
+#[test]
+fn floor_probe_baseline_ignores_the_callers_ofv_hat() {
+    let floor = |b: &mut PackedBounds| {
+        let (model, _) = probe_fixture();
+        let i = coordinate_names(&model.default_params)
+            .iter()
+            .position(|n| n == "ETA_CL")
+            .unwrap();
+        b.lower[i] = -3.0;
+    };
+    let low = |r: &SirResult| {
+        r.warnings
+            .iter()
+            .find(|w| w.starts_with("effective sample size"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no low-ESS warning: {:?}", r.warnings))
+    };
+    let a = low(&run_probe_fixture_with(SirScale::Packed, 0.0, PROBE_MODEL, floor).unwrap());
+    let b = low(&run_probe_fixture_with(SirScale::Packed, 50.0, PROBE_MODEL, floor).unwrap());
+    assert!(a.contains("ETA_CL (ΔOFV"), "{a}");
+    assert_eq!(a, b, "the probe moved with ofv_hat");
+}
+
+/// #1749 r1 #4: a declared prior is a density on the packed scale, so
+/// `sir_scale = natural` is refused for a priored model — and only then: the
+/// same model under `packed`, and the unpriored model under `natural`, run.
+#[test]
+fn natural_scale_is_refused_with_a_prior_only() {
+    let priored = PROBE_MODEL.replace(
+        "theta TVCL(5.0, 0.01, 100)",
+        "theta TVCL(5.0, 0.01, 100) prior(5.0, rse = 20%)",
+    );
+    assert_ne!(priored, PROBE_MODEL);
+    let err = run_probe_fixture_with(SirScale::Natural, 0.0, &priored, |_| {}).unwrap_err();
+    assert!(
+        err.contains("sir_scale = natural is not defined for a model with prior(...)")
+            && err.contains("Use sir_scale = packed"),
+        "{err}"
+    );
+    assert!(run_probe_fixture_with(SirScale::Packed, 0.0, &priored, |_| {}).is_ok());
+    assert!(run_probe_fixture_with(SirScale::Natural, 0.0, PROBE_MODEL, |_| {}).is_ok());
+}
+
+/// #1749 r1 #5: the heaviest-draw sentence's numbers. Two free coordinates,
+/// proposal `L = [[2, 0], [1, 3]]` (marginal sds 2 and √10), and the heavy
+/// draw's scaled residual `z = (1, −2)`, so `δ = L z = (2, −5)`: in marginal
+/// sds `(1.0, −1.581)`, the second is the largest move. In raw packed units it
+/// would read −5, and by `|z|` alone the first coordinate would tie or lose.
+#[test]
+fn heaviest_draw_reports_the_largest_move_in_marginal_proposal_sds() {
+    let (model, _) = probe_fixture();
+    let params = model.default_params.clone();
+    let PackedStart { packed, fixed, .. } = pack_with_bounds(&params);
+    let free: Vec<usize> = (0..packed.len()).filter(|&i| !fixed[i]).take(2).collect();
+    let names = coordinate_names(&params);
+    let free_names: Vec<String> = free.iter().map(|&i| names[i].clone()).collect();
+    let chol = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 1.0, 3.0]);
+    let mut moved = packed.clone();
+    moved[free[1]] -= 5.0;
+    let samples = vec![packed.clone(), moved.clone(), packed.clone()];
+    let z = vec![vec![0.1, 0.1], vec![1.0, -2.0], vec![0.0, 0.0]];
+    let h = heaviest_draw(
+        &[0.2, 0.7, 0.1],
+        &z,
+        &samples,
+        &chol,
+        &free,
+        &free_names,
+        &params,
+    );
+    assert_eq!(h.share, 0.7);
+    assert_eq!(h.name, free_names[1]);
+    assert!(
+        (h.sd_units - (-5.0 / 10f64.sqrt())).abs() < 1e-12,
+        "{}",
+        h.sd_units
+    );
+    let want = coordinate_values(&unpack_params(&moved, &params))[free[1]];
+    assert_eq!(h.value, want);
+}
+
+/// #1749 r1 #9: with fewer than 100 draws the ESS cannot reach the threshold,
+/// so the first sentence says that instead of calling the proposal poor; and
+/// an ESS just under 100 prints rounded down, never as "100.0 … below the 100".
+#[test]
+fn low_ess_warning_first_sentence_for_few_draws_and_near_the_threshold() {
+    let few = low_ess_warning(3.0, 50, SirScale::Packed, &heaviest(), Vec::new).unwrap();
+    assert!(
+        few.starts_with(
+            "effective sample size is 3.0 of 50 draws; with fewer than 100 draws it cannot \
+             reach the 100 at which the proposal is adequate"
+        ),
+        "{few}"
+    );
+    assert!(!few.contains(S_THRESHOLD), "{few}");
+    let near = low_ess_warning(99.96, 1000, SirScale::Packed, &heaviest(), Vec::new).unwrap();
+    assert!(
+        near.starts_with("effective sample size is 99.9 of 1000 draws, below"),
+        "{near}"
+    );
 }
 
 /// S2, run level: the probe reads each coordinate's **own** lower bound. With
@@ -476,8 +656,8 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
             f.ofv,
             &o,
             |b| {
-                for &i in &floors {
-                    b.lower[i] = floor;
+                for c in &floors {
+                    b.lower[c.diag] = floor;
                 }
             },
         )
