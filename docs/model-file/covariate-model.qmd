@@ -331,9 +331,24 @@ Reaching a fit with one still unbound is a hard error
 A `categorical` factor is an `if (COV == l₁) 1 + θ₁ else … else 1` chain whose
 trailing `1` *is* the reference level's factor, so an undeclared code would be
 modelled as the reference with nothing in the output to say so. A value in the
-data that is not one of the relation's declared levels is therefore refused
-before the fit starts (`E_COV_LEVEL_UNKNOWN`). List every level, use
-`categorical(levels = auto)` to read them off the data, or filter the rows out.
+data that is not one of the relation's levels is therefore refused
+(`E_COV_LEVEL_UNKNOWN`) by every entry point that evaluates the model on a
+population: `fit()` and `ferx check`, the `simulate*` and adaptive entry points,
+`predict()` / `predict_diag()` / `predict_survival()` / `predict_categorical()`,
+`compute_npde_npd()`, and `run_sir()` / `run_covariance()` on a supplied
+population (the same subject IDs with a recoded column used to pass). For a
+model with literal levels, add the value to the levels and refit, use
+`categorical(levels = auto)` to read them off the data, or drop or recode the
+rows.
+
+A model laid out on a fit (`bind_from_fit`, `layout_from_fit`) has the levels
+the fit was bound to and the fit's θ vector, so neither of those is a repair:
+the fit estimated no θ for the new value. Drop or recode those rows, or refit on
+data that carries the value. The message says which case it is.
+
+A **missing** value (`.`) is not a level and is not refused: it takes the neutral
+branch described under [Missing covariate values](#missing-covariate-values),
+which for a categorical factor is the reference level's factor.
 
 ## Where the factor is inserted
 
