@@ -325,13 +325,15 @@ pub(crate) fn validate_iov_simulatable(
     Ok(())
 }
 
-/// Refuse a θ vector whose length is not the model's (#1614), as `E_THETA_LENGTH`.
+/// Refuse a θ vector whose length is not the model's (#1614, #1615), as `E_THETA_LENGTH`.
 ///
 /// Nothing downstream can: the compiled closures read θ by position, a θ past the end
-/// reads `0.0` and a level θ past the end `NaN`, so a short vector simulates finite,
-/// plausible-looking rows and a long one silently drops its tail. Every `simulate*`
-/// entry runs this — the static ones through `check_simulate_preconditions`, the two
-/// adaptive ones directly, since they do not run that list.
+/// reads `0.0` and a level θ past the end `NaN`, so a short vector simulates or predicts
+/// finite, plausible-looking rows and a long one silently drops its tail. Every entry
+/// point that takes a parameter vector runs this one function: the static `simulate*`
+/// ones through `check_simulate_preconditions`, the two adaptive ones directly, since
+/// they do not run that list, and `predict_diag` (so `predict`), `predict_survival`,
+/// `predict_categorical` and `compute_npde_npd` directly (#1615).
 ///
 /// The usual way to get here is a level-block model: its θ count is set by the data
 /// it was bound against, so a fit's θ only fits a design bound with the *fit's*
@@ -344,7 +346,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
         return Ok(());
     }
     let mut message = format!(
-        "the supplied theta has {} values but this model has {expected}; simulation reads \
+        "the supplied theta has {} values but this model has {expected}; the model reads \
          theta by position, so these values would be read against the wrong parameters",
         theta.len()
     );

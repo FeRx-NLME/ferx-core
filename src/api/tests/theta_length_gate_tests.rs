@@ -87,7 +87,7 @@ fn assert_counts_message(msg: &str, got: usize, entry: &str) {
     );
     assert!(
         msg.contains(
-            "; simulation reads theta by position, so these values would be read against the \
+            "; the model reads theta by position, so these values would be read against the \
              wrong parameters"
         ),
         "{entry}, θ len {got}: why a length mismatch is refused, missing: {msg}"
@@ -186,5 +186,156 @@ fn a_theta_of_the_right_length_simulates_bit_identically() {
             panic!("continuous rows expected");
         };
         assert_eq!(vx.to_bits(), vy.to_bits());
+    }
+}
+
+// ── the predict-side entry points (#1615) ────────────────────────────────────
+
+/// Every predict-side entry point taking a parameter vector refuses a θ of the wrong length,
+/// short, long and empty, with the same message the simulate paths give (#1615).
+///
+/// Measured on `main` (`a1cd1b5b`, the issue's probe): `predict` with a one-value θ returned
+/// `Ok` with a first `pred` of exactly `0.0`; with three values the third was ignored.
+///
+/// Mutation — delete `check_theta_length` from any one entry point and that arm goes `Ok`,
+/// naming itself: `predict_diag` (which also reddens `predict`, its wrapper) and
+/// `compute_npde_npd` here; `predict_survival` and `predict_categorical` in
+/// `the_survival_predictors_refuse_a_theta_of_the_wrong_length`, which runs them on a model
+/// with their endpoint, so the refusal is not an empty-result fast path.
+#[test]
+fn every_predict_entry_refuses_a_theta_of_the_wrong_length() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = population();
+    for n in [1usize, 3, 0] {
+        let params = with_theta_len(&model.default_params, n);
+        let e = predict(&model, &pop, &params).expect_err("predict");
+        assert_counts_message(&e, n, "predict");
+        let e = predict_diag(&model, &pop, &params).expect_err("predict_diag");
+        assert_counts_message(&e, n, "predict_diag");
+        let e = crate::stats::npde::compute_npde_npd(&model, &pop, &params, 20, Some(4))
+            .expect_err("compute_npde_npd");
+        assert_counts_message(&e, n, "compute_npde_npd");
+    }
+}
+
+/// The other side of the predict gate: a θ of the right length predicts exactly what it did
+/// before, bit for bit — rows from `predict_diag`, and npd/npde from `compute_npde_npd` —
+/// against a copy routed through `with_theta_len(.., 2)`, so a gate that perturbed θ (rather
+/// than only reading its length) dies too, as does one comparing against the wrong count.
+#[test]
+fn a_theta_of_the_right_length_predicts_bit_identically() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = population();
+    let same = with_theta_len(&model.default_params, 2);
+    assert_eq!(same.theta, model.default_params.theta);
+    let a = predict_diag(&model, &pop, &model.default_params).expect("accepted");
+    let b = predict_diag(&model, &pop, &same).expect("accepted");
+    assert_eq!(a.results.len(), 6);
+    assert_eq!(a.results.len(), b.results.len());
+    for (x, y) in a.results.iter().zip(&b.results) {
+        assert!(x.pred.is_finite() && x.pred > 0.0, "{}", x.pred);
+        assert_eq!(x.pred.to_bits(), y.pred.to_bits());
+    }
+    let na = crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, 20, Some(4))
+        .expect("accepted");
+    let nb = crate::stats::npde::compute_npde_npd(&model, &pop, &same, 20, Some(4)).expect("ok");
+    assert_eq!(na.len(), 2);
+    for (x, y) in na.iter().zip(&nb) {
+        assert_eq!(x.npd.len(), 3);
+        for (p, q) in x.npd.iter().zip(&y.npd) {
+            assert!(p.is_finite(), "{p}");
+            assert_eq!(p.to_bits(), q.to_bits());
+        }
+    }
+}
+
+/// `predict_survival` and `predict_categorical`, on real fixtures carrying their endpoint
+/// (`examples/pktte_joint.ferx`, `examples/binary_logistic.ferx`, each read model-aware),
+/// refuse a θ of the wrong length and predict a θ of the right length bit-identically.
+///
+/// The fixtures matter: on a model without the endpoint both return `Ok(empty)`, so a gate
+/// test there would hold only for a check placed before the empty result, and the control
+/// would compare two empty vecs. Here the control is non-empty and finite.
+///
+/// Mutation — delete `check_theta_length` from `predict_survival` (resp.
+/// `predict_categorical`) and its arm goes `Ok`, naming itself.
+#[cfg(feature = "survival")]
+#[test]
+fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
+    use crate::parser::model_parser::parse_full_model;
+    let read = |path: &str, data: &str| {
+        let src = std::fs::read_to_string(path).expect("example");
+        let m = parse_full_model(&src).expect("parses").model;
+        let pop = crate::api::read_population_for(&m, &None, data, None, None, None, &[])
+            .expect("routed read")
+            .0;
+        (m, pop)
+    };
+    let counts = |msg: &str, got: usize, want: usize, entry: &str| {
+        assert!(
+            msg.contains(&format!(
+                "the supplied theta has {got} values but this model has {want}; the model \
+                 reads theta by position"
+            )),
+            "{entry}, θ len {got}: {msg}"
+        );
+    };
+
+    let (tte, tte_pop) = read("examples/pktte_joint.ferx", "data/pktte_joint.csv");
+    let k = tte.default_params.theta.len();
+    let grid = [1.0, 10.0, 50.0];
+    for n in [k - 1, k + 1] {
+        let e = predict_survival(
+            &tte,
+            &tte_pop,
+            &with_theta_len(&tte.default_params, n),
+            &grid,
+        )
+        .expect_err("predict_survival");
+        counts(&e, n, k, "predict_survival");
+    }
+    let a = predict_survival(&tte, &tte_pop, &tte.default_params, &grid).expect("accepted");
+    let b = predict_survival(
+        &tte,
+        &tte_pop,
+        &with_theta_len(&tte.default_params, k),
+        &grid,
+    )
+    .expect("accepted");
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert!(x.survival.is_finite() && x.survival < 1.0, "{}", x.survival);
+        assert_eq!(x.survival.to_bits(), y.survival.to_bits());
+        assert_eq!(x.cum_hazard.to_bits(), y.cum_hazard.to_bits());
+    }
+
+    let (bin, bin_pop) = read("examples/binary_logistic.ferx", "data/binary_logistic.csv");
+    let k = bin.default_params.theta.len();
+    for n in [k - 1, k + 1] {
+        let e = predict_categorical(&bin, &bin_pop, &with_theta_len(&bin.default_params, n))
+            .expect_err("predict_categorical");
+        counts(&e, n, k, "predict_categorical");
+    }
+    // Off the all-zero initial estimates, so a misread θ would move every probability.
+    let mut params = bin.default_params.clone();
+    params.theta = vec![-0.4, 0.9, 0.5];
+    let a = predict_categorical(&bin, &bin_pop, &params).expect("accepted");
+    let b = predict_categorical(&bin, &bin_pop, &with_theta_len(&params, k)).expect("accepted");
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        let (
+            crate::types::Prediction::CatProbs { probs: p },
+            crate::types::Prediction::CatProbs { probs: q },
+        ) = (&x.prediction, &y.prediction)
+        else {
+            panic!("category probabilities expected");
+        };
+        assert_eq!(p.len(), 2);
+        for (u, v) in p.iter().zip(q) {
+            assert!(u.is_finite() && *u > 0.0 && *u < 1.0, "{u}");
+            assert_eq!(u.to_bits(), v.to_bits());
+        }
     }
 }
