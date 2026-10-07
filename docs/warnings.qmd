@@ -150,9 +150,12 @@ with `"run_sir: "` / `"run_covariance: "`, and `message()` is the text without
 it. Their other refusals (dose compartment, endpoint routing, a fit with no
 covariance matrix) carry no context and no prefix, as before. Of the input
 refusals, an unseen categorical level (`E_COV_LEVEL_UNKNOWN`), a supplied
-model whose `[covariate_model]` is still unbound (`E_COVSTAT_UNRESOLVED`) and a
-θ level the fit never estimated (`E_THETA_LEVEL_BINDING`) carry a code; the rest
-have `code()` `None`.
+model whose `[covariate_model]` is still unbound (`E_COVSTAT_UNRESOLVED`) and
+every refusal of the fit's data bindings carry a code. That last class covers a θ
+level the fit never estimated, malformed recorded bindings, and a fit that recorded
+none: `E_THETA_LEVEL_BINDING` on a model with a level block,
+`E_COVARIATE_STATS_BINDING` on one with only `[covariate_model]` statistics. The
+rest have `code()` `None`.
 
 The binders (`bind_theta_levels`, `bind_covariate_stats`, `bind_from_fit`,
 `layout_from_fit`) return an `EngineError` too, with the same two binding codes:

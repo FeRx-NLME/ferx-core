@@ -311,8 +311,9 @@ let (mut population, _) = read_population_for(
     opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
 )?;
 
-bind_theta_levels(&mut parsed, &model_text, &mut population)?;
-bind_covariate_stats(&mut parsed, &model_text, &population)?;
+// The binders return an `EngineError` (#1773); its `to_string()` is the message.
+bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
+bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
 // `fit` reads the gradient method off the model, not the options.
 parsed.model.gradient_method = if parsed.model.is_sde() {
@@ -400,9 +401,11 @@ let (mut design, _) = read_population_for_simulation(
     &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
     None, None, &design_parsed.column_map,
 )?;
-bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)?;
+bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)
+    .map_err(|e| e.to_string())?;
 let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
-let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
+let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)
+    .map_err(|e| e.to_string())?;
 ```
 
 One call binds both halves. On the measured case, a design of the fit's
