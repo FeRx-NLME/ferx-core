@@ -352,6 +352,104 @@ struct SirWire {
     /// Retained packed-parameter draws when `sir_keep_samples = true` was set.
     /// `None` otherwise; consumed by `simulate_with_uncertainty()`.
     resamples_packed: Option<Vec<Vec<f64>>>,
+    /// The settings the draws were scored under (#1758). Additive: absent in
+    /// bundles written before it existed, which load as `None`, so no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings: Option<SirSettingsWire>,
+}
+
+/// [`SirSettings`](crate::estimation::sir::SirSettings) on the wire. The enums
+/// travel as their `[fit_options]` tokens and are decoded here, so an unknown
+/// token is `Corrupt` like every other enum on this wire (#1382) rather than a
+/// bare JSON error.
+#[derive(Serialize, Deserialize)]
+struct SirSettingsWire {
+    samples: usize,
+    resamples: usize,
+    seed: u64,
+    df: f64,
+    scale: String,
+    keep_samples: bool,
+    inner_maxiter: usize,
+    inner_tol: f64,
+    mu_referencing: bool,
+    n_agq: usize,
+    inner_optimizer: String,
+    ebe_warm_start: bool,
+    ode_reltol: f64,
+    ode_abstol: f64,
+    ode_max_steps: usize,
+    ode_method: String,
+    ode_stiff_abort_after: Option<u32>,
+    ode_auto_switch: bool,
+}
+
+/// An enum's serde token: its `[fit_options]` spelling.
+fn enum_token<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(s)) => s,
+        other => unreachable!("a unit enum serialises to a string token, got {other:?}"),
+    }
+}
+
+/// The enum a token names; an unknown token is `Corrupt` (#1382).
+fn enum_from_token<T: serde::de::DeserializeOwned>(
+    field: &str,
+    token: String,
+) -> Result<T, FitrxError> {
+    serde_json::from_value(serde_json::Value::String(token.clone()))
+        .map_err(|_| FitrxError::Corrupt(format!("unknown sir.settings.{field} {token:?}")))
+}
+
+impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
+    fn from(s: &crate::estimation::sir::SirSettings) -> Self {
+        Self {
+            samples: s.samples,
+            resamples: s.resamples,
+            seed: s.seed,
+            df: s.df,
+            scale: enum_token(&s.scale),
+            keep_samples: s.keep_samples,
+            inner_maxiter: s.inner_maxiter,
+            inner_tol: s.inner_tol,
+            mu_referencing: s.mu_referencing,
+            n_agq: s.n_agq,
+            inner_optimizer: enum_token(&s.inner_optimizer),
+            ebe_warm_start: s.ebe_warm_start,
+            ode_reltol: s.ode_reltol,
+            ode_abstol: s.ode_abstol,
+            ode_max_steps: s.ode_max_steps,
+            ode_method: enum_token(&s.ode_method),
+            ode_stiff_abort_after: s.ode_stiff_abort_after,
+            ode_auto_switch: s.ode_auto_switch,
+        }
+    }
+}
+
+impl SirSettingsWire {
+    fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
+        Ok(crate::estimation::sir::SirSettings {
+            samples: self.samples,
+            resamples: self.resamples,
+            seed: self.seed,
+            df: self.df,
+            scale: enum_from_token("scale", self.scale)?,
+            keep_samples: self.keep_samples,
+            inner_maxiter: self.inner_maxiter,
+            inner_tol: self.inner_tol,
+            mu_referencing: self.mu_referencing,
+            n_agq: self.n_agq,
+            inner_optimizer: enum_from_token("inner_optimizer", self.inner_optimizer)?,
+            ebe_warm_start: self.ebe_warm_start,
+            ode_reltol: self.ode_reltol,
+            ode_abstol: self.ode_abstol,
+            ode_max_steps: self.ode_max_steps,
+            ode_method: enum_from_token("ode_method", self.ode_method)?,
+            ode_stiff_abort_after: self.ode_stiff_abort_after,
+            ode_auto_switch: self.ode_auto_switch,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -745,6 +843,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 ci_kappa: r.sir_ci_kappa.clone(),
                 ess: r.sir_ess,
                 resamples_packed: r.sir_resamples_packed.clone(),
+                settings: r.sir_settings.as_ref().map(SirSettingsWire::from),
             })
         } else {
             None
@@ -1943,18 +2042,26 @@ fn wire_to_fit_result(
         ),
     };
 
-    let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ci_kappa, sir_ess, sir_resamples_packed) =
-        match w.sir {
-            Some(s) => (
-                s.ci_theta,
-                s.ci_omega,
-                s.ci_sigma,
-                s.ci_kappa,
-                s.ess,
-                s.resamples_packed,
-            ),
-            None => (None, None, None, None, None, None),
-        };
+    let (
+        sir_ci_theta,
+        sir_ci_omega,
+        sir_ci_sigma,
+        sir_ci_kappa,
+        sir_ess,
+        sir_resamples_packed,
+        sir_settings,
+    ) = match w.sir {
+        Some(s) => (
+            s.ci_theta,
+            s.ci_omega,
+            s.ci_sigma,
+            s.ci_kappa,
+            s.ess,
+            s.resamples_packed,
+            s.settings.map(SirSettingsWire::into_settings).transpose()?,
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
 
     // `validate_parallel_lengths` has already ensured that omega/sigma
     // `init_as_sd` are either empty (pre-issue-#5 bundle) or exactly the
@@ -2121,6 +2228,7 @@ fn wire_to_fit_result(
         multi_start_seed: w.multi_start_seed,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
+        sir_settings,
         imp_seed: w.imp_seed,
         npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
@@ -3018,6 +3126,142 @@ mod tests {
         );
         let reloaded: FitWire = serde_json::from_value(value).unwrap();
         assert!(reloaded.sir.as_ref().unwrap().ci_kappa.is_none());
+    }
+
+    /// A SIR record with every field, and every enum, off its default — so a
+    /// wire that dropped a field, or decoded a token to the default, differs.
+    fn off_default_sir_settings() -> crate::estimation::sir::SirSettings {
+        crate::estimation::sir::SirSettings {
+            samples: 321,
+            resamples: 123,
+            seed: 4242,
+            df: 3.0,
+            scale: crate::types::SirScale::Natural,
+            keep_samples: true,
+            inner_maxiter: 17,
+            inner_tol: 3e-4,
+            mu_referencing: false,
+            n_agq: 5,
+            inner_optimizer: crate::types::InnerOptimizer::NelderMead,
+            ebe_warm_start: true,
+            ode_reltol: 1e-7,
+            ode_abstol: 1e-9,
+            ode_max_steps: 777,
+            ode_method: crate::ode::OdeMethod::Rodas5P,
+            ode_stiff_abort_after: Some(9),
+            ode_auto_switch: false,
+        }
+    }
+
+    fn sir_fit_with_settings() -> FitResult {
+        let mut r = minimal_fit_result();
+        r.sir_ess = Some(50.0);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        r.sir_seed = Some(4242);
+        r.sir_settings = Some(off_default_sir_settings());
+        r
+    }
+
+    /// T9 (#1758): the SIR record survives the bundle, field for field.
+    /// Mutations: drop any wire field (it fails to compile — the wire is
+    /// exhaustive in both directions), or map a token to the default enum (the
+    /// equality dies, since every enum here is off-default).
+    #[test]
+    fn roundtrip_keeps_sir_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_settings.fitrx");
+        let r = sir_fit_with_settings();
+        assert_ne!(
+            r.sir_settings,
+            Some(crate::estimation::sir::SirSettings::default())
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+        assert_eq!(loaded.fit.sir_seed, Some(4242));
+    }
+
+    /// T9 (#1758): the enums travel as their `[fit_options]` tokens, the
+    /// spelling a user reads in the model file. Mutation: drop a `rename_all` or
+    /// the `rodas5p` rename (that variant's token changes).
+    #[test]
+    fn sir_settings_enums_travel_as_their_fit_options_tokens() {
+        use crate::ode::OdeMethod;
+        use crate::types::{InnerOptimizer, SirScale};
+        for s in [SirScale::Packed, SirScale::Natural] {
+            assert_eq!(enum_token(&s), s.label());
+        }
+        for m in [
+            OdeMethod::Rk45,
+            OdeMethod::Rosenbrock23,
+            OdeMethod::Rodas4,
+            OdeMethod::Rodas5P,
+            OdeMethod::Vern7,
+            OdeMethod::Auto,
+        ] {
+            assert_eq!(enum_token(&m), m.as_str());
+            assert_eq!(OdeMethod::parse(&enum_token(&m)), Some(m));
+        }
+        // The `[fit_options] inner_optimizer` tokens (`parse_fit_option`).
+        for (o, tok) in [
+            (InnerOptimizer::Auto, "auto"),
+            (InnerOptimizer::Bfgs, "bfgs"),
+            (InnerOptimizer::Lbfgs, "lbfgs"),
+            (InnerOptimizer::NelderMead, "nelder_mead"),
+        ] {
+            assert_eq!(enum_token(&o), tok);
+        }
+    }
+
+    /// T9 (#1758): additive, so no `FORMAT_VERSION` bump. A SIR fit without a
+    /// record writes no `settings` key (mutation: drop `skip_serializing_if`, and
+    /// it comes back as `null`); a bundle written before #1758 has none and
+    /// loads `None`.
+    #[test]
+    fn fit_wire_missing_sir_settings_loads_none() {
+        let mut r = sir_fit_with_settings();
+        r.sir_settings = None;
+        let none = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !none["sir"].as_object().unwrap().contains_key("settings"),
+            "a fit with no record must not write the key: {}",
+            none["sir"]
+        );
+
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value["sir"]
+                .as_object_mut()
+                .unwrap()
+                .remove("settings")
+                .is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        let loaded = wire_to_fit_result(wire, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(loaded.sir_settings, None);
+    }
+
+    /// T9 (#1758, #1382): an unrecognised token is `Corrupt`, naming the
+    /// field, not a silent degrade to the default scale. The Rust variant name
+    /// (`Natural`) is the likeliest wrong spelling. Mutation: decode an unknown
+    /// token to `SirScale::default()` — the load succeeds.
+    #[test]
+    fn an_unknown_sir_settings_token_is_corrupt() {
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["sir"]["settings"]["scale"], "natural");
+        value["sir"]["settings"]["scale"] = serde_json::json!("Natural");
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        match wire_to_fit_result(wire, r.subjects.clone(), Vec::new()) {
+            Err(FitrxError::Corrupt(msg)) => {
+                assert!(msg.contains("sir.settings.scale"), "{msg}");
+                assert!(msg.contains("\"Natural\""), "{msg}");
+            }
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// A weighted kappa (#1031) carries its declaration and the arm size it was

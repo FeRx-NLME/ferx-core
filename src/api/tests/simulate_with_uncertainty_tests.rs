@@ -510,6 +510,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         multi_start_seed: None,
         saem_seed: None,
         sir_seed: None,
+        sir_settings: None,
         imp_seed: None,
         npde_seed: None,
         bloq_method: "drop".to_string(),

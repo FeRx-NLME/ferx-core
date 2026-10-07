@@ -195,7 +195,11 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// monitors), event-time root-finding and the analytic-sensitivity path therefore work for
 /// all methods, with no per-method or per-feature wiring, and a method added later inherits
 /// the whole set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialised as its canonical [`as_str`](OdeMethod::as_str) token, the spelling a
+/// `.fitrx` bundle records it under (#1758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OdeMethod {
     /// Explicit Dormand-Prince RK45 — see the module docs. The stepper
     /// [`Auto`](OdeMethod::Auto) falls back to, and what it selects on any system that is not
@@ -210,6 +214,7 @@ pub enum OdeMethod {
     /// Rodas5P: 8-stage, order 5(4), L-stable and stiffly accurate. Best at tight tolerances
     /// (`ode_reltol ≤ 1e-9`), the regime where an ODE-form OFV has to match the analytical
     /// one.
+    #[serde(rename = "rodas5p")]
     Rodas5P,
     /// Verner 7(6): 10-stage explicit, order 7. **Not** a stiff method — the high-order option
     /// for a fit that is accuracy-limited rather than stability-limited, where step count

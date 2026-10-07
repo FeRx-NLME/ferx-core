@@ -71,15 +71,16 @@ pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_
 #[cfg(test)]
 pub(crate) use pool::{default_fit_pool, ode_override_pool};
 pub(crate) use postfit::{
-    absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
-    compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
-    compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
-    eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
-    extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
-    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning, non_fit_diagnostics,
-    nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
-    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
-    runaway_guard_warning, sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
+    absorption_flip_flop_ebe_warning, apply_sir_result, boundary_estimate_warning,
+    compute_eps_shrinkage, compute_eta_shrinkage, compute_kappa_shrinkage,
+    compute_kappa_shrinkage_by_occ, compute_param_corr, compute_subject_results, cov_diagnostics,
+    covariate_relation_estimates, eps_shrinkage_warning, eta_shrinkage_warning,
+    extract_residual_correlation_se, extract_standard_errors, high_correlation_warning,
+    inflated_rse_warning, integrates_odes, is_last_estimating_stage, kappa_weight_typicals,
+    keep_gn_zero_eta_warning, non_fit_diagnostics, nonfinite_objective_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
     sweep_sensitivity_solver_stats, with_solver_stats, SolverStatsPhase,
 };
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};

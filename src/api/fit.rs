@@ -2839,31 +2839,13 @@ fn fit_inner(
         interaction: options.interaction,
         warnings,
         warnings_structured: native_warnings,
-        // If the normal SIR ran, use that; otherwise use the fallback result.
-        sir_ci_theta: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .map(|s| s.ci_theta.clone()),
-        sir_ci_omega: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .map(|s| s.ci_omega.clone()),
-        sir_ci_sigma: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .map(|s| s.ci_sigma.clone()),
-        sir_ci_kappa: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .and_then(|s| s.kappa_ci()),
-        sir_ess: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .map(|s| s.effective_sample_size),
-        sir_resamples_packed: sir_result
-            .as_ref()
-            .or(sir_fallback_result.as_ref())
-            .and_then(|s| s.resamples_packed.clone()),
+        // Filled by `apply_sir_result` below, the one SIR → FitResult mapping (#1713).
+        sir_ci_theta: None,
+        sir_ci_omega: None,
+        sir_ci_sigma: None,
+        sir_ci_kappa: None,
+        sir_ess: None,
+        sir_resamples_packed: None,
         importance_sampling: is_result,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
@@ -2949,7 +2931,8 @@ fn fit_inner(
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,
-        sir_seed: options.sir_seed,
+        sir_seed: None,
+        sir_settings: None,
         imp_seed: options.imp_seed,
         // Record the *resolved* NPDE seed (default included) so the diagnostic
         // is reproducible from the output; `None` when NPDE did not run.
@@ -2980,6 +2963,12 @@ fn fit_inner(
         covariate_table: None,
         exclusions: population.exclusions.clone(),
     };
+    // The normal SIR when it ran, else the non-PD fallback's (#1713).
+    apply_sir_result(
+        &mut fit_result,
+        sir_result.as_ref(),
+        sir_fallback_result.as_ref(),
+    );
 
     if time_gradients {
         let (an_c, an_n, fd_c, fd_n, jac_an_c, jac_an_n, jac_fd_c, jac_fd_n) =

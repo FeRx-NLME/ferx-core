@@ -7166,9 +7166,21 @@ pub struct FitResult {
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
-    /// Seed used for the SIR resampling step.  `None` when SIR was not run or
-    /// no explicit seed was set.
+    /// The seed the SIR draws actually used: `sir_seed` when it was set, the
+    /// built-in default otherwise, so the run is reproducible from this field
+    /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
+    /// Equal to `sir_settings.seed` whenever SIR ran.
     pub sir_seed: Option<u64>,
+    /// Every setting the reported SIR draws were scored under (#1758): the
+    /// scale, degrees of freedom, draw counts, seed, inner-loop and ODE
+    /// settings. `None` exactly when SIR did not run, and on a fit fitted or
+    /// loaded from a `.fitrx` written before #1758.
+    ///
+    /// [`run_sir`](crate::run_sir) reads it: a setting its caller leaves at the
+    /// default is taken from here, so `run_sir` on this fit with default options
+    /// repeats the reported SIR.
+    #[serde(default)]
+    pub sir_settings: Option<crate::estimation::sir::SirSettings>,
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
     pub imp_seed: Option<u64>,
@@ -8536,7 +8548,11 @@ impl Default for FitOptions {
 ///   correlation. The PsN SIR convention. Lower limits no longer depend on the
 ///   box, but a variance informed by few groups has a heavy upper tail. The
 ///   proposal is re-centred on this target's Laplace mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialised as its `[fit_options]` label (`packed` / `natural`), the spelling a
+/// `.fitrx` bundle records it under (#1758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SirScale {
     /// Flat on the packed (optimizer) scale. The default, and the only scale
     /// before #1723.
@@ -8747,7 +8763,10 @@ pub enum SaemMstepSolver {
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
 /// user pin the per-subject solver explicitly instead of the size-based default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Serialised as its `[fit_options]` token (`auto` / `bfgs` / `lbfgs` /
+/// `nelder_mead`), the spelling a `.fitrx` bundle records it under (#1758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InnerOptimizer {
     /// Size-based selection (the historical behaviour): dense BFGS below
     /// [`crate::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM`], limited-memory
