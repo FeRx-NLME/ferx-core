@@ -135,7 +135,8 @@ pub fn run_sir(
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
-    // before the ODE scope below opens, so a recorded `ode_reltol` reaches the integrator.
+    // first, so every reader below sees them: this ODE scope and the one `run_sir_core` opens
+    // itself (#1212), which is the one the draws' solves run under.
     let options = &resolve_sir_options(fit, options);
     // `fit()` sets these process globals and nothing resets them, so without this the
     // draws would be re-solved with whichever solver the last `fit()` in the process used.
@@ -1100,10 +1101,13 @@ mod tests {
     }
 
     /// T6 (#1758): the ODE twin. `mm_iv` (Michaelis–Menten, the smallest ODE
-    /// example), FOCEI, a non-default `ode_reltol` and a pinned `rk45`. The
-    /// recorded tolerances must reach the integrator, which means resolving
-    /// them **before** `run_sir` opens the fit-scoped ODE scope. Mutation: open
-    /// the scope with the caller's options (resolve after it) — ESS differs.
+    /// example), FOCEI, a non-default `ode_reltol` / `ode_abstol` and a pinned
+    /// `rk45`, FD inner gradients. The recorded solver settings must reach the
+    /// integrator. Mutations: delete `recorded!(ode_reltol …)`, `(ode_abstol …)`
+    /// or `(ode_method …)` — ESS differs. Opening `run_sir`'s own ODE scope with
+    /// the caller's options instead is an *equivalent* mutation: `run_sir_core`
+    /// opens its own scope from the resolved options (#1212), and that is the
+    /// one the draws run under.
     #[test]
     fn run_sir_repeats_an_ode_fit_sir_under_its_recorded_tolerances() {
         let prep = crate::api::prepare_run("examples/mm_iv.ferx", Some("data/mm_iv.csv"))
@@ -1157,7 +1161,7 @@ mod tests {
 
     /// T10 (#1758): the record survives a `.fitrx` round trip, and `run_sir` on
     /// the reloaded fit repeats the in-fit SIR — to the bit up to the one input
-    /// `.fitrx` stores lossily. `ebes.csv` writes each EBE at 6 dp, and the EBEs
+    /// `.fitrx` stores lossily. `ebes.csv` writes each EBE at 6 dp (#1631), and the EBEs
     /// warm-start every draw's inner solve, so the reloaded ESS moved by 7.1e-9
     /// (8.5e-11 relative, measured on macOS arm64). The test pins that this
     /// rounding is the *whole* gap: the in-memory fit with its EBEs rounded the

@@ -329,7 +329,17 @@ opts.sir_resamples = 500;
 let fit_with_sir = run_sir(&fit, None, None, &opts)?;
 ```
 
-`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (IOV models), `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
+`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (IOV models), `sir_ess`, `sir_seed`, `sir_settings` and (when `sir_keep_samples = true`) `sir_resamples_packed` replaced by this run's.
+
+### Which settings `run_sir` uses
+
+A fit that ran SIR records every setting its draws were scored under in `FitResult::sir_settings` ([#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)): `samples`, `resamples`, the `seed` actually used (the built-in default when `sir_seed` was unset), `df`, `scale`, `keep_samples`, the inner-loop settings (`inner_maxiter`, `inner_tol`, `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start`) and the six `ode_*` solver settings. `FitResult::sir_seed` is the same resolved seed; both are `None` exactly when SIR did not run.
+
+`run_sir` takes each of these from the record **wherever the caller's `FitOptions` holds the default value**, and the caller's value otherwise. So `run_sir(&fit, …, &FitOptions::default())` repeats the fit's own SIR, bit for bit (ESS and every interval), and passing only `sir_samples = 2000` changes the draw count and keeps the fit's scale, degrees of freedom and seed. The recorded ODE solver settings reach every draw's integration, and `inner_optimizer` / `ebe_warm_start` are set for the process as `fit()` sets them, so a later fit in the same process cannot change which inner solver the draws use. A fit with no record (SIR never ran, or a `.fitrx` saved before #1758) uses the caller's options as given.
+
+The test is by value, so **an explicit default cannot override a non-default record**: `sir_scale = SirScale::Packed` on a fit recorded `natural` reruns `natural`. To force a default, write it into `fit.sir_settings` (or set that field to `None`) before calling. `method` and `interaction` are not part of the record; the scored marginal comes from the fit itself (#1710).
+
+After a `.fitrx` round trip the record is intact, but the bundle stores EBEs at 6 decimals ([#1631](https://github.com/FeRx-NLME/ferx-core/issues/1631)) and they warm-start every draw, so the repeat is close rather than bit-identical: on the bundled warfarin example the ESS moved by 8.5e-11 relative.
 
 ### Which objective weights the draws
 

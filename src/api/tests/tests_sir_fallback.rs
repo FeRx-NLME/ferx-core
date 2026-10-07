@@ -385,7 +385,10 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
 
 /// T8 (#1758): a fit whose SIR did not run reports neither a seed nor
 /// settings, even when it was handed a `sir_seed` (before #1758 it echoed the
-/// option). warfarin, `sir = false`, no covariance step.
+/// option). warfarin, `sir = false`, no covariance step. Mutation: the
+/// pre-#1758 pair — the literal echoes `options.sir_seed` *and* the helper
+/// leaves `sir_seed` alone when no SIR ran. Either half alone is inert, since
+/// the helper clears what the literal set (T3 pins that half).
 #[test]
 fn a_fit_without_sir_reports_no_sir_seed_or_settings() {
     let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))

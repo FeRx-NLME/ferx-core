@@ -323,6 +323,12 @@ fixture (`tests/data/mbma_placebo/`, seed 1705, Linux run):
 
 ```yaml
 sir:
+  settings:
+    scale: packed
+    df: 5
+    samples: 1000
+    resamples: 250
+    seed: 1705
   effective_sample_size: 143.2
   ci_theta:
     # ... one entry per theta, keyed by name
@@ -339,6 +345,12 @@ sir:
       lower: 83.166077
       upper: 367.409851
 ```
+
+`settings` names what the intervals came from: the scale SIR's flat prior is
+flat on, the Student-t degrees of freedom, the draw counts and the seed actually
+used ([#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)). The console
+prints the same on one `Settings:` line. The complete record, inner-loop and
+ODE settings included, is `FitResult::sir_settings` and the `.fitrx` bundle.
 
 Each `lower` / `upper` pair is the 2.5th / 97.5th percentile of the resampled
 draws, on the scale the estimate is reported on: a θ as estimated, and the

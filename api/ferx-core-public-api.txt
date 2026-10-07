@@ -535,7 +535,31 @@ pub ferx_core::estimation::sir::SirResult::ci_sigma: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::estimation::sir::SirResult::ci_theta: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::estimation::sir::SirResult::effective_sample_size: f64
 pub ferx_core::estimation::sir::SirResult::resamples_packed: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
+pub ferx_core::estimation::sir::SirResult::settings: ferx_core::estimation::sir::SirSettings
 pub ferx_core::estimation::sir::SirResult::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::estimation::sir::SirSettings
+pub ferx_core::estimation::sir::SirSettings::df: f64
+pub ferx_core::estimation::sir::SirSettings::ebe_warm_start: bool
+pub ferx_core::estimation::sir::SirSettings::inner_maxiter: usize
+pub ferx_core::estimation::sir::SirSettings::inner_optimizer: ferx_core::InnerOptimizer
+pub ferx_core::estimation::sir::SirSettings::inner_tol: f64
+pub ferx_core::estimation::sir::SirSettings::keep_samples: bool
+pub ferx_core::estimation::sir::SirSettings::mu_referencing: bool
+pub ferx_core::estimation::sir::SirSettings::n_agq: usize
+pub ferx_core::estimation::sir::SirSettings::ode_abstol: f64
+pub ferx_core::estimation::sir::SirSettings::ode_auto_switch: bool
+pub ferx_core::estimation::sir::SirSettings::ode_max_steps: usize
+pub ferx_core::estimation::sir::SirSettings::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::estimation::sir::SirSettings::ode_reltol: f64
+pub ferx_core::estimation::sir::SirSettings::ode_stiff_abort_after: core::option::Option<u32>
+pub ferx_core::estimation::sir::SirSettings::resamples: usize
+pub ferx_core::estimation::sir::SirSettings::samples: usize
+pub ferx_core::estimation::sir::SirSettings::scale: ferx_core::SirScale
+pub ferx_core::estimation::sir::SirSettings::seed: u64
+impl ferx_core::estimation::sir::SirSettings
+pub fn ferx_core::estimation::sir::SirSettings::from_options(options: &ferx_core::FitOptions) -> Self
+impl core::default::Default for ferx_core::estimation::sir::SirSettings
+pub fn ferx_core::estimation::sir::SirSettings::default() -> Self
 pub fn ferx_core::estimation::sir::run_sir_core(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, eta_hats: &[nalgebra::base::alias::DVector<f64>], proposal_cov: &nalgebra::base::alias::DMatrix<f64>, ofv_hat: f64, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::estimation::sir::SirResult, alloc::string::String>
 pub mod ferx_core::estimation::trace
 pub struct ferx_core::estimation::trace::TraceWriter
@@ -3127,6 +3151,7 @@ pub ferx_core::types::FitResult::sir_ci_theta: core::option::Option<alloc::vec::
 pub ferx_core::types::FitResult::sir_ess: core::option::Option<f64>
 pub ferx_core::types::FitResult::sir_resamples_packed: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub ferx_core::types::FitResult::sir_seed: core::option::Option<u64>
+pub ferx_core::types::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::types::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::types::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::theta_fixed: alloc::vec::Vec<bool>
@@ -4607,6 +4632,7 @@ pub ferx_core::FitResult::sir_ci_theta: core::option::Option<alloc::vec::Vec<(f6
 pub ferx_core::FitResult::sir_ess: core::option::Option<f64>
 pub ferx_core::FitResult::sir_resamples_packed: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub ferx_core::FitResult::sir_seed: core::option::Option<u64>
+pub ferx_core::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::theta_fixed: alloc::vec::Vec<bool>
