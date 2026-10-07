@@ -3984,11 +3984,9 @@ mod tests {
         h_matrix: &DMatrix<f64>,
         interaction: bool,
     ) {
-        let population = population.clone();
         let template = &model.default_params;
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let (eta_hat, h_matrix) = (eta_hat.clone(), h_matrix.clone());
         let mut options = FitOptions::default();
         options.interaction = interaction;
 
@@ -3996,10 +3994,10 @@ mod tests {
             &x,
             template,
             model,
-            &population,
+            population,
             subject,
-            &eta_hat,
-            &h_matrix,
+            eta_hat,
+            h_matrix,
             &[],
             &bounds,
             &options,
@@ -4008,21 +4006,21 @@ mod tests {
             &x,
             template,
             model,
-            &population,
+            population,
             subject,
-            &eta_hat,
-            &h_matrix,
+            eta_hat,
+            h_matrix,
             &[],
             &bounds,
             &options,
         );
         let nll_ref = subject_nll_at(
             model,
-            &population,
+            population,
             subject,
             &unpack_params(&x, template),
-            &eta_hat,
-            &h_matrix,
+            eta_hat,
+            h_matrix,
             &[],
             &options,
         );
@@ -4040,21 +4038,21 @@ mod tests {
             let two_h = xp[j] - xm[j];
             let nll_p = subject_nll_at(
                 model,
-                &population,
+                population,
                 subject,
                 &unpack_params(&xp, template),
-                &eta_hat,
-                &h_matrix,
+                eta_hat,
+                h_matrix,
                 &[],
                 &options,
             );
             let nll_m = subject_nll_at(
                 model,
-                &population,
+                population,
                 subject,
                 &unpack_params(&xm, template),
-                &eta_hat,
-                &h_matrix,
+                eta_hat,
+                h_matrix,
                 &[],
                 &options,
             );
@@ -4464,24 +4462,29 @@ mod tests {
             }
         }
 
-        /// An `n_eta = 0` exponential hazard with a covariate effect — the shape of library
-        /// model 037. One exact event and one right-censored subject, so both the
+        /// An `n_eta = 0` exponential hazard with a covariate effect — the shape of the
+        /// NONMEM model that surfaced #1744. One exact event and one right-censored subject, so both the
         /// `log h(t)` and the `−H(t)` terms carry a θ-gradient.
+        ///
+        /// Two spellings of the same hazard. The compact one has no `[error_model]`, so
+        /// Sheiner–Beal's own `ErrorSpec::Single` condition already keeps its FOCE leg
+        /// off the closed form, with or without the gate: only its FOCEI leg can see the
+        /// gate. The second carries the placeholder PK and `[error_model]` blocks of the
+        /// shipped `examples/tte_exponential.ferx`, which satisfy every Sheiner–Beal
+        /// condition but the gate — so its FOCE leg is what reaches Sheiner–Beal when
+        /// the gate is dropped.
         #[test]
         fn tte_only_fixed_ebe_grad_matches_fd_via_fallback() {
-            let model = parse(
-                "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n  theta TH_AGE(0.2, -10, \
-                 10)\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = \
-                 TVLAM\n  loghr  = TH_AGE * (AGE - 50) / 10\n",
-            );
-            assert!(model.has_tte(), "fixture precondition: a TTE endpoint");
-            assert_eq!(model.n_eta, 0, "fixture precondition: no random effects");
-            assert!(!closed_form_fixed_ebe_grad_ok(
-                &model,
-                &model.default_params,
-                &[]
-            ));
-            let subjects = [(7.0, true, 40.0), (30.0, false, 60.0)]
+            let hazard = "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = \
+                          TVLAM\n  loghr  = TH_AGE * (AGE - 50) / 10\n";
+            let thetas = "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n  theta TH_AGE(0.2, \
+                          -10, 10)\n";
+            let placeholder_gaussian = "  theta DUMMY_CL(1.0, FIX)\n  theta DUMMY_V(1.0, \
+                                        FIX)\n  sigma SIGMA_DV ~ 0.01 FIX\n\
+                                        [individual_parameters]\n  CL = DUMMY_CL\n  V  = \
+                                        DUMMY_V\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+                                        v=V)\n[error_model]\n  DV ~ additive(SIGMA_DV)\n";
+            let subjects: Vec<Subject> = [(7.0, true, 40.0), (30.0, false, 60.0)]
                 .into_iter()
                 .enumerate()
                 .map(|(i, (t, exact, age))| {
@@ -4496,9 +4499,40 @@ mod tests {
                 .collect();
             let pop = population(&["AGE"], subjects);
             let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
-            for subject in 0..pop.subjects.len() {
-                for interaction in [true, false] {
-                    check_gn_grad_matches_fd_at(&model, &pop, subject, &eta, &h, interaction);
+            for (label, src, sb_reachable) in [
+                ("compact", format!("{thetas}{hazard}"), false),
+                (
+                    "placeholder [error_model]",
+                    format!("{thetas}{placeholder_gaussian}{hazard}"),
+                    true,
+                ),
+            ] {
+                let model = parse(&src);
+                assert!(
+                    model.has_tte(),
+                    "{label}: fixture precondition: a TTE endpoint"
+                );
+                assert_eq!(
+                    model.n_eta, 0,
+                    "{label}: fixture precondition: no random effects"
+                );
+                assert!(!closed_form_fixed_ebe_grad_ok(
+                    &model,
+                    &model.default_params,
+                    &[]
+                ));
+                // The straddle: Sheiner–Beal's extra conditions on top of the gate.
+                // Asserted both ways, so the placeholder spelling cannot silently stop
+                // reaching the FOCE closed form and leave that leg a tautology.
+                assert_eq!(
+                    model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_)),
+                    sb_reachable,
+                    "{label}: fixture precondition: Sheiner–Beal's own conditions"
+                );
+                for subject in 0..pop.subjects.len() {
+                    for interaction in [true, false] {
+                        check_gn_grad_matches_fd_at(&model, &pop, subject, &eta, &h, interaction);
+                    }
                 }
             }
         }

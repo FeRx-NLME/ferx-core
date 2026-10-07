@@ -26,8 +26,8 @@ mod non_gaussian_score {
     use ferx_core::{fit, FitOptions};
     use nalgebra::{Matrix2, Vector2};
 
-    /// `h(t) = LAM · exp(B·X)`, no random effects — the shape of a covariate TTE
-    /// model such as NONMEM library model 037.
+    /// `h(t) = LAM · exp(B·X)`, no random effects — the shape of the covariate TTE
+    /// model that surfaced #1744.
     const MODEL: &str = r"
 [parameters]
   theta LAM(0.05, 0.0001, 10.0)
@@ -163,13 +163,14 @@ mod non_gaussian_score {
     /// `MATRIX=S` and `MATRIX=RSR` are the two estimators that read the per-subject
     /// score; `MATRIX=R` does not and is the control — it was right before the fix.
     ///
-    /// Measured worst relative SE error against the closed form (macOS arm64; the
-    /// quantities are a 24-row sum, not a fit, so no platform sensitivity is
-    /// expected): S 1.5e-8, R 3.6e-4, RSR 6.8e-4. S is that tight because the score
-    /// is a central difference of a smooth objective; R is the FD Hessian of the
-    /// OFV, and RSR inherits R's error. Bounds: S 1e-6 (65×), R 2e-3 (5.5×),
-    /// RSR 3e-3 (4.4×). Before the fix S was singular (no SEs, so `se_at_mle`
-    /// panics) and RSR returned SE = 0 (relative error 1).
+    /// Measured worst relative SE error against the closed form, on Linux x86_64
+    /// (glibc 2.28), identical in every printed digit on macOS arm64 — the
+    /// quantities are a 24-row sum, not a fit: S 1.5e-8, R 3.6e-4, RSR 6.8e-4. The
+    /// `eprintln!` below prints them, so `--nocapture` re-measures. S is that tight
+    /// because the score is a central difference of a smooth objective; R is the FD
+    /// Hessian of the OFV, and RSR inherits R's error. Bounds: S 1e-6 (65×), R 2e-3
+    /// (5.5×), RSR 3e-3 (4.4×). Before the fix S was singular (no SEs, so
+    /// `se_at_mle` panics) and RSR returned SE = 0 (relative error 1).
     #[test]
     fn s_and_sandwich_covariance_match_the_closed_form_score() {
         let (lam, b) = mle();
@@ -196,6 +197,7 @@ mod non_gaussian_score {
             for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
                 assert!(g.is_finite(), "{method:?} SE[{k}] is not finite: {g}");
                 let rel = (g - w).abs() / w;
+                eprintln!("{method:?} SE[{k}]: rel {rel:.3e} (bound {tol:e})");
                 assert!(
                     rel < tol,
                     "{method:?} SE[{k}]: ferx {g:.8e}, closed form {w:.8e}, rel {rel:.3e}"
@@ -209,7 +211,8 @@ mod non_gaussian_score {
     /// and `gn_hybrid` with a gradient-based polish.
     ///
     /// From `(LAM, B) = (0.05, 0.3)` the OFV gap to the MLE is 2.692. Measured OFV
-    /// left after `outer_maxiter = 5`: L-BFGS 3e-14, SLSQP 8.1e-6, trust-region
+    /// left after `outer_maxiter = 5`, on Linux x86_64 (glibc 2.28) and identical in
+    /// every printed digit on macOS arm64: L-BFGS 3e-14, SLSQP 8.1e-6, trust-region
     /// 1.1e-2 (0.41% of the gap), GN 1.1e-2, `gn_hybrid` + L-BFGS 3e-14 (its polish
     /// has its own iteration budget). The bound — 10% of the gap left — is 24× the
     /// worst. Trust-region and GN agree bit-for-bit here: both solve the same BHHH
@@ -254,6 +257,11 @@ mod non_gaussian_score {
                 "{method:?}/{optimizer:?}: OFV is not finite"
             );
             let left = (res.ofv - ofv_mle) / gap;
+            eprintln!(
+                "{method:?}/{optimizer:?}: OFV left {:.3e} ({:.3e} of the gap)",
+                res.ofv - ofv_mle,
+                left
+            );
             assert!(
                 left < 0.1,
                 "{method:?}/{optimizer:?}: {:.1}% of the OFV gap left after 5 outer iterations \
