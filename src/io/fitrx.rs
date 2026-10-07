@@ -428,7 +428,43 @@ impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
 }
 
 impl SirSettingsWire {
+    /// Decoded and held to the domain `[fit_options]` enforces for the same keys
+    /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
+    /// default, so a value the parser would reject must not enter through the bundle.
     fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
+        let bad = |field: &str, why: &str, got: String| {
+            Err(FitrxError::Corrupt(format!(
+                "sir.settings.{field} must be {why}, got {got}"
+            )))
+        };
+        if !(self.df >= 1.0) {
+            return bad("df", ">= 1", self.df.to_string());
+        }
+        for (field, v) in [
+            ("ode_reltol", self.ode_reltol),
+            ("ode_abstol", self.ode_abstol),
+        ] {
+            if !(v > 0.0 && v.is_finite()) {
+                return bad(field, "a positive finite value", v.to_string());
+            }
+        }
+        if self.ode_max_steps == 0 {
+            return bad("ode_max_steps", "a positive integer", "0".to_string());
+        }
+        if !(1..=crate::estimation::agq::MAX_AGQ_NODES).contains(&self.n_agq) {
+            return bad(
+                "n_agq",
+                &format!("in 1..={}", crate::estimation::agq::MAX_AGQ_NODES),
+                self.n_agq.to_string(),
+            );
+        }
+        if self.ode_stiff_abort_after == Some(0) {
+            return bad(
+                "ode_stiff_abort_after",
+                "positive or absent",
+                "0".to_string(),
+            );
+        }
         Ok(crate::estimation::sir::SirSettings {
             samples: self.samples,
             resamples: self.resamples,
@@ -2062,6 +2098,16 @@ fn wire_to_fit_result(
         ),
         None => (None, None, None, None, None, None, None),
     };
+    // Two copies of one seed (#1767): a record whose seed differs from `sir_seed`
+    // would make `fit.sir_seed` report one run and `run_sir` reproduce another.
+    if let Some(st) = sir_settings.as_ref() {
+        if w.sir_seed != Some(st.seed) {
+            return Err(FitrxError::Corrupt(format!(
+                "sir_seed {:?} disagrees with sir.settings.seed {}",
+                w.sir_seed, st.seed
+            )));
+        }
+    }
 
     // `validate_parallel_lengths` has already ensured that omega/sigma
     // `init_as_sd` are either empty (pre-issue-#5 bundle) or exactly the
@@ -3261,6 +3307,101 @@ mod tests {
                 assert!(msg.contains("\"Natural\""), "{msg}");
             }
             other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Load `sir_fit_with_settings()` with `edit` applied to its wire JSON.
+    fn load_edited_sir_wire(
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<FitResult, FitrxError> {
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        edit(&mut value);
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+    }
+
+    /// #1767 finding 6: a recorded value outside the domain `[fit_options]` enforces
+    /// for the same key is `Corrupt`, naming the field and the value — `run_sir`
+    /// would otherwise adopt it past the parser's gate. Each row also loads the
+    /// boundary value, so the gate is straddled: a check that rejected everything
+    /// (or an off-by-one bound) fails the accept half, a deleted check the reject
+    /// half. Mutations: delete any one check; `> 1.0` for `df`; `1..MAX` for `n_agq`.
+    #[test]
+    fn sir_settings_out_of_domain_values_are_corrupt() {
+        let max_agq = crate::estimation::agq::MAX_AGQ_NODES;
+        let agq_shows = format!("got {}", max_agq + 1);
+        let rows: [(&str, serde_json::Value, serde_json::Value, &str); 6] = [
+            ("df", serde_json::json!(0.5), serde_json::json!(1.0), "0.5"),
+            (
+                "ode_reltol",
+                serde_json::json!(0.0),
+                serde_json::json!(1e-12),
+                "got 0",
+            ),
+            (
+                "ode_abstol",
+                serde_json::json!(-1e-6),
+                serde_json::json!(1e-12),
+                "-0.000001",
+            ),
+            (
+                "ode_max_steps",
+                serde_json::json!(0),
+                serde_json::json!(1),
+                "got 0",
+            ),
+            (
+                "n_agq",
+                serde_json::json!(max_agq + 1),
+                serde_json::json!(max_agq),
+                &agq_shows,
+            ),
+            (
+                "ode_stiff_abort_after",
+                serde_json::json!(0),
+                serde_json::json!(1),
+                "got 0",
+            ),
+        ];
+        for (field, reject, accept, shows) in rows {
+            let rejected = load_edited_sir_wire(|v| v["sir"]["settings"][field] = reject.clone());
+            match rejected {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(
+                        msg.contains(&format!("sir.settings.{field} ")),
+                        "{field}: {msg}"
+                    );
+                    assert!(msg.contains(shows), "{field}: {msg}");
+                }
+                other => panic!("{field}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+            let loaded = load_edited_sir_wire(|v| v["sir"]["settings"][field] = accept.clone())
+                .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
+            assert!(loaded.sir_settings.is_some(), "{field}");
+        }
+    }
+
+    /// #1767 finding 7: `sir_seed` and `sir.settings.seed` are two copies of one seed;
+    /// a bundle where they disagree, or where the record has no `sir_seed` beside it,
+    /// is `Corrupt`. The control — the two equal — loads (that is
+    /// `roundtrip_keeps_sir_settings`). Mutation: delete the check (both load).
+    #[test]
+    fn a_sir_seed_disagreeing_with_the_record_is_corrupt() {
+        for (seed, shows) in [
+            (serde_json::json!(4243), "Some(4243)"),
+            (serde_json::Value::Null, "None"),
+        ] {
+            match load_edited_sir_wire(|v| v["sir_seed"] = seed.clone()) {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(msg.contains("sir.settings.seed 4242"), "{msg}");
+                    assert!(msg.contains(shows), "{msg}");
+                }
+                other => panic!(
+                    "sir_seed {seed}: expected Corrupt, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
         }
     }
 

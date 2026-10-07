@@ -227,7 +227,9 @@ when the model uses kappa (block IOV).
 `samples`, `resamples`, the resolved `seed`, `df`, `scale`, `keep_samples`,
 `inner_maxiter`, `inner_tol`, `mu_referencing`, `n_agq`, `inner_optimizer`,
 `ebe_warm_start` and the six `ode_*` settings. The enums are written as their
-`[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token
+`[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token,
+a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance,
+`n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed`
 fails the load as corrupt. The key is additive, so `format_version` stays `"1"`:
 a bundle saved before #1758 has no `settings` and loads `sir_settings = None`,
 and `run_sir` on it uses the caller's options as given.
