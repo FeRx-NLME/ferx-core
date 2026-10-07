@@ -111,7 +111,16 @@ pub fn fit_from_files(
     // Parse the full model so an authoritative `[covariates]` block is visible
     // here (the file's `[fit_options]` are still ignored — the caller's
     // `options` win, preserving historical behaviour).
-    let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
+    //
+    // The file is read **once** (#1752): the parse, the binders below, `model_hash`
+    // and `model_text` all come from this one read, so an edit to the file while
+    // the fit runs cannot bind against a different version than was parsed.
+    let crate::io::model_source::ModelSource {
+        text: model_text,
+        hash: model_hash,
+        mut parsed,
+        ..
+    } = crate::io::model_source::ModelSource::read(model_path)?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
@@ -148,16 +157,12 @@ pub fn fit_from_files(
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
     // property of the dataset. Mirrors `run_model_with_data_inits`.
-    {
-        let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
-        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
-        // #1111: resolve any symbolic `[covariate_model]` statistic
-        // (`center = median`, `ref = mode`, `levels = auto`) against the same
-        // dataset. `assert_covariate_model_bound` names this entry point as one
-        // that binds them, so it has to actually do it.
-        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
-    }
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    // #1111: resolve any symbolic `[covariate_model]` statistic
+    // (`center = median`, `ref = mode`, `levels = auto`) against the same
+    // dataset. `assert_covariate_model_bound` names this entry point as one
+    // that binds them, so it has to actually do it.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD. One rule, shared
@@ -170,16 +175,14 @@ pub fn fit_from_files(
         result.warnings.push(w);
         rebuild_warnings_structured(&mut result);
     }
-    // Hash inputs post-fit (same pattern as `run_model_with_data`). The
-    // model and CSV were already read by `parse_model_file` and
-    // `read_nonmem_csv` upstream, so the OS page cache typically serves
-    // these reads; failures are non-fatal and just disable the integrity
-    // check in `run_sir`.
+    // The model's hash and text are the read that was parsed and fitted (#1752).
+    // The CSV is hashed post-fit; a failure there is non-fatal and just disables
+    // the data integrity check in `run_sir`.
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
-    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.model_hash = Some(model_hash);
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
-    result.model_text = std::fs::read_to_string(model_path).ok();
+    result.model_text = Some(model_text);
     Ok(result)
 }
 

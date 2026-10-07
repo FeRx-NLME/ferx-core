@@ -152,7 +152,8 @@ enum FirstArg<'a> {
     /// A bare word — no dot, no path separator. The user meant a tool, and this
     /// build does not have it (a typo, or a tool that only exists in a later
     /// version). Reading it as a model path is what produced the misleading
-    /// "Failed to read model file: No such file or directory".
+    /// "Failed to read model file: No such file or directory" (now "cannot read the
+    /// model file …", #1752).
     UnknownTool(&'a str),
     /// Either the path is there, or the filesystem would not say: hand it to
     /// the fit/simulate path, which opens it and reports whatever the OS says.

@@ -323,6 +323,11 @@ mod entry_point_errors_tests;
 #[path = "tests/theta_length_gate_tests.rs"]
 mod theta_length_gate_tests;
 
+// #1752: every entry point reads its model file once.
+#[cfg(test)]
+#[path = "tests/single_model_read_tests.rs"]
+mod single_model_read_tests;
+
 // ── SDE end-to-end integration ───────────────────────────────────────────────
 
 #[cfg(test)]

@@ -159,6 +159,9 @@ pub struct PreparedRun {
     pub model_hash: Option<String>,
     /// SHA-256 of the dataset, `None` if it could not be hashed.
     pub data_hash: Option<String>,
+    /// The model file's text from the one read that was parsed, bound and hashed
+    /// (#1752), stored on the fit as `model_text`.
+    pub(crate) model_text: String,
 }
 
 /// Parse a model file and read its dataset, stopping short of the fit.
@@ -180,9 +183,14 @@ pub fn prepare_run_with_inits(
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<PreparedRun, String> {
-    use crate::parser::model_parser::parse_full_model_file;
-
-    let mut parsed = parse_full_model_file(Path::new(model_path))?;
+    // One read of the model file (#1752): the parse, the binders, `model_hash` and
+    // the stored `model_text` are all this read, never a later version of the file.
+    let crate::io::model_source::ModelSource {
+        text: model_text,
+        hash: model_hash,
+        mut parsed,
+        ..
+    } = crate::io::model_source::ModelSource::read(model_path)?;
     set_model_name(&mut parsed.model, model_path);
     if let Some(method) = inits_override {
         parsed.fit_options.inits_from_nca = Some(method);
@@ -197,16 +205,12 @@ pub fn prepare_run_with_inits(
     // this synthesizes the per-record index column on every subject and
     // re-parses the model with the real θ count — before anything reads
     // `parsed.model`'s parameter vector.
-    {
-        let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
-        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
-        // #1111: and resolve any symbolic `[covariate_model]` statistic
-        // (`center = median`, `ref = mode`, `levels = auto`) against the same
-        // dataset, which likewise re-parses so the desugared expression carries
-        // the resolved constant.
-        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
-    }
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    // #1111: and resolve any symbolic `[covariate_model]` statistic
+    // (`center = median`, `ref = mode`, `levels = auto`) against the same
+    // dataset, which likewise re-parses so the desugared expression carries
+    // the resolved constant.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
 
     let init_params = build_init_params(&parsed);
     // Sync the resolved gradient method from fit_options onto the model so
@@ -215,11 +219,11 @@ pub fn prepare_run_with_inits(
     parsed.model.gradient_method =
         crate::types::GradientMethod::effective(&parsed.model, &parsed.fit_options);
 
-    // Hash both inputs up front (needed before the fit for the checkpoint
-    // integrity check, #755) and reuse the digests for the post-fit result
-    // stamping below — so we still hash each file only once. Errors are
-    // non-fatal: a missing hash just disables the resume/integrity checks.
-    let model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    // Hash the data up front (needed before the fit for the checkpoint integrity
+    // check, #755) and reuse the digest for the post-fit result stamping. An error
+    // is non-fatal: a missing hash just disables the resume/integrity checks. The
+    // model's hash is the one read above.
+    let model_hash = Some(model_hash);
     let data_hash = crate::io::hash::sha256_file(Path::new(&data_path)).ok();
 
     Ok(PreparedRun {
@@ -231,6 +235,7 @@ pub fn prepare_run_with_inits(
         data_path_warning,
         model_hash,
         data_hash,
+        model_text,
     })
 }
 
@@ -321,6 +326,7 @@ pub fn run_model_with_overrides(
         data_path_warning,
         model_hash,
         data_hash,
+        model_text,
     } = prepare_run_with_inits(model_path, data_path, inits_override)?;
     let data_path = data_path.as_str();
 
@@ -372,7 +378,7 @@ pub fn run_model_with_overrides(
     result.data_path = Some(data_path.to_string());
     result.model_hash = model_hash;
     result.data_hash = data_hash;
-    result.model_text = std::fs::read_to_string(model_path).ok();
+    result.model_text = Some(model_text);
     derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
 }
@@ -487,10 +493,15 @@ pub fn run_model_simulate_with_overrides(
     model_path: &str,
     overrides: &RunOverrides,
 ) -> Result<(FitResult, Population), String> {
-    use crate::parser::model_parser::parse_full_model_file;
     use std::collections::HashMap;
 
-    let mut parsed = parse_full_model_file(Path::new(model_path))?;
+    // One read of the model file (#1752), as in `prepare_run_with_inits`.
+    let crate::io::model_source::ModelSource {
+        text: model_text,
+        hash: model_hash,
+        mut parsed,
+        ..
+    } = crate::io::model_source::ModelSource::read(model_path)?;
     let sim_spec = parsed
         .simulation
         .clone()
@@ -690,14 +701,10 @@ pub fn run_model_simulate_with_overrides(
     // declaration's broadcast init, since the DSL has no way to state per-level
     // simulation values; a design that needs distinct ones should use the
     // explicit `theta NAME[N]` form and its own index column.
-    {
-        let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
-        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
-        // #1111: the simulation design is the dataset here, so a symbolic
-        // covariate statistic resolves against the simulated covariates.
-        crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
-    }
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
+    // #1111: the simulation design is the dataset here, so a symbolic
+    // covariate statistic resolves against the simulated covariates.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
     let template = template;
 
     // Simulate
@@ -920,12 +927,11 @@ pub fn run_model_simulate_with_overrides(
     if let Some(w) = threads_warning {
         result.warnings.push(w);
     }
-    // No data file to hash — data is simulated in-process. Hash the model
-    // post-fit (same pattern as `run_model_with_data`); failures are
-    // non-fatal and just disable the integrity check in `run_sir`.
+    // No data file to hash — data is simulated in-process. The model's hash and
+    // text are the read that was parsed (#1752).
     result.model_path = Some(model_path.to_string());
-    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
-    result.model_text = std::fs::read_to_string(model_path).ok();
+    result.model_hash = Some(model_hash);
+    result.model_text = Some(model_text);
     // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
     // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
     // `fit()` already built `warnings_structured` from the fit warnings; rebuild it

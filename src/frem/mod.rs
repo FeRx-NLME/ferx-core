@@ -913,10 +913,15 @@ pub fn prepare_frem(
     fit_init: Option<&FremFitInit>,
 ) -> Result<FremPrepareResult, String> {
     use crate::io::datareader::read_nonmem_csv_mapped;
-    use crate::parser::model_parser::parse_full_model_file;
 
     // Full parse so the optional `[covariates]` block is available for fallback.
-    let parsed = parse_full_model_file(model_path)?;
+    // One read (#1752): the FREM model is generated from the same text that was
+    // parsed, not from a later read of the file.
+    let crate::io::model_source::ModelSource {
+        text: base_text,
+        parsed,
+        ..
+    } = crate::io::model_source::ModelSource::read(model_path)?;
     let base_model = &parsed.model;
     reject_non_gaussian_endpoints(base_model)?;
     // Honour the model's `[data]` column mapping (#730) so FREM prep reads the
@@ -953,10 +958,6 @@ pub fn prepare_frem(
 
     let out_model = output_model_path.unwrap_or(&default_model_path);
     let out_data = output_data_path.unwrap_or(&default_data_path);
-
-    // Read base model text for model generation.
-    let base_text = std::fs::read_to_string(model_path)
-        .map_err(|e| format!("Failed to read model file: {}", e))?;
 
     // Generate FREM model.
     let model_text = generate_frem_model(&base_text, base_model, &frem_info, out_data, fit_init)?;

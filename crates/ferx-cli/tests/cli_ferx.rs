@@ -383,9 +383,11 @@ fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
         stderr.contains("tool `covsearchx` not recognized"),
         "expected the unknown-tool error: {stderr}"
     );
-    // The regression this exists to catch: the old model-file reading.
+    // The regression this exists to catch: the old model-file reading. The phrase
+    // is the one an unreadable model file reports (#1752: it was `Failed to read
+    // model file`).
     assert!(
-        !stderr.contains("Failed to read model file"),
+        !stderr.contains("cannot read the model file"),
         "a tool name must not be reported as a model file: {stderr}"
     );
     assert!(
@@ -417,6 +419,28 @@ fn a_missing_model_file_is_reported_by_name() {
     assert!(
         !stderr.contains("not recognized"),
         "a path must not be reported as a tool: {stderr}"
+    );
+}
+
+/// The witness that keeps the unknown-tool test's negative phrase anchor live: a
+/// model path that exists but cannot be read (here a directory) reaches the fit
+/// path and reports exactly that phrase, naming the path (#1752). Without it, a
+/// rewording of the read failure would leave `!contains(..)` above passing on a
+/// phrase nothing prints.
+#[test]
+fn an_unreadable_model_path_reports_the_read_failure_by_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(tmp.path().join("mydir")).expect("mkdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["mydir", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on a directory");
+    assert_eq!(out.status.code(), Some(1), "unreadable model → exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot read the model file mydir: "),
+        "expected the read failure: {stderr}"
     );
 }
 
