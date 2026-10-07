@@ -44,7 +44,7 @@ pub use api::{
     SimulateUncertaintyOptions, SimulationOutput, SimulationResult, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
-pub use diagnostics::{CheckReport, Diagnostic, Severity};
+pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
 pub use environment::EnvironmentInfo;
 pub use estimation::run_covariance::run_covariance;
 pub use estimation::run_sir::run_sir;

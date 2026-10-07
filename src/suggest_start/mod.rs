@@ -77,7 +77,7 @@ pub fn inits_from_nca(
     model: &CompiledModel,
     population: &Population,
     method: NcaInit,
-) -> Result<SuggestedStart, String> {
+) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     // Reached from `fit()` (which validates first) but also a standalone public
     // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
     // dose precondition here too — same loud-not-silent contract as
@@ -86,8 +86,8 @@ pub fn inits_from_nca(
     first_error(&crate::api::check_dose_compartments(model, population))?;
     match method {
         NcaInit::Nca => Ok(nca_only(model, population)),
-        NcaInit::Sweep => nca_with_sweep(model, population),
-        NcaInit::Ebe => nca_with_ebe(model, population),
+        NcaInit::Sweep => Ok(nca_with_sweep(model, population)?),
+        NcaInit::Ebe => Ok(nca_with_ebe(model, population)?),
     }
 }
 

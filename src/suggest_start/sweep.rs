@@ -23,7 +23,9 @@ fn rrmse(
     population: &Population,
     params: &ModelParameters,
 ) -> Result<f64, String> {
-    let preds = predict(model, population, params)?;
+    // `rrmse` scores a candidate start; a refusal here is a failed candidate, not a
+    // precondition `inits_from_nca` reports, which checked its own before sweeping.
+    let preds = predict(model, population, params).map_err(|e| e.to_string())?;
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
     // population.subjects[i].obs_times.

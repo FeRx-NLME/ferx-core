@@ -205,7 +205,7 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
         .expect("an unbound model must not predict");
     // One assertion per sentence (and clause) of the message and the suggestion.
     assert!(
-        err.starts_with(
+        err.to_string().starts_with(
             "`theta PLACEBO[...]` was never bound to data, so it has no levels and every \
              value gathered from it is NaN. "
         ),
@@ -214,29 +214,31 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     // That the advice is also *true* — following it reproduces the fit's predictions on
     // new data — is `from_fit::following_the_unbound_predict_refusal_gives_the_fits_predictions`.
     assert!(
-        err.contains(
+        err.to_string().contains(
             "With a fit's θ, call `bind_from_fit(&mut parsed, &model_text, &mut population, \
              &fit.data_bindings)` on the population you pass to `predict`"
         ),
         "the from-fit binder, on the population predict reads: {err}"
     );
     assert!(
-        err.contains(", with the `data_bindings` the fit (or its `.fitrx`) carries"),
+        err.to_string()
+            .contains(", with the `data_bindings` the fit (or its `.fitrx`) carries"),
         "where the fit's bindings come from: {err}"
     );
     assert!(
-        err.contains(", and predict with the model it re-parses into `parsed`."),
+        err.to_string()
+            .contains(", and predict with the model it re-parses into `parsed`."),
         "the bound model is a re-parse, not the one in hand: {err}"
     );
     assert!(
-        err.contains(
+        err.to_string().contains(
             "`bind_theta_levels` on that population fits only a θ laid out for the levels it \
              discovers, such as the model's own `default_params`."
         ),
         "when the other binder is the right one: {err}"
     );
     assert!(
-        err.ends_with(
+        err.to_string().ends_with(
             "Or declare the block explicitly as `theta PLACEBO[N](...)` and index it with \
              your own column."
         ),
@@ -252,7 +254,7 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
         "run_model_simulate",
     ] {
         assert!(
-            !err.contains(absent),
+            !err.to_string().contains(absent),
             "`{absent}` in predict's refusal: {err}"
         );
     }
@@ -282,7 +284,7 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     )
     .err()
     .expect("an unbound model must not simulate");
-    assert_eq!(sim_err, sim.message);
+    assert_eq!(sim_err.to_string(), sim.message);
 
     // Bound, the same model predicts.
     let mut pop = population(2, 2);
@@ -1368,26 +1370,29 @@ mod from_fit {
         params.theta.pop();
         let err = simulate_with_seed(&model, &pop, &params, 1, 1).unwrap_err();
         assert!(
-            err.contains("the supplied theta has 4 values but this model has 5"),
+            err.to_string()
+                .contains("the supplied theta has 4 values but this model has 5"),
             "{err}"
         );
         assert!(
-            err.contains("declares the theta level block(s) `PLACEBO`"),
+            err.to_string()
+                .contains("declares the theta level block(s) `PLACEBO`"),
             "{err}"
         );
         assert!(
-            err.contains("whose theta count is set by the data the model was bound against."),
+            err.to_string()
+                .contains("whose theta count is set by the data the model was bound against."),
             "why the count moves: {err}"
         );
         assert!(
-            err.contains(
+            err.to_string().contains(
                 "A fit's theta fits only a design bound against that fit's level bindings, \
                  which give the design the fit's theta layout"
             ),
             "what a fit's theta needs: {err}"
         );
         assert!(
-            !err.contains("bind_theta_levels"),
+            !err.to_string().contains("bind_theta_levels"),
             "no Rust function in a message a wrapper reaches: {err}"
         );
 
@@ -1399,11 +1404,12 @@ mod from_fit {
         params.theta.pop();
         let err = simulate_with_seed(&model, &population(2, 2), &params, 1, 1).unwrap_err();
         assert!(
-            err.contains("the supplied theta has 1 values but this model has 2"),
+            err.to_string()
+                .contains("the supplied theta has 1 values but this model has 2"),
             "{err}"
         );
-        assert!(!err.contains("level block"), "{err}");
-        assert!(!err.contains("level bindings"), "{err}");
+        assert!(!err.to_string().contains("level block"), "{err}");
+        assert!(!err.to_string().contains("level bindings"), "{err}");
     }
 
     /// T9. The unseen-level refusal's second action works, not only its wording:
@@ -1490,7 +1496,7 @@ mod from_fit {
                 .err()
                 .expect("an unbound model must not predict");
         assert!(
-            err.contains("`bind_from_fit("),
+            err.to_string().contains("`bind_from_fit("),
             "the refusal names the binder this test follows: {err}"
         );
 
@@ -1591,11 +1597,11 @@ mod from_fit {
         let err = crate::api::predict_diag(&fit.model, &never, &params)
             .err()
             .expect("predict_diag");
-        assert_run_refusal(&err, "predict_diag");
+        assert_run_refusal(&err.to_string(), "predict_diag");
         let err = crate::api::predict(&fit.model, &never, &params)
             .err()
             .expect("predict");
-        assert_run_refusal(&err, "predict");
+        assert_run_refusal(&err.to_string(), "predict");
         let err = crate::api::simulate_with_options_diag(
             &fit.model,
             &never,
@@ -1605,11 +1611,11 @@ mod from_fit {
         )
         .err()
         .expect("simulate_with_options_diag");
-        assert_run_refusal(&err, "simulate_with_options_diag");
+        assert_run_refusal(&err.to_string(), "simulate_with_options_diag");
         let err = crate::stats::npde::compute_npde_npd(&fit.model, &never, &params, 20, Some(1))
             .err()
             .expect("compute_npde_npd");
-        assert_run_refusal(&err, "compute_npde_npd");
+        assert_run_refusal(&err.to_string(), "compute_npde_npd");
 
         let err = crate::api::fit(&fit.model, &never, &params, &FitOptions::default())
             .err()
@@ -1642,7 +1648,7 @@ mod from_fit {
         let err = crate::api::predict_diag(&from_fit.model, &never, &p)
             .err()
             .expect("predict_diag, from-fit model");
-        assert_run_refusal(&err, "predict_diag, from-fit model");
+        assert_run_refusal(&err.to_string(), "predict_diag, from-fit model");
     }
 
     /// #1647: each refusal's advice is *true*. Following the `Run` sentence gives the fit's
@@ -1754,7 +1760,7 @@ mod from_fit {
             20,
             Some(1),
         ) {
-            assert!(!e.contains("is bound, but"), "{e}");
+            assert!(!e.to_string().contains("is bound, but"), "{e}");
         }
 
         // The other side: bound, on a population never bound, it is reported.

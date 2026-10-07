@@ -2128,7 +2128,7 @@ fn test_simulate_with_options_errs_when_omega_iov_missing() {
     )
     .expect_err("an IOV model with no omega_iov must not simulate");
     assert!(
-        err.contains("omega_iov") && err.contains("kappa"),
+        err.to_string().contains("omega_iov") && err.to_string().contains("kappa"),
         "error must name the missing IOV covariance; got: {err}"
     );
 }
@@ -2142,7 +2142,10 @@ fn test_simulate_with_seed_errs_when_omega_iov_missing() {
     // there, rather than rows with zero inter-occasion variability.
     let err = simulate_with_seed(&model, &population, &params, 1, 1)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(err.contains("carry no omega_iov"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("carry no omega_iov"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]

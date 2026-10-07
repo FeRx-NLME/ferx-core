@@ -208,7 +208,7 @@ fn matching_requires_observations() {
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("matching without observations must error");
     assert!(
-        err.contains("observations"),
+        err.to_string().contains("observations"),
         "error should mention the missing observations: {err}"
     );
 }

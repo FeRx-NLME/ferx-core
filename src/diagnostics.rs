@@ -218,14 +218,125 @@ impl CheckReport {
     }
 }
 
-/// Collapse a slice of diagnostics to the historical `Result<(), String>`:
-/// `Err` with the first error-severity message, else `Ok`. This lets `fit()`
-/// keep its fail-fast behavior and identical error strings while sharing the
-/// diagnostic-producing validators with `ferx check`.
-pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), String> {
+/// Collapse a slice of diagnostics to a fail-fast `Result`: `Err` carrying the
+/// first error-severity [`Diagnostic`], else `Ok`. This lets the entry points
+/// keep their fail-fast behavior and identical error strings (the `Display` of
+/// the returned [`EngineError`] is the diagnostic's message) while sharing the
+/// diagnostic-producing validators with `ferx check` — and, since #1746, while
+/// handing the caller the same code, block and suggestion `ferx check` reports.
+pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
     match diagnostics.iter().find(|d| d.is_error()) {
-        Some(d) => Err(d.message.clone()),
+        Some(d) => Err(EngineError::from_diagnostic(d.clone())),
         None => Ok(()),
+    }
+}
+
+/// The error a non-`fit` entry point (`predict*`, `simulate*`, `compute_npde_npd`,
+/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca`) returns when it
+/// refuses its input (#1746).
+///
+/// When `ferx check` reports the same refusal with a code, the error carries that
+/// [`Diagnostic`] — so a caller matches on [`code`](Self::code) instead of parsing
+/// the message. A refusal `ferx check` has no code for carries none
+/// ([`diagnostic`](Self::diagnostic) is `None`); a code is never invented at the
+/// entry point.
+///
+/// `Display` is the historical `String` error byte for byte: the message, preceded
+/// by `"{context}: "` when the refusal names its entry point (`run_sir`,
+/// `run_covariance`). `.to_string()` therefore recovers the pre-#1746 `Err`.
+#[derive(Debug, Clone)]
+pub struct EngineError {
+    diagnostic: Option<Diagnostic>,
+    message: String,
+    context: Option<String>,
+}
+
+impl EngineError {
+    /// An error carrying `d`, whose message is `d.message`.
+    pub(crate) fn from_diagnostic(d: Diagnostic) -> Self {
+        EngineError {
+            message: d.message.clone(),
+            diagnostic: Some(d),
+            context: None,
+        }
+    }
+
+    /// An error carrying `d` whose message is `message` rather than `d.message` —
+    /// for a refusal whose historical text folds more than the diagnostic's message
+    /// (e.g. its suggestion) into one sentence.
+    pub(crate) fn with_message(d: Diagnostic, message: impl Into<String>) -> Self {
+        EngineError {
+            message: message.into(),
+            diagnostic: Some(d),
+            context: None,
+        }
+    }
+
+    /// This error, attributed to the entry point `context` (e.g. `"run_sir"`).
+    pub(crate) fn in_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
+        self
+    }
+
+    /// The diagnostic `ferx check` reports for this refusal, if it has one.
+    pub fn diagnostic(&self) -> Option<&Diagnostic> {
+        self.diagnostic.as_ref()
+    }
+
+    /// The diagnostic's stable code (e.g. `"E_COV_LEVEL_UNKNOWN"`), if any.
+    pub fn code(&self) -> Option<&str> {
+        self.diagnostic.as_ref().map(|d| d.code.as_str())
+    }
+
+    /// The model block the diagnostic belongs to, if known.
+    pub fn block(&self) -> Option<&str> {
+        self.diagnostic.as_ref().and_then(|d| d.block.as_deref())
+    }
+
+    /// The diagnostic's actionable hint, if any.
+    pub fn suggestion(&self) -> Option<&str> {
+        self.diagnostic
+            .as_ref()
+            .and_then(|d| d.suggestion.as_deref())
+    }
+
+    /// The message, without the entry-point context.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The entry point the refusal names, e.g. `Some("run_sir")`.
+    pub fn context(&self) -> Option<&str> {
+        self.context.as_deref()
+    }
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(c) = &self.context {
+            write!(f, "{c}: ")?;
+        }
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
+impl From<String> for EngineError {
+    fn from(message: String) -> Self {
+        EngineError {
+            diagnostic: None,
+            message,
+            context: None,
+        }
+    }
+}
+
+/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
+impl From<&str> for EngineError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
     }
 }
 
@@ -265,13 +376,57 @@ mod tests {
             Diagnostic::error("E_B", "second is the error"),
             Diagnostic::error("E_C", "third"),
         ];
-        assert_eq!(first_error(&diags), Err("second is the error".to_string()));
+        let err = first_error(&diags).expect_err("an error-severity diagnostic");
+        assert_eq!(err.to_string(), "second is the error");
+    }
+
+    /// #1746: the `Err` carries the whole diagnostic `ferx check` reports — code,
+    /// block, line and suggestion — and its `Display` is the message alone, as the
+    /// `String` it replaced was. A failure with no diagnostic carries no code.
+    ///
+    /// Mutations: build the error from `d.message` only (a `From<String>`) → the
+    /// `code()` assert dies; drop `suggestion` / `block` in the copy → that assert
+    /// dies; prefix `Display` with the code → the `to_string()` asserts die.
+    #[test]
+    fn first_error_carries_the_diagnostic_and_displays_its_message() {
+        let mut coded = Diagnostic::error("E_B", "second is the error")
+            .with_block("covariate_model")
+            .with_suggestion("bind it first");
+        coded.line = Some(7);
+        let diags = vec![Diagnostic::warning("W_A", "warn first"), coded];
+        let err = first_error(&diags).expect_err("an error-severity diagnostic");
+        assert_eq!(err.code(), Some("E_B"));
+        assert_eq!(err.block(), Some("covariate_model"));
+        assert_eq!(err.suggestion(), Some("bind it first"));
+        assert_eq!(err.diagnostic().and_then(|d| d.line), Some(7));
+        assert_eq!(err.message(), "second is the error");
+        assert_eq!(err.context(), None);
+        assert_eq!(err.to_string(), "second is the error");
+
+        let plain = EngineError::from("no diagnostic here".to_string());
+        assert!(plain.diagnostic().is_none());
+        assert_eq!(plain.code(), None);
+        assert_eq!(plain.to_string(), "no diagnostic here");
+
+        // Context is printed ahead of the message and kept out of `message()`.
+        let attributed = plain.in_context("run_sir");
+        assert_eq!(attributed.context(), Some("run_sir"));
+        assert_eq!(attributed.message(), "no diagnostic here");
+        assert_eq!(attributed.to_string(), "run_sir: no diagnostic here");
+
+        // `with_message` keeps the diagnostic while printing its own text.
+        let folded = EngineError::with_message(
+            Diagnostic::error("E_X", "short"),
+            "short. With the advice folded in.",
+        );
+        assert_eq!(folded.code(), Some("E_X"));
+        assert_eq!(folded.to_string(), "short. With the advice folded in.");
     }
 
     #[test]
     fn first_error_ok_when_no_errors() {
         let diags = vec![Diagnostic::warning("W_A", "just a warning")];
-        assert_eq!(first_error(&diags), Ok(()));
+        assert!(first_error(&diags).is_ok());
     }
 
     #[test]

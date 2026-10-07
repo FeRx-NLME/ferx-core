@@ -1544,7 +1544,10 @@ fn transit_flip_flop_without_twin_errs_in_predict() {
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// The reject also fires on the `simulate()` path — a panic through the
@@ -1558,7 +1561,10 @@ fn transit_flip_flop_without_twin_errs_in_simulate() {
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
@@ -1759,7 +1765,10 @@ V1 = TVF\n\n\
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an

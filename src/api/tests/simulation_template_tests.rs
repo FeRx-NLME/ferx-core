@@ -220,7 +220,8 @@ fn propensity_matching_rejects_a_design_template() {
     };
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts).unwrap_err();
     assert!(
-        err.contains("non-finite DV values") && err.contains("design template"),
+        err.to_string().contains("non-finite DV values")
+            && err.to_string().contains("design template"),
         "the message must name the real cause, not an EBE convergence failure: {err}"
     );
 

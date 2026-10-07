@@ -118,25 +118,25 @@ fn every_flipped_entry_point_returns_the_text_fit_returns() {
     assert_no_wrapper_text(&want);
 
     let got = predict_diag(&model, &pop, params).expect_err("predict_diag");
-    assert_eq!(got, want, "predict_diag");
+    assert_eq!(got.to_string(), want, "predict_diag");
 
     let opts = SimulateOptions {
         seed: Some(1),
         ..Default::default()
     };
     let got = simulate_with_options(&model, &pop, params, 1, &opts).expect_err("options");
-    assert_eq!(got, want, "simulate_with_options");
+    assert_eq!(got.to_string(), want, "simulate_with_options");
     let got = simulate_with_options_diag(&model, &pop, params, 1, &opts).expect_err("diag");
-    assert_eq!(got, want, "simulate_with_options_diag");
+    assert_eq!(got.to_string(), want, "simulate_with_options_diag");
 
     let got = crate::suggest_start::inits_from_nca(&model, &pop, crate::NcaInit::Nca)
         .expect_err("inits_from_nca");
-    assert_eq!(got, want, "inits_from_nca");
+    assert_eq!(got.to_string(), want, "inits_from_nca");
 
     #[cfg(feature = "survival")]
     {
         let got = predict_survival(&model, &pop, params, &[1.0, 2.0]).expect_err("survival");
-        assert_eq!(got, want, "predict_survival");
+        assert_eq!(got.to_string(), want, "predict_survival");
     }
 }
 
@@ -154,8 +154,8 @@ fn predict_categorical_returns_the_text_fit_returns() {
     let want = fit_err(&model, &pop, params);
     assert!(want.contains("E_ENDPOINT_UNROUTED"), "{want}");
     let got = predict_categorical(&model, &pop, params).expect_err("predict_categorical");
-    assert_eq!(got, want);
-    assert_no_wrapper_text(&got);
+    assert_eq!(got.to_string(), want);
+    assert_no_wrapper_text(&got.to_string());
 }
 
 // ── T2: one fixture per check family, through predict_diag ───────────────────
@@ -403,10 +403,10 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             Err(e) => e,
             Ok(out) => panic!("{}: accepted, {} rows", f.name, out.results.len()),
         };
-        assert!(got.contains(f.phrase), "{}: {got}", f.name);
-        assert_no_wrapper_text(&got);
+        assert!(got.to_string().contains(f.phrase), "{}: {got}", f.name);
+        assert_no_wrapper_text(&got.to_string());
         assert_eq!(
-            got,
+            got.to_string(),
             fit_err(&f.model, &f.pop, &params),
             "{} vs fit()",
             f.name
@@ -476,22 +476,29 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
         };
         let [sim, nca, surv, cat] = checked_by(f.name);
         if let Some(want) = sim {
-            let got = simulate_with_options(&f.model, &f.pop, &params, 1, &opts).err();
+            let got = simulate_with_options(&f.model, &f.pop, &params, 1, &opts)
+                .err()
+                .map(|e| e.to_string());
             cell("simulate_with_options", want, got);
         }
         if let Some(want) = nca {
-            let got =
-                crate::suggest_start::inits_from_nca(&f.model, &f.pop, crate::NcaInit::Nca).err();
+            let got = crate::suggest_start::inits_from_nca(&f.model, &f.pop, crate::NcaInit::Nca)
+                .err()
+                .map(|e| e.to_string());
             cell("inits_from_nca", want, got);
         }
         #[cfg(feature = "survival")]
         {
             if let Some(want) = surv {
-                let got = predict_survival(&f.model, &f.pop, &params, &[1.0, 2.0]).err();
+                let got = predict_survival(&f.model, &f.pop, &params, &[1.0, 2.0])
+                    .err()
+                    .map(|e| e.to_string());
                 cell("predict_survival", want, got);
             }
             if let Some(want) = cat {
-                let got = predict_categorical(&f.model, &f.pop, &params).err();
+                let got = predict_categorical(&f.model, &f.pop, &params)
+                    .err()
+                    .map(|e| e.to_string());
                 cell("predict_categorical", want, got);
             }
         }
@@ -528,7 +535,10 @@ fn uncertainty_precondition_failure_is_an_err() {
     };
     let got = simulate_with_uncertainty(&model, &pop, &fit_result, &opts)
         .expect_err("an unroutable dose must fail the run");
-    assert_eq!(got, fit_err(&model, &pop, &model.default_params));
+    assert_eq!(
+        got.to_string(),
+        fit_err(&model, &pop, &model.default_params)
+    );
 }
 
 // ── T4: the formerly `Vec`-returning forms return the same `Err` ───────────────
@@ -546,11 +556,11 @@ fn convenience_forms_return_exactly_the_err_text() {
     let want = predict_diag(&model, &pop, params).expect_err("fixture is refused");
 
     let got = predict(&model, &pop, params).expect_err("predict");
-    assert_eq!(got, want, "predict");
+    assert_eq!(got.to_string(), want.to_string(), "predict");
     let got = simulate(&model, &pop, params, 1).expect_err("simulate");
-    assert_eq!(got, want, "simulate");
+    assert_eq!(got.to_string(), want.to_string(), "simulate");
     let got = simulate_with_seed(&model, &pop, params, 1, 3).expect_err("simulate_with_seed");
-    assert_eq!(got, want, "simulate_with_seed");
+    assert_eq!(got.to_string(), want.to_string(), "simulate_with_seed");
 }
 
 /// The rule after #898 PR 2: no library entry point turns a precondition `Err` back into a

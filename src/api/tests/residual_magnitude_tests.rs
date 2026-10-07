@@ -183,7 +183,7 @@ fn simulate_rejects_a_zero_weight_the_way_fit_does() {
     let err = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &sim_opts())
         .expect_err("a zero weight must not simulate");
     assert!(
-        err.contains("sigma slot 0") && err.contains("TIME 2"),
+        err.to_string().contains("sigma slot 0") && err.to_string().contains("TIME 2"),
         "got: {err}"
     );
 }
@@ -208,7 +208,10 @@ fn the_seeded_entry_point_errs_on_a_zero_weight() {
     let pop = population_with_weights(&[0.5, 0.0, 2.0]);
     let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(err.contains("sigma slot 0"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("sigma slot 0"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]

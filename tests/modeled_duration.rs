@@ -922,7 +922,8 @@ fn predict_on_analytical_model_with_modeled_dose_errs() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string()
+            .contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -937,7 +938,8 @@ fn predict_on_ode_missing_param_errs() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string()
+            .contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -951,7 +953,8 @@ fn simulate_on_analytical_model_with_modeled_dose_errs() {
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
     assert!(
-        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string()
+            .contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -977,7 +980,8 @@ fn simulate_propensity_on_analytical_model_with_modeled_dose_errs() {
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("an unbacked RATE=-2 dose must be refused before the EBE pass");
     assert!(
-        err.contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string()
+            .contains("RATE=-2 (modeled infusion duration) into compartment"),
         "{err}"
     );
 }

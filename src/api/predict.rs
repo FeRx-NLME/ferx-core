@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -67,7 +67,7 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<PredictionResult>, String> {
+) -> Result<Vec<PredictionResult>, EngineError> {
     predict_diag(model, population, params).map(|out| out.results)
 }
 
@@ -133,7 +133,7 @@ pub fn predict_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<PredictionOutput, String> {
+) -> Result<PredictionOutput, EngineError> {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
@@ -150,7 +150,8 @@ pub fn predict_diag(
             .next()
             .map(|c| c.to_uppercase().chain(chars).collect())
             .unwrap_or_default();
-        return Err(format!("{} {capitalized}.", d.message));
+        let message = format!("{} {capitalized}.", d.message);
+        return Err(EngineError::with_message(d.clone(), message));
     }
     // θ against the model's layout (#1615): a short θ reads `0.0` past its end and
     // predicted 0, a long one dropped its tail. After the unbound-block arm, whose θ
@@ -178,7 +179,7 @@ pub fn predict_diag(
     // data-derived statistics that build it (#1111): an unresolved relation
     // simply is not in the compiled expression, and a dropped covariate effect
     // is invisible in a prediction.
-    crate::api::assert_covariate_model_bound(model)?;
+    first_error(&crate::api::check_covariate_model_bound(model))?;
     // …and that no categorical covariate takes a value outside its relation's
     // levels, which the generated chain would score as the reference with nothing
     // to say so (#1740). `fit()` and `simulate()` refuse it through their bundles.
@@ -187,8 +188,14 @@ pub fn predict_diag(
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
     first_error(&check_dose_compartments(model, population))?;
-    check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
-    check_absorption_flip_flop_no_twin(model, population, &params.theta).map_or(Ok(()), Err)?;
+    first_error(&check_absorption_closed_form_support_diags(
+        model, population,
+    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model,
+        population,
+        &params.theta,
+    ))?;
     // A time-varying covariate on a survival hazard would be silently frozen — refuse
     // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
@@ -215,7 +222,8 @@ pub fn predict_diag(
             "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \
              has no continuous observations either — so the call would return an empty vec rather \
              than an occupancy π(t). State-occupancy prediction is a later slice (#820)."
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -326,7 +334,7 @@ pub fn predict_categorical(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<EndpointPredictionResult>, String> {
+) -> Result<Vec<EndpointPredictionResult>, EngineError> {
     // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
     // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
     // takes no time argument (#741). Without this, `predict_categorical` was the one
@@ -441,7 +449,7 @@ pub fn predict_survival(
     population: &Population,
     params: &ModelParameters,
     time_grid: &[f64],
-) -> Result<Vec<SurvivalPredictionResult>, String> {
+) -> Result<Vec<SurvivalPredictionResult>, EngineError> {
     // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the

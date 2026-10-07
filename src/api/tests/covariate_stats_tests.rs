@@ -474,7 +474,7 @@ fn live_params(m: &CompiledModel) -> crate::types::ModelParameters {
 }
 
 /// PRED per subject, one observation each.
-fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, String> {
+fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, crate::EngineError> {
     let p = live_params(m);
     crate::api::predict(m, pop, &p).map(|r| {
         let v: Vec<f64> = r.iter().map(|r| r.pred).collect();
@@ -514,10 +514,13 @@ fn predict_refuses_a_categorical_value_outside_the_levels() {
         "`levels = auto`",
         "drop or recode those rows",
     ] {
-        assert!(e.contains(needle), "missing {needle:?}: {e}");
+        assert!(e.to_string().contains(needle), "missing {needle:?}: {e}");
     }
     for absent in ["the fit's levels", "The fit estimated no θ"] {
-        assert!(!e.contains(absent), "{absent:?} is the from-fit cell: {e}");
+        assert!(
+            !e.to_string().contains(absent),
+            "{absent:?} is the from-fit cell: {e}"
+        );
     }
 }
 
@@ -548,20 +551,23 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
         "The fit estimated no θ for these values",
         "drop or recode those rows, or refit on data that carries them",
     ] {
-        assert!(e.contains(needle), "from fit, missing {needle:?}: {e}");
+        assert!(
+            e.to_string().contains(needle),
+            "from fit, missing {needle:?}: {e}"
+        );
     }
     for absent in ["levels = auto", "Add the value"] {
         assert!(
-            !e.contains(absent),
+            !e.to_string().contains(absent),
             "from fit, {absent:?} is wrong here: {e}"
         );
     }
 
     let literal = parse_full_model(&grp_literal()).expect("parse").model;
     let e = preds(&literal, &design).expect_err("literal: unlisted level refused");
-    assert!(e.contains("has levels [1.0, 2.0, 3.0]"), "{e}");
-    assert!(e.contains("`levels = auto`"), "{e}");
-    assert!(!e.contains("The fit estimated no θ"), "{e}");
+    assert!(e.to_string().contains("has levels [1.0, 2.0, 3.0]"), "{e}");
+    assert!(e.to_string().contains("`levels = auto`"), "{e}");
+    assert!(!e.to_string().contains("The fit estimated no θ"), "{e}");
 
     // The listed twin of the design predicts from the fit's layout.
     let mut twin = population("GRP", &[1.0, 2.0, 2.0]);
@@ -606,9 +612,14 @@ fn the_from_fit_advice_covers_a_relation_whose_levels_are_written_out() {
     );
 
     let e = preds(&parsed.model, &design).expect_err("from fit: unlisted level refused");
-    assert!(e.contains("The fit estimated no θ for these values"), "{e}");
     assert!(
-        e.contains("adding them to `levels = [...]` first if the levels are written out"),
+        e.to_string()
+            .contains("The fit estimated no θ for these values"),
+        "{e}"
+    );
+    assert!(
+        e.to_string()
+            .contains("adding them to `levels = [...]` first if the levels are written out"),
         "the written-out case needs its repair: {e}"
     );
 
@@ -693,9 +704,9 @@ fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() 
             crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
         ),
     ] {
-        assert!(err.starts_with(&format!("{entry}: ")), "{err}");
+        assert!(err.to_string().starts_with(&format!("{entry}: ")), "{err}");
         assert!(
-            err.contains("`GRP` takes [4.0] in this data"),
+            err.to_string().contains("`GRP` takes [4.0] in this data"),
             "{entry}: {err}"
         );
     }

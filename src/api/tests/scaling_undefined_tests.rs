@@ -94,7 +94,7 @@ fn predict_rejects_an_undefined_scaling_identifier() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("TOTALLY_UNDEFINED_NAME"),
+        err.to_string().contains("TOTALLY_UNDEFINED_NAME"),
         "unexpected Err: {err}"
     );
 }

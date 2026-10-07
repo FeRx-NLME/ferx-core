@@ -116,19 +116,19 @@ fn every_static_simulate_entry_refuses_a_theta_of_the_wrong_length() {
         let params = with_theta_len(&model.default_params, n);
 
         let e = simulate(&model, &pop, &params, 1).expect_err("simulate");
-        assert_counts_message(&e, n, "simulate");
+        assert_counts_message(&e.to_string(), n, "simulate");
         let e = simulate_with_seed(&model, &pop, &params, 1, 5).expect_err("simulate_with_seed");
-        assert_counts_message(&e, n, "simulate_with_seed");
+        assert_counts_message(&e.to_string(), n, "simulate_with_seed");
         let opts = SimulateOptions {
             seed: Some(5),
             ..Default::default()
         };
         let e = simulate_with_options_diag(&model, &pop, &params, 1, &opts)
             .expect_err("simulate_with_options_diag");
-        assert_counts_message(&e, n, "simulate_with_options_diag");
+        assert_counts_message(&e.to_string(), n, "simulate_with_options_diag");
         let e = simulate_with_options(&model, &pop, &params, 1, &opts)
             .expect_err("simulate_with_options");
-        assert_counts_message(&e, n, "simulate_with_options");
+        assert_counts_message(&e.to_string(), n, "simulate_with_options");
     }
 }
 
@@ -155,7 +155,11 @@ fn simulate_with_uncertainty_refuses_a_fit_theta_of_the_wrong_length() {
             };
             let e = simulate_with_uncertainty(&model, &pop, &fit_result, &opts)
                 .expect_err("simulate_with_uncertainty");
-            assert_counts_message(&e, n, &format!("simulate_with_uncertainty ({draws} draws)"));
+            assert_counts_message(
+                &e.to_string(),
+                n,
+                &format!("simulate_with_uncertainty ({draws} draws)"),
+            );
         }
     }
 }
@@ -209,12 +213,12 @@ fn every_predict_entry_refuses_a_theta_of_the_wrong_length() {
     for n in [1usize, 3, 0] {
         let params = with_theta_len(&model.default_params, n);
         let e = predict(&model, &pop, &params).expect_err("predict");
-        assert_counts_message(&e, n, "predict");
+        assert_counts_message(&e.to_string(), n, "predict");
         let e = predict_diag(&model, &pop, &params).expect_err("predict_diag");
-        assert_counts_message(&e, n, "predict_diag");
+        assert_counts_message(&e.to_string(), n, "predict_diag");
         let e = crate::stats::npde::compute_npde_npd(&model, &pop, &params, 20, Some(4))
             .expect_err("compute_npde_npd");
-        assert_counts_message(&e, n, "compute_npde_npd");
+        assert_counts_message(&e.to_string(), n, "compute_npde_npd");
     }
 }
 
@@ -292,7 +296,7 @@ fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
             &grid,
         )
         .expect_err("predict_survival");
-        counts(&e, n, k, "predict_survival");
+        counts(&e.to_string(), n, k, "predict_survival");
     }
     let a = predict_survival(&tte, &tte_pop, &tte.default_params, &grid).expect("accepted");
     let b = predict_survival(
@@ -315,7 +319,7 @@ fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
     for n in [k - 1, k + 1] {
         let e = predict_categorical(&bin, &bin_pop, &with_theta_len(&bin.default_params, n))
             .expect_err("predict_categorical");
-        counts(&e, n, k, "predict_categorical");
+        counts(&e.to_string(), n, k, "predict_categorical");
     }
     // Off the all-zero initial estimates, so a misread θ would move every probability.
     let mut params = bin.default_params.clone();

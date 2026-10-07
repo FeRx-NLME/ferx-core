@@ -1682,7 +1682,7 @@ fn asymptotic_errors_without_covariance_step() {
         seed: Some(0),
     };
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
-    assert!(err.contains("covariance"));
+    assert!(err.to_string().contains("covariance"));
 }
 
 // ---------------------------------------------------------------------------

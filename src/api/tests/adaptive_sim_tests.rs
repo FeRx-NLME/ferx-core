@@ -933,7 +933,7 @@ fn adaptive_reset_decision_collision_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("a decision within 1e-15 of a reset must be rejected, not silently dropped");
     assert!(
-        err.contains("1e-15") && err.to_lowercase().contains("reset"),
+        err.to_string().contains("1e-15") && err.to_string().to_lowercase().contains("reset"),
         "error should cite the 1e-15 reset/break collision: {err}"
     );
 }
@@ -1080,7 +1080,7 @@ fn rejects_analytical_model() {
     };
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("analytical model must be rejected");
-    assert!(err.contains("ODE"), "got: {err}");
+    assert!(err.to_string().contains("ODE"), "got: {err}");
 }
 
 #[test]
@@ -1096,7 +1096,7 @@ fn rejects_empty_decision_schedule() {
     };
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("an empty decision schedule must be rejected");
-    assert!(err.contains("decision schedule"), "got: {err}");
+    assert!(err.to_string().contains("decision schedule"), "got: {err}");
 }
 
 #[test]
@@ -1656,7 +1656,8 @@ fn adaptive_base_ss_dose_with_tv_covariate_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("SS base dose × TV covariate must be rejected");
     assert!(
-        err.contains("plain fixed bolus or infusion") && err.contains("steady-state"),
+        err.to_string().contains("plain fixed bolus or infusion")
+            && err.to_string().contains("steady-state"),
         "got: {err}"
     );
 }
@@ -1686,7 +1687,8 @@ fn adaptive_base_lagged_dose_with_tv_covariate_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("lagged base dose × TV covariate must be rejected");
     assert!(
-        err.contains("plain fixed bolus or infusion") && err.contains("lagged"),
+        err.to_string().contains("plain fixed bolus or infusion")
+            && err.to_string().contains("lagged"),
         "got: {err}"
     );
 }
@@ -1728,7 +1730,8 @@ fn adaptive_base_modeled_rate_dose_with_tv_covariate_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("modeled-RATE base dose × TV covariate must be rejected");
     assert!(
-        err.contains("plain fixed bolus or infusion") && err.contains("modeled-RATE"),
+        err.to_string().contains("plain fixed bolus or infusion")
+            && err.to_string().contains("modeled-RATE"),
         "got: {err}"
     );
 }
@@ -1761,7 +1764,8 @@ fn adaptive_base_input_rate_dose_with_tv_covariate_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("input-rate base dose × TV covariate must be rejected");
     assert!(
-        err.contains("plain fixed bolus or infusion") && err.contains("input-rate"),
+        err.to_string().contains("plain fixed bolus or infusion")
+            && err.to_string().contains("input-rate"),
         "got: {err}"
     );
 }
@@ -1989,7 +1993,8 @@ fn adaptive_base_ss_dose_with_iov_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("SS base dose × IOV must be rejected");
     assert!(
-        err.contains("plain fixed bolus or infusion") && err.contains("steady-state"),
+        err.to_string().contains("plain fixed bolus or infusion")
+            && err.to_string().contains("steady-state"),
         "got: {err}"
     );
 }
@@ -2462,7 +2467,8 @@ fn adaptive_base_regimen_with_reset_under_iov_is_rejected() {
     )
     .expect_err("base × reset under IOV must be rejected");
     assert!(
-        err.contains("system resets") && err.contains("constant-covariate path only"),
+        err.to_string().contains("system resets")
+            && err.to_string().contains("constant-covariate path only"),
         "got: {err}"
     );
 }
@@ -2498,7 +2504,8 @@ fn adaptive_base_regimen_with_reset_under_tv_covariate_is_rejected() {
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
         .expect_err("base × reset under a time-varying covariate must be rejected");
     assert!(
-        err.contains("system resets") && err.contains("constant-covariate path only"),
+        err.to_string().contains("system resets")
+            && err.to_string().contains("constant-covariate path only"),
         "got: {err}"
     );
 }
@@ -2676,7 +2683,7 @@ fn dv_monitor_without_error_model_is_rejected() {
     };
     let err = simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts)
         .expect_err("DV monitor with no error model must be rejected");
-    assert!(err.contains("error_model"), "got: {err}");
+    assert!(err.to_string().contains("error_model"), "got: {err}");
 }
 
 #[test]
@@ -3291,7 +3298,8 @@ fn adaptive_auc_target_rejects_time_varying_covariate() {
     )
     .expect_err("auc_target on a TV subject must be rejected");
     assert!(
-        err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("time-varying"),
+        err.to_string().to_lowercase().contains("auc_target")
+            && err.to_string().to_lowercase().contains("time-varying"),
         "error should cite auc_target + time-varying: {err}"
     );
 }
@@ -3359,7 +3367,7 @@ fn adaptive_rejects_malformed_absorption_fractions() {
     )
     .expect_err("malformed absorption fractions must be rejected on the adaptive path");
     assert!(
-        err.to_lowercase().contains("fraction"),
+        err.to_string().to_lowercase().contains("fraction"),
         "expected an absorption-fraction error, got: {err}"
     );
 }
@@ -3435,7 +3443,8 @@ fn adaptive_auc_target_rejects_iov() {
     )
     .expect_err("auc_target on an IOV model must be rejected");
     assert!(
-        err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
+        err.to_string().to_lowercase().contains("auc_target")
+            && err.to_string().to_lowercase().contains("iov"),
         "error should cite auc_target + IOV: {err}"
     );
 }
@@ -3472,7 +3481,8 @@ fn adaptive_auc_target_rejects_reset() {
     )
     .expect_err("auc_target on a reset subject must be rejected");
     assert!(
-        err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("reset"),
+        err.to_string().to_lowercase().contains("auc_target")
+            && err.to_string().to_lowercase().contains("reset"),
         "error should cite auc_target + reset: {err}"
     );
 }
@@ -3581,13 +3591,13 @@ fn adaptive_rejects_non_ascending_or_duplicate_decision_times() {
     // Out of order.
     let err = run(vec![0.0, 48.0, 24.0]).expect_err("unsorted schedule must be rejected");
     assert!(
-        err.to_lowercase().contains("increasing"),
+        err.to_string().to_lowercase().contains("increasing"),
         "error should cite the ordering: {err}"
     );
     // Duplicate time (strictly-increasing rejects equality).
     let err = run(vec![0.0, 24.0, 24.0, 48.0]).expect_err("duplicate time must be rejected");
     assert!(
-        err.to_lowercase().contains("increasing"),
+        err.to_string().to_lowercase().contains("increasing"),
         "error should cite the ordering: {err}"
     );
     // The ascending control still runs.
@@ -4226,7 +4236,10 @@ fn from_spec_rejects_decision_times_in_opts() {
     };
     let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
         .unwrap_err();
-    assert!(err.contains("opts.decision_times"), "got: {err}");
+    assert!(
+        err.to_string().contains("opts.decision_times"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -4242,7 +4255,7 @@ fn from_spec_rejects_monitors_in_opts() {
     };
     let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
         .unwrap_err();
-    assert!(err.contains("opts.monitors"), "got: {err}");
+    assert!(err.to_string().contains("opts.monitors"), "got: {err}");
 }
 
 #[test]
@@ -4255,7 +4268,7 @@ fn from_spec_rejects_analytical_model() {
     let opts = AdaptiveSimulateOptions::default();
     let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
         .unwrap_err();
-    assert!(err.contains("ODE model"), "got: {err}");
+    assert!(err.to_string().contains("ODE model"), "got: {err}");
 }
 
 #[test]
@@ -4274,7 +4287,7 @@ fn from_spec_rejects_observe_covariate_absent_from_data() {
     let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
         .unwrap_err();
     assert!(
-        err.contains("BADCOV") && err.contains("not found in data"),
+        err.to_string().contains("BADCOV") && err.to_string().contains("not found in data"),
         "got: {err}"
     );
 }
@@ -5872,7 +5885,9 @@ fn adaptive_run_with_a_diverged_state_serves_nan_and_does_not_verify() {
         Err(e) => e,
     };
     assert!(
-        e.contains("frozen-schedule replay verification failed") && e.contains("cannot confirm it"),
+        e.to_string()
+            .contains("frozen-schedule replay verification failed")
+            && e.to_string().contains("cannot confirm it"),
         "{e}"
     );
 }
@@ -5922,7 +5937,7 @@ fn adaptive_run_with_nan_rows_from_the_rhs_does_not_verify() {
         &opts(true),
     ) {
         Ok(_) => panic!("NaN rows must not verify as agreement (#1539)"),
-        Err(e) => assert!(e.contains("cannot confirm it"), "{e}"),
+        Err(e) => assert!(e.to_string().contains("cannot confirm it"), "{e}"),
     }
 }
 
@@ -6488,7 +6503,8 @@ fn origin_run(
             }
         },
         &opts,
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     let reads = reads.lock().unwrap().clone();
     Ok((res.trajectories.iter().map(|t| t.ipred).collect(), reads))
 }
@@ -7065,6 +7081,7 @@ fn run_1571(
         fixed_bolus,
         &opts,
     )
+    .map_err(|e| e.to_string())
 }
 
 /// Assert the straddle for one model on the programmatic entry point, under both
@@ -7121,10 +7138,10 @@ fn programmatic_and_spec_entry_points_return_the_same_missing_covariate_error() 
     )
     .expect_err("from_spec");
     assert!(
-        spec.contains("WT") && spec.contains("not found in data"),
+        spec.to_string().contains("WT") && spec.to_string().contains("not found in data"),
         "got: {spec}"
     );
-    assert_eq!(programmatic, spec);
+    assert_eq!(programmatic.to_string(), spec.to_string());
     // ...and the spec path's positive side: with WT present it runs.
     let with_wt = simulate_adaptive_from_spec(
         &model,
@@ -7200,7 +7217,10 @@ fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
         &opts,
     )
     .expect_err("simulate_adaptive must reject a Selected error model");
-    assert!(err.contains(want), "simulate_adaptive: got: {err}");
+    assert!(
+        err.to_string().contains(want),
+        "simulate_adaptive: got: {err}"
+    );
     let err = simulate_adaptive_from_spec(
         &selected,
         &pop,
@@ -7211,7 +7231,7 @@ fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
     )
     .expect_err("simulate_adaptive_from_spec must reject a Selected error model");
     assert!(
-        err.contains(want),
+        err.to_string().contains(want),
         "simulate_adaptive_from_spec: got: {err}"
     );
 
@@ -7237,7 +7257,9 @@ fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
     )
     .expect_err("a missing selector column must be rejected");
     assert!(
-        err.contains("FREE") && err.contains("not found in data") && !err.contains(want),
+        err.to_string().contains("FREE")
+            && err.to_string().contains("not found in data")
+            && !err.to_string().contains(want),
         "missing selector: got: {err}"
     );
 }
@@ -7896,14 +7918,17 @@ fn both_adaptive_entries_refuse_a_theta_of_the_wrong_length() {
         let params = super::theta_length_gate_tests::with_theta_len(&model.default_params, n);
         let want = format!("the supplied theta has {n} values but this model has 2");
         match simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts) {
-            Err(e) => assert!(e.contains(&want), "simulate_adaptive, θ len {n}: {e}"),
+            Err(e) => assert!(
+                e.to_string().contains(&want),
+                "simulate_adaptive, θ len {n}: {e}"
+            ),
             Ok(_) => panic!("simulate_adaptive accepted a θ of length {n}"),
         }
         let params =
             super::theta_length_gate_tests::with_theta_len(&parsed.model.default_params, n);
         match simulate_adaptive_from_spec(&parsed.model, &pop, &params, 1, spec, &spec_opts) {
             Err(e) => assert!(
-                e.contains(&want),
+                e.to_string().contains(&want),
                 "simulate_adaptive_from_spec, θ len {n}: {e}"
             ),
             Ok(_) => panic!("simulate_adaptive_from_spec accepted a θ of length {n}"),

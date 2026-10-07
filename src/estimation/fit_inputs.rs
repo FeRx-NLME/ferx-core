@@ -14,6 +14,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{CompiledModel, FitOptions, FitResult, ParsedModel, Population};
 
@@ -57,7 +58,6 @@ enum ModelFileUse {
 fn read_model_file(
     fit: &FitResult,
     path: &str,
-    entry: &str,
     why: ModelFileUse,
 ) -> Result<(ParsedModel, String), String> {
     // In the reader-settings cell the caller holds a model already, so a failure
@@ -72,7 +72,7 @@ fn read_model_file(
     let src = crate::io::model_source::ModelSource::load(
         Path::new(path),
         fit.model_hash.as_deref(),
-        &format!("{entry}: "),
+        "",
         &because,
     )
     .map_err(crate::io::model_source::ModelSourceError::into_message)?;
@@ -82,7 +82,7 @@ fn read_model_file(
 /// Refuse a population that is not the fit's subjects in the fit's order: the
 /// fit's EBEs are matched to subjects by position. One message per cause, the
 /// order one naming the first position that differs.
-fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Result<(), String> {
+fn check_subjects(fit: &FitResult, population: &Population) -> Result<(), String> {
     if fit.subjects.is_empty() {
         return Ok(());
     }
@@ -90,7 +90,7 @@ fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Resu
                        must be the one the fit saw.";
     if population.subjects.len() != fit.subjects.len() {
         return Err(format!(
-            "{entry}: the population has {} subjects but the fit has {}. {WHY}",
+            "the population has {} subjects but the fit has {}. {WHY}",
             population.subjects.len(),
             fit.subjects.len()
         ));
@@ -102,7 +102,7 @@ fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Resu
         .position(|(p, f)| p.id != f.id);
     if let Some(i) = first {
         return Err(format!(
-            "{entry}: subject {} of the population is `{}`, but the fit's is `{}`. {WHY}",
+            "subject {} of the population is `{}`, but the fit's is `{}`. {WHY}",
             i + 1,
             population.subjects[i].id,
             fit.subjects[i].id
@@ -121,10 +121,8 @@ fn check_lent_stats(
     population: &Population,
     supplied: bool,
     with_model_file: bool,
-    entry: &str,
 ) -> Result<(), String> {
-    let mismatch =
-        crate::api::check_stats_on(m, population).map_err(|e| format!("{entry}: {e}"))?;
+    let mismatch = crate::api::check_stats_on(m, population)?;
     let Some(d) = mismatch else {
         return Ok(());
     };
@@ -150,7 +148,7 @@ fn check_lent_stats(
          block, which `bind_covariate_stats` does not bind."
     };
     Err(format!(
-        "{entry}: this fit records no data-derived bindings (an older `.fitrx`), so the \
+        "this fit records no data-derived bindings (an older `.fitrx`), so the \
          supplied model's covariate statistics were checked against {against}, and they \
          differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
          was bound on other data, and scoring the fit's θ with it would centre the \
@@ -185,26 +183,37 @@ fn check_lent_stats(
 /// The population must be the fit's subjects in the fit's order, checked before any
 /// binding, and the model must have the fit's θ count. Both were panics (#1622).
 /// Last, a categorical covariate value outside the model's levels is refused
-/// (`E_COV_LEVEL_UNKNOWN`'s text, #1740): the subject IDs can match while a
-/// covariate column was recoded.
+/// (`E_COV_LEVEL_UNKNOWN`, #1740): the subject IDs can match while a covariate
+/// column was recoded.
+///
+/// Every refusal is attributed to `entry` as the [`EngineError`]'s context, so it
+/// prints as `"{entry}: {message}"`; a refusal `ferx check` codes
+/// (`E_COV_LEVEL_UNKNOWN`, `E_COVSTAT_UNRESOLVED`) keeps its diagnostic (#1746).
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult,
     model: Option<&'a CompiledModel>,
     population: Option<&'a Population>,
     entry: &str,
-) -> Result<FitInputs<'a>, String> {
-    let prefix = |e: String| format!("{entry}: {e}");
+) -> Result<FitInputs<'a>, EngineError> {
+    resolve_fit_inputs_unattributed(fit, model, population).map_err(|e| e.in_context(entry))
+}
 
+/// [`resolve_fit_inputs`] before its refusal is attributed to the entry point.
+fn resolve_fit_inputs_unattributed<'a>(
+    fit: &FitResult,
+    model: Option<&'a CompiledModel>,
+    population: Option<&'a Population>,
+) -> Result<FitInputs<'a>, EngineError> {
     // A supplied model carries no `iov_column`, and the one in the model file need
     // not be the one this model was built with, so refuse rather than parse
     // occasions out of the data with settings the model may not share. First, so
     // nothing is read for a call that cannot run.
     if let (Some(m), None) = (model, population) {
         if m.n_kappa > 0 {
-            return Err(format!(
-                "{entry}: caller-supplied `model` for an IOV (n_kappa > 0) model \
+            return Err(EngineError::from(
+                "caller-supplied `model` for an IOV (n_kappa > 0) model \
                  requires `population` to also be supplied — the model carries no \
-                 `iov_column`, and per-occasion kappas are parsed with it."
+                 `iov_column`, and per-occasion kappas are parsed with it.",
             ));
         }
     }
@@ -214,22 +223,15 @@ pub(crate) fn resolve_fit_inputs<'a>(
 
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
-        let path = fit.model_path.as_deref().ok_or_else(|| {
-            format!(
-                "{entry}: no model supplied and fit.model_path is None. \
-                 Either pass `model = Some(&model)` or re-fit via fit_from_files \
-                 so the path is recorded."
-            )
-        })?;
-        file = Some(read_model_file(fit, path, entry, ModelFileUse::Rebuild)?);
+        let path = fit.model_path.as_deref().ok_or(
+            "no model supplied and fit.model_path is None. \
+             Either pass `model = Some(&model)` or re-fit via fit_from_files \
+             so the path is recorded.",
+        )?;
+        file = Some(read_model_file(fit, path, ModelFileUse::Rebuild)?);
     } else if population.is_none() {
         if let Some(path) = fit.model_path.as_deref() {
-            file = Some(read_model_file(
-                fit,
-                path,
-                entry,
-                ModelFileUse::ReaderSettings,
-            )?);
+            file = Some(read_model_file(fit, path, ModelFileUse::ReaderSettings)?);
         }
     }
 
@@ -237,32 +239,25 @@ pub(crate) fn resolve_fit_inputs<'a>(
     let mut population: Cow<'a, Population> = match population {
         Some(p) => Cow::Borrowed(p),
         None => {
-            let path = fit.data_path.as_deref().ok_or_else(|| {
-                format!(
-                    "{entry}: no population supplied and fit.data_path is None. \
-                     Either pass `population = Some(&pop)` or re-fit via fit_from_files \
-                     so the path is recorded."
-                )
-            })?;
+            let path = fit.data_path.as_deref().ok_or(
+                "no population supplied and fit.data_path is None. \
+                 Either pass `population = Some(&pop)` or re-fit via fit_from_files \
+                 so the path is recorded.",
+            )?;
             if let Some(expected) = &fit.data_hash {
-                let actual = sha256_file(Path::new(path)).map_err(prefix)?;
+                let actual = sha256_file(Path::new(path))?;
                 if &actual != expected {
-                    return Err(format!(
-                        "{entry}: data hash mismatch for {path}. Stored: {expected}, current: \
+                    return Err(EngineError::from(format!(
+                        "data hash mismatch for {path}. Stored: {expected}, current: \
                          {actual}. The dataset has changed since the fit was produced — \
                          refusing to run against stale data."
-                    ));
+                    )));
                 }
             }
             let p = match (&file, model) {
-                (Some((parsed, _)), _) => {
-                    crate::api::read_population_as_fitted(parsed, path)
-                        .map_err(prefix)?
-                        .0
-                }
+                (Some((parsed, _)), _) => crate::api::read_population_as_fitted(parsed, path)?.0,
                 (None, Some(m)) => {
-                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])
-                        .map_err(prefix)?
+                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])?
                 }
                 (None, None) => unreachable!("model = None always reads the model file"),
             };
@@ -271,7 +266,7 @@ pub(crate) fn resolve_fit_inputs<'a>(
     };
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
-    check_subjects(fit, &population, entry)?;
+    check_subjects(fit, &population)?;
 
     // --- Model -------------------------------------------------------------
     let model: ModelRef<'a> = match model {
@@ -284,30 +279,28 @@ pub(crate) fn resolve_fit_inputs<'a>(
             } else {
                 Some(population.to_mut())
             };
-            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
-                .map_err(prefix)?;
+            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)?;
             ModelRef::Built(Box::new(parsed.model))
         }
         Some(m) => {
             if !fit.data_bindings.is_empty() && m.data_bindings() != &fit.data_bindings {
-                return Err(format!(
-                    "{entry}: the supplied model is not bound with this fit's bindings: its \
+                return Err(EngineError::from(
+                    "the supplied model is not bound with this fit's bindings: its \
                      data-derived bindings (level layout, covariate statistics) differ from \
                      the fit's `data_bindings`. Pass `model = None` to rebuild it from the \
                      fit, or bind it with `ferx_core::api::bind_from_fit` and the fit's \
-                     `data_bindings`."
+                     `data_bindings`.",
                 ));
             }
             if let Cow::Owned(p) = &mut population {
-                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
-                    .map_err(prefix)?;
+                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)?;
             }
-            crate::api::assert_covariate_model_bound(m).map_err(prefix)?;
+            crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
             // No recorded bindings to compare (an older `.fitrx`): the population
             // decides. After the level index write, so a population with a level the
             // model never saw keeps that refusal.
             if fit.data_bindings.is_empty() && !m.data_bindings().covariate_stats.is_empty() {
-                check_lent_stats(m, &population, supplied, file.is_some(), entry)?;
+                check_lent_stats(m, &population, supplied, file.is_some())?;
             }
             ModelRef::Lent(m)
         }
@@ -315,21 +308,20 @@ pub(crate) fn resolve_fit_inputs<'a>(
 
     let inputs = FitInputs { model, population };
     if inputs.model().n_theta != fit.theta.len() {
-        return Err(format!(
-            "{entry}: the model has n_theta = {} but the fit has {} θ. Verify you supplied \
+        return Err(EngineError::from(format!(
+            "the model has n_theta = {} but the fit has {} θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with \
              the fit's `data_bindings`).",
             inputs.model().n_theta,
             fit.theta.len()
-        ));
+        )));
     }
     // The same subjects can carry a recoded covariate: a categorical value outside
     // the model's levels would be scored as the reference level (#1740).
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(
         inputs.model(),
         &inputs.population,
-    ))
-    .map_err(prefix)?;
+    ))?;
     Ok(inputs)
 }
 
