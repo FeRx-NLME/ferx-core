@@ -133,6 +133,7 @@ found:
 | covariate levels | `E_COV_LEVEL_UNKNOWN` |
 | θ levels bound, population bound for the θ levels | `E_THETA_LEVELS_UNBOUND`, `E_THETA_LEVELS_DATA_UNBOUND`; the simulation data checks also `E_THETA_GATHER_INDEX_MISSING`, `E_THETA_GATHER_INDEX_RANGE` |
 | θ length | `E_THETA_LENGTH` |
+| Ω, σ, Ω~IOV~ shape | `E_PARAM_SHAPE` |
 | dose compartment | `E_DOSE_CMT_OUT_OF_RANGE`, `E_DOSE_CMT_NOT_INFUSABLE` |
 | absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
 | flip-flop without an ODE twin | `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`) |

@@ -71,6 +71,25 @@ const ODE_IOV: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// Two states, residual error on CMT 2 only — a `Dv` monitor on CMT 1 has none.
+const ODE_CMT2_ERROR_ONLY: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, periph])
+[odes]
+  d/dt(central) = -(CL / V) * central
+  d/dt(periph) = 0
+[error_model]
+  CMT=2: DV ~ proportional(PROP)
+"#;
+
 // Analytical (non-ODE) twin — used to assert simulate_adaptive rejects it.
 const ANALYTICAL: &str = r#"
 [parameters]
@@ -2670,11 +2689,12 @@ fn adaptive_base_dose_after_controller_stop_still_lands() {
 
 #[test]
 fn dv_monitor_without_error_model_is_rejected() {
-    // Edge (a): a DV monitor on a model with no residual error (here sigma is
-    // stripped) is a typed error, never a fabricated σ.
-    let model = parse_model_string(ODE_NO_IIV).expect("parse");
-    let mut params = model.default_params.clone();
-    params.sigma.values = vec![]; // no [error_model] coverage for the monitor
+    // Edge (a): a DV monitor on a compartment no [error_model] covers is a typed
+    // error, never a fabricated σ. The error model covers CMT 2 only; the monitor
+    // reads CMT 1. (Stripping σ no longer reaches this: since #1764 a σ shorter than
+    // the model's is refused first, as `E_PARAM_SHAPE`.)
+    let model = parse_model_string(ODE_CMT2_ERROR_ONLY).expect("parse");
+    let params = model.default_params.clone();
     let pop = population(vec![subj("1", vec![6.0], vec![])]);
     let opts = AdaptiveSimulateOptions {
         decision_times: vec![0.0],
@@ -2683,7 +2703,11 @@ fn dv_monitor_without_error_model_is_rejected() {
     };
     let err = simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts)
         .expect_err("DV monitor with no error model must be rejected");
-    assert!(err.to_string().contains("error_model"), "got: {err}");
+    assert!(
+        err.to_string()
+            .contains("requests DV observation on compartment 1 but no [error_model]"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -7945,4 +7969,62 @@ fn both_adaptive_entries_refuse_a_theta_of_the_wrong_length() {
         &spec_opts,
     )
     .expect("simulate_adaptive_from_spec, correct θ length");
+}
+
+// ── #1764: the Ω / σ / Ω_IOV shape gate on both adaptive entries ─────────────
+
+/// Both adaptive entries refuse a mis-shaped Ω, σ or Ω_IOV with `E_PARAM_SHAPE`. They do not
+/// run `check_simulate_preconditions`, so each calls the shared gate itself.
+///
+/// Measured on `main` (`cfc84253`): a mis-sized Ω or Ω_IOV panicked in the η / κ draw
+/// (`Gemv: dimensions mismatch`), an absent Ω_IOV on an IOV model panicked, a long σ or an
+/// Ω_IOV on a κ-free model ran to `Ok`, and a short σ under a `Dv` monitor was an `Err` saying
+/// no `[error_model]` covers the compartment. σ is read only by a `Dv` monitor's assay; the
+/// gate refuses a mis-sized one either way, since the entry is handed the model's layout.
+///
+/// Mutation — delete the `check_param_shape` call in `simulate_adaptive` and its arms go red
+/// (an `Ok`, or the panic above), naming it, on both the κ-free and the IOV model; delete the
+/// one in `simulate_adaptive_from_spec` and that arm does.
+#[test]
+fn both_adaptive_entries_refuse_a_mis_shaped_omega_sigma_or_omega_iov() {
+    use super::param_shape_gate_tests::{assert_refused, shape_cells};
+    let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    for text in [ODE_IIV, ODE_IOV] {
+        let model = parse_model_string(text).expect("parse");
+        for cell in shape_cells(&model.default_params) {
+            match simulate_adaptive(&model, &pop, &cell.params, 1, fixed_bolus, &opts) {
+                Err(e) => assert_refused(&e, &cell, "simulate_adaptive"),
+                Ok(_) => panic!("simulate_adaptive accepted {}", cell.label),
+            }
+        }
+        simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("simulate_adaptive, the model's own shape");
+    }
+
+    let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block");
+    let spec_opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    for cell in shape_cells(&parsed.model.default_params) {
+        match simulate_adaptive_from_spec(&parsed.model, &pop, &cell.params, 1, spec, &spec_opts) {
+            Err(e) => assert_refused(&e, &cell, "simulate_adaptive_from_spec"),
+            Ok(_) => panic!("simulate_adaptive_from_spec accepted {}", cell.label),
+        }
+    }
+    simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &spec_opts,
+    )
+    .expect("simulate_adaptive_from_spec, the model's own shape");
 }

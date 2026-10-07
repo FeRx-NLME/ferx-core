@@ -469,6 +469,29 @@ from zeros past its end, and a long one dropped its tail
 `predict_diag`, `predict_survival`, `predict_categorical` and
 `stats::npde::compute_npde_npd` refuse it the same way; before, a short θ
 predicted 0 ([#1615](https://github.com/FeRx-NLME/ferx-core/issues/1615)).
+`fit()` refuses initial parameters of the wrong θ length the same way; before,
+a short θ fitted to a meaningless objective and a long one panicked
+([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)).
+
+#### The shape of Ω, σ and Ω~IOV~
+
+The entry points that read random effects or residual errors — `fit()` (its
+initial parameters), every `simulate*` and adaptive entry point,
+`simulate_with_uncertainty`, `compute_npde_npd`, `run_sir()` and
+`run_covariance()` — refuse an Ω, σ or Ω~IOV~ whose dimension is not the
+model's (`E_PARAM_SHAPE`), as well as an Ω~IOV~ on a model with no κ and a
+missing one on a model with κ. Previously a mis-sized block panicked, and a
+long σ or a missing Ω~IOV~ ran to completion with the block silently ignored
+([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)). `run_sir()` and
+`run_covariance()` check the fit's σ and Ω~IOV~; they already refused an Ω of
+the wrong dimension. `predict` and the survival predictors read none of the
+three, so they do not check them. On `simulate*` a missing Ω~IOV~ keeps its
+own message ([#1019](https://github.com/FeRx-NLME/ferx-core/issues/1019)), and
+`compute_npde_npd` keeps its documented fallback to κ = 0 for one. On
+`run_sir()`, `run_covariance()` and `simulate_with_uncertainty` a fit with no
+Ω~IOV~ is refused: before, they used the model's initial Ω~IOV~ in its place.
+`fit()` returns these refusals as its message only, since its error is a
+string.
 
 ### Level labels and values: `theta_level_map`, `theta_level_values` {#level-labels-values}
 

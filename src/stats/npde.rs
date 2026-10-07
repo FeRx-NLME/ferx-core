@@ -107,7 +107,9 @@ pub struct SubjectNpde {
 /// `fit()`'s post-fit step this cannot fire, since the fit already refused it. A θ
 /// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615), and a bound
 /// `theta NAME[...]` block on a population never bound for it is
-/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647).
+/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647). An Ω or σ whose dimension is not the
+/// model's, or an Ω_IOV of the wrong dimension or on a model with no κ, is
+/// `E_PARAM_SHAPE`'s (#1764); an absent Ω_IOV is the κ = 0 fallback above.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
@@ -119,6 +121,15 @@ pub fn compute_npde_npd(
     // θ against the model's layout (#1615): the reference distribution is simulated
     // from it, and a θ read past its end is `0.0`.
     crate::api::check_theta_length(model, &params.theta)?;
+    // …and Ω / σ / Ω_IOV (#1764): a mis-sized block panicked in the draw. An absent
+    // Ω_IOV is not checked: it falls back to κ = 0, as documented above.
+    let [omega, sigma, omega_iov] = crate::api::ParamBlock::all_of(params);
+    let blocks = if params.omega_iov.is_some() {
+        vec![omega, sigma, omega_iov]
+    } else {
+        vec![omega, sigma]
+    };
+    crate::api::check_param_shape(model, &blocks)?;
     // A bound level block on a population never bound for it gathers `NaN` on every
     // record, and every npd came back `NaN` with `Ok` (#1647).
     crate::diagnostics::first_error(&crate::api::check_level_index_columns(

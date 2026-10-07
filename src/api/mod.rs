@@ -97,6 +97,7 @@ pub use run::{
 };
 pub(crate) use simulate::check_theta_length;
 pub(crate) use simulate::obs_row_time;
+pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
     simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
@@ -385,3 +386,8 @@ mod adaptive_sim_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_snapshot_verify_tests.rs"]
 mod adaptive_snapshot_verify_tests;
+
+// #1764: Ω / σ / Ω_IOV shape against the model, and θ length on `fit()`'s initial parameters.
+#[cfg(test)]
+#[path = "tests/param_shape_gate_tests.rs"]
+mod param_shape_gate_tests;

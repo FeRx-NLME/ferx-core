@@ -492,6 +492,13 @@ fn fit_unstamped(
             model.theta_blocks().unbound_level_blocks()[0],
         ));
     }
+    // #1764: `init_params` against the model's layout. A short θ fitted to a finite,
+    // meaningless objective; a long θ or a mis-sized Ω / σ / Ω_IOV panicked in the
+    // gradient or the inner solve, and a long σ was carried into the result unused.
+    // The same checks the post-fit entry points run; `fit` returns their message.
+    crate::api::check_theta_length(model, &init_params.theta).map_err(|e| e.to_string())?;
+    crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))
+        .map_err(|e| e.to_string())?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Other
     // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
