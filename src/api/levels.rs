@@ -519,18 +519,22 @@ fn lay_out_on_fit(
     use crate::api::covariate_stats::stats_binding_error;
     // What the model needs comes from its text, parsed with no data-derived binding
     // (#1686): both halves are read here.
-    let declared = declared_model(parsed, model_text, Reads::Both).map_err(level_binding_error)?;
-    let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
     // A refusal that is not one half's alone is the level half's when the model has
-    // one: the half every binder sequence checks first (#1773).
-    let either = |message: String| {
-        if decls.is_empty() {
-            stats_binding_error(message)
-        } else {
+    // one: the half every binder sequence checks first (#1773). Before the
+    // declaration is read, `parsed`'s own blocks say whether it has one.
+    let either_on = |has_levels: bool, message: String| {
+        if has_levels {
             level_binding_error(message)
+        } else {
+            stats_binding_error(message)
         }
     };
+    let has_levels = !parsed.model.theta_blocks().level_blocks().is_empty();
+    let declared = declared_model(parsed, model_text, Reads::Both)
+        .map_err(|message| either_on(has_levels, message))?;
+    let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
+    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
+    let either = |message: String| either_on(!decls.is_empty(), message);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(either(no_fit_bindings_message(&decls, &symbolic)));
     }

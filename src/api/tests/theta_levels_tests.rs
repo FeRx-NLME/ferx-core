@@ -6913,7 +6913,7 @@ mod rebind {
 /// `bind_for_check` go through.
 mod binding_codes {
     #![allow(deprecated)]
-    use super::bind_from_fit::{fitted, model, weighed};
+    use super::bind_from_fit::{fitted, model, pre_bound, weighed};
     use super::*;
     use crate::api::validation::bind_for_check;
     use crate::api::{
@@ -7125,6 +7125,28 @@ mod binding_codes {
             )
             .expect_err(&what);
             assert_code(&e, want, &what);
+        }
+    }
+    /// #1791 review r1, row 4. A model text that fails the unbound re-parse
+    /// `lay_out_on_fit` reads its declaration from takes the code of the half
+    /// `parsed` has: the statistics code on a stats-only model, the level code on a
+    /// level model. Both sides of the gate in one test; `parsed` is bound first, so
+    /// the declaration is re-parsed rather than borrowed.
+    ///
+    /// Mutation — tag that failure with the level code unconditionally (the round-1
+    /// state): the stats-only cell dies.
+    #[test]
+    fn a_failed_declaration_parse_takes_the_code_of_the_half_parsed_has() {
+        for (level, want) in [(false, STATS), (true, LEVEL)] {
+            let text = model(level, !level);
+            let mut parsed = pre_bound(&text, &mut weighed(3, 2, 60.0));
+            assert!(
+                !parsed.model.data_bindings().is_empty(),
+                "level {level}: bound"
+            );
+            let e = layout_from_fit(&mut parsed, "not a model", &fitted(&text))
+                .expect_err("the text does not parse");
+            assert_code(&e, want, &format!("level {level}"));
         }
     }
 }

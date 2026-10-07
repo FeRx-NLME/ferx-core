@@ -535,3 +535,32 @@ fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
         }
     }
 }
+
+/// #1791 review r1, row 2. A fit that recorded no data bindings, rebuilt from its
+/// model file (`model = None`), is refused by the from-fit binder with a code: the
+/// level code on a level model, the statistics code on a stats-only one. This is
+/// the class `warnings.qmd` names, run rather than traced.
+///
+/// Mutation — `.to_string()` the code away at the resolver's `bind_from_fit_on`:
+/// both cells' `code()` is `None`.
+#[test]
+fn a_fit_without_bindings_is_refused_with_the_half_code() {
+    for (kind, code) in [
+        (Kind::Level, "E_THETA_LEVEL_BINDING"),
+        (Kind::Median, "E_COVARIATE_STATS_BINDING"),
+    ] {
+        let c = case(kind);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let e = run_covariance(&fit, None, Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("no bindings to rebuild from");
+        assert_eq!(e.code(), Some(code), "{kind:?}: {e}");
+        assert_eq!(e.context(), Some("run_covariance"), "{kind:?}: {e}");
+        assert!(
+            e.to_string()
+                .contains("this fit carries no data-derived bindings"),
+            "{kind:?}: {e}"
+        );
+    }
+}

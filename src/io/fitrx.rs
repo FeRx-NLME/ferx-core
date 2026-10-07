@@ -1307,6 +1307,8 @@ fn read_bundled_population(
                         Some(&mut population),
                         &fit.data_bindings,
                     )
+                    // The code is dropped on purpose: this text only feeds the
+                    // replay warning below. #1775 lists it among the uncoded sites.
                     .map_err(|d| d.message)?;
                 }
                 match fingerprint.first_difference(&population) {
