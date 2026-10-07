@@ -28,6 +28,27 @@ When a change here matters to a downstream consumer, tell them the two-step and 
 
 When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
 
+**A worktree session runs behind a fence, so write Bash for it.** Once a Claude Code session is
+isolated in a worktree, the harness refuses any shell command it cannot prove keeps git inside
+that worktree. Measured 2026-10-07 over 205 worktree sessions: **1,808 commands refused**, a
+median of 7 per session, each a wasted round trip. Only about a quarter of them ran git at all;
+the rest were refused for being too complex to analyse. Plain single commands, `bash FILE`,
+`python3 FILE` and `tools/*.sh` were refused **zero** times. So, inside a worktree:
+
+- **One plain command per Bash call.** No `;`/`&&`/`|` chains around git, no `$(git …)`, no
+  `for`/`while`, no heredoc. Anything compound goes into a script in the session scratchpad,
+  written with the Write tool and run as `bash <path>` or `python3 <path>`.
+- **Git runs bare from the worktree**: `git status`, never `git -C <dir>` and never
+  `cd <dir> && git`. The main checkout is out of reach by design, and other chats own it.
+- **Edit files with the Edit/Write tools**, not `python3 - <<EOF` or `cat >> file <<EOF`.
+- **`tools/wt-status.sh [--fetch]`** answers the questions those compounds kept asking, in one
+  call: branch, `HEAD`, base, ahead/behind, conflicts with `origin/main` (by `merge-tree`, no
+  ref touched), files changed, upstream state, and uncommitted paths. Tested by
+  `tests/wt_status_script.rs`.
+
+Run anything that must reach another checkout (a sibling repo's `origin/main`, the
+`ferx-r` lock) **before** `EnterWorktree`, or as a plain `gh api` call.
+
 ## Workspace layout and the public-API boundary
 
 The repo is a cargo **workspace** whose root package is `ferx-core` itself:
