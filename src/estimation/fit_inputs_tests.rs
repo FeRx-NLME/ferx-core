@@ -883,9 +883,11 @@ mod fitted_population_1783 {
 
     /// T6. The rule survives `save_fit` → `load_fit`, and the loaded fit's
     /// covariance step on the bundled (unlabelled) population is the one on the
-    /// labelled population `run_model_with_data` returned. Not the inline step: the
-    /// bundle's `ebes.csv` rounds the EBEs (measured: 4.8e-7 at most), and the
-    /// reconverged covariance moves with its warm start (5.5e-4 relative).
+    /// labelled population `run_model_with_data` returned. Not the inline step: a
+    /// loaded fit rebuilds its Ω factor from `fit.omega` and starts from the EBEs
+    /// `ebes.csv` rounds (measured: 4.8e-7 at most), and its covariance differs from
+    /// the inline one by up to 5.5e-4 relative (`foce.qmd` documents the
+    /// reloaded-fit match as up to FD noise).
     ///
     /// Mutation — drop the wire field (on save or on load): the loaded rule is
     /// `None`, asserted against `Some(PerDose)` first. (The step itself would then
@@ -954,9 +956,10 @@ mod fitted_population_1783 {
 
     /// T8, cell F. A fit that records no rule, on a population with no occasion
     /// labels and no rule to derive them with, is refused rather than run with every
-    /// kappa on one occasion. The message's input space is (does the fingerprint
-    /// say the fit derived its occasions?) × (was the model file read, stating no
-    /// rule?); every cell is reached here and asserted whole, so deleting a sentence
+    /// kappa on one occasion. The message's input space is (no fingerprint / one
+    /// saying the fit derived its occasions / one saying it did not, reachable only
+    /// with another scheme, which is not checked) × (was the model file read,
+    /// stating no rule?); every cell is reached here and asserted whole, so deleting a sentence
     /// reddens each cell that carries it, and a sentence leaking into a cell that
     /// must not carry it reddens that cell. The twin: the labelled population
     /// `run_model_with_data` returned runs, and matches the inline step.
@@ -984,6 +987,34 @@ mod fitted_population_1783 {
             // The twin: the labelled population runs.
             let got = run_covariance(&fit, Some(m), f.returned.as_ref(), &f.opts).unwrap();
             assert_same_cov(&got, &f.fit, "returned");
+        }
+        // A fingerprint of another scheme is not checked, so it reaches this refusal
+        // too. The one that says nothing was derived (the column fit's) must not add
+        // the sentence; the `dose` fit's own must. Without this pair a gate on the
+        // fingerprint's presence alone passes (#1783 mutation sweep, M12).
+        let stale = |fp: &crate::types::PopulationFingerprint| {
+            fp.clone()
+                .with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1)
+        };
+        for (fp, want) in [
+            (
+                column().fit.population_fingerprint.as_ref().unwrap(),
+                format!("{F_LEAD}{F_FIX}"),
+            ),
+            (
+                f.fit.population_fingerprint.as_ref().unwrap(),
+                format!("{F_LEAD}{F_DERIVED}{F_FIX}"),
+            ),
+        ] {
+            let mut fit = unrecorded(f, false);
+            fit.population_fingerprint = Some(stale(fp));
+            assert!(!fit.population_fingerprint.as_ref().unwrap().is_current());
+            assert_eq!(
+                err_of(run_covariance(&fit, Some(m), Some(read), &f.opts)),
+                want,
+                "stale fingerprint, derived: {}",
+                fp.occasions_derived()
+            );
         }
         // The file read (`model = None`), stating no rule: the `time(60)` fit.
         let t = time_window();

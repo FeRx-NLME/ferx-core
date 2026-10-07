@@ -16,6 +16,10 @@
 //! fingerprint of the population it was given. The re-read replays the settings —
 //! a row filter its caller added, which the model file never held, included — and
 //! every population, supplied or re-read, is compared against the fingerprint last.
+//!
+//! #1783 then prepares that population the way `fit()` prepared the one it was
+//! given — derived occasions under the fit's recorded rule, LTBS's log-DV — with
+//! `fit()`'s own helper, so the step scores the population the fit scored.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -222,6 +226,14 @@ fn check_lent_stats(
 /// (#1685), the population — supplied, or re-read and bound — must be the one the
 /// fit was given, record for record: [`population_refusal`] names the first
 /// difference.
+///
+/// Then the population is prepared as `fit()` prepared the one it was given
+/// (#1783), by the same `fitted_population`: time-varying covariates the model
+/// never reads pruned, occasions derived under the fit's recorded `iov_occasion`
+/// rule, DV log-transformed for `log(DV) ~ …`. A fit that records no rule (a
+/// `.fitrx` saved before #1783) takes the model file's when the file was read,
+/// and is refused when the model has kappas and the population no occasion
+/// labels.
 ///
 /// | The fit carries | Re-read with | `(Some(m), None)` on an IOV model | Verified |
 /// |---|---|---|---|
