@@ -84,9 +84,11 @@ use crate::types::*;
 ///   `fd_hessian_step`, `cov_inner_tol`, `mu_referencing`, the inner-loop
 ///   settings, and `cancel`. `run_covariance_step` on `options` is
 ///   **ignored** — calling this function is itself the request to run the step.
-///   `interaction` is not read from `options` either: it comes from the fit
-///   (`fit.method`, then `fit.interaction`), so the Hessian is taken of the
-///   objective the estimates minimise (#1710).
+///   `method` and `interaction` are not read from `options` either: they come from
+///   the fit (`fit.method`, then `fit.interaction`), so the Hessian is taken of the
+///   objective the estimates minimise (#1710, #1755); `n_agq` is still the caller's
+///   (#1758). A `[mixture]` fit's per-class overrides are rebuilt from the fit, with
+///   the same error as `run_sir` when they are not available (#1704).
 pub fn run_covariance(
     fit: &FitResult,
     model: Option<&CompiledModel>,
@@ -208,7 +210,8 @@ fn run_covariance_scoped(
     // values from `x_hat`. A `FitResult` whose `theta`/`omega`/`sigma` were mutated
     // in-process *after* the fit is therefore evaluated at the original packed
     // point; recompute the fit rather than editing its estimates in place.
-    let base_params = fitted_params_from_result(fit, model_ref);
+    let base_params =
+        fitted_params_from_result(fit, model_ref).map_err(|e| format!("run_covariance: {e}"))?;
     let (params, x_hat) = match &fit.packed_estimate {
         // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
         // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.

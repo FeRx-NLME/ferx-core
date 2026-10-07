@@ -1220,7 +1220,7 @@ pub fn simulate_with_uncertainty_diag(
     };
 
     let template =
-        crate::estimation::uncertainty_samples::fitted_params_from_result(fit_result, model);
+        crate::estimation::uncertainty_samples::fitted_params_from_result(fit_result, model)?;
     let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
         fit_result,
         &template,

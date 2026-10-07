@@ -54,10 +54,24 @@ pub enum UncertaintyMethod {
 /// `FitResult` stores the fitted theta/Omega/Sigma as plain fields but not as
 /// a `ModelParameters` value; callers of `simulate_with_uncertainty()` and
 /// `draw_parameter_samples()` need a full template, so this helper builds one.
+///
+/// # `[mixture]` models (#1704)
+///
+/// The per-class Ω/Σ are rebuilt from the fitted base, so a class that overrides
+/// nothing is exact. A class **override** (`omega(2) ETA_CL ~ …` in `[mixture]`) is
+/// estimated, but its fitted value is not a `FitResult` field: it is read from
+/// [`FitResult::packed_estimate`], which only the in-memory result of a packed-space
+/// `fit()` (FOCE / FOCEI / Laplace / Gauss-Newton) carries.
+///
+/// # Errors
+///
+/// For a `[mixture]` model with at least one override, when `packed_estimate` is
+/// `None` (a fit read from `.fitrx`, built in R, or estimated by SAEM / IMP / Bayes) or
+/// does not have this model's packed length (a different model).
 pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
-) -> ModelParameters {
+) -> Result<ModelParameters, String> {
     let template = &model.default_params;
     let omega_diagonal = template.omega.diagonal;
     let omega = OmegaMatrix::from_matrix_with_mask(
@@ -78,7 +92,20 @@ pub fn fitted_params_from_result(
             iov_template.free_mask.clone(),
         )
     });
-    ModelParameters {
+    let sigma = SigmaVector {
+        values: fit_result.sigma.clone(),
+        names: fit_result.sigma_names.clone(),
+    };
+    let mixture = match template.mixture.as_ref() {
+        None => None,
+        Some(tmpl) => Some(crate::estimation::parameterization::mixture_from_base(
+            tmpl,
+            &omega,
+            &sigma,
+            fitted_mixture_overrides(fit_result, template, tmpl)?,
+        )),
+    };
+    Ok(ModelParameters {
         theta: fit_result.theta.clone(),
         theta_names: fit_result.theta_names.clone(),
         theta_lower: template.theta_lower.clone(),
@@ -86,10 +113,7 @@ pub fn fitted_params_from_result(
         theta_fixed: fit_result.theta_fixed.clone(),
         omega,
         omega_fixed: fit_result.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: fit_result.sigma.clone(),
-            names: fit_result.sigma_names.clone(),
-        },
+        sigma,
         sigma_fixed: fit_result.sigma_fixed.clone(),
         // Prefer the fit's own `block_sigma` correlations (#847) — they are the
         // estimated values — and fall back to the model declaration for a
@@ -106,7 +130,50 @@ pub fn fitted_params_from_result(
         },
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
-        mixture: None,
+        mixture,
+    })
+}
+
+/// The packed `[mixture]` override segment of `fit_result`'s estimate (#1704): empty
+/// for a model without overrides, the `packed_estimate` slice otherwise. See
+/// [`fitted_params_from_result`] for when that is unavailable.
+fn fitted_mixture_overrides<'a>(
+    fit_result: &'a FitResult,
+    template: &ModelParameters,
+    tmpl: &crate::types::MixtureParams,
+) -> Result<&'a [f64], String> {
+    if tmpl.omega_override_addr.is_empty() && tmpl.sigma_override_addr.is_empty() {
+        return Ok(&[]);
+    }
+    let segs = packed_segments(template);
+    match fit_result.packed_estimate.as_deref() {
+        Some(v) if v.len() == segs.total() => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
+        Some(v) => Err(format!(
+            "the fit's packed estimate has {} coordinates but this model's parameter layout \
+             has {}, so the [mixture] override values cannot be read from it. Supply the \
+             model the fit was estimated with.",
+            v.len(),
+            segs.total()
+        )),
+        None => {
+            let names: Vec<String> = tmpl
+                .omega_override_addr
+                .iter()
+                .map(|&(c, e)| format!("omega({}) {}", c + 1, template.omega.eta_names[e]))
+                .chain(
+                    tmpl.sigma_override_addr
+                        .iter()
+                        .map(|&(c, si)| format!("sigma({}) {}", c + 1, template.sigma.names[si])),
+                )
+                .collect();
+            Err(format!(
+                "this [mixture] fit estimates the per-class override(s) {}, and a FitResult \
+                 does not store their fitted values. They are carried only by the in-memory \
+                 result of a FOCE, FOCEI, Laplace or Gauss-Newton fit(); a fit read from \
+                 .fitrx, built in R, or estimated by SAEM, IMP or Bayes lacks them (#1765).",
+                names.join(", ")
+            ))
+        }
     }
 }
 

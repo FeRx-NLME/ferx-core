@@ -706,7 +706,7 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
     };
     let model = &prep.parsed.model;
     let f = crate::api::fit(model, &prep.population, &prep.init_params, &opts).unwrap();
-    let params = fitted_params_from_result(&f, model);
+    let params = fitted_params_from_result(&f, model).unwrap();
     let etas: Vec<DVector<f64>> = f.subjects.iter().map(|s| s.eta.clone()).collect();
     let cov = f.covariance_matrix.clone().expect("covariance");
     let PackedStart { fixed, .. } = pack_with_bounds(&params);

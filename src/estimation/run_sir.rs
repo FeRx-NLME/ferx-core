@@ -103,10 +103,21 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
 ///   `sir_seed`, `sir_keep_samples`, `sir_df`, `sir_scale`, plus the inner-loop settings
 ///   (`inner_maxiter`, `inner_tol`, `mu_referencing`, `verbose`, `cancel`).
-///   `interaction` is **not** read from `options`: it comes from the fit
-///   (`fit.method`, then `fit.interaction`), so the draws are weighted with the
-///   objective the estimates minimise (#1710). Other fields (e.g. `method`) are
-///   ignored.
+///   `n_agq` is read from `options` too: a `FitResult` does not record it (#1758),
+///   so pass the fit's own for an `n_agq > 1` fit. `method` and `interaction` are
+///   **not** read from `options`: they come from the fit (`fit.method`, then
+///   `fit.interaction` for a method that does not fix it), so the draws are
+///   weighted with the objective the estimates minimise (#1710, #1755) and the
+///   result equals the in-fit SIR at the same settings. Other fields are ignored.
+///
+/// # `[mixture]` models
+///
+/// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
+/// from the fit (#1704). A class override's fitted value is carried only by the
+/// in-memory result of a packed-space `fit()`, so for a mixture model with at least
+/// one override this returns an error on a fit read from `.fitrx`, built in R, or
+/// estimated by SAEM / IMP / Bayes (see
+/// [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
@@ -176,7 +187,7 @@ fn run_sir_scoped(
     }
 
     // --- Reconstruct ModelParameters and eta_hats -------------------------
-    let params = fitted_params_from_result(fit, model_ref);
+    let params = fitted_params_from_result(fit, model_ref).map_err(|e| format!("run_sir: {e}"))?;
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
 
     // --- Now require a covariance matrix to seed the proposal -------------
