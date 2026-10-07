@@ -1246,7 +1246,14 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 
     // data.csv is optional — re-parse only when present.
     let population = match data_csv {
-        Some(bytes) => Some(read_bundled_population(&bytes, &model_source, &fit)?),
+        Some(bytes) => {
+            let (population, note) = read_bundled_population(&bytes, &model_source, &fit)?;
+            if let Some(note) = note {
+                fit.warnings.push(note);
+                crate::api::rebuild_warnings_structured(&mut fit);
+            }
+            population
+        }
         None => None,
     };
 
@@ -1263,15 +1270,19 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 /// A fit that records its reader settings and a population fingerprint (#1685) is
 /// read with those settings — its `[data_selection]` and any row filter its caller
 /// added included — given its level index columns from the fit's `data_bindings`,
-/// and refused as `Corrupt` when the result is not the fingerprinted population. One
-/// that does not (a bundle saved before #1685, or a fit made in memory with no
-/// settings to replay) is read as before: the model's `[data]` renames and endpoint
-/// routing only, unverified, since that read never claimed to reproduce the fit's.
+/// and checked against the fingerprint. When that read cannot reproduce the
+/// fingerprinted population, the bundle still loads: the population is `None` and
+/// the returned note says why (#1685 review r1 #2). The θ, Ω and σ do not depend on
+/// how this version reads a CSV, and `run_sir` / `run_covariance` refuse a wrong
+/// population where it is used. One that does not record both (a bundle saved
+/// before #1685, or a fit made in memory with no settings to replay) is read as
+/// before: the model's `[data]` renames and endpoint routing only, unverified, since
+/// that read never claimed to reproduce the fit's.
 fn read_bundled_population(
     bytes: &[u8],
     model_source: &str,
     fit: &FitResult,
-) -> Result<Population, FitrxError> {
+) -> Result<(Option<Population>, Option<String>), FitrxError> {
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), bytes)?;
     let data_path = tmp.path().to_str().ok_or_else(|| {
@@ -1284,28 +1295,37 @@ fn read_bundled_population(
         .filter(|f| f.is_current());
     match (parsed, &fit.reader_settings, fingerprint) {
         (Ok(mut parsed), Some(settings), Some(fingerprint)) => {
-            let (mut population, _) =
-                crate::api::read_population_with(&parsed.model, settings, data_path)
-                    .map_err(FitrxError::Corrupt)?;
-            // The fit's population carries the level index columns its binding
-            // wrote; write them the same way, from the fit's own bindings.
-            if !parsed.model.theta_blocks().level_blocks().is_empty() {
-                crate::api::bind_from_fit_on(
-                    &mut parsed,
-                    model_source,
-                    Some(&mut population),
-                    &fit.data_bindings,
-                )
-                .map_err(FitrxError::Corrupt)?;
-            }
-            match fingerprint.first_difference(&population) {
-                None => Ok(population),
-                Some(d) => Err(FitrxError::Corrupt(format!(
-                    "data.csv read with the fit's recorded reader settings is not the \
-                     population the fit was given: {d}. The bundled data, or how this \
-                     version of ferx reads it, has changed since the fit was saved."
-                ))),
-            }
+            let replayed = (|| -> Result<Population, String> {
+                let (mut population, _) =
+                    crate::api::read_population_with(&parsed.model, settings, data_path)?;
+                // The fit's population carries the level index columns its binding
+                // wrote; write them the same way, from the fit's own bindings.
+                if !parsed.model.theta_blocks().level_blocks().is_empty() {
+                    crate::api::bind_from_fit_on(
+                        &mut parsed,
+                        model_source,
+                        Some(&mut population),
+                        &fit.data_bindings,
+                    )?;
+                }
+                match fingerprint.first_difference(&population) {
+                    None => Ok(population),
+                    Some(d) => Err(format!("it is not the population the fit was given: {d}")),
+                }
+            })();
+            Ok(match replayed {
+                Ok(population) => (Some(population), None),
+                Err(why) => (
+                    None,
+                    Some(format!(
+                        "load_fit: the bundled data.csv was not loaded. Read with the \
+                         fit's recorded reader settings, {why}. The bundled data, or how \
+                         this version of ferx reads it, has changed since the fit was \
+                         saved. The estimates are loaded; to run `run_sir` or \
+                         `run_covariance`, pass the fit's population or refit."
+                    )),
+                ),
+            })
         }
         // data.csv is bundled with its original headers, so honour the model's
         // `[data]` column mapping (#730) when re-reading — otherwise a fit that
@@ -1317,10 +1337,12 @@ fn read_bundled_population(
         // fail with its own diagnostic).
         (Ok(m), _, _) => {
             crate::api::read_population_routed_by(&m.model, tmp.path(), None, &m.column_map)
+                .map(|p| (Some(p), None))
                 .map_err(FitrxError::Corrupt)
         }
         (Err(_), _, _) => {
             crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &[])
+                .map(|p| (Some(p), None))
                 .map_err(FitrxError::Corrupt)
         }
     }
@@ -3733,11 +3755,13 @@ mod tests {
     /// is the fingerprinted one. Control: the same fit saved without the two fields
     /// (what a bundle from before #1685 is), or with a fingerprint of another scheme,
     /// loads as today. A bundle whose recorded settings no longer reproduce the
-    /// population is `Corrupt`, naming the difference.
+    /// population loads its estimates with no population and a note naming the
+    /// difference (review r1 #2; it was `Corrupt`).
     ///
     /// Mutations — ignore the recorded settings in `load_fit`: `Select` / `DoseFilter`
-    /// load 30 subjects / 60 doses; skip the level bind: `Level` is `Corrupt`; skip
-    /// the verification: the tampered bundle loads.
+    /// load 30 subjects / 60 doses; skip the level bind: `Level` loads no population;
+    /// skip the verification: the tampered bundle loads its population; drop the
+    /// note: its equality dies.
     #[test]
     fn load_fit_reads_the_bundled_data_as_the_fit_did() {
         use crate::estimation::fit_inputs::test_fixtures::{case, Kind};
@@ -3792,17 +3816,34 @@ mod tests {
             .unwrap()
             .ignore_exprs
             .clear();
-        let err = save_load(&tampered, &c).map(|_| ()).unwrap_err();
-        match err {
-            FitrxError::Corrupt(m) => assert_eq!(
-                m,
-                "data.csv read with the fit's recorded reader settings is not the population \
-                 the fit was given: the doses of subject `1` differ: 2 in this population, 1 \
-                 in the fit's, with the same observation records. The bundled data, or how \
-                 this version of ferx reads it, has changed since the fit was saved."
-            ),
-            other => panic!("expected Corrupt, got {other:?}"),
-        }
+        // Review r1 #2: the bundle still loads — estimates intact, no population, and
+        // a note naming the difference — rather than failing as `Corrupt`.
+        let loaded = save_load(&tampered, &c).expect("the estimates still load");
+        assert!(loaded.population.is_none());
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&loaded.fit.theta), bits(&c.fit.theta));
+        const NOTE: &str = "load_fit: the bundled data.csv was not loaded. Read with the fit's \
+             recorded reader settings, it is not the population the fit was given: the doses \
+             of subject `1` differ: 2 in this population, 1 in the fit's, with the same \
+             observation records. The bundled data, or how this version of ferx reads it, has \
+             changed since the fit was saved. The estimates are loaded; to run `run_sir` or \
+             `run_covariance`, pass the fit's population or refit.";
+        assert_eq!(loaded.fit.warnings.last().map(String::as_str), Some(NOTE));
+        assert!(
+            loaded
+                .fit
+                .warnings_structured
+                .iter()
+                .any(|w| w.message == NOTE),
+            "the structured warnings are rebuilt"
+        );
+        // A matching bundle carries no such note.
+        let clean = save_load(&c.fit, &c).unwrap();
+        assert!(!clean
+            .fit
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("load_fit:")));
     }
 
     #[test]

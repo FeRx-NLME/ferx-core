@@ -385,8 +385,10 @@ asked to embed data (`--include-data` on the CLI, or `SaveFitOptions::include_da
 `load_fit` re-reads it into `LoadedFit::population`. On a bundle that records
 `reader_settings` and a `population_fingerprint`, it reads with those settings
 (row filters included), writes the level index columns from `data_bindings`, and
-checks the result against the fingerprint: a mismatch is a `Corrupt` error that
-names the first subject that differs. Before #1685, and still on a bundle that
+checks the result against the fingerprint. On a mismatch the bundle still loads
+its estimates, with `population = None` and a warning naming the first subject
+that differs, since a later change to how ferx reads a CSV should not make an older
+bundle unloadable. Before #1685, and still on a bundle that
 lacks either key, it reads with the model's `[data]` renames only, so a fit with
 `ignore_subjects` or a dose-row filter came back with the excluded rows in it.
 
