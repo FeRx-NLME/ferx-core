@@ -447,6 +447,9 @@ pub fn fit(
     // review r1 #1): `run_model_with_data` hands back its population with them set.
     let derived = crate::api::run::occasions_are_derived(model, options);
     result.population_fingerprint = Some(PopulationFingerprint::of_with(population, derived));
+    // The rule those occasions were derived under (#1783): a post-hoc step derives
+    // them again with it, and a file entry point's rule is the caller's, not the file's.
+    result.iov_occasion = Some(options.iov_occasion.clone());
     Ok(result)
 }
 
@@ -2961,6 +2964,7 @@ fn fit_inner(
         model_text: None,
         reader_settings: None,
         population_fingerprint: None,
+        iov_occasion: None,
         theta_init,
         omega_init,
         sigma_init,
