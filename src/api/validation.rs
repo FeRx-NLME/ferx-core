@@ -198,10 +198,9 @@ fn bound_level_columns(model: &CompiledModel) -> Vec<(&str, String)> {
 /// picks the binder [`check_level_index_columns`] names (#1647).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LevelDataEntry {
-    /// `predict_diag`, `compute_npde_npd` and the `simulate*` / adaptive entry points:
-    /// they run a θ that is already laid out, so the population must be indexed with the
-    /// levels that θ was laid out for. (`predict_survival` / `predict_categorical` run no
-    /// covariate check at all, and do not run this one either.)
+    /// `predict_diag`, `predict_survival`, `predict_categorical`, `compute_npde_npd` and
+    /// the `simulate*` / adaptive entry points: they run a θ that is already laid out, so
+    /// the population must be indexed with the levels that θ was laid out for.
     Run,
     /// `fit()` (and `ferx check`, which binds before it gets here): it estimates θ, so
     /// the model is laid out afresh on the population's own levels.

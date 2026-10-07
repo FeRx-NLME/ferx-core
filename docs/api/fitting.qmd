@@ -329,7 +329,10 @@ unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths and `predict` report
 the same problem as `E_THETA_LEVELS_UNBOUND`. The other half, a *bound* model
 handed a population that was never bound, is `E_THETA_LEVELS_DATA_UNBOUND` on
-`predict`, the simulate paths, `compute_npde_npd` and `fit`. To run a θ already
+`predict`, the simulate paths, `compute_npde_npd`, `predict_survival`,
+`predict_categorical` and `fit`; one bound for other levels than the model's is
+`E_THETA_LEVELS_DATA_MISMATCH` there, refused and never re-indexed (#1762). To
+run a θ already
 laid out (a fit's, or the model's own), bind that population with
 `bind_from_fit` and the bindings the θ was laid out on. To fit it, bind a fresh
 parse with `bind_theta_levels`

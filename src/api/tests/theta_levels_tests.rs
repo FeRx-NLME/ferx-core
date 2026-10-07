@@ -1586,7 +1586,9 @@ mod from_fit {
     /// | bound | never bound | `fit`, `ferx check` | `NEVER_BOUND` + `FIT_BINDER` |
     /// | bound | bound by the same binding | any | runs — here, the control |
     /// | bound on A | bound on B, θ count differs | predict, simulate | `E_THETA_LENGTH` (#1615) |
-    /// | bound on A | bound on B, same θ count | any | **runs, silently on A's levels** — measured, follow-up |
+    /// | bound on A | bound on B, same θ count | any | `E_THETA_LEVELS_DATA_MISMATCH`, every unseen label (#1762, `a_population_bound_for_other_levels_is_refused_on_every_run_entry`) |
+    /// | bound on A, θ_A | a subset of A bound on its own, fewer θ | any | `E_THETA_LEVELS_DATA_MISMATCH`, the first misindexed record (#1762, `a_subset_bound_on_its_own_is_refused_and_bind_from_fit_fixes_it`) |
+    /// | bound on A | partly bound | any | `E_THETA_LEVELS_DATA_UNBOUND`, "`k` of `n` subjects" (#1762) |
     ///
     /// Both sides of the entry gate in one test (`Run` vs `Fit`) and both sides of the
     /// population gate (never bound vs bound).

@@ -74,8 +74,8 @@ the same list on each:
 | `predict_diag()` | coded `RATE`, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, `[covariate_model]` bound, covariate levels, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
 | `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
 | `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights); then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
-| `predict_survival()` | time-varying covariate on a hazard, θ length, dose compartment, covariate levels |
-| `predict_categorical()` | time-varying covariate on the linear predictor, θ length, endpoint routing, covariate levels |
+| `predict_survival()` | time-varying covariate on a hazard, θ levels bound, θ length, population bound for the θ levels, covariates present, dose compartment, covariate levels |
+| `predict_categorical()` | time-varying covariate on the linear predictor, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, covariate levels |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
 | `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, θ length, then the rest of its own adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
 | `predict()` | `predict_diag()`'s list, in its order. |
@@ -131,7 +131,7 @@ found:
 | covariates present | `E_MISSING_COVARIATE`, `E_ETA_NOT_DECLARED` |
 | `[covariate_model]` bound | `E_COVSTAT_UNRESOLVED` |
 | covariate levels | `E_COV_LEVEL_UNKNOWN` |
-| θ levels bound, population bound for the θ levels | `E_THETA_LEVELS_UNBOUND`, `E_THETA_LEVELS_DATA_UNBOUND`; the simulation data checks also `E_THETA_GATHER_INDEX_MISSING`, `E_THETA_GATHER_INDEX_RANGE` |
+| θ levels bound, population bound for the θ levels | `E_THETA_LEVELS_UNBOUND`, `E_THETA_LEVELS_DATA_UNBOUND`, `E_THETA_LEVELS_DATA_MISMATCH`; the simulation data checks also `E_THETA_GATHER_INDEX_MISSING`, `E_THETA_GATHER_INDEX_RANGE` |
 | θ length | `E_THETA_LENGTH` |
 | dose compartment | `E_DOSE_CMT_OUT_OF_RANGE`, `E_DOSE_CMT_NOT_INFUSABLE` |
 | absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
