@@ -34,13 +34,14 @@ pub use api::bind_theta_levels_from_fit;
 pub use api::{
     bind_from_fit, bind_theta_levels, check_model_data, check_model_data_warnings,
     check_model_options, configure_global_thread_pool, fit, fit_from_files, install_on_engine_pool,
-    layout_from_fit, predict, predict_diag, prepare_run, prepare_run_with_inits, resolve_data_path,
-    run_from_file, run_model_simulate, run_model_simulate_with_overrides, run_model_with_data,
-    run_model_with_data_inits, run_model_with_overrides, simulate, simulate_adaptive,
-    simulate_adaptive_from_spec, simulate_with_options, simulate_with_options_diag,
-    simulate_with_seed, simulate_with_uncertainty, simulate_with_uncertainty_diag, theta_level_map,
-    theta_level_values, validate_model_file, AdaptiveSimulateOptions, AdaptiveSimulationResult,
-    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, RunOverrides, SimulateOptions,
+    layout_from_fit, predict, predict_diag, prepare_run, prepare_run_with_inits,
+    read_population_with, resolve_data_path, run_from_file, run_model_simulate,
+    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
+    run_model_with_overrides, simulate, simulate_adaptive, simulate_adaptive_from_spec,
+    simulate_with_options, simulate_with_options_diag, simulate_with_seed,
+    simulate_with_uncertainty, simulate_with_uncertainty_diag, theta_level_map, theta_level_values,
+    validate_model_file, AdaptiveSimulateOptions, AdaptiveSimulationResult, PoolPlan,
+    PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides, SimulateOptions,
     SimulateUncertaintyOptions, SimulationOutput, SimulationResult, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;

@@ -13,8 +13,12 @@
 //! - A supplied `model` / `population` is not hash-checked (the in-memory values
 //!   don't carry their source bytes), but must be the fitted one: the fit's
 //!   bindings and θ count, the fit's subjects in the fit's order.
-//! - `Some(model)` with `population = None` still reads the hash-verified model
-//!   file, for the reader settings the re-read needs; pass both to avoid it.
+//! - A fit that records its reader settings (#1685) re-reads `fit.data_path` with
+//!   them, so `Some(model)` with `population = None` does not read the model file.
+//!   An older fit takes the model file's settings, which with `Some(model)` means
+//!   reading the hash-verified model file; pass both to avoid it.
+//! - A fit that carries a population fingerprint (every fit since #1685) refuses
+//!   any population, supplied or re-read, that is not the one it was given.
 
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::types::*;
@@ -81,16 +85,15 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # IOV models (n_kappa > 0)
 ///
 /// For models with inter-occasion variability, re-reading the dataset
-/// requires the `iov_column` name from the model file's `[fit_options]`
-/// block — that name doesn't survive on a `CompiledModel`. When the
-/// caller passes `None` for both `model` and `population`, this function
-/// parses the full model file (including `[fit_options]`) and threads
-/// `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, `run_sir`
-/// returns an error rather than read occasions with an `iov_column` the
-/// supplied model may not share: the model carries none, and the model file's
-/// need not be the one it was built with. Workaround: pass both `Some(model)`
-/// and `Some(population)` for IOV cases.
+/// requires the `iov_column` the fit read with — that name doesn't survive on
+/// a `CompiledModel`. A fit that records its reader settings (#1685) carries
+/// it, so every cell runs. On an older fit, `None` for both `model` and
+/// `population` parses the full model file (including `[fit_options]`) and
+/// threads its `iov_column` into the reader, while `Some(model)` for an IOV
+/// model with `population = None` is an error rather than read occasions with
+/// an `iov_column` the supplied model may not share: the model carries none,
+/// and the model file's need not be the one it was built with. Workaround:
+/// pass both `Some(model)` and `Some(population)`.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -274,6 +277,7 @@ fn run_sir_scoped(
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
     replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    inputs.note_warnings(&mut out.warnings);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);
     Ok(out)
@@ -540,17 +544,23 @@ mod tests {
         // The fit object here is shape-wise nonsense (warfarin non-IOV
         // fit + IOV model) — but the IOV check fires before any
         // dimension check, so this triggers the intended branch first.
+        //
+        // #1685 T8: on a **legacy** fit — no recorded reader settings or
+        // fingerprint, as an older `.fitrx` — the refusal stands; a fit that
+        // records its `iov_column` runs instead (T9).
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 
         let opts = quick_opts();
-        let Some(fit) = fit_with_cov_or_skip(
+        let Some(mut fit) = fit_with_cov_or_skip(
             model_path.to_str().unwrap(),
             data_path.to_str().unwrap(),
             opts.clone(),
         ) else {
             return;
         };
+        fit.reader_settings = None;
+        fit.population_fingerprint = None;
 
         let iov_model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
             "examples/warfarin_iov.ferx",

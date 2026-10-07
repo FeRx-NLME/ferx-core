@@ -499,6 +499,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         model_hash: None,
         data_hash: None,
         model_text: None,
+        reader_settings: None,
+        population_fingerprint: None,
         theta_init: template.theta.clone(),
         omega_init: template.omega.matrix.clone(),
         sigma_init: template.sigma.values.clone(),
