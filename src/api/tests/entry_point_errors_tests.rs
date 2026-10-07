@@ -477,6 +477,46 @@ fn check_diagnostics(
 
 // ── which entry point checks which family (docs/warnings.qmd#entry-point-errors) ──
 
+/// The families of the θ-level population check (#1647, #1762). Kept out of [`families`]:
+/// `fit()` refuses them with a `Fit` binder where `predict_diag` names a `Run` one, so
+/// "the text `fit()` gives" does not hold for them by design (pinned in
+/// `theta_levels_tests.rs`).
+///
+/// The fixture is #1762's own cell: a model bound on studies 1–2 and a population of
+/// studies 3–4 bound on its own — the same θ count, so only this check can refuse it.
+fn level_families() -> Vec<Family> {
+    let text = "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  \
+        theta EFF[STUDY](0.0, -10.0, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+        sigma PROP ~ 0.02\n[individual_parameters]\n  CL = TVCL + EFF\n  V  = TVV\n\
+        [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+        DV ~ proportional(PROP)\n";
+    let studies = |first: usize| {
+        let subjects = (0..2)
+            .map(|i| {
+                let mut s = subject_with(vec![bolus()], 1);
+                s.id = format!("{}", first + i);
+                s.covariates = HashMap::from([("STUDY".to_string(), (first + i) as f64)]);
+                s
+            })
+            .collect();
+        population_of(subjects, &["STUDY"])
+    };
+    let mut model = parse_full_model(text).expect("parse");
+    crate::api::bind_theta_levels(&mut model, text, &mut studies(1)).expect("bind on A");
+    let mut other = parse_full_model(text).expect("parse");
+    let mut pop = studies(3);
+    crate::api::bind_theta_levels(&mut other, text, &mut pop).expect("bind B on its own");
+    assert_eq!(other.model.n_theta, model.model.n_theta, "the same θ count");
+    vec![Family {
+        name: "population bound for the θ levels (#1762)",
+        phrase: "is bound, but this population was bound for other levels",
+        code: Some("E_THETA_LEVELS_DATA_MISMATCH"),
+        model: model.model,
+        pop,
+        theta: None,
+    }]
+}
+
 /// Does each narrower entry point refuse this family? `None` = do not call it (see the one
 /// use). Order: `simulate_with_options`, `inits_from_nca`, `predict_survival`,
 /// `predict_categorical`.
@@ -485,7 +525,9 @@ fn checked_by(family: &str) -> [Option<bool>; 4] {
     const N: Option<bool> = Some(false);
     match family {
         "modeled dose rates (#324)" => [Y, Y, N, N],
-        "covariates present (#1028)" => [Y, N, N, N],
+        // #1763: the survival predictors refuse a covariate the data lacks.
+        "covariates present (#1028)" => [Y, N, Y, Y],
+        "population bound for the θ levels (#1762)" => [Y, N, Y, Y],
         "covariate model bound (#1111)" => [Y, N, N, N],
         "categorical level outside the levels (#1740)" => [Y, N, Y, Y],
         "dose compartments (#375)" => [Y, Y, Y, N],
@@ -522,7 +564,7 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
         seed: Some(1),
         ..Default::default()
     };
-    for f in families() {
+    for f in families().into_iter().chain(level_families()) {
         let mut params = f.model.default_params.clone();
         if let Some(theta) = &f.theta {
             params.theta = theta.clone();

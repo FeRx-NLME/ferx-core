@@ -241,7 +241,7 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     );
     assert!(
         err.to_string()
-            .contains(", and predict with the model it re-parses into `parsed`."),
+            .contains(", and call `predict` with the model it re-parses into `parsed`."),
         "the bound model is a re-parse, not the one in hand: {err}"
     );
     assert!(
@@ -1786,6 +1786,406 @@ mod from_fit {
                 "{entry:?}"
             );
         }
+    }
+
+    // ── #1762: a population bound for other levels than the model's ─────────────
+
+    const MISMATCH: &str = "E_THETA_LEVELS_DATA_MISMATCH";
+    /// M3, one constant per sentence.
+    const OTHER_LEVELS: &str =
+        "`theta PLACEBO[...]` is bound, but this population was bound for other levels: ";
+    const NO_THETA: &str = " The θ being run has no value for them.";
+    const RUN_UNSEEN: &str = " To predict them, fit a model bound on this population.";
+    /// M2's cause sentence, up to the record it names.
+    const ANOTHER_TABLE: &str = "`theta PLACEBO[...]` is bound, but this population's index \
+        into its levels was written for another level table: ";
+
+    /// [`population`] with `STUDY` numbered from `first` instead of 1, under ids that
+    /// follow it, so two populations of the same shape show disjoint levels.
+    fn studies_from(first: usize, n_studies: usize, n_times: usize) -> Population {
+        let mut pop = population(n_studies, n_times);
+        for (s, subject) in pop.subjects.iter_mut().enumerate() {
+            subject.id = format!("{}", first + s);
+            subject
+                .covariates
+                .insert("STUDY".to_string(), (first + s) as f64);
+        }
+        pop
+    }
+
+    /// A population bound on its own, by a fresh parse — the way a caller who never meant
+    /// to share a level table writes the index columns.
+    fn bound_on_its_own(text: &str, mut pop: Population) -> (Population, usize) {
+        let n_theta = bind(text, &mut pop).expect("bind on its own").n_theta;
+        (pop, n_theta)
+    }
+
+    /// The fit θ with the level effects moved off zero, so a misread level changes a
+    /// prediction.
+    fn moved_theta(model: &CompiledModel) -> Vec<f64> {
+        let mut theta = model.default_params.theta.clone();
+        for (i, t) in theta.iter_mut().enumerate().skip(1).take(5) {
+            *t = 0.3 * i as f64 - 0.7;
+        }
+        theta
+    }
+
+    fn pred_bits(model: &CompiledModel, pop: &Population, theta: &[f64]) -> Vec<(String, u64)> {
+        crate::api::predict_diag(model, pop, &fit_theta_params(model, theta))
+            .expect("predict_diag")
+            .results
+            .into_iter()
+            .map(|r| (r.id, r.pred.to_bits()))
+            .collect()
+    }
+
+    /// Every `Run` entry's refusal of `pop`, by entry name: `(code, Display text)`.
+    fn run_refusals(
+        model: &CompiledModel,
+        pop: &Population,
+        theta: &[f64],
+    ) -> Vec<(&'static str, Option<String>, String)> {
+        let params = fit_theta_params(model, theta);
+        let sim_opts = Default::default();
+        let cell = |entry, r: Result<(), crate::diagnostics::EngineError>| {
+            let e = r.err().unwrap_or_else(|| panic!("{entry} ran"));
+            (entry, e.code().map(str::to_string), e.to_string())
+        };
+        vec![
+            cell(
+                "predict_diag",
+                crate::api::predict_diag(model, pop, &params).map(|_| ()),
+            ),
+            cell(
+                "predict",
+                crate::api::predict(model, pop, &params).map(|_| ()),
+            ),
+            cell(
+                "simulate_with_options_diag",
+                crate::api::simulate_with_options_diag(model, pop, &params, 1, &sim_opts)
+                    .map(|_| ()),
+            ),
+            cell(
+                "compute_npde_npd",
+                crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1)).map(|_| ()),
+            ),
+        ]
+    }
+
+    /// The `Run` entries all run `pop`.
+    fn runs_everywhere(model: &CompiledModel, pop: &Population, theta: &[f64], what: &str) {
+        let params = fit_theta_params(model, theta);
+        crate::api::predict(model, pop, &params).unwrap_or_else(|e| panic!("{what}: {e}"));
+        crate::api::simulate_with_options_diag(model, pop, &params, 1, &Default::default())
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1))
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        let fatal: Vec<_> = crate::api::check_model_data(model, pop)
+            .into_iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .collect();
+        assert!(fatal.is_empty(), "{what}: {fatal:?}");
+    }
+
+    /// T1 (#1762, plan cell P1). A model bound on studies 1–3 and a population of studies
+    /// 4–6 bound **on its own**: the same 7-θ layout, so `E_THETA_LENGTH` passes, and
+    /// before this every entry ran it — bit-identical to A on A, studies 4–6 reading
+    /// studies 1–3's effects (measured at `cfc84253`). Now each `Run` entry refuses it
+    /// with M3, every unseen label listed.
+    ///
+    /// The control is the other side of the gate in the same test: a fresh copy of A,
+    /// bound on its own, shows the model's labels and runs, bit-identical to A on A.
+    ///
+    /// Mutations — drop the `Unseen` arm (return `None`): every entry runs, and the
+    /// first `run_refusals` cell panics naming itself; look the label up in the
+    /// population's own discovered levels rather than the model's (`decl.labels()`):
+    /// B's labels are all found, the refusal dies, and the control still passes.
+    #[test]
+    fn a_population_bound_for_other_levels_is_refused_on_every_run_entry() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let want = pred_bits(&fit.model, &a, &theta);
+
+        let (b, n_b) = bound_on_its_own(&text, studies_from(4, 3, 2));
+        assert_eq!(
+            n_b, fit.model.n_theta,
+            "the same θ count: no E_THETA_LENGTH"
+        );
+        let labels = "it has 6 level(s) the model's block does not: `STUDY=4,TIME=1`, \
+            `STUDY=4,TIME=2`, `STUDY=5,TIME=1`, `STUDY=5,TIME=2`, `STUDY=6,TIME=1`, \
+            `STUDY=6,TIME=2`.";
+        for (entry, code, err) in run_refusals(&fit.model, &b, &theta) {
+            assert_eq!(code.as_deref(), Some(MISMATCH), "{entry}: {err}");
+            assert!(err.starts_with(OTHER_LEVELS), "{entry}: the cause: {err}");
+            assert!(err.contains(labels), "{entry}: every label: {err}");
+            assert!(err.contains(NO_THETA), "{entry}: why it cannot run: {err}");
+            assert!(err.ends_with(RUN_UNSEEN), "{entry}: the remedy: {err}");
+            // `bind_from_fit` would refuse these levels, so it is no remedy here.
+            assert!(!err.contains("bind_from_fit"), "{entry}: {err}");
+            assert!(!err.contains("never bound"), "{entry}: {err}");
+            assert_no_engine_column(&err, entry);
+        }
+
+        // P6: A's design observed at TIME 2, 3 instead of 1, 2, bound on its own. Before
+        // this it ran, reading TIME=3 at A's TIME=2 positions; TIME=3 has no θ in A.
+        let mut shifted = population(3, 2);
+        for s in &mut shifted.subjects {
+            s.obs_times = vec![2.0, 3.0];
+        }
+        let (shifted, _) = bound_on_its_own(&text, shifted);
+        for (entry, code, err) in run_refusals(&fit.model, &shifted, &theta) {
+            assert_eq!(code.as_deref(), Some(MISMATCH), "{entry}: {err}");
+            assert!(
+                err.contains(
+                    "it has 3 level(s) the model's block does not: `STUDY=1,TIME=3`, \
+                     `STUDY=2,TIME=3`, `STUDY=3,TIME=3`."
+                ),
+                "{entry}: {err}"
+            );
+        }
+
+        let (a2, _) = bound_on_its_own(&text, population(3, 2));
+        assert_eq!(pred_bits(&fit.model, &a2, &theta), want, "A on a fresh A");
+        runs_everywhere(&fit.model, &a2, &theta, "A on a fresh A");
+    }
+
+    /// T2 (P4). A subset of A's studies (2–3) bound on its own lays out 5 θ, not 7, and
+    /// `E_THETA_LENGTH` compares θ with the *model*, so A's θ passes: before this the
+    /// subset read levels 1–4, which are studies 1–2's. Every label is among the model's,
+    /// so it is M2, naming the first misindexed record; and following its binder
+    /// (`bind_from_fit` with A's bindings) gives A's own rows for those studies, bit for
+    /// bit — the re-index the check refuses to do silently.
+    ///
+    /// Mutations — route "every label seen" to the `Unseen` message (the M2 assertions
+    /// die); re-index instead of refusing (the `Err` dies).
+    #[test]
+    fn a_subset_bound_on_its_own_is_refused_and_bind_from_fit_fixes_it() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let mut subset = population(3, 2);
+        subset.subjects.remove(0);
+        let (own, n_own) = bound_on_its_own(&text, subset.clone());
+        assert_eq!(n_own, 5, "the subset's own layout: 2 x 2 levels + 2 - 1");
+
+        let record = "subject 2 at time 1 is level `STUDY=2,TIME=1`, level 3 of the model's \
+            block, and its index says 1. ";
+        for (entry, code, err) in run_refusals(&fit.model, &own, &theta) {
+            assert_eq!(code.as_deref(), Some(MISMATCH), "{entry}: {err}");
+            assert!(err.starts_with(ANOTHER_TABLE), "{entry}: the cause: {err}");
+            assert!(err.contains(record), "{entry}: the record: {err}");
+            assert!(err.contains(RUN_BINDER), "{entry}: the binder: {err}");
+            assert!(err.ends_with(RUN_WHICH_MODEL), "{entry}: {err}");
+            assert!(!err.contains("never bound"), "{entry}: {err}");
+            assert!(!err.contains(NO_THETA), "{entry}: {err}");
+            assert_no_engine_column(&err, entry);
+        }
+
+        // Follow the sentence: A's rows for studies 2–3, bit for bit.
+        let want: Vec<_> = pred_bits(&fit.model, &a, &theta)
+            .into_iter()
+            .filter(|(id, _)| id != "1")
+            .collect();
+        let mut followed = own.clone();
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_from_fit(&mut parsed, &text, &mut followed, fit.model.data_bindings())
+            .expect("bind from A");
+        assert_eq!(pred_bits(&parsed.model, &followed, &theta), want);
+        // …and A's own model runs that population too: it is now indexed for A's table.
+        assert_eq!(pred_bits(&fit.model, &followed, &theta), want);
+    }
+
+    /// T3 (P2). `fit()` and `check_model_data` — the `Fit` entry — refuse the P1 pair with
+    /// the fresh-parse binder, never `bind_from_fit`; the `Run` entry, in the same test,
+    /// with its own remedy. Both sides of the entry gate.
+    ///
+    /// Mutation — swap the `Run` and `Fit` remedies on the `Unseen` arm: both halves die.
+    #[test]
+    fn fit_refuses_a_population_bound_for_other_levels_with_the_fit_binder() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let (b, _) = bound_on_its_own(&text, studies_from(4, 3, 2));
+        let params = fit.model.default_params.clone();
+
+        let err = crate::api::fit(&fit.model, &b, &params, &FitOptions::default())
+            .err()
+            .expect("fit");
+        assert!(err.starts_with(OTHER_LEVELS), "fit: the cause: {err}");
+        assert!(err.contains(NO_THETA), "fit: {err}");
+        assert!(err.ends_with(FIT_BINDER), "fit: the binder: {err}");
+        assert!(!err.contains("bind_from_fit"), "fit: {err}");
+        assert!(!err.contains(RUN_UNSEEN), "fit: {err}");
+        let diags = crate::api::check_model_data(&fit.model, &b);
+        let d = diags
+            .iter()
+            .find(|d| d.code == MISMATCH)
+            .unwrap_or_else(|| panic!("check_model_data: {diags:?}"));
+        assert_eq!(d.block.as_deref(), Some("parameters"));
+        assert!(d.message.ends_with(FIT_BINDER), "{}", d.message);
+
+        let err = crate::api::predict_diag(&fit.model, &b, &params)
+            .err()
+            .expect("predict_diag");
+        assert!(err.to_string().ends_with(RUN_UNSEEN), "predict_diag: {err}");
+        assert!(!err.to_string().contains(FIT_BINDER), "predict_diag: {err}");
+    }
+
+    /// T4 (P5). A's three subjects plus one never bound: before this "this population was
+    /// never bound for it" — false, three of four were. Now `k of n` and the first such
+    /// subject, under the same code and binder. The other side of the all/some gate in
+    /// the same test: a population no subject of which was bound keeps the #1647 text,
+    /// byte for byte.
+    ///
+    /// Mutations — decide "never bound" on `all` subjects lacking the index rather than
+    /// `any` carrying it (the partly bound cell gets `NEVER_BOUND`); drop the count from
+    /// the message (its assertion dies).
+    #[test]
+    fn a_partly_bound_population_is_not_told_it_was_never_bound() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let mut partly = a.clone();
+        let mut stray = population(4, 2).subjects.remove(3);
+        stray.covariates.insert("STUDY".to_string(), 2.0);
+        partly.subjects.push(stray);
+
+        let some = "`theta PLACEBO[...]` is bound, but 1 of 4 subjects in this population \
+            carry no index into the block's levels, the first being subject 4: they were \
+            not bound with the rest. ";
+        for (entry, code, err) in run_refusals(&fit.model, &partly, &theta) {
+            assert_eq!(
+                code.as_deref(),
+                Some("E_THETA_LEVELS_DATA_UNBOUND"),
+                "{entry}: {err}"
+            );
+            assert!(err.starts_with(some), "{entry}: k of n: {err}");
+            assert!(err.ends_with(RUN_WHICH_MODEL), "{entry}: the binder: {err}");
+            assert!(!err.contains("never bound"), "{entry}: {err}");
+        }
+        let err = crate::api::fit(
+            &fit.model,
+            &partly,
+            &fit.model.default_params,
+            &FitOptions::default(),
+        )
+        .err()
+        .expect("fit");
+        assert!(err.starts_with(some) && err.ends_with(FIT_BINDER), "{err}");
+
+        // The other side: nobody bound is still "never bound", byte for byte.
+        for (entry, _, err) in run_refusals(&fit.model, &population(3, 2), &theta) {
+            assert_run_refusal(&err, entry);
+        }
+    }
+
+    /// T5. A bound population with the level column `STUDY` taken off one subject: the
+    /// index is there, but which level it names cannot be checked. The level is unknown,
+    /// so no binder is offered (each would refuse the missing column).
+    ///
+    /// Mutation — treat a record whose level column is missing as consistent (skip it):
+    /// the population runs and this dies.
+    #[test]
+    fn an_index_without_its_level_column_cannot_be_checked() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let mut gone = a.clone();
+        // Off the baseline and off every per-record snapshot the binder seeded from it.
+        let s = &mut gone.subjects[1];
+        s.covariates.remove("STUDY");
+        for m in s
+            .obs_covariates
+            .iter_mut()
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.remove("STUDY");
+        }
+        gone.covariate_names.clear();
+        let want = "`theta PLACEBO[...]` is bound, and subject 2 carries an index into the \
+            block's levels but no value in its level column `STUDY`, so which level the \
+            index names cannot be checked.";
+        let err =
+            crate::api::predict_diag(&fit.model, &gone, &fit_theta_params(&fit.model, &theta))
+                .err()
+                .expect("predict_diag");
+        assert_eq!(err.code(), Some(MISMATCH), "{err}");
+        assert_eq!(err.to_string(), want);
+        let diags = crate::api::check_model_data(&fit.model, &gone);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == MISMATCH && d.message == want),
+            "{diags:?}"
+        );
+    }
+
+    /// T6. The check reads the index the predictor reads. `PLACEBO[STUDY, TIME]` varies
+    /// within a subject, so the binder writes per-record snapshots and the baseline holds
+    /// only the first record's index: a bound population, whose records' snapshots differ
+    /// from their baseline, runs; one snapshot edited to another valid index is refused,
+    /// naming that record's time.
+    ///
+    /// Mutation — compare the subject's baseline (`covariates`) instead of the record's
+    /// snapshot (`obs_cov`): the bound control is refused at its second record.
+    #[test]
+    fn the_level_table_check_reads_the_index_the_predictor_reads() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let s = &a.subjects[1];
+        let base = s.covariates["__level_PLACEBO"];
+        assert_ne!(
+            s.obs_covariates[1]["__level_PLACEBO"], base,
+            "the fixture's second record must index another level than its baseline"
+        );
+        runs_everywhere(&fit.model, &a, &theta, "A on A");
+
+        let mut edited = a.clone();
+        edited.subjects[1].obs_covariates[1].insert("__level_PLACEBO".to_string(), 1.0);
+        let err =
+            crate::api::predict_diag(&fit.model, &edited, &fit_theta_params(&fit.model, &theta))
+                .err()
+                .expect("predict_diag");
+        assert!(
+            err.to_string().contains(
+                "subject 2 at time 2 is level `STUDY=2,TIME=2`, level 4 of the model's block, \
+                 and its index says 1. "
+            ),
+            "{err}"
+        );
+    }
+
+    /// T7 (P3). The model's labels are whatever it was laid out on: a model laid out by
+    /// `bind_from_fit` checks a population against the fit's labels, so B bound on its own
+    /// is refused, and a population bound from the same fit runs.
+    #[test]
+    fn a_from_fit_model_checks_against_the_fits_labels() {
+        let text = no_eta_model();
+        let mut a = population(3, 2);
+        let fit = bind_fit(&text, &mut a);
+        let theta = moved_theta(&fit.model);
+        let mut design = population(2, 2);
+        let mut from_fit = parse_full_model(&text).unwrap();
+        crate::api::bind_from_fit(&mut from_fit, &text, &mut design, fit.model.data_bindings())
+            .expect("bind the design");
+        let (b, _) = bound_on_its_own(&text, studies_from(4, 3, 2));
+        for (entry, code, err) in run_refusals(&from_fit.model, &b, &theta) {
+            assert_eq!(code.as_deref(), Some(MISMATCH), "{entry}: {err}");
+            assert!(err.starts_with(OTHER_LEVELS), "{entry}: {err}");
+        }
+        runs_everywhere(&from_fit.model, &design, &theta, "from-fit model, design");
+        assert_eq!(
+            pred_bits(&from_fit.model, &design, &theta),
+            pred_bits(&fit.model, &a, &theta)[..4].to_vec(),
+            "the design's rows are A's first two studies'"
+        );
     }
 
     // ── #1633: "nothing is written to `population` unless every block binds" ──────

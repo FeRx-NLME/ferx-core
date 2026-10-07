@@ -148,9 +148,7 @@ pub fn predict_diag(
     // first, as `simulate()` does (#1644) — and, as `fit()`'s refusal does, name the
     // way out in the `Err`'s text itself (its `Display`), while `message()` stays the
     // diagnostic's message and the advice is `suggestion()` only (#1746 review r1 #6).
-    if let Some(d) = check_unbound_theta_levels(model, UnboundLevelsEntry::Predict).first() {
-        return Err(EngineError::with_suggestion_in_display(d.clone()));
-    }
+    unbound_level_refusal(model, "predict")?;
     // θ against the model's layout (#1615): a short θ reads `0.0` past its end and
     // predicted 0, a long one dropped its tail. After the unbound-block arm, whose θ
     // count is not yet the bound model's, so that refusal names the real cause.
@@ -338,8 +336,19 @@ pub fn predict_categorical(
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
+    // level block, a population not bound for the bound block, or a covariate the data
+    // lacks each returned `Ok` here — `NaN` probabilities for the first two, the
+    // covariate read as 0.0 for the third.
+    unbound_level_refusal(model, "predict_categorical")?;
     // θ against the model's layout, as `predict()` checks it (#1615).
     super::check_theta_length(model, &params.theta)?;
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
+    first_error(&check_covariates(model, population))?;
     // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
     // `obs_records`, so a population read model-blind — its binary rows in the
     // Gaussian grid — would come back empty, indistinguishable from a model with no
@@ -462,8 +471,19 @@ pub fn predict_survival(
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so refuse instead (#741).
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
+    // level block, a population not bound for the bound block, or a covariate the data
+    // lacks each returned `Ok` here — `NaN` survival for the first two, the covariate
+    // read as 0.0 (`S = 1` under a multiplicative hazard) for the third.
+    unbound_level_refusal(model, "predict_survival")?;
     // θ against the model's layout, as `predict()` checks it (#1615).
     super::check_theta_length(model, &params.theta)?;
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
+    first_error(&check_covariates(model, population))?;
 
     // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
     // changes the exposure the hazard sees. This entry point was the one member of
