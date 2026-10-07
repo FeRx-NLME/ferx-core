@@ -203,6 +203,9 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
     let err = crate::api::predict_diag(&parsed.model, &pop, &parsed.model.default_params)
         .err()
         .expect("an unbound model must not predict");
+    // #1746 (review r1 #2): the folded text still carries the diagnostic. Mutation:
+    // `EngineError::from(message)` in place of `with_message(d.clone(), message)` → dies.
+    assert_eq!(err.code(), Some("E_THETA_LEVELS_UNBOUND"), "{err}");
     // One assertion per sentence (and clause) of the message and the suggestion.
     assert!(
         err.to_string().starts_with(
