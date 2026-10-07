@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use crate::io::hash::{sha256_bytes, sha256_file};
+use crate::io::hash::sha256_file;
 use crate::types::{CompiledModel, FitOptions, FitResult, ParsedModel, Population};
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
@@ -69,23 +69,14 @@ fn read_model_file(
              Pass `population = Some(&pop)` as well, and the model file is not read."
             .to_string(),
     };
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("{entry}: cannot read the model file {path}: {e}.{because}"))?;
-    if let Some(expected) = &fit.model_hash {
-        let actual = sha256_bytes(&bytes);
-        if &actual != expected {
-            return Err(format!(
-                "{entry}: model hash mismatch for {path}. Stored: {expected}, current: \
-                 {actual}. The .ferx file has changed since the fit was produced — \
-                 refusing to run against stale source.{because}"
-            ));
-        }
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|e| format!("{entry}: the model file {path} is not UTF-8: {e}"))?;
-    let parsed = crate::parser::model_parser::parse_full_model_source(&text, Path::new(path))
-        .map_err(|e| format!("{entry}: {e}"))?;
-    Ok((parsed, text))
+    let src = crate::io::model_source::ModelSource::load(
+        Path::new(path),
+        fit.model_hash.as_deref(),
+        &format!("{entry}: "),
+        &because,
+    )
+    .map_err(crate::io::model_source::ModelSourceError::into_message)?;
+    Ok((src.parsed, src.text))
 }
 
 /// Refuse a population that is not the fit's subjects in the fit's order: the
