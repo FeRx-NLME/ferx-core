@@ -902,17 +902,27 @@ pub fn run_sir_core(
     // scope too rather than relying on its caller having done so. Inside `fit()` the current
     // worker already carries that override, which the scope detects without leasing a second
     // pool; a direct caller gets the tolerances it passed instead of the spec's parse-time ones.
-    crate::api::with_fit_ode_scope(options, || {
-        run_sir_core_scoped(
-            model,
-            population,
-            params,
-            eta_hats,
-            proposal_cov,
-            ofv_hat,
-            options,
-        )
-    })?
+    //
+    // #1767: likewise the inner solver. The draws' EBE re-solves read the process globals,
+    // not `options`, so they are set here — where `SirSettings` is stamped from the same
+    // `options` — and restored afterwards. Inside `fit()` they already hold these values.
+    crate::estimation::inner_optimizer::with_inner_settings(
+        options.inner_optimizer,
+        options.ebe_warm_start,
+        || {
+            crate::api::with_fit_ode_scope(options, || {
+                run_sir_core_scoped(
+                    model,
+                    population,
+                    params,
+                    eta_hats,
+                    proposal_cov,
+                    ofv_hat,
+                    options,
+                )
+            })
+        },
+    )?
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -2578,6 +2578,30 @@ fn ebe_warm_start_enabled() -> bool {
     EBE_WARM_START.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Run `f` with the inner-loop optimizer and the EBE warm start set to `mode` / `warm`,
+/// then put back whatever the process held before — also when `f` panics. For a post-hoc
+/// step (SIR) that must re-solve EBEs with the settings it records, without leaking them
+/// into the next standalone call the way an unscoped `set_*` does (#1767). Not a fix for
+/// concurrent callers: the globals stay process-wide (#426).
+pub(crate) fn with_inner_settings<R>(
+    mode: crate::types::InnerOptimizer,
+    warm: bool,
+    f: impl FnOnce() -> R,
+) -> R {
+    use std::sync::atomic::Ordering::Relaxed;
+    struct Restore(u8, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INNER_OPT_MODE.store(self.0, Relaxed);
+            EBE_WARM_START.store(self.1, Relaxed);
+        }
+    }
+    let _restore = Restore(INNER_OPT_MODE.load(Relaxed), EBE_WARM_START.load(Relaxed));
+    set_inner_optimizer(mode);
+    set_ebe_warm_start(warm);
+    f()
+}
+
 /// `FERX_PROFILE=1` attribution counters for the inner loop: how many EBE solves
 /// run, and per inner gradient step whether the exact analytic gradient served it
 /// or it fell back to the `~2·n_eta+1`-prediction FD gradient. A high fallback
