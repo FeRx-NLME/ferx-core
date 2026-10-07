@@ -296,3 +296,78 @@ fn missing_docker_and_dead_daemon_are_told_apart() {
          docker: {err}"
     );
 }
+
+/// The free-disk guard, both sides of the gate in one test: a threshold above any disk
+/// refuses before `docker run` with each sentence of its message, `0` skips the check and
+/// reaches `docker run`, and a non-number is refused. On 2026-10-07 a slow sweep filled the
+/// host disk and Docker restarted mid-build; the guard stops that before it starts.
+#[test]
+fn low_host_disk_is_refused_before_docker_run() {
+    let dir = scratch_dir();
+    let marker = dir.path().join("ran");
+    // `info` succeeds; `run` leaves a marker, so the test sees whether the container started.
+    let docker = write_exe(
+        dir.path(),
+        "docker",
+        &format!(
+            "if [ \"$1\" = run ]; then touch '{}'; fi\nexit 0",
+            marker.display()
+        ),
+    );
+    let run = |min_free: &str| {
+        Command::new("bash")
+            .arg(repo_root().join("tools/linux-test.sh"))
+            .args(["--", "test"])
+            .env("FERX_DOCKER", &docker)
+            .env("FERX_LINUX_MIN_FREE_GB", min_free)
+            .current_dir(repo_root())
+            .output()
+            .expect("spawn bash tools/linux-test.sh")
+    };
+
+    // No disk has a billion GB free: refused, and the container never starts.
+    let out = run("1000000000");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "low disk: exit 2; stderr: {err}"
+    );
+    for must in [
+        "GB free on the host disk, below the 1000000000 GB a build may need.",
+        "Free space first (docker system df; a merged branch's build folder: /ferx-clean)",
+        "or set FERX_LINUX_MIN_FREE_GB to override.",
+    ] {
+        assert!(err.contains(must), "low-disk message lacks {must:?}: {err}");
+    }
+    assert!(
+        !marker.exists(),
+        "docker run started despite the low-disk refusal"
+    );
+
+    // `0` skips the check: the run goes ahead.
+    let out = run("0");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "FERX_LINUX_MIN_FREE_GB=0 must skip the check; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "FERX_LINUX_MIN_FREE_GB=0 did not reach docker run"
+    );
+
+    // A non-number is refused rather than silently compared.
+    let out = run("forty");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bad value: exit 2; stderr: {err}"
+    );
+    assert!(
+        err.contains("FERX_LINUX_MIN_FREE_GB must be a whole number of GB, got 'forty'"),
+        "{err}"
+    );
+}

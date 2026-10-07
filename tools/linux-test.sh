@@ -55,6 +55,8 @@ Example (the slow-tests.yml core leg):
       --features ci,survival,slow-tests --profile ci-test --no-fail-fast
 
 The docker binary is $FERX_DOCKER (default: docker).
+Refuses to start with less than $FERX_LINUX_MIN_FREE_GB (default 40) GB free on the host
+disk; 0 skips the check.
 
 Ctrl-C does not stop a running container (#1693); stop it with
   docker kill $(docker ps -q --filter ancestor=rustlang/rust:nightly)
@@ -163,6 +165,24 @@ if ! command -v "$docker_bin" >/dev/null 2>&1; then
 fi
 if ! "$docker_bin" info >/dev/null 2>&1; then
   echo "linux-test: docker daemon not reachable (docker info failed) — start the Docker daemon and retry" >&2
+  exit 2
+fi
+
+# Free host disk. A cold build adds ~25 GB to the ferx-linux-target volume (more under a
+# new --target-dir), and Docker Desktop's VM disk grows on the host. On 2026-10-07 a slow
+# sweep took the host from 135 GiB to 11 GiB free and Docker restarted mid-build (exit 125,
+# no test run). Refuse up front instead. FERX_LINUX_MIN_FREE_GB=0 skips the check.
+min_free_gb="${FERX_LINUX_MIN_FREE_GB:-40}"
+if ! [[ "$min_free_gb" =~ ^[0-9]+$ ]]; then
+  echo "linux-test: FERX_LINUX_MIN_FREE_GB must be a whole number of GB, got '$min_free_gb'" >&2
+  exit 2
+fi
+# A threshold of 0 never trips the comparison, which is what makes it the off switch.
+free_kb="$(df -Pk "$tree" | awk 'NR == 2 { print $4 }')"
+if [[ "$free_kb" =~ ^[0-9]+$ ]] && [ "$free_kb" -lt $((min_free_gb * 1024 * 1024)) ]; then
+  echo "linux-test: only $((free_kb / 1024 / 1024)) GB free on the host disk, below the" \
+    "${min_free_gb} GB a build may need. Free space first (docker system df; a merged" \
+    "branch's build folder: /ferx-clean), or set FERX_LINUX_MIN_FREE_GB to override." >&2
   exit 2
 fi
 
