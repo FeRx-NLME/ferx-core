@@ -309,7 +309,7 @@ fn biphasic_igd_fraction_value_error_errs_on_predict() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("Pathway fractions on compartment"),
+        err.to_string().contains("Pathway fractions on compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -325,7 +325,7 @@ fn biphasic_igd_fraction_value_error_errs_on_simulate() {
     let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
     assert!(
-        err.contains("Pathway fractions on compartment"),
+        err.to_string().contains("Pathway fractions on compartment"),
         "unexpected Err: {err}"
     );
 }

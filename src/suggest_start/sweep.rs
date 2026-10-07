@@ -7,6 +7,7 @@ use nalgebra::DVector;
 use rayon::prelude::*;
 
 use crate::api::predict;
+use crate::diagnostics::EngineError;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::suggest_start::find_theta_for_slot;
 use crate::types::{CompiledModel, ModelParameters, Population};
@@ -22,7 +23,7 @@ fn rrmse(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<f64, String> {
+) -> Result<f64, EngineError> {
     let preds = predict(model, population, params)?;
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
@@ -78,7 +79,7 @@ pub fn sweep_slots(
     n_pts: usize,
     factor: f64,
     label: &str,
-) -> Result<(ModelParameters, Vec<String>), String> {
+) -> Result<(ModelParameters, Vec<String>), EngineError> {
     let mut warnings = Vec::new();
 
     let idx_a = find_theta_for_slot(model, slot_a);
@@ -139,7 +140,7 @@ pub fn sweep_unwritten_thetas(
     targets: &[usize],
     n_pts: usize,
     factor: f64,
-) -> Result<(ModelParameters, Vec<String>), String> {
+) -> Result<(ModelParameters, Vec<String>), EngineError> {
     if targets.is_empty() {
         return Ok((base.clone(), Vec::new()));
     }

@@ -118,25 +118,25 @@ fn every_flipped_entry_point_returns_the_text_fit_returns() {
     assert_no_wrapper_text(&want);
 
     let got = predict_diag(&model, &pop, params).expect_err("predict_diag");
-    assert_eq!(got, want, "predict_diag");
+    assert_eq!(got.to_string(), want, "predict_diag");
 
     let opts = SimulateOptions {
         seed: Some(1),
         ..Default::default()
     };
     let got = simulate_with_options(&model, &pop, params, 1, &opts).expect_err("options");
-    assert_eq!(got, want, "simulate_with_options");
+    assert_eq!(got.to_string(), want, "simulate_with_options");
     let got = simulate_with_options_diag(&model, &pop, params, 1, &opts).expect_err("diag");
-    assert_eq!(got, want, "simulate_with_options_diag");
+    assert_eq!(got.to_string(), want, "simulate_with_options_diag");
 
     let got = crate::suggest_start::inits_from_nca(&model, &pop, crate::NcaInit::Nca)
         .expect_err("inits_from_nca");
-    assert_eq!(got, want, "inits_from_nca");
+    assert_eq!(got.to_string(), want, "inits_from_nca");
 
     #[cfg(feature = "survival")]
     {
         let got = predict_survival(&model, &pop, params, &[1.0, 2.0]).expect_err("survival");
-        assert_eq!(got, want, "predict_survival");
+        assert_eq!(got.to_string(), want, "predict_survival");
     }
 }
 
@@ -154,8 +154,8 @@ fn predict_categorical_returns_the_text_fit_returns() {
     let want = fit_err(&model, &pop, params);
     assert!(want.contains("E_ENDPOINT_UNROUTED"), "{want}");
     let got = predict_categorical(&model, &pop, params).expect_err("predict_categorical");
-    assert_eq!(got, want);
-    assert_no_wrapper_text(&got);
+    assert_eq!(got.to_string(), want);
+    assert_no_wrapper_text(&got.to_string());
 }
 
 // ── T2: one fixture per check family, through predict_diag ───────────────────
@@ -165,6 +165,9 @@ struct Family {
     name: &'static str,
     /// A phrase only this family's check message contains.
     phrase: &'static str,
+    /// The code `ferx check` gives this refusal, which the entry point's `Err` carries
+    /// (#1746); `None` where `ferx check` has none, and then the `Err` invents none.
+    code: Option<&'static str>,
     model: CompiledModel,
     pop: Population,
     /// `None` → the model's defaults. The flip-flop family is a function of θ.
@@ -221,6 +224,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "modeled dose rates (#324)",
             phrase: "RATE=-2 (modeled infusion duration) into compartment 1",
+            code: Some("E_MODELED_DURATION_NO_PARAM"),
             model: iv(),
             pop: one(subject_with(
                 vec![DoseEvent::modeled(
@@ -238,6 +242,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "covariates present (#1028)",
             phrase: "Model references covariate(s) not found in data (case-sensitive): WT",
+            code: Some("E_MISSING_COVARIATE"),
             model: parse_model_string(READS_WT).expect("parse"),
             pop: one(subject_with(vec![bolus()], 1)),
             theta: None,
@@ -245,6 +250,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "covariate model bound (#1111)",
             phrase: "bind_covariate_stats",
+            code: Some("E_COVSTAT_UNRESOLVED"),
             model: parse_full_model(UNBOUND_COVARIATE_MODEL)
                 .expect("parse")
                 .model,
@@ -258,6 +264,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "categorical level outside the levels (#1740)",
             phrase: "`GRP` takes [4.0] in this data",
+            code: Some("E_COV_LEVEL_UNKNOWN"),
             model: parse_full_model(GRP_LEVELS_123).expect("parse").model,
             pop: {
                 let mut s = subject_with(vec![bolus()], 1);
@@ -271,6 +278,7 @@ fn families() -> Vec<Family> {
             Family {
                 name: "dose compartments (#375)",
                 phrase: "infusion into compartment 0",
+                code: Some("E_DOSE_CMT_NOT_INFUSABLE"),
                 model,
                 pop,
                 theta: None,
@@ -279,6 +287,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "absorption closed-form support",
             phrase: "does not support infusion doses in this form (subject 1)",
+            code: Some("E_TRANSIT_UNSUPPORTED"),
             model: parse_model_string(TWINLESS_TRANSIT).expect("parse"),
             pop: one(subject_with(
                 vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)],
@@ -291,6 +300,7 @@ fn families() -> Vec<Family> {
             // model the inert `[scaling]` block leaves without an ODE twin to reroute to.
             name: "flip-flop, no twin (#776)",
             phrase: "flip-flop",
+            code: Some("E_TRANSIT_FLIP_FLOP"),
             model: parse_model_string(TWINLESS_TRANSIT).expect("parse"),
             pop: one(subject_with(vec![bolus()], 1)),
             theta: Some(vec![2.0, 4.0, 3.0, 20.0]),
@@ -298,6 +308,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "analytic readout support (#650)",
             phrase: "EVID=3/4 reset",
+            code: None,
             model: parse_model_string(DEPOT_READOUT).expect("parse"),
             pop: {
                 let mut s = subject_with(vec![bolus()], 2);
@@ -311,6 +322,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "absorption dosing (#588)",
             phrase: "Pathway fractions on compartment",
+            code: Some("E_ABSORPTION_FRACTION"),
             model: parse_full_model(FRACTIONS_SUM_TO_1_2).expect("parse").model,
             pop: one(subject_with(vec![bolus()], 1)),
             theta: None,
@@ -351,6 +363,7 @@ fn survival_families() -> Vec<Family> {
         Family {
             name: "survival time-varying covariate (#741)",
             phrase: "#741",
+            code: None,
             model: tv_model,
             pop: population_of(vec![tv_subject], &["CRCL"]),
             theta: None,
@@ -358,6 +371,7 @@ fn survival_families() -> Vec<Family> {
         Family {
             name: "endpoint routing (#1199)",
             phrase: "E_ENDPOINT_UNROUTED",
+            code: Some("E_ENDPOINT_UNROUTED"),
             model: parse_full_model(&src).expect("parses").model,
             pop: crate::read_nonmem_csv(
                 std::path::Path::new("data/binary_logistic.csv"),
@@ -403,15 +417,60 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             Err(e) => e,
             Ok(out) => panic!("{}: accepted, {} rows", f.name, out.results.len()),
         };
-        assert!(got.contains(f.phrase), "{}: {got}", f.name);
-        assert_no_wrapper_text(&got);
+        assert!(got.to_string().contains(f.phrase), "{}: {got}", f.name);
+        assert_no_wrapper_text(&got.to_string());
         assert_eq!(
-            got,
+            got.to_string(),
             fit_err(&f.model, &f.pop, &params),
             "{} vs fit()",
             f.name
         );
+        // #1746: the `Err` carries the diagnostic `ferx check` reports for the same input
+        // — code, block and suggestion — or none when `ferx check` has no code for it.
+        // Both sides of that gate are in this one loop: nine families are coded, two
+        // (#650, #741) are not.
+        assert_eq!(got.code(), f.code, "{}: code", f.name);
+        let checked = check_diagnostics(&f.model, &f.pop, &params);
+        let want = checked.iter().find(|d| d.is_error());
+        assert_eq!(
+            got.code(),
+            want.map(|d| d.code.as_str()),
+            "{}: the entry point's code vs ferx check's ({checked:?})",
+            f.name
+        );
+        assert_eq!(
+            got.block(),
+            want.and_then(|d| d.block.as_deref()),
+            "{}: block",
+            f.name
+        );
+        assert_eq!(
+            got.suggestion(),
+            want.and_then(|d| d.suggestion.as_deref()),
+            "{}: suggestion",
+            f.name
+        );
     }
+}
+
+/// The model/data diagnostics `ferx check` runs for a model file and its data: the same
+/// list `fit()` fails fast on, plus the two absorption closed-form refusals it adds (at
+/// the model's default θ, which is the θ these fixtures pass).
+fn check_diagnostics(
+    model: &CompiledModel,
+    pop: &Population,
+    params: &ModelParameters,
+) -> Vec<crate::Diagnostic> {
+    let mut out = check_model_data(model, pop);
+    out.extend(crate::api::check_absorption_closed_form_support_diags(
+        model, pop,
+    ));
+    out.extend(crate::api::check_absorption_flip_flop_no_twin_diags(
+        model,
+        pop,
+        &params.theta,
+    ));
+    out
 }
 
 // ── which entry point checks which family (docs/warnings.qmd#entry-point-errors) ──
@@ -468,10 +527,14 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
         }
         // A `Y` cell must refuse **for this family's own reason**: `is_err()` alone is green
         // when the entry point refuses the fixture through some other check (review r2, V4).
-        let cell = |entry: &str, want: bool, got: Option<String>| {
+        // …and carry the family's code (#1746): a narrow entry point reaching its check
+        // through an internal `String` helper would refuse with the right text and no code.
+        let cell = |entry: &str, want: bool, got: Option<crate::EngineError>| {
             assert_eq!(got.is_some(), want, "{entry} × {}: {got:?}", f.name);
-            if let Some(msg) = got {
+            if let Some(err) = got {
+                let msg = err.to_string();
                 assert!(msg.contains(f.phrase), "{entry} × {}: {msg}", f.name);
+                assert_eq!(err.code(), f.code, "{entry} × {}: code", f.name);
             }
         };
         let [sim, nca, surv, cat] = checked_by(f.name);
@@ -528,7 +591,10 @@ fn uncertainty_precondition_failure_is_an_err() {
     };
     let got = simulate_with_uncertainty(&model, &pop, &fit_result, &opts)
         .expect_err("an unroutable dose must fail the run");
-    assert_eq!(got, fit_err(&model, &pop, &model.default_params));
+    assert_eq!(
+        got.to_string(),
+        fit_err(&model, &pop, &model.default_params)
+    );
 }
 
 // ── T4: the formerly `Vec`-returning forms return the same `Err` ───────────────
@@ -546,11 +612,139 @@ fn convenience_forms_return_exactly_the_err_text() {
     let want = predict_diag(&model, &pop, params).expect_err("fixture is refused");
 
     let got = predict(&model, &pop, params).expect_err("predict");
-    assert_eq!(got, want, "predict");
+    assert_eq!(got.to_string(), want.to_string(), "predict");
     let got = simulate(&model, &pop, params, 1).expect_err("simulate");
-    assert_eq!(got, want, "simulate");
+    assert_eq!(got.to_string(), want.to_string(), "simulate");
     let got = simulate_with_seed(&model, &pop, params, 1, 3).expect_err("simulate_with_seed");
-    assert_eq!(got, want, "simulate_with_seed");
+    assert_eq!(got.to_string(), want.to_string(), "simulate_with_seed");
+    // #1746: the same code too. `simulate` / `simulate_with_seed` reach the check through
+    // `simulate_inner_with_draw`; when that helper returned `String` the text survived and
+    // the code came back `None` (measured on the plan's probe).
+    assert_eq!(want.code(), Some("E_DOSE_CMT_NOT_INFUSABLE"), "{want}");
+    assert_eq!(got.code(), want.code(), "simulate_with_seed");
+    let got = simulate(&model, &pop, params, 1).expect_err("simulate");
+    assert_eq!(got.code(), want.code(), "simulate");
+}
+
+/// #1746: the absorption closed-form refusal is coded by model family, as `ferx check`
+/// codes it — `E_IG_*` for an inverse-Gaussian model where the transit family above reads
+/// `E_TRANSIT_*` — so the docs' "(`E_IG_UNSUPPORTED` for an inverse-Gaussian model)" is
+/// pinned on the entry point, not only on the check.
+///
+/// Mutation: swap the arms of `absorption_family_code` → both this and the transit
+/// families of `each_precondition_family_is_an_err_carrying_its_own_message` die.
+#[test]
+fn an_inverse_gaussian_closed_form_refusal_carries_the_ig_code() {
+    const TWINLESS_IG: &str = "[parameters]\n  theta TVCL(0.5, 0.001, 50.0)\n  \
+        theta TVV(4.0, 0.1, 500.0)\n  theta TVMAT(20.0, 0.05, 200.0)\n  \
+        theta TVCV2(0.5, 0.001, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\
+        [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  MAT = TVMAT\n  \
+        CV2 = TVCV2\n[structural_model]\n  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)\n\
+        [scaling]\n  obs_scale = 1\n[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_model_string(TWINLESS_IG).expect("parse");
+    let pop = population_of(
+        vec![subject_with(
+            vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)],
+            1,
+        )],
+        &[],
+    );
+    let params = &model.default_params;
+    let err = predict_diag(&model, &pop, params).expect_err("an infusion into a closed form");
+    assert!(
+        err.to_string().contains("does not support infusion doses"),
+        "{err}"
+    );
+    assert_eq!(err.code(), Some("E_IG_UNSUPPORTED"), "{err}");
+    let checked = check_diagnostics(&model, &pop, params);
+    assert_eq!(
+        checked
+            .iter()
+            .find(|d| d.is_error())
+            .map(|d| d.code.as_str()),
+        Some("E_IG_UNSUPPORTED"),
+        "{checked:?}"
+    );
+}
+
+/// #1746 T5: the two simulate families that reach their data checks through helpers of
+/// their own — `simulate_with_uncertainty` (per-draw chokepoint) and `simulate_adaptive`
+/// (`check_adaptive_model_data`) — hand back `ferx check`'s code for an unseen categorical
+/// level (#1740), not just its text.
+///
+/// Mutation: `.map_err(|e| e.to_string())` on `check_adaptive_model_data`'s
+/// `first_error`, or on the uncertainty loop's `simulate_inner_with_draw` call → that
+/// entry point's `code()` assert dies.
+#[test]
+fn uncertainty_and_adaptive_refusals_carry_the_level_code() {
+    const GRP_ODE: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
+        theta TVV(40.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
+        [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  \
+        ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -CL/V*central\n\
+        [covariates]\n  GRP categorical(levels = [1, 2, 3])\n\
+        [covariate_model]\n  CL ~ GRP categorical(ref = 2)\n[error_model]\n  DV ~ proportional(PROP)\n";
+    let grp = |g: f64| {
+        let mut s = subject_with(vec![bolus()], 1);
+        s.covariates = HashMap::from([("GRP".to_string(), g)]);
+        population_of(vec![s], &["GRP"])
+    };
+
+    let model = parse_full_model(GRP_LEVELS_123).expect("parse").model;
+    // `simulate_with_seed` runs `check_simulation_data` only inside
+    // `simulate_inner_with_draw` — the helper the plan's probe found returning the text
+    // with the code dropped (M3).
+    simulate_with_seed(&model, &grp(2.0), &model.default_params, 1, 3)
+        .expect("a listed level simulates");
+    let err = simulate_with_seed(&model, &grp(4.0), &model.default_params, 1, 3)
+        .expect_err("an unseen level is refused");
+    assert!(err.to_string().contains("`GRP` takes [4.0]"), "{err}");
+    assert_eq!(
+        err.code(),
+        Some("E_COV_LEVEL_UNKNOWN"),
+        "simulate_with_seed: {err}"
+    );
+
+    let fit_result = synthetic_fit(&model);
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2,
+        n_sim_per_draw: 1,
+        seed: Some(7),
+        ..Default::default()
+    };
+    simulate_with_uncertainty(&model, &grp(2.0), &fit_result, &opts)
+        .expect("a listed level simulates");
+    let err = simulate_with_uncertainty(&model, &grp(4.0), &fit_result, &opts)
+        .expect_err("an unseen level is refused");
+    assert!(err.to_string().contains("`GRP` takes [4.0]"), "{err}");
+    assert_eq!(
+        err.code(),
+        Some("E_COV_LEVEL_UNKNOWN"),
+        "uncertainty: {err}"
+    );
+
+    let model = parse_full_model(GRP_ODE).expect("parse").model;
+    let adaptive = |pop: &Population| {
+        crate::simulate_adaptive(
+            &model,
+            pop,
+            &model.default_params,
+            1,
+            || {
+                |_: &crate::sim::adaptive::ControllerCtx| {
+                    vec![crate::sim::adaptive::DoseAction::Hold]
+                }
+            },
+            &crate::AdaptiveSimulateOptions {
+                seed: Some(1),
+                decision_times: vec![2.0],
+                ..Default::default()
+            },
+        )
+    };
+    adaptive(&grp(2.0)).expect("a listed level simulates");
+    let err = adaptive(&grp(4.0)).expect_err("an unseen level is refused");
+    assert!(err.to_string().contains("`GRP` takes [4.0]"), "{err}");
+    assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "adaptive: {err}");
 }
 
 /// The rule after #898 PR 2: no library entry point turns a precondition `Err` back into a

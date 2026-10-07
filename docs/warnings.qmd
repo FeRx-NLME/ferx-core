@@ -105,6 +105,55 @@ One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
 the run continues. The point estimate was in-domain; one draw out of it is not a
 reason to lose the others.
 
+#### Matching on the code {#entry-point-error-codes}
+
+Every entry point in the table above except `fit()` returns its `Err` as an
+`EngineError` rather than a `String`. Its `to_string()` is the message described
+above, unchanged, so code that only prints or searches the text keeps working.
+
+When `ferx check` reports the same refusal with a code, the `EngineError`
+carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
+[check report](file-formats/check-report.qmd#error-warning-codes) gives for the
+same model and data. A caller can match on `code()` instead of parsing the
+message. `message()` never repeats the suggestion, so show either `to_string()`
+alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
+unbound `theta NAME[...]` block is the one whose `to_string()` also ends with its
+suggestion.) When `ferx check` has no code for the refusal, `code()` is `None`: an
+entry point never invents one. The time-varying covariate on a hazard and the
+depot readout across a reset are refusals of that kind.
+
+Each precondition check emits one of a fixed set of codes, depending on what it
+found:
+
+| Precondition | `code()` |
+|---|---|
+| coded `RATE` | `E_MODELED_RATE_NO_PARAM`, `E_MODELED_DURATION_NO_PARAM`, `E_DOSE_ATTR_DOUBLE_USE` |
+| covariates present | `E_MISSING_COVARIATE`, `E_ETA_NOT_DECLARED` |
+| `[covariate_model]` bound | `E_COVSTAT_UNRESOLVED` |
+| covariate levels | `E_COV_LEVEL_UNKNOWN` |
+| θ levels bound, population bound for the θ levels | `E_THETA_LEVELS_UNBOUND`, `E_THETA_LEVELS_DATA_UNBOUND`; the simulation data checks also `E_THETA_GATHER_INDEX_MISSING`, `E_THETA_GATHER_INDEX_RANGE` |
+| θ length | `E_THETA_LENGTH` |
+| dose compartment | `E_DOSE_CMT_OUT_OF_RANGE`, `E_DOSE_CMT_NOT_INFUSABLE` |
+| absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
+| flip-flop without an ODE twin | `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`) |
+| absorption input rate | `E_ABSORPTION_FRACTION`, `E_ABSORPTION_DOMAIN`, `E_ABSORPTION_DIFFUSION`, `E_ABSORPTION_RATE_ZERO_ORDER`, `E_ABSORPTION_SS_INFUSION`, `E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER` |
+| κ weights, residual weights | `E_KAPPA_WEIGHT_NONPOSITIVE`, `E_RUV_MAGNITUDE_NONPOSITIVE` |
+| endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
+| time-varying covariate on a hazard, depot readout across a reset, a CTMM model, TTE simulatable, Ω~IOV~ present, `horizon`, the adaptive-dosing rejections | none |
+
+`run_sir()` and `run_covariance()` name themselves when they refuse the fit's
+inputs — a changed model or data file, a population that is not the fit's
+subjects, a model that is not the fitted one, a categorical level the fit never
+saw: the `EngineError`'s `context()` is the entry point, `to_string()` starts
+with `"run_sir: "` / `"run_covariance: "`, and `message()` is the text without
+it. Their other refusals (dose compartment, endpoint routing, a fit with no
+covariance matrix) carry no context and no prefix, as before. Of the input
+refusals, an unseen categorical level (`E_COV_LEVEL_UNKNOWN`) and a supplied
+model whose `[covariate_model]` is still unbound (`E_COVSTAT_UNRESOLVED`) carry a
+code; the rest have `code()` `None`.
+
+`fit()` keeps returning a `String`.
+
 ### The non-fit bundle {#non-fit-bundle}
 
 The rule is that **a finding about the model or the data is carried; a finding

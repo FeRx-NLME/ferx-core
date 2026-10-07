@@ -92,7 +92,7 @@ pub fn run_covariance(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1710: differentiate the fit's own marginal, whatever `interaction` the caller carries.
     let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
@@ -114,7 +114,7 @@ fn run_covariance_scoped(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Input resolution mirrors `run_sir` exactly: stale-input errors win over
     // any downstream failure so a user pointing at the wrong model/dataset
     // hears about that first.
@@ -149,21 +149,23 @@ fn run_covariance_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
-        return Err(format!(
-            "run_covariance: supplied model has n_eta = {} but fit.omega is {}×{}. \
+        return Err(crate::diagnostics::EngineError::from(format!(
+            "supplied model has n_eta = {} but fit.omega is {}×{}. \
              Verify you supplied the same model used for the fit.",
             model_ref.n_eta,
             fit.omega.nrows(),
             fit.omega.ncols()
-        ));
+        ))
+        .in_context("run_covariance"));
     }
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(format!(
-            "run_covariance: fit.subjects[0] has eta dim {} but model has n_eta = {}. \
+        return Err(crate::diagnostics::EngineError::from(format!(
+            "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
             model_ref.n_eta
-        ));
+        ))
+        .in_context("run_covariance"));
     }
 
     // --- Reconstruct the covariance-step inputs ---------------------------
@@ -810,7 +812,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("model hash mismatch"),
+            err.to_string().contains("model hash mismatch"),
             "expected hash-mismatch message, got: {}",
             err
         );
@@ -839,7 +841,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("data hash mismatch"),
+            err.to_string().contains("data hash mismatch"),
             "expected data hash-mismatch message, got: {}",
             err
         );
@@ -902,7 +904,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("no model supplied"),
+            err.to_string().contains("no model supplied"),
             "expected 'no model supplied' error, got: {}",
             err
         );
@@ -936,7 +938,7 @@ mod tests {
 
         let err = run_covariance(&fit, Some(&iov_model), None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("IOV") && err.contains("population"),
+            err.to_string().contains("IOV") && err.to_string().contains("population"),
             "expected IOV-needs-population error, got: {}",
             err
         );
@@ -1079,24 +1081,25 @@ mod from_fit_bindings {
                 .map(|_| ())
                 .expect_err("refused");
             assert!(
-                err.starts_with(
+                err.to_string().starts_with(
                     "run_covariance: this fit carries no data-derived bindings, so the model \
                      cannot be rebuilt the way it was fitted: "
                 ),
                 "{kind:?}: {err}"
             );
             assert_eq!(
-                err.contains("its theta level block(s) `SHIFT[STUDY]`"),
+                err.to_string()
+                    .contains("its theta level block(s) `SHIFT[STUDY]`"),
                 has_level,
                 "{kind:?}: {err}"
             );
             assert_eq!(
-                err.contains("a statistic of `WT` symbolically"),
+                err.to_string().contains("a statistic of `WT` symbolically"),
                 has_stat,
                 "{kind:?}: {err}"
             );
             assert!(
-                err.ends_with(
+                err.to_string().ends_with(
                     "The fit is an older `.fitrx` bundle, or was made before ferx recorded \
                      these bindings with a fit. Refit the model to record them."
                 ),
@@ -1115,7 +1118,7 @@ mod from_fit_bindings {
     /// - an unbound median model is refused (was `Ok` with no covariance).
     ///
     /// Mutations — delete the bindings comparison, the `n_theta` check, the index
-    /// write, or the `assert_covariate_model_bound` call: one cell each panics, or
+    /// write, or the `check_covariate_model_bound` call: one cell each panics, or
     /// returns `Ok`, and dies.
     #[test]
     fn a_supplied_model_must_be_the_fitted_one() {
@@ -1130,7 +1133,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             "run_covariance: the supplied model is not bound with this fit's bindings: its \
              data-derived bindings (level layout, covariate statistics) differ from the fit's \
              `data_bindings`. Pass `model = None` to rebuild it from the fit, or bind it with \
@@ -1148,7 +1151,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             "run_covariance: the model has n_theta = 6 but the fit has 8 θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with the \
              fit's `data_bindings`)."
@@ -1180,9 +1183,12 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
         );
+        // #1746: a population that is not the fit's has no `ferx check` code.
+        assert_eq!(err.code(), None, "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
         // …then the right count in the wrong order, naming the first position.
         let mut swapped = level.prep.population.clone();
         swapped.subjects.swap(1, 2);
@@ -1195,7 +1201,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             format!(
                 "run_covariance: subject 2 of the population is `3`, but the fit's is `2`. {WHY}"
             )
@@ -1212,7 +1218,7 @@ mod from_fit_bindings {
             .map(|_| ())
             .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             format!("run_covariance: the population has 31 subjects but the fit has 30. {WHY}")
         );
 
@@ -1227,7 +1233,8 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert!(
-            err.contains("is not bound with this fit's bindings"),
+            err.to_string()
+                .contains("is not bound with this fit's bindings"),
             "{err}"
         );
         let mut no_bindings = median.fit.clone();
@@ -1241,11 +1248,16 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert!(
-            err.starts_with(
+            err.to_string().starts_with(
                 "run_covariance: [covariate_model] relations still need data-derived statistics:"
             ),
             "{err}"
         );
+        // #1746 (review r1 #3/#4): an input refusal that `ferx check` codes keeps its
+        // code and is attributed to the entry point. Mutation: assert the model bound
+        // through `assert_covariate_model_bound(m)?` (String) again → `code()` dies.
+        assert_eq!(err.code(), Some("E_COVSTAT_UNRESOLVED"), "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
     }
 
     /// The #1729 refusal, spelled out in full so deleting any sentence of it in
@@ -1330,7 +1342,11 @@ mod from_fit_bindings {
             let err = run_covariance(&fit, Some(lent), pop, &c.opts)
                 .map(|_| ())
                 .expect_err("a design-bound model is refused");
-            assert_eq!(err, stats_refusal(source, mm, dm, false), "{source:?}");
+            assert_eq!(
+                err.to_string(),
+                stats_refusal(source, mm, dm, false),
+                "{source:?}"
+            );
         }
     }
 
@@ -1353,13 +1369,16 @@ mod from_fit_bindings {
         let err = run_covariance(&fit, Some(lent), Some(&c.prep.population), &c.opts)
             .map(|_| ())
             .expect_err("refused");
-        assert_eq!(err, stats_refusal(Source::Supplied, mm, dm, true));
+        assert_eq!(
+            err.to_string(),
+            stats_refusal(Source::Supplied, mm, dm, true)
+        );
 
         let err = run_covariance(&fit, Some(lent), None, &c.opts)
             .map(|_| ())
             .expect_err("refused");
         assert!(
-            err.starts_with(
+            err.to_string().starts_with(
                 "run_covariance: theta SHIFT[STUDY]: the design has 1 level(s) the fit \
                  estimated no theta for: `STUDY=3`."
             ),
@@ -1398,7 +1417,11 @@ mod from_fit_bindings {
             let err = run_covariance(f, Some(lent), pop, &c.opts)
                 .map(|_| ())
                 .expect_err("refused");
-            assert_eq!(err, stats_refusal(source, mm, dm, false), "{source:?}");
+            assert_eq!(
+                err.to_string(),
+                stats_refusal(source, mm, dm, false),
+                "{source:?}"
+            );
         }
         // The supplied and re-read texts differ, so neither equality is the other's.
         assert_ne!(
@@ -1434,7 +1457,7 @@ mod from_fit_bindings {
             .map(|_| ())
             .expect_err("refused");
         assert!(
-            err.starts_with(
+            err.to_string().starts_with(
                 "run_covariance: [covariate_model] needs summary statistics for covariate \
                  `WT`, but the dataset carries no non-missing value for it"
             ),
@@ -1470,7 +1493,7 @@ mod from_fit_bindings {
                 .expect_err("refused");
             let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
             assert_eq!(
-                err,
+                err.to_string(),
                 stats_refusal(Source::Supplied, mm, dm, levels),
                 "{kind:?}"
             );
@@ -1491,7 +1514,8 @@ mod from_fit_bindings {
                     .map(|_| ())
                     .expect_err("the level block stays unbound");
                 assert!(
-                    err.starts_with("run_covariance: the model has n_theta = 6 but the fit has 8"),
+                    err.to_string()
+                        .starts_with("run_covariance: the model has n_theta = 6 but the fit has 8"),
                     "{err}"
                 );
             } else {
@@ -1523,11 +1547,23 @@ mod from_fit_bindings {
             .map(|_| ())
             .unwrap_err();
         assert!(
-            err.starts_with("run_covariance: model hash mismatch for "),
+            err.to_string()
+                .starts_with("run_covariance: model hash mismatch for "),
+            "{err}"
+        );
+        // #1746: an input `ferx check` has no code for carries none — "refused, no
+        // code" stays distinct from a coded precondition — and is still attributed
+        // to the entry point. Mutation: give non-diagnostic errors a generic code →
+        // the `None` assert dies.
+        assert_eq!(err.code(), None, "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
+        assert!(
+            err.message().starts_with("model hash mismatch for "),
             "{err}"
         );
         assert!(
-            err.ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
+            err.to_string()
+                .ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
             "{err}"
         );
 
@@ -1536,10 +1572,11 @@ mod from_fit_bindings {
             .map(|_| ())
             .unwrap_err();
         assert!(
-            err.starts_with("run_covariance: cannot read the model file "),
+            err.to_string()
+                .starts_with("run_covariance: cannot read the model file "),
             "{err}"
         );
-        assert!(err.ends_with(BECAUSE), "{err}");
+        assert!(err.to_string().ends_with(BECAUSE), "{err}");
 
         // The advice: with the population supplied too, the file is not read.
         let got = run_covariance(&c.fit, Some(model), Some(&c.prep.population), &c.opts)

@@ -114,7 +114,7 @@ pub fn compute_npde_npd(
     params: &ModelParameters,
     nsim: usize,
     seed: Option<u64>,
-) -> Result<Vec<SubjectNpde>, String> {
+) -> Result<Vec<SubjectNpde>, crate::diagnostics::EngineError> {
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
     // θ against the model's layout (#1615): the reference distribution is simulated
     // from it, and a θ read past its end is `0.0`.
@@ -431,7 +431,12 @@ mod tests {
 
         let e = compute_npde_npd(&model, &pop([1.0, 2.0, 4.0]), &params, 200, Some(1740))
             .expect_err("an unlisted level must be refused");
-        assert!(e.contains("`GRP` takes [4.0] in this data"), "{e}");
+        assert!(
+            e.to_string().contains("`GRP` takes [4.0] in this data"),
+            "{e}"
+        );
+        // #1746: the refusal carries `ferx check`'s code.
+        assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
     }
 
     /// Regression for #506: NPDE/NPD must simulate against the time-varying

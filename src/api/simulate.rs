@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -53,7 +53,7 @@ pub fn simulate(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     let mut rng = rand::rng();
     simulate_inner(model, population, params, n_sim, &mut rng)
 }
@@ -70,7 +70,7 @@ pub fn simulate_with_seed(
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     simulate_inner(model, population, params, n_sim, &mut rng)
@@ -340,7 +340,7 @@ pub(crate) fn validate_iov_simulatable(
 /// level bindings. The message says so whenever the model declares a level block. It
 /// names no function, since a wrapper reaches it too; from Rust, the binder is
 /// [`bind_from_fit`](crate::bind_from_fit) with the fit's `data_bindings`.
-pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result<(), String> {
+pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result<(), EngineError> {
     let expected = model.default_params.theta.len();
     if theta.len() == expected {
         return Ok(());
@@ -390,12 +390,16 @@ fn check_simulate_preconditions(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
     check_theta_length(model, theta)?;
     first_error(&check_modeled_dose_rates(model, population))?;
     first_error(&check_dose_compartments(model, population))?;
-    check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
-    check_absorption_flip_flop_no_twin(model, population, theta).map_or(Ok(()), Err)?;
+    first_error(&check_absorption_closed_form_support_diags(
+        model, population,
+    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model, population, theta,
+    ))?;
     #[cfg(feature = "survival")]
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
     first_error(&check_absorption_dosing(model, population))
@@ -412,7 +416,7 @@ pub fn simulate_with_options(
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
 }
 
@@ -449,7 +453,7 @@ pub fn simulate_with_options_diag(
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<SimulationOutput, String> {
+) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
     // Start the SS-equilibration non-convergence sink clean, then drain it into this run's
@@ -488,9 +492,7 @@ pub fn simulate_with_options_diag(
     // subject at or before entry (#522 review).
     if let Some(h) = opts.horizon {
         if !h.is_finite() || h <= 0.0 {
-            return Err(format!(
-                "SimulateOptions.horizon must be finite and > 0 (got {h})"
-            ));
+            return Err(format!("SimulateOptions.horizon must be finite and > 0 (got {h})").into());
         }
         // A horizon below a subject's TTE entry_time would censor it before it
         // entered observation (a row with time = h < entry_time). The
@@ -508,7 +510,8 @@ pub fn simulate_with_options_diag(
                          ({entry_time}); the administrative horizon must be ≥ every \
                          subject's entry time",
                         subject.id
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -570,7 +573,9 @@ pub fn simulate_with_options_diag(
 
     if population.subjects.is_empty() {
         return Err(
-            "propensity-score matching requires a non-empty observed population".to_string(),
+            "propensity-score matching requires a non-empty observed population"
+                .to_string()
+                .into(),
         );
     }
     if let Some(s) = population
@@ -582,7 +587,8 @@ pub fn simulate_with_options_diag(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
             s.id
-        ));
+        )
+        .into());
     }
     // A `DV = .` design template read by `read_population_for_simulation` (#957)
     // has rows but NaN observations, so the emptiness check above no longer
@@ -602,7 +608,8 @@ pub fn simulate_with_options_diag(
              design template carries NaN placeholders — match against the observed dataset \
              instead",
             s.id
-        ));
+        )
+        .into());
     }
 
     // Fitted (posthoc) BSV etas depend only on the observed data + params, so
@@ -628,7 +635,8 @@ pub fn simulate_with_options_diag(
             "propensity-score matching: the posthoc eta for subject '{}' is \
              non-finite (its EBE did not converge); cannot match",
             population.subjects[i].id
-        ));
+        )
+        .into());
     }
 
     let omega_inv = &params.omega.inv;
@@ -668,7 +676,7 @@ fn simulate_inner<R: rand::Rng>(
     params: &ModelParameters,
     n_sim: usize,
     rng: &mut R,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
     // These entry points return only the rows; per-subject simulation diagnostics
@@ -992,7 +1000,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     warnings: &mut Vec<String>,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
 
     // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
@@ -1015,7 +1023,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
              discrete-state trajectory has no simulation path, so the Gaussian emitter would \
              produce meaningless all-zero observations. CTMM simulation is a later slice."
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -1154,7 +1163,7 @@ pub fn simulate_with_uncertainty(
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<Vec<SimulationResult>, EngineError> {
     simulate_with_uncertainty_diag(model, population, fit_result, opts).map(|o| o.results)
 }
 
@@ -1178,7 +1187,7 @@ pub fn simulate_with_uncertainty_diag(
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
-) -> Result<SimulationOutput, String> {
+) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
     // Start the SS-equilibration non-convergence sink clean, as `simulate_with_options_diag`
@@ -1231,7 +1240,7 @@ pub fn simulate_with_uncertainty_diag(
     let mut sim_warnings: Vec<String> = Vec::new();
     // One solver-stats scope around every draw: the loop is serial (the RNG draw order is
     // part of the contract), so the thread-local scope sees every integration. #1304.
-    let (looped, stats) = super::with_solver_stats(model, || -> Result<(), String> {
+    let (looped, stats) = super::with_solver_stats(model, || -> Result<(), EngineError> {
         simulate_uncertainty_draws(
             model,
             population,
@@ -1267,7 +1276,7 @@ fn simulate_uncertainty_draws(
     rng: &mut rand::rngs::StdRng,
     results: &mut Vec<SimulationResult>,
     sim_warnings: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,

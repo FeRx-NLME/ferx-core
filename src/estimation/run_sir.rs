@@ -112,7 +112,7 @@ pub fn run_sir(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1710: score the fit's own marginal, whatever `interaction` the caller carries.
     let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
@@ -128,7 +128,7 @@ fn run_sir_scoped(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Hash verification runs before the covariance check so a stale-input
     // error wins over a missing-cov error. A user pointing at the wrong
     // model or dataset should hear about that first; the cov-missing case
@@ -156,21 +156,23 @@ fn run_sir_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
-        return Err(format!(
-            "run_sir: supplied model has n_eta = {} but fit.omega is {}×{}. \
+        return Err(crate::diagnostics::EngineError::from(format!(
+            "supplied model has n_eta = {} but fit.omega is {}×{}. \
              Verify you supplied the same model used for the fit.",
             model_ref.n_eta,
             fit.omega.nrows(),
             fit.omega.ncols()
-        ));
+        ))
+        .in_context("run_sir"));
     }
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(format!(
-            "run_sir: fit.subjects[0] has eta dim {} but model has n_eta = {}. \
+        return Err(crate::diagnostics::EngineError::from(format!(
+            "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
             model_ref.n_eta
-        ));
+        ))
+        .in_context("run_sir"));
     }
 
     // --- Reconstruct ModelParameters and eta_hats -------------------------
@@ -348,7 +350,7 @@ mod tests {
         assert!(fit.covariance_matrix.is_none());
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("covariance_matrix"),
+            err.to_string().contains("covariance_matrix"),
             "expected cov-missing message, got: {}",
             err
         );
@@ -380,7 +382,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("model hash mismatch"),
+            err.to_string().contains("model hash mismatch"),
             "expected hash-mismatch message, got: {}",
             err
         );
@@ -494,7 +496,7 @@ mod tests {
 
         let err = run_sir(&fit, Some(&iov_model), None, &opts).unwrap_err();
         assert!(
-            err.contains("IOV") && err.contains("population"),
+            err.to_string().contains("IOV") && err.to_string().contains("population"),
             "expected IOV-needs-population error, got: {}",
             err
         );
@@ -624,7 +626,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("data hash mismatch"),
+            err.to_string().contains("data hash mismatch"),
             "expected data hash-mismatch message, got: {}",
             err
         );
@@ -789,7 +791,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("no model supplied"),
+            err.to_string().contains("no model supplied"),
             "expected 'no model supplied' error, got: {}",
             err
         );
@@ -915,7 +917,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .expect_err("refused");
         assert!(
-            err.starts_with(
+            err.to_string().starts_with(
                 "run_sir: this fit records no data-derived bindings (an older `.fitrx`), so \
                  the supplied model's covariate statistics were checked against the supplied \
                  population, and they differ: the median of `WT` is "

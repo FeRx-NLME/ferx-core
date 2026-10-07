@@ -191,7 +191,8 @@ fn predict_errs_before_reaching_the_event_driven_walk() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string()
+            .contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -203,7 +204,8 @@ fn simulate_errs_before_reaching_the_event_driven_walk() {
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
     assert!(
-        err.contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string()
+            .contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -452,7 +454,10 @@ fn pure_tte_high_cmt_dose_predict_refuses_the_model_blind_load() {
     );
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// `simulate()` on the same model-blind population. #905 pinned "one row with a NaN
@@ -467,7 +472,10 @@ fn pure_tte_high_cmt_dose_simulate_refuses_the_model_blind_load() {
     assert_eq!(pop.subjects[0].obs_times, vec![5.0]);
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// `fit()` on the model-blind population. #905's contract was "no panic" with a
@@ -811,7 +819,7 @@ fn predict_errs_on_an_ode_dose_past_the_declared_states() {
     let pop = pop_of(&ode_csv(3));
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("subject 1, time 0: dose into compartment 3, but the `[odes]` block declares only 2 state(s)"), "unexpected Err: {err}");
+    assert!(err.to_string().contains("subject 1, time 0: dose into compartment 3, but the `[odes]` block declares only 2 state(s)"), "unexpected Err: {err}");
 }
 
 /// Positive control — the check must not be over-broad. Every declared state is

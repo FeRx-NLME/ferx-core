@@ -693,7 +693,8 @@ pub fn fit(
         model,
         population,
         &options.iov_occasion,
-    ))?;
+    ))
+    .map_err(|e| e.to_string())?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
     // occasion count) is a property of the *data*, not the model — so this cap cannot be
     // checked in `check_model_options`, which never sees the population. Check it here, once
@@ -1321,7 +1322,7 @@ fn fit_inner(
     // is always single-endpoint here, which the EKF residual-variance
     // assumption in stats/likelihood.rs relies on.)
     let option_diags = check_model_options(model, options);
-    first_error(&option_diags)?;
+    first_error(&option_diags).map_err(|e| e.to_string())?;
 
     // A free variance whose initial value packs onto the optimizer's own lower
     // rail (#1229). Evaluated on `init_params`, not `model.default_params`:
@@ -1329,7 +1330,7 @@ fn fit_inner(
     // inits, and it is the vector the optimizer actually starts from that gets
     // clamped. Placed here — before every population-dependent check — because
     // the predicate needs no data and fails identically for every method.
-    first_error(&check_variance_init_rails(init_params, options))?;
+    first_error(&check_variance_init_rails(init_params, options)).map_err(|e| e.to_string())?;
     // #254: refuse a prior that cannot be applied, before any optimizer runs.
     // See `check_parameter_priors` for why an unapplied prior is an error and
     // not a warning.
@@ -1337,7 +1338,8 @@ fn fit_inner(
         model,
         init_params,
         options,
-    ))?;
+    ))
+    .map_err(|e| e.to_string())?;
 
     // An initial estimate that packs strictly outside its own box and is
     // silently clamped there (#1251). Computed **once**, into a local: it
@@ -1349,7 +1351,7 @@ fn fit_inner(
     // Getting that wrong reports every one of these from `ferx check` and drops
     // them silently from `fit()`, the #1033 failure mode.
     let start_box_diags = check_packed_start_in_box(init_params, options);
-    first_error(&start_box_diags)?;
+    first_error(&start_box_diags).map_err(|e| e.to_string())?;
 
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
@@ -1507,7 +1509,8 @@ fn fit_inner(
         // The `?` is defensive, not reachable through `fit()`: both checks `inits_from_nca`
         // can fail on are in `check_model_data_rule`, whose first error `fit()` has already
         // returned before entering this function. No test covers it for that reason.
-        let suggested = crate::suggest_start::inits_from_nca(model, population, method)?;
+        let suggested = crate::suggest_start::inits_from_nca(model, population, method)
+            .map_err(|e| e.to_string())?;
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }
@@ -2315,7 +2318,8 @@ fn fit_inner(
             &result.params,
             options.npde_nsim,
             options.npde_seed,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;

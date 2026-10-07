@@ -474,7 +474,7 @@ fn live_params(m: &CompiledModel) -> crate::types::ModelParameters {
 }
 
 /// PRED per subject, one observation each.
-fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, String> {
+fn preds(m: &CompiledModel, pop: &Population) -> Result<Vec<f64>, crate::EngineError> {
     let p = live_params(m);
     crate::api::predict(m, pop, &p).map(|r| {
         let v: Vec<f64> = r.iter().map(|r| r.pred).collect();
@@ -514,10 +514,13 @@ fn predict_refuses_a_categorical_value_outside_the_levels() {
         "`levels = auto`",
         "drop or recode those rows",
     ] {
-        assert!(e.contains(needle), "missing {needle:?}: {e}");
+        assert!(e.to_string().contains(needle), "missing {needle:?}: {e}");
     }
     for absent in ["the fit's levels", "The fit estimated no θ"] {
-        assert!(!e.contains(absent), "{absent:?} is the from-fit cell: {e}");
+        assert!(
+            !e.to_string().contains(absent),
+            "{absent:?} is the from-fit cell: {e}"
+        );
     }
 }
 
@@ -541,6 +544,8 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
     assert!(from_fit.bound_from_fit());
 
     let e = preds(&from_fit, &design).expect_err("from fit: unlisted level refused");
+    // The from-fit refusal is the one ferx-r#498 maps: it carries the code (#1746).
+    assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
     for needle in [
         "has the fit's levels [1.0, 2.0, 3.0] (reference 2)",
         "`GRP` takes [4.0] in this data",
@@ -548,20 +553,23 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
         "The fit estimated no θ for these values",
         "drop or recode those rows, or refit on data that carries them",
     ] {
-        assert!(e.contains(needle), "from fit, missing {needle:?}: {e}");
+        assert!(
+            e.to_string().contains(needle),
+            "from fit, missing {needle:?}: {e}"
+        );
     }
     for absent in ["levels = auto", "Add the value"] {
         assert!(
-            !e.contains(absent),
+            !e.to_string().contains(absent),
             "from fit, {absent:?} is wrong here: {e}"
         );
     }
 
     let literal = parse_full_model(&grp_literal()).expect("parse").model;
     let e = preds(&literal, &design).expect_err("literal: unlisted level refused");
-    assert!(e.contains("has levels [1.0, 2.0, 3.0]"), "{e}");
-    assert!(e.contains("`levels = auto`"), "{e}");
-    assert!(!e.contains("The fit estimated no θ"), "{e}");
+    assert!(e.to_string().contains("has levels [1.0, 2.0, 3.0]"), "{e}");
+    assert!(e.to_string().contains("`levels = auto`"), "{e}");
+    assert!(!e.to_string().contains("The fit estimated no θ"), "{e}");
 
     // The listed twin of the design predicts from the fit's layout.
     let mut twin = population("GRP", &[1.0, 2.0, 2.0]);
@@ -606,9 +614,14 @@ fn the_from_fit_advice_covers_a_relation_whose_levels_are_written_out() {
     );
 
     let e = preds(&parsed.model, &design).expect_err("from fit: unlisted level refused");
-    assert!(e.contains("The fit estimated no θ for these values"), "{e}");
     assert!(
-        e.contains("adding them to `levels = [...]` first if the levels are written out"),
+        e.to_string()
+            .contains("The fit estimated no θ for these values"),
+        "{e}"
+    );
+    assert!(
+        e.to_string()
+            .contains("adding them to `levels = [...]` first if the levels are written out"),
         "the written-out case needs its repair: {e}"
     );
 
@@ -693,11 +706,21 @@ fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() 
             crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
         ),
     ] {
-        assert!(err.starts_with(&format!("{entry}: ")), "{err}");
+        assert!(err.to_string().starts_with(&format!("{entry}: ")), "{err}");
         assert!(
-            err.contains("`GRP` takes [4.0] in this data"),
+            err.to_string().contains("`GRP` takes [4.0] in this data"),
             "{entry}: {err}"
         );
+        // #1746: the refusal keeps `ferx check`'s diagnostic through the input
+        // resolution, and the entry point is its context, not part of its message.
+        // Mutations: `.to_string()` the level error in `resolve_fit_inputs` → the code
+        // asserts die; bake `"{entry}: "` back into the message → `message()` dies;
+        // drop the context → `context()` and the `starts_with` above die.
+        assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{entry}: {err}");
+        assert_eq!(err.block(), Some("covariate_model"), "{entry}: {err}");
+        assert_eq!(err.context(), Some(entry), "{entry}: {err}");
+        assert!(!err.message().starts_with(entry), "{entry}: {err}");
+        assert_eq!(err.to_string(), format!("{entry}: {}", err.message()));
     }
     crate::run_covariance(&fit, Some(&m), Some(&fit_pop), &opts)
         .expect("the fit's own population is not refused");

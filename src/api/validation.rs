@@ -2738,7 +2738,7 @@ pub(crate) fn check_dose_attr_finiteness(
 /// compiled expression — and a missing covariate divides to `0.0` rather than
 /// `inf` in this engine, so nothing further down would have complained. Fail
 /// here instead, exactly as `check_unbound_theta_levels` does for #1064.
-fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
+pub(crate) fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
     match crate::api::assert_covariate_model_bound(model) {
         Ok(()) => Vec::new(),
         Err(msg) => {
@@ -2880,6 +2880,52 @@ fn twin_decline_clause(model: &CompiledModel) -> String {
         ),
         None => String::new(),
     }
+}
+
+/// The code an absorption closed-form refusal carries: `E_IG_*` for an inverse-Gaussian
+/// model, `E_TRANSIT_*` otherwise.
+fn absorption_family_code(
+    model: &CompiledModel,
+    ig: &'static str,
+    transit: &'static str,
+) -> &'static str {
+    if matches!(model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg) {
+        ig
+    } else {
+        transit
+    }
+}
+
+/// [`check_absorption_closed_form_support`] as the diagnostic `ferx check` reports
+/// (`E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`). The one place that code is assigned:
+/// `ferx check` and every predict / simulate entry point read it from here, so the
+/// entry point's `Err` carries the same code (#1746).
+pub(crate) fn check_absorption_closed_form_support_diags(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    check_absorption_closed_form_support(model, population)
+        .map(|e| {
+            let code = absorption_family_code(model, "E_IG_UNSUPPORTED", "E_TRANSIT_UNSUPPORTED");
+            vec![Diagnostic::error(code, e)]
+        })
+        .unwrap_or_default()
+}
+
+/// [`check_absorption_flip_flop_no_twin`] as the diagnostic `ferx check` reports
+/// (`E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP`); see
+/// [`check_absorption_closed_form_support_diags`].
+pub(crate) fn check_absorption_flip_flop_no_twin_diags(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Vec<Diagnostic> {
+    check_absorption_flip_flop_no_twin(model, population, theta)
+        .map(|e| {
+            let code = absorption_family_code(model, "E_IG_FLIP_FLOP", "E_TRANSIT_FLIP_FLOP");
+            vec![Diagnostic::error(code, e)]
+        })
+        .unwrap_or_default()
 }
 
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
@@ -7016,32 +7062,17 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
                     // IG models — previously only `fit()` reported these (#776 review, IG #790).
                     // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
-                    let is_ig =
-                        matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
-                    if let Some(e) =
-                        check_absorption_closed_form_support(&parsed.model, &population)
-                    {
-                        let code = if is_ig {
-                            "E_IG_UNSUPPORTED"
-                        } else {
-                            "E_TRANSIT_UNSUPPORTED"
-                        };
-                        diags.push(Diagnostic::error(code, e));
-                    }
+                    diags.extend(check_absorption_closed_form_support_diags(
+                        &parsed.model,
+                        &population,
+                    ));
                     // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
                     // same way `fit()` does, so `ferx check` catches it up front.
-                    if let Some(e) = check_absorption_flip_flop_no_twin(
+                    diags.extend(check_absorption_flip_flop_no_twin_diags(
                         &parsed.model,
                         &population,
                         &init_params.theta,
-                    ) {
-                        let code = if is_ig {
-                            "E_IG_FLIP_FLOP"
-                        } else {
-                            "E_TRANSIT_FLIP_FLOP"
-                        };
-                        diags.push(Diagnostic::error(code, e));
-                    }
+                    ));
                 }
             }
             Err(d) => {

@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -64,9 +64,12 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
 /// so a model covariate absent from the data read as `0.0` and the run returned
 /// `Ok` — the frozen-replay verifier passed too, since it replays the same
 /// snapshots (#1571).
-fn check_adaptive_model_data(model: &CompiledModel, population: &Population) -> Result<(), String> {
+fn check_adaptive_model_data(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<(), EngineError> {
     first_error(&check_simulation_data(model, population))?;
-    reject_selected_error_for_adaptive(model)
+    Ok(reject_selected_error_for_adaptive(model)?)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
@@ -242,7 +245,7 @@ pub fn simulate_adaptive<F, C>(
     n_sim: usize,
     make_controller: F,
     opts: &AdaptiveSimulateOptions,
-) -> Result<AdaptiveSimulationResult, String>
+) -> Result<AdaptiveSimulationResult, EngineError>
 where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
@@ -274,7 +277,8 @@ where
         return Err("simulate_adaptive requires a non-empty decision schedule \
              (`AdaptiveSimulateOptions::decision_times`); with no decision times the controller \
              is never consulted and no dose is ever issued"
-            .to_string());
+            .to_string()
+            .into());
     }
 
     // Programmatic path: cmt-based monitors (no compiled `observe` expression) and
@@ -344,7 +348,7 @@ fn run_adaptive_population<F, C>(
     target_window: Option<(f64, f64)>,
     auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
-) -> Result<AdaptiveSimulationResult, String>
+) -> Result<AdaptiveSimulationResult, EngineError>
 where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
@@ -379,9 +383,9 @@ where
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
     first_error(&check_dose_compartments(model, population))?;
-    if let Some(msg) = check_absorption_closed_form_support(model, population) {
-        return Err(msg);
-    }
+    first_error(&check_absorption_closed_form_support_diags(
+        model, population,
+    ))?;
     first_error(&check_absorption_dosing(model, population))?;
 
     // The occasion bookkeeping assumes a strictly-increasing decision schedule:
@@ -462,7 +466,8 @@ where
              the reset would integrate that discontinuity inaccurately. Drop `auc_target` (all \
              other outputs remain per-event / per-occasion / reset aware), or track \
              #700/#701/#716 for a per-event, reset-node-aware AUC."
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -1154,7 +1159,7 @@ pub fn simulate_adaptive_from_spec(
     n_sim: usize,
     spec: &crate::sim::adaptive::AdaptiveDosingSpec,
     opts: &AdaptiveSimulateOptions,
-) -> Result<AdaptiveSimulationResult, String> {
+) -> Result<AdaptiveSimulationResult, EngineError> {
     // The spec is the single source of truth for the decision schedule and the
     // monitored signal; an `opts` that *also* sets them is ambiguous (two
     // schedules, two monitors) — reject it rather than silently pick one.
@@ -1162,14 +1167,16 @@ pub fn simulate_adaptive_from_spec(
         return Err(
             "simulate_adaptive_from_spec takes its decision schedule from the \
              [adaptive_dosing] block's `at`; leave `opts.decision_times` empty"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     if !opts.monitors.is_empty() {
         return Err(
             "simulate_adaptive_from_spec takes its monitor from the [adaptive_dosing] \
              block's `observe`; leave `opts.monitors` empty"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -1210,7 +1217,8 @@ pub fn simulate_adaptive_from_spec(
              not found in data (case-sensitive): {}. Available covariate columns: {}.",
             missing.join(", "),
             available
-        ));
+        )
+        .into());
     }
     let ode = model
         .ode_spec

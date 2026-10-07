@@ -166,7 +166,7 @@ fn simulate_missing_selector_covariate_is_rejected() {
     )
     .expect_err("simulate must reject a missing selector covariate");
     assert!(
-        err.contains("FREE"),
+        err.to_string().contains("FREE"),
         "error should name the missing covariate FREE: {err}"
     );
 }

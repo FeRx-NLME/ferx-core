@@ -1394,7 +1394,11 @@ fn the_documented_from_fit_sequence_binds_statistics_without_a_level_block() {
     let mut params = bare.model.default_params.clone();
     params.theta = theta.to_vec();
     let err = ferx_core::api::simulate_with_seed(&bare.model, &pop, &params, 2, 7).unwrap_err();
-    assert!(err.contains("still need data-derived statistics"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("still need data-derived statistics"),
+        "{err}"
+    );
 
     // The documented sequence.
     let (n, a) = simulate_design_from(&model, &result.data_bindings, &design_path, &theta);

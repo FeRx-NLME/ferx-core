@@ -416,7 +416,7 @@ mod survival_smoke {
         let (model, pop) = tv_cov_hazard_model_and_pop();
         let err = ferx_core::predict(&model, &pop, &model.default_params)
             .expect_err("predict() must refuse this input");
-        assert!(err.contains("#741"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("#741"), "unexpected Err: {err}");
     }
 
     /// `simulate()` errs on the same combination for the same reason (#741).
@@ -425,7 +425,7 @@ mod survival_smoke {
         let (model, pop) = tv_cov_hazard_model_and_pop();
         let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0)
             .expect_err("simulate_with_seed() must refuse this input");
-        assert!(err.contains("#741"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("#741"), "unexpected Err: {err}");
     }
 
     /// `predict_survival()` refuses too — the survival curves read the hazard at the
@@ -437,7 +437,7 @@ mod survival_smoke {
         let err =
             ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0])
                 .expect_err("a time-varying covariate on a hazard must be refused");
-        assert!(err.contains("#741"), "{err}");
+        assert!(err.to_string().contains("#741"), "{err}");
     }
 
     /// A zero-rate hazard (`λ = 0`): every draw hits the degenerate sentinel, so each
@@ -1029,7 +1029,7 @@ mod survival_smoke {
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("RTTE simulation without a horizon must be rejected");
         assert!(
-            err.contains("RTTE") && err.contains("horizon"),
+            err.to_string().contains("RTTE") && err.to_string().contains("horizon"),
             "error should require a horizon, got: {err}"
         );
     }
@@ -1100,7 +1100,7 @@ mod survival_smoke {
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("RTTE simulation with resets must be rejected");
         assert!(
-            err.contains("resets"),
+            err.to_string().contains("resets"),
             "error should flag EVID=3/4 resets, got: {err}"
         );
     }
@@ -1151,7 +1151,7 @@ mod survival_smoke {
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("multi-CMT RTTE simulation must be rejected");
         assert!(
-            err.contains("multiple CMTs"),
+            err.to_string().contains("multiple CMTs"),
             "error should flag multiple RTTE CMTs, got: {err}"
         );
     }
@@ -1200,7 +1200,7 @@ mod survival_smoke {
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("RTTE + competing single-TTE simulation must be rejected");
         assert!(
-            err.contains("competing single-event TTE"),
+            err.to_string().contains("competing single-event TTE"),
             "error should flag the competing single-event TTE sibling, got: {err}"
         );
     }
@@ -2021,7 +2021,7 @@ mod survival_smoke {
             };
             let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
                 .expect_err("non-finite / non-positive horizon must error");
-            assert!(err.contains("horizon"), "got: {err}");
+            assert!(err.to_string().contains("horizon"), "got: {err}");
         }
         // A valid horizon still succeeds.
         let ok = SimulateOptions {
@@ -2064,7 +2064,7 @@ mod survival_smoke {
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &below)
             .expect_err("horizon below entry_time must error");
-        assert!(err.contains("entry_time"), "got: {err}");
+        assert!(err.to_string().contains("entry_time"), "got: {err}");
         // A horizon at/above entry is fine.
         let above = SimulateOptions {
             seed: Some(1),
@@ -2297,7 +2297,7 @@ mod survival_smoke {
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("ODE-accumulated TTE simulation with resets must error");
         assert!(
-            err.contains("reset"),
+            err.to_string().contains("reset"),
             "error must name the unsupported resets: {err}"
         );
     }
@@ -3792,7 +3792,7 @@ mod survival_smoke {
         )
         .expect_err("ODE-accumulated TTE simulation without a horizon must error");
         assert!(
-            err.contains("horizon"),
+            err.to_string().contains("horizon"),
             "error must name the required horizon; got: {err}"
         );
         // With a horizon → Ok, producing TTE event/censor outcomes.
@@ -3819,6 +3819,6 @@ mod survival_smoke {
         let pop = joint_pktte_pop();
         let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7)
             .expect_err("simulate_with_seed() must refuse this input");
-        assert!(err.contains("horizon"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("horizon"), "unexpected Err: {err}");
     }
 }

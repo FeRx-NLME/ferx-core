@@ -314,17 +314,18 @@ fn readout_tad_is_a_data_column_refused_when_absent_and_read_when_present() {
 
     // Absent: both entry points refuse, naming the column and the `[odes]` scope.
     let predict_err = crate::api::predict(&model, &without, params)
-        .expect_err("predict(): TAD absent from the data must be an Err, not a silent 0.0");
+        .expect_err("predict(): TAD absent from the data must be an Err, not a silent 0.0")
+        .to_string();
     let fit_err = crate::api::fit(&model, &without, params, &eval_only)
         .err()
         .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0");
     for (entry, err) in [("predict", &predict_err), ("fit", &fit_err)] {
         assert!(
-            err.contains("TAD") && err.contains("not found in data"),
+            err.to_string().contains("TAD") && err.to_string().contains("not found in data"),
             "{entry}(): must name the missing column, got: {err}"
         );
         assert!(
-            err.contains("solver-injected built-in"),
+            err.to_string().contains("solver-injected built-in"),
             "{entry}(): must explain TAD's `[odes]` scope, got: {err}"
         );
     }

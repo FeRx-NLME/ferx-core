@@ -424,7 +424,7 @@ mod ctmm_smoke {
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
         let err = simulate(&model, &pop, &model.default_params, 1)
             .expect_err("simulate() must refuse this input");
-        assert!(err.contains("CTMM"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("CTMM"), "unexpected Err: {err}");
     }
 
     /// A live CTMM fit must still write an sdtab. CTMM observations are
@@ -466,7 +466,7 @@ mod ctmm_smoke {
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
         let err = predict(&model, &pop, &model.default_params)
             .expect_err("predict() must refuse this input");
-        assert!(err.contains("CTMM"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("CTMM"), "unexpected Err: {err}");
     }
 
     /// #898: on the `_diag` / `_with_options` entry points the same two CTMM refusals are an
@@ -488,10 +488,11 @@ mod ctmm_smoke {
             Ok(out) => panic!("predict_diag accepted CTMM: {} rows", out.results.len()),
         };
         assert!(
-            err.contains("predict() does not support a [markov_model] (CTMM)"),
+            err.to_string()
+                .contains("predict() does not support a [markov_model] (CTMM)"),
             "{err}"
         );
-        assert!(err.contains("#820"), "{err}");
+        assert!(err.to_string().contains("#820"), "{err}");
 
         let opts = SimulateOptions {
             seed: Some(1),
@@ -500,11 +501,16 @@ mod ctmm_smoke {
         let err = simulate_with_options(&model, &pop, params, 1, &opts)
             .expect_err("simulate_with_options must refuse CTMM");
         assert!(
-            err.contains("does not support a [markov_model] (CTMM)"),
+            err.to_string()
+                .contains("does not support a [markov_model] (CTMM)"),
             "{err}"
         );
-        assert!(err.contains("no simulation path"), "{err}");
-        assert!(err.contains("CTMM simulation is a later slice."), "{err}");
+        assert!(err.to_string().contains("no simulation path"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("CTMM simulation is a later slice."),
+            "{err}"
+        );
     }
 
     /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts

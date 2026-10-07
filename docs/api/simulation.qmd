@@ -14,7 +14,7 @@ pub fn simulate(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 **Parameters:**
@@ -25,7 +25,9 @@ pub fn simulate(
 
 **Returns:** `Ok` with a vector of `SimulationResult`, one per observation per subject per
 replicate, or `Err` when the model and data fail a precondition — the same message `fit()`
-gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)).
+gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)). The
+`Err` is an `EngineError`, which also carries `ferx check`'s code for the refusal when there
+is one (see [Matching on the code](../warnings.qmd#entry-point-error-codes)).
 
 **Example:**
 ```rust
@@ -108,7 +110,7 @@ pub fn simulate_with_seed(
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 ## `simulate_with_options()` — propensity-score matching
@@ -123,7 +125,7 @@ pub fn simulate_with_options(
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 
 pub struct SimulateOptions {
     pub seed: Option<u64>,                  // None draws from entropy
@@ -225,7 +227,7 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<PredictionResult>, String>
+) -> Result<Vec<PredictionResult>, EngineError>
 ```
 
 **Returns:** `Ok` with a vector of `PredictionResult` holding population-level predictions,
@@ -253,7 +255,7 @@ pub fn simulate_with_uncertainty(
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 ```rust

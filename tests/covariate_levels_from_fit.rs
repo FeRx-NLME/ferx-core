@@ -77,7 +77,7 @@ fn predict_after_bind_from_fit_refuses_a_level_the_fit_never_saw() {
     )
     .expect("fit at the initial estimates");
 
-    let predict_on = |last: u32| -> Result<Vec<f64>, String> {
+    let predict_on = |last: u32| -> Result<Vec<f64>, ferx_core::EngineError> {
         let design_path = write(&dir, &format!("design{last}.csv"), &data(last));
         let mut design = ferx_core::read_nonmem_csv(&design_path, None, None).expect("read design");
         let mut parsed = parse_full_model(MODEL).expect("parse");
@@ -95,7 +95,11 @@ fn predict_after_bind_from_fit_refuses_a_level_the_fit_never_saw() {
     assert!(twin.iter().all(|p| p.is_finite()), "{twin:?}");
 
     // Recoded to 4, a level the fit has no θ for: refused, with the from-fit advice.
-    let e = predict_on(4).expect_err("an unseen level must be refused");
+    let err = predict_on(4).expect_err("an unseen level must be refused");
+    // The refusal carries `ferx check`'s code, so a caller (ferx-r#498) can match on it
+    // rather than on this text (#1746).
+    assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{err}");
+    let e = err.to_string();
     assert!(
         e.contains("has the fit's levels [1.0, 2.0, 3.0] (reference 2)"),
         "{e}"
