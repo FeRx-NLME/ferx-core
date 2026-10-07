@@ -327,7 +327,13 @@ let result = fit(&parsed.model, &population, &parsed.model.default_params, &pars
 Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths and `predict` report
-the same problem as `E_THETA_LEVELS_UNBOUND`. To simulate with the model's own initial
+the same problem as `E_THETA_LEVELS_UNBOUND`. The other half, a *bound* model
+handed a population that was never bound, is `E_THETA_LEVELS_DATA_UNBOUND` on
+`predict`, the simulate paths, `compute_npde_npd` and `fit`. To run a θ already
+laid out (a fit's, or the model's own), bind that population with
+`bind_from_fit` and the bindings the θ was laid out on. To fit it, bind a fresh
+parse with `bind_theta_levels`
+([#1647](https://github.com/FeRx-NLME/ferx-core/issues/1647)). To simulate with the model's own initial
 estimates, bind a design the same way, on the population from
 `read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
 the fit instead, as described in
@@ -459,7 +465,10 @@ index columns from the population, and only `bind_from_fit` writes them.
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
 from zeros past its end, and a long one dropped its tail
-([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)).
+([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)). `predict`,
+`predict_diag`, `predict_survival`, `predict_categorical` and
+`stats::npde::compute_npde_npd` refuse it the same way; before, a short θ
+predicted 0 ([#1615](https://github.com/FeRx-NLME/ferx-core/issues/1615)).
 
 ### Level labels and values: `theta_level_map`, `theta_level_values` {#level-labels-values}
 

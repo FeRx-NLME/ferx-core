@@ -77,19 +77,17 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// subject's map carries counts as present. Without this, `predict()` gaining the
 /// check (#1028) would have started panicking on those callers even though nothing
 /// about their predictions was undefined.
+///
+/// A bound level block's synthesized index column is never named here: when the
+/// population lacks it, [`check_level_index_columns`] reports that the population was
+/// never bound, and every caller runs it first (#1647).
 pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
-    let carried = |name: &str| -> bool {
-        population.covariate_names.iter().any(|n| n == name)
-            || (!population.subjects.is_empty()
-                && population
-                    .subjects
-                    .iter()
-                    .all(|s| s.covariates.contains_key(name)))
-    };
+    let level_columns = bound_level_columns(model);
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
-        .filter(|name| !carried(name))
+        .filter(|name| !population_carries(population, name))
+        .filter(|name| !level_columns.iter().any(|(_, c)| c == *name))
         .map(|s| s.as_str())
         .collect();
 
@@ -166,6 +164,98 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         .with_suggestion(format!("available covariate columns: {}", available)),
     );
     diags
+}
+
+/// Whether `population` carries the covariate `name` in the sense
+/// [`check_covariates`] documents: listed in `covariate_names`, or in every
+/// subject's own map.
+fn population_carries(population: &Population, name: &str) -> bool {
+    population.covariate_names.iter().any(|n| n == name)
+        || (!population.subjects.is_empty()
+            && population
+                .subjects
+                .iter()
+                .all(|s| s.covariates.contains_key(name)))
+}
+
+/// `(block, synthesized index column)` of every **bound** level block whose column the
+/// model reads. An unbound block's column is not here: an unbound block is
+/// [`check_unbound_theta_levels`]'s to report, before any population is looked at.
+fn bound_level_columns(model: &CompiledModel) -> Vec<(&str, String)> {
+    let blocks = model.theta_blocks();
+    blocks
+        .level_blocks()
+        .iter()
+        .map(|d| d.name())
+        .filter(|name| !blocks.unbound_level_blocks().iter().any(|u| u == name))
+        .map(|name| (name, crate::parser::model_parser::level_index_column(name)))
+        .filter(|(_, column)| model.referenced_covariates.iter().any(|c| c == column))
+        .collect()
+}
+
+/// Which entry point met a population never bound for a bound level block — it
+/// picks the binder [`check_level_index_columns`] names (#1647).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LevelDataEntry {
+    /// `predict_diag`, `compute_npde_npd` and the `simulate*` / adaptive entry points:
+    /// they run a θ that is already laid out, so the population must be indexed with the
+    /// levels that θ was laid out for. (`predict_survival` / `predict_categorical` run no
+    /// covariate check at all, and do not run this one either.)
+    Run,
+    /// `fit()` (and `ferx check`, which binds before it gets here): it estimates θ, so
+    /// the model is laid out afresh on the population's own levels.
+    Fit,
+}
+
+/// A **bound** `theta NAME[...]` block handed a population that was never bound for
+/// it (#1647): the population carries no synthesized index column, so every record
+/// would gather `NaN`. The usual way here is "fit, then predict or simulate new data".
+///
+/// The model is bound, so [`check_unbound_theta_levels`] passes; without this the
+/// covariate check named the engine-internal column as "not found in data", a column
+/// the user never wrote and cannot add. That column is never named here either. The
+/// binder named depends on `entry`, since only a fit lays θ out afresh:
+///
+/// | Entry | Binder named |
+/// |---|---|
+/// | `Run` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
+/// | `Fit` | `bind_theta_levels` on a fresh parse |
+///
+/// A population bound for *another* binding of the same block carries the column and
+/// passes; a θ of the wrong length for it is `E_THETA_LENGTH`'s.
+pub(crate) fn check_level_index_columns(
+    model: &CompiledModel,
+    population: &Population,
+    entry: LevelDataEntry,
+) -> Vec<Diagnostic> {
+    bound_level_columns(model)
+        .into_iter()
+        .filter(|(_, column)| !population_carries(population, column))
+        .map(|(name, _)| {
+            let binder = match entry {
+                LevelDataEntry::Run => {
+                    "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
+                     population, &fit.data_bindings)`, passing the bindings the θ you run was \
+                     laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
+                     of `parsed.model.data_bindings()` taken before the call. Then run the model \
+                     it re-parses into `parsed`."
+                }
+                LevelDataEntry::Fit => {
+                    "To fit this population, parse the model text again and bind it with \
+                     `bind_theta_levels(&mut parsed, &model_text, &mut population)`, which lays \
+                     θ out for the levels it holds."
+                }
+            };
+            Diagnostic::error(
+                "E_THETA_LEVELS_DATA_UNBOUND",
+                format!(
+                    "`theta {name}[...]` is bound, but this population was never bound for \
+                     it, so its records carry no index into the block's levels. {binder}"
+                ),
+            )
+            .with_block("parameters")
+        })
+        .collect()
 }
 
 /// Map an error string from [`read_population_for`] onto a `ferx check`
@@ -1378,6 +1468,11 @@ pub(crate) fn check_simulation_data(
     let mut diags = check_unbound_theta_levels(model, UnboundLevelsEntry::Simulate);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
+    diags.extend(check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ));
     diags.extend(check_covariates(model, population));
     // Unrouted half only: a design template has no event rows by construction. An
     // unrouted template would otherwise simulate *no* events (the TTE draw is keyed
@@ -1413,6 +1508,11 @@ pub fn check_model_data_rule(
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
+    diags.extend(check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Fit,
+    ));
     diags.extend(check_covariates(model, population));
     // Before the per-CMT checks: an unrouted endpoint CMT would otherwise surface as
     // `E_PER_CMT_ERROR_MODEL` ("CMT 3 has no error model") and name the wrong cause.

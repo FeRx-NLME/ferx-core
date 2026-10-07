@@ -1451,10 +1451,11 @@ mod from_fit {
     /// fit's own predictions for those subjects, bit for bit.
     ///
     /// The first wording named `bind_theta_levels` on the predict population. That
-    /// re-discovers the levels (5 θ here, against the fit's 7), and `predict_diag` has no
-    /// θ-length guard (#1615), so the fit's θ came back `Ok` read at the wrong positions —
-    /// measured on this fixture at `74078e0c`: subject 3 at t = 1 predicted 2.455468 against
-    /// the fit's 7.557837, subject 2 at t = 2 0.182376 against 6.250023.
+    /// re-discovers the levels (5 θ here, against the fit's 7), and `predict_diag` had no
+    /// θ-length guard then (#1615), so the fit's θ came back `Ok` read at the wrong positions
+    /// — measured on this fixture at `74078e0c`: subject 3 at t = 1 predicted 2.455468
+    /// against the fit's 7.557837, subject 2 at t = 2 0.182376 against 6.250023. Since
+    /// #1615 that mismatched count is `E_THETA_LENGTH`; a same-count mismatch is not.
     #[test]
     fn following_the_unbound_predict_refusal_gives_the_fits_predictions() {
         let text = no_eta_model();
@@ -1503,6 +1504,399 @@ mod from_fit {
         // for the levels it discovers, which is not the fit's layout.
         let mut own = new_data.clone();
         assert_eq!(bind(&text, &mut own).unwrap().n_theta, 5);
+    }
+
+    // ── #1647: a bound model on a population that was never bound ──────────────
+
+    const NEVER_BOUND: &str = "`theta PLACEBO[...]` is bound, but this population was never \
+        bound for it, so its records carry no index into the block's levels. ";
+    const RUN_BINDER: &str = "Bind the population with `bind_from_fit(&mut parsed, \
+        &model_text, &mut population, &fit.data_bindings)`";
+    const RUN_WHICH_BINDINGS: &str = ", passing the bindings the θ you run was laid out on: \
+        the fit's `data_bindings`, or, for the model's own θ, a clone of \
+        `parsed.model.data_bindings()` taken before the call.";
+    const RUN_WHICH_MODEL: &str = " Then run the model it re-parses into `parsed`.";
+    const FIT_BINDER: &str = "To fit this population, parse the model text again and bind it \
+        with `bind_theta_levels(&mut parsed, &model_text, &mut population)`, which lays θ out \
+        for the levels it holds.";
+
+    /// The refusal a θ-running entry point gives, one assertion per sentence (and clause).
+    fn assert_run_refusal(err: &str, entry: &str) {
+        assert!(err.starts_with(NEVER_BOUND), "{entry}: the cause: {err}");
+        assert!(err.contains(RUN_BINDER), "{entry}: the binder: {err}");
+        assert!(
+            err.contains(RUN_WHICH_BINDINGS),
+            "{entry}: which bindings to pass: {err}"
+        );
+        assert!(
+            err.ends_with(RUN_WHICH_MODEL),
+            "{entry}: which model to run: {err}"
+        );
+        // The other cell's binder: a θ already laid out must not be re-laid out.
+        assert!(!err.contains(FIT_BINDER), "{entry}: {err}");
+        assert!(!err.contains("`bind_theta_levels("), "{entry}: {err}");
+        assert_no_engine_column(err, entry);
+    }
+
+    fn assert_no_engine_column(err: &str, entry: &str) {
+        for absent in [
+            "__level_",
+            "not found in data",
+            "Available covariate columns",
+        ] {
+            assert!(!err.contains(absent), "{entry}: `{absent}` in: {err}");
+        }
+    }
+
+    /// #1647. Fit, then predict / simulate / npde / fit on new data that was never bound:
+    /// the model's block is bound, so `E_THETA_LEVELS_UNBOUND` passes, and before this the
+    /// covariate check refused with "covariate(s) not found in data: __level_PLACEBO" — a
+    /// column the user never wrote. Measured at `712cd47b` with the check removed: that text
+    /// on `predict_diag`, `simulate_with_options_diag` and `fit`, and `compute_npde_npd`
+    /// returning `Ok` with every npd `NaN`.
+    ///
+    /// The cells (model × population × entry), and the sentence each gets:
+    ///
+    /// | Model | Population | Entry | Gets |
+    /// |---|---|---|---|
+    /// | unbound | any | predict / simulate | `E_THETA_LEVELS_UNBOUND` (#1644, pinned above) |
+    /// | unbound | any | `fit` | `fit()`'s own refusal (pinned above) |
+    /// | bound (`bind_theta_levels`) | never bound | predict, simulate, npde | `NEVER_BOUND` + `RUN_*` |
+    /// | bound from a fit (`bind_from_fit`) | never bound | the same | the same — here, second arm |
+    /// | bound | never bound | `fit`, `ferx check` | `NEVER_BOUND` + `FIT_BINDER` |
+    /// | bound | bound by the same binding | any | runs — here, the control |
+    /// | bound on A | bound on B, θ count differs | predict, simulate | `E_THETA_LENGTH` (#1615) |
+    /// | bound on A | bound on B, same θ count | any | **runs, silently on A's levels** — measured, follow-up |
+    ///
+    /// Both sides of the entry gate in one test (`Run` vs `Fit`) and both sides of the
+    /// population gate (never bound vs bound).
+    ///
+    /// Mutations — delete `check_level_index_columns` from `predict_diag`,
+    /// `check_simulation_data`, `check_model_data_rule` or `compute_npde_npd` and that arm
+    /// goes `Ok` (the covariate check no longer names the column), naming itself; swap the
+    /// two binder sentences and both sides die; delete any one sentence or clause and its
+    /// own assertion dies; drop the level-column exclusion from `check_covariates` and the
+    /// `check_model_data` arm dies on `E_MISSING_COVARIATE`.
+    #[test]
+    fn a_bound_model_on_a_population_never_bound_names_the_binder_for_its_entry() {
+        let text = no_eta_model();
+        let mut fit_pop = population(3, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+        let params = fit.model.default_params.clone();
+        let never = population(3, 2);
+
+        // The control: the population it was bound on runs.
+        crate::api::predict_diag(&fit.model, &fit_pop, &params).expect("bound population");
+
+        let err = crate::api::predict_diag(&fit.model, &never, &params)
+            .err()
+            .expect("predict_diag");
+        assert_run_refusal(&err, "predict_diag");
+        let err = crate::api::predict(&fit.model, &never, &params)
+            .err()
+            .expect("predict");
+        assert_run_refusal(&err, "predict");
+        let err = crate::api::simulate_with_options_diag(
+            &fit.model,
+            &never,
+            &params,
+            1,
+            &Default::default(),
+        )
+        .err()
+        .expect("simulate_with_options_diag");
+        assert_run_refusal(&err, "simulate_with_options_diag");
+        let err = crate::stats::npde::compute_npde_npd(&fit.model, &never, &params, 20, Some(1))
+            .err()
+            .expect("compute_npde_npd");
+        assert_run_refusal(&err, "compute_npde_npd");
+
+        let err = crate::api::fit(&fit.model, &never, &params, &FitOptions::default())
+            .err()
+            .expect("fit");
+        assert!(err.starts_with(NEVER_BOUND), "fit: the cause: {err}");
+        assert!(err.ends_with(FIT_BINDER), "fit: the binder: {err}");
+        assert!(!err.contains("bind_from_fit"), "fit: {err}");
+        assert_no_engine_column(&err, "fit");
+
+        // The diagnostic itself, as `ferx check` and #1746's typed errors carry it.
+        let diags = crate::api::check_model_data(&fit.model, &never);
+        let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E_THETA_LEVELS_DATA_UNBOUND"), "{codes:?}");
+        assert!(!codes.contains(&"E_MISSING_COVARIATE"), "{codes:?}");
+        let sim = crate::api::validation::check_simulation_data(&fit.model, &never);
+        let d = sim
+            .iter()
+            .find(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
+            .expect("simulate's bundle");
+        assert_eq!(d.block.as_deref(), Some("parameters"));
+        assert!(!sim.iter().any(|d| d.code == "E_MISSING_COVARIATE"));
+
+        // A model laid out on the fit's bindings (`bound_from_fit`) gets the same refusal:
+        // `bind_from_fit` is still the binder, and the one `bind_theta_levels` would refuse.
+        let mut design = population(2, 2);
+        let mut from_fit = parse_full_model(&text).unwrap();
+        crate::api::bind_from_fit(&mut from_fit, &text, &mut design, fit.model.data_bindings())
+            .expect("bind the design");
+        let p = fit_theta_params(&from_fit.model, &params.theta);
+        let err = crate::api::predict_diag(&from_fit.model, &never, &p)
+            .err()
+            .expect("predict_diag, from-fit model");
+        assert_run_refusal(&err, "predict_diag, from-fit model");
+    }
+
+    /// #1647: each refusal's advice is *true*. Following the `Run` sentence gives the fit's
+    /// own predictions on the new data, bit for bit, both ways it offers: with the fit's
+    /// bindings, and — literally as written, on the running model's own `parsed` — with a
+    /// clone of `parsed.model.data_bindings()` taken before the call. Following the `Fit`
+    /// sentence leaves no fatal model/data finding for `fit()`.
+    ///
+    /// Review r1 row 1: the first wording passed `parsed.model.data_bindings()` straight into
+    /// a call taking `&mut parsed`, which does not compile (E0502, measured); this test then
+    /// followed it with a different object, so the sentence as written was never exercised.
+    ///
+    /// Mutation — name `bind_theta_levels` in the `Run` sentence instead: that binder lays
+    /// θ out for the new data's 5 levels, so the fit's 7-value θ is refused (`n_theta`
+    /// assertion below shows why); and a sentence naming `layout_from_fit` (which writes no
+    /// column) would leave the population refused again.
+    #[test]
+    fn following_the_never_bound_population_refusals_works() {
+        let text = no_eta_model();
+        let mut fit_pop = population(3, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+        let mut theta = fit.model.default_params.theta.clone();
+        for (i, t) in theta.iter_mut().enumerate().skip(1).take(5) {
+            *t = 0.3 * i as f64 - 0.7;
+        }
+        let rows = |model: &CompiledModel, pop: &Population| -> Vec<(String, u64, u64)> {
+            crate::api::predict_diag(model, pop, &fit_theta_params(model, &theta))
+                .expect("predict")
+                .results
+                .into_iter()
+                .filter(|r| r.id != "1")
+                .map(|r| (r.id, r.time.to_bits(), r.pred.to_bits()))
+                .collect()
+        };
+        let want = rows(&fit.model, &fit_pop);
+        assert_eq!(want.len(), 4);
+
+        let mut new_data = population(3, 2);
+        new_data.subjects.remove(0);
+        crate::api::predict_diag(&fit.model, &new_data, &fit_theta_params(&fit.model, &theta))
+            .err()
+            .expect("the refusal under test");
+        // "the fit's `data_bindings`": a fresh parse bound on the fit's.
+        let mut followed = new_data.clone();
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_from_fit(&mut parsed, &text, &mut followed, fit.model.data_bindings())
+            .expect("bind");
+        assert_eq!(rows(&parsed.model, &followed), want);
+
+        // "for the model's own θ, a clone of `parsed.model.data_bindings()` taken before the
+        // call": the running model's own `parsed`, re-bound in place.
+        let mut followed = new_data.clone();
+        let mut parsed = fit;
+        let own = parsed.model.data_bindings().clone();
+        crate::api::bind_from_fit(&mut parsed, &text, &mut followed, &own).expect("bind");
+        assert_eq!(rows(&parsed.model, &followed), want);
+
+        let mut refit = new_data.clone();
+        let mut parsed = parse_full_model(&text).unwrap();
+        crate::api::bind_theta_levels(&mut parsed, &text, &mut refit).expect("bind");
+        assert_eq!(
+            parsed.model.n_theta, 5,
+            "laid out for the new data's own levels"
+        );
+        let fatal: Vec<_> = crate::api::check_model_data(&parsed.model, &refit)
+            .into_iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .collect();
+        assert!(fatal.is_empty(), "{fatal:?}");
+    }
+
+    /// Review r1 row 2: an **unbound** model is never told its block "is bound". The gate's
+    /// own filter keeps unbound blocks out; `check_model_data` and `compute_npde_npd` run no
+    /// unbound-block check ahead of it, so without the filter they would say exactly that.
+    /// Both sides of the filter in one test: the unbound model reports nothing, the same
+    /// block bound (on a population never bound) reports it.
+    ///
+    /// Mutation — drop the `unbound_level_blocks` filter in `bound_level_columns`: this test
+    /// dies, on its first (direct-call) arm; the `check_model_data` and npde arms state the
+    /// same through the entry points the review named. The mutation survived 257 lib tests
+    /// before this test existed (review r1).
+    #[test]
+    fn an_unbound_model_is_never_told_its_block_is_bound() {
+        use crate::api::{check_level_index_columns, LevelDataEntry};
+        let text = no_eta_model();
+        let unbound = parse_full_model(&text).unwrap().model;
+        assert!(!unbound.theta_blocks().unbound_level_blocks().is_empty());
+        let pop = population(2, 2);
+        for entry in [LevelDataEntry::Run, LevelDataEntry::Fit] {
+            assert!(
+                check_level_index_columns(&unbound, &pop, entry).is_empty(),
+                "{entry:?}"
+            );
+        }
+        let codes: Vec<String> = crate::api::check_model_data(&unbound, &pop)
+            .into_iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(
+            !codes.iter().any(|c| c == "E_THETA_LEVELS_DATA_UNBOUND"),
+            "{codes:?}"
+        );
+        // npde has no unbound-model refusal of its own (#1763); whatever it returns, it must
+        // not be this one.
+        if let Err(e) = crate::stats::npde::compute_npde_npd(
+            &unbound,
+            &pop,
+            &unbound.default_params,
+            20,
+            Some(1),
+        ) {
+            assert!(!e.contains("is bound, but"), "{e}");
+        }
+
+        // The other side: bound, on a population never bound, it is reported.
+        let bound = bind_fit(&text, &mut population(2, 2)).model;
+        for entry in [LevelDataEntry::Run, LevelDataEntry::Fit] {
+            assert_eq!(
+                check_level_index_columns(&bound, &pop, entry).len(),
+                1,
+                "{entry:?}"
+            );
+        }
+    }
+
+    // ── #1633: "nothing is written to `population` unless every block binds" ──────
+
+    /// Two level blocks: `EFFT` (keyed on `TIME`) first, `EFFS` (keyed on `STUDY`) second,
+    /// so a design with a new study binds the first and is refused on the second.
+    fn two_block_model() -> String {
+        no_eta_model()
+            .replace(
+                "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                "theta EFFT[TIME](0.0, -10.0, 10.0)\n  theta EFFS[STUDY](0.0, -10.0, 10.0)",
+            )
+            .replace("CL = TVCL + PLACEBO", "CL = TVCL + EFFT + EFFS")
+    }
+
+    /// Everything a binder may write to a population, in a fixed order with values as bits:
+    /// the column lists and every subject's five covariate channels, keys sorted.
+    fn population_snapshot(pop: &Population) -> Vec<String> {
+        let map = |m: &HashMap<String, f64>| {
+            let mut kv: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k}={:x}", v.to_bits()))
+                .collect();
+            kv.sort();
+            kv.join(",")
+        };
+        let mut out = vec![
+            format!("names {:?}", pop.covariate_names),
+            format!("inputs {:?}", pop.input_columns),
+        ];
+        for s in &pop.subjects {
+            out.push(format!("{} subject {}", s.id, map(&s.covariates)));
+            for (kind, maps) in [
+                ("obs", &s.obs_covariates),
+                ("dose", &s.dose_covariates),
+                ("pk_only", &s.pk_only_covariates),
+                ("reset", &s.reset_covariates),
+            ] {
+                out.push(format!("{} {kind} n={}", s.id, maps.len()));
+                for (j, m) in maps.iter().enumerate() {
+                    out.push(format!("{} {kind}[{j}] {}", s.id, map(m)));
+                }
+            }
+        }
+        out
+    }
+
+    /// #1633. `bind_from_fit` and the deprecated `bind_theta_levels_from_fit` promise
+    /// "nothing is written to `population` unless every block binds". On a two-block model
+    /// whose first block binds and whose second is refused for an unseen level, the design
+    /// population — and `parsed.model`'s θ layout — must be exactly as passed in.
+    ///
+    /// The two-block geometry is the point: a single block cannot tell "nothing written"
+    /// from "written block by block, refused before the first write". The `Ok` control on
+    /// the same fixture shows both columns *are* written when every block binds, so a
+    /// snapshot that cannot see a write (say, of the wrong population) fails there.
+    ///
+    /// Mutations (each kills its binder's arm, which names itself):
+    /// 1. on the unseen-level refusal, write a `__level_EFFT` value into the population
+    ///    before returning `Err`;
+    /// 2. bind block by block — build one block's table and write its column inside the
+    ///    loop — so `EFFT`'s column is on the population when `EFFS` is refused.
+    #[test]
+    #[allow(deprecated)]
+    fn a_refusal_on_the_second_block_writes_nothing_to_the_population() {
+        let text = two_block_model();
+        let mut fit_pop = population(2, 2);
+        let fit = bind_fit(&text, &mut fit_pop);
+        assert_eq!(
+            fit.model.theta_blocks().level_blocks().len(),
+            2,
+            "two level blocks"
+        );
+        let blocks: Vec<&str> = fit
+            .model
+            .theta_blocks()
+            .level_blocks()
+            .iter()
+            .map(|d| d.name())
+            .collect();
+        assert_eq!(blocks, ["EFFT", "EFFS"], "block 1 binds, block 2 refuses");
+
+        type Binder =
+            fn(&mut ParsedModel, &str, &mut Population, &ParsedModel) -> Result<(), String>;
+        let binders: [(&str, Binder); 2] = [
+            ("bind_from_fit", |p, t, pop, fit| {
+                crate::api::bind_from_fit(p, t, pop, fit.model.data_bindings())
+            }),
+            ("bind_theta_levels_from_fit", |p, t, pop, fit| {
+                bind_theta_levels_from_fit(p, t, pop, &fit.bindings.levels)
+            }),
+        ];
+        for (name, binder) in binders {
+            // Refused: study 3 was never fitted; both TIME levels were.
+            let mut design = population(3, 2);
+            let before = population_snapshot(&design);
+            let mut parsed = parse_full_model(&text).unwrap();
+            let n_theta_before = parsed.model.n_theta;
+            let err = binder(&mut parsed, &text, &mut design, &fit).unwrap_err();
+            assert!(
+                err.contains("theta EFFS[STUDY]") && err.contains("`STUDY=3`"),
+                "{name}: refused on the second block: {err}"
+            );
+            let after = population_snapshot(&design);
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "{name}: population shape changed"
+            );
+            for (b, a) in before.iter().zip(&after) {
+                assert_eq!(b, a, "{name}: the refusal wrote to the population");
+            }
+            assert_eq!(
+                parsed.model.n_theta, n_theta_before,
+                "{name}: parsed.model moved"
+            );
+
+            // The control: a design whose every level was fitted binds, and both columns land.
+            let mut ok = population(2, 2);
+            let before = population_snapshot(&ok);
+            let mut parsed = parse_full_model(&text).unwrap();
+            binder(&mut parsed, &text, &mut ok, &fit).expect("every block binds");
+            assert_ne!(before, population_snapshot(&ok), "{name}: nothing written");
+            for col in ["__level_EFFT", "__level_EFFS"] {
+                assert!(
+                    ok.subjects.iter().all(|s| s.covariates.contains_key(col)),
+                    "{name}: {col} not written"
+                );
+            }
+            assert_eq!(parsed.model.n_theta, fit.model.n_theta, "{name}");
+        }
     }
 }
 

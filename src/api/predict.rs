@@ -123,6 +123,8 @@ pub struct PredictionOutput {
 /// `markov`) a CTMM-only model, which has no predictor yet. An unbound `theta NAME[...]` level
 /// block is the one exception to `fit()`'s text: it reports `E_THETA_LEVELS_UNBOUND`'s message,
 /// as the simulate paths do, followed by that diagnostic's suggestion for `predict` (#1644).
+/// A θ whose length is not the model's is refused as the simulate paths refuse it,
+/// with `E_THETA_LENGTH`'s message (#1615).
 /// An input failing several at once reports the first in *this* function's order, which is
 /// not `fit()`'s.
 /// [`predict`] returns that same text. Adding another check is explicitly *not* how a
@@ -150,6 +152,18 @@ pub fn predict_diag(
             .unwrap_or_default();
         return Err(format!("{} {capitalized}.", d.message));
     }
+    // θ against the model's layout (#1615): a short θ reads `0.0` past its end and
+    // predicted 0, a long one dropped its tail. After the unbound-block arm, whose θ
+    // count is not yet the bound model's, so that refusal names the real cause.
+    super::check_theta_length(model, &params.theta)?;
+    // A bound block on a population never bound for it has no index column to gather
+    // on: name the binder before the covariate check, which leaves that column out
+    // (#1647).
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
     // Every identifier the parser could not bind resolves as a covariate, and a
     // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
@@ -305,7 +319,8 @@ pub struct PredictionResult {
 /// A time-varying covariate on the linear predictor, a population loaded without endpoint
 /// routing, or a categorical covariate value outside its `[covariate_model]` relation's
 /// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// These are the only three it checks.
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). These are
+/// the only four it checks.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
@@ -317,6 +332,8 @@ pub fn predict_categorical(
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // θ against the model's layout, as `predict()` checks it (#1615).
+    super::check_theta_length(model, &params.theta)?;
     // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
     // `obs_records`, so a population read model-blind — its binary rows in the
     // Gaussian grid — would come back empty, indistinguishable from a model with no
@@ -416,7 +433,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// A time-varying covariate on a hazard, a dose into a compartment the model cannot
 /// deliver into, or a categorical covariate value outside its `[covariate_model]` relation's
 /// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// These are the only three it checks.
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). These are
+/// the only four it checks.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,
@@ -438,6 +456,8 @@ pub fn predict_survival(
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so refuse instead (#741).
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // θ against the model's layout, as `predict()` checks it (#1615).
+    super::check_theta_length(model, &params.theta)?;
 
     // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
     // changes the exposure the hazard sees. This entry point was the one member of
