@@ -110,6 +110,7 @@ pub(crate) use adaptive::{
     pk_bits_eq, reject_selected_error_for_adaptive, reject_unsupported_adaptive,
     verify_adaptive_snapshots,
 };
+pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     multistart_prefers, perturb_init, saem_active_covariate_group_etas,

@@ -23,7 +23,8 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    CompiledModel, FitOptions, FitResult, ParsedModel, Population, PopulationDifference,
+    CompiledModel, FitOptions, FitResult, IovOccasionRule, ParsedModel, Population,
+    PopulationDifference,
 };
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
@@ -41,12 +42,18 @@ pub(crate) struct FitInputs<'a> {
     warnings: Vec<String>,
 }
 
-impl FitInputs<'_> {
-    pub(crate) fn model(&self) -> &CompiledModel {
-        match &self.model {
+impl ModelRef<'_> {
+    fn get(&self) -> &CompiledModel {
+        match self {
             ModelRef::Lent(m) => m,
             ModelRef::Built(m) => m,
         }
+    }
+}
+
+impl FitInputs<'_> {
+    pub(crate) fn model(&self) -> &CompiledModel {
+        self.model.get()
     }
     pub(crate) fn population(&self) -> &Population {
         &self.population
@@ -332,6 +339,11 @@ fn resolve_fit_inputs_unattributed<'a>(
     // Whether the model file was read: without recorded settings, a re-read then took
     // the file's settings rather than the routed reader's (no renames, no selection).
     let file_settings = file.is_some();
+    // The occasion rule the population is prepared with (#1783): the fit's own, else
+    // (a bundle saved before it was recorded) the model file's when it was read.
+    let file_rule = file
+        .as_ref()
+        .map(|(parsed, _)| parsed.fit_options.iov_occasion.clone());
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
     check_subjects(fit, &population)?;
@@ -414,7 +426,69 @@ fn resolve_fit_inputs_unattributed<'a>(
             ));
         }
     }
-    Ok(inputs)
+    // Then (#1783) the population the fit scored: `fit()`'s own preparation of the
+    // one it was given, under the fit's rule. After the check, which is of the given
+    // population: on a natural-DV re-read, before any log transform. The notes are
+    // dropped; the fit carries them.
+    let FitInputs {
+        model,
+        population,
+        warnings,
+    } = inputs;
+    let m = model.get();
+    let rule = fit.iov_occasion.clone().or(file_rule);
+    let population = crate::api::fitted_population(
+        m,
+        rule.as_ref().unwrap_or(&IovOccasionRule::Column),
+        false,
+        population,
+        &mut Vec::new(),
+    );
+    if fit.iov_occasion.is_none()
+        && m.n_kappa > 0
+        && population.subjects.iter().all(|s| s.occasions.is_empty())
+    {
+        return Err(unrecorded_rule_refusal(fit, rule.as_ref()));
+    }
+    Ok(FitInputs {
+        model,
+        population,
+        warnings,
+    })
+}
+
+/// The refusal for a fit that records no occasion rule (a bundle saved before
+/// #1783) when the population carries no occasion labels: its kappas cannot be
+/// assigned to occasions. `file_rule` is the model file's, when it was read; a
+/// derived one would have labelled the population, so here it is `Column` or absent.
+fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>) -> EngineError {
+    let mut msg = String::from(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), and the population carries no occasion labels, so the per-occasion \
+         kappas cannot be assigned to occasions.",
+    );
+    if fit
+        .population_fingerprint
+        .as_ref()
+        .is_some_and(|fp| fp.occasions_derived())
+    {
+        msg.push_str(
+            " Its population fingerprint shows the fit derived its occasions from a \
+             model-side `iov_occasion` rule (`dose` or `time(...)`), which it did not \
+             record.",
+        );
+    }
+    if file_rule.is_some() {
+        msg.push_str(
+            " The model file's `[fit_options]` sets no `iov_occasion` to fall back on, \
+             and no occasion column was read from the data.",
+        );
+    }
+    msg.push_str(
+        " Pass the population `run_model_with_data` returned, which carries the \
+         occasion labels the fit ran with, or refit so the rule is recorded.",
+    );
+    EngineError::from(msg)
 }
 
 /// Where the population a post-hoc step was about to run on came from, for
