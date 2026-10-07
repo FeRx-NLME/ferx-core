@@ -105,6 +105,41 @@ One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
 the run continues. The point estimate was in-domain; one draw out of it is not a
 reason to lose the others.
 
+#### Matching on the code {#entry-point-error-codes}
+
+Every entry point in the table above except `fit()` returns its `Err` as an
+`EngineError` rather than a `String`. Its `to_string()` is the message described
+above, unchanged, so code that only prints or searches the text keeps working.
+
+When `ferx check` reports the same refusal with a code, the `EngineError`
+carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
+[check report](file-formats/check-report.qmd#error-warning-codes) gives for the
+same model and data. A caller can match on `code()` instead of parsing the
+message. When `ferx check` has no code for the refusal, `code()` is `None`: an
+entry point never invents one. The time-varying covariate on a hazard and the
+depot readout across a reset are refusals of that kind.
+
+| Precondition | `code()` |
+|---|---|
+| coded `RATE` (a modeled duration) | `E_MODELED_DURATION_NO_PARAM` |
+| covariates present | `E_MISSING_COVARIATE` |
+| `[covariate_model]` bound | `E_COVSTAT_UNRESOLVED` |
+| covariate levels | `E_COV_LEVEL_UNKNOWN` |
+| dose compartment (an infusion into `CMT=0`) | `E_DOSE_CMT_NOT_INFUSABLE` |
+| absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
+| flip-flop without an ODE twin | `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`) |
+| absorption input rate (pathway fractions) | `E_ABSORPTION_FRACTION` |
+| endpoint routing | `E_ENDPOINT_UNROUTED` |
+| time-varying covariate on a hazard, depot readout across a reset | none |
+
+`run_sir()` and `run_covariance()` name themselves in their refusals: the
+`EngineError`'s `context()` is the entry point, `to_string()` starts with
+`"run_sir: "` / `"run_covariance: "`, and `message()` is the text without it. A
+refusal of their own inputs — a changed model or data file, a population that
+is not the fit's — has `code()` `None`.
+
+`fit()` keeps returning a `String`.
+
 ### The non-fit bundle {#non-fit-bundle}
 
 The rule is that **a finding about the model or the data is carried; a finding

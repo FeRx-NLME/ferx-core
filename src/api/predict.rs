@@ -129,6 +129,10 @@ pub struct PredictionOutput {
 /// not `fit()`'s.
 /// [`predict`] returns that same text. Adding another check is explicitly *not* how a
 /// warning-severity finding reaches `predict()`; that is what `warnings` is for.
+///
+/// The `Err` is an [`EngineError`]: that text is its `Display`, and it carries the
+/// diagnostic `ferx check` reports for the same refusal — its `code()`, `block()` and
+/// `suggestion()` — or none where `ferx check` has no code for it (#1746).
 pub fn predict_diag(
     model: &CompiledModel,
     population: &Population,
