@@ -7170,6 +7170,11 @@ pub struct FitResult {
     /// built-in default otherwise, so the run is reproducible from this field
     /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
     /// Equal to `sir_settings.seed` whenever SIR ran.
+    ///
+    /// Except on a fit produced before #1758 (a `.fitrx` with no `sir.settings`),
+    /// where the field echoes the seed the fit was *given*: `None` for a SIR run
+    /// on the default seed, `Some` even when SIR did not run. `run_sir` on such a
+    /// fit draws with this seed when the caller sets none.
     pub sir_seed: Option<u64>,
     /// Every setting the reported SIR draws were scored under (#1758): the
     /// scale, degrees of freedom, draw counts, seed, inner-loop and ODE

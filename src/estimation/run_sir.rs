@@ -112,8 +112,10 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   an unset one and yields to the record. To override with a default value, set it
 ///   on `fit.sir_settings` (or clear that field) before calling. A fit without a
 ///   record (`sir_settings = None`: no SIR ran, or a `.fitrx` written before #1758)
-///   uses `options` as given. `inner_optimizer` and `ebe_warm_start` are applied to
-///   the process the way `fit()` applies them.
+///   uses `options` as given, except that an unset `sir_seed` falls back to
+///   `fit.sir_seed` (the seed such a fit was given). `inner_optimizer` and
+///   `ebe_warm_start` hold for the draws only: the process's previous values are
+///   restored when SIR returns.
 ///   `method` and `interaction` are **not** read from `options`: they come from the
 ///   fit (`fit.method`, then `fit.interaction` for a method that does not fix it), so
 ///   the draws are weighted with the objective the estimates minimise (#1710, #1755)
@@ -136,12 +138,10 @@ pub fn run_sir(
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
     // first, so every reader below sees them: this ODE scope and the one `run_sir_core` opens
-    // itself (#1212), which is the one the draws' solves run under.
+    // itself (#1212), which is the one the draws' solves run under. The resolved
+    // `inner_optimizer` / `ebe_warm_start` reach the draws through `run_sir_core`, which sets
+    // those process globals for its run and restores them (#1767).
     let options = &resolve_sir_options(fit, options);
-    // `fit()` sets these process globals and nothing resets them, so without this the
-    // draws would be re-solved with whichever solver the last `fit()` in the process used.
-    crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
-    crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
     // #1710: score the fit's own marginal, whatever `interaction` the caller carries.
     let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
@@ -156,10 +156,15 @@ pub fn run_sir(
 /// `fit.sir_settings` (#1758), so `run_sir(fit, …, &FitOptions::default())`
 /// repeats the SIR the fit reports. Value-based, as `ode_solver_override` is: a
 /// field equal to its default reads as "no opinion". A fit with no record (SIR
-/// never ran, or written before #1758) leaves `options` as given.
+/// never ran, or written before #1758) leaves `options` as given, but for an unset
+/// `sir_seed`, which takes `fit.sir_seed`: before #1758 that field echoed the seed
+/// the fit was given, so it is the seed a pre-#1758 SIR drew with (#1767).
 fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
     let mut o = options.clone();
     let Some(rec) = fit.sir_settings.as_ref() else {
+        if o.sir_seed.is_none() {
+            o.sir_seed = fit.sir_seed;
+        }
         return o;
     };
     let d = FitOptions::default();
@@ -970,6 +975,26 @@ mod tests {
             crate::estimation::sir::SirSettings::from_options(&resolved),
             crate::estimation::sir::SirSettings::from_options(&caller)
         );
+    }
+
+    /// #1767 finding 3: a fit with no record (a pre-#1758 `.fitrx`) still carries the seed
+    /// it was given in `sir_seed`, and `run_sir` draws with it when the caller sets none —
+    /// not with the built-in default. Both sides of the gate in one test: an unset caller
+    /// seed takes the fit's, an explicit one wins. Mutations: drop the fallback (the first
+    /// assertion gets `None`); apply it unconditionally (the second gets 7, not 1).
+    #[test]
+    fn resolve_sir_options_without_a_record_takes_the_fits_seed() {
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        fit.sir_settings = None;
+        fit.sir_seed = Some(7);
+        let unset = FitOptions::default();
+        assert_eq!(unset.sir_seed, None, "premise: the caller sets no seed");
+        assert_eq!(resolve_sir_options(&fit, &unset).sir_seed, Some(7));
+        let explicit = FitOptions {
+            sir_seed: Some(1),
+            ..FitOptions::default()
+        };
+        assert_eq!(resolve_sir_options(&fit, &explicit).sir_seed, Some(1));
     }
 
     /// `fit`'s SIR outputs cleared, its record kept, so a `run_sir` that failed

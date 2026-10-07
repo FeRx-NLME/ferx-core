@@ -317,9 +317,14 @@ fn apply_sir_result_clears_every_field_when_sir_did_not_run() {
 /// model returns a κ interval, and records the settings it scored under.
 /// `warfarin_iov` (one kappa), a tame PD proposal as in `warfarin_fixture`,
 /// FOCE as the file declares it — FD inner gradients. Every recorded setting
-/// is off its default, so a `run_sir_core` that stamped `Default` (or dropped
-/// a field in `SirSettings::from_options`) fails the equality. Mutations:
-/// stamp `SirSettings::default()` in `run_sir_core`; drop κ from the SIR.
+/// is off its default except the two process-global ones, `inner_optimizer`
+/// and `ebe_warm_start`: `run_sir_core` now applies them for its run (#1767),
+/// and a non-default value written here would reach a concurrent test's fit in
+/// this shared binary. They are pinned in `tests/run_sir_inner_settings_scope.rs`
+/// and by the resolve test. So a `run_sir_core` that stamped `Default` (or read
+/// a field from the defaults in `SirSettings::from_options`) fails the
+/// equality. Mutations: stamp `SirSettings::default()` in `run_sir_core`; drop
+/// κ from the SIR.
 #[test]
 fn resolve_sir_fallback_records_its_settings_and_kappa() {
     let prep = crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
@@ -339,12 +344,12 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
         sir_resamples: 20,
         sir_seed: Some(1713),
         sir_df: 7.0,
+        sir_scale: SirScale::Natural,
         sir_keep_samples: true,
         inner_maxiter: 150,
         inner_tol: 2e-5,
         mu_referencing: false,
         n_agq: 3,
-        ebe_warm_start: true,
         ode_reltol: 2e-4,
         ode_abstol: 2e-6,
         ode_max_steps: 9_000,
