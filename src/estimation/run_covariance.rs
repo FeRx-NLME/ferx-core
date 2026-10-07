@@ -1118,7 +1118,7 @@ mod from_fit_bindings {
     /// - an unbound median model is refused (was `Ok` with no covariance).
     ///
     /// Mutations — delete the bindings comparison, the `n_theta` check, the index
-    /// write, or the `assert_covariate_model_bound` call: one cell each panics, or
+    /// write, or the `check_covariate_model_bound` call: one cell each panics, or
     /// returns `Ok`, and dies.
     #[test]
     fn a_supplied_model_must_be_the_fitted_one() {
