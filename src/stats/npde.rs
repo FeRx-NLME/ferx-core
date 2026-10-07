@@ -119,6 +119,15 @@ pub fn compute_npde_npd(
     // θ against the model's layout (#1615): the reference distribution is simulated
     // from it, and a θ read past its end is `0.0`.
     crate::api::check_theta_length(model, &params.theta)?;
+    // …and Ω / σ / Ω_IOV (#1764): a mis-sized block panicked in the draw. An absent
+    // Ω_IOV is not checked: it falls back to κ = 0, as documented above.
+    let [omega, sigma, omega_iov] = crate::api::ParamBlock::all_of(params);
+    let blocks = if params.omega_iov.is_some() {
+        vec![omega, sigma, omega_iov]
+    } else {
+        vec![omega, sigma]
+    };
+    crate::api::check_param_shape(model, &blocks)?;
     // A bound level block on a population never bound for it gathers `NaN` on every
     // record, and every npd came back `NaN` with `Ok` (#1647).
     crate::diagnostics::first_error(&crate::api::check_level_index_columns(

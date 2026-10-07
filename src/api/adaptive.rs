@@ -267,6 +267,8 @@ where
     // θ against the model's layout (#1614): this path does not run
     // `check_simulate_preconditions`, so the shared gate is called here directly.
     super::simulate::check_theta_length(model, &params.theta)?;
+    // Ω / σ / Ω_IOV likewise (#1764): σ is read by a `Dv` monitor's assay.
+    super::check_param_shape(model, &super::ParamBlock::all_of(params))?;
 
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
@@ -1195,8 +1197,9 @@ pub fn simulate_adaptive_from_spec(
     // branch, not CMT, so the compartment-keyed assay would draw NaN (#658). Shared
     // with `simulate_adaptive` (#1571).
     check_adaptive_model_data(model, population)?;
-    // θ against the model's layout (#1614), as in `simulate_adaptive`.
+    // θ against the model's layout (#1614), as in `simulate_adaptive`; Ω / σ / Ω_IOV too (#1764).
     super::simulate::check_theta_length(model, &params.theta)?;
+    super::check_param_shape(model, &super::ParamBlock::all_of(params))?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).

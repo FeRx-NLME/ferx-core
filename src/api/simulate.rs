@@ -371,6 +371,87 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
     first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
 }
 
+/// The dimension of one random-effect or residual block a caller supplied, for
+/// [`check_param_shape`] (#1764). Each entry point passes the blocks it reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ParamBlock {
+    /// Ω's dimension.
+    Omega(usize),
+    /// σ's length.
+    Sigma(usize),
+    /// Ω_IOV's dimension, `None` when absent.
+    OmegaIov(Option<usize>),
+}
+
+impl ParamBlock {
+    /// Ω, σ and Ω_IOV of a parameter set.
+    pub(crate) fn all_of(params: &ModelParameters) -> [ParamBlock; 3] {
+        [
+            ParamBlock::Omega(params.omega.dim()),
+            ParamBlock::Sigma(params.sigma.values.len()),
+            ParamBlock::OmegaIov(params.omega_iov.as_ref().map(|m| m.dim())),
+        ]
+    }
+
+    /// Ω, σ and Ω_IOV of a fit.
+    pub(crate) fn all_of_fit(fit: &FitResult) -> [ParamBlock; 3] {
+        [
+            ParamBlock::Omega(fit.omega.nrows()),
+            ParamBlock::Sigma(fit.sigma.len()),
+            ParamBlock::OmegaIov(fit.omega_iov.as_ref().map(|m| m.nrows())),
+        ]
+    }
+}
+
+/// Refuse an Ω, σ or Ω_IOV whose dimension is not the model's (#1764), as
+/// `E_PARAM_SHAPE` — the sibling of [`check_theta_length`].
+///
+/// Measured before this gate: a mis-sized Ω panicked in the η draw or the inner
+/// solve (`Gemv: dimensions mismatch`), a short σ panicked indexing the residual
+/// variance, a long σ or an Ω_IOV on a model without κ ran to `Ok` with the block
+/// silently ignored, and a fit with no Ω_IOV was run post hoc on the model's initial
+/// one. `predict` and the survival predictors read none of the three (η = 0), so they
+/// do not call this; `compute_npde_npd` leaves out an absent Ω_IOV, which it documents
+/// as κ = 0.
+pub(crate) fn check_param_shape(
+    model: &CompiledModel,
+    supplied: &[ParamBlock],
+) -> Result<(), EngineError> {
+    const BY_POSITION: &str = "the model reads it by position, so its values would be \
+        read against the wrong random effects or residual errors";
+    let want = &model.default_params;
+    for block in supplied {
+        let message = match *block {
+            ParamBlock::Omega(got) if got != want.omega.dim() => format!(
+                "the supplied omega is {got}×{got} but this model has {} eta; {BY_POSITION}",
+                want.omega.dim()
+            ),
+            ParamBlock::Sigma(got) if got != want.sigma.values.len() => format!(
+                "the supplied sigma has {got} values but this model has {}; {BY_POSITION}",
+                want.sigma.values.len()
+            ),
+            ParamBlock::OmegaIov(got) => match (got, want.omega_iov.as_ref().map(|m| m.dim())) {
+                (Some(g), Some(w)) if g != w => format!(
+                    "the supplied omega_iov is {g}×{g} but this model has {w} kappa; \
+                     {BY_POSITION}"
+                ),
+                (None, Some(w)) => format!(
+                    "the supplied parameters carry no omega_iov but this model has {w} kappa; \
+                     without it every occasion would get the same parameters"
+                ),
+                (Some(g), None) => format!(
+                    "the supplied parameters carry a {g}×{g} omega_iov but this model has no \
+                     kappa; the inter-occasion variability it describes would be dropped"
+                ),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        return first_error(&[Diagnostic::error("E_PARAM_SHAPE", message)]);
+    }
+    Ok(())
+}
+
 /// The model/data preconditions shared by `simulate`, `simulate_with_seed`,
 /// `simulate_with_options{,_diag}` and `simulate_with_uncertainty`, as an `Err` carrying the
 /// bare check message — the text `fit()` gives for that precondition (#898).
@@ -389,9 +470,13 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
 fn check_simulate_preconditions(
     model: &CompiledModel,
     population: &Population,
-    theta: &[f64],
+    params: &ModelParameters,
 ) -> Result<(), EngineError> {
+    let theta = &params.theta;
     check_theta_length(model, theta)?;
+    // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
+    validate_iov_simulatable(model, params)?;
+    check_param_shape(model, &ParamBlock::all_of(params))?;
     first_error(&check_modeled_dose_rates(model, population))?;
     first_error(&check_dose_compartments(model, population))?;
     first_error(&check_absorption_closed_form_support_diags(
@@ -471,7 +556,7 @@ pub fn simulate_with_options_diag(
 
     // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
     // as a clean Err here; `simulate` / `simulate_with_seed` get the same `Err` from
-    // the chokepoint below.
+    // `check_simulate_preconditions` at the chokepoint below.
     validate_iov_simulatable(model, params)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
@@ -536,7 +621,7 @@ pub fn simulate_with_options_diag(
     // reason: otherwise a malformed multi-pathway / SS / infusion absorption model
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
-    check_simulate_preconditions(model, population, &params.theta)?;
+    check_simulate_preconditions(model, population, params)?;
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -1011,7 +1096,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     //
     // Every precondition below is an `Err`, never a panic (#898), and every
     // `simulate*` entry point returns it as is.
-    check_simulate_preconditions(model, population, &params.theta)?;
+    check_simulate_preconditions(model, population, params)?;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
@@ -1035,12 +1120,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     #[cfg(feature = "survival")]
     validate_tte_simulatable(model, population, horizon)?;
 
-    // Same split for the IOV precondition (#1019): `simulate_with_options*` already
-    // returned a clean Err; `simulate` / `simulate_with_seed` reach it only here,
-    // where rows with no inter-occasion variability must not be emitted.
-    validate_iov_simulatable(model, params)?;
-
-    // Same split again for the model-vs-population checks (#1083). The
+    // Same split for the model-vs-population checks (#1083). The
     // `Result`-returning entry points above have already run this list and
     // returned a clean `Err`; `simulate` / `simulate_with_seed` reach it only
     // here, and the failures this catches are silent by
@@ -1198,6 +1278,9 @@ pub fn simulate_with_uncertainty_diag(
     // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
     // would first be handed to the draw machinery, and a zero-draw run never reaches it.
     check_theta_length(model, &fit_result.theta)?;
+    // …and Ω / σ / Ω_IOV (#1764): a mis-sized Ω panicked in the draw, and a fit
+    // with no Ω_IOV on an IOV model simulated with none.
+    check_param_shape(model, &ParamBlock::all_of_fit(fit_result))?;
 
     // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
     // uncertainty path does not yet expose — validate once here rather than per
