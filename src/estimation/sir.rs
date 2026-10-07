@@ -141,6 +141,9 @@ pub(crate) struct FloorProbe {
     pub dofv: f64,
     /// The variance there, on the reported scale.
     pub variance: f64,
+    /// The probe point also set non-zero block covariances of this η to 0
+    /// ([`FloorProbeCoord::zeroes_a_covariance`]); the warning says so.
+    pub covariances_zeroed: bool,
 }
 
 /// The low-ESS warning (#1723), or `None` when `ess >= SIR_LOW_ESS`.
@@ -191,15 +194,23 @@ pub(crate) fn low_ess_warning(
                     .iter()
                     .map(|p| {
                         format!(
-                            "{} (ΔOFV {:.2} at variance {:.2e})",
-                            p.name, p.dofv, p.variance
+                            "{} (ΔOFV {:.2} at variance {:.2e}{})",
+                            p.name,
+                            p.dofv,
+                            p.variance,
+                            if p.covariances_zeroed {
+                                ", with its covariances in the block also set to 0"
+                            } else {
+                                ""
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 msg.push_str(&format!(
-                    " The data do not bound {listed} away from zero: each, moved alone to \
-                     its lower bound in the parameter box, costs less than χ²₁(0.95) = 3.84 in \
+                    " The data do not bound {listed} away from zero: each, moved to its \
+                     lower bound in the parameter box with the other parameters at the \
+                     estimates, costs less than χ²₁(0.95) = 3.84 in \
                      OFV, so its SIR lower limit reflects the parameter box rather than the \
                      data."
                 ));
@@ -258,6 +269,15 @@ pub(crate) fn floor_probe_coords(params: &ModelParameters, fixed: &[bool]) -> Ve
         block(seg.iov_start(), iov);
     }
     out
+}
+
+impl FloorProbeCoord {
+    /// Whether [`floor_probe_point`] changes a covariance as well as the
+    /// variance: some off-diagonal of the row is non-zero at `x_hat`. False for
+    /// a diagonal η, a block's first η, and a row of structural zeros.
+    pub(crate) fn zeroes_a_covariance(&self, x_hat: &[f64]) -> bool {
+        self.row_off.iter().any(|&j| x_hat[j] != 0.0)
+    }
 }
 
 /// The packed point a floor probe scores: the estimate with the variance's
@@ -1170,6 +1190,7 @@ fn run_sir_in_box(
                         name: coord_names[i].clone(),
                         dofv,
                         variance: coordinate_values(&p)[i],
+                        covariances_zeroed: c.zeroes_a_covariance(&x_hat),
                     })
                 })
                 .collect()

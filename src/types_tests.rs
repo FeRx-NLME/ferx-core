@@ -652,6 +652,7 @@ fn classify_warning_sir_low_ess_rows_route_to_sir() {
             name: "ETA_KA".into(),
             dofv: 1.56,
             variance: 6.1e-6,
+            covariances_zeroed: false,
         }]
     };
     let rows = [

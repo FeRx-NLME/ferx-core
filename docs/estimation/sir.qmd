@@ -212,11 +212,15 @@ proposal is adequate, so these intervals rest on few draws. The heaviest draw
 carries 52.9% of the weight; it moves ETA_CL by -6.36 proposal standard
 deviations from the proposal centre, to 4.585e-4 on the reported scale. Increase
 `sir_samples` for more stable intervals. The data do not bound ETA_KA (ΔOFV 1.56
-at variance 6.14e-6) away from zero: each, moved alone to its lower bound in the
-parameter box, costs less than χ²₁(0.95) = 3.84 in OFV, so its SIR lower limit
-reflects the parameter box rather than the data. `sir_scale = natural` makes
-these lower limits independent of the box.
+at variance 6.14e-6) away from zero: each, moved to its lower bound in the
+parameter box with the other parameters at the estimates, costs less than
+χ²₁(0.95) = 3.84 in OFV, so its SIR lower limit reflects the parameter box rather
+than the data. `sir_scale = natural` makes these lower limits independent of the
+box.
 ```
+
+A flagged η inside a block whose covariances the check set to 0 carries
+", with its covariances in the block also set to 0" after its variance.
 
 With fewer than 100 draws the ESS cannot reach 100 at all, so the first
 sentence says that instead.

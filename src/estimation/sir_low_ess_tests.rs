@@ -40,6 +40,7 @@ fn wiov_probe() -> Vec<FloorProbe> {
         name: n.into(),
         dofv: d,
         variance: 6.14e-6,
+        covariances_zeroed: false,
     })
     .collect()
 }
@@ -118,7 +119,8 @@ fn low_ess_warning_names_each_flagged_variance_and_only_those() {
         S_SHELF_TAIL,
         S_TO_NATURAL,
         "ETA_KA (ΔOFV 1.56 at variance 6.14e-6) away from zero",
-        "costs less than χ²₁(0.95) = 3.84 in OFV",
+        "each, moved to its lower bound in the parameter box with the other parameters \
+         at the estimates, costs less than χ²₁(0.95) = 3.84 in OFV",
         "its SIR lower limit reflects the parameter box rather than the data.",
     ] {
         assert!(has(&msg, s), "missing {s:?} in {msg}");
@@ -127,6 +129,45 @@ fn low_ess_warning_names_each_flagged_variance_and_only_those() {
     for unflagged in ["ETA_CL (ΔOFV", "ETA_V (ΔOFV", "KAPPA_CL (ΔOFV"] {
         assert!(!has(&msg, unflagged), "{unflagged} named in {msg}");
     }
+}
+
+/// #1749 r2: a block η's probe point also zeroes its covariances, so "with the
+/// other parameters at the estimates" is not the whole story for it. The note
+/// rides on that variance's own entry, and only on it: one message with a
+/// flagged block η and a flagged diagonal η, so a note stuck on or stuck off
+/// both fail here.
+#[test]
+fn low_ess_warning_notes_zeroed_covariances_on_that_variance_only() {
+    let probe = || {
+        vec![
+            FloorProbe {
+                name: "ETA_KA".into(),
+                dofv: 1.56,
+                variance: 6.14e-6,
+                covariances_zeroed: false,
+            },
+            FloorProbe {
+                name: "ETA_Q".into(),
+                dofv: 0.42,
+                variance: 6.14e-6,
+                covariances_zeroed: true,
+            },
+        ]
+    };
+    let msg = low_ess_warning(3.5, 1000, SirScale::Packed, &heaviest(), probe).unwrap();
+    assert!(
+        has(
+            &msg,
+            "ETA_Q (ΔOFV 0.42 at variance 6.14e-6, with its covariances in the block also \
+             set to 0)"
+        ),
+        "{msg}"
+    );
+    assert!(
+        has(&msg, "ETA_KA (ΔOFV 1.56 at variance 6.14e-6), ETA_Q"),
+        "{msg}"
+    );
+    assert_eq!(msg.matches("also set to 0").count(), 1, "{msg}");
 }
 
 /// Row "heaviest move is a θ": the draw sentence names the θ, the variances are
@@ -156,6 +197,7 @@ fn low_ess_warning_flags_strictly_below_the_chi2_quantile() {
                 name: "ETA_KA".into(),
                 dofv: d,
                 variance: 6.14e-6,
+                covariances_zeroed: false,
             }]
         };
         low_ess_warning(3.5, 1000, SirScale::Packed, &heaviest(), probe).unwrap()
@@ -314,6 +356,24 @@ fn floor_probe_point_puts_a_block_variance_at_its_floor() {
     assert_eq!(s[(iq, iv)], 0.0, "ETA_Q~ETA_V left live");
     let est = &p.omega.matrix;
     assert!((s[(iv, iv)] - est[(iv, iv)]).abs() < 1e-12, "ETA_V moved");
+    // The warning's "covariances also set to 0" note: ETA_Q only. ETA_CL and
+    // KAPPA_CL are diagonal; ETA_V is the block's first η, and its row's only
+    // entries are structural zeros (already 0) — a note keyed on `row_off`
+    // being non-empty would mark it wrongly.
+    let zeroes: Vec<(&str, bool)> = coords
+        .iter()
+        .map(|c| (names[c.diag].as_str(), c.zeroes_a_covariance(&packed)))
+        .collect();
+    assert_eq!(
+        zeroes,
+        [
+            ("ETA_CL", false),
+            ("ETA_V", false),
+            ("ETA_Q", true),
+            ("KAPPA_CL", false)
+        ],
+        "{coords:?}"
+    );
 }
 
 /// A SIR run on the probe fixture with only 40 draws, so the ESS is below the
@@ -505,6 +565,18 @@ fn floor_probe_moves_each_coordinate_to_its_own_box_floor() {
     assert!(w.contains("ETA_CL (ΔOFV"), "ETA_CL not flagged: {w}");
     assert!(w.contains("at variance 2.48e-3"), "{w}");
     assert!(!w.contains("ETA_KA"), "the FIX ETA_KA was probed: {w}");
+    // #1749 r2: the run wires each probe's covariance note through. ETA_Q (the
+    // block's second η) carries it, ETA_V (the first) and ETA_CL do not. Matched
+    // on ETA_Q's own entry, not its ΔOFV digits, which are a fit number.
+    let q = &w[w
+        .find("ETA_Q (ΔOFV")
+        .unwrap_or_else(|| panic!("ETA_Q not flagged: {w}"))..];
+    let q = &q[..=q.find(')').unwrap()];
+    assert!(
+        q.ends_with(", with its covariances in the block also set to 0)"),
+        "{q}"
+    );
+    assert_eq!(w.matches("also set to 0").count(), 1, "{w}");
 }
 
 /// S9, centre: `ŷ + C ∇` on a 2-D fixture with a known `C`, and the clamp
