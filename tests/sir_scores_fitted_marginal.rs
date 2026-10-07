@@ -730,7 +730,10 @@ fn mixture_without_packed_estimate() {
             run_covariance(&stored, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
         ),
     ] {
-        let e = res.expect_err("an override fit without its packed estimate must be refused");
+        // The entry points return `EngineError` (#1771); its `Display` is the message.
+        let e = res
+            .expect_err("an override fit without its packed estimate must be refused")
+            .to_string();
         for must in [
             format!("{entry}: this [mixture] fit"),
             "per-class override(s) omega(2) ETA_CL".to_string(),
@@ -759,7 +762,8 @@ fn mixture_without_packed_estimate() {
         let mut other = cleared(&r);
         other.packed_estimate = Some(v);
         let e = run_sir(&other, Some(&model), Some(&pop), &sir_defaults())
-            .expect_err("a packed estimate of the wrong length must be refused");
+            .expect_err("a packed estimate of the wrong length must be refused")
+            .to_string();
         for must in [
             format!(
                 "run_sir: the fit's packed estimate has {other_len} coordinates but this \
