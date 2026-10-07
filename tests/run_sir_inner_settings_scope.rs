@@ -119,7 +119,7 @@ fn sir_runs_with_its_recorded_inner_solver_and_restores_the_process_one() {
         ..Default::default()
     });
     let err = run_sir(&no_cov, Some(model), Some(pop), &quiet).expect_err("no covariance");
-    assert!(err.contains("covariance_matrix"), "{err}");
+    assert!(err.to_string().contains("covariance_matrix"), "{err}");
     let after_err = bits(
         &run_covariance(&fitted, Some(model), Some(pop), &quiet)
             .expect("run_covariance")
