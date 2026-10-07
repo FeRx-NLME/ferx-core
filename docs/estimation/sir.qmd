@@ -350,7 +350,7 @@ Every draw is weighted with the objective the fit minimised, so `run_sir(&fit, N
 
 Two limits:
 
-- **`n_agq` is read from `opts`.** A `FitResult` does not record the AGQ node count yet ([#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)), so for a fit with `n_agq > 1` pass the same `n_agq` the fit used.
+- **`n_agq` comes from the fit's SIR record.** A fit that ran SIR records its AGQ node count in `sir_settings` (see [Which settings `run_sir` uses](#which-settings-run_sir-uses)); for a fit with no record (no SIR ran, or a `.fitrx` saved before [#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)) and `n_agq > 1`, pass the same `n_agq` the fit used.
 - **Mixture overrides are not stored on a `FitResult`.** Their fitted values are carried only by the in-memory result of a FOCE, FOCEI, Laplace or Gauss-Newton `fit()`. For a `[mixture]` model with at least one override, `run_sir` and `run_covariance` return an error on a fit loaded from `.fitrx`, built in R, or estimated by SAEM, IMP or Bayes ([#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)). A mixture model without overrides is not affected.
 
 ### Caller-supplied vs. re-read inputs
