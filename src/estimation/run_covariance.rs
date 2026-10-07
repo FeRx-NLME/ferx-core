@@ -93,6 +93,9 @@ use crate::types::*;
 ///   objective the estimates minimise (#1710, #1755); `n_agq` is still the caller's
 ///   (#1758). A `[mixture]` fit's per-class overrides are rebuilt from the fit, with
 ///   the same error as `run_sir` when they are not available (#1704).
+///   `iov_occasion` is not read either: the population is prepared as `fit()`
+///   prepared it — occasions derived under the fit's recorded rule
+///   (`fit.iov_occasion`), DV log-transformed for a `log(DV) ~ …` model (#1783).
 pub fn run_covariance(
     fit: &FitResult,
     model: Option<&CompiledModel>,

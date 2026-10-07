@@ -588,6 +588,8 @@ A covariance step that runs but cannot produce a usable matrix (a non-positive-d
 
 The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is not hash-checked but must be the fitted model and population, and `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source, binding the model from the fit's `data_bindings`. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs.-re-read-inputs).
 
+Whichever population it runs on, `run_covariance` prepares it the way `fit()` did before scoring it ([#1783](https://github.com/FeRx-NLME/ferx-core/issues/1783)): it derives the occasions under the `iov_occasion` rule the fit recorded (`dose` or `time(...)`), and log-transforms DV for a `log(DV) ~ ...` model. Before, a derived-occasion fit returned `Ok` with `covariance_status = Failed`, and an LTBS fit returned standard errors 777 times too large.
+
 ### Hessian regularization
 
 Because the EBEs reconverge, the Hessian is positive-definite on well-conditioned surfaces and no regularization is needed. As a safety net for genuinely ill-conditioned or near-singular problems, ferx-core still inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`, adding a warning to `FitResult.warnings`:

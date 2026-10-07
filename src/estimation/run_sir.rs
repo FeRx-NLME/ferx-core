@@ -122,8 +122,10 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   `method` and `interaction` are **not** read from `options`: they come from the
 ///   fit (`fit.method`, then `fit.interaction` for a method that does not fix it), so
 ///   the draws are weighted with the objective the estimates minimise (#1710, #1755)
-///   and the result equals the in-fit SIR at the same settings. Other fields are
-///   ignored.
+///   and the result equals the in-fit SIR at the same settings. Nor is
+///   `iov_occasion`: the population is prepared as `fit()` prepared it, occasions
+///   derived under the fit's recorded rule (`fit.iov_occasion`) and DV
+///   log-transformed for a `log(DV) ~ …` model (#1783). Other fields are ignored.
 ///
 /// # `[mixture]` models
 ///

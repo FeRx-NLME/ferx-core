@@ -447,7 +447,92 @@ pub fn fit(
     // review r1 #1): `run_model_with_data` hands back its population with them set.
     let derived = crate::api::run::occasions_are_derived(model, options);
     result.population_fingerprint = Some(PopulationFingerprint::of_with(population, derived));
+    // The rule those occasions were derived under (#1783): a post-hoc step derives
+    // them again with it, and a file entry point's rule is the caller's, not the file's.
+    result.iov_occasion = Some(options.iov_occasion.clone());
     Ok(result)
+}
+
+/// The population `fit()` scores: `population` pruned of time-varying covariates
+/// the model never reads, given the occasions a derived `iov_occasion` rule makes,
+/// and log-transformed for a `log(DV) ~ …` model (#1783). The **one** preparation:
+/// `fit()` runs it on the population it was given, and `run_sir` /
+/// `run_covariance` on the population they resolve, with the rule the fit
+/// recorded, so a post-hoc step scores the fit's θ on the population the fit did.
+///
+/// `population` is copied only when a step applies; a re-read owned one is
+/// modified in place. `warnings` receives this preparation's notes: the rule set
+/// without kappa, the rule overriding `iov_column` (`had_column`), and DV ≤ 0
+/// under LTBS. The single-occasion refusal and the occasion-count warning stay
+/// in `fit()`.
+pub(crate) fn fitted_population<'a>(
+    model: &CompiledModel,
+    rule: &IovOccasionRule,
+    had_column: bool,
+    population: std::borrow::Cow<'a, Population>,
+    warnings: &mut Vec<String>,
+) -> std::borrow::Cow<'a, Population> {
+    // If any subject has per-event covariate snapshots that don't carry
+    // a variation in covariates the model actually references (e.g.
+    // DAY / STIME columns in NONMEM-format datasets), clear those
+    // snapshots so the downstream prediction path routes through the
+    // cheap analytical/no-TV fast path instead of the event-driven
+    // path. Bigger wins on SAD-style datasets where every subject has
+    // a varying DAY column but no model expression touches DAY.
+    // Log-transform-both-sides (LTBS) case 2 (`log(DV) ~ additive`): the data's
+    // DV is on the natural scale, so log-transform every observation once here,
+    // before any prediction is scored against it. Case 1 (`DV ~ log_additive`,
+    // `dv_pre_logged`) leaves the already-log DV untouched. Logging into the
+    // owned clone leaves the caller's `Population` (and any `simulate` reuse of
+    // it) unmodified, and avoids double-logging on repeated `fit()` calls.
+    let needs_dv_log = model.log_transform && !model.dv_pre_logged;
+    // A model-side IOV occasion rule (`iov_occasion = dose | time(...)`) derives
+    // the occasion labels from each subject's timeline instead of a data column.
+    // Only meaningful when the model actually declares kappa: without it the
+    // derived labels feed nothing, so skip the clone + derivation entirely and
+    // tell the user the option is a no-op rather than silently paying for it.
+    let iov_rule_set = *rule != IovOccasionRule::Column;
+    if iov_rule_set && model.n_kappa == 0 {
+        warnings.push(
+            "iov_occasion is set in [fit_options] but the model declares no kappa (IOV) \
+             random effects, so it has no effect and no occasions were derived."
+                .to_string(),
+        );
+    }
+    let derive_occ = iov_rule_set && model.n_kappa > 0;
+    let needs_prune = population.subjects.iter().any(|s| {
+        !s.dose_covariates.is_empty()
+            || !s.obs_covariates.is_empty()
+            || !s.pk_only_covariates.is_empty()
+            // EVID=3/4 snapshots count too (#1133) — `prune_irrelevant_tv_covariates`
+            // now scans and clears them, so a subject whose only populated vector is
+            // `reset_covariates` must reach it rather than being gated out here.
+            || !s.reset_covariates.is_empty()
+    });
+    if !(needs_prune || needs_dv_log || derive_occ) {
+        return population;
+    }
+    let mut population = population;
+    let p = population.to_mut();
+    if needs_prune {
+        p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+    }
+    if derive_occ {
+        apply_iov_occasion_rule(p, rule, had_column, warnings);
+    }
+    if needs_dv_log {
+        let n_nonpos = log_transform_observations(p);
+        if n_nonpos > 0 {
+            warnings.push(format!(
+                "LTBS (log(DV) ~ ...): {n_nonpos} observation(s) had DV ≤ 0, which \
+                 cannot be log-transformed; they were floored to log({LTBS_FLOOR:e}). \
+                 Check the data scale, or use `DV ~ log_additive(...)` if DV is \
+                 already log-transformed.",
+                LTBS_FLOOR = crate::pk::LTBS_FLOOR,
+            ));
+        }
+    }
+    population
 }
 
 fn fit_unstamped(
@@ -763,76 +848,16 @@ fn fit_unstamped(
             }
         }
     }
-    // If any subject has per-event covariate snapshots that don't carry
-    // a variation in covariates the model actually references (e.g.
-    // DAY / STIME columns in NONMEM-format datasets), clear those
-    // snapshots so the downstream prediction path routes through the
-    // cheap analytical/no-TV fast path instead of the event-driven
-    // path. Bigger wins on SAD-style datasets where every subject has
-    // a varying DAY column but no model expression touches DAY.
-    // Log-transform-both-sides (LTBS) case 2 (`log(DV) ~ additive`): the data's
-    // DV is on the natural scale, so log-transform every observation once here,
-    // before any prediction is scored against it. Case 1 (`DV ~ log_additive`,
-    // `dv_pre_logged`) leaves the already-log DV untouched. Logging into the
-    // owned clone leaves the caller's `Population` (and any `simulate` reuse of
-    // it) unmodified, and avoids double-logging on repeated `fit()` calls.
-    let needs_dv_log = model.log_transform && !model.dv_pre_logged;
     let mut ltbs_warnings: Vec<String> = Vec::new();
-    // A model-side IOV occasion rule (`iov_occasion = dose | time(...)`) derives
-    // the occasion labels from each subject's timeline instead of a data column.
-    // Only meaningful when the model actually declares kappa: without it the
-    // derived labels feed nothing, so skip the clone + derivation entirely and
-    // tell the user the option is a no-op rather than silently paying for it.
-    let iov_rule_set = options.iov_occasion != IovOccasionRule::Column;
-    if iov_rule_set && model.n_kappa == 0 {
-        ltbs_warnings.push(
-            "iov_occasion is set in [fit_options] but the model declares no kappa (IOV) \
-             random effects, so it has no effect and no occasions were derived."
-                .to_string(),
-        );
-    }
     let derive_occ = crate::api::run::occasions_are_derived(model, options);
-    let pop_pruned: std::borrow::Cow<Population> = {
-        let needs_prune = population.subjects.iter().any(|s| {
-            !s.dose_covariates.is_empty()
-                || !s.obs_covariates.is_empty()
-                || !s.pk_only_covariates.is_empty()
-                // EVID=3/4 snapshots count too (#1133) — `prune_irrelevant_tv_covariates`
-                // now scans and clears them, so a subject whose only populated vector is
-                // `reset_covariates` must reach it rather than being gated out here.
-                || !s.reset_covariates.is_empty()
-        });
-        if needs_prune || needs_dv_log || derive_occ {
-            let mut p = population.clone();
-            if needs_prune {
-                p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
-            }
-            if derive_occ {
-                apply_iov_occasion_rule(
-                    &mut p,
-                    &options.iov_occasion,
-                    options.iov_column.is_some(),
-                    &mut ltbs_warnings,
-                );
-            }
-            if needs_dv_log {
-                let n_nonpos = log_transform_observations(&mut p);
-                if n_nonpos > 0 {
-                    ltbs_warnings.push(format!(
-                        "LTBS (log(DV) ~ ...): {n_nonpos} observation(s) had DV ≤ 0, which \
-                         cannot be log-transformed; they were floored to log({LTBS_FLOOR:e}). \
-                         Check the data scale, or use `DV ~ log_additive(...)` if DV is \
-                         already log-transformed.",
-                        LTBS_FLOOR = crate::pk::LTBS_FLOOR,
-                    ));
-                }
-            }
-            std::borrow::Cow::Owned(p)
-        } else {
-            std::borrow::Cow::Borrowed(population)
-        }
-    };
-    let pop_ref: &Population = &*pop_pruned;
+    let pop_pruned = fitted_population(
+        model,
+        &options.iov_occasion,
+        options.iov_column.is_some(),
+        std::borrow::Cow::Borrowed(population),
+        &mut ltbs_warnings,
+    );
+    let pop_ref: &Population = &pop_pruned;
 
     // A model-side occasion rule must actually partition the timeline. The
     // dataset-column path is guarded by `E_IOV_MISSING_OCC`; the derived path
@@ -2946,6 +2971,7 @@ fn fit_inner(
         model_text: None,
         reader_settings: None,
         population_fingerprint: None,
+        iov_occasion: None,
         theta_init,
         omega_init,
         sigma_init,

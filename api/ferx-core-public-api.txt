@@ -3089,6 +3089,7 @@ pub ferx_core::types::FitResult::importance_sampling: core::option::Option<ferx_
 pub ferx_core::types::FitResult::inits_from_nca: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::input_columns: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::interaction: bool
+pub ferx_core::types::FitResult::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::types::FitResult::iwres_lag1_r: f64
 pub ferx_core::types::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
@@ -4573,6 +4574,7 @@ pub ferx_core::FitResult::importance_sampling: core::option::Option<ferx_core::I
 pub ferx_core::FitResult::inits_from_nca: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::input_columns: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::interaction: bool
+pub ferx_core::FitResult::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::FitResult::iwres_lag1_r: f64
 pub ferx_core::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>

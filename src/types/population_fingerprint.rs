@@ -176,6 +176,11 @@ impl PopulationFingerprint {
         Self::of_with(population, false)
     }
 
+    /// Whether the fit derived its occasion labels from a model-side rule.
+    pub(crate) fn occasions_derived(&self) -> bool {
+        self.occasions_derived
+    }
+
     /// The fingerprint of `population`. With `occasions_derived` (the fit derives its
     /// occasion labels from a model-side rule, `run::occasions_are_derived`), the
     /// labels the population carries are left out: the fit overwrites them.

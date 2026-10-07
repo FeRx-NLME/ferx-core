@@ -305,6 +305,18 @@ settings and refuse a population that does not match the fingerprint. Both keys
 are absent on a bundle saved before #1685, which loads them as `None`; the
 format version did not change.
 
+### `iov_occasion`
+
+The IOV occasion rule the fit ran under
+([#1783](https://github.com/FeRx-NLME/ferx-core/issues/1783)): `"column"`,
+`"per_dose"` or `{"time_windows": [24.0, 48.0]}`. It is the rule of the options
+the fit ran with; a file entry point takes those from its caller, not from the
+model file's `[fit_options]`. `run_sir` and `run_covariance` derive the
+population's occasions with it, as `fit()` did. Written by every fit; absent on a
+bundle saved before #1783, which loads it as `None`. The steps then use the model
+file's rule when they read the file, with a warning naming it; set
+`fit.iov_occasion` when the fit ran under another rule.
+
 ## `ebes.csv`
 
 ```
