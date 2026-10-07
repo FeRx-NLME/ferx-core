@@ -1382,3 +1382,95 @@ fn a_threads_flag_sizes_one_pool_and_no_idle_set_beside_it() {
         2 * THREADS + 1
     );
 }
+
+// ── one read of the model file (#1752) ────────────────────────────────────────
+
+/// `ferx <model> --data … --output run.fitrx` opens the model file exactly once
+/// (#1760 review r1, finding 1: the `--output` branch read it a second time to hand
+/// `save_fit` a source that `save_fit` then ignored in favour of `model_text`).
+///
+/// The model is a FIFO served by a thread in this test that counts its opens and
+/// serves the example's text on the first one and an edited text on any later one.
+/// After a serve it waits for the reader to close (`ENXIO` on a non-blocking
+/// write-open) before serving again, so two reads are never concatenated — the same
+/// harness as `ferx-core`'s `single_model_read_tests`. Mutation — restore the
+/// `read_to_string(model_path)` in `main.rs`'s `--output` branch: 2 opens.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_fit_with_output_opens_the_model_file_once() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    let nonblocking = |p: &std::path::Path, write: bool| {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .custom_flags(O_NONBLOCK)
+            .open(p)
+    };
+
+    let a = std::fs::read_to_string(repo_root().join("examples/one_cpt_iv.ferx")).unwrap();
+    let b = format!("{a}\n# edited after the first read\n");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("one_cpt_iv.ferx");
+    let made = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(made.success(), "mkfifo");
+    let opens = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let (fifo, opens, stop, a) = (fifo.clone(), opens.clone(), stop.clone(), a.clone());
+        std::thread::spawn(move || loop {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let n = opens.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = f.write_all(if n == 1 { a.as_bytes() } else { b.as_bytes() });
+            drop(f);
+            while nonblocking(&fifo, true).is_ok() {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg(&fifo)
+        .arg("--data")
+        .arg(repo_root().join("data/one_cpt_iv.csv"))
+        .args(["--output", "run.fitrx"])
+        .output()
+        .expect("run ferx fit");
+
+    stop.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !server.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "FIFO server did not stop"
+        );
+        drop(nonblocking(&fifo, false));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    server.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "fit should succeed; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("run.fitrx").exists(),
+        "the bundle is written"
+    );
+    let n = opens.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "the CLI opened the model file {n} times");
+}
