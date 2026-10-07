@@ -1780,6 +1780,16 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && !model.has_non_gaussian()
 }
 
+/// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
+/// [`closed_form_fixed_ebe_grad_ok`]: its chain rule assumes `ipreds = f₀ + a·η̂` and
+/// a single `(∂R/∂σ_k, ∂d/∂σ_k)` per observation, so it also needs analytical PK and
+/// `ErrorSpec::Single`. Kept apart from the gate so a test can assert that a fixture
+/// satisfies everything *but* the gate — `sb_ok` is exactly the conjunction of the two,
+/// so a new Sheiner–Beal restriction belongs here.
+pub(crate) fn sheiner_beal_scope_ok(model: &CompiledModel) -> bool {
+    model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_))
+}
+
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
@@ -1823,7 +1833,8 @@ pub(crate) fn subject_nll_pop_grad(
     //     through `error_spec` (so per-CMT works), and the θ axis is a
     //     forward-FD on `pk::compute_predictions_with_tv` — which itself
     //     dispatches to the ODE solver for ODE models. So Laplace can run on
-    //     ODE + PerCmt models too; the only blockers are M3 and IOV.
+    //     ODE + PerCmt models too; the blockers are what
+    //     `closed_form_fixed_ebe_grad_ok` excludes.
     // IIV on residual error (#409): the closed-form SB/Laplace gradients build
     // R and ∂R/∂σ from σ alone and carry no `exp(2·η_ruv)` scaling nor the extra
     // residual-eta c̃ column that `foce_subject_nll_interaction` now adds. Fall
@@ -1841,8 +1852,7 @@ pub(crate) fn subject_nll_pop_grad(
     // `_scaled` dispatch, which carries the `|f|^{2p}` loading. An exponent
     // that names a θ is θ-dependent like any other magnitude and goes to FD.
     let common_ok = closed_form_fixed_ebe_grad_ok(model, template, kappas);
-    let sb_ok =
-        common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
+    let sb_ok = common_ok && sheiner_beal_scope_ok(model);
     let laplace_ok = common_ok;
 
     if (options.interaction && laplace_ok) || (!options.interaction && sb_ok) {
@@ -4521,11 +4531,12 @@ mod tests {
                     &model.default_params,
                     &[]
                 ));
-                // The straddle: Sheiner–Beal's extra conditions on top of the gate.
+                // The straddle: Sheiner–Beal's extra conditions on top of the gate,
+                // read off the predicate `sb_ok` itself rather than a paraphrase.
                 // Asserted both ways, so the placeholder spelling cannot silently stop
                 // reaching the FOCE closed form and leave that leg a tautology.
                 assert_eq!(
-                    model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_)),
+                    sheiner_beal_scope_ok(&model),
                     sb_reachable,
                     "{label}: fixture precondition: Sheiner–Beal's own conditions"
                 );
@@ -4612,6 +4623,52 @@ mod tests {
                 })
                 .collect();
             let pop = population(&["X"], vec![s]);
+            let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
+            for interaction in [true, false] {
+                check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
+            }
+        }
+
+        /// A CTMM endpoint takes the same exclusion. The binary fixture pins the gate's
+        /// discrete arm over `has_tte()`; this one pins its CTMM arm over
+        /// `has_tte() || has_discrete()`, which passes every other test here. The
+        /// generator is `examples/ctmm_2state.ferx`'s, `n_eta = 0` for the reason the
+        /// binary fixture gives. With no `[error_model]` the FOCE leg is kept off
+        /// Sheiner–Beal by its own scope, so the FOCEI leg is the one that sees the gate.
+        #[cfg(feature = "markov")]
+        #[test]
+        fn ctmm_fixed_ebe_grad_matches_fd_via_fallback() {
+            let model = parse(
+                "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, \
+                 3.0)\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
+                 asleep=1]\n  transition awake  -> asleep = exp(LQ01)\n  transition asleep -> \
+                 awake  = exp(LQ10)\n",
+            );
+            assert!(
+                model.has_ctmm() && !model.has_tte() && !model.has_discrete(),
+                "fixture precondition: a CTMM endpoint and neither a TTE nor a discrete one"
+            );
+            assert!(!sheiner_beal_scope_ok(&model));
+            assert!(!closed_form_fixed_ebe_grad_ok(
+                &model,
+                &model.default_params,
+                &[]
+            ));
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            // Both transitions and a stay, so both log-intensities carry a θ-gradient.
+            s.obs_records = [(0.0, 0), (1.5, 1), (3.0, 1), (5.0, 0)]
+                .into_iter()
+                .map(|(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 5,
+                })
+                .collect();
+            let pop = population(&[], vec![s]);
             let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
             for interaction in [true, false] {
                 check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
