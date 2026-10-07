@@ -858,6 +858,26 @@ fn run_sir_in_box(
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 
+    // `sir_draw_ofv` scores a `[mixture]` model with the K-class marginal, which needs
+    // the per-class Ω/Σ (#1755); and a non-mixture model has no class to score. A
+    // mismatch is a caller error, refused here rather than panicking in `mixture_ofv`.
+    match (model.mixture.is_some(), params.mixture.is_some()) {
+        (true, false) => {
+            return Err(
+                "run_sir_core: the model declares [mixture] but the parameters carry \
+                 no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
+                 fitted_params_from_result or pass the fit's own parameters."
+                    .to_string(),
+            )
+        }
+        (false, true) => {
+            return Err("run_sir_core: the parameters carry per-class Ω/Σ \
+                 (ModelParameters::mixture) but the model declares no [mixture]."
+                .to_string())
+        }
+        _ => {}
+    }
+
     if n_resamples > n_samples {
         return Err("sir_resamples must be <= sir_samples".to_string());
     }
@@ -1050,37 +1070,14 @@ fn run_sir_in_box(
         z_vectors.push(z_free.into_iter().map(|zi| zi * scale).collect());
     }
 
-    // Step 2: Evaluate importance weights in parallel (warm-started inner loop)
-    let inner_maxiter = options.inner_maxiter;
-    let inner_tol = options.inner_tol;
-
-    // OFV (prior included) at one admissible packed point, EBEs re-solved warm
-    // from the fit's. Shared by the draws and the low-ESS floor probe, so the
-    // probe's ΔOFV is the very quantity the weights score.
+    // Step 2: Evaluate importance weights in parallel (warm-started inner loop).
+    // OFV (prior included) at one admissible packed point. Shared by the draws and the
+    // low-ESS floor probe, so the probe's ΔOFV is the very quantity the weights score.
     let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
-        let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-        let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
-            model,
-            population,
-            params_k,
-            inner_maxiter,
-            inner_tol,
-            Some(eta_hats),
-            Some(&sir_mu_k),
-            0, // SIR: no EBE convergence tracking
-            0, // SIR: warm-started; no inner multi-start
-            InnerHessianSeed::None,
-            // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are
-            // the frozen-variance mode that marginal linearises around (#1722).
-            options,
-        );
-        // Through the method-aware seam, so an AGQ fit's SIR weights come from
-        // the AGQ marginal it was actually optimised against, not the FOCE one.
-        let nll_k = pop_nll_opts(model, population, params_k, &ehs, &hms, &kappas, options);
-        // The prior half, at this draw. `x_k` is already the packed vector
-        // the penalty is defined on. A no-op (`+ 0.0`) for an unpriored fit,
-        // so those weights stay bit-identical.
-        2.0 * nll_k + priors.penalty(x_k)
+        // The prior half, at this draw. `x_k` is already the packed vector the penalty
+        // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
+        // bit-identical.
+        sir_draw_ofv(model, population, params_k, eta_hats, options) + priors.penalty(x_k)
     };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
@@ -1264,6 +1261,55 @@ fn run_sir_in_box(
     })
 }
 
+/// The **data** objective (−2 log L, no prior) SIR scores one draw with: the objective
+/// the fit minimised, re-evaluated at `params` (#1755).
+///
+/// * A `[mixture]` model scores the K-class marginal, [`mixture_ofv`], cold
+///   (`warm = None`) — the objective a mixture fit reports, which the one-class
+///   `pop_nll_opts` is not: on `tests/nonmem/mixture_iv.csv` with a class-2 Ω override
+///   that was 937.968 against the fit's 298.328 at the estimates, a gap that moved by
+///   hundreds across draws and left an ESS of 1.09 of 200.
+/// * Every other model re-solves the EBEs warm from the fit's (`eta_hats`) and takes
+///   [`pop_nll_opts`] under `options`, whose `method` / `interaction` the callers set to
+///   the fit's own through `fit_inputs::scoring_options` — so a Laplace fit is scored
+///   with its Laplace marginal, not the FOCEI one.
+///
+/// At the estimates this equals the fit's data OFV exactly (pinned by
+/// `sir_draw_ofv_at_the_estimate_is_the_fits_objective`).
+///
+/// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
+pub(crate) fn sir_draw_ofv(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> f64 {
+    if model.mixture.is_some() {
+        return crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
+            .ofv;
+    }
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+        model,
+        population,
+        params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(eta_hats),
+        Some(&mu_k),
+        0, // SIR: no EBE convergence tracking
+        0, // SIR: warm-started; no inner multi-start
+        InnerHessianSeed::None,
+        // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are the
+        // frozen-variance mode that marginal linearises around (#1722).
+        options,
+    );
+    // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
+    // marginal it was actually optimised against, not the FOCE one.
+    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+}
+
 /// The IOV kappa variances of one unpacked draw — the `omega_iov` diagonal, in
 /// packed (`kappa_names`) order, as `ci_kappa` reports them (#1705). Empty for a
 /// model with no kappa. Only the diagonal, like `ci_omega`: a `block_kappa`'s
@@ -1317,6 +1363,10 @@ fn percentile_ci(values: &[f64]) -> (f64, f64) {
 #[cfg(test)]
 #[path = "sir_low_ess_tests.rs"]
 mod low_ess_tests;
+
+#[cfg(test)]
+#[path = "sir_scorer_tests.rs"]
+mod scorer_tests;
 
 #[cfg(test)]
 mod tests {

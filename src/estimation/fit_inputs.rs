@@ -333,11 +333,39 @@ pub(crate) fn resolve_fit_inputs<'a>(
     Ok(inputs)
 }
 
-/// The caller's options with `interaction` set to the marginal `fit` was estimated
-/// under (#1710), for a post-hoc step that re-scores the objective at the fit's
-/// estimates.
+/// The caller's options scoring the objective a stage running `method` minimised:
+/// `method` itself (so `pop_nll_opts` takes the Laplace/AGQ marginal for a Laplace fit,
+/// and the inner solve its seed and variance convention), no chain, and the
+/// interaction flag [`interaction_for`] gives that method over `inherited_interaction`.
 ///
-/// Keyed on `fit.method` first, through the same [`interaction_for`] rule the stage
+/// The **single** builder of SIR's (and the standalone covariance step's) scoring
+/// options (#1755): `fit()` calls it with its last estimating stage for the in-fit SIR
+/// and its fallback, and [`fitted_marginal_options`] calls it with the fit's recorded
+/// method for `run_sir` / `run_covariance`. Before, `run_sir` scored `options.method`
+/// (the caller's, `FoceI` by default) on a Laplace fit, and the in-fit SIR of a chain
+/// `[focei, laplace]` scored the top-level `method` rather than the final stage.
+///
+/// `n_agq` is still the caller's: a `FitResult` does not record it (#1758).
+///
+/// [`interaction_for`]: crate::types::interaction_for
+pub(crate) fn scoring_options(
+    method: crate::types::EstimationMethod,
+    inherited_interaction: bool,
+    options: &FitOptions,
+) -> FitOptions {
+    FitOptions {
+        method,
+        methods: Vec::new(),
+        interaction: crate::types::interaction_for(method, inherited_interaction),
+        ..options.clone()
+    }
+}
+
+/// The caller's options with `method` and `interaction` set to the marginal `fit` was
+/// estimated under (#1710, #1755), for a post-hoc step that re-scores the objective at
+/// the fit's estimates. [`scoring_options`] over `fit.method` and `fit.interaction`.
+///
+/// The interaction flag is keyed on `fit.method` first, through the same [`interaction_for`] rule the stage
 /// loop uses, and on the stored `fit.interaction` only for a method the rule passes
 /// through (Gauss-Newton). So a `.fitrx` written before #1710 — whose FOCE fits carry
 /// the leaked `interaction: true` — still re-scores under FOCE, and a caller passing
@@ -347,10 +375,7 @@ pub(crate) fn resolve_fit_inputs<'a>(
 ///
 /// [`interaction_for`]: crate::types::interaction_for
 pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
-    FitOptions {
-        interaction: crate::types::interaction_for(fit.method, fit.interaction),
-        ..options.clone()
-    }
+    scoring_options(fit.method, fit.interaction, options)
 }
 
 /// The #1619 / #1622 fixture, shared by the `run_covariance` and `run_sir` tests:

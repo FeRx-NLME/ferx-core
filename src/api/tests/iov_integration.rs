@@ -2156,7 +2156,8 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
     // The supported way to rebuild parameters from a fit — the fix the R bridge
     // mirrors. It must carry the IOV covariance through, and simulate cleanly.
     let params =
-        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model);
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model)
+            .expect("non-mixture fit rebuilds");
     assert!(
         params.omega_iov.is_some(),
         "fitted_params_from_result must thread omega_iov through for a kappa model"

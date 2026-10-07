@@ -2514,6 +2514,13 @@ fn fit_inner(
                 .to_string(),
         );
     }
+    // SIR and its fallback score every draw with the objective the last estimating stage
+    // minimised — its method as well as its interaction flag (#1755) — through the same
+    // builder `run_sir` uses on the fit, so the two cannot drift. `post_opts` alone keeps
+    // the top-level `method`: on a chain `[focei, laplace]` that weighted the Laplace
+    // estimates with the FOCEI objective.
+    let sir_opts =
+        crate::estimation::fit_inputs::scoring_options(final_method, options.interaction, options);
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
             if options.verbose {
@@ -2526,7 +2533,7 @@ fn fit_inner(
                 &result.eta_hats,
                 cov,
                 result.ofv,
-                options,
+                &sir_opts,
             ) {
                 Ok(sir) => {
                     for w in &sir.warnings {
@@ -2555,7 +2562,7 @@ fn fit_inner(
     // (`covariance_fallback = sir` or `sir = true`), run SIR with the rectified
     // |eigenvalue| proposal built inside compute_covariance.
     let sir_fallback_result = resolve_sir_fallback(
-        options,
+        &sir_opts,
         result.covariance_matrix.is_some(),
         sir_result.is_some(),
         result.sir_fallback_proposal.as_ref(),

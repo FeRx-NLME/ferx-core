@@ -331,6 +331,18 @@ let fit_with_sir = run_sir(&fit, None, None, &opts)?;
 
 `run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (IOV models), `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
 
+### Which objective weights the draws
+
+Every draw is weighted with the objective the fit minimised, so `run_sir(&fit, None, None, &opts)` reproduces the SIR that `fit()` runs with `sir = true` at the same `sir_samples`, `sir_resamples` and `sir_seed`, bit for bit ([#1755](https://github.com/FeRx-NLME/ferx-core/issues/1755)):
+
+- **The fit's method, not the caller's.** `method` and `interaction` come from the fit (`fit.method`, the last estimating stage of a chain), whatever `opts` says. A Laplace fit is scored with the Laplace marginal even when `opts` is `FitOptions::default()` (FOCEI). The same holds inside `fit()`: a chain `methods = [focei, laplace]` scores its SIR with Laplace, the stage that produced the estimates. `run_covariance` takes the method from the fit in the same way.
+- **The mixture marginal for a `[mixture]` model.** Each draw is scored with the K-class marginal the mixture fit reports as its OFV, and the per-class Ω/Σ overrides (`omega(2) ETA_CL ~ …`) are rebuilt from the fit ([#1704](https://github.com/FeRx-NLME/ferx-core/issues/1704)). The SIR intervals cover the base θ/Ω/Σ; the overrides are sampled but get no interval of their own.
+
+Two limits:
+
+- **`n_agq` is read from `opts`.** A `FitResult` does not record the AGQ node count yet ([#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)), so for a fit with `n_agq > 1` pass the same `n_agq` the fit used.
+- **Mixture overrides are not stored on a `FitResult`.** Their fitted values are carried only by the in-memory result of a FOCE, FOCEI, Laplace or Gauss-Newton `fit()`. For a `[mixture]` model with at least one override, `run_sir` and `run_covariance` return an error on a fit loaded from `.fitrx`, built in R, or estimated by SAEM, IMP or Bayes ([#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)). A mixture model without overrides is not affected.
+
 ### Caller-supplied vs. re-read inputs
 
 The second and third arguments to `run_sir` are `Option<&CompiledModel>` and `Option<&Population>`:

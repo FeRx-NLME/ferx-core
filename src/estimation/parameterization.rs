@@ -709,42 +709,10 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
     // then apply this class's overrides from the packed scalars (same order as
     // `pack_params`: all Omega overrides, then all Sigma overrides).
     let mixture = template.mixture.as_ref().map(|tmpl| {
-        let k = tmpl.omega.len();
-        let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
-        let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
-        for &(c, e) in &tmpl.omega_override_addr {
-            let chol_diag = v[idx].exp();
-            idx += 1;
-            class_omega_mat[c][(e, e)] = chol_diag * chol_diag;
-        }
-        for &(c, s) in &tmpl.sigma_override_addr {
-            class_sigma_val[c][s] = v[idx].exp();
-            idx += 1;
-        }
-        let class_omega = (0..k)
-            .map(|c| {
-                OmegaMatrix::from_matrix_with_mask(
-                    class_omega_mat[c].clone(),
-                    omega.eta_names.clone(),
-                    omega.diagonal,
-                    omega.free_mask.clone(),
-                )
-            })
-            .collect();
-        let class_sigma = (0..k)
-            .map(|c| SigmaVector {
-                values: class_sigma_val[c].clone(),
-                names: sigma.names.clone(),
-            })
-            .collect();
-        crate::types::MixtureParams {
-            omega: class_omega,
-            sigma: class_sigma,
-            omega_override_addr: tmpl.omega_override_addr.clone(),
-            omega_override_fixed: tmpl.omega_override_fixed.clone(),
-            sigma_override_addr: tmpl.sigma_override_addr.clone(),
-            sigma_override_fixed: tmpl.sigma_override_fixed.clone(),
-        }
+        let n = tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len();
+        let mix = mixture_from_base(tmpl, &omega, &sigma, &v[idx..idx + n]);
+        idx += n;
+        mix
     });
 
     // Residual correlations (#847). The pair indices are structural, so they are
@@ -774,6 +742,60 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
         mixture,
+    }
+}
+
+/// The per-class Ω/Σ of a `[mixture]` model (#977): every class starts from the base
+/// `omega` / `sigma`, so a non-overridden entry tracks the base, and each override in
+/// `tmpl`'s address lists takes its value from `packed`, the override segment of a
+/// packed vector (`ln` Cholesky diagonal per Ω override, then `ln` value per Σ override,
+/// the [`pack_params`] order). `packed.len()` must equal the override count.
+///
+/// The one implementation of that rebuild: [`unpack_params`] reads it for every packed
+/// point, and `fitted_params_from_result` for a fit's estimates (#1704), so the
+/// standalone SIR and covariance steps get the very class matrices the fit had.
+pub(crate) fn mixture_from_base(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    packed: &[f64],
+) -> crate::types::MixtureParams {
+    let k = tmpl.omega.len();
+    let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
+    let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
+    let (packed_omega, packed_sigma) = packed.split_at(tmpl.omega_override_addr.len());
+    for (&(c, e), &x) in tmpl.omega_override_addr.iter().zip(packed_omega) {
+        let chol_diag = x.exp();
+        class_omega_mat[c][(e, e)] = chol_diag * chol_diag;
+    }
+    for (&(c, si), &x) in tmpl.sigma_override_addr.iter().zip(packed_sigma) {
+        class_sigma_val[c][si] = x.exp();
+    }
+    let class_omega = class_omega_mat
+        .into_iter()
+        .map(|m| {
+            OmegaMatrix::from_matrix_with_mask(
+                m,
+                omega.eta_names.clone(),
+                omega.diagonal,
+                omega.free_mask.clone(),
+            )
+        })
+        .collect();
+    let class_sigma = class_sigma_val
+        .into_iter()
+        .map(|values| SigmaVector {
+            values,
+            names: sigma.names.clone(),
+        })
+        .collect();
+    crate::types::MixtureParams {
+        omega: class_omega,
+        sigma: class_sigma,
+        omega_override_addr: tmpl.omega_override_addr.clone(),
+        omega_override_fixed: tmpl.omega_override_fixed.clone(),
+        sigma_override_addr: tmpl.sigma_override_addr.clone(),
+        sigma_override_fixed: tmpl.sigma_override_fixed.clone(),
     }
 }
 
