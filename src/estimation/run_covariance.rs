@@ -1186,6 +1186,9 @@ mod from_fit_bindings {
             err.to_string(),
             format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
         );
+        // #1746: a population that is not the fit's has no `ferx check` code.
+        assert_eq!(err.code(), None, "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
         // …then the right count in the wrong order, naming the first position.
         let mut swapped = level.prep.population.clone();
         swapped.subjects.swap(1, 2);
@@ -1541,6 +1544,16 @@ mod from_fit_bindings {
         assert!(
             err.to_string()
                 .starts_with("run_covariance: model hash mismatch for "),
+            "{err}"
+        );
+        // #1746: an input `ferx check` has no code for carries none — "refused, no
+        // code" stays distinct from a coded precondition — and is still attributed
+        // to the entry point. Mutation: give non-diagnostic errors a generic code →
+        // the `None` assert dies.
+        assert_eq!(err.code(), None, "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
+        assert!(
+            err.message().starts_with("model hash mismatch for "),
             "{err}"
         );
         assert!(

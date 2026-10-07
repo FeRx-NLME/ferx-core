@@ -544,6 +544,8 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
     assert!(from_fit.bound_from_fit());
 
     let e = preds(&from_fit, &design).expect_err("from fit: unlisted level refused");
+    // The from-fit refusal is the one ferx-r#498 maps: it carries the code (#1746).
+    assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
     for needle in [
         "has the fit's levels [1.0, 2.0, 3.0] (reference 2)",
         "`GRP` takes [4.0] in this data",
@@ -709,6 +711,16 @@ fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() 
             err.to_string().contains("`GRP` takes [4.0] in this data"),
             "{entry}: {err}"
         );
+        // #1746: the refusal keeps `ferx check`'s diagnostic through the input
+        // resolution, and the entry point is its context, not part of its message.
+        // Mutations: `.to_string()` the level error in `resolve_fit_inputs` → the code
+        // asserts die; bake `"{entry}: "` back into the message → `message()` dies;
+        // drop the context → `context()` and the `starts_with` above die.
+        assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{entry}: {err}");
+        assert_eq!(err.block(), Some("covariate_model"), "{entry}: {err}");
+        assert_eq!(err.context(), Some(entry), "{entry}: {err}");
+        assert!(!err.message().starts_with(entry), "{entry}: {err}");
+        assert_eq!(err.to_string(), format!("{entry}: {}", err.message()));
     }
     crate::run_covariance(&fit, Some(&m), Some(&fit_pop), &opts)
         .expect("the fit's own population is not refused");

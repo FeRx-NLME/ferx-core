@@ -435,6 +435,8 @@ mod tests {
             e.to_string().contains("`GRP` takes [4.0] in this data"),
             "{e}"
         );
+        // #1746: the refusal carries `ferx check`'s code.
+        assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
     }
 
     /// Regression for #506: NPDE/NPD must simulate against the time-varying
