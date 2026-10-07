@@ -1253,6 +1253,11 @@ mod from_fit_bindings {
             ),
             "{err}"
         );
+        // #1746 (review r1 #3/#4): an input refusal that `ferx check` codes keeps its
+        // code and is attributed to the entry point. Mutation: assert the model bound
+        // through `assert_covariate_model_bound(m)?` (String) again → `code()` dies.
+        assert_eq!(err.code(), Some("E_COVSTAT_UNRESOLVED"), "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
     }
 
     /// The #1729 refusal, spelled out in full so deleting any sentence of it in
