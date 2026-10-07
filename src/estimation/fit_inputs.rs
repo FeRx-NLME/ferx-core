@@ -219,8 +219,9 @@ fn check_lent_stats(
 /// | The fit carries | Re-read with | `(Some(m), None)` on an IOV model | Verified |
 /// |---|---|---|---|
 /// | settings + fingerprint | the recorded settings | runs (`iov_column` is recorded) | yes |
+/// | settings + a fingerprint of another scheme | the recorded settings | runs | no; warns |
 /// | a fingerprint only (`fit()` on an in-memory population) | the model file's | refused | yes |
-/// | neither (an older `.fitrx`), or a fingerprint of another scheme | the model file's | refused | no |
+/// | neither (an older `.fitrx`) | the model file's | refused | no |
 ///
 /// Every refusal is attributed to `entry` as the [`EngineError`]'s context, so it
 /// prints as `"{entry}: {message}"`; a refusal `ferx check` codes
@@ -241,9 +242,10 @@ fn resolve_fit_inputs_unattributed<'a>(
     model: Option<&'a CompiledModel>,
     population: Option<&'a Population>,
 ) -> Result<FitInputs<'a>, EngineError> {
-    // A fingerprint of another scheme cannot be compared: the fit is treated as one
-    // without, and the result says so. Recorded settings are used only with a
-    // fingerprint to verify their re-read against.
+    // A fingerprint of another scheme cannot be compared: the population is not
+    // verified, and the result says so. Recorded settings are still replayed without
+    // one (review r1 #5): they are the settings the fit read with, where the model
+    // file's can lack a caller's row filter.
     let mut warnings = Vec::new();
     let fingerprint = match fit.population_fingerprint.as_ref() {
         Some(fp) if !fp.is_current() => {
@@ -252,10 +254,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         }
         fp => fp,
     };
-    let settings = fit
-        .reader_settings
-        .as_ref()
-        .filter(|_| fingerprint.is_some());
+    let settings = fit.reader_settings.as_ref();
 
     // A supplied model carries no `iov_column`, and the one in the model file need
     // not be the one this model was built with, so refuse rather than parse
@@ -330,6 +329,9 @@ fn resolve_fit_inputs_unattributed<'a>(
             Cow::Owned(p)
         }
     };
+    // Whether the model file was read: without recorded settings, a re-read then took
+    // the file's settings rather than the routed reader's (no renames, no selection).
+    let file_settings = file.is_some();
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
     check_subjects(fit, &population)?;
@@ -398,10 +400,11 @@ fn resolve_fit_inputs_unattributed<'a>(
     // Last (#1685): the population the step runs on is the one the fit was given.
     if let Some(fp) = fingerprint {
         if let Some(d) = fp.first_difference(&inputs.population) {
-            let source = match (supplied, settings.is_some()) {
-                (true, _) => PopulationSource::Supplied,
-                (false, true) => PopulationSource::RecordedSettings,
-                (false, false) => PopulationSource::ModelFileSettings,
+            let source = match (supplied, settings.is_some(), file_settings) {
+                (true, _, _) => PopulationSource::Supplied,
+                (false, true, _) => PopulationSource::RecordedSettings,
+                (false, false, true) => PopulationSource::ModelFileSettings,
+                (false, false, false) => PopulationSource::Routed,
             };
             return Err(population_refusal(
                 &d,
@@ -425,6 +428,9 @@ enum PopulationSource {
     /// Re-read with the model file's settings: the fit recorded none (it was given
     /// its population in memory).
     ModelFileSettings,
+    /// Re-read with the model's endpoint routing only: the fit records neither
+    /// settings nor a `model_path` (review r1 #3).
+    Routed,
 }
 
 /// The refusal for a population that is not the one the fit was given (#1685): what
@@ -476,6 +482,12 @@ fn population_refusal(
             "The fit records no reader settings (it was given its population in memory), \
              so `fit.data_path` was re-read with the model file's `[data]` renames and \
              `[data_selection]`, which did not reproduce it. Pass the fit's population as \
+             `population = Some(&pop)`."
+        }
+        PopulationSource::Routed => {
+            "The fit records neither reader settings nor a `model_path`, so `fit.data_path` \
+             was re-read with the model's endpoint routing only: no `[data]` renames and no \
+             `[data_selection]` were applied. Pass the fit's population as \
              `population = Some(&pop)`."
         }
     };

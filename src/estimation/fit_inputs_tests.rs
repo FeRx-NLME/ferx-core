@@ -23,6 +23,10 @@ const FILE: &str = "The fit records no reader settings (it was given its populat
                     memory), so `fit.data_path` was re-read with the model file's `[data]` \
                     renames and `[data_selection]`, which did not reproduce it. Pass the \
                     fit's population as `population = Some(&pop)`.";
+const ROUTED: &str = "The fit records neither reader settings nor a `model_path`, so \
+                      `fit.data_path` was re-read with the model's endpoint routing only: no \
+                      `[data]` renames and no `[data_selection]` were applied. Pass the fit's \
+                      population as `population = Some(&pop)`.";
 const DOSE_CAUSE: &str = " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose \
                           record changes the doses without changing any observation.";
 
@@ -104,6 +108,17 @@ fn a_caller_row_filter_is_replayed_on_the_re_read() {
             run_covariance(&c.fit, m, None, &c.opts).unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_same_covariance(&got, &want, what);
     }
+    // Review r1 #5: a fingerprint of another scheme cannot be compared, but the
+    // recorded settings are still replayed: the re-read is the fitted 240
+    // observations, not the model file's 300 (here the two differ, so the cell
+    // straddles), unverified and with the warning.
+    let mut stale = c.fit.clone();
+    stale.population_fingerprint = stale
+        .population_fingerprint
+        .map(|f| f.with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1));
+    let got = run_covariance(&stale, None, None, &c.opts).expect("stale scheme");
+    assert_same_covariance(&got, &want, "stale scheme, recorded settings");
+    assert!(got.warnings.iter().any(|w| w == STALE_FINGERPRINT_WARNING));
 
     let (n_file, n_fit) = (
         file_read.subjects[0].observations.len(),
@@ -111,8 +126,8 @@ fn a_caller_row_filter_is_replayed_on_the_re_read() {
     );
     assert_eq!((n_file, n_fit), (10, 8));
     let records = format!(
-        "the observation records of subject `1` differ: {n_file} in this population, {n_fit} \
-         in the fit's."
+        "the records of subject `1` differ: {n_file} observations in this population, \
+         {n_fit} in the fit's."
     );
     let err = err_of(run_covariance(
         &c.fit,
@@ -286,9 +301,6 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
         .filter(|w| *w == STALE_FINGERPRINT_WARNING)
         .count();
     assert_eq!(n, 1);
-    // A stale fingerprint's recorded settings are not replayed either: the re-read
-    // falls back to the model file's settings, which state the same filter here.
-    run_covariance(&stale, None, None, &c.opts).expect("legacy re-read");
 
     let mut extra = c.prep.population.clone();
     extra.covariate_names.push("EXTRA".to_string());
@@ -315,6 +327,30 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
             SUPPLIED
         )
     );
+
+    // Review r1 #4: a record that differs with the observation count unchanged says
+    // so, rather than printing "10 in this population, 10 in the fit's".
+    let mut nudged = c.prep.population.clone();
+    nudged.subjects[0].observations[3] *= 1.5;
+    let err = err_of(run_covariance(&c.fit, Some(model), Some(&nudged), &c.opts));
+    assert_eq!(
+        err,
+        refusal(
+            "run_covariance",
+            "the records of subject `1` differ with the same 10 observations: an observation \
+             time, value, compartment, censoring flag or occasion, or an `EVID = 2` or reset \
+             row.",
+            SUPPLIED
+        )
+    );
+
+    // Review r1 #3: no recorded settings and no `model_path` — the routed re-read,
+    // which opens no model file — says what that read did not apply.
+    let mut routed = c.fit.clone();
+    routed.model_path = None;
+    routed.reader_settings = None;
+    let err = err_of(run_covariance(&routed, Some(model), None, &c.opts));
+    assert_eq!(err, refusal("run_covariance", &what, ROUTED));
 }
 
 /// T9: an IOV model with recorded settings. `(Some(model), None)` was refused (the
@@ -414,7 +450,7 @@ fn every_legitimate_cell_resolves_to_the_fitted_population() {
 /// back is passing the fit's population, and must not be refused.
 ///
 /// Mutation — hash `occasions` / `dose_occasions` under a derived rule too: the
-/// supplied cell is refused ("…the observation records of subject `1` differ…").
+/// supplied cell is refused ("…the records of subject `1` differ…").
 #[test]
 fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
     let dir = tempfile::tempdir().unwrap();

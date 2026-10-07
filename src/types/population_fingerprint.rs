@@ -139,10 +139,18 @@ impl std::fmt::Display for Difference {
                 id,
                 population,
                 fit,
-            } => write!(
+            } if population != fit => write!(
                 f,
-                "the observation records of subject `{id}` differ: {population} in this \
+                "the records of subject `{id}` differ: {population} observations in this \
                  population, {fit} in the fit's"
+            ),
+            // The digest covers more than the observation count, so equal counts
+            // need their own wording (review r1 #4).
+            Difference::Records { id, population, .. } => write!(
+                f,
+                "the records of subject `{id}` differ with the same {population} \
+                 observations: an observation time, value, compartment, censoring flag or \
+                 occasion, or an `EVID = 2` or reset row"
             ),
             Difference::Doses {
                 id,
