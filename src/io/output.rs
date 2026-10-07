@@ -533,6 +533,19 @@ fn standard_error_source_note(result: &FitResult) -> Option<String> {
     })
 }
 
+/// The console line naming the settings a SIR block was produced under
+/// (#1758): scale, degrees of freedom, draw counts and seed.
+fn sir_settings_line(st: &crate::estimation::sir::SirSettings) -> String {
+    format!(
+        "Settings: scale {}, df {}, {} samples / {} resamples, seed {}",
+        st.scale.label(),
+        st.df,
+        st.samples,
+        st.resamples,
+        st.seed
+    )
+}
+
 /// Print NONMEM-style results to stderr
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
@@ -799,6 +812,9 @@ pub fn print_results(result: &FitResult) {
     // SIR results
     if let Some(ess) = result.sir_ess {
         eprintln!("\n--- SIR Uncertainty (95% CI) ---");
+        if let Some(ref settings) = result.sir_settings {
+            eprintln!("{}", sir_settings_line(settings));
+        }
         eprintln!("Effective sample size: {:.1}", ess);
         if let Some(ref ci) = result.sir_ci_theta {
             for (i, name) in result.theta_names.iter().enumerate() {
@@ -2829,6 +2845,16 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // SIR section
     if let Some(ess) = result.sir_ess {
         writeln!(f, "\nsir:").map_err(|e| e.to_string())?;
+        if let Some(ref st) = result.sir_settings {
+            // The settings that produced the intervals below (#1758); the
+            // complete record, ODE and inner-loop settings included, is in `.fitrx`.
+            writeln!(f, "  settings:").map_err(|e| e.to_string())?;
+            writeln!(f, "    scale: {}", st.scale.label()).map_err(|e| e.to_string())?;
+            writeln!(f, "    df: {}", st.df).map_err(|e| e.to_string())?;
+            writeln!(f, "    samples: {}", st.samples).map_err(|e| e.to_string())?;
+            writeln!(f, "    resamples: {}", st.resamples).map_err(|e| e.to_string())?;
+            writeln!(f, "    seed: {}", st.seed).map_err(|e| e.to_string())?;
+        }
         writeln!(f, "  effective_sample_size: {:.1}", ess).map_err(|e| e.to_string())?;
         if let Some(ref ci) = result.sir_ci_theta {
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
@@ -3156,6 +3182,7 @@ mod tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
+            sir_settings: None,
             imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
@@ -3496,6 +3523,53 @@ mod tests {
             input_scale: vec![1.0, 1.0],
         }];
         base
+    }
+
+    /// #1758: the SIR block names the settings its intervals came from — the
+    /// console line and the YAML `settings:` map — and says nothing when the fit
+    /// carries no record. Mutations: drop the console `if let` or the YAML block
+    /// (their assertions die); swap any two fields in either (the values are
+    /// all distinct, so the strings differ).
+    #[test]
+    fn sir_block_reports_the_settings_it_ran_under() {
+        let st = crate::estimation::sir::SirSettings {
+            samples: 200,
+            resamples: 100,
+            seed: 7,
+            df: 3.0,
+            scale: crate::types::SirScale::Natural,
+            ..Default::default()
+        };
+        assert_eq!(
+            sir_settings_line(&st),
+            "Settings: scale natural, df 3, 200 samples / 100 resamples, seed 7"
+        );
+
+        let write = |result: &FitResult| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fit.yaml");
+            write_estimates_yaml(result, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        r.sir_ess = Some(82.5);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        let bare = write(&r);
+        assert!(bare.contains("\nsir:"), "{bare}");
+        assert!(
+            !bare.contains("  settings:"),
+            "no record, no settings block:\n{bare}"
+        );
+
+        r.sir_settings = Some(st);
+        let yaml = write(&r);
+        assert!(
+            yaml.contains(
+                "\nsir:\n  settings:\n    scale: natural\n    df: 3\n    samples: 200\n    \
+                 resamples: 100\n    seed: 7\n  effective_sample_size: 82.5\n"
+            ),
+            "{yaml}"
+        );
     }
 
     /// The fitted weights are only interpretable alongside the `(x − center) / scale` they
@@ -3958,6 +4032,7 @@ mod tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
+            sir_settings: None,
             imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),

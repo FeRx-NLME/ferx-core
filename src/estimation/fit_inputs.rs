@@ -337,7 +337,8 @@ fn resolve_fit_inputs_unattributed<'a>(
 /// (the caller's, `FoceI` by default) on a Laplace fit, and the in-fit SIR of a chain
 /// `[focei, laplace]` scored the top-level `method` rather than the final stage.
 ///
-/// `n_agq` is still the caller's: a `FitResult` does not record it (#1758).
+/// `n_agq` is the caller's here; `run_sir` resolves it beforehand from the fit's
+/// `sir_settings` when the caller left it at the default (#1758).
 ///
 /// [`interaction_for`]: crate::types::interaction_for
 pub(crate) fn scoring_options(

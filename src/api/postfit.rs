@@ -578,6 +578,30 @@ pub(crate) fn resolve_sir_fallback(
     }
 }
 
+/// Copy a SIR run onto `out` (#1713): the one mapping from `SirResult` to the
+/// `FitResult` SIR fields, shared by `fit()` and `run_sir`.
+///
+/// `normal` is the SIR on the covariance-step proposal; `fallback` the one on
+/// the non-PD fallback proposal (`resolve_sir_fallback`). The normal run wins
+/// when both are present. With neither, every SIR field is cleared, so a fit
+/// whose SIR did not run reports `sir_seed = None` whatever seed it was handed
+/// (#1758).
+pub(crate) fn apply_sir_result(
+    out: &mut FitResult,
+    normal: Option<&crate::estimation::sir::SirResult>,
+    fallback: Option<&crate::estimation::sir::SirResult>,
+) {
+    let sir = normal.or(fallback);
+    out.sir_ci_theta = sir.map(|s| s.ci_theta.clone());
+    out.sir_ci_omega = sir.map(|s| s.ci_omega.clone());
+    out.sir_ci_sigma = sir.map(|s| s.ci_sigma.clone());
+    out.sir_ci_kappa = sir.and_then(|s| s.kappa_ci());
+    out.sir_ess = sir.map(|s| s.effective_sample_size);
+    out.sir_resamples_packed = sir.and_then(|s| s.resamples_packed.clone());
+    out.sir_seed = sir.map(|s| s.settings.seed);
+    out.sir_settings = sir.map(|s| s.settings.clone());
+}
+
 pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,

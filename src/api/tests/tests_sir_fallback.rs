@@ -224,3 +224,196 @@ fn resolve_sir_fallback_fires_and_yields_finite_cis() {
         "no failure warning expected on the success path: {warnings:?}"
     );
 }
+
+// ── apply_sir_result: the one SirResult → FitResult mapping (#1713, #1758) ──
+
+/// A synthetic `SirResult` whose every reported field is distinguishable by
+/// `tag`, so a field copied from the wrong run (or not copied) shows up.
+fn tagged_sir(tag: f64) -> crate::estimation::sir::SirResult {
+    let settings = crate::estimation::sir::SirSettings {
+        samples: 100 + tag as usize,
+        seed: 1000 + tag as u64,
+        df: 2.0 + tag,
+        scale: SirScale::Natural,
+        ..Default::default()
+    };
+    crate::estimation::sir::SirResult {
+        ci_theta: vec![(tag, tag + 1.0)],
+        ci_omega: vec![(tag + 0.1, tag + 0.2)],
+        ci_sigma: vec![(tag + 0.01, tag + 0.02)],
+        ci_kappa: vec![(tag + 0.03, tag + 0.04)],
+        effective_sample_size: 10.0 * tag,
+        resamples_packed: Some(vec![vec![tag; 3]]),
+        warnings: Vec::new(),
+        settings,
+    }
+}
+
+/// Every SIR field of `out` equals the one `sir` should have produced.
+fn assert_sir_fields_from(out: &FitResult, sir: &crate::estimation::sir::SirResult, who: &str) {
+    assert_eq!(out.sir_ci_theta.as_ref(), Some(&sir.ci_theta), "{who}: θ");
+    assert_eq!(out.sir_ci_omega.as_ref(), Some(&sir.ci_omega), "{who}: Ω");
+    assert_eq!(out.sir_ci_sigma.as_ref(), Some(&sir.ci_sigma), "{who}: σ");
+    assert_eq!(out.sir_ci_kappa.as_ref(), Some(&sir.ci_kappa), "{who}: κ");
+    assert_eq!(out.sir_ess, Some(sir.effective_sample_size), "{who}: ESS");
+    assert_eq!(
+        out.sir_resamples_packed, sir.resamples_packed,
+        "{who}: resamples"
+    );
+    assert_eq!(out.sir_seed, Some(sir.settings.seed), "{who}: seed");
+    assert_eq!(
+        out.sir_settings.as_ref(),
+        Some(&sir.settings),
+        "{who}: settings"
+    );
+}
+
+/// T1 (#1713): with only the non-PD fallback run, all eight SIR fields come
+/// from it — κ included, the field #1713 found unpinned. Mutations: drop the
+/// helper's `.or(fallback)` (every assertion dies), or drop any one field
+/// assignment (that field's assertion dies, its `who` naming it).
+#[test]
+fn apply_sir_result_fills_every_field_from_the_fallback() {
+    let fb = tagged_sir(3.0);
+    let mut out = crate::types::test_helpers::minimal_fit_result();
+    apply_sir_result(&mut out, None, Some(&fb));
+    let k = out.sir_ci_kappa.as_ref().expect("fallback κ CI");
+    assert_eq!(k.len(), 1);
+    assert!(k[0].0.is_finite() && k[0].1.is_finite(), "{k:?}");
+    assert_sir_fields_from(&out, &fb, "fallback");
+}
+
+/// T2: with both runs present the normal SIR wins, field by field. Mutation:
+/// `fallback.or(normal)` reports the fallback's values.
+#[test]
+fn apply_sir_result_prefers_the_normal_run() {
+    let normal = tagged_sir(1.0);
+    let fb = tagged_sir(3.0);
+    let mut out = crate::types::test_helpers::minimal_fit_result();
+    apply_sir_result(&mut out, Some(&normal), Some(&fb));
+    assert_sir_fields_from(&out, &normal, "normal");
+}
+
+/// T3 (#1758): with neither run, every SIR field is cleared — including a
+/// `sir_seed` the fit was handed but never used. Mutation: a helper that only
+/// writes on `Some`, or that leaves `sir_seed` alone, keeps the stale values.
+#[test]
+fn apply_sir_result_clears_every_field_when_sir_did_not_run() {
+    let mut out = crate::types::test_helpers::minimal_fit_result();
+    apply_sir_result(&mut out, Some(&tagged_sir(1.0)), None);
+    assert!(out.sir_seed.is_some() && out.sir_settings.is_some());
+    apply_sir_result(&mut out, None, None);
+    assert_eq!(out.sir_ci_theta, None);
+    assert_eq!(out.sir_ci_omega, None);
+    assert_eq!(out.sir_ci_sigma, None);
+    assert_eq!(out.sir_ci_kappa, None);
+    assert_eq!(out.sir_ess, None);
+    assert_eq!(out.sir_resamples_packed, None);
+    assert_eq!(out.sir_seed, None);
+    assert_eq!(out.sir_settings, None);
+}
+
+/// T4 (#1713, #1758): the fallback path through `run_sir_core` on a real IOV
+/// model returns a κ interval, and records the settings it scored under.
+/// `warfarin_iov` (one kappa), a tame PD proposal as in `warfarin_fixture`,
+/// FOCE as the file declares it — FD inner gradients. Every recorded setting
+/// is off its default except the two process-global ones, `inner_optimizer`
+/// and `ebe_warm_start`: `run_sir_core` now applies them for its run (#1767),
+/// and a non-default value written here would reach a concurrent test's fit in
+/// this shared binary. They are pinned in `tests/run_sir_inner_settings_scope.rs`
+/// and by the resolve test. So a `run_sir_core` that stamped `Default` (or read
+/// a field from the defaults in `SirSettings::from_options`) fails the
+/// equality. Mutations: stamp `SirSettings::default()` in `run_sir_core`; drop
+/// κ from the SIR.
+#[test]
+fn resolve_sir_fallback_records_its_settings_and_kappa() {
+    let prep = crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare warfarin_iov");
+    let model = &prep.parsed.model;
+    let pop = &prep.population;
+    let params = prep.init_params.clone();
+    let eta_hats: Vec<DVector<f64>> = (0..pop.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let n_packed = crate::estimation::parameterization::pack_params(&params).len();
+    let proposal = DMatrix::from_diagonal(&DVector::from_element(n_packed, 0.01));
+    let opts = FitOptions {
+        verbose: false,
+        covariance_fallback: CovarianceFallback::Sir,
+        sir_samples: 40,
+        sir_resamples: 20,
+        sir_seed: Some(1713),
+        sir_df: 7.0,
+        sir_scale: SirScale::Natural,
+        sir_keep_samples: true,
+        inner_maxiter: 150,
+        inner_tol: 2e-5,
+        mu_referencing: false,
+        n_agq: 3,
+        ode_reltol: 2e-4,
+        ode_abstol: 2e-6,
+        ode_max_steps: 9_000,
+        ode_method: crate::ode::OdeMethod::Rodas4,
+        ode_stiff_abort_after: Some(17),
+        ode_auto_switch: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let mut warnings = Vec::new();
+    let sir = resolve_sir_fallback(
+        &opts,
+        false,
+        false,
+        Some(&proposal),
+        model,
+        pop,
+        &params,
+        &eta_hats,
+        0.0,
+        &mut warnings,
+    )
+    .unwrap_or_else(|| panic!("the fallback must run: {warnings:?}"));
+    assert_eq!(sir.ci_kappa.len(), 1, "one κ interval: {:?}", sir.ci_kappa);
+    let (lo, hi) = sir.ci_kappa[0];
+    assert!(
+        lo.is_finite() && hi.is_finite() && lo <= hi,
+        "κ [{lo}, {hi}]"
+    );
+    let want = crate::estimation::sir::SirSettings::from_options(&opts);
+    assert_ne!(
+        want,
+        crate::estimation::sir::SirSettings::default(),
+        "the fixture must be off-default, or the stamp check is a tautology"
+    );
+    assert_eq!(sir.settings, want);
+    assert_eq!(sir.settings.seed, 1713);
+}
+
+/// T8 (#1758): a fit whose SIR did not run reports neither a seed nor
+/// settings, even when it was handed a `sir_seed` (before #1758 it echoed the
+/// option). warfarin, `sir = false`, no covariance step. Mutation: the
+/// pre-#1758 pair — the literal echoes `options.sir_seed` *and* the helper
+/// leaves `sir_seed` alone when no SIR ran. Either half alone is inert, since
+/// the helper clears what the literal set (T3 pins that half).
+#[test]
+fn a_fit_without_sir_reports_no_sir_seed_or_settings() {
+    let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("prepare warfarin");
+    let opts = FitOptions {
+        verbose: false,
+        sir: false,
+        run_covariance_step: false,
+        sir_seed: Some(9),
+        outer_maxiter: 2,
+        ..prep.parsed.fit_options.clone()
+    };
+    let fit = crate::api::fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("fit");
+    assert_eq!(fit.sir_ess, None, "SIR must not have run");
+    assert_eq!(fit.sir_seed, None);
+    assert_eq!(fit.sir_settings, None);
+}

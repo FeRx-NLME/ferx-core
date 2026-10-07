@@ -46,6 +46,102 @@ pub struct SirResult {
     /// — currently the rank deficiency and the bound-driven shrinkage the
     /// proposal needed (#1021). Empty on a clean run.
     pub warnings: Vec<String>,
+    /// Every setting these draws were scored under, read off the options
+    /// `run_sir_core` was handed — so it records what ran, including a value
+    /// the caller tightened on the way in (an LTBS fit's `inner_tol`) (#1758).
+    pub settings: SirSettings,
+}
+
+/// Every [`FitOptions`] setting that changes a SIR result, as one SIR run used
+/// it (#1758). Carried on [`FitResult::sir_settings`] so a later
+/// [`run_sir`](crate::run_sir) on that fit re-scores under the same settings by
+/// default, and so a reader can tell which scale, degrees of freedom and seed
+/// produced the reported intervals.
+///
+/// Recorded inside `run_sir_core` from the options it scored with, never by a
+/// caller, so the record cannot disagree with the draws.
+///
+/// `method` and `interaction` are not here: they already ride on the
+/// [`FitResult`] (`method`, `interaction`), and which of them SIR scores is
+/// [`run_sir`](crate::run_sir)'s business (#1710).
+///
+/// `Default` is `SirSettings::from_options(&FitOptions::default())`, the
+/// settings of a SIR run that changed nothing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SirSettings {
+    /// `sir_samples`: proposal draws.
+    pub samples: usize,
+    /// `sir_resamples`: draws kept by the resampling step.
+    pub resamples: usize,
+    /// The seed the draws used, resolved: `sir_seed`, or the built-in default
+    /// when that was unset. So the run is reproducible from this field alone.
+    pub seed: u64,
+    /// `sir_df`: Student-t proposal degrees of freedom.
+    pub df: f64,
+    /// `sir_scale`: the scale SIR's flat prior is flat on (#1723).
+    pub scale: SirScale,
+    /// `sir_keep_samples`: whether the resampled vectors were retained.
+    pub keep_samples: bool,
+    /// `inner_maxiter` of each draw's EBE re-solve.
+    pub inner_maxiter: usize,
+    /// `inner_tol` of each draw's EBE re-solve.
+    pub inner_tol: f64,
+    /// `mu_referencing` (read by the IOV re-solve).
+    pub mu_referencing: bool,
+    /// `n_agq`: quadrature nodes of the scored marginal.
+    pub n_agq: usize,
+    /// `inner_optimizer`: the per-subject EBE solver.
+    pub inner_optimizer: InnerOptimizer,
+    /// `ebe_warm_start`: warm-started Nelder–Mead fallback.
+    pub ebe_warm_start: bool,
+    /// `ode_reltol` of every ODE solve.
+    pub ode_reltol: f64,
+    /// `ode_abstol` of every ODE solve.
+    pub ode_abstol: f64,
+    /// `ode_max_steps` per ODE segment.
+    pub ode_max_steps: usize,
+    /// `ode_method`: the ODE stepper.
+    pub ode_method: crate::ode::OdeMethod,
+    /// `ode_stiff_abort_after`: the stiff-segment abort budget.
+    pub ode_stiff_abort_after: Option<u32>,
+    /// `ode_auto_switch`: in-segment stepper switching under `ode_method = auto`.
+    pub ode_auto_switch: bool,
+}
+
+/// The SIR seed when `sir_seed` is unset.
+const DEFAULT_SIR_SEED: u64 = 12345;
+
+impl SirSettings {
+    /// The settings a SIR run under `options` uses: each field copied, the seed
+    /// resolved to the built-in default when `options.sir_seed` is `None`.
+    pub fn from_options(options: &FitOptions) -> Self {
+        Self {
+            samples: options.sir_samples,
+            resamples: options.sir_resamples,
+            seed: options.sir_seed.unwrap_or(DEFAULT_SIR_SEED),
+            df: options.sir_df,
+            scale: options.sir_scale,
+            keep_samples: options.sir_keep_samples,
+            inner_maxiter: options.inner_maxiter,
+            inner_tol: options.inner_tol,
+            mu_referencing: options.mu_referencing,
+            n_agq: options.n_agq,
+            inner_optimizer: options.inner_optimizer,
+            ebe_warm_start: options.ebe_warm_start,
+            ode_reltol: options.ode_reltol,
+            ode_abstol: options.ode_abstol,
+            ode_max_steps: options.ode_max_steps,
+            ode_method: options.ode_method,
+            ode_stiff_abort_after: options.ode_stiff_abort_after,
+            ode_auto_switch: options.ode_auto_switch,
+        }
+    }
+}
+
+impl Default for SirSettings {
+    fn default() -> Self {
+        Self::from_options(&FitOptions::default())
+    }
 }
 
 impl SirResult {
@@ -806,17 +902,27 @@ pub fn run_sir_core(
     // scope too rather than relying on its caller having done so. Inside `fit()` the current
     // worker already carries that override, which the scope detects without leasing a second
     // pool; a direct caller gets the tolerances it passed instead of the spec's parse-time ones.
-    crate::api::with_fit_ode_scope(options, || {
-        run_sir_core_scoped(
-            model,
-            population,
-            params,
-            eta_hats,
-            proposal_cov,
-            ofv_hat,
-            options,
-        )
-    })?
+    //
+    // #1767: likewise the inner solver. The draws' EBE re-solves read the process globals,
+    // not `options`, so they are set here — where `SirSettings` is stamped from the same
+    // `options` — and restored afterwards. Inside `fit()` they already hold these values.
+    crate::estimation::inner_optimizer::with_inner_settings(
+        options.inner_optimizer,
+        options.ebe_warm_start,
+        || {
+            crate::api::with_fit_ode_scope(options, || {
+                run_sir_core_scoped(
+                    model,
+                    population,
+                    params,
+                    eta_hats,
+                    proposal_cov,
+                    ofv_hat,
+                    options,
+                )
+            })
+        },
+    )?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1020,10 +1126,8 @@ fn run_sir_in_box(
     // density computation). Uses n_free, matching the Student-t dimensionality.
     let log_det_proposal = conditioned.log_det;
 
-    let mut rng = match options.sir_seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::seed_from_u64(12345),
-    };
+    let settings = SirSettings::from_options(options);
+    let mut rng = StdRng::seed_from_u64(settings.seed);
 
     if options.verbose {
         eprintln!(
@@ -1258,6 +1362,7 @@ fn run_sir_in_box(
         effective_sample_size: ess,
         resamples_packed,
         warnings,
+        settings,
     })
 }
 
@@ -1412,6 +1517,7 @@ mod tests {
             effective_sample_size: 10.0,
             resamples_packed: None,
             warnings: Vec::new(),
+            settings: SirSettings::default(),
         };
         assert_eq!(r.kappa_ci(), None);
         r.ci_kappa = vec![(0.02, 0.12)];
