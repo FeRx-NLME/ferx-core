@@ -7863,6 +7863,9 @@ pub struct FitOptions {
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
     /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
     pub sir_df: f64,
+    /// The scale SIR's target is flat on — see [`SirScale`]. Default
+    /// [`SirScale::Packed`] (#1723). Set via `[fit_options]` key `sir_scale`.
+    pub sir_scale: SirScale,
     // Importance-sampling options (consumed by the `Imp` chain stage; ignored
     // otherwise). By default `imp` is a Monte-Carlo EM **estimator** matching
     // NONMEM `METHOD=IMP`: the conditional mode + first-order variance are found
@@ -8441,6 +8444,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            sir_scale: SirScale::Packed,
             n_agq: 1,
             vi_iters: 25_000,
             vi_mc_samples: 32,
@@ -8512,6 +8516,42 @@ impl Default for FitOptions {
             checkpoint_path: None,
             checkpoint_model_hash: None,
             checkpoint_data_hash: None,
+        }
+    }
+}
+
+/// The parameter scale SIR's importance-sampling target is flat on (#1723).
+///
+/// SIR's target is the likelihood times a flat prior, and "flat" needs a scale.
+/// The two choices differ only where the likelihood itself is flat, which is
+/// exactly where a variance's interval comes from:
+///
+/// * [`SirScale::Packed`] — flat on the optimizer's packed scale (log-sd for a
+///   variance, `ln θ` for a θ with a non-negative lower bound). A variance the
+///   data cannot bound away from zero then has a likelihood shelf that runs
+///   down to the packed box floor, so its SIR lower limit tracks the box. It
+///   samples a variance informed by few groups well.
+/// * [`SirScale::Natural`] — flat on the reported scale: Ω / κ variances and
+///   covariances, σ as a variance, θ as declared, a `block_sigma` ρ as a
+///   correlation. The PsN SIR convention. Lower limits no longer depend on the
+///   box, but a variance informed by few groups has a heavy upper tail. The
+///   proposal is re-centred on this target's Laplace mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SirScale {
+    /// Flat on the packed (optimizer) scale. The default, and the only scale
+    /// before #1723.
+    #[default]
+    Packed,
+    /// Flat on the reported (natural) scale.
+    Natural,
+}
+
+impl SirScale {
+    /// The `[fit_options] sir_scale` spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            SirScale::Packed => "packed",
+            SirScale::Natural => "natural",
         }
     }
 }
@@ -9576,6 +9616,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_seed",
         "sir_keep_samples",
         "sir_df",
+        "sir_scale",
         "bloq_method",
         "bloq",
         "npde_nsim",

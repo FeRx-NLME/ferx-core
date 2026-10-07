@@ -2489,6 +2489,11 @@ pub ferx_core::types::SimOutcome::Event::observed: bool
 pub ferx_core::types::SimOutcome::Event::time: f64
 impl ferx_core::SimOutcome
 pub fn ferx_core::SimOutcome::continuous_value(&self) -> f64
+pub enum ferx_core::types::SirScale
+pub ferx_core::types::SirScale::Natural
+pub ferx_core::types::SirScale::Packed
+impl ferx_core::SirScale
+pub fn ferx_core::SirScale::label(self) -> &'static str
 pub enum ferx_core::types::ThetaTransform
 pub ferx_core::types::ThetaTransform::Identity
 pub ferx_core::types::ThetaTransform::Log
@@ -2959,6 +2964,7 @@ pub ferx_core::types::FitOptions::sir_df: f64
 pub ferx_core::types::FitOptions::sir_keep_samples: bool
 pub ferx_core::types::FitOptions::sir_resamples: usize
 pub ferx_core::types::FitOptions::sir_samples: usize
+pub ferx_core::types::FitOptions::sir_scale: ferx_core::SirScale
 pub ferx_core::types::FitOptions::sir_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::stagnation_guard: bool
 pub ferx_core::types::FitOptions::start_sigma: f64
@@ -3827,6 +3833,11 @@ pub ferx_core::SimOutcome::Event::observed: bool
 pub ferx_core::SimOutcome::Event::time: f64
 impl ferx_core::SimOutcome
 pub fn ferx_core::SimOutcome::continuous_value(&self) -> f64
+pub enum ferx_core::SirScale
+pub ferx_core::SirScale::Natural
+pub ferx_core::SirScale::Packed
+impl ferx_core::SirScale
+pub fn ferx_core::SirScale::label(self) -> &'static str
 pub enum ferx_core::ThetaTransform
 pub ferx_core::ThetaTransform::Identity
 pub ferx_core::ThetaTransform::Log
@@ -4418,6 +4429,7 @@ pub ferx_core::FitOptions::sir_df: f64
 pub ferx_core::FitOptions::sir_keep_samples: bool
 pub ferx_core::FitOptions::sir_resamples: usize
 pub ferx_core::FitOptions::sir_samples: usize
+pub ferx_core::FitOptions::sir_scale: ferx_core::SirScale
 pub ferx_core::FitOptions::sir_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::stagnation_guard: bool
 pub ferx_core::FitOptions::start_sigma: f64

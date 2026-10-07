@@ -10,11 +10,12 @@
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
-    compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
+    compute_mu_k, coordinate_names, coordinate_values, pack_with_bounds, packed_segments,
+    unpack_params, PackedBounds, PackedStart,
 };
 use crate::estimation::uncertainty_samples::{
-    admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian, logit_theta_coords,
-    to_draw_scale,
+    admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian,
+    log_abs_jacobian_natural, logit_theta_coords, to_draw_scale, LogitThetaCoord,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -105,6 +106,286 @@ const PROPOSAL_EIG_FLOOR_REL: f64 = 1e-10;
 /// Loadings below this magnitude are not reported when naming the parameters
 /// that make up a degenerate or shrunk proposal direction.
 const DIRECTION_LOADING_MIN: f64 = 0.15;
+
+/// The effective sample size below which SIR's intervals carry a warning
+/// (#1723) — the threshold `docs/estimation/sir.qmd` already names as a poor
+/// proposal. Measured margin: healthy fixtures at 1000 draws sit at 143 (the
+/// MBMA placebo shape), 293, 405 (`warfarin_iov` FOCE, since #1722) and 497;
+/// the degenerate `warfarin_iov` FOCEI run at 3.5.
+pub(crate) const SIR_LOW_ESS: f64 = 100.0;
+
+/// χ²₁(0.95). A free variance whose **conditional** ΔOFV at its packed lower
+/// bound is below this has zero inside its likelihood-ratio interval: the
+/// conditional ΔOFV is an upper bound on the profile one. The converse does not
+/// hold, so a coordinate above it is never described as bounded away from zero.
+const CHI2_1_95: f64 = 3.841_458_820_694_124;
+
+/// The draw the SIR intervals lean on most, described for the low-ESS warning.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HeaviestDraw {
+    /// Its share of the normalised importance weight, in `[0, 1]`.
+    pub share: f64,
+    /// The coordinate it moves furthest, in proposal standard deviations.
+    pub name: String,
+    /// That move, in marginal proposal standard deviations (signed).
+    pub sd_units: f64,
+    /// That coordinate's value at the draw, on the reported scale.
+    pub value: f64,
+}
+
+/// One free Ω / κ diagonal moved alone to its packed lower bound (#1723).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FloorProbe {
+    pub name: String,
+    /// OFV there minus the OFV at the estimates, EBEs re-solved.
+    pub dofv: f64,
+    /// The variance there, on the reported scale.
+    pub variance: f64,
+    /// The probe point also set non-zero block covariances of this η to 0
+    /// ([`FloorProbeCoord::zeroes_a_covariance`]); the warning says so.
+    pub covariances_zeroed: bool,
+}
+
+/// The low-ESS warning (#1723), or `None` when `ess >= SIR_LOW_ESS`.
+///
+/// `probe` runs the floor probe and is called **only** below the threshold
+/// and only under [`SirScale::Packed`] — a healthy run spends nothing on it,
+/// and under `Natural` the target has no box-dependent shelf to report.
+pub(crate) fn low_ess_warning(
+    ess: f64,
+    n_samples: usize,
+    scale: SirScale,
+    heaviest: &HeaviestDraw,
+    probe: impl FnOnce() -> Vec<FloorProbe>,
+) -> Option<String> {
+    if ess >= SIR_LOW_ESS {
+        return None;
+    }
+    // Rounded down, so an ESS just under the threshold never prints as "100.0".
+    let shown = (ess * 10.0).floor() / 10.0;
+    let mut msg = if (n_samples as f64) < SIR_LOW_ESS {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws; with fewer than \
+             {SIR_LOW_ESS:.0} draws it cannot reach the {SIR_LOW_ESS:.0} at which the proposal \
+             is adequate, so these intervals rest on few draws."
+        )
+    } else {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws, below the \
+             {SIR_LOW_ESS:.0} at which the proposal is adequate, so these intervals rest on \
+             few draws."
+        )
+    };
+    msg.push_str(&format!(
+        " The heaviest draw carries {:.1}% of the weight; it moves {} by {:+.2} proposal \
+         standard deviations from the proposal centre, to {:.3e} on the reported scale.",
+        100.0 * heaviest.share,
+        heaviest.name,
+        heaviest.sd_units,
+        heaviest.value
+    ));
+    msg.push_str(" Increase `sir_samples` for more stable intervals.");
+    match scale {
+        SirScale::Packed => {
+            let flagged: Vec<FloorProbe> =
+                probe().into_iter().filter(|p| p.dofv < CHI2_1_95).collect();
+            if !flagged.is_empty() {
+                let listed = flagged
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{} (ΔOFV {:.2} at variance {:.2e}{})",
+                            p.name,
+                            p.dofv,
+                            p.variance,
+                            if p.covariances_zeroed {
+                                ", with its covariances in the block also set to 0"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                msg.push_str(&format!(
+                    " The data do not bound {listed} away from zero: each, moved to its \
+                     lower bound in the parameter box with the other parameters at the \
+                     estimates, costs less than χ²₁(0.95) = 3.84 in \
+                     OFV, so its SIR lower limit reflects the parameter box rather than the \
+                     data."
+                ));
+                msg.push_str(
+                    " `sir_scale = natural` makes these lower limits independent of the box.",
+                );
+            }
+        }
+        SirScale::Natural => {
+            msg.push_str(
+                " Under `sir_scale = natural` a variance informed by few groups has a heavy \
+                 upper tail; `sir_scale = packed` may sample it better.",
+            );
+        }
+    }
+    Some(msg)
+}
+
+/// One variance the floor probe moves: the packed index of its Cholesky
+/// diagonal `ln L_ii`, and those of the off-diagonals `L_ik` (k < i) in the
+/// same row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloorProbeCoord {
+    pub diag: usize,
+    pub row_off: Vec<usize>,
+}
+
+/// The free Ω / Ω_IOV variances the floor probe moves — never a FIX one, a θ,
+/// a σ or a `[mixture]` override. In a `block_omega` / block κ an η's variance
+/// is `Σ_ii = Σ_k L_ik²`, so flooring `ln L_ii` alone leaves `Σ_ii ≈ Σ_{k<i}
+/// L_ik²` and only drives the η's correlation towards ±1; the probe point
+/// therefore also zeroes the row's off-diagonals ([`floor_probe_point`]).
+pub(crate) fn floor_probe_coords(params: &ModelParameters, fixed: &[bool]) -> Vec<FloorProbeCoord> {
+    let seg = packed_segments(params);
+    let mut out = Vec::new();
+    let mut block = |start: usize, om: &OmegaMatrix| {
+        let mut rows: Vec<FloorProbeCoord> = (0..om.dim())
+            .map(|_| FloorProbeCoord {
+                diag: usize::MAX,
+                row_off: Vec::new(),
+            })
+            .collect();
+        for (off, (r, c)) in
+            crate::estimation::parameterization::lower_tri_iter(om.dim(), om.diagonal).enumerate()
+        {
+            if r == c {
+                rows[r].diag = start + off;
+            } else {
+                rows[r].row_off.push(start + off);
+            }
+        }
+        out.extend(rows.into_iter().filter(|c| !fixed[c.diag]));
+    };
+    block(seg.omega_start(), &params.omega);
+    if let Some(ref iov) = params.omega_iov {
+        block(seg.iov_start(), iov);
+    }
+    out
+}
+
+impl FloorProbeCoord {
+    /// Whether [`floor_probe_point`] changes a covariance as well as the
+    /// variance: some off-diagonal of the row is non-zero at `x_hat`. False for
+    /// a diagonal η, a block's first η, and a row of structural zeros.
+    pub(crate) fn zeroes_a_covariance(&self, x_hat: &[f64]) -> bool {
+        self.row_off.iter().any(|&j| x_hat[j] != 0.0)
+    }
+}
+
+/// The packed point a floor probe scores: the estimate with the variance's
+/// Cholesky diagonal at its own packed lower bound and its row's off-diagonals
+/// at 0, so `Σ_ii = e^{2·lower}`. Any point on that constraint is a valid
+/// upper bound for the profile ΔOFV there. A held non-zero off-diagonal is set
+/// to 0 too; the bounds screen then rejects the point and the variance is not
+/// flagged — the conservative outcome.
+pub(crate) fn floor_probe_point(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    c: &FloorProbeCoord,
+) -> Vec<f64> {
+    let mut x = x_hat.to_vec();
+    x[c.diag] = bounds.lower[c.diag];
+    for &j in &c.row_off {
+        x[j] = 0.0;
+    }
+    x
+}
+
+/// The proposal centre under [`SirScale::Natural`], on the draw scale: the
+/// estimate moved to the Laplace mode of the tilted target, `ŷ + C ∇ log|J|`,
+/// with `C` the free-block proposal covariance and `∇ log|J|` the gradient of
+/// [`log_abs_jacobian_natural`] there; clamped into the draw-scale box.
+pub(crate) fn natural_centre(
+    y_hat: &[f64],
+    cov_free: &DMatrix<f64>,
+    grad_free: &DVector<f64>,
+    free_idx: &[usize],
+    draw_bounds: &PackedBounds,
+) -> Vec<f64> {
+    let shift = cov_free * grad_free;
+    let mut c = y_hat.to_vec();
+    for (a, &i) in free_idx.iter().enumerate() {
+        c[i] = (y_hat[i] + shift[a]).clamp(draw_bounds.lower[i], draw_bounds.upper[i]);
+    }
+    c
+}
+
+/// `∇_y log_abs_jacobian_natural` over the free coordinates, on the draw scale,
+/// by central differences of the one implementation (a logit θ goes through
+/// its `y → x` map, so the chain factor comes for free).
+fn natural_log_jac_gradient(
+    y_hat: &[f64],
+    free_idx: &[usize],
+    logit_coords: &[LogitThetaCoord],
+    params: &ModelParameters,
+    fixed: &[bool],
+) -> DVector<f64> {
+    let at = |y: &[f64]| {
+        let mut x = y.to_vec();
+        from_draw_scale(&mut x, logit_coords);
+        log_abs_jacobian_natural(&x, params, fixed)
+    };
+    let h = 1e-5;
+    DVector::from_iterator(
+        free_idx.len(),
+        free_idx.iter().map(|&i| {
+            let mut yp = y_hat.to_vec();
+            let mut ym = y_hat.to_vec();
+            yp[i] += h;
+            ym[i] -= h;
+            (at(&yp) - at(&ym)) / (2.0 * h)
+        }),
+    )
+}
+
+/// Describe the draw with the largest normalised weight: its share and the free
+/// coordinate it moves furthest in marginal proposal standard deviations.
+fn heaviest_draw(
+    normalized_weights: &[f64],
+    z_vectors: &[Vec<f64>],
+    samples: &[Vec<f64>],
+    proposal_chol: &DMatrix<f64>,
+    free_idx: &[usize],
+    free_names: &[String],
+    params: &ModelParameters,
+) -> HeaviestDraw {
+    let (k, &share) =
+        normalized_weights
+            .iter()
+            .enumerate()
+            .fold((0, &f64::NEG_INFINITY), |best, (i, w)| {
+                if *w > *best.1 {
+                    (i, w)
+                } else {
+                    best
+                }
+            });
+    let delta = proposal_chol * DVector::from_column_slice(&z_vectors[k]);
+    let (a, t) = (0..free_idx.len())
+        .map(|a| (a, delta[a] / proposal_chol.row(a).norm()))
+        .fold((0, 0.0f64), |best, (a, t)| {
+            if t.abs() > best.1.abs() {
+                (a, t)
+            } else {
+                best
+            }
+        });
+    let values = coordinate_values(&unpack_params(&samples[k], params));
+    HeaviestDraw {
+        share,
+        name: free_names[a].clone(),
+        sd_units: t,
+        value: values[free_idx[a]],
+    }
+}
 
 /// Why a proposal sample contributed no weight. Tallied so a run in which
 /// *every* sample is rejected can say which check did the rejecting (#1021).
@@ -548,6 +829,32 @@ fn run_sir_core_scoped(
     ofv_hat: f64,
     options: &FitOptions,
 ) -> Result<SirResult, String> {
+    run_sir_in_box(
+        model,
+        population,
+        params,
+        eta_hats,
+        proposal_cov,
+        ofv_hat,
+        options,
+        |_| {},
+    )
+}
+
+/// [`run_sir_core_scoped`] with a hook on the packed box before anything reads
+/// it. Production passes a no-op; the #1723 box-dependence test moves the
+/// variance floors with it, which no public input can do.
+#[allow(clippy::too_many_arguments)]
+fn run_sir_in_box(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    proposal_cov: &DMatrix<f64>,
+    ofv_hat: f64,
+    options: &FitOptions,
+    adjust_box: impl FnOnce(&mut PackedBounds),
+) -> Result<SirResult, String> {
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 
@@ -560,11 +867,12 @@ fn run_sir_core_scoped(
     // box requires the packed vector anyway.
     let PackedStart {
         packed: x_hat,
-        bounds,
+        mut bounds,
         fixed: fixed_mask,
         // #1307's pack-move list is not this caller's object.
         moves: _,
     } = pack_with_bounds(params);
+    adjust_box(&mut bounds);
     let n_packed = x_hat.len();
 
     // Parameter priors (#254). SIR approximates the posterior the fit targeted,
@@ -581,6 +889,17 @@ fn run_sir_core_scoped(
     // about whether the prior is in.
     let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
     let ofv_hat = ofv_hat + priors.penalty(&x_hat);
+    // #1723: a declared prior is a density on the packed scale, so the target is
+    // already `L · p(x)` with no flat prior left to move to the reported scale;
+    // the natural Jacobian would tilt the prior the fit was estimated under.
+    if options.sir_scale == SirScale::Natural && priors.is_active() {
+        return Err(
+            "sir_scale = natural is not defined for a model with prior(...): the SIR \
+             target is already the likelihood times the declared prior on the packed scale, \
+             so there is no flat prior to move to the reported scale. Use sir_scale = packed."
+                .to_string(),
+        );
+    }
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
         return Err(format!(
@@ -659,6 +978,24 @@ fn run_sir_core_scoped(
     }
     let proposal_chol = conditioned.chol.clone();
 
+    // `sir_scale = natural` (#1723): the target gains `log|∂n/∂x|`, and the
+    // proposal is re-centred on that tilted target's Laplace mode so it does
+    // not have to reach for it from the packed estimate. Under `Packed` the
+    // centre is `ŷ` itself and nothing below differs from before #1723.
+    let natural = options.sir_scale == SirScale::Natural;
+    let centre = if natural {
+        let grad = natural_log_jac_gradient(&y_hat, &free_idx, &logit_coords, params, &fixed_mask);
+        let cov_free = &proposal_chol * proposal_chol.transpose();
+        natural_centre(&y_hat, &cov_free, &grad, &free_idx, &draw_bounds)
+    } else {
+        y_hat.clone()
+    };
+    let log_jac_nat_hat = if natural {
+        log_abs_jacobian_natural(&x_hat, params, &fixed_mask)
+    } else {
+        0.0
+    };
+
     // Log-determinant of the conditioned free-block proposal covariance (for
     // density computation). Uses n_free, matching the Student-t dimensionality.
     let log_det_proposal = conditioned.log_det;
@@ -697,11 +1034,12 @@ fn run_sir_core_scoped(
         let scale = (nu / chi2).sqrt();
         let z_vec_free = DVector::from_column_slice(&z_free);
         let delta_free = &proposal_chol * &z_vec_free * scale;
-        // Build the full packed sample: free indices get y_hat + delta_free,
+        // Build the full packed sample: free indices get centre + delta_free,
         // fixed indices stay pinned at x_hat (so the strict bounds check
         // `lower == upper == x_hat[i]` passes; a fixed index is never a logit
-        // coordinate, so `y_hat[i] == x_hat[i]` there).
-        let mut x_k = y_hat.clone();
+        // coordinate, so `y_hat[i] == x_hat[i]` there, and the natural
+        // re-centre moves free indices only).
+        let mut x_k = centre.clone();
         for (a, &i) in free_idx.iter().enumerate() {
             x_k[i] += delta_free[a];
         }
@@ -716,6 +1054,35 @@ fn run_sir_core_scoped(
     let inner_maxiter = options.inner_maxiter;
     let inner_tol = options.inner_tol;
 
+    // OFV (prior included) at one admissible packed point, EBEs re-solved warm
+    // from the fit's. Shared by the draws and the low-ESS floor probe, so the
+    // probe's ΔOFV is the very quantity the weights score.
+    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
+        let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
+        let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+            model,
+            population,
+            params_k,
+            inner_maxiter,
+            inner_tol,
+            Some(eta_hats),
+            Some(&sir_mu_k),
+            0, // SIR: no EBE convergence tracking
+            0, // SIR: warm-started; no inner multi-start
+            InnerHessianSeed::None,
+            // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are
+            // the frozen-variance mode that marginal linearises around (#1722).
+            options,
+        );
+        // Through the method-aware seam, so an AGQ fit's SIR weights come from
+        // the AGQ marginal it was actually optimised against, not the FOCE one.
+        let nll_k = pop_nll_opts(model, population, params_k, &ehs, &hms, &kappas, options);
+        // The prior half, at this draw. `x_k` is already the packed vector
+        // the penalty is defined on. A no-op (`+ 0.0`) for an unpriored fit,
+        // so those weights stay bit-identical.
+        2.0 * nll_k + priors.penalty(x_k)
+    };
+
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
         .par_iter()
         .zip(z_vectors.par_iter())
@@ -728,31 +1095,7 @@ fn run_sir_core_scoped(
                 Err(outcome) => return (f64::NEG_INFINITY, outcome),
             };
 
-            // Run inner loop warm-started from ML EBEs
-            let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (ehs, hms, _, _kappas) = run_inner_loop_warm_seeded(
-                model,
-                population,
-                &params_k,
-                inner_maxiter,
-                inner_tol,
-                Some(eta_hats),
-                Some(&sir_mu_k),
-                0, // SIR: no EBE convergence tracking
-                0, // SIR: warm-started; no inner multi-start
-                InnerHessianSeed::None,
-                // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are
-                // the frozen-variance mode that marginal linearises around (#1722).
-                options,
-            );
-
-            // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come
-            // from the AGQ marginal it was actually optimised against, not the FOCE one.
-            let nll_k = pop_nll_opts(model, population, &params_k, &ehs, &hms, &_kappas, options);
-            // The prior half, at this draw. `x_k` is already the packed vector
-            // the penalty is defined on. A no-op (`+ 0.0`) for an unpriored fit,
-            // so those weights stay bit-identical.
-            let ofv_k = 2.0 * nll_k + priors.penalty(x_k);
+            let ofv_k = ofv_at(&params_k, x_k);
             if !ofv_k.is_finite() {
                 return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }
@@ -769,7 +1112,10 @@ fn run_sir_core_scoped(
             // The proposal density is on the draw scale, the target on the
             // packed scale: `π_y(y) = π_x(x(y)) |dx/dy|`. Taken relative to the
             // centre, like `log_q_hat`; exactly 0 with no logit coordinate.
-            let log_jac = log_abs_jacobian(x_k, &logit_coords) - log_jac_hat;
+            let mut log_jac = log_abs_jacobian(x_k, &logit_coords) - log_jac_hat;
+            if natural {
+                log_jac += log_abs_jacobian_natural(x_k, params, &fixed_mask) - log_jac_nat_hat;
+            }
 
             // Importance weight: log w_k = -0.5 * dOFV_k + log|dx/dy| - log_q_k + log_q_hat
             (
@@ -808,6 +1154,53 @@ fn run_sir_core_scoped(
 
     if options.verbose {
         eprintln!("  SIR: effective sample size = {:.1}", ess);
+    }
+
+    // #1723: below the docs' own adequacy threshold the intervals are not
+    // returned silently. The floor probe runs only here, and only under the
+    // packed target, so a healthy run costs nothing extra.
+    let mut warnings = conditioned.warnings();
+    if ess < SIR_LOW_ESS {
+        let heaviest = heaviest_draw(
+            &normalized_weights,
+            &z_vectors,
+            &samples,
+            &proposal_chol,
+            &free_idx,
+            &free_names,
+            params,
+        );
+        let probe = || {
+            // The baseline is `ofv_at` at the estimate, not the caller's
+            // `ofv_hat`: an offset between the two cancels in the normalised
+            // weights, but here it would shift an absolute ΔOFV compared against
+            // 3.84 (e.g. a Laplace `fit.ofv` against FOCEI-scored draws).
+            let base = match screen_draw(&x_hat, &bounds, params) {
+                Ok(p) => ofv_at(&p, &x_hat),
+                Err(_) => return Vec::new(),
+            };
+            floor_probe_coords(params, &fixed_mask)
+                .into_iter()
+                .filter_map(|c| {
+                    let x = floor_probe_point(&x_hat, &bounds, &c);
+                    let p = screen_draw(&x, &bounds, params).ok()?;
+                    let i = c.diag;
+                    let dofv = ofv_at(&p, &x) - base;
+                    dofv.is_finite().then(|| FloorProbe {
+                        name: coord_names[i].clone(),
+                        dofv,
+                        variance: coordinate_values(&p)[i],
+                        covariances_zeroed: c.zeroes_a_covariance(&x_hat),
+                    })
+                })
+                .collect()
+        };
+        if let Some(w) = low_ess_warning(ess, n_samples, options.sir_scale, &heaviest, probe) {
+            if options.verbose {
+                eprintln!("  SIR: {w}");
+            }
+            warnings.push(w);
+        }
     }
 
     // Step 3: Resample with replacement proportional to weights
@@ -867,7 +1260,7 @@ fn run_sir_core_scoped(
         ci_kappa,
         effective_sample_size: ess,
         resamples_packed,
-        warnings: conditioned.warnings(),
+        warnings,
     })
 }
 
@@ -920,6 +1313,10 @@ fn percentile_ci(values: &[f64]) -> (f64, f64) {
     let hi = sorted[hi_idx.min(n - 1)];
     (lo, hi)
 }
+
+#[cfg(test)]
+#[path = "sir_low_ess_tests.rs"]
+mod low_ess_tests;
 
 #[cfg(test)]
 mod tests {

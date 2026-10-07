@@ -631,6 +631,44 @@ fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
     assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
 }
 
+/// #1723: every row of the low-ESS warning's input space, rendered by the
+/// builder itself and prefixed as `fit()` (`SIR:`), `run_sir` (`SIR:`) and the
+/// non-PD fallback (`SIR fallback:`) push it, routes to `sir` at `Warning`. The
+/// chain has generic `degenerate` → `optimizer_health` and `condition number` →
+/// `condition_number` arms *above* the `sir:` one, so a rewording that lets one
+/// of those tokens in misroutes the message — and this test renders the real
+/// text, so it sees the rewording.
+#[test]
+fn classify_warning_sir_low_ess_rows_route_to_sir() {
+    use crate::estimation::sir::{low_ess_warning, FloorProbe, HeaviestDraw};
+    let h = HeaviestDraw {
+        share: 0.529,
+        name: "ETA_CL".into(),
+        sd_units: -6.36,
+        value: 4.6e-4,
+    };
+    let flagged = || {
+        vec![FloorProbe {
+            name: "ETA_KA".into(),
+            dofv: 1.56,
+            variance: 6.1e-6,
+            covariances_zeroed: false,
+        }]
+    };
+    let rows = [
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, flagged),
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, Vec::new),
+        low_ess_warning(35.2, 1000, SirScale::Natural, &h, flagged),
+    ];
+    for msg in rows.into_iter().map(|m| m.expect("below the threshold")) {
+        for prefix in ["SIR: ", "SIR fallback: "] {
+            let w = classify_warning(&format!("{prefix}{msg}"));
+            assert_eq!(w.category, WarningCode::Sir, "{prefix}{msg}");
+            assert_eq!(w.severity, WarningSeverity::Warning, "{prefix}{msg}");
+        }
+    }
+}
+
 #[test]
 fn classify_warning_mu_ref_is_info() {
     let w = classify_warning("mu-ref: CL, V");
