@@ -1120,9 +1120,11 @@ fn an_unreadable_model_file_is_e_model_read_and_a_bad_one_a_parse_error() {
     let bad = dir.path().join("bad.ferx");
     std::fs::write(&bad, "[parameters]\n  theta TVCL(\n").unwrap();
     let report = crate::api::validate_model_file(bad.to_str().unwrap(), None);
-    assert!(
-        !report.diagnostics.is_empty()
-            && report.diagnostics.iter().all(|d| d.code != "E_MODEL_READ"),
+    // The parse's own code, not merely "not `E_MODEL_READ`" (#1760 review r1,
+    // finding 3): any other mapping of a parse failure must fail this.
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        report.diagnostics[0].code, "E_PARSE",
         "{:?}",
         report.diagnostics
     );

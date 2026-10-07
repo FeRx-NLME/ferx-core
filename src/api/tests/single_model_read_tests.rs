@@ -105,6 +105,18 @@ fn open_nonblocking(path: &Path, write: bool) -> std::io::Result<std::fs::File> 
 /// would append the next text to the stream the first reader is still reading.
 /// A reader's close shows as `ENXIO` on a non-blocking write-open (a probe that
 /// writes nothing, so a reader still draining sees only EOF).
+///
+/// Known blind spot (#1760 review r1, finding 2): a second open that lands
+/// *inside* one probe — within about a millisecond of the first reader's close —
+/// connects to the probe, reads an empty file, and is not counted. A probe cannot
+/// tell that reader from the first one still closing. Such a re-read is still
+/// caught when its text is hashed or stored (`sha(A)` / `model_text == A` fail
+/// on `""`), and FREM generation fails on `""`. Only a re-read whose text the
+/// binders ignore — `MODEL_A` has no level block or symbolic statistic — would
+/// pass, and only if it came within that millisecond. Every entry point parses
+/// the text and builds its population (or simulation design) between the first
+/// read and any bind, which takes longer than that.
+/// Each re-read mutation in the PR was killed with a count of 2.
 struct ModelFifo {
     path: PathBuf,
     opens: Arc<AtomicUsize>,
