@@ -927,10 +927,29 @@ mod fitted_population_1783 {
         fit
     }
 
+    /// The note a step carries when it derived the occasions with the model
+    /// file's rule (review r1 #1), in full.
+    const W_FILE_DOSE: &str = "this fit records no IOV occasion rule (it was saved before \
+                               ferx recorded one, #1783), so the occasions were derived with \
+                               the model file's `iov_occasion = dose`. A fit made through \
+                               `fit_from_files` ran under its caller's rule, not the file's: \
+                               if that was another rule, these results are wrong. Set \
+                               `fit.iov_occasion` to the rule the fit ran with.";
+
+    fn has_file_note(r: &FitResult) -> bool {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("derived with the model file's"))
+    }
+
     /// T7. A fit that records no rule takes the model file's when the step reads
-    /// the file (`model = None`): the `dose` fit's file states `dose`.
+    /// the file (`model = None`): the `dose` fit's file states `dose`. Right here
+    /// (a `run_model_with_data` fit runs under its file's rule), and the result says
+    /// which rule it guessed; the recorded fit's says nothing.
     ///
-    /// Mutation — skip the file fallback: the unlabelled cells are refused.
+    /// Mutations — skip the file fallback: the unlabelled cells are refused. Drop the
+    /// note: the `contains` fails. Push it for a recorded rule too, or for a guessed
+    /// `Column`: the controls fail.
     #[test]
     fn unrecorded_rule_takes_the_model_file_rule() {
         let f = dose();
@@ -939,6 +958,94 @@ mod fitted_population_1783 {
             let got =
                 run_covariance(&fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
             assert_same_cov(&got, &f.fit, cell);
+            assert!(
+                got.warnings.iter().any(|w| w == W_FILE_DOSE),
+                "{cell}: {:?}",
+                got.warnings
+            );
+            let recorded = run_covariance(&f.fit, None, p, &f.opts).unwrap();
+            assert!(!has_file_note(&recorded), "{cell}: recorded rule");
+        }
+        // A guessed `Column` derives nothing — the labels are the column's — so it
+        // is no guess about the occasions and carries no note.
+        let c = column();
+        let got = run_covariance(&unrecorded(c, true), None, None, &c.opts).unwrap();
+        assert_same_cov(&got, &c.fit, "column, unrecorded");
+        assert!(
+            !has_file_note(&got),
+            "column, unrecorded: {:?}",
+            got.warnings
+        );
+    }
+
+    /// A model file stating `iov_occasion = dose`, fitted through `fit_from_files`
+    /// under the caller's `time(60)` (review r1 #1's geometry).
+    fn dose_file_time_fit() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| {
+            let (dir, model_path, data_path) = write_case(
+                "examples/warfarin_iov.ferx",
+                "data/warfarin_iov.csv",
+                &[(
+                    "iov_column = OCC\n  covariance = false",
+                    "iov_occasion = dose\n  covariance = true",
+                )],
+                None,
+            );
+            let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+            let prep = crate::api::prepare_run(m, Some(d)).expect("prepares");
+            let opts = prep.parsed.fit_options.clone();
+            assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
+            let fit_opts = FitOptions {
+                iov_occasion: IovOccasionRule::TimeWindows(vec![EDGE]),
+                outer_maxiter: MAXITER,
+                run_covariance_step: true,
+                ..opts.clone()
+            };
+            let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
+            FileFit {
+                _dir: dir,
+                model_path,
+                data_path,
+                fit,
+                returned: None,
+                prep,
+                opts,
+            }
+        })
+    }
+
+    /// Review r1 #1. An old bundle of a `fit_from_files` fit whose caller's rule
+    /// (`time(60)`) was not its file's (`dose`): the fallback derives with the wrong
+    /// rule, the derived labels are not fingerprinted, and the step returns
+    /// `Computed` with wrong SEs (measured by the reviewer at `f8a394ad`: se_kappa
+    /// 412.47 against the inline 0.10506). It cannot be refused — the common old
+    /// bundle, T7's, is right — so the result names the rule it guessed. The
+    /// straddle: the same fit with its rule recorded matches inline, with no note.
+    ///
+    /// Mutation — drop the note: the `contains` fails on both cells.
+    #[test]
+    fn a_guessed_rule_is_named_on_the_result() {
+        let f = dose_file_time_fit();
+        assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
+        assert!(has_kappa_se(&f.fit));
+        let fit = unrecorded(f, true);
+        for (p, cell) in cells(f) {
+            let got = run_covariance(&fit, None, p, &f.opts).unwrap();
+            assert!(
+                got.warnings.iter().any(|w| w == W_FILE_DOSE),
+                "{cell}: {:?}",
+                got.warnings
+            );
+            // The note is not a false alarm here: the guess is wrong.
+            assert_ne!(
+                got.se_kappa.as_deref().map(bits),
+                f.fit.se_kappa.as_deref().map(bits),
+                "{cell}: the file's rule reproduced the fit's"
+            );
+            let recorded = run_covariance(&f.fit, None, p, &f.opts).unwrap();
+            assert_same_cov(&recorded, &f.fit, cell);
+            assert!(!has_file_note(&recorded), "{cell}: recorded rule");
         }
     }
 
@@ -950,9 +1057,10 @@ mod fitted_population_1783 {
                              from a model-side `iov_occasion` rule (`dose` or `time(...)`), \
                              which it did not record.";
     const F_FILE: &str = " The model file's `[fit_options]` sets no `iov_occasion` to fall \
-                          back on, and no occasion column was read from the data.";
+                          back on.";
     const F_FIX: &str = " Pass the population `run_model_with_data` returned, which carries \
-                         the occasion labels the fit ran with, or refit so the rule is recorded.";
+                         the occasion labels the fit ran with, set `fit.iov_occasion` to the \
+                         rule the fit ran with, or refit so the rule is recorded.";
 
     /// T8, cell F. A fit that records no rule, on a population with no occasion
     /// labels and no rule to derive them with, is refused rather than run with every

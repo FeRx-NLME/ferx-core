@@ -314,7 +314,8 @@ the fit ran with; a file entry point takes those from its caller, not from the
 model file's `[fit_options]`. `run_sir` and `run_covariance` derive the
 population's occasions with it, as `fit()` did. Written by every fit; absent on a
 bundle saved before #1783, which loads it as `None`. The steps then use the model
-file's rule when they read the file.
+file's rule when they read the file, with a warning naming it; set
+`fit.iov_occasion` when the fit ran under another rule.
 
 ## `ebes.csv`
 

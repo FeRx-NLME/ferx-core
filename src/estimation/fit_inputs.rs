@@ -42,7 +42,8 @@ enum ModelRef<'a> {
 pub(crate) struct FitInputs<'a> {
     model: ModelRef<'a>,
     population: Cow<'a, Population>,
-    /// Notes for the step's result: today only [`STALE_FINGERPRINT_WARNING`].
+    /// Notes for the step's result: [`STALE_FINGERPRINT_WARNING`], and the
+    /// model-file occasion rule note (`file_rule_warning`, #1783).
     warnings: Vec<String>,
 }
 
@@ -445,10 +446,19 @@ fn resolve_fit_inputs_unattributed<'a>(
     let FitInputs {
         model,
         population,
-        warnings,
+        mut warnings,
     } = inputs;
     let m = model.get();
     let rule = fit.iov_occasion.clone().or(file_rule);
+    // A rule taken from the model file is a guess (review r1 #1): a fit made through
+    // `fit_from_files` ran under its caller's rule, which need not be the file's, and
+    // the derived labels are not fingerprinted, so nothing downstream can tell. Say so
+    // whenever the guess derives the occasions; a `Column` guess derives nothing.
+    if let (None, Some(r)) = (&fit.iov_occasion, &rule) {
+        if m.n_kappa > 0 && *r != IovOccasionRule::Column {
+            warnings.push(file_rule_warning(r));
+        }
+    }
     let population = crate::api::fitted_population(
         m,
         rule.as_ref().unwrap_or(&IovOccasionRule::Column),
@@ -491,16 +501,39 @@ fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>)
         );
     }
     if file_rule.is_some() {
-        msg.push_str(
-            " The model file's `[fit_options]` sets no `iov_occasion` to fall back on, \
-             and no occasion column was read from the data.",
-        );
+        msg.push_str(" The model file's `[fit_options]` sets no `iov_occasion` to fall back on.");
     }
     msg.push_str(
         " Pass the population `run_model_with_data` returned, which carries the \
-         occasion labels the fit ran with, or refit so the rule is recorded.",
+         occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
+         ran with, or refit so the rule is recorded.",
     );
     EngineError::from(msg)
+}
+
+/// A rule in the DSL's spelling: `dose`, `time(24, 48)`.
+fn rule_dsl(rule: &IovOccasionRule) -> String {
+    match rule {
+        IovOccasionRule::Column => "column".to_string(),
+        IovOccasionRule::PerDose => "dose".to_string(),
+        IovOccasionRule::TimeWindows(edges) => {
+            let e: Vec<String> = edges.iter().map(|e| e.to_string()).collect();
+            format!("time({})", e.join(", "))
+        }
+    }
+}
+
+/// The note for a fit that records no occasion rule (a bundle saved before #1783)
+/// whose occasions were derived with the model file's rule (review r1 #1).
+pub(crate) fn file_rule_warning(rule: &IovOccasionRule) -> String {
+    format!(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), so the occasions were derived with the model file's `iov_occasion = {}`. \
+         A fit made through `fit_from_files` ran under its caller's rule, not the file's: \
+         if that was another rule, these results are wrong. Set `fit.iov_occasion` to the \
+         rule the fit ran with.",
+        rule_dsl(rule)
+    )
 }
 
 /// Where the population a post-hoc step was about to run on came from, for
