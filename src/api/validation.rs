@@ -236,8 +236,9 @@ pub(crate) fn check_level_index_columns(
                 LevelDataEntry::Run => {
                     "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
                      population, &fit.data_bindings)`, passing the bindings the θ you run was \
-                     laid out on: the fit's `data_bindings`, or `parsed.model.data_bindings()` \
-                     for the model's own θ. Then run the model it re-parses into `parsed`."
+                     laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
+                     of `parsed.model.data_bindings()` taken before the call. Then run the model \
+                     it re-parses into `parsed`."
                 }
                 LevelDataEntry::Fit => {
                     "To fit this population, parse the model text again and bind it with \

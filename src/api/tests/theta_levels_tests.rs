@@ -1513,7 +1513,8 @@ mod from_fit {
     const RUN_BINDER: &str = "Bind the population with `bind_from_fit(&mut parsed, \
         &model_text, &mut population, &fit.data_bindings)`";
     const RUN_WHICH_BINDINGS: &str = ", passing the bindings the θ you run was laid out on: \
-        the fit's `data_bindings`, or `parsed.model.data_bindings()` for the model's own θ.";
+        the fit's `data_bindings`, or, for the model's own θ, a clone of \
+        `parsed.model.data_bindings()` taken before the call.";
     const RUN_WHICH_MODEL: &str = " Then run the model it re-parses into `parsed`.";
     const FIT_BINDER: &str = "To fit this population, parse the model text again and bind it \
         with `bind_theta_levels(&mut parsed, &model_text, &mut population)`, which lays θ out \
@@ -1644,9 +1645,15 @@ mod from_fit {
         assert_run_refusal(&err, "predict_diag, from-fit model");
     }
 
-    /// #1647: each refusal's advice is *true*. Following the `Run` sentence with
-    /// `parsed.model.data_bindings()` gives the fit's own predictions on the new data, bit
-    /// for bit; following the `Fit` sentence leaves no fatal model/data finding for `fit()`.
+    /// #1647: each refusal's advice is *true*. Following the `Run` sentence gives the fit's
+    /// own predictions on the new data, bit for bit, both ways it offers: with the fit's
+    /// bindings, and — literally as written, on the running model's own `parsed` — with a
+    /// clone of `parsed.model.data_bindings()` taken before the call. Following the `Fit`
+    /// sentence leaves no fatal model/data finding for `fit()`.
+    ///
+    /// Review r1 row 1: the first wording passed `parsed.model.data_bindings()` straight into
+    /// a call taking `&mut parsed`, which does not compile (E0502, measured); this test then
+    /// followed it with a different object, so the sentence as written was never exercised.
     ///
     /// Mutation — name `bind_theta_levels` in the `Run` sentence instead: that binder lays
     /// θ out for the new data's 5 levels, so the fit's 7-value θ is refused (`n_theta`
@@ -1678,10 +1685,19 @@ mod from_fit {
         crate::api::predict_diag(&fit.model, &new_data, &fit_theta_params(&fit.model, &theta))
             .err()
             .expect("the refusal under test");
+        // "the fit's `data_bindings`": a fresh parse bound on the fit's.
         let mut followed = new_data.clone();
         let mut parsed = parse_full_model(&text).unwrap();
         crate::api::bind_from_fit(&mut parsed, &text, &mut followed, fit.model.data_bindings())
             .expect("bind");
+        assert_eq!(rows(&parsed.model, &followed), want);
+
+        // "for the model's own θ, a clone of `parsed.model.data_bindings()` taken before the
+        // call": the running model's own `parsed`, re-bound in place.
+        let mut followed = new_data.clone();
+        let mut parsed = fit;
+        let own = parsed.model.data_bindings().clone();
+        crate::api::bind_from_fit(&mut parsed, &text, &mut followed, &own).expect("bind");
         assert_eq!(rows(&parsed.model, &followed), want);
 
         let mut refit = new_data.clone();
@@ -1696,6 +1712,60 @@ mod from_fit {
             .filter(|d| d.severity == crate::diagnostics::Severity::Error)
             .collect();
         assert!(fatal.is_empty(), "{fatal:?}");
+    }
+
+    /// Review r1 row 2: an **unbound** model is never told its block "is bound". The gate's
+    /// own filter keeps unbound blocks out; `check_model_data` and `compute_npde_npd` run no
+    /// unbound-block check ahead of it, so without the filter they would say exactly that.
+    /// Both sides of the filter in one test: the unbound model reports nothing, the same
+    /// block bound (on a population never bound) reports it.
+    ///
+    /// Mutation — drop the `unbound_level_blocks` filter in `bound_level_columns`: this test
+    /// dies, on its first (direct-call) arm; the `check_model_data` and npde arms state the
+    /// same through the entry points the review named. The mutation survived 257 lib tests
+    /// before this test existed (review r1).
+    #[test]
+    fn an_unbound_model_is_never_told_its_block_is_bound() {
+        use crate::api::{check_level_index_columns, LevelDataEntry};
+        let text = no_eta_model();
+        let unbound = parse_full_model(&text).unwrap().model;
+        assert!(!unbound.theta_blocks().unbound_level_blocks().is_empty());
+        let pop = population(2, 2);
+        for entry in [LevelDataEntry::Run, LevelDataEntry::Fit] {
+            assert!(
+                check_level_index_columns(&unbound, &pop, entry).is_empty(),
+                "{entry:?}"
+            );
+        }
+        let codes: Vec<String> = crate::api::check_model_data(&unbound, &pop)
+            .into_iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(
+            !codes.iter().any(|c| c == "E_THETA_LEVELS_DATA_UNBOUND"),
+            "{codes:?}"
+        );
+        // npde has no unbound-model refusal of its own (#1763); whatever it returns, it must
+        // not be this one.
+        if let Err(e) = crate::stats::npde::compute_npde_npd(
+            &unbound,
+            &pop,
+            &unbound.default_params,
+            20,
+            Some(1),
+        ) {
+            assert!(!e.contains("is bound, but"), "{e}");
+        }
+
+        // The other side: bound, on a population never bound, it is reported.
+        let bound = bind_fit(&text, &mut population(2, 2)).model;
+        for entry in [LevelDataEntry::Run, LevelDataEntry::Fit] {
+            assert_eq!(
+                check_level_index_columns(&bound, &pop, entry).len(),
+                1,
+                "{entry:?}"
+            );
+        }
     }
 
     // ── #1633: "nothing is written to `population` unless every block binds" ──────
