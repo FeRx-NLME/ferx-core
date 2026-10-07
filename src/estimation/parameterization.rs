@@ -763,6 +763,12 @@ pub(crate) fn mixture_from_base(
     let k = tmpl.omega.len();
     let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
     let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
+    // `zip` below would silently leave trailing overrides at the base value.
+    debug_assert_eq!(
+        packed.len(),
+        tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len(),
+        "mixture_from_base: override segment length"
+    );
     let (packed_omega, packed_sigma) = packed.split_at(tmpl.omega_override_addr.len());
     for (&(c, e), &x) in tmpl.omega_override_addr.iter().zip(packed_omega) {
         let chol_diag = x.exp();

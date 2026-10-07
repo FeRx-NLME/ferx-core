@@ -1274,8 +1274,12 @@ fn run_sir_in_box(
 ///   the fit's own through `fit_inputs::scoring_options` — so a Laplace fit is scored
 ///   with its Laplace marginal, not the FOCEI one.
 ///
-/// At the estimates this equals the fit's data OFV exactly (pinned by
-/// `sir_draw_ofv_at_the_estimate_is_the_fits_objective`).
+/// At the estimates this equals the fit's data OFV (bit for bit on FOCEI, Laplace and
+/// mixture fits, to 4e-10 on FOCE's frozen-variance re-solve; pinned by
+/// `sir_draw_ofv_at_the_estimate_is_the_fits_objective`) — when the last stage
+/// estimates. After an evaluation-only last stage (`agq_eval_only`, `imp_eval_only`)
+/// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
+/// offset is constant across draws, so the normalised weights are unchanged.
 ///
 /// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
 pub(crate) fn sir_draw_ofv(

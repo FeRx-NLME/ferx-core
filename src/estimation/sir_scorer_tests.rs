@@ -79,7 +79,7 @@ fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64,
 }
 
 /// T3. `sir_draw_ofv` at the estimates **is** the fit's objective — bit for bit on
-/// FOCEI, Laplace and a `[mixture]` override fit, to 1e-8 on FOCE — — scored through `run_sir`'s option
+/// FOCEI, Laplace and a `[mixture]` override fit, to 1e-8 on FOCE — scored through `run_sir`'s option
 /// builder with caller defaults (`method = FoceI`). The FOCE / FOCEI arms are the
 /// no-move control; the Laplace arm dies when the builder stops taking the fit's
 /// method (−3.40e-2 on the #1755 probe), the mixture arm when the scorer loses its

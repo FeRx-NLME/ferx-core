@@ -708,7 +708,7 @@ fn mixture_override_run_covariance_is_identical_to_in_fit() {
 /// | fit         | `packed_estimate` | outcome                                     |
 /// |-------------|-------------------|---------------------------------------------|
 /// | override    | `None`            | `Err`: names the override and why it is gone |
-/// | override    | wrong length      | `Err`: layout mismatch, no `.fitrx` story   |
+/// | override    | shorter / longer  | `Err`: layout mismatch, no `.fitrx` story   |
 /// | no override | `None`            | `Ok`, identical to the in-fit SIR            |
 ///
 /// Each sentence of each message is asserted by a substring, so deleting one reddens
@@ -750,22 +750,30 @@ fn mixture_without_packed_estimate() {
         }
     }
 
-    // Row 2: a packed estimate of another layout.
-    let mut other = cleared(&r);
-    other.packed_estimate = Some(MIX_PACKED[..6].to_vec());
-    let e = run_sir(&other, Some(&model), Some(&pop), &sir_defaults())
-        .expect_err("a packed estimate of the wrong length must be refused");
-    for must in [
-        "run_sir: the fit's packed estimate has 6 coordinates but this model's parameter \
-         layout has 7",
-        "Supply the model the fit was estimated with.",
-    ] {
-        assert!(e.contains(must), "layout message lacks {must:?}: {e}");
+    // Row 2: a packed estimate of another layout, shorter and longer — a `>=` length
+    // guard passes the longer one and reads the overrides from the wrong slots (#1768
+    // review finding 2).
+    for other_len in [6, 8] {
+        let mut v = MIX_PACKED.to_vec();
+        v.resize(other_len, 0.0);
+        let mut other = cleared(&r);
+        other.packed_estimate = Some(v);
+        let e = run_sir(&other, Some(&model), Some(&pop), &sir_defaults())
+            .expect_err("a packed estimate of the wrong length must be refused");
+        for must in [
+            format!(
+                "run_sir: the fit's packed estimate has {other_len} coordinates but this \
+                 model's parameter layout has 7"
+            ),
+            "Supply the model the fit was estimated with.".to_string(),
+        ] {
+            assert!(e.contains(&must), "layout message lacks {must:?}: {e}");
+        }
+        assert!(
+            !e.contains(".fitrx"),
+            "layout message tells the .fitrx story: {e}"
+        );
     }
-    assert!(
-        !e.contains(".fitrx"),
-        "layout message tells the .fitrx story: {e}"
-    );
 
     // Row 3: no override — the base is exact, so nothing is missing.
     let (model0, pop0, r0) = mixture_sir_fit(false);
