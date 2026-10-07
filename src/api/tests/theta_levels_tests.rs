@@ -204,8 +204,19 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
         .err()
         .expect("an unbound model must not predict");
     // #1746 (review r1 #2): the folded text still carries the diagnostic. Mutation:
-    // `EngineError::from(message)` in place of `with_message(d.clone(), message)` → dies.
+    // build it with `EngineError::from(text)` → the `code()` assert dies.
     assert_eq!(err.code(), Some("E_THETA_LEVELS_UNBOUND"), "{err}");
+    // (review r1 #6) …and the advice is in `to_string()` once (asserted below) and in
+    // `suggestion()`, never also in `message()`, so a renderer of `message()` +
+    // `suggestion()` does not show it twice. Both sides of the split in one test.
+    let advice = err.suggestion().expect("the refusal names its binder");
+    assert!(advice.contains("bind_from_fit"), "{advice}");
+    assert!(
+        !err.message().contains("bind_from_fit"),
+        "{}",
+        err.message()
+    );
+    assert!(err.to_string().contains("bind_from_fit"), "{err}");
     // One assertion per sentence (and clause) of the message and the suggestion.
     assert!(
         err.to_string().starts_with(

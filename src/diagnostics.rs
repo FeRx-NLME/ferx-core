@@ -244,11 +244,19 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
 /// `Display` is the historical `String` error byte for byte: the message, preceded
 /// by `"{context}: "` when the refusal names its entry point (`run_sir`,
 /// `run_covariance`). `.to_string()` therefore recovers the pre-#1746 `Err`.
+///
+/// One refusal's historical text also folds its suggestion in after the message
+/// (`predict`'s unbound `theta NAME[...]` block). There `Display` appends it, while
+/// [`message`](Self::message) stays the bare message and the suggestion is only in
+/// [`suggestion`](Self::suggestion). So a renderer shows either `to_string()` alone,
+/// or `message()` and `suggestion()` side by side — never the advice twice.
 #[derive(Debug, Clone)]
 pub struct EngineError {
     diagnostic: Option<Diagnostic>,
     message: String,
     context: Option<String>,
+    /// `Display` appends the diagnostic's suggestion as a sentence after the message.
+    suggestion_in_display: bool,
 }
 
 impl EngineError {
@@ -258,17 +266,17 @@ impl EngineError {
             message: d.message.clone(),
             diagnostic: Some(d),
             context: None,
+            suggestion_in_display: false,
         }
     }
 
-    /// An error carrying `d` whose message is `message` rather than `d.message` —
-    /// for a refusal whose historical text folds more than the diagnostic's message
-    /// (e.g. its suggestion) into one sentence.
-    pub(crate) fn with_message(d: Diagnostic, message: impl Into<String>) -> Self {
+    /// An error carrying `d` whose `Display` folds the suggestion in after the
+    /// message, capitalised and closed with a full stop — for a refusal whose
+    /// historical text read that way. [`message`](Self::message) stays `d.message`.
+    pub(crate) fn with_suggestion_in_display(d: Diagnostic) -> Self {
         EngineError {
-            message: message.into(),
-            diagnostic: Some(d),
-            context: None,
+            suggestion_in_display: true,
+            ..EngineError::from_diagnostic(d)
         }
     }
 
@@ -300,7 +308,7 @@ impl EngineError {
             .and_then(|d| d.suggestion.as_deref())
     }
 
-    /// The message, without the entry-point context.
+    /// The message, without the entry-point context and without the suggestion.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -316,7 +324,16 @@ impl std::fmt::Display for EngineError {
         if let Some(c) = &self.context {
             write!(f, "{c}: ")?;
         }
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        if self.suggestion_in_display {
+            if let Some(s) = self.suggestion() {
+                let mut chars = s.chars();
+                if let Some(first) = chars.next() {
+                    write!(f, " {}{}.", first.to_uppercase(), chars.as_str())?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -329,6 +346,7 @@ impl From<String> for EngineError {
             diagnostic: None,
             message,
             context: None,
+            suggestion_in_display: false,
         }
     }
 }
@@ -414,13 +432,27 @@ mod tests {
         assert_eq!(attributed.message(), "no diagnostic here");
         assert_eq!(attributed.to_string(), "run_sir: no diagnostic here");
 
-        // `with_message` keeps the diagnostic while printing its own text.
-        let folded = EngineError::with_message(
-            Diagnostic::error("E_X", "short"),
-            "short. With the advice folded in.",
-        );
+        // A folded refusal prints the advice once, after the message, while `message()`
+        // and `suggestion()` keep them apart (review r1 #6). Mutations: fold into
+        // `message` instead → the `message()` assert dies; drop the fold from `Display`
+        // → the `to_string()` assert dies; skip the capital → it dies too.
+        let folded = EngineError::with_suggestion_in_display(
+            Diagnostic::error("E_X", "Short.").with_suggestion("with the advice folded in"),
+        )
+        .in_context("predict");
         assert_eq!(folded.code(), Some("E_X"));
-        assert_eq!(folded.to_string(), "short. With the advice folded in.");
+        assert_eq!(folded.message(), "Short.");
+        assert_eq!(folded.suggestion(), Some("with the advice folded in"));
+        assert_eq!(
+            folded.to_string(),
+            "predict: Short. With the advice folded in."
+        );
+        // The fold is the exception: an ordinary diagnostic with a suggestion prints
+        // its message alone.
+        let plain_coded = EngineError::from_diagnostic(
+            Diagnostic::error("E_X", "Short.").with_suggestion("advice"),
+        );
+        assert_eq!(plain_coded.to_string(), "Short.");
     }
 
     #[test]

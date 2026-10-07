@@ -115,7 +115,10 @@ When `ferx check` reports the same refusal with a code, the `EngineError`
 carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
 [check report](file-formats/check-report.qmd#error-warning-codes) gives for the
 same model and data. A caller can match on `code()` instead of parsing the
-message. When `ferx check` has no code for the refusal, `code()` is `None`: an
+message. `message()` never repeats the suggestion, so show either `to_string()`
+alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
+unbound `theta NAME[...]` block is the one whose `to_string()` also ends with its
+suggestion.) When `ferx check` has no code for the refusal, `code()` is `None`: an
 entry point never invents one. The time-varying covariate on a hazard and the
 depot readout across a reset are refusals of that kind.
 

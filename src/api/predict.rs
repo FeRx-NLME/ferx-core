@@ -146,16 +146,10 @@ pub fn predict_diag(
     // column no population carries yet, so the covariate check below would name
     // that engine-internal column as missing from the data. Report the real cause
     // first, as `simulate()` does (#1644) — and, as `fit()`'s refusal does, name the
-    // way out in the `Err` itself: `first_error` returns the message alone.
+    // way out in the `Err`'s text itself (its `Display`), while `message()` stays the
+    // diagnostic's message and the advice is `suggestion()` only (#1746 review r1 #6).
     if let Some(d) = check_unbound_theta_levels(model, UnboundLevelsEntry::Predict).first() {
-        let suggestion = d.suggestion.as_deref().unwrap_or_default();
-        let mut chars = suggestion.chars();
-        let capitalized: String = chars
-            .next()
-            .map(|c| c.to_uppercase().chain(chars).collect())
-            .unwrap_or_default();
-        let message = format!("{} {capitalized}.", d.message);
-        return Err(EngineError::with_message(d.clone(), message));
+        return Err(EngineError::with_suggestion_in_display(d.clone()));
     }
     // θ against the model's layout (#1615): a short θ reads `0.0` past its end and
     // predicted 0, a long one dropped its tail. After the unbound-block arm, whose θ
