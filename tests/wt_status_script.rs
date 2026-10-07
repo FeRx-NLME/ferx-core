@@ -2,7 +2,7 @@
 //!
 //! The script exists so an agent behind Claude Code's worktree fence asks "behind? conflicts?
 //! dirty? pushed?" in one plain command instead of the `$(git …)` / `|` / `&&` compounds the
-//! fence refuses (see the script header and `AGENTS.md` § Worktree isolation). Each test builds
+//! fence refuses (see the script header). Each test builds
 //! a scratch `origin` + clone under `CARGO_TARGET_TMPDIR` and runs the script there, never on
 //! this checkout.
 //!

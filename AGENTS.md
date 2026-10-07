@@ -28,12 +28,6 @@ When a change here matters to a downstream consumer, tell them the two-step and 
 
 When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
 
-**Claude Code only: if a worktree session refuses a command.** A worktree-isolated Claude Code
-session refuses any Bash it cannot prove keeps git inside the worktree, such as `git -C`,
-`cd … && git`, or chains, heredocs and loops. When that happens, run plain `git` from the
-worktree and put compound logic in a script file run as `bash FILE`. `tools/wt-status.sh [--fetch]`
-reports branch, base, ahead/behind, conflicts and uncommitted paths in one call.
-
 ## Workspace layout and the public-API boundary
 
 The repo is a cargo **workspace** whose root package is `ferx-core` itself:
