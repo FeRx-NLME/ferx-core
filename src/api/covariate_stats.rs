@@ -28,6 +28,7 @@
 use std::collections::HashSet;
 
 use crate::api::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
+use crate::diagnostics::{Diagnostic, EngineError};
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
@@ -63,7 +64,36 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// which the fitted θ was estimated against, and are never re-taken from the data
 /// at hand. A model the deprecated `bind_theta_levels_from_fit` laid out without
 /// the fit's statistics has no fit centre to keep, and is refused.
+///
+/// Every refusal carries the code `E_COVARIATE_STATS_BINDING` on block
+/// `covariate_model` (#1773), the code `ferx check --data` reports for it.
 pub fn bind_covariate_stats(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &Population,
+) -> Result<(), EngineError> {
+    bind_covariate_stats_diag(parsed, model_text, population).map_err(EngineError::from_diagnostic)
+}
+
+/// [`bind_covariate_stats`], refusing with the [`Diagnostic`] itself: what
+/// `ferx check`'s binding step reads.
+pub(crate) fn bind_covariate_stats_diag(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &Population,
+) -> Result<(), Diagnostic> {
+    bind_stats_on_data(parsed, model_text, population).map_err(stats_binding_error)
+}
+
+/// The diagnostic of a `[covariate_model]` statistic that cannot bind (#1773): on
+/// the data, or from a fit. The one place `E_COVARIATE_STATS_BINDING` is assigned;
+/// `ferx check`, the binders and the entry points calling them all read it here.
+pub(crate) fn stats_binding_error(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error("E_COVARIATE_STATS_BINDING", message).with_block("covariate_model")
+}
+
+/// The body of [`bind_covariate_stats`]; every refusal is the statistics half's.
+fn bind_stats_on_data(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &Population,

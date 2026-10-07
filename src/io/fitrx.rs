@@ -1306,7 +1306,8 @@ fn read_bundled_population(
                         model_source,
                         Some(&mut population),
                         &fit.data_bindings,
-                    )?;
+                    )
+                    .map_err(|d| d.message)?;
                 }
                 match fingerprint.first_difference(&population) {
                     None => Ok(population),

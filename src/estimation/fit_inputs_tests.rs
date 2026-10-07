@@ -482,3 +482,56 @@ fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
     }
     run_covariance(&fit, None, Some(&returned), &opts).expect("the returned population runs");
 }
+
+/// #1773. The resolver's two level writes keep the binder's code through
+/// `run_sir` / `run_covariance`: `E_THETA_LEVEL_BINDING` on `parameters`, with the
+/// entry point as context and the binder's text unchanged. Both cells are a level
+/// the fit never estimated, from each side: the model rebuilt from the file and laid
+/// out on the fit, given the design population (`STUDY=4` is unseen); and a lent
+/// model bound on the design, given the fit's data re-read (`STUDY=3` is unseen to
+/// it). `run_sir` is refused in the resolver, before it reads the covariance matrix
+/// this fit does not carry.
+///
+/// Mutations — `.to_string()` the code away at either write (`bind_from_fit_on` or
+/// `write_fitted_level_columns` in `resolve_fit_inputs`): that cell's `code()` is
+/// `None`.
+#[test]
+fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
+    let c = case(Kind::Level);
+    let design = super::test_fixtures::design(&c);
+    // A lent model needs a fit with no recorded bindings to compare against.
+    let mut legacy = c.fit.clone();
+    legacy.data_bindings = Default::default();
+    let lent = &design.parsed.model;
+    for entry in ["run_covariance", "run_sir"] {
+        let run = |fit: &FitResult, m: Option<&CompiledModel>, p: Option<&Population>| match entry {
+            "run_covariance" => run_covariance(fit, m, p, &c.opts),
+            _ => run_sir(fit, m, p, &c.opts),
+        };
+        let cells = [
+            (
+                "rebuilt",
+                run(&c.fit, None, Some(&design.population)),
+                "`STUDY=4`",
+            ),
+            ("lent", run(&legacy, Some(lent), None), "`STUDY=3`"),
+        ];
+        for (what, r, unseen) in cells {
+            let e = r.map(|_| ()).expect_err(what);
+            assert_eq!(
+                e.code(),
+                Some("E_THETA_LEVEL_BINDING"),
+                "{entry}/{what}: {e}"
+            );
+            assert_eq!(e.block(), Some("parameters"), "{entry}/{what}: {e}");
+            assert_eq!(e.context(), Some(entry), "{entry}/{what}: {e}");
+            assert!(
+                e.to_string().starts_with(&format!(
+                    "{entry}: theta SHIFT[STUDY]: the design has 1 level(s) the fit estimated \
+                     no theta for: {unseen}."
+                )),
+                "{entry}/{what}: {e}"
+            );
+        }
+    }
+}

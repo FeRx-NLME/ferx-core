@@ -7117,17 +7117,15 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 ///
 /// Each failure keeps its own code, since each points somewhere else (#1739):
 /// a level block that cannot bind is a `[parameters]` error; a statistic that
-/// cannot bind is a `[covariate_model]` one.
+/// cannot bind is a `[covariate_model]` one. The binders assign the code (#1773),
+/// so `check` reports the diagnostic a caller of the binder gets.
 pub(crate) fn bind_for_check(
     parsed: &mut crate::types::ParsedModel,
     model_text: &str,
     population: &mut Population,
 ) -> Result<(), Diagnostic> {
-    crate::api::bind_theta_levels(parsed, model_text, population)
-        .map_err(|e| Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"))?;
-    crate::api::bind_covariate_stats(parsed, model_text, population).map_err(|e| {
-        Diagnostic::error("E_COVARIATE_STATS_BINDING", e).with_block("covariate_model")
-    })
+    crate::api::levels::bind_theta_levels_diag(parsed, model_text, population)?;
+    crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
 }
 
 /// Validate `model.output_columns` against known quantities, emitting

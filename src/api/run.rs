@@ -211,12 +211,18 @@ pub fn prepare_run_with_inits(
     // this synthesizes the per-record index column on every subject and
     // re-parses the model with the real θ count — before anything reads
     // `parsed.model`'s parameter vector.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+        .map_err(|e| e.to_string())?;
     // #1111: and resolve any symbolic `[covariate_model]` statistic
     // (`center = median`, `ref = mode`, `levels = auto`) against the same
     // dataset, which likewise re-parses so the desugared expression carries
     // the resolved constant.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
+        .map_err(|e| e.to_string())?;
 
     let init_params = build_init_params(&parsed);
     // Sync the resolved gradient method from fit_options onto the model so
@@ -718,10 +724,16 @@ pub fn run_model_simulate_with_overrides(
     // declaration's broadcast init, since the DSL has no way to state per-level
     // simulation values; a design that needs distinct ones should use the
     // explicit `theta NAME[N]` form and its own index column.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)
+        .map_err(|e| e.to_string())?;
     // #1111: the simulation design is the dataset here, so a symbolic
     // covariate statistic resolves against the simulated covariates.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)
+        .map_err(|e| e.to_string())?;
     let template = template;
 
     // Simulate
