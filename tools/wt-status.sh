@@ -6,10 +6,8 @@
 # An agent session isolated in a worktree (Claude Code's `EnterWorktree`) runs
 # behind a fence that refuses any shell command it cannot prove keeps git inside
 # that worktree: `git -C`, `cd … && git`, `$(git …)`, pipes and `;`/`&&` chains
-# around git, heredocs, loops. Measured 2026-10-07 over 205 worktree sessions:
-# 1,808 commands refused, a median of 7 per session, each one a wasted round
-# trip. A plain single command, a `bash FILE` and a `tools/*.sh` call were refused
-# zero times.
+# around git, heredocs, loops. A plain single command, `bash FILE` and a
+# `tools/*.sh` call pass.
 #
 # The compounds that kept being refused were the same few questions asked by
 # hand: how far behind the base am I, does it conflict, what is uncommitted, is
