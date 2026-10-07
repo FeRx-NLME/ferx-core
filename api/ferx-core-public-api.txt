@@ -4687,6 +4687,14 @@ pub ferx_core::ModelParameters::theta_names: alloc::vec::Vec<alloc::string::Stri
 pub ferx_core::ModelParameters::theta_upper: alloc::vec::Vec<f64>
 impl ferx_core::ModelParameters
 pub fn ferx_core::ModelParameters::has_any_fixed(&self) -> bool
+#[non_exhaustive] pub struct ferx_core::ModelSource
+pub ferx_core::ModelSource::hash: alloc::string::String
+pub ferx_core::ModelSource::parsed: ferx_core::ParsedModel
+pub ferx_core::ModelSource::path: std::path::PathBuf
+pub ferx_core::ModelSource::text: alloc::string::String
+impl ferx_core::ModelSource
+pub fn ferx_core::ModelSource::read(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, alloc::string::String>
+pub fn ferx_core::ModelSource::read_verified(path: impl core::convert::AsRef<std::path::Path>, expected_hash: core::option::Option<&str>, entry: &str) -> core::result::Result<Self, alloc::string::String>
 pub struct ferx_core::MonitorSpec
 pub ferx_core::MonitorSpec::cmt: usize
 pub ferx_core::MonitorSpec::mode: ferx_core::sim::adaptive::ObserveMode

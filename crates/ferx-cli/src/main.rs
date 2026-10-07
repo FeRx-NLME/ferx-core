@@ -152,7 +152,8 @@ enum FirstArg<'a> {
     /// A bare word — no dot, no path separator. The user meant a tool, and this
     /// build does not have it (a typo, or a tool that only exists in a later
     /// version). Reading it as a model path is what produced the misleading
-    /// "Failed to read model file: No such file or directory".
+    /// "Failed to read model file: No such file or directory" (now "cannot read the
+    /// model file …", #1752).
     UnknownTool(&'a str),
     /// Either the path is there, or the filesystem would not say: hand it to
     /// the fit/simulate path, which opens it and reports whatever the OS says.
@@ -406,7 +407,9 @@ fn main() {
             }
 
             if let Some(out) = &output_path {
-                let model_source = std::fs::read_to_string(model_path).unwrap_or_default();
+                // The text the fit parsed (#1752): reading the file again here would be a
+                // second open, and `save_fit` prefers `model_text` anyway.
+                let model_source = fit_result.model_text.clone().unwrap_or_default();
                 // Use the resolved data path from the fit result, not the raw
                 // `--data` flag: with a model-declared `[data]` block (#690)
                 // and no `--data`, the CSV that was actually fit is only known

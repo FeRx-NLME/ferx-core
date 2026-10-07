@@ -989,64 +989,33 @@ fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
     }
 }
 
-/// #1743. The three ways the check's binding step fails each carry their own code
-/// and block, asserted in one test so no arm can borrow another's: a failed
-/// re-read of the model file is `E_MODEL_REREAD` with **no** block, even on a
-/// model with no level block (the arm was `E_THETA_LEVEL_BINDING` on
-/// `parameters`); a level block that cannot bind keeps `E_THETA_LEVEL_BINDING` on
-/// `parameters`; a statistic that cannot bind keeps `E_COVARIATE_STATS_BINDING`
-/// on `covariate_model`.
+/// #1739. The two ways the check's binding step fails each carry their own code
+/// and block, asserted in one test so neither arm can borrow the other's: a level
+/// block that cannot bind is `E_THETA_LEVEL_BINDING` on `parameters`; a statistic
+/// that cannot bind is `E_COVARIATE_STATS_BINDING` on `covariate_model`. (#1743's
+/// third arm, a failed *re-read* of the model file, went with the re-read in
+/// #1752: the binder takes the text the check parsed.)
 ///
-/// Mutations — restore the old code or block on the re-read arm: the first cell.
-/// Delete either sentence of its message: the `contains` on that sentence.
-/// Swap the two binders' codes: the second and third cells.
+/// Mutations — swap the two binders' codes or blocks: the first or second cell.
 #[test]
 fn each_binding_failure_of_the_check_carries_its_own_code() {
     use crate::api::validation::bind_for_check;
-    let bind = |text: &str, read: std::io::Result<String>, pop: &mut Population| {
+    let bind = |text: &str, pop: &mut Population| {
         let mut parsed = parse_full_model(text).unwrap();
-        bind_for_check(&mut parsed, "m.ferx", read, pop).expect_err("the bind fails")
+        bind_for_check(&mut parsed, text, pop).expect_err("the bind fails")
     };
-    // No level block: the re-read arm is no level-block error.
     let text = grp_auto();
-    let reread = bind(
-        &text,
-        Err(std::io::Error::other("gone")),
-        &mut population("GRP", &[1.0, 2.0]),
-    );
-    assert_eq!(reread.code, "E_MODEL_REREAD", "{reread:?}");
-    assert_eq!(reread.block, None, "{reread:?}");
-    assert!(
-        reread
-            .message
-            .contains("Failed to re-read the model file `m.ferx` to bind it to the data: gone."),
-        "{}",
-        reread.message
-    );
-    assert!(
-        reread.message.contains(
-            "The check had already read it, so it was moved, deleted or made unreadable \
-             while the check ran."
-        ),
-        "{}",
-        reread.message
-    );
-
     let level = text
         .replace(
             "  theta TVV(40.0, 1.0, 500.0)",
             "  theta TVV(40.0, 1.0, 500.0)\n  theta PLACEBO[GRP](0.5, -5.0, 5.0)",
         )
         .replace("V  = TVV", "V  = TVV * exp(PLACEBO)");
-    let levels = bind(
-        &level,
-        Ok(level.clone()),
-        &mut population("GRP", &[1.0, 2.0]),
-    );
+    let levels = bind(&level, &mut population("GRP", &[1.0, 2.0]));
     assert_eq!(levels.code, "E_THETA_LEVEL_BINDING", "{levels:?}");
     assert_eq!(levels.block.as_deref(), Some("parameters"), "{levels:?}");
 
-    let stats = bind(&text, Ok(text.clone()), &mut population("GRP", &[2.0, 2.0]));
+    let stats = bind(&text, &mut population("GRP", &[2.0, 2.0]));
     assert_eq!(stats.code, "E_COVARIATE_STATS_BINDING", "{stats:?}");
     assert_eq!(stats.block.as_deref(), Some("covariate_model"), "{stats:?}");
     assert!(
@@ -1056,18 +1025,20 @@ fn each_binding_failure_of_the_check_carries_its_own_code() {
     );
 }
 
-/// #1743, end to end: a `validate_model_file` run whose model file is deleted
-/// after the parse, while the data are read, reports `E_MODEL_REREAD` with no
-/// block, and no binding code. The data file is a FIFO, so the writer controls
-/// when the read finishes: it deletes the model while the reader blocks on the
-/// pipe, then writes the rows. Control, in the same test: the same files with the
-/// model left in place validate clean of every binding code.
+/// #1752, inverting #1743's test: a `validate_model_file` run whose model file is
+/// deleted after the parse, while the data are read, completes. The check reads
+/// the model file once and binds from that read's text, so nothing is left to
+/// fail. The data file is a FIFO, so the writer controls when the read finishes:
+/// it deletes the model while the reader blocks on the pipe, then writes the rows.
+/// Both arms (deleted, left in place) must report no error and must carry the
+/// desugared `[covariate_model]`, which the report fills only once `levels = auto`
+/// / `ref = mode` are bound — so the binding step ran in both.
 ///
-/// Mutations — restore the old code on the re-read arm: the `code` assertion.
-/// Restore its `parameters` block: the `block` assertion.
+/// Mutation — read the model file a second time for the binding step: the deleted
+/// arm reports an error.
 #[cfg(unix)]
 #[test]
-fn a_model_file_gone_by_the_rebind_is_its_own_error() {
+fn a_model_file_gone_after_the_parse_does_not_fail_the_check() {
     use std::io::Write;
     let text = grp_auto();
     let rows = {
@@ -1076,13 +1047,6 @@ fn a_model_file_gone_by_the_rebind_is_its_own_error() {
     };
     let dir = tempfile::tempdir().unwrap();
     let model = dir.path().join("m.ferx");
-    let binding_codes = |r: &crate::diagnostics::CheckReport| -> Vec<_> {
-        r.diagnostics
-            .iter()
-            .filter(|d| d.code.ends_with("_BINDING") || d.code == "E_MODEL_REREAD")
-            .cloned()
-            .collect()
-    };
 
     for gone in [true, false] {
         std::fs::write(&model, &text).unwrap();
@@ -1118,15 +1082,52 @@ fn a_model_file_gone_by_the_rebind_is_its_own_error() {
             panic!("the writer is still blocked: the check never opened the data");
         }
         writer.join().unwrap();
-        let hits = binding_codes(&report);
-        if gone {
-            assert_eq!(hits.len(), 1, "{:?}", report.diagnostics);
-            assert_eq!(hits[0].code, "E_MODEL_REREAD", "{:?}", hits[0]);
-            assert_eq!(hits[0].block, None, "{:?}", hits[0]);
-        } else {
-            assert!(hits.is_empty(), "control: {:?}", report.diagnostics);
-        }
+        // The straddle: the model really is gone in one arm and present in the other.
+        assert_eq!(model.exists(), !gone, "gone = {gone}");
+        let errors: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "gone = {gone}: {:?}", report.diagnostics);
+        assert!(
+            !report.desugared_individual_parameters.is_empty(),
+            "gone = {gone}: the binding step did not run: {:?}",
+            report.diagnostics
+        );
     }
+}
+
+/// #1752: a model file that cannot be read is `E_MODEL_READ`, with no block, and
+/// names the path. It was `E_PARSE`, though nothing had been parsed. A file that
+/// reads but does not parse keeps a parse code, in the same test, so neither arm
+/// can take the other's.
+///
+/// Mutations — map a read failure through `parse_error_to_diagnostic`: the first
+/// cell. Map a parse failure to `E_MODEL_READ`: the second.
+#[test]
+fn an_unreadable_model_file_is_e_model_read_and_a_bad_one_a_parse_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.ferx");
+    let report = crate::api::validate_model_file(missing.to_str().unwrap(), None);
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_MODEL_READ", "{d:?}");
+    assert_eq!(d.block, None, "{d:?}");
+    let want = format!("cannot read the model file {}: ", missing.display());
+    assert!(d.message.starts_with(&want), "{}", d.message);
+
+    let bad = dir.path().join("bad.ferx");
+    std::fs::write(&bad, "[parameters]\n  theta TVCL(\n").unwrap();
+    let report = crate::api::validate_model_file(bad.to_str().unwrap(), None);
+    // The parse's own code, not merely "not `E_MODEL_READ`" (#1760 review r1,
+    // finding 3): any other mapping of a parse failure must fail this.
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        report.diagnostics[0].code, "E_PARSE",
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The #1738 fixture: `CL ~ WT power` with an explicit `=> THETA_CL_WT(...)`,
