@@ -740,11 +740,14 @@ fn mixture_without_packed_estimate() {
             "a fit read from .fitrx, built in R, or estimated by SAEM, IMP or Bayes lacks them"
                 .to_string(),
         ] {
-            assert!(e.contains(&must), "{entry} message lacks {must:?}: {e}");
+            assert!(
+                e.to_string().contains(&must),
+                "{entry} message lacks {must:?}: {e}"
+            );
         }
         for must_not in ["refit", "declared", "layout"] {
             assert!(
-                !e.contains(must_not),
+                !e.to_string().contains(must_not),
                 "{entry} message says {must_not:?}: {e}"
             );
         }
@@ -767,10 +770,13 @@ fn mixture_without_packed_estimate() {
             ),
             "Supply the model the fit was estimated with.".to_string(),
         ] {
-            assert!(e.contains(&must), "layout message lacks {must:?}: {e}");
+            assert!(
+                e.to_string().contains(&must),
+                "layout message lacks {must:?}: {e}"
+            );
         }
         assert!(
-            !e.contains(".fitrx"),
+            !e.to_string().contains(".fitrx"),
             "layout message tells the .fitrx story: {e}"
         );
     }

@@ -220,6 +220,8 @@ const READS_WT: &str = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  \
 fn families() -> Vec<Family> {
     let iv = || parse_model_string(ONE_CPT_IV).expect("parse");
     let one = |s: Subject| population_of(vec![s], &[]);
+    // Only the `survival` build extends it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut out = vec![
         Family {
             name: "modeled dose rates (#324)",
