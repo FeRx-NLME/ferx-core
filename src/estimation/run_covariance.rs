@@ -15,8 +15,12 @@
 //! - A supplied `model` / `population` is not hash-checked (the in-memory values
 //!   don't carry their source bytes), but must be the fitted one: the fit's
 //!   bindings and θ count, the fit's subjects in the fit's order.
-//! - `Some(model)` with `population = None` still reads the hash-verified model
-//!   file, for the reader settings the re-read needs; pass both to avoid it.
+//! - A fit that records its reader settings (#1685) re-reads `fit.data_path` with
+//!   them, so `Some(model)` with `population = None` does not read the model file.
+//!   An older fit takes the model file's settings, which with `Some(model)` means
+//!   reading the hash-verified model file; pass both to avoid it.
+//! - A fit that carries a population fingerprint (every fit since #1685) refuses
+//!   any population, supplied or re-read, that is not the one it was given.
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
@@ -57,21 +61,21 @@ use crate::types::*;
 /// `Err`. Mirroring `fit()`, the returned `FitResult` carries
 /// `covariance_matrix = None`, `covariance_status = Failed`, and the diagnostic
 /// appended to `warnings`. `Err` is reserved for input problems: a missing /
-/// hash-mismatched model or dataset, a dimension mismatch, or an IOV model
+/// hash-mismatched model or dataset, a dimension mismatch, a population that is
+/// not the one the fit was given (#1685), or, on an older fit, an IOV model
 /// supplied without its population (see below).
 ///
 /// # IOV models (n_kappa > 0)
 ///
 /// As with `run_sir`, re-reading the dataset for an IOV model requires the
-/// `iov_column` name from the model file's `[fit_options]` block, which does
-/// not survive on a `CompiledModel`. When the caller passes `None` for both
-/// `model` and `population`, this function parses the full model file and
-/// threads `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`,
-/// `run_covariance` returns an error rather than read occasions with an
-/// `iov_column` the supplied model may not share: the model carries none, and the
-/// model file's need not be the one it was built with. Workaround: pass both
-/// `Some(model)` and `Some(population)` for IOV cases.
+/// `iov_column` the fit read with, which does not survive on a `CompiledModel`. A
+/// fit that records its reader settings (#1685) carries it, so every cell runs.
+/// On an older fit, `None` for both `model` and `population` parses the full model
+/// file and threads its `iov_column` into the reader, while `Some(model)` for an
+/// IOV model with `population = None` is an error rather than read occasions with
+/// an `iov_column` the supplied model may not share: the model carries none, and
+/// the model file's need not be the one it was built with. Workaround: pass both
+/// `Some(model)` and `Some(population)`.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
@@ -313,6 +317,7 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and
     // the new covariance warnings get `details` sourced from the *refreshed*
@@ -918,16 +923,21 @@ mod tests {
         // Some(model) for an IOV (n_kappa > 0) model but None population: must
         // refuse rather than re-read data without iov_column. The IOV check
         // fires before any dimension check, so the shape-mismatched fit is fine.
+        // #1685 T8: on a **legacy** fit — no recorded reader settings or
+        // fingerprint, as an older `.fitrx` — the refusal stands; a fit that
+        // records its `iov_column` runs instead (T9).
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 
-        let fit = fit_from_files(
+        let mut fit = fit_from_files(
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
             None,
             Some(quick_opts()),
         )
         .expect("fit must converge");
+        fit.reader_settings = None;
+        fit.population_fingerprint = None;
 
         let iov_model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
             "examples/warfarin_iov.ferx",
@@ -1023,9 +1033,15 @@ mod from_fit_bindings {
                 "{kind:?}: [data_selection] dropped subject 3"
             );
 
+            let want = oracle(&c);
             let got = run_covariance(&c.fit, None, None, &c.opts)
                 .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
-            assert_same_covariance(&got, &oracle(&c), &format!("{kind:?} None/None"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} None/None"));
+            // #1685 T10: `(Some, None)` re-reads with the recorded settings now, not
+            // the model file's; the result is the same to the bit.
+            let got = run_covariance(&c.fit, Some(&c.prep.parsed.model), None, &c.opts)
+                .unwrap_or_else(|e| panic!("{kind:?} Some/None: {e}"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} Some/None"));
         }
     }
 
@@ -1056,6 +1072,7 @@ mod from_fit_bindings {
             Kind::Level,
             Kind::LevelMedian,
             Kind::Select,
+            Kind::DoseFilter,
         ] {
             assert_re_read_matches(kind);
         }
@@ -1409,8 +1426,12 @@ mod from_fit_bindings {
         let fitted = &c.prep.parsed.model;
         let (mm, dm) = (wt_median(lent), wt_median(fitted));
 
+        // The routed re-read is the legacy path (#1685): a fit with recorded reader
+        // settings re-reads with them, `[data_selection]` included.
         let mut routed = fit.clone();
         routed.model_path = None;
+        routed.reader_settings = None;
+        routed.population_fingerprint = None;
         let cells = [
             (&fit, Some(&c.prep.population), Source::Supplied),
             (&fit, None, Source::ReRead),
@@ -1426,6 +1447,18 @@ mod from_fit_bindings {
                 "{source:?}"
             );
         }
+        // #1685, the other side of the routed caveat's gate: no `model_path`, but
+        // recorded settings, so the re-read did apply the selection and says nothing
+        // about it.
+        let mut recorded = fit.clone();
+        recorded.model_path = None;
+        let err = run_covariance(&recorded, Some(lent), None, &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            stats_refusal(Source::ReRead, mm, dm, false)
+        );
         // The supplied and re-read texts differ, so neither equality is the other's.
         assert_ne!(
             stats_refusal(Source::Supplied, mm, dm, false),
@@ -1438,10 +1471,26 @@ mod from_fit_bindings {
 
         // A fit that records its bindings decides by them, not by the population:
         // the fitted model on a supplied population with other WT values is not
-        // re-summarised (which population a caller supplies is #1685's question).
-        let got = run_covariance(&c.fit, Some(fitted), Some(&design.population), &c.opts)
+        // re-summarised. Which population a caller supplies is #1685's question, so
+        // this holds on a fit without a population fingerprint (an older `.fitrx`)…
+        let mut unprinted = c.fit.clone();
+        unprinted.reader_settings = None;
+        unprinted.population_fingerprint = None;
+        let got = run_covariance(&unprinted, Some(fitted), Some(&design.population), &c.opts)
             .expect("recorded bindings are not re-checked against the population");
         assert!(got.covariance_matrix.is_some(), "{:?}", got.warnings);
+        // …and a fit with one refuses the design's population on its covariate values
+        // (#1685), not on the statistics.
+        let err = run_covariance(&c.fit, Some(fitted), Some(&design.population), &c.opts)
+            .map(|_| ())
+            .expect_err("not the fit's population");
+        assert!(
+            err.to_string().starts_with(
+                "run_covariance: this population is not the one the fit was given: the \
+                 covariate values of subject `1` differ"
+            ),
+            "{err}"
+        );
 
         let mut absent = c.prep.population.clone();
         for s in &mut absent.subjects {
@@ -1535,6 +1584,14 @@ mod from_fit_bindings {
     ///
     /// Mutations — drop the `because` text from either failure, or the prefix from
     /// the read error: the matching assertion dies.
+    ///
+    /// #1685 T8: that is the **legacy** contract — a fit with no recorded reader
+    /// settings or fingerprint (an older `.fitrx`). A fit that records its settings
+    /// re-reads with them, so the model file is not read at all: with the file gone,
+    /// `(Some, None)` runs bit-identical to `(Some, Some)`.
+    ///
+    /// Mutation — read the model file for its settings even when the fit records
+    /// them: the last cell is refused on the missing file.
     #[test]
     fn a_supplied_model_reads_the_model_file_only_for_its_reader() {
         const BECAUSE: &str = " The population is re-read with this file's `[data]` \
@@ -1543,10 +1600,13 @@ mod from_fit_bindings {
                                model file is not read.";
         let c = case(Kind::Median);
         let model = &c.prep.parsed.model;
+        let mut legacy = c.fit.clone();
+        legacy.reader_settings = None;
+        legacy.population_fingerprint = None;
 
         let text = std::fs::read_to_string(&c.model_path).unwrap();
         std::fs::write(&c.model_path, format!("{text}\n# edited after the fit\n")).unwrap();
-        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+        let err = run_covariance(&legacy, Some(model), None, &c.opts)
             .map(|_| ())
             .unwrap_err();
         assert!(
@@ -1571,7 +1631,7 @@ mod from_fit_bindings {
         );
 
         std::fs::remove_file(&c.model_path).unwrap();
-        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+        let err = run_covariance(&legacy, Some(model), None, &c.opts)
             .map(|_| ())
             .unwrap_err();
         assert!(
@@ -1582,8 +1642,13 @@ mod from_fit_bindings {
         assert!(err.to_string().ends_with(BECAUSE), "{err}");
 
         // The advice: with the population supplied too, the file is not read.
-        let got = run_covariance(&c.fit, Some(model), Some(&c.prep.population), &c.opts)
+        let want = run_covariance(&legacy, Some(model), Some(&c.prep.population), &c.opts)
             .expect("no model file needed");
-        assert!(got.covariance_matrix.is_some());
+        assert!(want.covariance_matrix.is_some());
+
+        // Recorded settings: the missing file is never opened.
+        let got = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .expect("a fit with recorded reader settings needs no model file");
+        assert_same_covariance(&got, &want, "recorded settings, Some/None");
     }
 }

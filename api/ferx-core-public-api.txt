@@ -42,6 +42,16 @@ pub ferx_core::api::PreparedRun::init_params: ferx_core::ModelParameters
 pub ferx_core::api::PreparedRun::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::api::PreparedRun::parsed: ferx_core::ParsedModel
 pub ferx_core::api::PreparedRun::population: ferx_core::Population
+#[non_exhaustive] pub struct ferx_core::api::ReaderSettings
+pub ferx_core::api::ReaderSettings::accept_exprs: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::ReaderSettings::column_map: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub ferx_core::api::ReaderSettings::covariate_decls: core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>
+pub ferx_core::api::ReaderSettings::fallback_columns: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub ferx_core::api::ReaderSettings::ignore_exprs: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::ReaderSettings::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::ReaderSettings::iov_column: core::option::Option<alloc::string::String>
+impl ferx_core::ReaderSettings
+pub fn ferx_core::ReaderSettings::from_parsed(parsed: &ferx_core::ParsedModel) -> Self
 pub struct ferx_core::api::RunOverrides
 pub ferx_core::api::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
 pub ferx_core::api::RunOverrides::threads: core::option::Option<usize>
@@ -104,6 +114,7 @@ pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Op
 pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
 pub fn ferx_core::api::read_population_for(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
+pub fn ferx_core::api::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::api::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
@@ -3121,7 +3132,9 @@ pub ferx_core::types::FitResult::optimizer: alloc::string::String
 pub ferx_core::types::FitResult::outer_gtol: f64
 pub ferx_core::types::FitResult::outer_maxiter: usize
 pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::population_fingerprint: core::option::Option<ferx_core::PopulationFingerprint>
 pub ferx_core::types::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
+pub ferx_core::types::FitResult::reader_settings: core::option::Option<ferx_core::ReaderSettings>
 pub ferx_core::types::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::FitResult::restored_from_checkpoint: bool
@@ -3319,6 +3332,7 @@ pub ferx_core::types::Population::warnings: alloc::vec::Vec<alloc::string::Strin
 impl ferx_core::Population
 pub fn ferx_core::Population::n_obs(&self) -> usize
 pub fn ferx_core::Population::prune_irrelevant_tv_covariates(&mut self, referenced: &[alloc::string::String]) -> usize
+#[non_exhaustive] pub struct ferx_core::types::PopulationFingerprint
 pub struct ferx_core::types::PosteriorSummary
 pub ferx_core::types::PosteriorSummary::ess_bulk: f64
 pub ferx_core::types::PosteriorSummary::ess_tail: f64
@@ -4602,7 +4616,9 @@ pub ferx_core::FitResult::optimizer: alloc::string::String
 pub ferx_core::FitResult::outer_gtol: f64
 pub ferx_core::FitResult::outer_maxiter: usize
 pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::population_fingerprint: core::option::Option<ferx_core::PopulationFingerprint>
 pub ferx_core::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
+pub ferx_core::FitResult::reader_settings: core::option::Option<ferx_core::ReaderSettings>
 pub ferx_core::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::FitResult::restored_from_checkpoint: bool
@@ -4848,6 +4864,7 @@ pub ferx_core::Population::warnings: alloc::vec::Vec<alloc::string::String>
 impl ferx_core::Population
 pub fn ferx_core::Population::n_obs(&self) -> usize
 pub fn ferx_core::Population::prune_irrelevant_tv_covariates(&mut self, referenced: &[alloc::string::String]) -> usize
+#[non_exhaustive] pub struct ferx_core::PopulationFingerprint
 pub struct ferx_core::PosteriorSummary
 pub ferx_core::PosteriorSummary::ess_bulk: f64
 pub ferx_core::PosteriorSummary::ess_tail: f64
@@ -4884,6 +4901,16 @@ pub ferx_core::PriorSummary::prior_lower_95: f64
 pub ferx_core::PriorSummary::prior_upper_95: f64
 pub ferx_core::PriorSummary::prior_value: f64
 pub ferx_core::PriorSummary::shift_in_prior_sds: f64
+#[non_exhaustive] pub struct ferx_core::ReaderSettings
+pub ferx_core::ReaderSettings::accept_exprs: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::ReaderSettings::column_map: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub ferx_core::ReaderSettings::covariate_decls: core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>
+pub ferx_core::ReaderSettings::fallback_columns: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub ferx_core::ReaderSettings::ignore_exprs: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::ReaderSettings::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::ReaderSettings::iov_column: core::option::Option<alloc::string::String>
+impl ferx_core::ReaderSettings
+pub fn ferx_core::ReaderSettings::from_parsed(parsed: &ferx_core::ParsedModel) -> Self
 pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize
@@ -5104,6 +5131,7 @@ pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<
 pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv(path: &std::path::Path, covariate_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>) -> core::result::Result<ferx_core::Population, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv_with_covariates(path: &std::path::Path, decls: &[ferx_core::CovariateDecl], extra_columns: &[alloc::string::String], iov_column: core::option::Option<&str>) -> core::result::Result<(ferx_core::Population, ferx_core::CovariateTable), alloc::string::String>
+pub fn ferx_core::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::run_covariance(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>

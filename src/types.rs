@@ -9,6 +9,14 @@ use std::collections::HashMap;
 pub use crate::parser::model_parser::IndivParamPartials;
 pub use crate::parser::model_parser::ThetaBlocks;
 
+// A child module, so its exhaustive destructure of `DoseEvent` can name the
+// private `cmt` field (#1685).
+mod population_fingerprint;
+pub(crate) use population_fingerprint::Difference as PopulationDifference;
+pub use population_fingerprint::PopulationFingerprint;
+#[cfg(test)]
+pub(crate) use population_fingerprint::SCHEME as POPULATION_FINGERPRINT_SCHEME;
+
 /// How a dose's infusion `rate`/`duration` are determined.
 ///
 /// NONMEM overloads the `RATE` column with negative codes that make the
@@ -7089,6 +7097,20 @@ pub struct FitResult {
     /// launched via `fit_from_files` / CLI or loaded from a `.fitrx` bundle;
     /// `None` for in-memory `fit()` callers who never had a file path.
     pub model_text: Option<String>,
+    /// The settings the data were read with (#1685): `[data]` renames,
+    /// `[covariates]`, `iov_column`, and the `[data_selection]` clauses with any a
+    /// caller added. `run_sir`, `run_covariance` and `load_fit` re-read
+    /// `data_path` with these. `Some` when the fit was launched from a data file
+    /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`
+    /// and on a `.fitrx` bundle saved before #1685.
+    #[serde(default)]
+    pub reader_settings: Option<crate::api::ReaderSettings>,
+    /// A fingerprint of the population `fit()` was given (#1685). Every post-hoc
+    /// step refuses a population that does not match it. `None` on a `.fitrx`
+    /// bundle saved before #1685; a fingerprint from another encoding scheme is
+    /// treated as absent, with a warning.
+    #[serde(default)]
+    pub population_fingerprint: Option<PopulationFingerprint>,
     /// Initial theta values as supplied to the optimizer, parallel to `theta`
     /// and `theta_names`.
     pub theta_init: Vec<f64>,

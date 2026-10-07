@@ -278,6 +278,33 @@ The key is absent when the model has no data-derived binding, and on a bundle
 saved before #1621; both load with empty bindings. Edited bindings that list a
 level twice are refused when a design is bound against them.
 
+### `reader_settings` and `population_fingerprint`
+
+How the fit read its data, and a fingerprint of the population it was given
+([#1685](https://github.com/FeRx-NLME/ferx-core/issues/1685)):
+
+```json
+"reader_settings": {
+  "column_map": [["DV", "CONC"]],
+  "covariate_decls": null,
+  "fallback_columns": null,
+  "iov_column": "OCC",
+  "ignore_exprs": ["TIME > 24"],
+  "accept_exprs": [],
+  "ignore_subjects": ["3"]
+},
+"population_fingerprint": { "scheme": 1, "covariate_names": ["WT"], "subjects": [ ... ] }
+```
+
+`reader_settings` holds the `[data]` renames, the `[covariates]` declarations (or
+the explicit covariate columns), the occasion column and the `[data_selection]`
+clauses, with any a caller added to the model file's. It is present when the fit
+was launched from a data file. `population_fingerprint` is written by every fit;
+treat it as opaque. `run_sir` and `run_covariance` re-read `data_path` with the
+settings and refuse a population that does not match the fingerprint. Both keys
+are absent on a bundle saved before #1685, which loads them as `None`; the
+format version did not change.
+
 ## `ebes.csv`
 
 ```
@@ -354,6 +381,16 @@ duplicated for grep-friendliness.
 A verbatim copy of the input NONMEM CSV. Only present when the writer was
 asked to embed data (`--include-data` on the CLI, or `SaveFitOptions::include_data
 = Some(path)` via the Rust API).
+
+`load_fit` re-reads it into `LoadedFit::population`. On a bundle that records
+`reader_settings` and a `population_fingerprint`, it reads with those settings
+(row filters included), writes the level index columns from `data_bindings`, and
+checks the result against the fingerprint. On a mismatch the bundle still loads
+its estimates, with `population = None` and a warning naming the first subject
+that differs, since a later change to how ferx reads a CSV should not make an older
+bundle unloadable. Before #1685, and still on a bundle that
+lacks either key, it reads with the model's `[data]` renames only, so a fit with
+`ignore_subjects` or a dose-row filter came back with the excluded rows in it.
 
 ## Versioning
 

@@ -162,6 +162,9 @@ pub struct PreparedRun {
     /// The model file's text from the one read that was parsed, bound and hashed
     /// (#1752), stored on the fit as `model_text`.
     pub(crate) model_text: String,
+    /// The settings `population` was read with, stored on the fit as
+    /// `reader_settings` (#1685).
+    pub(crate) reader_settings: ReaderSettings,
 }
 
 /// Parse a model file and read its dataset, stopping short of the fit.
@@ -198,7 +201,10 @@ pub fn prepare_run_with_inits(
 
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
 
-    let (mut population, covariate_table) = read_population_as_fitted(&parsed, &data_path)?;
+    // The settings this read uses are the ones the fit records (#1685).
+    let reader_settings = ReaderSettings::from_parsed(&parsed);
+    let (mut population, covariate_table) =
+        read_population_with(&parsed.model, &reader_settings, &data_path)?;
 
     // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
     // combination, so its level count is a property of the data. Bind it now —
@@ -236,6 +242,7 @@ pub fn prepare_run_with_inits(
         model_hash,
         data_hash,
         model_text,
+        reader_settings,
     })
 }
 
@@ -327,6 +334,7 @@ pub fn run_model_with_overrides(
         model_hash,
         data_hash,
         model_text,
+        reader_settings,
     } = prepare_run_with_inits(model_path, data_path, inits_override)?;
     let data_path = data_path.as_str();
 
@@ -379,8 +387,17 @@ pub fn run_model_with_overrides(
     result.model_hash = model_hash;
     result.data_hash = data_hash;
     result.model_text = Some(model_text);
+    result.reader_settings = Some(reader_settings);
     derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
+}
+
+/// Whether `fit()` replaces the population's occasion labels with ones derived from
+/// a model-side `iov_occasion` rule (#757). The one predicate for `fit()`'s own
+/// derivation, [`derive_output_occasions`], and the population fingerprint, which
+/// then leaves the overwritten labels out (#1685 review r1 #1).
+pub(crate) fn occasions_are_derived(model: &CompiledModel, options: &FitOptions) -> bool {
+    model.n_kappa > 0 && options.iov_occasion != IovOccasionRule::Column
 }
 
 /// Mirror [`fit`]'s model-side IOV occasion derivation onto a caller-owned
@@ -397,7 +414,7 @@ pub(crate) fn derive_output_occasions(
     options: &FitOptions,
     population: &mut Population,
 ) {
-    if model.n_kappa == 0 || options.iov_occasion == IovOccasionRule::Column {
+    if !occasions_are_derived(model, options) {
         return;
     }
     let mut sink = Vec::new();
@@ -1021,22 +1038,10 @@ pub(crate) fn build_selection_filter(opts: &FitOptions) -> Result<Option<Selecti
     .map(Some)
 }
 
-/// Build a `SelectionFilter` merging the model file's rules with a caller-supplied
-/// `FitOptions` (e.g. from the R wrapper). Conditions from both sources are
-/// deduplicated and OR'd (ignore) / AND'd (accept) together.
-pub(crate) fn build_selection_filter_merged(
-    model_opts: &FitOptions,
-    call_opts: &FitOptions,
-) -> Result<Option<SelectionFilter>, String> {
-    let (ignore, accept, subjects) = merge_selection_exprs(model_opts, call_opts);
-    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
-        return Ok(None);
-    }
-    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
-}
-
 /// The merged `[data_selection]` expression strings — the model file's plus the
-/// caller's, de-duplicated — that [`build_selection_filter_merged`] compiles.
+/// caller's (e.g. from the R wrapper), de-duplicated, ignore OR'd and accept AND'd —
+/// that [`ReaderSettings::with_call_selection`] records and
+/// [`read_population_with`] compiles.
 ///
 /// Split out so the *strings* can be had without the compiled filter (#1409 review).
 /// `fit_from_files` reads its population through the merged filter but hands `fit()`
@@ -1203,15 +1208,126 @@ pub(crate) fn read_population_as_fitted(
     parsed: &ParsedModel,
     data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    let sel_filter = build_selection_filter(&parsed.fit_options)?;
-    read_population_for(
+    read_population_with(
         &parsed.model,
-        &parsed.covariate_decls,
+        &ReaderSettings::from_parsed(parsed),
         data_path,
-        None,
-        parsed.fit_options.iov_column.as_deref(),
-        sel_filter.as_ref(),
-        &parsed.column_map,
+    )
+}
+
+/// Everything the dataset reader reads a file with besides the model's endpoint
+/// routing: the `[data]` column renames, the covariate declarations (or, without
+/// them, the explicit covariate columns), the IOV column and the `[data_selection]`
+/// clauses, the model file's merged with any a caller added (#1685).
+///
+/// A file entry point builds one, reads with it through [`read_population_with`],
+/// and records it on [`FitResult::reader_settings`], so the recorded settings are
+/// the ones the data were read with by construction. `run_sir`, `run_covariance`
+/// and `load_fit` re-read `fit.data_path` with them: a row filter the model file
+/// does not state (a `fit_from_files` option, `ferx_fit(settings = list(ignore =
+/// ...))` in R) is then applied again, where re-reading with the model file's
+/// settings dropped it.
+///
+/// Build one with [`ReaderSettings::from_parsed`] and adjust its fields; it is
+/// `#[non_exhaustive]`, so a struct literal outside ferx-core does not compile.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct ReaderSettings {
+    /// `[data]` renames, `(model name, CSV column)`.
+    #[serde(default)]
+    pub column_map: Vec<(String, String)>,
+    /// The `[covariates]` block. When `Some`, it decides which columns are read as
+    /// covariates and `fallback_columns` is not read.
+    #[serde(default)]
+    pub covariate_decls: Option<Vec<CovariateDecl>>,
+    /// Covariate columns for a model with no `[covariates]` block (the
+    /// `covariate_columns` argument of [`fit_from_files`](crate::fit_from_files));
+    /// `None` auto-detects.
+    #[serde(default)]
+    pub fallback_columns: Option<Vec<String>>,
+    /// The occasion column for an IOV model.
+    #[serde(default)]
+    pub iov_column: Option<String>,
+    /// `[data_selection] ignore` clauses, OR'd.
+    #[serde(default)]
+    pub ignore_exprs: Vec<String>,
+    /// `[data_selection] accept` clauses, AND'd.
+    #[serde(default)]
+    pub accept_exprs: Vec<String>,
+    /// `[data_selection] ignore_subjects`.
+    #[serde(default)]
+    pub ignore_subjects: Vec<String>,
+}
+
+impl ReaderSettings {
+    /// The settings a fit of the model file reads its data with: its `[data]`
+    /// renames, `[covariates]`, `[fit_options] iov_column` and `[data_selection]`.
+    pub fn from_parsed(parsed: &ParsedModel) -> Self {
+        ReaderSettings {
+            column_map: parsed.column_map.clone(),
+            covariate_decls: parsed.covariate_decls.clone(),
+            fallback_columns: None,
+            iov_column: parsed.fit_options.iov_column.clone(),
+            ignore_exprs: parsed.fit_options.ignore_exprs.clone(),
+            accept_exprs: parsed.fit_options.accept_exprs.clone(),
+            ignore_subjects: parsed.fit_options.ignore_subjects.clone(),
+        }
+    }
+
+    /// These settings with the caller's `[data_selection]` clauses merged in, the
+    /// way [`fit_from_files`](crate::fit_from_files) merges its options with the
+    /// model file's: de-duplicated, ignore OR'd and accept AND'd.
+    pub(crate) fn with_call_selection(mut self, call: &FitOptions) -> Self {
+        let own = FitOptions {
+            ignore_exprs: std::mem::take(&mut self.ignore_exprs),
+            accept_exprs: std::mem::take(&mut self.accept_exprs),
+            ignore_subjects: std::mem::take(&mut self.ignore_subjects),
+            ..FitOptions::default()
+        };
+        let (ignore, accept, subjects) = merge_selection_exprs(&own, call);
+        self.ignore_exprs = ignore;
+        self.accept_exprs = accept;
+        self.ignore_subjects = subjects;
+        self
+    }
+
+    fn selection_filter(&self) -> Result<Option<SelectionFilter>, String> {
+        if self.ignore_exprs.is_empty()
+            && self.accept_exprs.is_empty()
+            && self.ignore_subjects.is_empty()
+        {
+            return Ok(None);
+        }
+        SelectionFilter::from_opts(
+            &self.ignore_exprs,
+            &self.accept_exprs,
+            &self.ignore_subjects,
+        )
+        .map(Some)
+    }
+}
+
+/// Read `data_path` for `model` with `settings`: [`read_population_for`] with every
+/// argument taken from one [`ReaderSettings`] (#1685). The file entry points read
+/// through this, so the settings they record on the fit are the ones they used.
+pub fn read_population_with(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    data_path: &str,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    let filter = settings.selection_filter()?;
+    let fallback: Option<Vec<&str>> = settings
+        .fallback_columns
+        .as_ref()
+        .map(|cols| cols.iter().map(String::as_str).collect());
+    read_population_for(
+        model,
+        &settings.covariate_decls,
+        data_path,
+        fallback.as_deref(),
+        settings.iov_column.as_deref(),
+        filter.as_ref(),
+        &settings.column_map,
     )
 }
 

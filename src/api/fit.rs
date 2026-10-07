@@ -125,35 +125,30 @@ pub fn fit_from_files(
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
-    let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
-    // The file's `[fit_options]` are ignored here by design, but its
-    // `[data_selection]` is **not** — `build_selection_filter_merged` just applied it
-    // to the read above. So the options handed to `fit()` have to carry the merged
-    // clauses too, or `CmtConsumer::DataSelectionFilter` is asked about an empty list
-    // and withholds `W_CMT_DEFAULTED` on a fit that really was filtered on a
-    // compartment the reader invented (#1409 review). Only the selection strings are
-    // merged; every other key still comes from the caller.
-    let opts = {
-        let (ignore_exprs, accept_exprs, ignore_subjects) =
-            crate::api::run::merge_selection_exprs(&parsed.fit_options, &opts);
-        FitOptions {
-            ignore_exprs,
-            accept_exprs,
-            ignore_subjects,
-            ..opts
-        }
+    // The settings the data are read with, recorded on the fit (#1685): the model
+    // file's `[data]` renames, `[covariates]` and `[data_selection]`, with the
+    // caller's selection clauses merged in. The file's `[fit_options]` are ignored
+    // here by design — its `iov_column` included, so none is read — but its
+    // `[data_selection]` is not.
+    let mut reader_settings = ReaderSettings::from_parsed(&parsed).with_call_selection(&opts);
+    reader_settings.fallback_columns =
+        covariate_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<String>>());
+    reader_settings.iov_column = None;
+    // The options handed to `fit()` have to carry the merged clauses too, or
+    // `CmtConsumer::DataSelectionFilter` is asked about an empty list and withholds
+    // `W_CMT_DEFAULTED` on a fit that really was filtered on a compartment the reader
+    // invented (#1409 review). Only the selection strings are merged; every other key
+    // still comes from the caller.
+    let opts = FitOptions {
+        ignore_exprs: reader_settings.ignore_exprs.clone(),
+        accept_exprs: reader_settings.accept_exprs.clone(),
+        ignore_subjects: reader_settings.ignore_subjects.clone(),
+        ..opts
     };
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
-    let (mut population, covariate_table) = read_population_for(
-        &parsed.model,
-        &parsed.covariate_decls,
-        data_path,
-        covariate_columns,
-        None,
-        sel_filter_fit.as_ref(),
-        &parsed.column_map,
-    )?;
+    let (mut population, covariate_table) =
+        read_population_with(&parsed.model, &reader_settings, data_path)?;
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
     // property of the dataset. Mirrors `run_model_with_data_inits`.
@@ -183,6 +178,7 @@ pub fn fit_from_files(
     result.model_hash = Some(model_hash);
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = Some(model_text);
+    result.reader_settings = Some(reader_settings);
     Ok(result)
 }
 
@@ -434,7 +430,27 @@ fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
 /// function expects an already-filtered `Population` and simply echoes its
 /// `exclusions` summary onto the result. Callers building a `Population` in
 /// memory should filter their records beforehand.
+///
+/// The result carries a fingerprint of `population` as given
+/// ([`FitResult::population_fingerprint`], #1685) — before any internal copy is
+/// pruned, log-transformed or given derived occasions — which `run_sir`,
+/// `run_covariance` and `load_fit` check the population they run on against.
 pub fn fit(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
+    let mut result = fit_unstamped(model, population, init_params, options)?;
+    // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
+    // the ones the population carries are not part of what it was given (#1685
+    // review r1 #1): `run_model_with_data` hands back its population with them set.
+    let derived = crate::api::run::occasions_are_derived(model, options);
+    result.population_fingerprint = Some(PopulationFingerprint::of_with(population, derived));
+    Ok(result)
+}
+
+fn fit_unstamped(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -768,7 +784,7 @@ pub fn fit(
                 .to_string(),
         );
     }
-    let derive_occ = iov_rule_set && model.n_kappa > 0;
+    let derive_occ = crate::api::run::occasions_are_derived(model, options);
     let pop_pruned: std::borrow::Cow<Population> = {
         let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
@@ -2921,6 +2937,8 @@ fn fit_inner(
         model_hash: None,
         data_hash: None,
         model_text: None,
+        reader_settings: None,
+        population_fingerprint: None,
         theta_init,
         omega_init,
         sigma_init,
