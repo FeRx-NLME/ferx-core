@@ -417,23 +417,28 @@ pub(crate) fn check_param_shape(
     model: &CompiledModel,
     supplied: &[ParamBlock],
 ) -> Result<(), EngineError> {
-    const BY_POSITION: &str = "the model reads it by position, so its values would be \
-        read against the wrong random effects or residual errors";
+    let by_position = |what: &str| {
+        format!(
+            "the model reads it by position, so its values would be read against the wrong {what}"
+        )
+    };
     let want = &model.default_params;
     for block in supplied {
         let message = match *block {
             ParamBlock::Omega(got) if got != want.omega.dim() => format!(
-                "the supplied omega is {got}×{got} but this model has {} eta; {BY_POSITION}",
-                want.omega.dim()
+                "the supplied omega is {got}×{got} but this model has {} eta; {}",
+                want.omega.dim(),
+                by_position("random effects")
             ),
             ParamBlock::Sigma(got) if got != want.sigma.values.len() => format!(
-                "the supplied sigma has {got} values but this model has {}; {BY_POSITION}",
-                want.sigma.values.len()
+                "the supplied sigma has {got} values but this model has {}; {}",
+                want.sigma.values.len(),
+                by_position("residual errors")
             ),
             ParamBlock::OmegaIov(got) => match (got, want.omega_iov.as_ref().map(|m| m.dim())) {
                 (Some(g), Some(w)) if g != w => format!(
-                    "the supplied omega_iov is {g}×{g} but this model has {w} kappa; \
-                     {BY_POSITION}"
+                    "the supplied omega_iov is {g}×{g} but this model has {w} kappa; {}",
+                    by_position("random effects")
                 ),
                 (None, Some(w)) => format!(
                     "the supplied parameters carry no omega_iov but this model has {w} kappa; \
@@ -1279,7 +1284,7 @@ pub fn simulate_with_uncertainty_diag(
     // would first be handed to the draw machinery, and a zero-draw run never reaches it.
     check_theta_length(model, &fit_result.theta)?;
     // …and Ω / σ / Ω_IOV (#1764): a mis-sized Ω panicked in the draw, and a fit
-    // with no Ω_IOV on an IOV model simulated with none.
+    // with no Ω_IOV on an IOV model simulated with the model's initial Ω_IOV.
     check_param_shape(model, &ParamBlock::all_of_fit(fit_result))?;
 
     // ODE-accumulated TTE event-time simulation needs a finite horizon, which this

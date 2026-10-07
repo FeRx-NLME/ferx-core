@@ -107,7 +107,9 @@ pub struct SubjectNpde {
 /// `fit()`'s post-fit step this cannot fire, since the fit already refused it. A θ
 /// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615), and a bound
 /// `theta NAME[...]` block on a population never bound for it is
-/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647).
+/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647). An Ω or σ whose dimension is not the
+/// model's, or an Ω_IOV of the wrong dimension or on a model with no κ, is
+/// `E_PARAM_SHAPE`'s (#1764); an absent Ω_IOV is the κ = 0 fallback above.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,

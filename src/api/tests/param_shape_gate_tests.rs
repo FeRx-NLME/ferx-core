@@ -38,9 +38,12 @@ const ODE_IOV: &str = "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  \
     V  = TVV\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
     d/dt(central) = -(CL / V) * central\n[error_model]\n  DV ~ proportional(PROP)\n";
 
-/// The reason clause of a mis-sized block.
-pub(super) const BY_POSITION: &str = "the model reads it by position, so its values would be \
-    read against the wrong random effects or residual errors";
+/// The reason clause of a mis-sized Ω or Ω_IOV.
+pub(super) const ETA_BY_POSITION: &str = "the model reads it by position, so its values would \
+    be read against the wrong random effects";
+/// The reason clause of a mis-sized σ.
+pub(super) const SIGMA_BY_POSITION: &str = "the model reads it by position, so its values \
+    would be read against the wrong residual errors";
 /// The reason clause of an absent Ω_IOV on a model with κ.
 pub(super) const NO_IOV: &str = "without it every occasion would get the same parameters";
 /// The reason clause of an Ω_IOV on a model without κ.
@@ -115,7 +118,7 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
             if n == 0 { "σ short" } else { "σ long" },
             q,
             &lead,
-            BY_POSITION,
+            SIGMA_BY_POSITION,
         );
     }
     for n in [0usize, 2] {
@@ -127,7 +130,7 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
             if n == 0 { "Ω short" } else { "Ω long" },
             q,
             &lead,
-            BY_POSITION,
+            ETA_BY_POSITION,
         );
     }
     if p.omega_iov.is_some() {
@@ -144,7 +147,7 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
                 },
                 q,
                 &lead,
-                BY_POSITION,
+                ETA_BY_POSITION,
             );
         }
         let mut q = p.clone();
@@ -289,7 +292,8 @@ fn fit_refuses_initial_theta_of_the_wrong_length() {
 
 /// `run_sir` and `run_covariance` refuse a fit whose σ or Ω_IOV is not the model's.
 ///
-/// Measured before on this IOV fit: an absent Ω_IOV ran both to `Ok` without κ; on
+/// Measured before on this IOV fit: an absent Ω_IOV ran both to `Ok` with the model's
+/// initial Ω_IOV in its place; on
 /// `run_covariance` a short σ and a mis-sized Ω_IOV panicked and a long σ ran to `Ok`;
 /// on `run_sir` the mis-sized ones were an `Err` about the covariance matrix. Ω is not
 /// in this list: both already refuse it by `n_eta`. Mutation — delete the
@@ -327,13 +331,14 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_sigma_or_omega_iov(
     assert_eq!(n, 5, "σ short/long and the three Ω_IOV cells");
 }
 
-/// The other side of every gate: parameters of the model's own shape are let through and
-/// give exactly what they gave before — the model's `default_params` against a copy whose
-/// Ω, σ and Ω_IOV are rebuilt from their values, bit for bit, on `fit`, `compute_npde_npd`
-/// and `simulate_with_seed`; and `run_covariance` accepts the resulting fit. A gate comparing against the wrong count, or one
-/// that touched the values rather than reading their shape, dies here.
+/// The other side of every gate: the gate admits parameters of the model's own shape — the
+/// model's `default_params` and a copy whose Ω, σ and Ω_IOV are rebuilt from their values —
+/// on `fit`, `compute_npde_npd`, `simulate_with_seed` and `run_covariance`. The live
+/// assertions are the `expect`s: a gate comparing against the wrong count (the `dim + 1`
+/// mutation) refuses here. The `to_bits` pairs compare two runs of this head, so they pin
+/// only that the gate reads shapes and never the values.
 #[test]
-fn correctly_shaped_parameters_give_bit_identical_results() {
+fn the_gate_admits_parameters_of_the_models_own_shape() {
     for (text, iov) in [(ONE_CPT_IV, false), (ODE_IOV, true)] {
         let model = parse_model_string(text).expect("parse");
         let pop = population(iov);

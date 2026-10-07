@@ -392,7 +392,8 @@ fn resolve_fit_inputs_unattributed<'a>(
         )));
     }
     // σ and Ω_IOV against the model (#1764): a mis-sized σ panicked or was dropped in
-    // `run_covariance`, and a fit with no Ω_IOV on an IOV model ran without κ in both.
+    // `run_covariance`, and a fit with no Ω_IOV on an IOV model ran both with the
+    // model's initial Ω_IOV in its place (`fitted_params_from_result`, #1789).
     // Ω keeps the n_eta checks `run_sir` / `run_covariance` already make.
     let [_, sigma, omega_iov] = crate::api::ParamBlock::all_of_fit(fit);
     crate::api::check_param_shape(inputs.model(), &[sigma, omega_iov])?;
