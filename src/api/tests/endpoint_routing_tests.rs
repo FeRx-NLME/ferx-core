@@ -261,10 +261,13 @@ fn inits_from_nca_sweep_returns_predicts_err_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
     let want = predict(&m, &u, &m.default_params).expect_err("fixture is refused");
+    assert_eq!(want.code(), Some("E_ENDPOINT_UNROUTED"), "{want}");
     for method in [NcaInit::Sweep, NcaInit::Ebe] {
         let got = inits_from_nca(&m, &u, method)
             .expect_err("the sweep must hand back predict()'s refusal");
         assert_eq!(got.to_string(), want.to_string(), "{method:?}");
+        // …with predict()'s code, not just its text (#1746 review r1 #1).
+        assert_eq!(got.code(), want.code(), "{method:?}");
     }
 }
 

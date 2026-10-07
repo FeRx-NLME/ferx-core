@@ -86,8 +86,8 @@ pub fn inits_from_nca(
     first_error(&crate::api::check_dose_compartments(model, population))?;
     match method {
         NcaInit::Nca => Ok(nca_only(model, population)),
-        NcaInit::Sweep => Ok(nca_with_sweep(model, population)?),
-        NcaInit::Ebe => Ok(nca_with_ebe(model, population)?),
+        NcaInit::Sweep => nca_with_sweep(model, population),
+        NcaInit::Ebe => nca_with_ebe(model, population),
     }
 }
 
@@ -117,7 +117,7 @@ fn nca_only(model: &CompiledModel, population: &Population) -> SuggestedStart {
 fn nca_with_sweep(
     model: &CompiledModel,
     population: &Population,
-) -> Result<SuggestedStart, String> {
+) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     let mut base = nca_only(model, population);
 
     // Collect non-fixed thetas that Option A left unchanged (still at model default).
@@ -241,7 +241,10 @@ fn nca_with_sweep(
 /// afterwards with etas=0 (Option B style).
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
-fn nca_with_ebe(model: &CompiledModel, population: &Population) -> Result<SuggestedStart, String> {
+fn nca_with_ebe(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
     // defaults.  Delegate to the etas=0 sweep directly (which runs NCA + sweep)
