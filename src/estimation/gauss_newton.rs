@@ -1764,7 +1764,11 @@ pub(crate) fn subject_eta_response_correction(
 /// - a θ-dependent residual magnitude (direct `∂R/∂θ`, in both the data term and log|H̃|);
 /// - `block_sigma` residual correlations: the closed forms build a diagonal `R` from
 ///   `variance_at` and leave the packed ρ coordinates at zero, while the objective uses
-///   the live correlations.
+///   the live correlations;
+/// - a non-Gaussian data term (`[event_model]` TTE / RTTE, `[binary_model]`, CTMM). Those
+///   records live in `subject.obs_records`, which both closed forms ignore: a TTE-only
+///   subject scored `(0, [0, …])` — the empty Gaussian marginal — and a joint PK + TTE
+///   subject dropped the hazard term from the NLL and its θ-gradient.
 pub(crate) fn closed_form_fixed_ebe_grad_ok(
     model: &CompiledModel,
     template: &ModelParameters,
@@ -1775,6 +1779,17 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()
         && template.residual_correlations.is_empty()
+        && !model.has_non_gaussian()
+}
+
+/// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
+/// [`closed_form_fixed_ebe_grad_ok`]: its chain rule assumes `ipreds = f₀ + a·η̂` and
+/// a single `(∂R/∂σ_k, ∂d/∂σ_k)` per observation, so it also needs analytical PK and
+/// `ErrorSpec::Single`. Kept apart from the gate so a test can assert that a fixture
+/// satisfies everything *but* the gate — `sb_ok` is exactly the conjunction of the two,
+/// so a new Sheiner–Beal restriction belongs here.
+pub(crate) fn sheiner_beal_scope_ok(model: &CompiledModel) -> bool {
+    model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_))
 }
 
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
@@ -1782,14 +1797,15 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
 ///
 /// Two analytical paths with different scope (see `sb_ok` / `laplace_ok` below):
 ///   - **Almquist Laplace (INTER)**: omega/sigma exact, θ via forward-FD of
-///     predictions. Runs for any model except M3 BLOQ and IOV — ODE models and
-///     per-CMT (`ErrorSpec::PerCmt`) error specs are both supported.
+///     predictions. Runs for any model [`closed_form_fixed_ebe_grad_ok`] admits —
+///     ODE models and per-CMT (`ErrorSpec::PerCmt`) error specs are both supported.
 ///   - **Sheiner–Beal (non-INTER)**: same θ axis, but the chain rule still
 ///     assumes a single error spec and `ipreds = f₀ + a·η̂`, so this branch
 ///     additionally requires analytical PK and `ErrorSpec::Single`.
 ///
-/// In all other cases — M3 BLOQ, IOV, or the SB path's extra restrictions —
-/// the dispatcher falls back to central FD over `subject_nll_at`. The Laplace
+/// In all other cases — anything the gate excludes (M3 BLOQ, IOV, a non-Gaussian
+/// endpoint, …), or the SB path's extra restrictions — the dispatcher falls back to
+/// central FD over `subject_nll_at`. The Laplace
 /// branch can also bail to FD per call when `H̃` fails Cholesky.
 ///
 /// Returns `(nll_i, gradient_i)` where `gradient_i[j] = d(nll_i)/d(x[j])`.
@@ -1819,7 +1835,8 @@ pub(crate) fn subject_nll_pop_grad(
     //     through `error_spec` (so per-CMT works), and the θ axis is a
     //     forward-FD on `pk::compute_predictions_with_tv` — which itself
     //     dispatches to the ODE solver for ODE models. So Laplace can run on
-    //     ODE + PerCmt models too; the only blockers are M3 and IOV.
+    //     ODE + PerCmt models too; the blockers are what
+    //     `closed_form_fixed_ebe_grad_ok` excludes.
     // IIV on residual error (#409): the closed-form SB/Laplace gradients build
     // R and ∂R/∂σ from σ alone and carry no `exp(2·η_ruv)` scaling nor the extra
     // residual-eta c̃ column that `foce_subject_nll_interaction` now adds. Fall
@@ -1837,8 +1854,7 @@ pub(crate) fn subject_nll_pop_grad(
     // `_scaled` dispatch, which carries the `|f|^{2p}` loading. An exponent
     // that names a θ is θ-dependent like any other magnitude and goes to FD.
     let common_ok = closed_form_fixed_ebe_grad_ok(model, template, kappas);
-    let sb_ok =
-        common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
+    let sb_ok = common_ok && sheiner_beal_scope_ok(model);
     let laplace_ok = common_ok;
 
     if (options.interaction && laplace_ok) || (!options.interaction && sb_ok) {
@@ -3962,15 +3978,27 @@ mod tests {
         population: &Population,
         interaction: bool,
     ) {
-        let population = population.clone();
-        let template = &model.default_params;
-        let x = pack_params(template);
-        let bounds = compute_bounds(template);
-
         let eta_hat = DVector::from_vec(vec![0.05]);
         // Non-zero η-Jacobian so the log|H̃| / c̃ terms — which read R and ∂R/∂f,
         // both magnitude-scaled — actually contribute.
         let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.4, -0.3, -0.15]);
+        check_gn_grad_matches_fd_at(model, population, 0, &eta_hat, &h_matrix, interaction);
+    }
+
+    /// [`check_gn_grad_matches_fd_on`] at an explicit subject, η̂ and η-Jacobian — for
+    /// fixtures whose shape is not the one-η / three-observation default (an `n_eta = 0`
+    /// TTE model has an empty η̂ and no Gaussian rows at all).
+    fn check_gn_grad_matches_fd_at(
+        model: &CompiledModel,
+        population: &Population,
+        subject: usize,
+        eta_hat: &DVector<f64>,
+        h_matrix: &DMatrix<f64>,
+        interaction: bool,
+    ) {
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
         let mut options = FitOptions::default();
         options.interaction = interaction;
 
@@ -3978,10 +4006,10 @@ mod tests {
             &x,
             template,
             model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
+            population,
+            subject,
+            eta_hat,
+            h_matrix,
             &[],
             &bounds,
             &options,
@@ -3990,21 +4018,21 @@ mod tests {
             &x,
             template,
             model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
+            population,
+            subject,
+            eta_hat,
+            h_matrix,
             &[],
             &bounds,
             &options,
         );
         let nll_ref = subject_nll_at(
             model,
-            &population,
-            0,
+            population,
+            subject,
             &unpack_params(&x, template),
-            &eta_hat,
-            &h_matrix,
+            eta_hat,
+            h_matrix,
             &[],
             &options,
         );
@@ -4022,21 +4050,21 @@ mod tests {
             let two_h = xp[j] - xm[j];
             let nll_p = subject_nll_at(
                 model,
-                &population,
-                0,
+                population,
+                subject,
                 &unpack_params(&xp, template),
-                &eta_hat,
-                &h_matrix,
+                eta_hat,
+                h_matrix,
                 &[],
                 &options,
             );
             let nll_m = subject_nll_at(
                 model,
-                &population,
-                0,
+                population,
+                subject,
                 &unpack_params(&xm, template),
-                &eta_hat,
-                &h_matrix,
+                eta_hat,
+                h_matrix,
                 &[],
                 &options,
             );
@@ -4401,5 +4429,252 @@ mod tests {
             "and `report_final_gradient = false` must not suppress a gradient the \
              optimizer produced anyway"
         );
+    }
+
+    // ── Non-Gaussian data terms reach the fixed-EBE gradient ──
+    //
+    // TTE / RTTE (`[event_model]`), discrete (`[binary_model]`) and CTMM records live in
+    // `subject.obs_records`, which `subject_nll_at` scores and both closed forms ignore.
+    // Before the `has_non_gaussian` exclusion in `closed_form_fixed_ebe_grad_ok`, an
+    // interaction fit of a TTE-only model returned `(0, [0, …])` for every subject — the
+    // empty Gaussian marginal — and a joint PK + TTE model dropped the hazard term from
+    // both the NLL and the gradient. Every caller of the fixed-EBE gradient inherited it:
+    // the S / R⁻¹·S·R⁻¹ covariance (a singular or zero score cross-product), the L-BFGS /
+    // SLSQP / trust-region outer gradient, and Gauss–Newton's BHHH system.
+    #[cfg(feature = "survival")]
+    mod non_gaussian {
+        use super::*;
+        use crate::types::{EventType, ObsRecord};
+
+        fn parse(src: &str) -> CompiledModel {
+            crate::parser::model_parser::parse_model_string(src).expect("fixture model parses")
+        }
+
+        fn population(covariate_names: &[&str], subjects: Vec<Subject>) -> Population {
+            Population {
+                covariate_names: covariate_names.iter().map(|c| c.to_string()).collect(),
+                dv_column: "DV".into(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
+                subjects,
+            }
+        }
+
+        fn event(time: f64, exact: bool) -> ObsRecord {
+            ObsRecord::Event {
+                time,
+                event_type: if exact {
+                    EventType::Exact
+                } else {
+                    EventType::RightCensored
+                },
+                entry_time: 0.0,
+                cmt: 2,
+            }
+        }
+
+        /// An `n_eta = 0` exponential hazard with a covariate effect — the shape of the
+        /// NONMEM model that surfaced #1744. One exact event and one right-censored subject, so both the
+        /// `log h(t)` and the `−H(t)` terms carry a θ-gradient.
+        ///
+        /// Two spellings of the same hazard. The compact one has no `[error_model]`, so
+        /// Sheiner–Beal's own `ErrorSpec::Single` condition already keeps its FOCE leg
+        /// off the closed form, with or without the gate: only its FOCEI leg can see the
+        /// gate. The second carries the placeholder PK and `[error_model]` blocks of the
+        /// shipped `examples/tte_exponential.ferx`, which satisfy every Sheiner–Beal
+        /// condition but the gate — so its FOCE leg is what reaches Sheiner–Beal when
+        /// the gate is dropped.
+        #[test]
+        fn tte_only_fixed_ebe_grad_matches_fd_via_fallback() {
+            let hazard = "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = \
+                          TVLAM\n  loghr  = TH_AGE * (AGE - 50) / 10\n";
+            let thetas = "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n  theta TH_AGE(0.2, \
+                          -10, 10)\n";
+            let placeholder_gaussian = "  theta DUMMY_CL(1.0, FIX)\n  theta DUMMY_V(1.0, \
+                                        FIX)\n  sigma SIGMA_DV ~ 0.01 FIX\n\
+                                        [individual_parameters]\n  CL = DUMMY_CL\n  V  = \
+                                        DUMMY_V\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+                                        v=V)\n[error_model]\n  DV ~ additive(SIGMA_DV)\n";
+            let subjects: Vec<Subject> = [(7.0, true, 40.0), (30.0, false, 60.0)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (t, exact, age))| {
+                    let mut s = Subject {
+                        id: format!("{}", i + 1),
+                        ..Default::default()
+                    };
+                    s.covariates.insert("AGE".into(), age);
+                    s.obs_records = vec![event(t, exact)];
+                    s
+                })
+                .collect();
+            let pop = population(&["AGE"], subjects);
+            let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
+            for (label, src, sb_reachable) in [
+                ("compact", format!("{thetas}{hazard}"), false),
+                (
+                    "placeholder [error_model]",
+                    format!("{thetas}{placeholder_gaussian}{hazard}"),
+                    true,
+                ),
+            ] {
+                let model = parse(&src);
+                assert!(
+                    model.has_tte(),
+                    "{label}: fixture precondition: a TTE endpoint"
+                );
+                assert_eq!(
+                    model.n_eta, 0,
+                    "{label}: fixture precondition: no random effects"
+                );
+                assert!(!closed_form_fixed_ebe_grad_ok(
+                    &model,
+                    &model.default_params,
+                    &[]
+                ));
+                // The straddle: Sheiner–Beal's extra conditions on top of the gate,
+                // read off the predicate `sb_ok` itself rather than a paraphrase.
+                // Asserted both ways, so the placeholder spelling cannot silently stop
+                // reaching the FOCE closed form and leave that leg a tautology.
+                assert_eq!(
+                    sheiner_beal_scope_ok(&model),
+                    sb_reachable,
+                    "{label}: fixture precondition: Sheiner–Beal's own conditions"
+                );
+                for subject in 0..pop.subjects.len() {
+                    for interaction in [true, false] {
+                        check_gn_grad_matches_fd_at(&model, &pop, subject, &eta, &h, interaction);
+                    }
+                }
+            }
+        }
+
+        /// Joint PK + TTE: the Gaussian rows are what the closed forms do carry, so the
+        /// PK components of the gradient were right all along and only the hazard θ
+        /// (`TVLAM`) read zero. The default one-η / three-observation shape of
+        /// [`check_gn_grad_matches_fd_on`] applies, with a non-zero η̂ and η-Jacobian.
+        #[test]
+        fn joint_pk_tte_fixed_ebe_grad_matches_fd_via_fallback() {
+            let model = parse(
+                "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, \
+                 500.0)\n  theta TVLAM(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma \
+                 PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+                 V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+                 DV ~ proportional(PROP_ERR)\n[event_model]\n  cmt    = 2\n  family = \
+                 exponential\n  scale  = TVLAM\n",
+            );
+            assert!(model.has_tte(), "fixture precondition: a TTE endpoint");
+            assert!(!closed_form_fixed_ebe_grad_ok(
+                &model,
+                &model.default_params,
+                &[]
+            ));
+            let mut s = Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 4.0, 8.0],
+                observations: vec![9.0, 7.0, 4.5],
+                obs_cmts: vec![1; 3],
+                cens: vec![0; 3],
+                ..Default::default()
+            };
+            s.obs_records = vec![event(7.0, true)];
+            let pop = population(&[], vec![s]);
+            check_gn_grad_matches_fd_on(&model, &pop, true);
+            check_gn_grad_matches_fd_on(&model, &pop, false);
+        }
+
+        /// A discrete endpoint takes the same exclusion: the gate is on the
+        /// non-Gaussian data term, not on TTE. Without this fixture an exclusion
+        /// spelled `has_tte()` passes both tests above.
+        ///
+        /// Fixed effects (`n_eta = 0`) on purpose. With an η the discrete term's
+        /// log|H̃| contribution is an FD Hessian on Shi steps that adapt with θ, and
+        /// `subject_nll_at` is then rough in θ at the ~5e-6 level — measured on this
+        /// model with `ETA_I ~ 0.25` at η̂ = 0.3, central differences at 1e-3 / 1e-4 /
+        /// 1e-5 / 1e-6 gave 0.1042 / 0.1058 / −0.0737 / 0.2412 — so no FD reference
+        /// resolves the gradient. That is the objective, not this gate.
+        #[test]
+        fn binary_fixed_ebe_grad_matches_fd_via_fallback() {
+            let model = parse(
+                "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                 10.0)\n[binary_model]\n  cmt   = 3\n  logit = TH0 + THX * X\n",
+            );
+            assert!(
+                model.has_discrete() && !model.has_tte(),
+                "fixture precondition: a discrete endpoint and no TTE one"
+            );
+            assert!(!closed_form_fixed_ebe_grad_ok(
+                &model,
+                &model.default_params,
+                &[]
+            ));
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            s.covariates.insert("X".into(), 0.8);
+            s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                .into_iter()
+                .map(|(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 3,
+                })
+                .collect();
+            let pop = population(&["X"], vec![s]);
+            let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
+            for interaction in [true, false] {
+                check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
+            }
+        }
+
+        /// A CTMM endpoint takes the same exclusion. The binary fixture pins the gate's
+        /// discrete arm over `has_tte()`; this one pins its CTMM arm over
+        /// `has_tte() || has_discrete()`, which passes every other test here. The
+        /// generator is `examples/ctmm_2state.ferx`'s, `n_eta = 0` for the reason the
+        /// binary fixture gives. With no `[error_model]` the FOCE leg is kept off
+        /// Sheiner–Beal by its own scope, so the FOCEI leg is the one that sees the gate.
+        #[cfg(feature = "markov")]
+        #[test]
+        fn ctmm_fixed_ebe_grad_matches_fd_via_fallback() {
+            let model = parse(
+                "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, \
+                 3.0)\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
+                 asleep=1]\n  transition awake  -> asleep = exp(LQ01)\n  transition asleep -> \
+                 awake  = exp(LQ10)\n",
+            );
+            assert!(
+                model.has_ctmm() && !model.has_tte() && !model.has_discrete(),
+                "fixture precondition: a CTMM endpoint and neither a TTE nor a discrete one"
+            );
+            assert!(!sheiner_beal_scope_ok(&model));
+            assert!(!closed_form_fixed_ebe_grad_ok(
+                &model,
+                &model.default_params,
+                &[]
+            ));
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            // Both transitions and a stay, so both log-intensities carry a θ-gradient.
+            s.obs_records = [(0.0, 0), (1.5, 1), (3.0, 1), (5.0, 0)]
+                .into_iter()
+                .map(|(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 5,
+                })
+                .collect();
+            let pop = population(&[], vec![s]);
+            let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
+            for interaction in [true, false] {
+                check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
+            }
+        }
     }
 }
