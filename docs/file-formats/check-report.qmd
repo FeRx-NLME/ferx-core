@@ -73,6 +73,7 @@ The file could not be read as a ferx model at all, or names a block ferx does no
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_PARSE` | error | The model file failed to parse (catch-all for parser errors). |
+| `E_MODEL_READ` | error | The model file could not be read: it does not exist, cannot be opened, or is not UTF-8. The message names the path and the operating system's reason, and no `block` is set. Before [#1752](https://github.com/FeRx-NLME/ferx-core/issues/1752) this was reported as `E_PARSE`. The check reads the file once, and parses and binds that one read, so a file moved or edited while the check runs does not change its result. |
 | `E_MISSING_BLOCK` | error | A required `[block]` is absent. `block` names which one. |
 | `E_UNKNOWN_BLOCK` | error | A `[block]` header is not a recognised block name. The message lists every offending header with its line, the valid set **this build accepts**, and a did-you-mean when there is a near match; `suggestion` carries the near match on its own. See [#1040](https://github.com/FeRx-NLME/ferx-core/issues/1040). |
 | `E_DEPRECATED_BLOCK` | error | A `[block]` that *was* ferx syntax and is no longer read — currently `[initial_values]`, whose contents moved inline into `[parameters]`. Reported separately from `E_UNKNOWN_BLOCK` so the message can name the replacement instead of offering a did-you-mean that does not exist. |
