@@ -41,6 +41,11 @@ pub(crate) const SCHEME: u32 = 1;
 #[non_exhaustive]
 pub struct PopulationFingerprint {
     scheme: u32,
+    /// The fit derived its occasion labels from a model-side `iov_occasion` rule,
+    /// so `occasions` and `dose_occasions` are left out of the records and doses
+    /// digests, here and in every population compared against this fingerprint.
+    #[serde(default)]
+    occasions_derived: bool,
     /// `Population::covariate_names`, sorted.
     covariate_names: Vec<String>,
     subjects: Vec<SubjectPrint>,
@@ -157,8 +162,16 @@ impl std::fmt::Display for Difference {
 }
 
 impl PopulationFingerprint {
-    /// The fingerprint of `population`.
+    /// The fingerprint of `population`, occasion labels included.
+    #[cfg(test)]
     pub(crate) fn of(population: &Population) -> Self {
+        Self::of_with(population, false)
+    }
+
+    /// The fingerprint of `population`. With `occasions_derived` (the fit derives its
+    /// occasion labels from a model-side rule, `run::occasions_are_derived`), the
+    /// labels the population carries are left out: the fit overwrites them.
+    pub(crate) fn of_with(population: &Population, occasions_derived: bool) -> Self {
         let Population {
             subjects,
             covariate_names,
@@ -174,8 +187,12 @@ impl PopulationFingerprint {
         names.sort();
         PopulationFingerprint {
             scheme: SCHEME,
+            occasions_derived,
             covariate_names: names,
-            subjects: subjects.iter().map(subject_print).collect(),
+            subjects: subjects
+                .iter()
+                .map(|s| subject_print(s, occasions_derived))
+                .collect(),
         }
     }
 
@@ -188,7 +205,7 @@ impl PopulationFingerprint {
     /// The first difference between `population` and the population this
     /// fingerprint was made of, or `None` when they are the same.
     pub(crate) fn first_difference(&self, population: &Population) -> Option<Difference> {
-        let got = Self::of(population);
+        let got = Self::of_with(population, self.occasions_derived);
         if got.subjects.len() != self.subjects.len() {
             return Some(Difference::SubjectCount {
                 population: got.subjects.len(),
@@ -243,7 +260,7 @@ impl PopulationFingerprint {
     }
 }
 
-fn subject_print(s: &Subject) -> SubjectPrint {
+fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     let Subject {
         id,
         doses,
@@ -275,7 +292,13 @@ fn subject_print(s: &Subject) -> SubjectPrint {
     obs_cmts.iter().for_each(|&c| r.usize(c));
     r.len(cens.len());
     cens.iter().for_each(|&c| r.bytes(&c.to_le_bytes()));
-    r.u32s(occasions);
+    // Derived labels are the fit's, not the population's: both sides hash none.
+    let derived_out: &[u32] = &[];
+    r.u32s(if occasions_derived {
+        derived_out
+    } else {
+        occasions
+    });
     r.len(obs_l2.len());
     obs_l2.iter().for_each(|&l| r.bytes(&l.to_le_bytes()));
     r.len(fremtype.len());
@@ -289,7 +312,11 @@ fn subject_print(s: &Subject) -> SubjectPrint {
     let mut d = Encoder::default();
     d.len(doses.len());
     doses.iter().for_each(|x| dose(&mut d, x));
-    d.u32s(dose_occasions);
+    d.u32s(if occasions_derived {
+        derived_out
+    } else {
+        dose_occasions
+    });
 
     let mut c = Encoder::default();
     c.map(covariates);

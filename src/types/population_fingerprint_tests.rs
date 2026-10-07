@@ -472,3 +472,40 @@ fn the_fingerprint_round_trips_through_json() {
     let back: PopulationFingerprint = serde_json::from_str(&json).unwrap();
     assert_eq!(back, fp);
 }
+
+/// Review r1 #1, both sides of the gate in one test: a fit that derives its occasion
+/// labels leaves the population's `occasions` / `dose_occasions` out — on the
+/// stamping side and on the comparing side — and a fit that reads them from a
+/// column keeps them in. Every other field is still compared under a derived rule.
+///
+/// Mutations — ignore the flag (always hash the labels): the derived cell differs;
+/// always leave them out: the column cell passes; flag only the stamping side:
+/// the derived cell differs.
+#[test]
+fn derived_occasion_labels_are_left_out_only_when_the_fit_derives_them() {
+    let base = population(vec![subject()]);
+    let mut relabelled = base.clone();
+    relabelled.subjects[0].occasions = vec![0, 0];
+    relabelled.subjects[0].dose_occasions = vec![0, 1];
+
+    let derived = PopulationFingerprint::of_with(&base, true);
+    assert_eq!(derived.first_difference(&relabelled), None, "derived rule");
+    let column = PopulationFingerprint::of_with(&base, false);
+    assert!(
+        matches!(
+            column.first_difference(&relabelled),
+            Some(Difference::Records { .. })
+        ),
+        "column rule"
+    );
+
+    let mut other = relabelled.clone();
+    other.subjects[0].observations[0] = 9.0;
+    assert!(
+        matches!(
+            derived.first_difference(&other),
+            Some(Difference::Records { .. })
+        ),
+        "the rest of the records still count"
+    );
+}

@@ -407,3 +407,42 @@ fn every_legitimate_cell_resolves_to_the_fitted_population() {
         }
     }
 }
+
+/// Review r1 #1: `run_model_with_data` hands back its population with the occasions
+/// a derived `iov_occasion` rule wrote (`derive_output_occasions`, for sdtab's `OCC`),
+/// after `fit()` fingerprinted the population it was given. Passing that population
+/// back is passing the fit's population, and must not be refused.
+///
+/// Mutation — hash `occasions` / `dose_occasions` under a derived rule too: the
+/// supplied cell is refused ("…the observation records of subject `1` differ…").
+#[test]
+fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("warfarin_iov_dose.ferx");
+    let data_path = dir.path().join("warfarin_iov.csv");
+    let text = std::fs::read_to_string("examples/warfarin_iov.ferx").unwrap();
+    assert!(text.contains("iov_column = OCC"));
+    let text = text.replace(
+        "iov_column = OCC",
+        "iov_occasion = dose\n  maxiter = 2\n  checkpoint = false",
+    );
+    std::fs::write(&model_path, text).unwrap();
+    std::fs::copy("data/warfarin_iov.csv", &data_path).unwrap();
+    let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+    let (fit, returned) = crate::api::run_model_with_data(m, Some(d)).expect("fits");
+    let prep = crate::api::prepare_run(m, Some(d)).unwrap();
+    // Live: the returned population carries derived occasions the reader did not.
+    assert!(prep.population.subjects[0].occasions.is_empty());
+    assert!(!returned.subjects[0].occasions.is_empty());
+
+    let opts = prep.parsed.fit_options.clone();
+    for (p, what) in [
+        (Some(&returned), "returned"),
+        (Some(&prep.population), "read"),
+    ] {
+        crate::estimation::fit_inputs::resolve_fit_inputs(&fit, None, p, "probe")
+            .map(|_| ())
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+    run_covariance(&fit, None, Some(&returned), &opts).expect("the returned population runs");
+}

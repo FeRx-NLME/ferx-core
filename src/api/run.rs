@@ -392,6 +392,14 @@ pub fn run_model_with_overrides(
     Ok((result, population))
 }
 
+/// Whether `fit()` replaces the population's occasion labels with ones derived from
+/// a model-side `iov_occasion` rule (#757). The one predicate for `fit()`'s own
+/// derivation, [`derive_output_occasions`], and the population fingerprint, which
+/// then leaves the overwritten labels out (#1685 review r1 #1).
+pub(crate) fn occasions_are_derived(model: &CompiledModel, options: &FitOptions) -> bool {
+    model.n_kappa > 0 && options.iov_occasion != IovOccasionRule::Column
+}
+
 /// Mirror [`fit`]'s model-side IOV occasion derivation onto a caller-owned
 /// population so downstream output — sdtab's `OCC` column and any per-occasion
 /// diagnostic keyed on [`Subject::occasions`] — reflects the derived labels.
@@ -406,7 +414,7 @@ pub(crate) fn derive_output_occasions(
     options: &FitOptions,
     population: &mut Population,
 ) {
-    if model.n_kappa == 0 || options.iov_occasion == IovOccasionRule::Column {
+    if !occasions_are_derived(model, options) {
         return;
     }
     let mut sink = Vec::new();

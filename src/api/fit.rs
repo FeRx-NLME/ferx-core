@@ -442,7 +442,11 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
-    result.population_fingerprint = Some(PopulationFingerprint::of(population));
+    // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
+    // the ones the population carries are not part of what it was given (#1685
+    // review r1 #1): `run_model_with_data` hands back its population with them set.
+    let derived = crate::api::run::occasions_are_derived(model, options);
+    result.population_fingerprint = Some(PopulationFingerprint::of_with(population, derived));
     Ok(result)
 }
 
@@ -780,7 +784,7 @@ fn fit_unstamped(
                 .to_string(),
         );
     }
-    let derive_occ = iov_rule_set && model.n_kappa > 0;
+    let derive_occ = crate::api::run::occasions_are_derived(model, options);
     let pop_pruned: std::borrow::Cow<Population> = {
         let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
