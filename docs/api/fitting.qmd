@@ -325,6 +325,8 @@ parsed.model.gradient_method = if parsed.model.is_sde() {
 let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 ```
 
+### A model or population left unbound
+
 Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths and `predict` report
@@ -333,8 +335,7 @@ handed a population that was never bound, is `E_THETA_LEVELS_DATA_UNBOUND` on
 `predict`, the simulate paths, `compute_npde_npd`, `predict_survival`,
 `predict_categorical` and `fit`; one bound for other levels than the model's is
 `E_THETA_LEVELS_DATA_MISMATCH` there, refused and never re-indexed (#1762). To
-run a θ already
-laid out (a fit's, or the model's own), bind that population with
+run a θ already laid out (a fit's, or the model's own), bind that population with
 `bind_from_fit` and the bindings the θ was laid out on. To fit it, bind a fresh
 parse with `bind_theta_levels`
 ([#1647](https://github.com/FeRx-NLME/ferx-core/issues/1647)). To simulate with the model's own initial
@@ -342,6 +343,8 @@ estimates, bind a design the same way, on the population from
 `read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
 the fit instead, as described in
 [the next section](#simulate-with-fit-theta).
+
+### Binding a bound model again
 
 A model already bound can be bound again, to other data, and binds as a fresh
 parse of its text would. Each binder reads what the text declares, not what the
