@@ -1,5 +1,7 @@
 //! #426: `run_covariance` re-solves the EBEs with the **caller's** inner-loop settings,
-//! whatever any other fit in the process sets or has set.
+//! whatever any other fit in the process sets or has set. Since #426's second PR a setting the
+//! caller leaves at its default comes from the fit's scoring record instead
+//! (`tests/run_covariance_scoring_record.rs`), which T4 (i) and (iv) account for.
 //!
 //! Until #426 `inner_optimizer` / `ebe_warm_start` were process globals that every `fit()`
 //! wrote and none restored, so a standalone covariance step scored with whichever inner solver
@@ -102,14 +104,36 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
         inline,
         "(iii) a later Nelder–Mead fit changed run_covariance's inner solver"
     );
+    // #426 PR 2: on a fit carrying its scoring record, `Auto` reads as "no opinion" and
+    // resolves to the recorded `lbfgs`, so the premise clears the record first.
     let default_inner = FitOptions {
         inner_optimizer: InnerOptimizer::Auto,
         ..f.lbfgs.clone()
     };
+    let mut unrecorded = f.fit_a.clone();
+    unrecorded.scoring_settings = None;
     assert_ne!(
-        cov_under(f, &default_inner),
+        bits(
+            &run_covariance(
+                &unrecorded,
+                Some(&f.prep.parsed.model),
+                Some(&f.prep.population),
+                &default_inner,
+            )
+            .expect("run_covariance")
+        ),
         inline,
         "(i) premise: the inner solver must move the covariance on this fixture"
+    );
+    // (iv) #426 PR 2: default options reproduce the inline step too, from the record.
+    let defaults = FitOptions {
+        verbose: false,
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        cov_under(f, &defaults),
+        inline,
+        "(iv) run_covariance with default options must reproduce the fit's inline step"
     );
 }
 

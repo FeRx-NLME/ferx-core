@@ -217,6 +217,11 @@ struct FitWire {
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sir_seed: Option<u64>,
+    /// The settings of the stage that produced the estimates (#426). Additive: absent
+    /// in bundles written before it existed, which load as `None`, so no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoring_settings: Option<ScoringSettingsWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     imp_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,8 +388,24 @@ struct SirSettingsWire {
     df: f64,
     scale: String,
     keep_samples: bool,
+    /// Flattened (#426): the record is nested in memory (`SirSettings::scoring`) but
+    /// stays flat on the wire, so a bundle written between #1758 and #426 reads
+    /// unchanged and this one writes the same keys.
+    #[serde(flatten)]
+    scoring: ScoringSettingsWire,
+}
+
+/// [`ScoringSettings`](crate::ScoringSettings) on the wire (#426): the top-level
+/// `scoring_settings` block, and the flattened scoring half of `sir.settings`. Enums
+/// travel as their `[fit_options]` tokens, as in [`SirSettingsWire`].
+#[derive(Serialize, Deserialize)]
+struct ScoringSettingsWire {
     inner_maxiter: usize,
     inner_tol: f64,
+    /// Absent from a `sir.settings` written before #426, which did not record it:
+    /// those draws ran no inner multi-start, so the default stands in.
+    #[serde(default = "default_inner_restarts")]
+    inner_restarts: usize,
     mu_referencing: bool,
     n_agq: usize,
     inner_optimizer: String,
@@ -397,6 +418,10 @@ struct SirSettingsWire {
     ode_auto_switch: bool,
 }
 
+fn default_inner_restarts() -> usize {
+    crate::types::FitOptions::default().inner_restarts
+}
+
 /// An enum's serde token: its `[fit_options]` spelling.
 fn enum_token<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
@@ -407,11 +432,12 @@ fn enum_token<T: Serialize>(value: &T) -> String {
 
 /// The enum a token names; an unknown token is `Corrupt` (#1382).
 fn enum_from_token<T: serde::de::DeserializeOwned>(
+    block: &str,
     field: &str,
     token: String,
 ) -> Result<T, FitrxError> {
     serde_json::from_value(serde_json::Value::String(token.clone()))
-        .map_err(|_| FitrxError::Corrupt(format!("unknown sir.settings.{field} {token:?}")))
+        .map_err(|_| FitrxError::Corrupt(format!("unknown {block}.{field} {token:?}")))
 }
 
 impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
@@ -423,8 +449,17 @@ impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
             df: s.df,
             scale: enum_token(&s.scale),
             keep_samples: s.keep_samples,
+            scoring: ScoringSettingsWire::from(&s.scoring),
+        }
+    }
+}
+
+impl From<&crate::ScoringSettings> for ScoringSettingsWire {
+    fn from(s: &crate::ScoringSettings) -> Self {
+        Self {
             inner_maxiter: s.inner_maxiter,
             inner_tol: s.inner_tol,
+            inner_restarts: s.inner_restarts,
             mu_referencing: s.mu_referencing,
             n_agq: s.n_agq,
             inner_optimizer: enum_token(&s.inner_optimizer),
@@ -444,14 +479,34 @@ impl SirSettingsWire {
     /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
     /// default, so a value the parser would reject must not enter through the bundle.
     fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
+        if !(self.df >= 1.0) {
+            return Err(FitrxError::Corrupt(format!(
+                "sir.settings.df must be >= 1, got {}",
+                self.df
+            )));
+        }
+        Ok(crate::estimation::sir::SirSettings {
+            samples: self.samples,
+            resamples: self.resamples,
+            seed: self.seed,
+            df: self.df,
+            scale: enum_from_token("sir.settings", "scale", self.scale)?,
+            keep_samples: self.keep_samples,
+            scoring: self.scoring.into_settings("sir.settings")?,
+        })
+    }
+}
+
+impl ScoringSettingsWire {
+    /// Decoded and held to the `[fit_options]` domain, as [`SirSettingsWire`] is:
+    /// `run_covariance` and `run_sir` adopt a recorded value wherever the caller left
+    /// the default. `block` names the key the record was read from in a `Corrupt`.
+    fn into_settings(self, block: &str) -> Result<crate::ScoringSettings, FitrxError> {
         let bad = |field: &str, why: &str, got: String| {
             Err(FitrxError::Corrupt(format!(
-                "sir.settings.{field} must be {why}, got {got}"
+                "{block}.{field} must be {why}, got {got}"
             )))
         };
-        if !(self.df >= 1.0) {
-            return bad("df", ">= 1", self.df.to_string());
-        }
         for (field, v) in [
             ("ode_reltol", self.ode_reltol),
             ("ode_abstol", self.ode_abstol),
@@ -477,23 +532,18 @@ impl SirSettingsWire {
                 "0".to_string(),
             );
         }
-        Ok(crate::estimation::sir::SirSettings {
-            samples: self.samples,
-            resamples: self.resamples,
-            seed: self.seed,
-            df: self.df,
-            scale: enum_from_token("scale", self.scale)?,
-            keep_samples: self.keep_samples,
+        Ok(crate::ScoringSettings {
             inner_maxiter: self.inner_maxiter,
             inner_tol: self.inner_tol,
+            inner_restarts: self.inner_restarts,
             mu_referencing: self.mu_referencing,
             n_agq: self.n_agq,
-            inner_optimizer: enum_from_token("inner_optimizer", self.inner_optimizer)?,
+            inner_optimizer: enum_from_token(block, "inner_optimizer", self.inner_optimizer)?,
             ebe_warm_start: self.ebe_warm_start,
             ode_reltol: self.ode_reltol,
             ode_abstol: self.ode_abstol,
             ode_max_steps: self.ode_max_steps,
-            ode_method: enum_from_token("ode_method", self.ode_method)?,
+            ode_method: enum_from_token(block, "ode_method", self.ode_method)?,
             ode_stiff_abort_after: self.ode_stiff_abort_after,
             ode_auto_switch: self.ode_auto_switch,
         })
@@ -945,6 +995,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         multi_start_seed: r.multi_start_seed,
         saem_seed: r.saem_seed,
         sir_seed: r.sir_seed,
+        scoring_settings: r.scoring_settings.as_ref().map(ScoringSettingsWire::from),
         imp_seed: r.imp_seed,
         npde_seed: r.npde_seed,
         bloq_method: r.bloq_method.clone(),
@@ -2192,6 +2243,10 @@ fn wire_to_fit_result(
         ),
         None => (None, None, None, None, None, None, None),
     };
+    let scoring_settings = w
+        .scoring_settings
+        .map(|s| s.into_settings("scoring_settings"))
+        .transpose()?;
     // Two copies of one seed (#1767): a record whose seed differs from `sir_seed`
     // would make `fit.sir_seed` report one run and `run_sir` reproduce another.
     if let Some(st) = sir_settings.as_ref() {
@@ -2369,6 +2424,7 @@ fn wire_to_fit_result(
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         sir_settings,
+        scoring_settings,
         imp_seed: w.imp_seed,
         npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
@@ -3281,8 +3337,16 @@ mod tests {
             df: 3.0,
             scale: crate::types::SirScale::Natural,
             keep_samples: true,
+            scoring: off_default_scoring_settings(),
+        }
+    }
+
+    /// A scoring record with every field, and every enum, off its default (#426).
+    fn off_default_scoring_settings() -> crate::ScoringSettings {
+        crate::ScoringSettings {
             inner_maxiter: 17,
             inner_tol: 3e-4,
+            inner_restarts: 4,
             mu_referencing: false,
             n_agq: 5,
             inner_optimizer: crate::types::InnerOptimizer::NelderMead,
@@ -4536,5 +4600,152 @@ mod tests {
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
         let loaded = load_fit(&path).unwrap();
         assert_eq!(loaded.fit.input_columns, r.input_columns);
+    }
+
+    // ── #426: the scoring record ───────────────────────────────────────────
+
+    /// T11 (#426): `scoring_settings` survives the bundle, field for field, beside a SIR
+    /// record whose scoring half differs from it. Mutations: drop the field from the writer
+    /// or the reader (the first equality dies); map a token to the default enum (every enum
+    /// here is off-default).
+    #[test]
+    fn roundtrip_keeps_scoring_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoring_settings.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.scoring_settings = Some(crate::ScoringSettings {
+            inner_tol: 1e-8,
+            ..off_default_scoring_settings()
+        });
+        assert_ne!(r.scoring_settings, Some(crate::ScoringSettings::default()));
+        assert_ne!(
+            r.scoring_settings.as_ref(),
+            r.sir_settings.as_ref().map(|s| &s.scoring)
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.scoring_settings, r.scoring_settings);
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+    }
+
+    /// T11 (#426): additive, so no `FORMAT_VERSION` bump. A fit without the record writes no
+    /// key (mutation: drop `skip_serializing_if`, and it comes back as `null`); a bundle
+    /// written before #426 has none and loads `None`.
+    #[test]
+    fn fit_wire_missing_scoring_settings_loads_none() {
+        let mut r = minimal_fit_result();
+        r.scoring_settings = None;
+        let none = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !none.as_object().unwrap().contains_key("scoring_settings"),
+            "a fit with no record must not write the key"
+        );
+        r.scoring_settings = Some(off_default_scoring_settings());
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("scoring_settings")
+                .is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        let loaded = wire_to_fit_result(wire, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(loaded.scoring_settings, None);
+    }
+
+    /// T11 (#426): `sir.settings` stays flat on the wire though `SirSettings` nests its scoring
+    /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
+    /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
+    /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
+    /// emits exactly those keys plus `inner_restarts`, still flat. Mutations: drop
+    /// `#[serde(flatten)]` (the frozen object fails to load, and the writer nests a `scoring`
+    /// key); drop the `inner_restarts` default (the frozen object fails to load).
+    #[test]
+    fn a_flat_pre_426_sir_record_still_loads() {
+        let frozen = serde_json::json!({
+            "samples": 321, "resamples": 123, "seed": 4242, "df": 3.0, "scale": "natural",
+            "keep_samples": true, "inner_maxiter": 17, "inner_tol": 3e-4,
+            "mu_referencing": false, "n_agq": 5, "inner_optimizer": "nelder_mead",
+            "ebe_warm_start": true, "ode_reltol": 1e-7, "ode_abstol": 1e-9,
+            "ode_max_steps": 777, "ode_method": "rodas5p", "ode_stiff_abort_after": 9,
+            "ode_auto_switch": false
+        });
+        let loaded = load_edited_sir_wire(|v| v["sir"]["settings"] = frozen.clone())
+            .expect("a pre-#426 SIR record loads");
+        let want = crate::estimation::sir::SirSettings {
+            scoring: crate::ScoringSettings {
+                inner_restarts: crate::types::FitOptions::default().inner_restarts,
+                ..off_default_scoring_settings()
+            },
+            ..off_default_sir_settings()
+        };
+        assert_eq!(loaded.sir_settings, Some(want));
+
+        let written = serde_json::to_value(build_fit_wire(&sir_fit_with_settings())).unwrap();
+        let mut keys: Vec<&String> = written["sir"]["settings"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        keys.sort();
+        let mut want_keys: Vec<&String> = frozen.as_object().unwrap().keys().collect();
+        let restarts = "inner_restarts".to_string();
+        want_keys.push(&restarts);
+        want_keys.sort();
+        assert_eq!(keys, want_keys);
+    }
+
+    /// T11 (#426): the top-level record is held to the `[fit_options]` domain like the SIR
+    /// record, and a refusal names the block it read. One row per check, the reject and the
+    /// boundary accept, as in `sir_settings_out_of_domain_values_are_corrupt`. Mutation:
+    /// decode the block with the `sir.settings` prefix (every message names the wrong block).
+    #[test]
+    fn scoring_settings_out_of_domain_values_are_corrupt() {
+        let mut r = minimal_fit_result();
+        r.scoring_settings = Some(off_default_scoring_settings());
+        let load = |field: &str, v: serde_json::Value| {
+            let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+            value["scoring_settings"][field] = v;
+            let wire: FitWire = serde_json::from_value(value).unwrap();
+            wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+        };
+        for (field, reject, accept) in [
+            (
+                "ode_reltol",
+                serde_json::json!(0.0),
+                serde_json::json!(1e-12),
+            ),
+            (
+                "ode_abstol",
+                serde_json::json!(-1.0),
+                serde_json::json!(1e-12),
+            ),
+            ("ode_max_steps", serde_json::json!(0), serde_json::json!(1)),
+            ("n_agq", serde_json::json!(0), serde_json::json!(1)),
+            (
+                "ode_stiff_abort_after",
+                serde_json::json!(0),
+                serde_json::json!(1),
+            ),
+            (
+                "inner_optimizer",
+                serde_json::json!("Lbfgs"),
+                serde_json::json!("lbfgs"),
+            ),
+        ] {
+            match load(field, reject) {
+                Err(FitrxError::Corrupt(msg)) => assert!(
+                    msg.contains(&format!("scoring_settings.{field} ")),
+                    "{field}: {msg}"
+                ),
+                other => panic!("{field}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+            let loaded = load(field, accept.clone())
+                .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
+            assert!(loaded.scoring_settings.is_some(), "{field}");
+        }
     }
 }

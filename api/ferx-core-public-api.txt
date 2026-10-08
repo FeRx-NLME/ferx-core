@@ -548,22 +548,11 @@ pub ferx_core::estimation::sir::SirResult::settings: ferx_core::estimation::sir:
 pub ferx_core::estimation::sir::SirResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::estimation::sir::SirSettings
 pub ferx_core::estimation::sir::SirSettings::df: f64
-pub ferx_core::estimation::sir::SirSettings::ebe_warm_start: bool
-pub ferx_core::estimation::sir::SirSettings::inner_maxiter: usize
-pub ferx_core::estimation::sir::SirSettings::inner_optimizer: ferx_core::InnerOptimizer
-pub ferx_core::estimation::sir::SirSettings::inner_tol: f64
 pub ferx_core::estimation::sir::SirSettings::keep_samples: bool
-pub ferx_core::estimation::sir::SirSettings::mu_referencing: bool
-pub ferx_core::estimation::sir::SirSettings::n_agq: usize
-pub ferx_core::estimation::sir::SirSettings::ode_abstol: f64
-pub ferx_core::estimation::sir::SirSettings::ode_auto_switch: bool
-pub ferx_core::estimation::sir::SirSettings::ode_max_steps: usize
-pub ferx_core::estimation::sir::SirSettings::ode_method: ferx_core::ode::OdeMethod
-pub ferx_core::estimation::sir::SirSettings::ode_reltol: f64
-pub ferx_core::estimation::sir::SirSettings::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::estimation::sir::SirSettings::resamples: usize
 pub ferx_core::estimation::sir::SirSettings::samples: usize
 pub ferx_core::estimation::sir::SirSettings::scale: ferx_core::SirScale
+pub ferx_core::estimation::sir::SirSettings::scoring: ferx_core::ScoringSettings
 pub ferx_core::estimation::sir::SirSettings::seed: u64
 impl ferx_core::estimation::sir::SirSettings
 pub fn ferx_core::estimation::sir::SirSettings::from_options(options: &ferx_core::FitOptions) -> Self
@@ -3141,6 +3130,7 @@ pub ferx_core::types::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::types::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
+pub ferx_core::types::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::types::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
@@ -4626,6 +4616,7 @@ pub ferx_core::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
+pub ferx_core::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
@@ -4931,6 +4922,24 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::ScoringSettings
+pub ferx_core::ScoringSettings::ebe_warm_start: bool
+pub ferx_core::ScoringSettings::inner_maxiter: usize
+pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
+pub ferx_core::ScoringSettings::inner_restarts: usize
+pub ferx_core::ScoringSettings::inner_tol: f64
+pub ferx_core::ScoringSettings::mu_referencing: bool
+pub ferx_core::ScoringSettings::n_agq: usize
+pub ferx_core::ScoringSettings::ode_abstol: f64
+pub ferx_core::ScoringSettings::ode_auto_switch: bool
+pub ferx_core::ScoringSettings::ode_max_steps: usize
+pub ferx_core::ScoringSettings::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::ScoringSettings::ode_reltol: f64
+pub ferx_core::ScoringSettings::ode_stiff_abort_after: core::option::Option<u32>
+impl ferx_core::ScoringSettings
+pub fn ferx_core::ScoringSettings::from_options(options: &ferx_core::FitOptions) -> Self
+impl core::default::Default for ferx_core::ScoringSettings
+pub fn ferx_core::ScoringSettings::default() -> Self
 pub struct ferx_core::SigmaVector
 pub ferx_core::SigmaVector::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::SigmaVector::values: alloc::vec::Vec<f64>

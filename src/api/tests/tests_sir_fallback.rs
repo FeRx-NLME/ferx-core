@@ -391,7 +391,10 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     // `want` comes from `from_options` itself, so the equality above cannot see a field
     // `from_options` drops; the per-call inner settings are pinned against the options directly.
     assert_eq!(
-        (sir.settings.inner_optimizer, sir.settings.ebe_warm_start),
+        (
+            sir.settings.scoring.inner_optimizer,
+            sir.settings.scoring.ebe_warm_start
+        ),
         (crate::types::InnerOptimizer::Lbfgs, true),
         "the recorded inner settings must be the ones passed"
     );

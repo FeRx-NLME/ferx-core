@@ -163,13 +163,19 @@ pub fn run_sir(
 /// `sir_seed`, which takes `fit.sir_seed`: before #1758 that field echoed the seed
 /// the fit was given, so it is the seed a pre-#1758 SIR drew with (#1767).
 fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
-    let mut o = options.clone();
     let Some(rec) = fit.sir_settings.as_ref() else {
+        let mut o = options.clone();
         if o.sir_seed.is_none() {
             o.sir_seed = fit.sir_seed;
         }
         return o;
     };
+    // The scoring half through the resolver `run_covariance` shares (#426). From the SIR
+    // record only, never `fit.scoring_settings`: the in-fit SIR scores with the fit's
+    // top-level options, not the producing stage's, and on a quadrature stage the two
+    // part company (`fit()` tightens that stage's `inner_tol` to 1e-8), so the stage's
+    // record would not repeat the reported SIR.
+    let mut o = crate::estimation::fit_inputs::with_scoring_record(Some(&rec.scoring), options);
     let d = FitOptions::default();
     macro_rules! recorded {
         ($field:ident = $value:expr) => {
@@ -184,18 +190,6 @@ fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
     recorded!(sir_df = rec.df);
     recorded!(sir_scale = rec.scale);
     recorded!(sir_keep_samples = rec.keep_samples);
-    recorded!(inner_maxiter = rec.inner_maxiter);
-    recorded!(inner_tol = rec.inner_tol);
-    recorded!(mu_referencing = rec.mu_referencing);
-    recorded!(n_agq = rec.n_agq);
-    recorded!(inner_optimizer = rec.inner_optimizer);
-    recorded!(ebe_warm_start = rec.ebe_warm_start);
-    recorded!(ode_reltol = rec.ode_reltol);
-    recorded!(ode_abstol = rec.ode_abstol);
-    recorded!(ode_max_steps = rec.ode_max_steps);
-    recorded!(ode_method = rec.ode_method);
-    recorded!(ode_stiff_abort_after = rec.ode_stiff_abort_after);
-    recorded!(ode_auto_switch = rec.ode_auto_switch);
     o
 }
 
@@ -919,18 +913,21 @@ mod tests {
             df: 3.0,
             scale: SirScale::Natural,
             keep_samples: true,
-            inner_maxiter: 17,
-            inner_tol: 3e-4,
-            mu_referencing: false,
-            n_agq: 5,
-            inner_optimizer: InnerOptimizer::Lbfgs,
-            ebe_warm_start: true,
-            ode_reltol: 1e-7,
-            ode_abstol: 1e-9,
-            ode_max_steps: 777,
-            ode_method: crate::ode::OdeMethod::Rodas5P,
-            ode_stiff_abort_after: Some(9),
-            ode_auto_switch: false,
+            scoring: crate::ScoringSettings {
+                inner_maxiter: 17,
+                inner_tol: 3e-4,
+                inner_restarts: 4,
+                mu_referencing: false,
+                n_agq: 5,
+                inner_optimizer: InnerOptimizer::Lbfgs,
+                ebe_warm_start: true,
+                ode_reltol: 1e-7,
+                ode_abstol: 1e-9,
+                ode_max_steps: 777,
+                ode_method: crate::ode::OdeMethod::Rodas5P,
+                ode_stiff_abort_after: Some(9),
+                ode_auto_switch: false,
+            },
         }
     }
 
@@ -1005,6 +1002,31 @@ mod tests {
             ..FitOptions::default()
         };
         assert_eq!(resolve_sir_options(&fit, &explicit).sir_seed, Some(1));
+    }
+
+    /// #426: `run_sir` reads the SIR record only, never `fit.scoring_settings` (the
+    /// stage's). A fit with a stage record and no SIR record resolves to the caller's
+    /// options as given; the control is the same fit with a SIR record carrying the same
+    /// scoring half, which does resolve, so the test straddles the source. Mutation: a
+    /// stage-record fallback (`.or(fit.scoring_settings)`) → the first assertion dies.
+    #[test]
+    fn resolve_sir_options_never_reads_the_stage_record() {
+        let rec = off_default_settings();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        fit.scoring_settings = Some(rec.scoring.clone());
+        fit.sir_settings = None;
+        let d = FitOptions::default();
+        assert_eq!(
+            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d)),
+            crate::ScoringSettings::from_options(&d),
+            "a stage record alone must not reach run_sir"
+        );
+        fit.sir_settings = Some(rec.clone());
+        assert_eq!(
+            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d)),
+            rec.scoring,
+            "control: the SIR record's scoring half does"
+        );
     }
 
     /// `fit`'s SIR outputs cleared, its record kept, so a `run_sir` that failed

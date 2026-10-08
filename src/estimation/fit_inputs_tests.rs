@@ -1337,3 +1337,147 @@ fn a_fit_without_bindings_is_refused_with_the_half_code() {
         );
     }
 }
+
+// ── #426: the scoring record ───────────────────────────────────────────────
+
+/// A record with every field off its [`FitOptions::default`] value, so each resolve line has
+/// a value to take that default caller options do not already hold.
+fn off_default_scoring() -> ScoringSettings {
+    ScoringSettings {
+        inner_maxiter: 17,
+        inner_tol: 3e-4,
+        inner_restarts: 4,
+        mu_referencing: false,
+        n_agq: 5,
+        inner_optimizer: InnerOptimizer::Lbfgs,
+        ebe_warm_start: true,
+        ode_reltol: 1e-7,
+        ode_abstol: 1e-9,
+        ode_max_steps: 777,
+        ode_method: crate::ode::OdeMethod::Rodas5P,
+        ode_stiff_abort_after: Some(9),
+        ode_auto_switch: false,
+    }
+}
+
+/// #426 T12, the resolve lines. Default caller options take every recorded field, each
+/// checked under its own name after its premise (the record differs from the default); a
+/// caller's non-default value wins. Both sides of the "caller left the default?" gate in one
+/// test. The three `bool`s have one non-default value, which record and caller share, so
+/// their `caller` check holds either way; the other ten catch an inverted gate. This is the
+/// only test that reaches the `inner_restarts` and `ode_stiff_abort_after` lines: no T9
+/// fixture moves the covariance with them (`tests/run_covariance_scoring_record.rs`). The
+/// record is destructured without `..`, so a new field does not compile here (E0027) until
+/// the pattern names it, beside the `field!` rows it then needs. Mutations: delete any one resolve line (its `record` check dies, naming the field);
+/// invert the gate (a `caller` check dies).
+#[test]
+fn scoring_record_fills_each_field_the_caller_left_default() {
+    let rec = off_default_scoring();
+    let d = FitOptions::default();
+    let resolved = with_scoring_record(Some(&rec), &d);
+    let caller = FitOptions {
+        inner_maxiter: 18,
+        inner_tol: 4e-4,
+        inner_restarts: 5,
+        mu_referencing: false,
+        n_agq: 6,
+        inner_optimizer: InnerOptimizer::NelderMead,
+        ebe_warm_start: true,
+        ode_reltol: 2e-7,
+        ode_abstol: 2e-9,
+        ode_max_steps: 778,
+        ode_method: crate::ode::OdeMethod::Rodas4,
+        ode_stiff_abort_after: Some(10),
+        ode_auto_switch: false,
+        ..FitOptions::default()
+    };
+    let kept = with_scoring_record(Some(&rec), &caller);
+    let ScoringSettings {
+        inner_maxiter: _,
+        inner_tol: _,
+        inner_restarts: _,
+        mu_referencing: _,
+        n_agq: _,
+        inner_optimizer: _,
+        ebe_warm_start: _,
+        ode_reltol: _,
+        ode_abstol: _,
+        ode_max_steps: _,
+        ode_method: _,
+        ode_stiff_abort_after: _,
+        ode_auto_switch: _,
+    } = rec.clone();
+    macro_rules! field {
+        ($f:ident) => {
+            let name = stringify!($f);
+            assert_ne!(rec.$f, d.$f, "{name}: premise — the record is off-default");
+            assert_eq!(
+                resolved.$f, rec.$f,
+                "{name}: record — a default caller takes it"
+            );
+            assert_eq!(
+                kept.$f, caller.$f,
+                "{name}: caller — a non-default caller keeps it"
+            );
+        };
+    }
+    field!(inner_maxiter);
+    field!(inner_tol);
+    field!(inner_restarts);
+    field!(mu_referencing);
+    field!(n_agq);
+    field!(inner_optimizer);
+    field!(ebe_warm_start);
+    field!(ode_reltol);
+    field!(ode_abstol);
+    field!(ode_max_steps);
+    field!(ode_method);
+    field!(ode_stiff_abort_after);
+    field!(ode_auto_switch);
+    // Nothing outside the record moves: a step setting, and the tally the record leaves out.
+    assert_eq!(resolved.cov_inner_tol, d.cov_inner_tol);
+    assert_eq!(
+        resolved.min_obs_for_convergence_check,
+        d.min_obs_for_convergence_check
+    );
+}
+
+/// #426 T12, the fallback order of `resolve_scoring_options`: the fit's own record, else the
+/// SIR record's scoring half (a `.fitrx` written between #1758 and #426), else the caller's
+/// options unchanged. Mutations: swap the order (the first assertion takes the SIR record);
+/// drop the SIR fallback (the second gets the caller's defaults); return anything but
+/// `options` when neither exists (the third, whose caller is off-default).
+#[test]
+fn resolve_scoring_options_prefers_the_fits_record_then_the_sir_records() {
+    let fit_rec = off_default_scoring();
+    let sir_rec = ScoringSettings {
+        inner_maxiter: 99,
+        ..off_default_scoring()
+    };
+    let mut fit = crate::types::test_helpers::minimal_fit_result();
+    fit.scoring_settings = Some(fit_rec.clone());
+    fit.sir_settings = Some(crate::estimation::sir::SirSettings {
+        scoring: sir_rec.clone(),
+        ..Default::default()
+    });
+    let d = FitOptions::default();
+    assert_eq!(
+        ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)),
+        fit_rec
+    );
+    fit.scoring_settings = None;
+    assert_eq!(
+        ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)),
+        sir_rec
+    );
+    fit.sir_settings = None;
+    let caller = FitOptions {
+        inner_tol: 1e-7,
+        ode_method: crate::ode::OdeMethod::Rodas4,
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        ScoringSettings::from_options(&resolve_scoring_options(&fit, &caller)),
+        ScoringSettings::from_options(&caller)
+    );
+}

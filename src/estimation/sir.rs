@@ -82,30 +82,12 @@ pub struct SirSettings {
     pub scale: SirScale,
     /// `sir_keep_samples`: whether the resampled vectors were retained.
     pub keep_samples: bool,
-    /// `inner_maxiter` of each draw's EBE re-solve.
-    pub inner_maxiter: usize,
-    /// `inner_tol` of each draw's EBE re-solve.
-    pub inner_tol: f64,
-    /// `mu_referencing` (read by the IOV re-solve).
-    pub mu_referencing: bool,
-    /// `n_agq`: quadrature nodes of the scored marginal.
-    pub n_agq: usize,
-    /// `inner_optimizer`: the per-subject EBE solver.
-    pub inner_optimizer: InnerOptimizer,
-    /// `ebe_warm_start`: warm-started Nelder–Mead fallback.
-    pub ebe_warm_start: bool,
-    /// `ode_reltol` of every ODE solve.
-    pub ode_reltol: f64,
-    /// `ode_abstol` of every ODE solve.
-    pub ode_abstol: f64,
-    /// `ode_max_steps` per ODE segment.
-    pub ode_max_steps: usize,
-    /// `ode_method`: the ODE stepper.
-    pub ode_method: crate::ode::OdeMethod,
-    /// `ode_stiff_abort_after`: the stiff-segment abort budget.
-    pub ode_stiff_abort_after: Option<u32>,
-    /// `ode_auto_switch`: in-segment stepper switching under `ode_method = auto`.
-    pub ode_auto_switch: bool,
+    /// The inner-loop and ODE settings each draw's EBE re-solve and objective ran
+    /// under (#426). The same record a fit carries on
+    /// [`FitResult::scoring_settings`](crate::FitResult::scoring_settings), taken here
+    /// from the options SIR was handed. `inner_restarts` is recorded for completeness:
+    /// the draws are warm-started and run no inner multi-start.
+    pub scoring: crate::ScoringSettings,
 }
 
 /// The SIR seed when `sir_seed` is unset.
@@ -122,18 +104,7 @@ impl SirSettings {
             df: options.sir_df,
             scale: options.sir_scale,
             keep_samples: options.sir_keep_samples,
-            inner_maxiter: options.inner_maxiter,
-            inner_tol: options.inner_tol,
-            mu_referencing: options.mu_referencing,
-            n_agq: options.n_agq,
-            inner_optimizer: options.inner_optimizer,
-            ebe_warm_start: options.ebe_warm_start,
-            ode_reltol: options.ode_reltol,
-            ode_abstol: options.ode_abstol,
-            ode_max_steps: options.ode_max_steps,
-            ode_method: options.ode_method,
-            ode_stiff_abort_after: options.ode_stiff_abort_after,
-            ode_auto_switch: options.ode_auto_switch,
+            scoring: crate::ScoringSettings::from_options(options),
         }
     }
 }
