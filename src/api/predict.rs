@@ -323,8 +323,12 @@ pub struct PredictionResult {
 /// A time-varying covariate on the linear predictor, a population loaded without endpoint
 /// routing, or a categorical covariate value outside its `[covariate_model]` relation's
 /// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). These are
-/// the only four it checks.
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). And
+/// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
+/// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
+/// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the data lacks
+/// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
@@ -448,8 +452,12 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// A time-varying covariate on a hazard, a dose into a compartment the model cannot
 /// deliver into, or a categorical covariate value outside its `[covariate_model]` relation's
 /// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). These are
-/// the only four it checks.
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). And
+/// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
+/// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
+/// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the data lacks
+/// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,

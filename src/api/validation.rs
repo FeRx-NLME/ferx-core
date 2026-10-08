@@ -232,7 +232,7 @@ pub(crate) enum LevelDataEntry {
 /// | no subject carries the index | `E_THETA_LEVELS_DATA_UNBOUND`, "never bound" | the binder above |
 /// | some subjects carry none | `E_THETA_LEVELS_DATA_UNBOUND`, "`k` of `n` subjects" | the binder above |
 /// | an index without its level column | `E_THETA_LEVELS_DATA_MISMATCH` | none: the level is unknown |
-/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: fit a model bound on this population; `Fit`: the `Fit` binder |
+/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder |
 /// | indexed for another table | `E_THETA_LEVELS_DATA_MISMATCH`, the first record | the binder above |
 ///
 /// A population is refused, never re-indexed: the check reads `&Population`, and
@@ -302,7 +302,7 @@ pub(crate) fn check_level_index_columns(
                 LevelIndexFinding::Unseen { labels } => {
                     let remedy = match entry {
                         LevelDataEntry::Run => {
-                            "To predict them, fit a model bound on this population."
+                            "A θ for them comes from a fit of a model bound on this population."
                         }
                         LevelDataEntry::Fit => binder,
                     };

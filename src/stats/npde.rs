@@ -105,9 +105,12 @@ pub struct SubjectNpde {
 /// (#1740) is an `Err` carrying `E_COV_LEVEL_UNKNOWN`'s message: the simulated
 /// reference distribution would score it as the reference level. Reached from
 /// `fit()`'s post-fit step this cannot fire, since the fit already refused it. A θ
-/// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615), and a bound
-/// `theta NAME[...]` block on a population never bound for it is
-/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647).
+/// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). A
+/// `theta NAME[...]` block never bound is `E_THETA_LEVELS_UNBOUND`'s; a bound one on a
+/// population never bound for it, or bound for only some of its subjects, is
+/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647, #1762); one bound for other levels is
+/// `E_THETA_LEVELS_DATA_MISMATCH`'s (#1762). A covariate the data lacks is
+/// `E_MISSING_COVARIATE`'s (#1763).
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,

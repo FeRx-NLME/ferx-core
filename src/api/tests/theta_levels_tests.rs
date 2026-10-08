@@ -1797,7 +1797,7 @@ mod from_fit {
     const OTHER_LEVELS: &str =
         "`theta PLACEBO[...]` is bound, but this population was bound for other levels: ";
     const NO_THETA: &str = " The θ being run has no value for them.";
-    const RUN_UNSEEN: &str = " To predict them, fit a model bound on this population.";
+    const RUN_UNSEEN: &str = " A θ for them comes from a fit of a model bound on this population.";
     /// M2's cause sentence, up to the record it names.
     const ANOTHER_TABLE: &str = "`theta PLACEBO[...]` is bound, but this population's index \
         into its levels was written for another level table: ";
@@ -2162,6 +2162,50 @@ mod from_fit {
             ),
             "{err}"
         );
+
+        // #1792 review r1 #5: a record whose snapshot lacks the index its subject's
+        // baseline carries is named as carrying none.
+        //
+        // Mutation — "its index says 1" in the `got: None` arm: this assertion dies.
+        let mut dropped = a.clone();
+        dropped.subjects[1].obs_covariates[1].remove("__level_PLACEBO");
+        let err =
+            crate::api::predict_diag(&fit.model, &dropped, &fit_theta_params(&fit.model, &theta))
+                .err()
+                .expect("predict_diag");
+        assert!(
+            err.to_string().contains(
+                "subject 2 at time 2 is level `STUDY=2,TIME=2`, level 4 of the model's block, \
+                 and it carries no index. "
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1792 review r1 #4. `-0.0 == 0.0`, so a level column holding both is one level,
+    /// as it was under `Vec::contains` before the matcher was keyed: the binder lays out
+    /// the θ of a population that spells it `0.0` throughout, and the check passes it.
+    ///
+    /// Mutation — `level_key` on `v.to_bits()` (no fold): `-0` and `0` become two levels,
+    /// and the θ count (or, failing that, the check) dies.
+    #[test]
+    fn negative_zero_and_zero_are_one_level() {
+        let text = no_eta_model();
+        let zeros = |first: f64| {
+            let mut p = population(3, 2);
+            for (s, v) in p.subjects.iter_mut().zip([first, 0.0, 1.0]) {
+                s.covariates.insert("STUDY".to_string(), v);
+            }
+            p
+        };
+        let mut plain = zeros(0.0);
+        let want = bind(&text, &mut plain).expect("plain zeros").n_theta;
+        let mut signed = zeros(-0.0);
+        assert!(signed.subjects[0].covariates["STUDY"].is_sign_negative());
+        let fit = bind_fit(&text, &mut signed);
+        assert_eq!(fit.model.n_theta, want, "one level for -0 and 0");
+        let theta = moved_theta(&fit.model);
+        runs_everywhere(&fit.model, &signed, &theta, "-0 and 0");
     }
 
     /// T7 (P3). The model's labels are whatever it was laid out on: a model laid out by
