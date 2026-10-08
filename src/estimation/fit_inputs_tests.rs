@@ -231,6 +231,56 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
     assert!(old.se_theta.is_none(), "the old garbage: a flat objective");
 }
 
+/// #1792 review r2 (a): the "`k` of `n`" cell of `E_THETA_LEVELS_DATA_UNBOUND` reaches
+/// a post-hoc caller too. The fit's own population with the index stripped from one
+/// subject is partly bound: `population_refusal` keeps that cell rather than the
+/// fingerprint text, since the fix is the binder, not another population.
+///
+/// Mutation — drop the "`k` of `n`" cell in `population_refusal`'s filter (keep
+/// only "never bound"): the fingerprint text comes back and both entries die.
+#[test]
+fn a_partly_bound_population_hears_k_of_n_on_a_post_hoc_step() {
+    let c = case(Kind::Level);
+    let model = &c.prep.parsed.model;
+    let mut partly = c.prep.population.clone();
+    let s = &mut partly.subjects[0];
+    for m in std::iter::once(&mut s.covariates)
+        .chain(s.obs_covariates.iter_mut())
+        .chain(s.dose_covariates.iter_mut())
+        .chain(s.pk_only_covariates.iter_mut())
+        .chain(s.reset_covariates.iter_mut())
+    {
+        m.remove("__level_SHIFT");
+    }
+    let id = partly.subjects[0].id.clone();
+    let n = partly.subjects.len();
+    for entry in ["run_covariance", "run_sir"] {
+        let r = match entry {
+            "run_covariance" => run_covariance(&c.fit, Some(model), Some(&partly), &c.opts),
+            _ => run_sir(&c.fit, Some(model), Some(&partly), &c.opts),
+        };
+        let e = r.map(|_| ()).expect_err("refused");
+        assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
+        assert_eq!(e.context(), Some(entry), "{e}");
+        let err = e.to_string();
+        assert!(
+            err.starts_with(&format!(
+                "{entry}: `theta SHIFT[...]` is bound, but 1 of {n} subjects in this population \
+                 carry no index into the block's levels, the first being subject {id}: they \
+                 were not bound with the rest. Bind the population with `bind_from_fit("
+            )),
+            "{err}"
+        );
+        for never in [
+            "not the one the fit was given",
+            "never bound",
+            "__level_SHIFT",
+        ] {
+            assert!(!err.contains(never), "{entry}: says {never}: {err}");
+        }
+    }
+}
+
 /// #1792 review r1 #1: a population bound **on its own** for other levels (every
 /// `STUDY` relabelled `+100`) carries the index, so `check_level_index_columns` finds
 /// `E_THETA_LEVELS_DATA_MISMATCH` — whose "a fit of a model bound on this population" is
