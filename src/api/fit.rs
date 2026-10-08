@@ -548,7 +548,7 @@ fn fit_unstamped(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     // #426: this call's `inner_optimizer` / `ebe_warm_start` are armed by `install_on_fit_pool`
-    // (on this thread, and on the workers of the pool it picks), not here: unlike the ODE
+    // (on the thread that runs the fit, and on the workers of the pool it picks), not here: unlike the ODE
     // override below, nothing before the pool solves an EBE. They were process globals that
     // every fit wrote and none restored, so a fit in another thread could switch this one's
     // inner solver mid-run.
@@ -561,8 +561,11 @@ fn fit_unstamped(
     // same options as the fit; the guard disarms on every exit path, including an early `?`,
     // so a later `predict` on the same model is unaffected. The fan-out is covered separately,
     // by `install_on_fit_pool`: arming reaches this thread only, and the workers that do the
-    // integrating get the value from the pool built for it.
-    let _ode_solver_override =
+    // integrating get the value from the pool built for it. The guard is dropped right before
+    // `install_on_fit_pool`, which arms it again on the thread that runs the fit: held across
+    // that `install`, a worker blocked in it would hand this value to the jobs of its own pool
+    // that it runs while waiting (#1801 review, finding 2).
+    let ode_solver_override =
         crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
@@ -909,6 +912,9 @@ fn fit_unstamped(
             ));
         }
     }
+
+    // Pre-pool validation is over; `install_on_fit_pool` re-arms on the thread it runs on.
+    drop(ode_solver_override);
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {

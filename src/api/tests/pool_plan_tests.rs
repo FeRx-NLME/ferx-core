@@ -679,3 +679,110 @@ fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
         .install(|| with_fit_scope(&default_request, rayon::current_num_threads).expect("nested"));
     assert_eq!(kept, 1, "an enclosing plain pool must be kept");
 }
+
+/// What a job queued on a one-worker `pool` reads while that worker is blocked in `nested`.
+///
+/// `rayon::join` runs `nested` on the pool's only worker and queues `read`; a worker blocked in
+/// a cross-pool `install` keeps executing its own pool's queued jobs while it waits, so on a
+/// one-worker pool `read` can only run there, mid-`nested`. Deterministic for that reason.
+fn read_while_blocked<T: Send>(
+    pool: &rayon::ThreadPool,
+    nested: impl FnOnce() + Send,
+    read: impl FnOnce() -> T + Send,
+) -> T {
+    pool.install(|| {
+        rayon::join(
+            || {
+                nested();
+            },
+            read,
+        )
+        .1
+    })
+}
+
+fn block_a_while() {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+/// #1801 review finding 1 (and 2): a nested fit-scoped call must not arm its scope on the
+/// calling thread across the cross-pool `install` it makes, because the calling worker runs its
+/// own pool's queued jobs while it waits, and those jobs belong to *its* pool's scope. Found by
+/// the round-1 probe: a job stolen during `install_on_fit_pool(&FitOptions::default(), …)` on
+/// an `(Lbfgs, warm)` worker read `(Auto, false)`.
+///
+/// Rows: `install_on_fit_pool` and `with_fit_scope` × the inner and the ODE half, plus a whole
+/// default `fit()` (whose pre-pool ODE guard is the second, `fit_unstamped`-level arm).
+/// Mutations: arm before `install` in `install_on_fit_pool` → its two rows die; the same in
+/// `with_fit_scope` → its two rows; keep `fit_unstamped`'s ODE guard alive across the pool →
+/// the `fit()` row.
+#[test]
+fn a_job_stolen_during_a_nested_scoped_call_reads_its_own_pools_scope() {
+    use crate::estimation::inner_optimizer::current_inner_settings;
+    use crate::ode::solver::effective_solver_options;
+    let default_request = FitOptions::default();
+    let baked = crate::ode::OdeSolverOptions::default();
+    let reltol = move || effective_solver_options(baked).reltol;
+
+    let inner_pool = fit_scope_pool(
+        FitScope {
+            inner: lbfgs_warm(),
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("inner pool");
+    let tight = FitOptions {
+        ode_reltol: 1e-11,
+        ..Default::default()
+    };
+    let ode_pool = fit_scope_pool(FitScope::of(&tight), 1).expect("ODE pool");
+
+    let fit_pool_inner = read_while_blocked(
+        &inner_pool,
+        || {
+            install_on_fit_pool(&default_request, block_a_while).expect("nested");
+        },
+        current_inner_settings,
+    );
+    let scope_inner = read_while_blocked(
+        &inner_pool,
+        || {
+            with_fit_scope(&default_request, block_a_while).expect("nested");
+        },
+        current_inner_settings,
+    );
+    let fit_pool_ode = read_while_blocked(
+        &ode_pool,
+        || {
+            install_on_fit_pool(&default_request, block_a_while).expect("nested");
+        },
+        reltol,
+    );
+    let scope_ode = read_while_blocked(
+        &ode_pool,
+        || {
+            with_fit_scope(&default_request, block_a_while).expect("nested");
+        },
+        reltol,
+    );
+    let model = one_cpt_model();
+    let pop = population();
+    let whole_fit_ode = read_while_blocked(
+        &ode_pool,
+        || {
+            fit(&model, &pop, &model.default_params, &short_fit_opts()).expect("nested fit");
+        },
+        reltol,
+    );
+    assert_eq!(
+        (fit_pool_inner, scope_inner),
+        (lbfgs_warm(), lbfgs_warm()),
+        "(install_on_fit_pool, with_fit_scope): a stolen job read the nested call's inner settings"
+    );
+    assert_eq!(
+        (fit_pool_ode, scope_ode, whole_fit_ode),
+        (1e-11, 1e-11, 1e-11),
+        "(install_on_fit_pool, with_fit_scope, fit): a stolen job read the nested call's ODE settings"
+    );
+}

@@ -201,17 +201,19 @@ impl FitScope {
         self.ode.same_pool_key(&other.ode) && self.inner == other.inner
     }
 
-    /// Arm both halves on this thread until the returned guards drop.
-    fn arm(
-        &self,
-    ) -> (
-        crate::ode::solver::OdeSolverOverrideGuard,
-        crate::estimation::inner_optimizer::InnerSettingsGuard,
-    ) {
-        (
-            crate::ode::solver::arm_ode_solver_override(self.ode),
-            crate::estimation::inner_optimizer::arm_inner_settings(self.inner),
-        )
+    /// `f` with both halves armed on whichever thread runs it, for the duration of the call.
+    ///
+    /// Arm inside the closure an `install` moves, never on the calling thread before it. A
+    /// Rayon worker blocked in a cross-pool `install` keeps running its own pool's queued jobs
+    /// while it waits, and those jobs belong to *its* pool's scope: a guard armed on it across
+    /// the `install` is what they would read (#1801 review, finding 1 — a job stolen during a
+    /// default-options nested call on an `(Lbfgs, warm)` worker read `(Auto, false)`).
+    fn armed<R>(self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+        move || {
+            let _ode = crate::ode::solver::arm_ode_solver_override(self.ode);
+            let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
+            f()
+        }
     }
 
     /// Install this scope for a pool worker's whole lifetime (its `start_handler`).
@@ -283,8 +285,8 @@ fn shared_fit_scope_pool(
 }
 
 /// Run `f` with `options`' fit scope — its ODE solver settings and its inner-loop settings —
-/// reaching every thread that can solve for it: armed on this thread, and run on a pool whose
-/// workers carry the same value (see [`fit_scope_pool`]).
+/// reaching every thread that can solve for it: armed on whichever thread runs `f`, and run on
+/// a pool whose workers carry the same value (see [`fit_scope_pool`]).
 ///
 /// Used by the standalone `run_covariance` / `run_sir` / `run_sir_core` entry points, which
 /// re-solve the inner loop exactly as `fit` does but may have no pool of their own. Runs
@@ -307,7 +309,7 @@ pub(crate) fn with_fit_scope<R: Send>(
     // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
     // CPU, which is the pool this engine never wants to own (#1460).
     let carried = rayon::current_thread_index().is_some() && worker_scope().same_pool_key(&scope);
-    let _armed = scope.arm();
+    let f = scope.armed(f);
     if scope.is_empty() {
         // Nothing for workers to carry, but `f` still `par_iter`s (SIR weighting, the
         // covariance step's per-subject passes). On a worker that also carries nothing, stay
@@ -369,7 +371,8 @@ fn install_on_ferx_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R +
     }
 }
 
-/// Run `f` on the pool this `fit()` call should use, with its fit scope armed.
+/// Run `f` on the pool this `fit()` call should use, with its fit scope armed on the thread
+/// that runs it (never on this one across the `install`; see `FitScope::armed`).
 ///
 /// Pool choice, in order: a pool carrying this call's scope when it is not empty — an ODE
 /// override or non-default inner settings (shared for unpinned fits, exclusive for a positive
@@ -383,7 +386,7 @@ pub(crate) fn install_on_fit_pool<R: Send>(
 ) -> Result<R, String> {
     let scope = FitScope::of(options);
     scope.validate()?;
-    let _armed = scope.arm();
+    let f = scope.armed(f);
     if !scope.is_empty() {
         return match options.threads.filter(|&n| n > 0) {
             Some(n) => Ok(fit_scope_pool(scope, n)?.install(f)),
