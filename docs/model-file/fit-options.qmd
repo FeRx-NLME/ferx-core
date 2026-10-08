@@ -75,14 +75,16 @@ What runs, how long, and how it is resumed or traced.
 #### Worker reuse for repeated fits
 
 Default fits share a persistent worker pool. Unpinned fits with the same
-fit-level ODE overrides also share a persistent pool keyed by those solver
-settings, so changing a tolerance does not multiply worker counts for concurrent
-calls. A positive `threads` value explicitly budgets the fit and exclusively
-leases a pool for the call; an idle pool with the same width and solver settings
-can be reused, while concurrent pinned fits keep independent budgets. This
-preserves the per-fit budgets assigned by `PoolPlan`.
-This isolates worker budgets and ODE settings; concurrent fits should still use
-consistent process-wide inner-optimizer and EBE warm-start settings.
+fit-level ODE overrides and the same non-default `inner_optimizer` /
+`ebe_warm_start` also share a persistent pool keyed by those settings, so
+changing a tolerance does not multiply worker counts for concurrent calls. A
+positive `threads` value explicitly budgets the fit and exclusively leases a
+pool for the call; an idle pool with the same width and settings can be reused,
+while concurrent pinned fits keep independent budgets. This preserves the
+per-fit budgets assigned by `PoolPlan`. Each fit's workers carry that fit's own
+ODE and inner-loop settings, so concurrent fits with different settings do not
+affect each other, and none of them changes the settings of a later call
+([#426](https://github.com/FeRx-NLME/ferx-core/issues/426)).
 
 Either way, a requested worker count sizes **one** pool: the one the fit runs on.
 The CLI's `--threads N` used to size Rayon's process-global pool as well, so a

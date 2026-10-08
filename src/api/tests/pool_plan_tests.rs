@@ -319,11 +319,11 @@ fn nested_ode_scope_stays_on_the_enclosing_fit_pool() {
         ..Default::default()
     };
     let ov = options.ode_solver_override();
-    let pool = ode_override_pool(ov, 1).expect("outer override pool");
+    let pool = fit_scope_pool(ov.into(), 1).expect("outer override pool");
     pool.install(|| {
         let outer_worker = thread::current().id();
         let nested_worker =
-            with_fit_ode_scope(&options, || thread::current().id()).expect("nested ODE scope");
+            with_fit_scope(&options, || thread::current().id()).expect("nested ODE scope");
         assert_eq!(
             nested_worker, outer_worker,
             "an internal SIR-style scope leased a second pool"
@@ -549,4 +549,133 @@ fn work_already_on_a_worker_stays_there_instead_of_nesting_a_pool() {
         width, 1,
         "an enclosing pool must be kept, not widened to the requested count"
     );
+}
+
+// ── the fit scope reaches every worker, and only the call it belongs to (#426) ──
+
+/// What each of 64 `par_iter` jobs read, slow enough that the pool's other workers steal.
+fn jobs_read<T: Send>(read: impl Fn() -> T + Sync + Send) -> Vec<T> {
+    (0..64)
+        .into_par_iter()
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            read()
+        })
+        .collect()
+}
+
+fn lbfgs_warm() -> crate::estimation::inner_optimizer::InnerSettings {
+    crate::estimation::inner_optimizer::InnerSettings {
+        mode: crate::types::InnerOptimizer::Lbfgs,
+        warm: true,
+    }
+}
+
+/// T1: a pool leased for non-default inner settings starts every worker with them installed,
+/// so the per-subject solves `par_iter` fans out read the call's solver, not the default.
+/// Mutation: `FitScope::install_on_worker` skips the inner half → the jobs read `(Auto, false)`.
+#[test]
+fn a_scoped_pool_installs_the_inner_settings_on_every_worker() {
+    use crate::estimation::inner_optimizer::current_inner_settings;
+    let scope = FitScope {
+        inner: lbfgs_warm(),
+        ..Default::default()
+    };
+    let pool = fit_scope_pool(scope, 3).expect("scoped pool");
+    let seen = pool.install(|| jobs_read(current_inner_settings));
+    let wrong = seen.iter().filter(|s| **s != lbfgs_warm()).count();
+    assert_eq!(wrong, 0, "{wrong}/64 jobs read other inner settings");
+}
+
+/// T3, both arms of `with_fit_scope`'s run-inline predicate in one test, and the ODE twin.
+///
+/// (a) A call that asks for the *default* scope, made on a worker of a pool carrying another
+/// call's scope, must leave that pool: its `par_iter` jobs run on the worker's siblings, which
+/// read what their pool installed. Before #426 `with_fit_ode_scope` ran an empty request
+/// inline on any worker — measured on `main` at `1f298774` with the ODE twin below: 43/64 jobs
+/// read the enclosing `ode_reltol`. (b) A call asking for the *same* scope stays on the
+/// enclosing worker rather than leasing a second full-width pool (in-fit SIR). (c) An empty
+/// request on a plain worker carrying nothing keeps that worker's budget.
+///
+/// Mutations: inline on any worker for an empty request → (a) and its ODE twin die; drop the
+/// carried-scope inline branch → (b) dies; always leave the worker on an empty request → (c)
+/// dies.
+#[test]
+fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
+    use crate::estimation::inner_optimizer::{current_inner_settings, InnerSettings};
+    use crate::ode::solver::effective_solver_options;
+    use std::thread;
+    let width = 3;
+    let lbfgs = FitOptions {
+        threads: Some(width),
+        inner_optimizer: crate::types::InnerOptimizer::Lbfgs,
+        ebe_warm_start: true,
+        ..Default::default()
+    };
+    let default_request = FitOptions {
+        threads: Some(width),
+        ..Default::default()
+    };
+
+    // (a) inner settings.
+    let pool = fit_scope_pool(FitScope::of(&lbfgs), width).expect("outer pool");
+    let (outer, nested) = pool.install(|| {
+        let outer = jobs_read(current_inner_settings);
+        let nested = with_fit_scope(&default_request, || jobs_read(current_inner_settings))
+            .expect("nested scope");
+        (outer, nested)
+    });
+    assert!(
+        outer.iter().all(|s| *s == lbfgs_warm()),
+        "premise: the enclosing pool's jobs read its scope"
+    );
+    let leaked = nested
+        .iter()
+        .filter(|s| **s != InnerSettings::default())
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "{leaked}/64 nested jobs read the enclosing inner settings"
+    );
+
+    // (a), ODE twin.
+    let tight = FitOptions {
+        threads: Some(width),
+        ode_reltol: 1e-11,
+        ..Default::default()
+    };
+    let baked = crate::ode::OdeSolverOptions::default();
+    let reltol = || effective_solver_options(baked).reltol;
+    let pool = fit_scope_pool(FitScope::of(&tight), width).expect("ODE pool");
+    let (outer, nested) = pool.install(|| {
+        let outer = jobs_read(reltol);
+        let nested = with_fit_scope(&default_request, || jobs_read(reltol)).expect("nested");
+        (outer, nested)
+    });
+    assert!(outer.iter().all(|r| *r == 1e-11), "premise: ODE pool");
+    let leaked = nested.iter().filter(|r| **r == 1e-11).count();
+    assert_eq!(
+        leaked, 0,
+        "{leaked}/64 nested jobs read the enclosing ode_reltol"
+    );
+
+    // (b) the same scope stays on the enclosing worker.
+    let pool = fit_scope_pool(FitScope::of(&lbfgs), width).expect("same-scope pool");
+    pool.install(|| {
+        let here = thread::current().id();
+        let nested = with_fit_scope(&lbfgs, || thread::current().id()).expect("nested");
+        assert_eq!(
+            nested, here,
+            "a same-scope nested call leased a second pool"
+        );
+    });
+
+    // (c) an empty request on a plain one-worker pool keeps its width.
+    let plain = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let kept = plain
+        .install(|| with_fit_scope(&default_request, rayon::current_num_threads).expect("nested"));
+    assert_eq!(kept, 1, "an enclosing plain pool must be kept");
 }

@@ -441,8 +441,6 @@ pub fn ferx_core::estimation::inner_optimizer::find_ebe(model: &ferx_core::Compi
 pub fn ferx_core::estimation::inner_optimizer::profile_report()
 pub fn ferx_core::estimation::inner_optimizer::run_inner_loop(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, max_iter: usize, tol: f64) -> (alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>, alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>, ferx_core::estimation::inner_optimizer::InnerLoopStats, alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>)
 pub fn ferx_core::estimation::inner_optimizer::run_inner_loop_warm(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, max_iter: usize, tol: f64, prev_etas: core::option::Option<&[nalgebra::base::alias::DVector<f64>]>, mu_k: core::option::Option<&[f64]>, min_obs: usize, restarts: usize) -> (alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>, alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>, ferx_core::estimation::inner_optimizer::InnerLoopStats, alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>)
-pub fn ferx_core::estimation::inner_optimizer::set_ebe_warm_start(on: bool)
-pub fn ferx_core::estimation::inner_optimizer::set_inner_optimizer(mode: ferx_core::InnerOptimizer)
 pub mod ferx_core::estimation::mixture
 pub struct ferx_core::estimation::mixture::MixtureEval
 pub ferx_core::estimation::mixture::MixtureEval::ebe_stats: ferx_core::estimation::inner_optimizer::InnerLoopStats

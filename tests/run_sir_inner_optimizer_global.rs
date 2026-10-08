@@ -1,21 +1,20 @@
 //! #1758 T5, the process-global row: `run_sir` applies the fit's recorded
 //! `inner_optimizer` instead of inheriting the last `fit()` in the process.
 //!
-//! `fit()` stores `inner_optimizer` in a process global and nothing resets it
-//! (`set_inner_optimizer` in `src/api/fit.rs`), so before #1758 a standalone SIR
-//! re-solved every draw's EBEs with whichever solver the most recent fit used.
-//! An R session that ran any other fit in between was enough. Measured on the
-//! plan (macOS arm64): ESS 78.37555008899564 in-fit against 78.37555022918151
-//! after an intervening `bfgs` fit.
+//! Until #426, `fit()` stored `inner_optimizer` in a process global and nothing
+//! reset it, so before #1758 a standalone SIR re-solved every draw's EBEs with
+//! whichever solver the most recent fit used. An R session that ran any other fit
+//! in between was enough. Measured on the plan (macOS arm64): ESS
+//! 78.37555008899564 in-fit against 78.37555022918151 after an intervening `bfgs`
+//! fit. Since #426 the setting is per call, so default options with no record
+//! score with `Auto`; the intervening `bfgs` fit is kept as the scenario.
 //!
-//! Its own test binary, with one test, because the global is process-wide: a
-//! concurrent test's `fit()` in a shared binary could move it mid-run.
-//!
-//! Fixture: warfarin, FOCEI, covariance step, 200 / 100 draws, seed 7, FD inner
-//! gradients. Mutation: drop `set_inner_optimizer` from `run_sir` — the draws
-//! re-solve with the intervening fit's `bfgs`, and the bit-identity dies. The
-//! premise (default options score differently) is asserted first, so the row
-//! cannot become a tautology.
+//! Fixture: warfarin, FOCEI, covariance step, 200 / 100 draws, seed 7, analytic
+//! (`Dual2`) inner gradients (measured: `gradient_method_inner`, #426).
+//! Mutation: drop `inner_optimizer` from `resolve_sir_options` — the draws
+//! re-solve with the default solver, and the bit-identity dies. The premise
+//! (default options score differently) is asserted first, so the row cannot
+//! become a tautology.
 
 use ferx_core::{fit, prepare_run, run_sir, FitOptions, FitResult, InnerOptimizer};
 

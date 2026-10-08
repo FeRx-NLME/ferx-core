@@ -112,8 +112,10 @@ pub fn run_covariance(
     // error comes out wrong. The scope covers the whole call, including the re-parse and
     // re-read paths, and puts the per-subject fan-out on a pool whose workers carry the same
     // settings — arming alone would reach this thread and leave the workers on the model
-    // file's.
-    crate::api::with_fit_ode_scope(options, || {
+    // file's. #426: the scope carries this call's `inner_optimizer` / `ebe_warm_start` the
+    // same way, so the reconverged EBEs use the caller's inner solver — the same source as
+    // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
+    crate::api::with_fit_scope(options, || {
         run_covariance_scoped(fit, model, population, options)
     })?
 }

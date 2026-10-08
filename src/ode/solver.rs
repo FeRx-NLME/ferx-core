@@ -446,8 +446,8 @@ impl OdeSolverOverride {
 // subjects with rayon, so the workers doing the integrating have to see it too. Two shapes
 // were tried and both are wrong, which is why this one looks the way it does.
 //
-// A single process-global slot — the shape `estimation::inner_optimizer::INNER_OPT_MODE`
-// uses — cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
+// A single process-global slot — the shape the inner-loop settings had until #426 —
+// cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
 // `par_iter` over replicates and `api::pool` explicitly supports concurrent callers, so with
 // one slot a second fit's arming overwrites the first's, and a fit that expressed *no*
 // opinion (the default `FitOptions`, i.e. almost every fit in the process) pushes the slot
@@ -461,7 +461,7 @@ impl OdeSolverOverride {
 // ordering to fall back on.
 //
 // So the override is a thread-local, and a fit that has one **runs on a pool whose workers
-// were started with that same value already installed** ([`crate::api::ode_override_pool`]).
+// were started with that same value already installed** (`api::pool::fit_scope_pool`, keyed by `api::pool::FitScope`).
 // A worker in that pool serves only fits carrying that override — the pool is keyed by it —
 // so "which fit am I serving?" has one answer per thread and no cross-fit read exists to be
 // wrong. A fit with no override keeps using the shared pool, whose workers never install one
@@ -494,22 +494,12 @@ pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
 }
 
-/// True only on a worker that already carries this non-empty override. Call
-/// before arming a nested entry point on its caller thread.
-pub(crate) fn worker_carries_ode_override(ov: OdeSolverOverride) -> bool {
-    !ov.is_empty()
-        && LOCAL_OVERRIDE
-            .get()
-            .flatten()
-            .is_some_and(|current| current.same_pool_key(&ov))
-}
-
 /// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
 /// before — so a nested fit's opinion wins while it runs and hands the setting back on exit,
 /// and an early `?` return out of the fit cannot leak the override into a later `predict`.
 ///
 /// Arming alone reaches only this thread. A caller whose work fans out over rayon must run
-/// that work through [`crate::api::pool::with_fit_ode_scope`], which also puts it on a pool
+/// that work through `api::pool::with_fit_scope`, which also puts it on a pool
 /// whose workers carry the same value.
 #[must_use = "the override is disarmed as soon as this guard drops"]
 pub(crate) struct OdeSolverOverrideGuard {
@@ -2578,7 +2568,7 @@ mod tests {
         }
 
         // The pool keyed to this override does carry it — on threads that armed nothing.
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| {
             assert_eq!(effective_solver_options(baked).reltol, 1e-11);
             // ...including inside a nested fan-out, which is where the real integrations
@@ -2627,7 +2617,7 @@ mod tests {
                 stiff_abort_after: Some(Some(0)),
                 auto_switch: Some(false),
             };
-            let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+            let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
             pool.install(|| {
                 let eff = effective_solver_options(baked);
                 assert_eq!(eff.reltol, 1e-9);
@@ -2645,7 +2635,7 @@ mod tests {
             stiff_abort_after: Some(None),
             ..Default::default()
         };
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| assert_eq!(effective_solver_options(baked).stiff_abort_after, None));
     }
 
@@ -2666,7 +2656,7 @@ mod tests {
             ..Default::default()
         };
         let ov = opts.ode_solver_override();
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| {
             // Already a worker carrying `ov` — exactly the state that made the short-circuit
             // look safe.
@@ -2696,9 +2686,9 @@ mod tests {
             reltol: Some(1e-10),
             ..Default::default()
         };
-        let pool_a = crate::api::ode_override_pool(a, 2).expect("pool a");
-        let pool_b = crate::api::ode_override_pool(b, 2).expect("pool b");
-        let pool_a_again = crate::api::ode_override_pool(a, 2).expect("pool a again");
+        let pool_a = crate::api::fit_scope_pool(a.into(), 2).expect("pool a");
+        let pool_b = crate::api::fit_scope_pool(b.into(), 2).expect("pool b");
+        let pool_a_again = crate::api::fit_scope_pool(a.into(), 2).expect("pool a again");
         assert!(
             pool_a.install(|| std::thread::current().id())
                 != pool_a_again.install(|| std::thread::current().id()),
@@ -2711,7 +2701,7 @@ mod tests {
         );
         // Width is part of the key too: a fit that pinned `threads` must not be handed a pool
         // of some other width.
-        let narrow = crate::api::ode_override_pool(a, 1).expect("pool a, one thread");
+        let narrow = crate::api::fit_scope_pool(a.into(), 1).expect("pool a, one thread");
         assert!(
             pool_a.install(|| std::thread::current().id())
                 != narrow.install(|| std::thread::current().id())

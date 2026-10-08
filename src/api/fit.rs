@@ -547,11 +547,11 @@ fn fit_unstamped(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
-    // Apply the fit-scoped inner-loop optimizer choice before any EBE solve runs.
-    // `Auto` (the default) reproduces the historical size-based dispatch, so this
-    // is a no-op unless the user pinned `inner_optimizer`.
-    crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
-    crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #426: this call's `inner_optimizer` / `ebe_warm_start` are armed by `install_on_fit_pool`
+    // (on this thread, and on the workers of the pool it picks), not here: unlike the ODE
+    // override below, nothing before the pool solves an EBE. They were process globals that
+    // every fit wrote and none restored, so a fit in another thread could switch this one's
+    // inner solver mid-run.
     // #1212: carry this call's ODE solver settings the last hop to the integrator. The
     // spec's `solver_opts` is stamped at parse time by `sync_ode_solver_opts`, every
     // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
