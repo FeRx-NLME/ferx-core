@@ -1367,8 +1367,8 @@ fn off_default_scoring() -> ScoringSettings {
 /// their `caller` check holds either way; the other ten catch an inverted gate. This is the
 /// only test that reaches the `inner_restarts` and `ode_stiff_abort_after` lines: no T9
 /// fixture moves the covariance with them (`tests/run_covariance_scoring_record.rs`). The
-/// record is destructured without `..`, so a new field does not compile here until it has a
-/// row. Mutations: delete any one resolve line (its `record` check dies, naming the field);
+/// record is destructured without `..`, so a new field does not compile here (E0027) until
+/// the pattern names it, beside the `field!` rows it then needs. Mutations: delete any one resolve line (its `record` check dies, naming the field);
 /// invert the gate (a `caller` check dies).
 #[test]
 fn scoring_record_fills_each_field_the_caller_left_default() {

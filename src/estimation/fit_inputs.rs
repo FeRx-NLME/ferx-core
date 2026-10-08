@@ -677,7 +677,8 @@ pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> 
     scoring_options(fit.method, fit.interaction, options)
 }
 
-/// The [`FitOptions`] a fit's objective was scored under, as one record (#426): every
+/// The [`FitOptions`] of the stage that produced a fit's estimates (and ran its inline
+/// covariance step), as one record (#426): every
 /// option a post-hoc step reads when it reconverges the EBEs and re-scores the objective
 /// at the fit's estimates. Carried on [`FitResult::scoring_settings`] (the stage that
 /// produced the estimates) and inside [`SirSettings`](crate::estimation::sir::SirSettings)
@@ -757,8 +758,10 @@ impl Default for ScoringSettings {
 /// non-default value wins and an explicit default cannot override a record. `None`
 /// returns `options` unchanged.
 ///
-/// The record is destructured without `..`, so a field added to [`ScoringSettings`]
-/// without a line here does not compile.
+/// The record is destructured without `..`. A field added to [`ScoringSettings`] and
+/// left out of the pattern does not compile (E0027); one added to the pattern without a
+/// `recorded!` line leaves an unused binding, an `unused_variables` warning that the
+/// Clippy gate (`tools/preflight.sh`, `-Dunused`) makes an error.
 pub(crate) fn with_scoring_record(
     rec: Option<&ScoringSettings>,
     options: &FitOptions,
@@ -806,7 +809,7 @@ pub(crate) fn with_scoring_record(
     o
 }
 
-/// `options` resolved against the settings `fit`'s objective was scored under, for a
+/// `options` resolved against the settings of the stage that produced `fit`'s estimates, for a
 /// post-hoc step that re-scores it at the fit's estimates ([`run_covariance`]): from
 /// [`FitResult::scoring_settings`], else from the SIR record's
 /// (`sir_settings.scoring`, a fit loaded from a `.fitrx` written between #1758 and

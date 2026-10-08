@@ -7217,10 +7217,11 @@ pub struct FitResult {
     /// repeats the reported SIR.
     #[serde(default)]
     pub sir_settings: Option<crate::estimation::sir::SirSettings>,
-    /// The inner-loop and ODE settings the reported objective was scored under
-    /// (#426): the options of the stage that produced the estimates, so on a
-    /// `methods = [..]` chain a stage's own `inner_tol` (a quadrature stage runs at
-    /// 1e-8 or tighter) rather than the top-level one. Set by every `fit()`; `None`
+    /// The inner-loop and ODE settings of the stage that produced the estimates (and ran
+    /// the inline covariance step) (#426): on a `methods = [..]` chain, the last stage that
+    /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
+    /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
+    /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
     /// only on a fit loaded from a `.fitrx` written before #426.
     ///
     /// [`run_covariance`](crate::run_covariance) reads it: a setting its caller leaves

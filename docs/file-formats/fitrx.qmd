@@ -233,7 +233,7 @@ fails the load as corrupt. The key is additive, so `format_version` stays `"1"`:
 a bundle saved before #1758 has no `settings` and loads `sir_settings = None`,
 and `run_sir` on it uses the caller's options as given.
 
-`scoring_settings` records the settings the fit's objective was scored under
+`scoring_settings` records the settings of the stage that produced the estimates
 (`FitResult::scoring_settings`, [#426](https://github.com/FeRx-NLME/ferx-core/issues/426)):
 `inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`,
 `inner_optimizer`, `ebe_warm_start` and the six `ode_*` settings, as the stage

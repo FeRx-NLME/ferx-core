@@ -217,7 +217,7 @@ struct FitWire {
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sir_seed: Option<u64>,
-    /// The settings the reported objective was scored under (#426). Additive: absent
+    /// The settings of the stage that produced the estimates (#426). Additive: absent
     /// in bundles written before it existed, which load as `None`, so no
     /// `FORMAT_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
