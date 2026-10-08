@@ -152,12 +152,18 @@ pub fn fit_from_files(
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
     // property of the dataset. Mirrors `run_model_with_data_inits`.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+        .map_err(|e| e.to_string())?;
     // #1111: resolve any symbolic `[covariate_model]` statistic
     // (`center = median`, `ref = mode`, `levels = auto`) against the same
     // dataset. `assert_covariate_model_bound` names this entry point as one
     // that binds them, so it has to actually do it.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
+    // #1772 removes: the binder's code is dropped until this entry point
+    // returns `EngineError`.
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
+        .map_err(|e| e.to_string())?;
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD. One rule, shared

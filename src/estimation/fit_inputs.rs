@@ -372,7 +372,8 @@ fn resolve_fit_inputs_unattributed<'a>(
             } else {
                 Some(population.to_mut())
             };
-            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)?;
+            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
+                .map_err(EngineError::from_diagnostic)?;
             ModelRef::Built(Box::new(parsed.model))
         }
         Some(m) => {
@@ -386,7 +387,8 @@ fn resolve_fit_inputs_unattributed<'a>(
                 ));
             }
             if let Cow::Owned(p) = &mut population {
-                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)?;
+                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
+                    .map_err(EngineError::from_diagnostic)?;
             }
             crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
             // No recorded bindings to compare (an older `.fitrx`): the population

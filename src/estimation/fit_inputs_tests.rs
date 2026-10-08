@@ -1151,3 +1151,85 @@ mod fitted_population_1783 {
         assert!(e.contains("not the one the fit was given"), "{e}");
     }
 }
+
+/// #1773. The resolver's two level writes keep the binder's code through
+/// `run_sir` / `run_covariance`: `E_THETA_LEVEL_BINDING` on `parameters`, with the
+/// entry point as context and the binder's text unchanged. Both cells are a level
+/// the fit never estimated, from each side: the model rebuilt from the file and laid
+/// out on the fit, given the design population (`STUDY=4` is unseen); and a lent
+/// model bound on the design, given the fit's data re-read (`STUDY=3` is unseen to
+/// it). `run_sir` is refused in the resolver, before it reads the covariance matrix
+/// this fit does not carry.
+///
+/// Mutations — `.to_string()` the code away at either write (`bind_from_fit_on` or
+/// `write_fitted_level_columns` in `resolve_fit_inputs`): that cell's `code()` is
+/// `None`.
+#[test]
+fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
+    let c = case(Kind::Level);
+    let design = super::test_fixtures::design(&c);
+    // A lent model needs a fit with no recorded bindings to compare against.
+    let mut legacy = c.fit.clone();
+    legacy.data_bindings = Default::default();
+    let lent = &design.parsed.model;
+    for entry in ["run_covariance", "run_sir"] {
+        let run = |fit: &FitResult, m: Option<&CompiledModel>, p: Option<&Population>| match entry {
+            "run_covariance" => run_covariance(fit, m, p, &c.opts),
+            _ => run_sir(fit, m, p, &c.opts),
+        };
+        let cells = [
+            (
+                "rebuilt",
+                run(&c.fit, None, Some(&design.population)),
+                "`STUDY=4`",
+            ),
+            ("lent", run(&legacy, Some(lent), None), "`STUDY=3`"),
+        ];
+        for (what, r, unseen) in cells {
+            let e = r.map(|_| ()).expect_err(what);
+            assert_eq!(
+                e.code(),
+                Some("E_THETA_LEVEL_BINDING"),
+                "{entry}/{what}: {e}"
+            );
+            assert_eq!(e.block(), Some("parameters"), "{entry}/{what}: {e}");
+            assert_eq!(e.context(), Some(entry), "{entry}/{what}: {e}");
+            assert!(
+                e.to_string().starts_with(&format!(
+                    "{entry}: theta SHIFT[STUDY]: the design has 1 level(s) the fit estimated \
+                     no theta for: {unseen}."
+                )),
+                "{entry}/{what}: {e}"
+            );
+        }
+    }
+}
+
+/// #1791 review r1, row 2. A fit that recorded no data bindings, rebuilt from its
+/// model file (`model = None`), is refused by the from-fit binder with a code: the
+/// level code on a level model, the statistics code on a stats-only one. This is
+/// the class `warnings.qmd` names, run rather than traced.
+///
+/// Mutation — `.to_string()` the code away at the resolver's `bind_from_fit_on`:
+/// both cells' `code()` is `None`.
+#[test]
+fn a_fit_without_bindings_is_refused_with_the_half_code() {
+    for (kind, code) in [
+        (Kind::Level, "E_THETA_LEVEL_BINDING"),
+        (Kind::Median, "E_COVARIATE_STATS_BINDING"),
+    ] {
+        let c = case(kind);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let e = run_covariance(&fit, None, Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("no bindings to rebuild from");
+        assert_eq!(e.code(), Some(code), "{kind:?}: {e}");
+        assert_eq!(e.context(), Some("run_covariance"), "{kind:?}: {e}");
+        assert!(
+            e.to_string()
+                .contains("this fit carries no data-derived bindings"),
+            "{kind:?}: {e}"
+        );
+    }
+}

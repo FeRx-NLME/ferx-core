@@ -111,7 +111,7 @@ fn population(n_studies: usize, n_times: usize) -> Population {
 /// Bind `text` against `pop`, returning the re-parsed model.
 fn bind(text: &str, pop: &mut Population) -> Result<CompiledModel, String> {
     let mut parsed = parse_full_model(text)?;
-    crate::api::bind_theta_levels(&mut parsed, text, pop)?;
+    crate::api::bind_theta_levels(&mut parsed, text, pop).map_err(|e| e.to_string())?;
     Ok(parsed.model)
 }
 
@@ -1094,7 +1094,7 @@ mod from_fit {
         fitted: &LevelBindings,
     ) -> Result<ParsedModel, String> {
         let mut parsed = parse_full_model(text).unwrap();
-        bind_theta_levels_from_fit(&mut parsed, text, design, fitted)?;
+        bind_theta_levels_from_fit(&mut parsed, text, design, fitted).map_err(|e| e.to_string())?;
         Ok(parsed)
     }
 
@@ -1873,9 +1873,11 @@ mod from_fit {
         let binders: [(&str, Binder); 2] = [
             ("bind_from_fit", |p, t, pop, fit| {
                 crate::api::bind_from_fit(p, t, pop, fit.model.data_bindings())
+                    .map_err(|e| e.to_string())
             }),
             ("bind_theta_levels_from_fit", |p, t, pop, fit| {
                 bind_theta_levels_from_fit(p, t, pop, &fit.bindings.levels)
+                    .map_err(|e| e.to_string())
             }),
         ];
         for (name, binder) in binders {
@@ -2965,7 +2967,7 @@ mod from_fit_repeated_labels {
 
     fn bind(text: &str, design: &mut Population, fitted: &LevelBindings) -> Result<usize, String> {
         let mut parsed = parse_full_model(text).unwrap();
-        bind_theta_levels_from_fit(&mut parsed, text, design, fitted)?;
+        bind_theta_levels_from_fit(&mut parsed, text, design, fitted).map_err(|e| e.to_string())?;
         Ok(parsed.model.n_theta)
     }
 
@@ -3107,7 +3109,7 @@ mod bind_from_fit {
     /// Bind a fresh parse of `text` on `design`.
     fn bind(text: &str, design: &mut Population, b: &DataBindings) -> Result<ParsedModel, String> {
         let mut parsed = parse_full_model(text).unwrap();
-        bind_from_fit(&mut parsed, text, design, b)?;
+        bind_from_fit(&mut parsed, text, design, b).map_err(|e| e.to_string())?;
         Ok(parsed)
     }
 
@@ -3395,7 +3397,8 @@ mod bind_from_fit {
             let before_model = prebound.model.data_bindings().clone();
             let before = format!("{design:?}");
             let err = bind_from_fit(&mut prebound, &text, &mut design, &DataBindings::default())
-                .expect_err(&cell);
+                .expect_err(&cell)
+                .to_string();
             assert_eq!(err, want, "{cell}: the twins refuse alike");
             assert_eq!(format!("{design:?}"), before, "{cell}");
             assert_eq!(prebound.model.data_bindings(), &before_model, "{cell}");
@@ -3426,7 +3429,9 @@ mod bind_from_fit {
         b.covariate_stats.clear();
         let mut design = weighed(3, 2, 80.0);
         let mut prebound = pre_bound(&text, &mut design);
-        let err = bind_from_fit(&mut prebound, &text, &mut design, &b).unwrap_err();
+        let err = bind_from_fit(&mut prebound, &text, &mut design, &b)
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, refusal(&text, &b));
         assert!(
             err.starts_with("[covariate_model] relations state a statistic of `WT`"),
@@ -3585,7 +3590,8 @@ mod bind_from_fit {
                 };
                 let before = shape(&parsed.model);
                 let err = crate::api::layout_from_fit(&mut parsed, &text, &b)
-                    .expect_err(&format!("{what} pre {pre}"));
+                    .expect_err(&format!("{what} pre {pre}"))
+                    .to_string();
                 assert_eq!(err, want, "{what} pre {pre}");
                 assert_eq!(shape(&parsed.model), before, "{what} pre {pre}: untouched");
             }
@@ -3740,7 +3746,7 @@ mod absorption {
     pub(super) fn try_bind(text: &str, pop: &Population) -> Result<(LevelContrast, usize), String> {
         let mut p = pop.clone();
         let mut parsed = parse_full_model(text)?;
-        crate::api::bind_theta_levels(&mut parsed, text, &mut p)?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p).map_err(|e| e.to_string())?;
         let free = parsed
             .model
             .theta_names
@@ -6434,7 +6440,8 @@ mod rebind {
         let mut parsed = parse_full_model(&text).unwrap();
         bind_covariate_stats(&mut parsed, &text, &c).unwrap();
         let err = crate::api::bind_theta_levels(&mut parsed, &text, &mut c)
-            .expect_err("C's own median makes its WT-60 subject's levels dead");
+            .expect_err("C's own median makes its WT-60 subject's levels dead")
+            .to_string();
         assert!(
             err.contains("each of these levels has no effect on the predictions"),
             "{err}"
@@ -6751,7 +6758,8 @@ mod rebind {
                 let mut pop = weighed(3, 2, 60.0);
                 let before_pop = format!("{pop:?}");
                 let err = crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
-                    .expect_err(&format!("{cell}: must be refused"));
+                    .expect_err(&format!("{cell}: must be refused"))
+                    .to_string();
                 assert_eq!(err, want, "{cell}");
                 for absent in ["differ", "bound to data", "_from_fit"] {
                     assert!(!err.contains(absent), "{cell}: `{absent}` in {err}");
@@ -6842,7 +6850,8 @@ mod rebind {
         assert_eq!(symbolic_covariates(&parsed.model), vec!["WT".to_string()]);
         let before = twin(&parsed);
         let err = bind_covariate_stats(&mut parsed, &text, &design)
-            .expect_err("no fit centre to keep, and the design's is not the fit's");
+            .expect_err("no fit centre to keep, and the design's is not the fit's")
+            .to_string();
         assert_eq!(
             err,
             "[covariate_model] relations still need data-derived statistics:\n  \
@@ -6894,6 +6903,250 @@ mod rebind {
             rebind(&mut parsed, &text, &mut pop);
             assert_eq!(twin(&parsed), twin(&once), "{name}");
             assert_eq!(canon(&pop), canon(&once_pop), "{name}");
+        }
+    }
+}
+
+/// #1773: the binders return `EngineError` carrying the code `ferx check` reports
+/// for the same refusal. Each code is assigned in one helper per half
+/// (`level_binding_error`, `stats_binding_error`), which both the binders and
+/// `bind_for_check` go through.
+mod binding_codes {
+    #![allow(deprecated)]
+    use super::bind_from_fit::{fitted, model, pre_bound, weighed};
+    use super::*;
+    use crate::api::validation::bind_for_check;
+    use crate::api::{
+        bind_covariate_stats, bind_from_fit, bind_theta_levels, bind_theta_levels_from_fit,
+        layout_from_fit,
+    };
+    use crate::diagnostics::{Diagnostic, EngineError};
+    use crate::parser::model_parser::{DataBindings, LevelContrast};
+
+    const LEVEL: (&str, &str) = ("E_THETA_LEVEL_BINDING", "parameters");
+    const STATS: (&str, &str) = ("E_COVARIATE_STATS_BINDING", "covariate_model");
+
+    fn assert_code(e: &EngineError, (code, block): (&str, &str), what: &str) {
+        assert_eq!(e.code(), Some(code), "{what}: {e}");
+        assert_eq!(e.block(), Some(block), "{what}: {e}");
+    }
+
+    /// `ferx check`'s binding step on a fresh parse of `text`.
+    fn check(text: &str, pop: &mut Population) -> Result<(), Diagnostic> {
+        let mut parsed = parse_full_model(text).unwrap();
+        bind_for_check(&mut parsed, text, pop)
+    }
+
+    /// The binder's error and the check's diagnostic are one refusal: code, block,
+    /// suggestion and text.
+    fn assert_same(e: &EngineError, d: &Diagnostic, what: &str) {
+        assert_eq!(e.code(), Some(d.code.as_str()), "{what}");
+        assert_eq!(e.block(), d.block.as_deref(), "{what}");
+        assert_eq!(e.suggestion(), d.suggestion.as_deref(), "{what}");
+        assert_eq!(e.to_string(), d.message, "{what}");
+    }
+
+    /// A refusal `ferx check` can reach, through each binder that reaches it, is
+    /// the check's own diagnostic: a level column missing on subject `1` (the
+    /// binder on the data's levels, and `bind_from_fit` on a design), and a
+    /// symbolic `WT` with no value in the data.
+    ///
+    /// Mutations — tag either half at the `pub` wrapper only and let
+    /// `bind_for_check` assign its own code: the codes drift and `assert_same` dies;
+    /// swap the two helpers' codes: both `assert_code`s die.
+    #[test]
+    fn a_binder_refusal_check_can_reach_has_check_code_block_and_text() {
+        let text = no_eta_model();
+        let no_study = || {
+            let mut pop = population(2, 2);
+            pop.subjects[0].covariates.remove("STUDY");
+            pop
+        };
+        let d = check(&text, &mut no_study()).expect_err("check refuses");
+        assert!(
+            d.message
+                .contains("column `STUDY` is not in the data (subject 1)"),
+            "{d:?}"
+        );
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = bind_theta_levels(&mut parsed, &text, &mut no_study()).expect_err("own levels");
+        assert_code(&e, LEVEL, "bind_theta_levels");
+        assert_same(&e, &d, "bind_theta_levels");
+
+        let mut fit_pop = population(2, 2);
+        let mut fit = parse_full_model(&text).unwrap();
+        bind_theta_levels(&mut fit, &text, &mut fit_pop).unwrap();
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = bind_from_fit(
+            &mut parsed,
+            &text,
+            &mut no_study(),
+            fit.model.data_bindings(),
+        )
+        .expect_err("design side");
+        assert_code(&e, LEVEL, "bind_from_fit");
+        assert_same(&e, &d, "bind_from_fit");
+
+        let text = model(false, true);
+        let no_wt = population(3, 2);
+        let d = check(&text, &mut no_wt.clone()).expect_err("check refuses");
+        assert!(d.message.contains("no non-missing value"), "{d:?}");
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = bind_covariate_stats(&mut parsed, &text, &no_wt).expect_err("no WT");
+        assert_code(&e, STATS, "bind_covariate_stats");
+        assert_same(&e, &d, "bind_covariate_stats");
+    }
+
+    /// A refusal only a from-fit binder can reach carries the level code: a design
+    /// level the fit never estimated (through `bind_from_fit` and the deprecated
+    /// `bind_theta_levels_from_fit`), malformed bindings (`layout_from_fit`), and a
+    /// model laid out on a fit handed to `bind_theta_levels`. The straddle that
+    /// makes the first one from-fit-only is asserted: `ferx check` binds the same
+    /// design to its own levels and accepts it, so the docs' "no `ferx check`
+    /// counterpart" sentence stays true.
+    ///
+    /// Mutation — drop the tag at the level boundary (`fitted_level_tables` in
+    /// `bind_from_fit_on`, the deprecated binder's wrapper, `validate_fitted_levels`
+    /// in `lay_out_on_fit`, `level_binding_error` on `bind_levels_on_data`): that
+    /// cell's code is the other half's or none.
+    #[test]
+    fn a_from_fit_only_refusal_carries_the_level_code() {
+        let text = no_eta_model();
+        let mut fit_pop = population(2, 2);
+        let mut fit = parse_full_model(&text).unwrap();
+        bind_theta_levels(&mut fit, &text, &mut fit_pop).unwrap();
+        let b = fit.model.data_bindings().clone();
+
+        check(&text, &mut population(3, 2)).expect("check binds the design on its own levels");
+
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = bind_from_fit(&mut parsed, &text, &mut population(3, 2), &b).expect_err("unseen");
+        assert_code(&e, LEVEL, "bind_from_fit");
+        assert!(
+            e.to_string().starts_with(
+                "theta PLACEBO[STUDY, TIME]: the design has 2 level(s) the fit estimated no \
+                 theta for"
+            ),
+            "{e}"
+        );
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = bind_theta_levels_from_fit(&mut parsed, &text, &mut population(3, 2), &b.levels)
+            .expect_err("unseen");
+        assert_code(&e, LEVEL, "bind_theta_levels_from_fit");
+
+        let mut auto = b.clone();
+        auto.levels.get_mut("PLACEBO").unwrap().contrast = LevelContrast::Auto;
+        let mut parsed = parse_full_model(&text).unwrap();
+        let e = layout_from_fit(&mut parsed, &text, &auto).expect_err("auto contrast");
+        assert_code(&e, LEVEL, "layout_from_fit");
+        assert!(e.to_string().contains("record the contrast `auto`"), "{e}");
+
+        let mut laid = parse_full_model(&text).unwrap();
+        layout_from_fit(&mut laid, &text, &b).unwrap();
+        let e = bind_theta_levels(&mut laid, &text, &mut population(2, 2)).expect_err("fit-bound");
+        assert_code(&e, LEVEL, "bind_theta_levels on a fit-bound model");
+        assert!(e.to_string().contains("laid out on a fit's levels"), "{e}");
+    }
+
+    /// A refusal of the statistics half carries the statistics code even on a model
+    /// with a level block: a fit whose statistics lack `WT`, a fit carrying a
+    /// statistic no relation reads, and `bind_covariate_stats` on a model the
+    /// deprecated binder laid out without the fit's centres.
+    ///
+    /// Mutation — tag `validate_fitted_stats` with the level helper, or
+    /// `bind_stats_on_data` with it: the stats cells die.
+    #[test]
+    fn a_stats_refusal_carries_the_stats_code() {
+        let text = model(true, true);
+        let mut b = fitted(&text);
+        b.covariate_stats.clear();
+        for (name, run) in [("bind_from_fit", true), ("layout_from_fit", false)] {
+            let mut parsed = parse_full_model(&text).unwrap();
+            let e = if run {
+                bind_from_fit(&mut parsed, &text, &mut weighed(3, 2, 80.0), &b)
+            } else {
+                layout_from_fit(&mut parsed, &text, &b)
+            }
+            .expect_err(name);
+            assert_code(&e, STATS, name);
+            assert!(
+                e.to_string().contains("carry no entry for it"),
+                "{name}: {e}"
+            );
+        }
+
+        let level_only = model(true, false);
+        let mut extra = fitted(&level_only);
+        extra.covariate_stats = fitted(&text).covariate_stats;
+        let mut parsed = parse_full_model(&level_only).unwrap();
+        let e = layout_from_fit(&mut parsed, &level_only, &extra).expect_err("extra statistic");
+        assert_code(&e, STATS, "an extra statistic");
+        assert!(
+            e.to_string().contains("no [covariate_model] relation"),
+            "{e}"
+        );
+
+        let mut design = weighed(3, 2, 80.0);
+        let mut parsed = parse_full_model(&text).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &text, &mut design, &fitted(&text).levels).unwrap();
+        let e = bind_covariate_stats(&mut parsed, &text, &design).expect_err("no fit centre");
+        assert_code(&e, STATS, "bind_covariate_stats on a fit-bound model");
+    }
+
+    /// A fit with no bindings at all, on a model that needs them: the refusal names
+    /// every half the model has, and carries the level code whenever the model has
+    /// a level block — the half every binder checks first — and the statistics
+    /// code only when it has none. Both sides of that gate in one test.
+    ///
+    /// Mutation — key the code on "a symbolic statistic is present" instead of "a
+    /// level block is present": the both-halves cell gets the statistics code.
+    #[test]
+    fn a_two_half_refusal_is_the_level_code() {
+        for (level, median, want) in [
+            (true, true, LEVEL),
+            (true, false, LEVEL),
+            (false, true, STATS),
+        ] {
+            let text = model(level, median);
+            let what = format!("level {level}, median {median}");
+            let mut parsed = parse_full_model(&text).unwrap();
+            let e = layout_from_fit(&mut parsed, &text, &DataBindings::default()).expect_err(&what);
+            assert_code(&e, want, &what);
+            assert!(
+                e.to_string().contains("carries no data-derived bindings"),
+                "{what}: {e}"
+            );
+            let mut parsed = parse_full_model(&text).unwrap();
+            let e = bind_from_fit(
+                &mut parsed,
+                &text,
+                &mut weighed(3, 2, 80.0),
+                &DataBindings::default(),
+            )
+            .expect_err(&what);
+            assert_code(&e, want, &what);
+        }
+    }
+    /// #1791 review r1, row 4. A model text that fails the unbound re-parse
+    /// `lay_out_on_fit` reads its declaration from takes the code of the half
+    /// `parsed` has: the statistics code on a stats-only model, the level code on a
+    /// level model. Both sides of the gate in one test; `parsed` is bound first, so
+    /// the declaration is re-parsed rather than borrowed.
+    ///
+    /// Mutation — tag that failure with the level code unconditionally (the round-1
+    /// state): the stats-only cell dies.
+    #[test]
+    fn a_failed_declaration_parse_takes_the_code_of_the_half_parsed_has() {
+        for (level, want) in [(false, STATS), (true, LEVEL)] {
+            let text = model(level, !level);
+            let mut parsed = pre_bound(&text, &mut weighed(3, 2, 60.0));
+            assert!(
+                !parsed.model.data_bindings().is_empty(),
+                "level {level}: bound"
+            );
+            let e = layout_from_fit(&mut parsed, "not a model", &fitted(&text))
+                .expect_err("the text does not parse");
+            assert_code(&e, want, &format!("level {level}"));
         }
     }
 }

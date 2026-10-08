@@ -140,6 +140,7 @@ found:
 | absorption input rate | `E_ABSORPTION_FRACTION`, `E_ABSORPTION_DOMAIN`, `E_ABSORPTION_DIFFUSION`, `E_ABSORPTION_RATE_ZERO_ORDER`, `E_ABSORPTION_SS_INFUSION`, `E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER` |
 | κ weights, residual weights | `E_KAPPA_WEIGHT_NONPOSITIVE`, `E_RUV_MAGNITUDE_NONPOSITIVE` |
 | endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
+| θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
 | time-varying covariate on a hazard, depot readout across a reset, a CTMM model, TTE simulatable, Ω~IOV~ present, `horizon`, the adaptive-dosing rejections | none |
 
 `run_sir()` and `run_covariance()` name themselves when they refuse the fit's
@@ -149,9 +150,22 @@ saw: the `EngineError`'s `context()` is the entry point, `to_string()` starts
 with `"run_sir: "` / `"run_covariance: "`, and `message()` is the text without
 it. Their other refusals (dose compartment, endpoint routing, a fit with no
 covariance matrix) carry no context and no prefix, as before. Of the input
-refusals, an unseen categorical level (`E_COV_LEVEL_UNKNOWN`) and a supplied
-model whose `[covariate_model]` is still unbound (`E_COVSTAT_UNRESOLVED`) carry a
-code; the rest have `code()` `None`.
+refusals, an unseen categorical level (`E_COV_LEVEL_UNKNOWN`), a supplied
+model whose `[covariate_model]` is still unbound (`E_COVSTAT_UNRESOLVED`) and
+every refusal of the fit's data bindings carry a code. That last class covers a θ
+level the fit never estimated, malformed recorded bindings, and a fit that recorded
+none: `E_THETA_LEVEL_BINDING` on a model with a level block,
+`E_COVARIATE_STATS_BINDING` on one with only `[covariate_model]` statistics. The
+rest have `code()` `None`.
+
+The binders (`bind_theta_levels`, `bind_covariate_stats`, `bind_from_fit`,
+`layout_from_fit`) return an `EngineError` too, with the same two binding codes:
+`E_THETA_LEVEL_BINDING` on `[parameters]` for a level block,
+`E_COVARIATE_STATS_BINDING` on `[covariate_model]` for a statistic. A refusal
+only a binder from a fit can reach — a design level the fit estimated no θ for,
+or malformed fit bindings — has no `ferx check` counterpart, since `ferx check
+--data` binds the data to its own levels; it carries the code all the same. A
+fit with no bindings at all, on a model with a level block, is the level code.
 
 `fit()` keeps returning a `String`.
 
