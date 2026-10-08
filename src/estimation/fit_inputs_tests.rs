@@ -231,6 +231,60 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
     assert!(old.se_theta.is_none(), "the old garbage: a flat objective");
 }
 
+/// #1792 review r1 #1: a population bound **on its own** for other levels (every
+/// `STUDY` relabelled `+100`) carries the index, so `check_level_index_columns` finds
+/// `E_THETA_LEVELS_DATA_MISMATCH` — whose "a fit of a model bound on this population" is
+/// advice for new data. On a post-hoc step it is not the fit's population, and hears
+/// the fingerprint refusal: the first covariate difference and "pass the population
+/// the fit was given". The straddle, in the same test: the gate does see a mismatch.
+///
+/// Mutation — let `population_refusal` return every level diagnostic (the pre-fix
+/// code): both entries' equality dies on the MISMATCH text.
+#[test]
+fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
+    let c = case(Kind::Level);
+    let text = std::fs::read_to_string(&c.model_path).unwrap();
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
+    let mut other = crate::api::read_population_as_fitted(&parsed, data(&c))
+        .unwrap()
+        .0;
+    for s in &mut other.subjects {
+        for m in std::iter::once(&mut s.covariates).chain(s.obs_covariates.iter_mut()) {
+            if let Some(v) = m.get_mut("STUDY") {
+                *v += 100.0;
+            }
+        }
+    }
+    crate::api::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
+    let model = &c.prep.parsed.model;
+    let codes: Vec<_> =
+        crate::api::check_level_index_columns(model, &other, crate::api::LevelDataEntry::Run)
+            .into_iter()
+            .map(|d| d.code)
+            .collect();
+    assert_eq!(codes, ["E_THETA_LEVELS_DATA_MISMATCH"], "the straddle");
+
+    for entry in ["run_covariance", "run_sir"] {
+        let r = match entry {
+            "run_covariance" => run_covariance(&c.fit, Some(model), Some(&other), &c.opts),
+            _ => run_sir(&c.fit, Some(model), Some(&other), &c.opts),
+        };
+        let e = r.map(|_| ()).expect_err("refused");
+        assert_eq!((e.code(), e.context()), (None, Some(entry)), "{e}");
+        let err = e.to_string();
+        assert!(
+            err.starts_with(&format!(
+                "{entry}: this population is not the one the fit was given: "
+            )),
+            "{err}"
+        );
+        assert!(err.ends_with(SUPPLIED), "{err}");
+        for never in ["a fit of a model bound on this population", "level(s)"] {
+            assert!(!err.contains(never), "{entry}: says {never}: {err}");
+        }
+    }
+}
+
 /// T3, probe C (re-measured at `045ca1b2`: SE(TVCL) 2410 against 0.310 on the fitted
 /// population; 60 doses against 30, the same 300 observations). A dose-row filter
 /// changes the doses and no observation; a population read without it is refused
