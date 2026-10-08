@@ -513,8 +513,8 @@ fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
     let text = std::fs::read_to_string("examples/warfarin_iov.ferx").unwrap();
     assert!(text.contains("iov_column = OCC"));
     let text = text.replace(
-        "iov_column = OCC",
-        "iov_occasion = dose\n  maxiter = 2\n  checkpoint = false",
+        "iov_column = OCC\n  covariance = false",
+        "iov_occasion = dose\n  maxiter = 2\n  checkpoint = false\n  covariance = true",
     );
     std::fs::write(&model_path, text).unwrap();
     std::fs::copy("data/warfarin_iov.csv", &data_path).unwrap();
@@ -534,5 +534,756 @@ fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
             .map(|_| ())
             .unwrap_or_else(|e| panic!("{what}: {e}"));
     }
-    run_covariance(&fit, None, Some(&returned), &opts).expect("the returned population runs");
+    // #1783: and it is the population the fit scored — the step is the inline one.
+    // At 2 outer iterations the inline step is `Computed` (measured; asserted).
+    assert_eq!(fit.covariance_status, CovarianceStatus::Computed);
+    let got =
+        run_covariance(&fit, None, Some(&returned), &opts).expect("the returned population runs");
+    let kappa = |f: &FitResult| bits(f.se_kappa.as_ref().expect("kappa SEs"));
+    assert!(!kappa(&fit).is_empty());
+    assert_eq!(kappa(&got), kappa(&fit), "se_kappa");
+}
+
+// ---------------------------------------------------------------------------
+// #1783: a post-hoc step prepares the population as `fit()` did — occasions
+// derived under the fit's recorded `iov_occasion` rule, DV log-transformed for
+// `log(DV) ~ …` — after the fingerprint check. The oracle is the fit's own inline
+// step: the same objective at the same point, so every cell must match it to the
+// bit. There is no NONMEM spelling of "a post-hoc step on a stored fit".
+//
+// Fixtures: `examples/warfarin_iov.ferx` (doses at t = 0 and 120 h on every
+// subject, so `dose` makes two occasions) and `examples/warfarin_ltbs.ferx`, each
+// fitted once per test binary and shared.
+// ---------------------------------------------------------------------------
+
+mod fitted_population_1783 {
+    use super::*;
+    use crate::api::PreparedRun;
+    use crate::types::IovOccasionRule;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    /// Outer iterations of every #1783 fixture fit: the smallest at which every
+    /// inline covariance step is `Computed` and the `dose` fit's SIR ESS exceeds 50
+    /// of 100 resamples (both asserted by the tests that lean on them). Measured on
+    /// macOS arm64: the ESS is 9.4 at 2, 13.6 at 3, 95.6 at 4 and 109.4 at 5; every
+    /// covariance step is `Computed` from 2.
+    const MAXITER: usize = 4;
+
+    /// The SIR settings of T2.
+    fn sir_opts(opts: &FitOptions) -> FitOptions {
+        FitOptions {
+            sir_samples: 300,
+            sir_resamples: 100,
+            sir_seed: Some(1),
+            ..opts.clone()
+        }
+    }
+
+    struct FileFit {
+        _dir: tempfile::TempDir,
+        model_path: PathBuf,
+        data_path: PathBuf,
+        fit: FitResult,
+        /// The population `run_model_with_data` returned (derived occasions written
+        /// for sdtab); `None` for a `fit_from_files` fixture.
+        returned: Option<Population>,
+        /// `prepare_run` on the same files: the population as read, unlabelled under
+        /// a derived rule.
+        prep: PreparedRun,
+        /// The model file's `[fit_options]`, what a caller passes to the step.
+        opts: FitOptions,
+    }
+
+    fn write_case(
+        model_src: &str,
+        data_src: &str,
+        edits: &[(&str, &str)],
+        data_edit: Option<fn(&str) -> String>,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.ferx");
+        let data_path = dir.path().join("data.csv");
+        let mut text = std::fs::read_to_string(model_src).unwrap();
+        for (from, to) in edits {
+            assert!(text.contains(from), "{model_src}: `{from}`");
+            text = text.replacen(from, to, 1);
+        }
+        std::fs::write(&model_path, text).unwrap();
+        let data = std::fs::read_to_string(data_src).unwrap();
+        let data = match data_edit {
+            Some(f) => f(&data),
+            None => data,
+        };
+        std::fs::write(&data_path, data).unwrap();
+        (dir, model_path, data_path)
+    }
+
+    /// A fit through `run_model_with_data`, whose rule is the model file's.
+    fn run_fit(
+        model_src: &str,
+        data_src: &str,
+        edits: &[(&str, &str)],
+        data_edit: Option<fn(&str) -> String>,
+    ) -> FileFit {
+        let (dir, model_path, data_path) = write_case(model_src, data_src, edits, data_edit);
+        let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+        let (fit, returned) = crate::api::run_model_with_data(m, Some(d)).expect("fits");
+        let prep = crate::api::prepare_run(m, Some(d)).expect("prepares");
+        let opts = prep.parsed.fit_options.clone();
+        FileFit {
+            _dir: dir,
+            model_path,
+            data_path,
+            fit,
+            returned: Some(returned),
+            prep,
+            opts,
+        }
+    }
+
+    fn iov(rule: &str) -> FileFit {
+        let to =
+            format!("{rule}\n  covariance = true\n  maxiter = {MAXITER}\n  checkpoint = false");
+        run_fit(
+            "examples/warfarin_iov.ferx",
+            "data/warfarin_iov.csv",
+            &[("iov_column = OCC\n  covariance = false", &to)],
+            None,
+        )
+    }
+
+    /// `iov_occasion = dose`.
+    fn dose() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| iov("iov_occasion = dose"))
+    }
+
+    /// The control: the same occasions from the data's `OCC` column.
+    fn column() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| iov("iov_column = OCC"))
+    }
+
+    /// The time-window edge of T3. `dose` puts the 72 h and 96 h samples in occasion
+    /// 0 (the second dose is at 120 h); `time(60)` puts them in occasion 1.
+    const EDGE: f64 = 60.0;
+
+    /// A model file that states **no** occasion rule and no `iov_column`, fitted
+    /// through `fit_from_files` with `iov_occasion = time(60)`: the fit's rule is
+    /// not the file's (`fit_from_files` ignores the file's `[fit_options]`).
+    fn time_window() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| {
+            let (dir, model_path, data_path) = write_case(
+                "examples/warfarin_iov.ferx",
+                "data/warfarin_iov.csv",
+                &[(
+                    "iov_column = OCC\n  covariance = false",
+                    "covariance = true",
+                )],
+                None,
+            );
+            let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+            let prep = crate::api::prepare_run(m, Some(d)).expect("prepares");
+            let opts = prep.parsed.fit_options.clone();
+            assert_eq!(opts.iov_occasion, IovOccasionRule::Column);
+            assert!(opts.iov_column.is_none());
+            let fit_opts = FitOptions {
+                iov_occasion: IovOccasionRule::TimeWindows(vec![EDGE]),
+                outer_maxiter: MAXITER,
+                run_covariance_step: true,
+                ..opts.clone()
+            };
+            let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
+            FileFit {
+                _dir: dir,
+                model_path,
+                data_path,
+                fit,
+                returned: None,
+                prep,
+                opts,
+            }
+        })
+    }
+
+    fn ltbs_fit(edits: &[(&str, &str)], data_edit: Option<fn(&str) -> String>) -> FileFit {
+        let iters = format!("maxiter = {MAXITER}\n  checkpoint = false");
+        let mut all = vec![("maxiter    = 300", iters.as_str())];
+        all.extend_from_slice(edits);
+        run_fit(
+            "examples/warfarin_ltbs.ferx",
+            "data/warfarin_ltbs.csv",
+            &all,
+            data_edit,
+        )
+    }
+
+    fn ltbs() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| ltbs_fit(&[], None))
+    }
+
+    /// `data/warfarin_ltbs.csv` with every observed DV replaced by its natural log,
+    /// written in the shortest form that round-trips, so the reader parses exactly
+    /// the `f64` that `log_transform_observations` makes of the natural-scale DV.
+    fn log_dv(csv: &str) -> String {
+        let mut out = String::new();
+        for (i, line) in csv.lines().enumerate() {
+            let mut cols: Vec<String> = line.split(',').map(str::to_string).collect();
+            if i == 0 {
+                assert_eq!(&cols[..3], ["ID", "TIME", "DV"]);
+            } else if cols[2] != "." {
+                let dv: f64 = cols[2].parse().unwrap();
+                assert!(dv > 0.0, "the fixture has no DV ≤ 0 to floor");
+                cols[2] = format!("{:?}", dv.ln());
+            }
+            out.push_str(&cols.join(","));
+            out.push('\n');
+        }
+        out
+    }
+
+    fn pre_logged() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| {
+            ltbs_fit(
+                &[("log(DV) ~ additive(ADD_LOG)", "DV ~ log_additive(ADD_LOG)")],
+                Some(log_dv),
+            )
+        })
+    }
+
+    /// The covariance, and every SE block, of two runs to the bit.
+    fn assert_same_cov(got: &FitResult, want: &FitResult, what: &str) {
+        assert_same_covariance(got, want, what);
+        let se = |v: &Option<Vec<f64>>| v.as_deref().map(bits);
+        assert_eq!(se(&got.se_omega), se(&want.se_omega), "{what}: se_omega");
+        assert_eq!(se(&got.se_sigma), se(&want.se_sigma), "{what}: se_sigma");
+        assert_eq!(se(&got.se_kappa), se(&want.se_kappa), "{what}: se_kappa");
+    }
+
+    /// The population cells of `model = None`: re-read, the population
+    /// `run_model_with_data` returned (labelled), and the one `prepare_run` reads
+    /// (unlabelled under a derived rule).
+    fn cells(f: &FileFit) -> Vec<(Option<&Population>, &'static str)> {
+        let mut v = vec![(None, "(None, None)")];
+        if let Some(r) = &f.returned {
+            v.push((Some(r), "(None, Some(returned))"));
+        }
+        v.push((Some(&f.prep.population), "(None, Some(read))"));
+        v
+    }
+
+    fn has_kappa_se(f: &FitResult) -> bool {
+        f.se_kappa.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// T1. Under `iov_occasion = dose`, `run_covariance` on every population cell is
+    /// the inline covariance step to the bit; the `iov_column` fit is the control
+    /// and is unchanged.
+    ///
+    /// Mutations — drop the derivation from `fitted_population`'s post-hoc call:
+    /// `(None, None)` and the read cell are `Failed` (measured on #1783: `Ok`, all
+    /// SEs `None`). Prepare only when `population = None`: the read cell is `Failed`.
+    #[test]
+    fn derived_rule_posthoc_matches_inline() {
+        for (f, what) in [(dose(), "dose"), (column(), "column")] {
+            assert_eq!(
+                f.fit.covariance_status,
+                CovarianceStatus::Computed,
+                "{what}"
+            );
+            assert!(
+                has_kappa_se(&f.fit),
+                "{what}: the inline step has kappa SEs"
+            );
+            for (p, cell) in cells(f) {
+                let got = run_covariance(&f.fit, None, p, &f.opts)
+                    .unwrap_or_else(|e| panic!("{what} {cell}: {e}"));
+                assert_same_cov(&got, &f.fit, &format!("{what} {cell}"));
+            }
+        }
+        // Live: the read population of the `dose` fit carries no labels, the returned
+        // one does, and the control's read population has its column's.
+        assert!(dose().prep.population.subjects[0].occasions.is_empty());
+        assert!(!dose().returned.as_ref().unwrap().subjects[0]
+            .occasions
+            .is_empty());
+        assert!(!column().prep.population.subjects[0].occasions.is_empty());
+        assert_eq!(dose().fit.iov_occasion, Some(IovOccasionRule::PerDose));
+        assert_eq!(column().fit.iov_occasion, Some(IovOccasionRule::Column));
+    }
+
+    /// T2. `run_sir` weights its draws with the same objective in every cell: the
+    /// ESS and the kappa CIs agree to the bit, and the proposal is not degenerate.
+    ///
+    /// Mutations — those of T1: the unlabelled cells score kappa against one
+    /// occasion and the ESS collapses (measured on #1783: 1.0, CI width 0).
+    #[test]
+    fn derived_rule_run_sir_matches_across_cells() {
+        let f = dose();
+        let opts = sir_opts(&f.opts);
+        let runs: Vec<(FitResult, &str)> = cells(f)
+            .into_iter()
+            .map(|(p, cell)| {
+                let r = run_sir(&f.fit, None, p, &opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
+                (r, cell)
+            })
+            .collect();
+        let ess = runs[0].0.sir_ess.expect("ESS");
+        assert!(ess > 50.0, "ESS {ess}: the proposal is degenerate");
+        let ci = |r: &FitResult| -> Vec<(u64, u64)> {
+            r.sir_ci_kappa
+                .as_ref()
+                .expect("kappa CI")
+                .iter()
+                .map(|(a, b)| (a.to_bits(), b.to_bits()))
+                .collect()
+        };
+        assert!(!ci(&runs[0].0).is_empty());
+        for (r, cell) in &runs[1..] {
+            assert_eq!(
+                r.sir_ess.map(f64::to_bits),
+                Some(ess.to_bits()),
+                "{cell}: ESS"
+            );
+            assert_eq!(ci(r), ci(&runs[0].0), "{cell}: kappa CI");
+        }
+    }
+
+    /// T3. The rule a post-hoc step derives with is the one the fit recorded, not
+    /// the model file's: here the file states none and the fit ran `time(60)`.
+    ///
+    /// Mutations — hard-code `PerDose` in the post-hoc resolution: the partition
+    /// differs (asserted below) and the SEs move. Prefer the file's rule over the
+    /// recorded one: the file's is `Column`, so nothing is derived and the step is
+    /// `Failed`.
+    #[test]
+    fn time_window_rule_is_the_recorded_one() {
+        let f = time_window();
+        assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
+        assert!(has_kappa_se(&f.fit));
+        assert_eq!(
+            f.fit.iov_occasion,
+            Some(IovOccasionRule::TimeWindows(vec![EDGE]))
+        );
+        // The precondition of the first mutation: `time(60)` and `dose` partition the
+        // fixture differently.
+        let derive = |rule: &IovOccasionRule| {
+            let mut p = f.prep.population.clone();
+            crate::api::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
+            p.subjects[0].occasions.clone()
+        };
+        assert_ne!(
+            derive(&IovOccasionRule::TimeWindows(vec![EDGE])),
+            derive(&IovOccasionRule::PerDose)
+        );
+        for (p, cell) in cells(f) {
+            let got =
+                run_covariance(&f.fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
+            assert_same_cov(&got, &f.fit, cell);
+        }
+    }
+
+    /// The caller's options with `inner_tol` pinned to the fit's LTBS tightening,
+    /// until #1786 makes the post-hoc steps apply it themselves (without it,
+    /// measured on #1783: rel 1.7e-9 on se_theta[0]).
+    fn ltbs_opts(f: &FileFit) -> FitOptions {
+        FitOptions {
+            inner_tol: FitOptions::LTBS_FIT_INNER_TOL,
+            ..f.opts.clone()
+        }
+    }
+
+    /// T4. On a `log(DV) ~ additive` fit the step scores log predictions against the
+    /// log-transformed DV, as `fit()` did.
+    ///
+    /// Mutation — drop the log transform from `fitted_population`'s post-hoc call
+    /// (natural DV): se_theta 777× the inline one (measured on #1783: 5.5113 vs
+    /// 0.0070974).
+    #[test]
+    fn ltbs_posthoc_matches_inline() {
+        let f = ltbs();
+        assert!(f.prep.parsed.model.log_transform && !f.prep.parsed.model.dv_pre_logged);
+        assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
+        for (p, cell) in cells(f) {
+            let got = run_covariance(&f.fit, None, p, &ltbs_opts(f))
+                .unwrap_or_else(|e| panic!("{cell}: {e}"));
+            assert_same_cov(&got, &f.fit, cell);
+        }
+    }
+
+    /// T5. `DV ~ log_additive` on data already on the log scale is not logged
+    /// again: the post-hoc step matches the inline one, and — since the one helper
+    /// serves both — the fit itself matches the `log(DV) ~ additive` fit of the
+    /// natural-scale data (the same `f64` DVs reach the objective).
+    ///
+    /// Mutation — `needs_dv_log = model.log_transform` (ignoring `dv_pre_logged`):
+    /// the pre-logged fit logs its DV twice and its OFV leaves the LTBS fit's.
+    #[test]
+    fn pre_logged_dv_is_not_logged_twice() {
+        let f = pre_logged();
+        assert!(f.prep.parsed.model.dv_pre_logged);
+        assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
+        assert_eq!(f.fit.ofv.to_bits(), ltbs().fit.ofv.to_bits(), "OFV");
+        for (p, cell) in cells(f) {
+            let got = run_covariance(&f.fit, None, p, &ltbs_opts(f))
+                .unwrap_or_else(|e| panic!("{cell}: {e}"));
+            assert_same_cov(&got, &f.fit, cell);
+        }
+    }
+
+    /// T6. The rule survives `save_fit` → `load_fit`, and the loaded fit's
+    /// covariance step on the bundled (unlabelled) population is the one on the
+    /// labelled population `run_model_with_data` returned. Not the inline step: a
+    /// loaded fit rebuilds its Ω factor from `fit.omega` and starts from the EBEs
+    /// `ebes.csv` rounds (measured: 4.8e-7 at most), and its covariance differs from
+    /// the inline one by up to 5.5e-4 relative (`foce.qmd` documents the
+    /// reloaded-fit match as up to FD noise).
+    ///
+    /// Mutation — drop the wire field (on save or on load): the loaded rule is
+    /// `None`, asserted against `Some(PerDose)` first. (The step itself would then
+    /// fall back to the model file's `dose` and still match.)
+    #[test]
+    fn fitrx_roundtrips_the_occasion_rule() {
+        let f = dose();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dose.fitrx");
+        let src = std::fs::read_to_string(&f.model_path).unwrap();
+        let opts = crate::io::fitrx::SaveFitOptions {
+            include_data: Some(f.data_path.clone()),
+        };
+        crate::io::fitrx::save_fit(&f.fit, f.returned.as_ref().unwrap(), &src, &path, opts)
+            .unwrap();
+        let loaded = crate::io::fitrx::load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.iov_occasion, Some(IovOccasionRule::PerDose));
+        let pop = loaded.population.as_ref().expect("data bundled");
+        assert!(
+            pop.subjects[0].occasions.is_empty(),
+            "the bundle is unlabelled"
+        );
+        let got = run_covariance(&loaded.fit, None, Some(pop), &f.opts).unwrap();
+        let want = run_covariance(&loaded.fit, None, f.returned.as_ref(), &f.opts).unwrap();
+        assert!(has_kappa_se(&want));
+        assert_same_cov(&got, &want, "loaded");
+    }
+
+    /// The fit as a bundle saved before #1783 reads it: no recorded rule, and with
+    /// `keep_fingerprint = false` none from #1685 either.
+    fn unrecorded(f: &FileFit, keep_fingerprint: bool) -> FitResult {
+        let mut fit = f.fit.clone();
+        fit.iov_occasion = None;
+        if !keep_fingerprint {
+            fit.population_fingerprint = None;
+        }
+        fit
+    }
+
+    /// The note a step carries when it derived the occasions with the model
+    /// file's rule (review r1 #1), in full.
+    const W_FILE_DOSE: &str = "this fit records no IOV occasion rule (it was saved before \
+                               ferx recorded one, #1783), so the occasions were derived with \
+                               the model file's `iov_occasion = dose`. A fit made through \
+                               `fit_from_files` ran under its caller's rule, not the file's: \
+                               if that was another rule, these results are wrong. Set \
+                               `fit.iov_occasion` to the rule the fit ran with.";
+
+    fn has_file_note(r: &FitResult) -> bool {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("derived with the model file's"))
+    }
+
+    /// T7. A fit that records no rule takes the model file's when the step reads
+    /// the file (`model = None`): the `dose` fit's file states `dose`. Right here
+    /// (a `run_model_with_data` fit runs under its file's rule), and the result says
+    /// which rule it guessed; the recorded fit's says nothing.
+    ///
+    /// Mutations — skip the file fallback: the unlabelled cells are refused. Drop the
+    /// note: the `contains` fails. Push it for a recorded rule too, or for a guessed
+    /// `Column`: the controls fail.
+    #[test]
+    fn unrecorded_rule_takes_the_model_file_rule() {
+        let f = dose();
+        let fit = unrecorded(f, true);
+        for (p, cell) in cells(f) {
+            let got =
+                run_covariance(&fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
+            assert_same_cov(&got, &f.fit, cell);
+            assert!(
+                got.warnings.iter().any(|w| w == W_FILE_DOSE),
+                "{cell}: {:?}",
+                got.warnings
+            );
+            let recorded = run_covariance(&f.fit, None, p, &f.opts).unwrap();
+            assert!(!has_file_note(&recorded), "{cell}: recorded rule");
+        }
+        // A guessed `Column` derives nothing — the labels are the column's — so it
+        // is no guess about the occasions and carries no note.
+        let c = column();
+        let got = run_covariance(&unrecorded(c, true), None, None, &c.opts).unwrap();
+        assert_same_cov(&got, &c.fit, "column, unrecorded");
+        assert!(
+            !has_file_note(&got),
+            "column, unrecorded: {:?}",
+            got.warnings
+        );
+    }
+
+    /// A model file stating `iov_occasion = dose`, fitted through `fit_from_files`
+    /// under the caller's `time(60)` (review r1 #1's geometry).
+    fn dose_file_time_fit() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| {
+            let (dir, model_path, data_path) = write_case(
+                "examples/warfarin_iov.ferx",
+                "data/warfarin_iov.csv",
+                &[(
+                    "iov_column = OCC\n  covariance = false",
+                    "iov_occasion = dose\n  covariance = true",
+                )],
+                None,
+            );
+            let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+            let prep = crate::api::prepare_run(m, Some(d)).expect("prepares");
+            let opts = prep.parsed.fit_options.clone();
+            assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
+            let fit_opts = FitOptions {
+                iov_occasion: IovOccasionRule::TimeWindows(vec![EDGE]),
+                outer_maxiter: MAXITER,
+                run_covariance_step: true,
+                ..opts.clone()
+            };
+            let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
+            FileFit {
+                _dir: dir,
+                model_path,
+                data_path,
+                fit,
+                returned: None,
+                prep,
+                opts,
+            }
+        })
+    }
+
+    /// Review r1 #1. An old bundle of a `fit_from_files` fit whose caller's rule
+    /// (`time(60)`) was not its file's (`dose`): the fallback derives with the wrong
+    /// rule, the derived labels are not fingerprinted, and the step returns
+    /// `Computed` with wrong SEs (measured by the reviewer at `f8a394ad`: se_kappa
+    /// 412.47 against the inline 0.10506). It cannot be refused — the common old
+    /// bundle, T7's, is right — so the result names the rule it guessed. The
+    /// straddle: the same fit with its rule recorded matches inline, with no note.
+    ///
+    /// Mutation — drop the note: the `contains` fails on both cells.
+    #[test]
+    fn a_guessed_rule_is_named_on_the_result() {
+        let f = dose_file_time_fit();
+        assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
+        assert!(has_kappa_se(&f.fit));
+        let fit = unrecorded(f, true);
+        for (p, cell) in cells(f) {
+            let got = run_covariance(&fit, None, p, &f.opts).unwrap();
+            assert!(
+                got.warnings.iter().any(|w| w == W_FILE_DOSE),
+                "{cell}: {:?}",
+                got.warnings
+            );
+            // The note is not a false alarm here: the guess is wrong.
+            assert_ne!(
+                got.se_kappa.as_deref().map(bits),
+                f.fit.se_kappa.as_deref().map(bits),
+                "{cell}: the file's rule reproduced the fit's"
+            );
+            let recorded = run_covariance(&f.fit, None, p, &f.opts).unwrap();
+            assert_same_cov(&recorded, &f.fit, cell);
+            assert!(!has_file_note(&recorded), "{cell}: recorded rule");
+        }
+    }
+
+    const F_LEAD: &str = "run_covariance: this fit records no IOV occasion rule (it was saved \
+                          before ferx recorded one, #1783), and the population carries no \
+                          occasion labels, so the per-occasion kappas cannot be assigned to \
+                          occasions.";
+    const F_DERIVED: &str = " Its population fingerprint shows the fit derived its occasions \
+                             from a model-side `iov_occasion` rule (`dose` or `time(...)`), \
+                             which it did not record.";
+    const F_FILE: &str = " The model file's `[fit_options]` sets no `iov_occasion` to fall \
+                          back on.";
+    const F_FIX: &str = " Pass the population `run_model_with_data` returned, which carries \
+                         the occasion labels the fit ran with, set `fit.iov_occasion` to the \
+                         rule the fit ran with, or refit so the rule is recorded.";
+
+    /// T8, cell F. A fit that records no rule, on a population with no occasion
+    /// labels and no rule to derive them with, is refused rather than run with every
+    /// kappa on one occasion. The message's input space is (no fingerprint / one
+    /// saying the fit derived its occasions / one saying it did not, reachable only
+    /// with another scheme, which is not checked) × (was the model file read,
+    /// stating no rule?); every cell is reached here and asserted whole, so deleting a sentence
+    /// reddens each cell that carries it, and a sentence leaking into a cell that
+    /// must not carry it reddens that cell. The twin: the labelled population
+    /// `run_model_with_data` returned runs, and matches the inline step.
+    ///
+    /// F3 (a recorded `Column` rule, an unlabelled population) is not reachable: the
+    /// fingerprint hashes the labels and refuses first, asserted last.
+    ///
+    /// Mutation — drop the guard: every refused cell returns `Ok` with `Failed`.
+    #[test]
+    fn unrecorded_rule_without_labels_is_refused() {
+        // No file read: `model = Some`, `population = Some(read)`.
+        let f = dose();
+        let m = &f.prep.parsed.model;
+        let read = &f.prep.population;
+        for (keep_fp, want) in [
+            (false, format!("{F_LEAD}{F_FIX}")),
+            (true, format!("{F_LEAD}{F_DERIVED}{F_FIX}")),
+        ] {
+            let fit = unrecorded(f, keep_fp);
+            assert_eq!(
+                err_of(run_covariance(&fit, Some(m), Some(read), &f.opts)),
+                want,
+                "fingerprint kept: {keep_fp}"
+            );
+            // The twin: the labelled population runs.
+            let got = run_covariance(&fit, Some(m), f.returned.as_ref(), &f.opts).unwrap();
+            assert_same_cov(&got, &f.fit, "returned");
+        }
+        // A fingerprint of another scheme is not checked, so it reaches this refusal
+        // too. The one that says nothing was derived (the column fit's) must not add
+        // the sentence; the `dose` fit's own must. Without this pair a gate on the
+        // fingerprint's presence alone passes (#1783 mutation sweep, M12).
+        let stale = |fp: &crate::types::PopulationFingerprint| {
+            fp.clone()
+                .with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1)
+        };
+        for (fp, want) in [
+            (
+                column().fit.population_fingerprint.as_ref().unwrap(),
+                format!("{F_LEAD}{F_FIX}"),
+            ),
+            (
+                f.fit.population_fingerprint.as_ref().unwrap(),
+                format!("{F_LEAD}{F_DERIVED}{F_FIX}"),
+            ),
+        ] {
+            let mut fit = unrecorded(f, false);
+            fit.population_fingerprint = Some(stale(fp));
+            assert!(!fit.population_fingerprint.as_ref().unwrap().is_current());
+            assert_eq!(
+                err_of(run_covariance(&fit, Some(m), Some(read), &f.opts)),
+                want,
+                "stale fingerprint, derived: {}",
+                fp.occasions_derived()
+            );
+        }
+        // The file read (`model = None`), stating no rule: the `time(60)` fit.
+        let t = time_window();
+        for (keep_fp, want) in [
+            (false, format!("{F_LEAD}{F_FILE}{F_FIX}")),
+            (true, format!("{F_LEAD}{F_DERIVED}{F_FILE}{F_FIX}")),
+        ] {
+            let fit = unrecorded(t, keep_fp);
+            for p in [None, Some(&t.prep.population)] {
+                assert_eq!(
+                    err_of(run_covariance(&fit, None, p, &t.opts)),
+                    want,
+                    "fingerprint kept: {keep_fp}, population supplied: {}",
+                    p.is_some()
+                );
+            }
+        }
+        // F3: the column fit, given its population with the labels removed.
+        let c = column();
+        let mut stripped = c.prep.population.clone();
+        for s in &mut stripped.subjects {
+            s.occasions.clear();
+            s.dose_occasions.clear();
+        }
+        let e = err_of(run_covariance(&c.fit, None, Some(&stripped), &c.opts));
+        assert!(e.contains("not the one the fit was given"), "{e}");
+    }
+}
+
+/// #1773. The resolver's two level writes keep the binder's code through
+/// `run_sir` / `run_covariance`: `E_THETA_LEVEL_BINDING` on `parameters`, with the
+/// entry point as context and the binder's text unchanged. Both cells are a level
+/// the fit never estimated, from each side: the model rebuilt from the file and laid
+/// out on the fit, given the design population (`STUDY=4` is unseen); and a lent
+/// model bound on the design, given the fit's data re-read (`STUDY=3` is unseen to
+/// it). `run_sir` is refused in the resolver, before it reads the covariance matrix
+/// this fit does not carry.
+///
+/// Mutations — `.to_string()` the code away at either write (`bind_from_fit_on` or
+/// `write_fitted_level_columns` in `resolve_fit_inputs`): that cell's `code()` is
+/// `None`.
+#[test]
+fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
+    let c = case(Kind::Level);
+    let design = super::test_fixtures::design(&c);
+    // A lent model needs a fit with no recorded bindings to compare against.
+    let mut legacy = c.fit.clone();
+    legacy.data_bindings = Default::default();
+    let lent = &design.parsed.model;
+    for entry in ["run_covariance", "run_sir"] {
+        let run = |fit: &FitResult, m: Option<&CompiledModel>, p: Option<&Population>| match entry {
+            "run_covariance" => run_covariance(fit, m, p, &c.opts),
+            _ => run_sir(fit, m, p, &c.opts),
+        };
+        let cells = [
+            (
+                "rebuilt",
+                run(&c.fit, None, Some(&design.population)),
+                "`STUDY=4`",
+            ),
+            ("lent", run(&legacy, Some(lent), None), "`STUDY=3`"),
+        ];
+        for (what, r, unseen) in cells {
+            let e = r.map(|_| ()).expect_err(what);
+            assert_eq!(
+                e.code(),
+                Some("E_THETA_LEVEL_BINDING"),
+                "{entry}/{what}: {e}"
+            );
+            assert_eq!(e.block(), Some("parameters"), "{entry}/{what}: {e}");
+            assert_eq!(e.context(), Some(entry), "{entry}/{what}: {e}");
+            assert!(
+                e.to_string().starts_with(&format!(
+                    "{entry}: theta SHIFT[STUDY]: the design has 1 level(s) the fit estimated \
+                     no theta for: {unseen}."
+                )),
+                "{entry}/{what}: {e}"
+            );
+        }
+    }
+}
+
+/// #1791 review r1, row 2. A fit that recorded no data bindings, rebuilt from its
+/// model file (`model = None`), is refused by the from-fit binder with a code: the
+/// level code on a level model, the statistics code on a stats-only one. This is
+/// the class `warnings.qmd` names, run rather than traced.
+///
+/// Mutation — `.to_string()` the code away at the resolver's `bind_from_fit_on`:
+/// both cells' `code()` is `None`.
+#[test]
+fn a_fit_without_bindings_is_refused_with_the_half_code() {
+    for (kind, code) in [
+        (Kind::Level, "E_THETA_LEVEL_BINDING"),
+        (Kind::Median, "E_COVARIATE_STATS_BINDING"),
+    ] {
+        let c = case(kind);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let e = run_covariance(&fit, None, Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("no bindings to rebuild from");
+        assert_eq!(e.code(), Some(code), "{kind:?}: {e}");
+        assert_eq!(e.context(), Some("run_covariance"), "{kind:?}: {e}");
+        assert!(
+            e.to_string()
+                .contains("this fit carries no data-derived bindings"),
+            "{kind:?}: {e}"
+        );
+    }
 }

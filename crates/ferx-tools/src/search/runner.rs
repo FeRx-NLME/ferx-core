@@ -883,10 +883,10 @@ fn compile_and_fit(
     let mut population = Cow::Borrowed(data);
     if !parsed.model.theta_blocks().level_blocks().is_empty() {
         bind_theta_levels(&mut parsed, &text, population.to_mut())
-            .map_err(CandidateError::model)?;
+            .map_err(|e| CandidateError::model(e.to_string()))?;
     }
     ferx_core::api::bind_covariate_stats(&mut parsed, &text, &population)
-        .map_err(CandidateError::model)?;
+        .map_err(|e| CandidateError::model(e.to_string()))?;
 
     // The caller's settings replace the file's wholesale when given; the four
     // overrides below are the runner's own and always win.

@@ -7111,6 +7111,15 @@ pub struct FitResult {
     /// treated as absent, with a warning.
     #[serde(default)]
     pub population_fingerprint: Option<PopulationFingerprint>,
+    /// The IOV occasion rule the fit derived its occasions under (#1783): the
+    /// `iov_occasion` of the options `fit()` ran with, which a file entry point
+    /// takes from the caller, not from the model file's `[fit_options]`.
+    /// `run_sir` and `run_covariance` derive the population's occasions with it,
+    /// as `fit()` did. `Some` for every fit; `None` on a `.fitrx` bundle saved
+    /// before #1783, for which the post-hoc steps fall back to the model file's
+    /// rule when they read the file.
+    #[serde(default)]
+    pub iov_occasion: Option<IovOccasionRule>,
     /// Initial theta values as supplied to the optimizer, parallel to `theta`
     /// and `theta_names`.
     pub theta_init: Vec<f64>,
@@ -7487,7 +7496,11 @@ pub struct NeuralNetworkInfo {
 /// The chosen rule populates `Subject::occasions` / `Subject::dose_occasions`,
 /// the same vectors the dataset-column path fills, so everything downstream
 /// (`split_obs_by_occasion`, the inner-loop kappa expansion) is unchanged.
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// A fit records the rule it ran under ([`FitResult::iov_occasion`], #1783); in
+/// `fit.json` it is `"column"`, `"per_dose"` or `{"time_windows": [24.0, 48.0]}`.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IovOccasionRule {
     /// Default: occasion labels come from the dataset column named by
     /// [`FitOptions::iov_column`] (or none, if that is unset).

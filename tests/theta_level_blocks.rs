@@ -781,7 +781,8 @@ fn bind_design_from_fit(
         &parsed.column_map,
     )
     .expect("read design");
-    ferx_core::bind_theta_levels_from_fit(&mut parsed, &model_text, &mut population, fitted)?;
+    ferx_core::bind_theta_levels_from_fit(&mut parsed, &model_text, &mut population, fitted)
+        .map_err(|e| e.to_string())?;
     Ok((parsed, population))
 }
 

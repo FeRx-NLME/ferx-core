@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use crate::api::apply_iov_occasion_rule;
+use crate::diagnostics::{Diagnostic, EngineError};
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
@@ -51,7 +52,36 @@ const TIME_COLUMN: &str = "TIME";
 /// Refused, with nothing written, on a model laid out on a fit's bindings
 /// ([`bind_from_fit`], [`layout_from_fit`]): binding it to this data's own levels
 /// would read the fitted θ at other positions.
+///
+/// Every refusal carries the code `E_THETA_LEVEL_BINDING` on block `parameters`
+/// (#1773), the code `ferx check --data` reports for it.
 pub fn bind_theta_levels(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &mut Population,
+) -> Result<(), EngineError> {
+    bind_theta_levels_diag(parsed, model_text, population).map_err(EngineError::from_diagnostic)
+}
+
+/// [`bind_theta_levels`], refusing with the [`Diagnostic`] itself: what
+/// `ferx check`'s binding step reads.
+pub(crate) fn bind_theta_levels_diag(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &mut Population,
+) -> Result<(), Diagnostic> {
+    bind_levels_on_data(parsed, model_text, population).map_err(level_binding_error)
+}
+
+/// The diagnostic of a level block that cannot bind (#1773): to the data's own
+/// levels, or to a fit's layout. The one place `E_THETA_LEVEL_BINDING` is assigned;
+/// `ferx check`, the binders and the entry points calling them all read it here.
+pub(crate) fn level_binding_error(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error("E_THETA_LEVEL_BINDING", message).with_block("parameters")
+}
+
+/// The body of [`bind_theta_levels`]; every refusal is the level half's.
+fn bind_levels_on_data(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &mut Population,
@@ -183,12 +213,25 @@ pub fn bind_theta_levels(
 /// to other data takes the fit's layout as a fresh parse would. Its covariate
 /// statistics are kept as `parsed` holds them: this binder takes none from the fit,
 /// so install the fit's first, or use [`bind_from_fit`], which binds both.
+///
+/// Every refusal carries `E_THETA_LEVEL_BINDING` on block `parameters` (#1773).
 #[deprecated(
     since = "0.4.1",
     note = "use `bind_from_fit` with the fit's `data_bindings`, which also binds the \
             covariate statistics from the fit"
 )]
 pub fn bind_theta_levels_from_fit(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &mut Population,
+    fitted: &LevelBindings,
+) -> Result<(), EngineError> {
+    bind_levels_from_fit_layout(parsed, model_text, population, fitted)
+        .map_err(|e| EngineError::from_diagnostic(level_binding_error(e)))
+}
+
+/// The body of [`bind_theta_levels_from_fit`]; every refusal is the level half's.
+fn bind_levels_from_fit_layout(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &mut Population,
@@ -259,13 +302,22 @@ pub fn bind_theta_levels_from_fit(
 /// - covariate statistics that lack a covariate a symbolic relation reads, or
 ///   carry one no relation reads;
 /// - a `population` level the fit never observed, since no θ was estimated for it.
+///
+/// A refusal of the level half carries `E_THETA_LEVEL_BINDING` on block
+/// `parameters`, one of the statistics half `E_COVARIATE_STATS_BINDING` on block
+/// `covariate_model` (#1773): the codes `ferx check --data` reports for a binding
+/// that fails on the data's own levels and statistics. An empty `fitted` on a model
+/// needing both halves is the level code, the half checked first. A level the fit
+/// never observed has no `ferx check` counterpart, since `check` binds data to its
+/// own levels.
 pub fn bind_from_fit(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &mut Population,
     fitted: &DataBindings,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
     bind_from_fit_on(parsed, model_text, Some(population), fitted)
+        .map_err(EngineError::from_diagnostic)
 }
 
 /// [`bind_from_fit`], with the population optional: it is written to only when the
@@ -282,23 +334,25 @@ pub(crate) fn bind_from_fit_on(
     model_text: &str,
     population: Option<&mut Population>,
     fitted: &DataBindings,
-) -> Result<(), String> {
+) -> Result<(), Diagnostic> {
     let Some(layout) = lay_out_on_fit(parsed, model_text, fitted)? else {
         return Ok(());
     };
     let tables = match (&population, layout.decls.is_empty()) {
         (_, true) => Vec::new(),
-        (Some(p), false) => fitted_level_tables(&layout.decls, p, &fitted.levels)?,
+        (Some(p), false) => {
+            fitted_level_tables(&layout.decls, p, &fitted.levels).map_err(level_binding_error)?
+        }
         (None, false) => {
-            return Err(format!(
+            return Err(level_binding_error(format!(
                 "theta {}: a level block needs the population its index columns are written to",
                 layout.decls[0].name()
-            ))
+            )))
         }
     };
     if let Some(population) = population {
         for (decl, table) in layout.decls.iter().zip(&tables) {
-            write_index_column(decl, table, population)?;
+            write_index_column(decl, table, population).map_err(level_binding_error)?;
         }
     }
     layout.apply(parsed);
@@ -323,13 +377,15 @@ pub(crate) fn bind_from_fit_on(
 /// [`bind_covariate_stats`](crate::api::bind_covariate_stats)) is laid out on the
 /// fit's statistics, or refused when the fit carries none (#1686). Refused, with
 /// `parsed` left as it was: everything [`bind_from_fit`] refuses except a level the
-/// fit never observed.
+/// fit never observed, with the same codes (#1773).
 pub fn layout_from_fit(
     parsed: &mut ParsedModel,
     model_text: &str,
     fitted: &DataBindings,
-) -> Result<(), String> {
-    if let Some(layout) = lay_out_on_fit(parsed, model_text, fitted)? {
+) -> Result<(), EngineError> {
+    if let Some(layout) =
+        lay_out_on_fit(parsed, model_text, fitted).map_err(EngineError::from_diagnostic)?
+    {
         layout.apply(parsed);
     }
     Ok(())
@@ -459,24 +515,41 @@ fn lay_out_on_fit(
     parsed: &ParsedModel,
     model_text: &str,
     fitted: &DataBindings,
-) -> Result<Option<FitLayout>, String> {
+) -> Result<Option<FitLayout>, Diagnostic> {
+    use crate::api::covariate_stats::stats_binding_error;
     // What the model needs comes from its text, parsed with no data-derived binding
     // (#1686): both halves are read here.
-    let declared = declared_model(parsed, model_text, Reads::Both)?;
+    // A refusal that is not one half's alone is the level half's when the model has
+    // one: the half every binder sequence checks first (#1773). Before the
+    // declaration is read, `parsed`'s own blocks say whether it has one.
+    let either_on = |has_levels: bool, message: String| {
+        if has_levels {
+            level_binding_error(message)
+        } else {
+            stats_binding_error(message)
+        }
+    };
+    let has_levels = !parsed.model.theta_blocks().level_blocks().is_empty();
+    let declared = declared_model(parsed, model_text, Reads::Both)
+        .map_err(|message| either_on(has_levels, message))?;
     let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
     let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
+    let either = |message: String| either_on(!decls.is_empty(), message);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
-        return Err(no_fit_bindings_message(&decls, &symbolic));
+        return Err(either(no_fit_bindings_message(&decls, &symbolic)));
     }
-    validate_fitted_levels(&decls, &fitted.levels)?;
-    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)?;
+    validate_fitted_levels(&decls, &fitted.levels).map_err(level_binding_error)?;
+    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)
+        .map_err(stats_binding_error)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(None);
     }
     let mut bindings = unbound_bindings(parsed);
     bindings.levels = fitted.levels.clone();
     bindings.covariate_stats = fitted.covariate_stats.clone();
-    let model = parse_full_model_with(model_text, &bindings)?.model;
+    let model = parse_full_model_with(model_text, &bindings)
+        .map_err(either)?
+        .model;
     // Not a gate (#1728 review): `validate_fitted_stats` has already required a
     // statistic for every covariate a symbolic relation reads, and given one, the
     // parser resolves the relation or refuses it. Asserted on every from-fit fixture
@@ -503,14 +576,17 @@ pub(crate) fn write_fitted_level_columns(
     model: &crate::types::CompiledModel,
     population: &mut Population,
     fitted: &LevelBindings,
-) -> Result<(), String> {
+) -> Result<(), Diagnostic> {
     let decls: Vec<LevelBlockDecl> = model.theta_blocks().level_blocks().to_vec();
-    validate_fitted_levels(&decls, fitted)?;
-    let tables = fitted_level_tables(&decls, population, fitted)?;
-    for (decl, table) in decls.iter().zip(&tables) {
-        write_index_column(decl, table, population)?;
-    }
-    Ok(())
+    (|| -> Result<(), String> {
+        validate_fitted_levels(&decls, fitted)?;
+        let tables = fitted_level_tables(&decls, population, fitted)?;
+        for (decl, table) in decls.iter().zip(&tables) {
+            write_index_column(decl, table, population)?;
+        }
+        Ok(())
+    })()
+    .map_err(level_binding_error)
 }
 
 /// The refusal for a fit that carries no data-derived bindings at all, on a model

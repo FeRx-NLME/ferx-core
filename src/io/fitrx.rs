@@ -251,6 +251,10 @@ struct FitWire {
     reader_settings: Option<crate::api::ReaderSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     population_fingerprint: Option<crate::types::PopulationFingerprint>,
+    /// The IOV occasion rule the fit ran under (#1783). Absent on bundles saved
+    /// before the field existed, which load it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    iov_occasion: Option<crate::types::IovOccasionRule>,
 }
 
 /// Wire form of [`DataBindings`]: the same fields, keyed by `BTreeMap` so
@@ -958,6 +962,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         data_bindings: DataBindingsWire::from(&r.data_bindings),
         reader_settings: r.reader_settings.clone(),
         population_fingerprint: r.population_fingerprint.clone(),
+        iov_occasion: r.iov_occasion.clone(),
     }
 }
 
@@ -1306,7 +1311,10 @@ fn read_bundled_population(
                         model_source,
                         Some(&mut population),
                         &fit.data_bindings,
-                    )?;
+                    )
+                    // The code is dropped on purpose: this text only feeds the
+                    // replay warning below. #1775 lists it among the uncoded sites.
+                    .map_err(|d| d.message)?;
                 }
                 match fingerprint.first_difference(&population) {
                     None => Ok(population),
@@ -2374,6 +2382,7 @@ fn wire_to_fit_result(
         data_bindings: w.data_bindings.into(),
         reader_settings: w.reader_settings,
         population_fingerprint: w.population_fingerprint,
+        iov_occasion: w.iov_occasion,
         // The covariate table is not persisted in the .fitrx bundle (yet); a
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
@@ -3707,9 +3716,10 @@ mod tests {
         assert!(b.is_empty());
     }
 
-    /// #1685 T13. The reader settings and the population fingerprint survive
-    /// `save_fit` → `load_fit` unchanged; a fit without them writes neither key, and
-    /// a `fit.json` from before #1685 (both keys deleted) loads them as `None`.
+    /// #1685 T13, #1783 T6. The reader settings, the population fingerprint and the
+    /// occasion rule survive `save_fit` → `load_fit` unchanged; a fit without them
+    /// writes none of the keys, and a `fit.json` from before #1685 / #1783 (the keys
+    /// deleted) loads them as `None`.
     ///
     /// Mutations — omit either field from `build_fit_wire`, or drop it on load: the
     /// round-trip equality dies; drop `#[serde(default)]` from either wire field:
@@ -3728,17 +3738,26 @@ mod tests {
         settings.fallback_columns = Some(vec!["WT".into()]);
         r.reader_settings = Some(settings);
         r.population_fingerprint = Some(crate::types::PopulationFingerprint::of(&p));
+        // #1783: the occasion rule, in its one variant that carries data.
+        r.iov_occasion = Some(crate::types::IovOccasionRule::TimeWindows(vec![24.0, 48.5]));
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
         let loaded = load_fit(&path).unwrap();
         assert_eq!(loaded.fit.reader_settings, r.reader_settings);
         assert_eq!(loaded.fit.population_fingerprint, r.population_fingerprint);
+        assert_eq!(loaded.fit.iov_occasion, r.iov_occasion);
 
+        const KEYS: [&str; 3] = ["reader_settings", "population_fingerprint", "iov_occasion"];
         let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
-        for key in ["reader_settings", "population_fingerprint"] {
+        for key in KEYS {
             assert!(plain.get(key).is_none(), "{key}: written when absent");
         }
         let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
-        for key in ["reader_settings", "population_fingerprint"] {
+        assert_eq!(
+            value["iov_occasion"],
+            serde_json::json!({ "time_windows": [24.0, 48.5] }),
+            "the documented spelling"
+        );
+        for key in KEYS {
             assert!(
                 value.as_object_mut().unwrap().remove(key).is_some(),
                 "{key}: must be written when set, or the removal tests nothing"
@@ -3746,6 +3765,7 @@ mod tests {
         }
         let old: FitWire = serde_json::from_value(value).unwrap();
         assert!(old.reader_settings.is_none() && old.population_fingerprint.is_none());
+        assert!(old.iov_occasion.is_none());
     }
 
     /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects

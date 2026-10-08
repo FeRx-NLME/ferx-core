@@ -16,6 +16,10 @@
 //! fingerprint of the population it was given. The re-read replays the settings —
 //! a row filter its caller added, which the model file never held, included — and
 //! every population, supplied or re-read, is compared against the fingerprint last.
+//!
+//! #1783 then prepares that population the way `fit()` prepared the one it was
+//! given — derived occasions under the fit's recorded rule, LTBS's log-DV — with
+//! `fit()`'s own helper, so the step scores the population the fit scored.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -23,7 +27,8 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    CompiledModel, FitOptions, FitResult, ParsedModel, Population, PopulationDifference,
+    CompiledModel, FitOptions, FitResult, IovOccasionRule, ParsedModel, Population,
+    PopulationDifference,
 };
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
@@ -37,16 +42,23 @@ enum ModelRef<'a> {
 pub(crate) struct FitInputs<'a> {
     model: ModelRef<'a>,
     population: Cow<'a, Population>,
-    /// Notes for the step's result: today only [`STALE_FINGERPRINT_WARNING`].
+    /// Notes for the step's result: [`STALE_FINGERPRINT_WARNING`], and the
+    /// model-file occasion rule note (`file_rule_warning`, #1783).
     warnings: Vec<String>,
+}
+
+impl ModelRef<'_> {
+    fn get(&self) -> &CompiledModel {
+        match self {
+            ModelRef::Lent(m) => m,
+            ModelRef::Built(m) => m,
+        }
+    }
 }
 
 impl FitInputs<'_> {
     pub(crate) fn model(&self) -> &CompiledModel {
-        match &self.model {
-            ModelRef::Lent(m) => m,
-            ModelRef::Built(m) => m,
-        }
+        self.model.get()
     }
     pub(crate) fn population(&self) -> &Population {
         &self.population
@@ -216,6 +228,14 @@ fn check_lent_stats(
 /// fit was given, record for record: [`population_refusal`] names the first
 /// difference.
 ///
+/// Then the population is prepared as `fit()` prepared the one it was given
+/// (#1783), by the same `fitted_population`: time-varying covariates the model
+/// never reads pruned, occasions derived under the fit's recorded `iov_occasion`
+/// rule, DV log-transformed for `log(DV) ~ …`. A fit that records no rule (a
+/// `.fitrx` saved before #1783) takes the model file's when the file was read,
+/// and is refused when the model has kappas and the population no occasion
+/// labels.
+///
 /// | The fit carries | Re-read with | `(Some(m), None)` on an IOV model | Verified |
 /// |---|---|---|---|
 /// | settings + fingerprint | the recorded settings | runs (`iov_column` is recorded) | yes |
@@ -332,6 +352,11 @@ fn resolve_fit_inputs_unattributed<'a>(
     // Whether the model file was read: without recorded settings, a re-read then took
     // the file's settings rather than the routed reader's (no renames, no selection).
     let file_settings = file.is_some();
+    // The occasion rule the population is prepared with (#1783): the fit's own, else
+    // (a bundle saved before it was recorded) the model file's when it was read.
+    let file_rule = file
+        .as_ref()
+        .map(|(parsed, _)| parsed.fit_options.iov_occasion.clone());
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
     check_subjects(fit, &population)?;
@@ -347,7 +372,8 @@ fn resolve_fit_inputs_unattributed<'a>(
             } else {
                 Some(population.to_mut())
             };
-            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)?;
+            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
+                .map_err(EngineError::from_diagnostic)?;
             ModelRef::Built(Box::new(parsed.model))
         }
         Some(m) => {
@@ -361,7 +387,8 @@ fn resolve_fit_inputs_unattributed<'a>(
                 ));
             }
             if let Cow::Owned(p) = &mut population {
-                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)?;
+                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
+                    .map_err(EngineError::from_diagnostic)?;
             }
             crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
             // No recorded bindings to compare (an older `.fitrx`): the population
@@ -391,6 +418,12 @@ fn resolve_fit_inputs_unattributed<'a>(
             fit.theta.len()
         )));
     }
+    // σ and Ω_IOV against the model (#1764): a mis-sized σ panicked or was dropped in
+    // `run_covariance`, and a fit with no Ω_IOV on an IOV model ran both with the
+    // model's initial Ω_IOV in its place (`fitted_params_from_result`, #1789).
+    // Ω keeps the n_eta checks `run_sir` / `run_covariance` already make.
+    let [_, sigma, omega_iov] = crate::api::ParamBlock::all_of_fit(fit);
+    crate::api::check_param_shape(inputs.model(), &[sigma, omega_iov])?;
     // The same subjects can carry a recoded covariate: a categorical value outside
     // the model's levels would be scored as the reference level (#1740).
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(
@@ -414,7 +447,101 @@ fn resolve_fit_inputs_unattributed<'a>(
             ));
         }
     }
-    Ok(inputs)
+    // Then (#1783) the population the fit scored: `fit()`'s own preparation of the
+    // one it was given, under the fit's rule. After the check, which is of the given
+    // population: on a natural-DV re-read, before any log transform. The notes are
+    // dropped; the fit carries them.
+    let FitInputs {
+        model,
+        population,
+        mut warnings,
+    } = inputs;
+    let m = model.get();
+    let rule = fit.iov_occasion.clone().or(file_rule);
+    // A rule taken from the model file is a guess (review r1 #1): a fit made through
+    // `fit_from_files` ran under its caller's rule, which need not be the file's, and
+    // the derived labels are not fingerprinted, so nothing downstream can tell. Say so
+    // whenever the guess derives the occasions; a `Column` guess derives nothing.
+    if let (None, Some(r)) = (&fit.iov_occasion, &rule) {
+        if m.n_kappa > 0 && *r != IovOccasionRule::Column {
+            warnings.push(file_rule_warning(r));
+        }
+    }
+    let population = crate::api::fitted_population(
+        m,
+        rule.as_ref().unwrap_or(&IovOccasionRule::Column),
+        false,
+        population,
+        &mut Vec::new(),
+    );
+    if fit.iov_occasion.is_none()
+        && m.n_kappa > 0
+        && population.subjects.iter().all(|s| s.occasions.is_empty())
+    {
+        return Err(unrecorded_rule_refusal(fit, rule.as_ref()));
+    }
+    Ok(FitInputs {
+        model,
+        population,
+        warnings,
+    })
+}
+
+/// The refusal for a fit that records no occasion rule (a bundle saved before
+/// #1783) when the population carries no occasion labels: its kappas cannot be
+/// assigned to occasions. `file_rule` is the model file's, when it was read; a
+/// derived one would have labelled the population, so here it is `Column` or absent.
+fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>) -> EngineError {
+    let mut msg = String::from(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), and the population carries no occasion labels, so the per-occasion \
+         kappas cannot be assigned to occasions.",
+    );
+    if fit
+        .population_fingerprint
+        .as_ref()
+        .is_some_and(|fp| fp.occasions_derived())
+    {
+        msg.push_str(
+            " Its population fingerprint shows the fit derived its occasions from a \
+             model-side `iov_occasion` rule (`dose` or `time(...)`), which it did not \
+             record.",
+        );
+    }
+    if file_rule.is_some() {
+        msg.push_str(" The model file's `[fit_options]` sets no `iov_occasion` to fall back on.");
+    }
+    msg.push_str(
+        " Pass the population `run_model_with_data` returned, which carries the \
+         occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
+         ran with, or refit so the rule is recorded.",
+    );
+    EngineError::from(msg)
+}
+
+/// A rule in the DSL's spelling: `dose`, `time(24, 48)`.
+fn rule_dsl(rule: &IovOccasionRule) -> String {
+    match rule {
+        IovOccasionRule::Column => "column".to_string(),
+        IovOccasionRule::PerDose => "dose".to_string(),
+        IovOccasionRule::TimeWindows(edges) => {
+            let e: Vec<String> = edges.iter().map(|e| e.to_string()).collect();
+            format!("time({})", e.join(", "))
+        }
+    }
+}
+
+/// The note for a fit that records no occasion rule (a bundle saved before #1783)
+/// whose occasions were derived with the model file's rule (review r1 #1).
+pub(crate) fn file_rule_warning(rule: &IovOccasionRule) -> String {
+    format!(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), so the occasions were derived with the model file's `iov_occasion = {}`. \
+         A fit made through `fit_from_files` ran under its caller's rule, not the file's: \
+         if that was another rule, these results are wrong. Set `fit.iov_occasion` to the \
+         rule the fit ran with.",
+        rule_dsl(rule)
+    )
 }
 
 /// Where the population a post-hoc step was about to run on came from, for

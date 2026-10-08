@@ -71,7 +71,7 @@ fn population(name: &str, values: &[f64]) -> Population {
 /// Bind `text` against `pop`, returning the re-parsed model.
 fn bind(text: &str, pop: &Population) -> Result<CompiledModel, String> {
     let mut parsed = parse_full_model(text)?;
-    crate::api::bind_covariate_stats(&mut parsed, text, pop)?;
+    crate::api::bind_covariate_stats(&mut parsed, text, pop).map_err(|e| e.to_string())?;
     Ok(parsed.model)
 }
 
@@ -1359,4 +1359,30 @@ fn check_stats_on_re_summarises_the_population() {
     }
     let err = super::check_stats_on(&bound, &absent).unwrap_err();
     assert!(err.contains("covariate `AGE`"), "{err}");
+}
+
+/// #1773. A fit's statistics that pass validation but that the re-parse refuses —
+/// a `levels = auto` relation recorded with one level, which leaves nothing to
+/// estimate — are a statistics refusal on a model with no level block, through
+/// `layout_from_fit` and `bind_from_fit` alike.
+///
+/// Mutation — tag the re-parse in `lay_out_on_fit` with the level code
+/// unconditionally: both cells get `E_THETA_LEVEL_BINDING`.
+#[test]
+fn a_from_fit_reparse_refusal_on_a_stats_only_model_is_the_stats_code() {
+    let text = grp_auto();
+    let mut fitted = parse_full_model(&text).unwrap();
+    crate::api::bind_covariate_stats(&mut fitted, &text, &population("GRP", &[1.0, 2.0])).unwrap();
+    let mut b = fitted.model.data_bindings().clone();
+    b.covariate_stats.get_mut("GRP").unwrap().levels = vec![2.0];
+    let mut parsed = parse_full_model(&text).unwrap();
+    let laid = crate::api::layout_from_fit(&mut parsed, &text, &b).expect_err("one level");
+    let mut parsed = parse_full_model(&text).unwrap();
+    let bound = crate::api::bind_from_fit(&mut parsed, &text, &mut population("GRP", &[2.0]), &b)
+        .expect_err("one level");
+    for (what, e) in [("layout_from_fit", laid), ("bind_from_fit", bound)] {
+        assert_eq!(e.code(), Some("E_COVARIATE_STATS_BINDING"), "{what}: {e}");
+        assert_eq!(e.block(), Some("covariate_model"), "{what}: {e}");
+        assert!(e.to_string().contains("nothing to estimate"), "{what}: {e}");
+    }
 }

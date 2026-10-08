@@ -33,9 +33,10 @@ fn main() -> Result<(), String> {
         opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
     )?;
 
-    // Bind data-driven declarations (no-ops for a model without them)
-    bind_theta_levels(&mut parsed, &model_text, &mut population)?;
-    bind_covariate_stats(&mut parsed, &model_text, &population)?;
+    // Bind data-driven declarations (no-ops for a model without them). The binders
+    // return an `EngineError`, whose `to_string()` is the message.
+    bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
+    bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
     // `fit` reads the gradient method off the model: stamp the file's `gradient = ...`
     parsed.model.gradient_method = if parsed.model.is_sde() {
