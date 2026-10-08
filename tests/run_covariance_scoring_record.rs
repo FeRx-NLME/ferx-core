@@ -236,6 +236,43 @@ fn inner_tol() {
     );
 }
 
+/// `inner_tol` again, on the same chain with the Laplace stage an **evaluator**
+/// (`agq_eval_only`): the FOCEI stage produces the estimates and runs the inline covariance
+/// step at 1e-5, and the trailing readout's 1e-8 must not overwrite the record (#1805 r1
+/// finding 1). Premise: the readout's 1e-8 moves the covariance, so a record holding it
+/// could not reproduce the inline step. Mutation: drop `!eval_only_methods.contains(&method)`
+/// from the record site in `fit_inner` → the record is 1e-8 and the row dies.
+/// `imp_eval_only` needs no row: an IMP readout does not tighten `inner_tol`, so its record
+/// equals the estimating stage's and the defect cannot show there.
+#[test]
+fn inner_tol_ignores_a_trailing_evaluator() {
+    let with = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        agq_eval_only: true,
+        ..quiet(EstimationMethod::FoceI)
+    };
+    let what = "inner_tol (trailing evaluator)";
+    let f = Fitted::new(&WARFARIN, &with, what);
+    assert_eq!(
+        f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
+        Some(FitOptions::default().inner_tol),
+        "{what}: the record is the estimating FOCEI stage's, not the Laplace readout's"
+    );
+    let inline = bits(&f.fit, what);
+    let readout = FitOptions {
+        inner_tol: 1e-8,
+        ..defaults()
+    };
+    assert!(
+        f.cov(&f.unrecorded(), &readout, what) != inline,
+        "{what}: premise — the readout's inner_tol must move the covariance"
+    );
+    assert!(
+        f.cov(&f.fit, &defaults(), what) == inline,
+        "{what}: run_covariance with default options must reproduce the inline step"
+    );
+}
+
 /// T10: the caller's non-default value wins over the record, and only it. Both sides of the
 /// "caller left the default?" gate on one fit: `bfgs` (non-default) scores exactly as on an
 /// unrecorded fit — and not as the inline `lbfgs` step — while `auto` (the default) yields to

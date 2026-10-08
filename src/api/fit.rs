@@ -1649,9 +1649,9 @@ fn fit_inner(
     // and only ever runs on the last estimating stage.
     let mut method_wall_times_secs: Vec<f64> = Vec::with_capacity(n_stages);
     let mut covariance_wall_time_secs: f64 = 0.0;
-    // #426: the scoring settings of the stage that produced the estimates — the last
-    // estimating stage, whose options also ran the inline covariance step — falling back
-    // to the last stage run for a chain of evaluators only. Taken from `stage_opts`, not
+    // #426: the scoring settings of the stage that produced the estimates — the last stage
+    // that estimates (not a trailing evaluator), whose options also ran the inline
+    // covariance step — falling back to the last stage run for a chain of evaluators only. Taken from `stage_opts`, not
     // `options`: a quadrature stage tightens its own `inner_tol`.
     let mut estimating_scoring: Option<crate::ScoringSettings> = None;
     let mut last_scoring: Option<crate::ScoringSettings> = None;
@@ -1810,7 +1810,11 @@ fn fit_inner(
             stage_opts.sir = false;
         }
         let stage_scoring = crate::ScoringSettings::from_options(&stage_opts);
-        if is_last_estimating {
+        // `is_last_estimating` is also true for the literal last stage when that stage is an
+        // evaluator (`agq_eval_only` / `imp_eval_only`): only a stage that estimates may
+        // write the record, or a trailing Laplace readout's 1e-8 replaces the 1e-5 the
+        // inline covariance step ran at.
+        if is_last_estimating && !eval_only_methods.contains(&method) {
             estimating_scoring = Some(stage_scoring.clone());
         }
         last_scoring = Some(stage_scoring);
