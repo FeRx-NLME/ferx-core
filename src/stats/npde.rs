@@ -105,11 +105,15 @@ pub struct SubjectNpde {
 /// (#1740) is an `Err` carrying `E_COV_LEVEL_UNKNOWN`'s message: the simulated
 /// reference distribution would score it as the reference level. Reached from
 /// `fit()`'s post-fit step this cannot fire, since the fit already refused it. A θ
-/// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615), and a bound
-/// `theta NAME[...]` block on a population never bound for it is
-/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647). An Ω or σ whose dimension is not the
-/// model's, or an Ω_IOV of the wrong dimension or on a model with no κ, is
-/// `E_PARAM_SHAPE`'s (#1764); an absent Ω_IOV is the κ = 0 fallback above.
+/// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). A
+/// `theta NAME[...]` block never bound is `E_THETA_LEVELS_UNBOUND`'s; a bound one on a
+/// population never bound for it, or bound for only some of its subjects, is
+/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647, #1762); one bound for other levels is
+/// `E_THETA_LEVELS_DATA_MISMATCH`'s (#1762). A covariate the data lacks is
+/// `E_MISSING_COVARIATE`'s (#1763).
+/// An Ω or σ whose dimension is not the model's, or an Ω_IOV of the wrong
+/// dimension or on a model with no κ, is `E_PARAM_SHAPE`'s (#1764); an absent
+/// Ω_IOV is the κ = 0 fallback above.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
@@ -118,6 +122,9 @@ pub fn compute_npde_npd(
     seed: Option<u64>,
 ) -> Result<Vec<SubjectNpde>, crate::diagnostics::EngineError> {
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
+    // whose count is not yet the bound model's, as `predict_diag` orders them.
+    crate::api::unbound_level_refusal(model, "compute_npde_npd")?;
     // θ against the model's layout (#1615): the reference distribution is simulated
     // from it, and a θ read past its end is `0.0`.
     crate::api::check_theta_length(model, &params.theta)?;
@@ -131,12 +138,15 @@ pub fn compute_npde_npd(
     };
     crate::api::check_param_shape(model, &blocks)?;
     // A bound level block on a population never bound for it gathers `NaN` on every
-    // record, and every npd came back `NaN` with `Ok` (#1647).
+    // record, and every npd came back `NaN` with `Ok` (#1647); one bound for other levels
+    // read the wrong level's θ (#1762).
     crate::diagnostics::first_error(&crate::api::check_level_index_columns(
         model,
         population,
         crate::api::LevelDataEntry::Run,
     ))?;
+    // A covariate the data lacks reads as 0.0 in the simulated reference (#1763).
+    crate::diagnostics::first_error(&crate::api::check_covariates(model, population))?;
     let base_seed = effective_seed(seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;

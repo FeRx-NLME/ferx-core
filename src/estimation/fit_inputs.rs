@@ -566,8 +566,10 @@ enum PopulationSource {
 ///
 /// Two causes keep their own text, since there the fix is a reader or a binder, not
 /// another population: a population read without the model's endpoint routing
-/// (`E_ENDPOINT_UNROUTED`), and one never bound for the model's level block (#1647's,
-/// from `check_level_index_columns`).
+/// (`E_ENDPOINT_UNROUTED`), and one never bound — or only partly bound — for the
+/// model's level block (#1647's and #1762's `E_THETA_LEVELS_DATA_UNBOUND`, from
+/// `check_level_index_columns`). One bound for other levels gets this function's text:
+/// for a post-hoc step the fix is the fit's population, not a refit.
 fn population_refusal(
     d: &PopulationDifference,
     model: &CompiledModel,
@@ -581,9 +583,15 @@ fn population_refusal(
         return e;
     }
     // Only a supplied population can lack the columns: a re-read, and a supplied one
-    // under `model = None`, are bound above.
-    let unbound =
-        crate::api::check_level_index_columns(model, population, crate::api::LevelDataEntry::Run);
+    // under `model = None`, are bound above. Only the unbound cells (#1647, #1762's
+    // "`k` of `n`"): a population bound for other levels is not the fit's, and hears
+    // so below — `E_THETA_LEVELS_DATA_MISMATCH`'s "a fit of a model bound on this
+    // population" is advice for new data, not for a post-hoc step on this fit.
+    let unbound: Vec<_> =
+        crate::api::check_level_index_columns(model, population, crate::api::LevelDataEntry::Run)
+            .into_iter()
+            .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
+            .collect();
     if let Err(e) = crate::diagnostics::first_error(&unbound) {
         return e;
     }

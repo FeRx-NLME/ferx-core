@@ -6,6 +6,7 @@
 //! Extracted verbatim from `api.rs`; every path stays resolvable through the
 //! `pub` / `pub(crate)` re-exports in the parent module.
 use super::*;
+use crate::api::levels::{level_index_finding, LevelIndexFinding};
 
 /// Does this identifier read as a random-effect name (`ETA_CL`, `eta_v`,
 /// `KAPPA_CL`)?
@@ -197,10 +198,9 @@ fn bound_level_columns(model: &CompiledModel) -> Vec<(&str, String)> {
 /// picks the binder [`check_level_index_columns`] names (#1647).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LevelDataEntry {
-    /// `predict_diag`, `compute_npde_npd` and the `simulate*` / adaptive entry points:
-    /// they run a θ that is already laid out, so the population must be indexed with the
-    /// levels that θ was laid out for. (`predict_survival` / `predict_categorical` run no
-    /// covariate check at all, and do not run this one either.)
+    /// `predict_diag`, `predict_survival`, `predict_categorical`, `compute_npde_npd` and
+    /// the `simulate*` / adaptive entry points: they run a θ that is already laid out, so
+    /// the population must be indexed with the levels that θ was laid out for.
     Run,
     /// `fit()` (and `ferx check`, which binds before it gets here): it estimates θ, so
     /// the model is laid out afresh on the population's own levels.
@@ -221,40 +221,131 @@ pub(crate) enum LevelDataEntry {
 /// | `Run` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
 /// | `Fit` | `bind_theta_levels` on a fresh parse |
 ///
-/// A population bound for *another* binding of the same block carries the column and
-/// passes; a θ of the wrong length for it is `E_THETA_LENGTH`'s.
+/// A population that carries the column is checked record by record against the
+/// model's own level table (#1762, [`level_index_finding`]): a population bound on its
+/// own for other levels — the same count or not — carries the column and indexes it
+/// for *its* levels, and ran silently on the model's. One diagnostic per block, the
+/// first cell that applies:
+///
+/// | Population | Code | Remedy |
+/// |---|---|---|
+/// | no subject carries the index | `E_THETA_LEVELS_DATA_UNBOUND`, "never bound" | the binder above |
+/// | some subjects carry none | `E_THETA_LEVELS_DATA_UNBOUND`, "`k` of `n` subjects" | the binder above |
+/// | an index without its level column | `E_THETA_LEVELS_DATA_MISMATCH` | none: the level is unknown |
+/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder |
+/// | indexed for another table | `E_THETA_LEVELS_DATA_MISMATCH`, the first record | the binder above |
+///
+/// A population is refused, never re-indexed: the check reads `&Population`, and
+/// re-indexing where it is possible at all (every level among the model's) is
+/// `bind_from_fit`, which the refusal names.
 pub(crate) fn check_level_index_columns(
     model: &CompiledModel,
     population: &Population,
     entry: LevelDataEntry,
 ) -> Vec<Diagnostic> {
+    let binder = match entry {
+        LevelDataEntry::Run => {
+            "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
+             population, &fit.data_bindings)`, passing the bindings the θ you run was \
+             laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
+             of `parsed.model.data_bindings()` taken before the call. Then run the model \
+             it re-parses into `parsed`."
+        }
+        LevelDataEntry::Fit => {
+            "To fit this population, parse the model text again and bind it with \
+             `bind_theta_levels(&mut parsed, &model_text, &mut population)`, which lays \
+             θ out for the levels it holds."
+        }
+    };
+    let blocks = model.theta_blocks();
     bound_level_columns(model)
         .into_iter()
-        .filter(|(_, column)| !population_carries(population, column))
-        .map(|(name, _)| {
-            let binder = match entry {
-                LevelDataEntry::Run => {
-                    "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
-                     population, &fit.data_bindings)`, passing the bindings the θ you run was \
-                     laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
-                     of `parsed.model.data_bindings()` taken before the call. Then run the model \
-                     it re-parses into `parsed`."
+        .filter_map(|(name, column)| {
+            // "Never bound" only when no subject carries the index: a population some of
+            // whose subjects do is partly bound, and is told so below (#1762).
+            let carried = population.covariate_names.contains(&column)
+                || population
+                    .subjects
+                    .iter()
+                    .any(|s| s.covariates.contains_key(&column));
+            if !carried {
+                return Some(Diagnostic::error(
+                    "E_THETA_LEVELS_DATA_UNBOUND",
+                    format!(
+                        "`theta {name}[...]` is bound, but this population was never bound for \
+                         it, so its records carry no index into the block's levels. {binder}"
+                    ),
+                ));
+            }
+            let decl = blocks.level_blocks().iter().find(|d| d.name() == name)?;
+            let (code, message) = match level_index_finding(decl, population)? {
+                LevelIndexFinding::SomeSubjectsUnbound {
+                    unbound,
+                    of,
+                    first_id,
+                } => (
+                    "E_THETA_LEVELS_DATA_UNBOUND",
+                    format!(
+                        "`theta {name}[...]` is bound, but {unbound} of {of} subjects in this \
+                         population carry no index into the block's levels, the first being \
+                         subject {first_id}: they were not bound with the rest. {binder}"
+                    ),
+                ),
+                LevelIndexFinding::ColumnMissing { id, column } => (
+                    "E_THETA_LEVELS_DATA_MISMATCH",
+                    format!(
+                        "`theta {name}[...]` is bound, and subject {id} carries an index into \
+                         the block's levels but no value in its level column `{column}`, so \
+                         which level the index names cannot be checked."
+                    ),
+                ),
+                LevelIndexFinding::Unseen { labels } => {
+                    let remedy = match entry {
+                        LevelDataEntry::Run => {
+                            "A θ for them comes from a fit of a model bound on this population."
+                        }
+                        LevelDataEntry::Fit => binder,
+                    };
+                    (
+                        "E_THETA_LEVELS_DATA_MISMATCH",
+                        format!(
+                            "`theta {name}[...]` is bound, but this population was bound for \
+                             other levels: it has {} level(s) the model's block does not: {}. \
+                             The θ being run has no value for them. {remedy}",
+                            labels.len(),
+                            labels
+                                .iter()
+                                .map(|l| format!("`{l}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
                 }
-                LevelDataEntry::Fit => {
-                    "To fit this population, parse the model text again and bind it with \
-                     `bind_theta_levels(&mut parsed, &model_text, &mut population)`, which lays \
-                     θ out for the levels it holds."
+                LevelIndexFinding::Misindexed {
+                    id,
+                    time,
+                    label,
+                    want,
+                    got,
+                } => {
+                    let got = match got {
+                        Some(g) => format!("its index says {g}"),
+                        None => "it carries no index".to_string(),
+                    };
+                    (
+                        "E_THETA_LEVELS_DATA_MISMATCH",
+                        format!(
+                            "`theta {name}[...]` is bound, but this population's index into \
+                             its levels was written for another level table: subject {id} at \
+                             time {time} is level `{label}`, level {want} of the model's block, \
+                             and {got}. {binder}"
+                        ),
+                    )
                 }
             };
-            Diagnostic::error(
-                "E_THETA_LEVELS_DATA_UNBOUND",
-                format!(
-                    "`theta {name}[...]` is bound, but this population was never bound for \
-                     it, so its records carry no index into the block's levels. {binder}"
-                ),
-            )
-            .with_block("parameters")
+            Some(Diagnostic::error(code, message))
         })
+        .map(|d| d.with_block("parameters"))
         .collect()
 }
 
@@ -824,11 +915,13 @@ pub(crate) fn check_unbound_theta_levels(
                 // `bind_theta_levels` re-discovers the levels from the population at
                 // hand, and on new data reads a fit's θ at the wrong positions (#1644
                 // review, row 1).
-                UnboundLevelsEntry::Predict => format!(
+                // The entry is named as the one that refused (#1763): the same advice
+                // reaches `predict_survival`, `predict_categorical` and `compute_npde_npd`.
+                UnboundLevelsEntry::Predict(entry) => format!(
                     "with a fit's θ, call `bind_from_fit(&mut parsed, &model_text, &mut \
                      population, &fit.data_bindings)` on the population you pass to \
-                     `predict`, with the `data_bindings` the fit (or its `.fitrx`) carries, \
-                     and predict with the model it re-parses into `parsed`. \
+                     `{entry}`, with the `data_bindings` the fit (or its `.fitrx`) carries, \
+                     and call `{entry}` with the model it re-parses into `parsed`. \
                      `bind_theta_levels` on that population fits only a θ laid out for the \
                      levels it discovers, such as the model's own `default_params`. Or \
                      declare the block explicitly as `theta {name}[N](...)` and index it \
@@ -848,14 +941,33 @@ pub(crate) fn check_unbound_theta_levels(
         .collect()
 }
 
+/// [`check_unbound_theta_levels`] as the `Err` of an entry that runs a fit's θ on a
+/// population it is handed: the way out is in the `Err`'s text (its `Display`), as
+/// `fit()`'s refusal puts it, while `message()` stays the diagnostic's message and the
+/// advice is `suggestion()` only (#1746 review r1 #6). `entry` is the name the
+/// suggestion gives the refusing entry (#1763).
+pub(crate) fn unbound_level_refusal(
+    model: &CompiledModel,
+    entry: &'static str,
+) -> Result<(), crate::diagnostics::EngineError> {
+    match check_unbound_theta_levels(model, UnboundLevelsEntry::Predict(entry)).first() {
+        Some(d) => Err(crate::diagnostics::EngineError::with_suggestion_in_display(
+            d.clone(),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Which entry point met an unbound level block — it decides
 /// [`check_unbound_theta_levels`]'s suggestion, not its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundLevelsEntry {
     /// `simulate*` / `simulate_adaptive*`, through `check_simulation_data`.
     Simulate,
-    /// `predict` / `predict_diag` (#1644).
-    Predict,
+    /// An entry that runs a fit's θ on a population it is handed — `predict` /
+    /// `predict_diag` (#1644), `predict_survival`, `predict_categorical`,
+    /// `compute_npde_npd` (#1763) — carrying the name the suggestion gives it.
+    Predict(&'static str),
 }
 
 /// Every `NAME[COLUMN]` gather index the data carries must be an integer level

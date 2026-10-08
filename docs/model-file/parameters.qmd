@@ -116,7 +116,10 @@ A model that reaches `fit()` unbound is refused, naming the block, rather than
 silently predicting `NaN`. The simulate paths and `predict` report the same
 problem as `E_THETA_LEVELS_UNBOUND`. A bound model handed a population that was
 never bound for its block is `E_THETA_LEVELS_DATA_UNBOUND`, which names the
-binder. To simulate a design with a fit's θ, bind it with
+binder. A population bound for *other* levels — bound on its own, for another
+dataset's studies or times — is `E_THETA_LEVELS_DATA_MISMATCH`: each record's
+index is checked against the level its own columns name in the model's levels,
+so it is refused rather than read at another level's θ. To simulate a design with a fit's θ, bind it with
 `bind_from_fit` and the fit's `data_bindings`, so the design keeps the
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).

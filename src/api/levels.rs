@@ -754,22 +754,162 @@ fn fitted_level_tables(
 ) -> Result<Vec<Vec<(Level, usize)>>, String> {
     let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
     for decl in decls {
-        let binding = &fitted[decl.name()];
-        let mut table = Vec::new();
-        let mut unseen = Vec::new();
-        for level in discover_levels(decl, population)? {
-            let label = level.label(decl.columns());
-            match binding.labels.iter().position(|l| *l == label) {
-                Some(i) => table.push((level, i + 1)),
-                None => unseen.push(label),
-            }
-        }
+        let (table, unseen) = match_level_table(decl, population, &fitted[decl.name()].labels)?;
         if !unseen.is_empty() {
             return Err(unseen_levels_message(decl, &unseen));
         }
         tables.push(table);
     }
     Ok(tables)
+}
+
+/// The one label matcher (#1762): each level `population` shows for `decl`, with its
+/// 1-based position in `labels`, and the label of every level `labels` lacks, in level
+/// order. [`bind_from_fit`] writes a population's index columns from the table, and
+/// [`level_index_finding`] re-derives from it the index each record should carry, so
+/// the binder and the check cannot disagree about what a label is.
+fn match_level_table(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    labels: &[String],
+) -> Result<(Vec<(Level, usize)>, Vec<String>), String> {
+    // Keyed, not `position`: at MBMA scale (thousands of levels) a linear search per level
+    // made the check on every run call quadratic (#1762, measured). A repeated label keeps
+    // its first position, as `position` did.
+    let mut at: HashMap<&str, usize> = HashMap::with_capacity(labels.len());
+    for (i, l) in labels.iter().enumerate() {
+        at.entry(l.as_str()).or_insert(i + 1);
+    }
+    let mut table = Vec::new();
+    let mut unseen = Vec::new();
+    for level in discover_levels(decl, population)? {
+        let label = level.label(decl.columns());
+        match at.get(label.as_str()) {
+            Some(&i) => table.push((level, i)),
+            None => unseen.push(label),
+        }
+    }
+    Ok((table, unseen))
+}
+
+/// The hash key of a level's values: their bits, with `-0.0` folded onto `0.0` so two
+/// keys are equal exactly when the values are `==` (every value is finite here).
+fn level_key(values: &[f64]) -> Vec<u64> {
+    values.iter().map(|v| (v + 0.0).to_bits()).collect()
+}
+
+/// Why a population's index column for one bound level block is not the index the
+/// model's level table gives its records (#1762). The first that applies, in this
+/// order; a population no subject of which carries the column is the caller's
+/// (`check_level_index_columns`) to report, before this is asked.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LevelIndexFinding {
+    /// `unbound` of the population's `of` subjects carry no index column; `first_id`
+    /// is the first of them.
+    SomeSubjectsUnbound {
+        unbound: usize,
+        of: usize,
+        first_id: String,
+    },
+    /// Subject `id` carries the index but no finite value in the level column
+    /// `column`, so the level its index names cannot be checked.
+    ColumnMissing { id: String, column: String },
+    /// Levels the population shows that the model's table does not hold, every one,
+    /// in level order.
+    Unseen { labels: Vec<String> },
+    /// The first record whose index is not its label's position in the model's table:
+    /// subject `id` at record time `time` is level `label`, position `want`, and
+    /// carries `got` (`None`: no index on that record).
+    Misindexed {
+        id: String,
+        time: f64,
+        label: String,
+        want: usize,
+        got: Option<f64>,
+    },
+}
+
+/// Whether `population`'s index column for the bound block `decl` is the index the
+/// model's own level table (`decl.labels()`, the binding the model was parsed with)
+/// gives each record (#1762). `None` when it is.
+///
+/// The level columns are the stamp: [`write_index_column`] derives each record's index
+/// from the record's own level values, so the index is re-derived here the same way,
+/// through the binder's own label matcher ([`match_level_table`]), and compared with the
+/// index the predictors read on that record (`Subject::obs_cov`: the record's snapshot,
+/// else the subject's baseline). Only the Gaussian observation records are compared:
+/// they define the block's levels. A dose, `EVID=2` or reset record carries an LOCF copy
+/// written by the same binder and is not re-checked, so an edit to only such a snapshot
+/// is out of this check's reach.
+pub(crate) fn level_index_finding(
+    decl: &LevelBlockDecl,
+    population: &Population,
+) -> Option<LevelIndexFinding> {
+    let column = level_index_column(decl.name());
+    let unbound: Vec<&Subject> = population
+        .subjects
+        .iter()
+        .filter(|s| !s.covariates.contains_key(&column))
+        .collect();
+    if let Some(first) = unbound.first() {
+        return Some(LevelIndexFinding::SomeSubjectsUnbound {
+            unbound: unbound.len(),
+            of: population.subjects.len(),
+            first_id: first.id.clone(),
+        });
+    }
+    for subject in &population.subjects {
+        for j in 0..subject.obs_times.len() {
+            for c in decl.columns() {
+                if !column_value(subject, c, j).is_some_and(f64::is_finite) {
+                    return Some(LevelIndexFinding::ColumnMissing {
+                        id: subject.id.clone(),
+                        column: c.clone(),
+                    });
+                }
+            }
+        }
+    }
+    if population.subjects.iter().all(|s| s.obs_times.is_empty()) {
+        // No record defines a level, so no index can be wrong.
+        return None;
+    }
+    let (table, unseen) = match_level_table(decl, population, decl.labels())
+        .expect("every level column is present and finite on every record");
+    if !unseen.is_empty() {
+        return Some(LevelIndexFinding::Unseen { labels: unseen });
+    }
+    let index: HashMap<Vec<u64>, (usize, &Level)> = table
+        .iter()
+        .map(|(level, i)| (level_key(&level.values), (*i, level)))
+        .collect();
+    for subject in &population.subjects {
+        for j in 0..subject.obs_times.len() {
+            let values: Vec<f64> = decl
+                .columns()
+                .iter()
+                .map(|c| column_value(subject, c, j).unwrap_or(f64::NAN))
+                .collect();
+            let &(want, level) = index
+                .get(&level_key(&values))
+                .expect("the table holds every level the population shows");
+            let got = subject.obs_cov(j).get(&column).copied();
+            if got != Some(want as f64) {
+                return Some(LevelIndexFinding::Misindexed {
+                    id: subject.id.clone(),
+                    time: subject
+                        .obs_raw_times
+                        .get(j)
+                        .copied()
+                        .unwrap_or(subject.obs_times[j]),
+                    label: level.label(decl.columns()),
+                    want,
+                    got,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Each label that occurs more than once in `labels`, once, in order of first
@@ -905,6 +1045,10 @@ fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
 /// contiguous and the binding is reproducible.
 fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec<Level>, String> {
     let mut levels: Vec<Level> = Vec::new();
+    // Deduplicated by key rather than `Vec::contains`, which was O(records × levels) and
+    // ran on every call through the level-table check (#1762). The first-seen values of a
+    // level are kept, as before.
+    let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
     for subject in &population.subjects {
         for j in 0..subject.obs_times.len() {
             let mut values = Vec::with_capacity(decl.columns().len());
@@ -926,9 +1070,8 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
                 }
                 values.push(v);
             }
-            let level = Level { values };
-            if !levels.contains(&level) {
-                levels.push(level);
+            if seen.insert(level_key(&values)) {
+                levels.push(Level { values });
             }
         }
     }
