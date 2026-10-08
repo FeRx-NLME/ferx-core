@@ -27,7 +27,7 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    CompiledModel, FitOptions, FitResult, IovOccasionRule, ParsedModel, Population,
+    CompiledModel, FitOptions, FitResult, InnerOptimizer, IovOccasionRule, ParsedModel, Population,
     PopulationDifference,
 };
 
@@ -675,6 +675,160 @@ pub(crate) fn scoring_options(
 /// [`interaction_for`]: crate::types::interaction_for
 pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
     scoring_options(fit.method, fit.interaction, options)
+}
+
+/// The [`FitOptions`] a fit's objective was scored under, as one record (#426): every
+/// option a post-hoc step reads when it reconverges the EBEs and re-scores the objective
+/// at the fit's estimates. Carried on [`FitResult::scoring_settings`] (the stage that
+/// produced the estimates) and inside [`SirSettings`](crate::estimation::sir::SirSettings)
+/// (the options SIR's draws were scored under), so [`run_covariance`](crate::run_covariance)
+/// and [`run_sir`](crate::run_sir) with default options score what the fit scored.
+///
+/// Objective-side only. `method` and `interaction` are not here: they ride on the fit
+/// itself ([`FitResult::method`], [`FitResult::interaction`]). Nor are the settings that
+/// define the covariance *step* rather than the objective it differentiates
+/// (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`;
+/// the Hessian anchor follows the fit's method): those say what the caller asks `run_covariance` to compute, and stay
+/// the caller's. `min_obs_for_convergence_check` is not either: it only counts unconverged
+/// EBEs, a tally both post-hoc steps discard.
+///
+/// `Default` is `ScoringSettings::from_options(&FitOptions::default())`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScoringSettings {
+    /// `inner_maxiter`: the iteration cap of each EBE solve.
+    pub inner_maxiter: usize,
+    /// `inner_tol`: the EBE convergence tolerance, as the stage ran it (after the
+    /// LTBS and quadrature tightenings `fit()` applies).
+    pub inner_tol: f64,
+    /// `inner_restarts`: the inner multi-start of a cold EBE solve.
+    pub inner_restarts: usize,
+    /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
+    pub mu_referencing: bool,
+    /// `n_agq`: quadrature nodes of the scored marginal.
+    pub n_agq: usize,
+    /// `inner_optimizer`: the per-subject EBE solver.
+    pub inner_optimizer: InnerOptimizer,
+    /// `ebe_warm_start`: warm-started Nelder–Mead fallback.
+    pub ebe_warm_start: bool,
+    /// `ode_reltol` of every ODE solve.
+    pub ode_reltol: f64,
+    /// `ode_abstol` of every ODE solve.
+    pub ode_abstol: f64,
+    /// `ode_max_steps` per ODE segment.
+    pub ode_max_steps: usize,
+    /// `ode_method`: the ODE stepper.
+    pub ode_method: crate::ode::OdeMethod,
+    /// `ode_stiff_abort_after`: the stiff-segment abort budget.
+    pub ode_stiff_abort_after: Option<u32>,
+    /// `ode_auto_switch`: in-segment stepper switching under `ode_method = auto`.
+    pub ode_auto_switch: bool,
+}
+
+impl ScoringSettings {
+    /// The scoring settings of a stage running `options`: each field copied.
+    pub fn from_options(options: &FitOptions) -> Self {
+        Self {
+            inner_maxiter: options.inner_maxiter,
+            inner_tol: options.inner_tol,
+            inner_restarts: options.inner_restarts,
+            mu_referencing: options.mu_referencing,
+            n_agq: options.n_agq,
+            inner_optimizer: options.inner_optimizer,
+            ebe_warm_start: options.ebe_warm_start,
+            ode_reltol: options.ode_reltol,
+            ode_abstol: options.ode_abstol,
+            ode_max_steps: options.ode_max_steps,
+            ode_method: options.ode_method,
+            ode_stiff_abort_after: options.ode_stiff_abort_after,
+            ode_auto_switch: options.ode_auto_switch,
+        }
+    }
+}
+
+impl Default for ScoringSettings {
+    fn default() -> Self {
+        Self::from_options(&FitOptions::default())
+    }
+}
+
+/// `options` with every scoring setting the caller left at its [`FitOptions::default`]
+/// value taken from `rec` (#426). Value-based, as `run_sir` resolves its own settings
+/// (#1758): a field equal to its default reads as "no opinion", so the caller's
+/// non-default value wins and an explicit default cannot override a record. `None`
+/// returns `options` unchanged.
+///
+/// The record is destructured without `..`, so a field added to [`ScoringSettings`]
+/// without a line here does not compile.
+pub(crate) fn with_scoring_record(
+    rec: Option<&ScoringSettings>,
+    options: &FitOptions,
+) -> FitOptions {
+    let mut o = options.clone();
+    let Some(rec) = rec else {
+        return o;
+    };
+    let ScoringSettings {
+        inner_maxiter,
+        inner_tol,
+        inner_restarts,
+        mu_referencing,
+        n_agq,
+        inner_optimizer,
+        ebe_warm_start,
+        ode_reltol,
+        ode_abstol,
+        ode_max_steps,
+        ode_method,
+        ode_stiff_abort_after,
+        ode_auto_switch,
+    } = rec.clone();
+    let d = FitOptions::default();
+    macro_rules! recorded {
+        ($field:ident) => {
+            if o.$field == d.$field {
+                o.$field = $field;
+            }
+        };
+    }
+    recorded!(inner_maxiter);
+    recorded!(inner_tol);
+    recorded!(inner_restarts);
+    recorded!(mu_referencing);
+    recorded!(n_agq);
+    recorded!(inner_optimizer);
+    recorded!(ebe_warm_start);
+    recorded!(ode_reltol);
+    recorded!(ode_abstol);
+    recorded!(ode_max_steps);
+    recorded!(ode_method);
+    recorded!(ode_stiff_abort_after);
+    recorded!(ode_auto_switch);
+    o
+}
+
+/// `options` resolved against the settings `fit`'s objective was scored under, for a
+/// post-hoc step that re-scores it at the fit's estimates ([`run_covariance`]): from
+/// [`FitResult::scoring_settings`], else from the SIR record's
+/// (`sir_settings.scoring`, a fit loaded from a `.fitrx` written between #1758 and
+/// #426), else `options` unchanged. See [`with_scoring_record`] for the convention.
+///
+/// Which record each post-hoc step reads, and why they differ: `run_covariance` reads
+/// this one, stage record first, because the inline covariance step ran under the
+/// producing stage's options. `run_sir` reads `sir_settings.scoring` only, and never
+/// falls back to the stage record (`resolve_sir_options`), because the in-fit SIR
+/// scores with the fit's top-level options, and a quadrature stage tightens its own
+/// `inner_tol` (1e-8 against 1e-5). Do not unify the two while the in-fit SIR still
+/// scores with the top-level options: the stage record would not repeat the reported
+/// SIR (`tests/run_covariance_scoring_record.rs`,
+/// `run_sir_scores_with_the_sir_record_not_the_stage_record`).
+///
+/// [`run_covariance`]: crate::run_covariance
+pub(crate) fn resolve_scoring_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    let rec = fit
+        .scoring_settings
+        .as_ref()
+        .or(fit.sir_settings.as_ref().map(|s| &s.scoring));
+    with_scoring_record(rec, options)
 }
 
 #[cfg(test)]

@@ -225,14 +225,23 @@ when the model uses kappa (block IOV).
 `sir.settings` records every setting the SIR draws were scored under
 (`FitResult::sir_settings`, [#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)):
 `samples`, `resamples`, the resolved `seed`, `df`, `scale`, `keep_samples`,
-`inner_maxiter`, `inner_tol`, `mu_referencing`, `n_agq`, `inner_optimizer`,
-`ebe_warm_start` and the six `ode_*` settings. The enums are written as their
+and, flat beside them, the scoring settings below. The enums are written as their
 `[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token,
 a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance,
 `n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed`
 fails the load as corrupt. The key is additive, so `format_version` stays `"1"`:
 a bundle saved before #1758 has no `settings` and loads `sir_settings = None`,
 and `run_sir` on it uses the caller's options as given.
+
+`scoring_settings` records the settings the fit's objective was scored under
+(`FitResult::scoring_settings`, [#426](https://github.com/FeRx-NLME/ferx-core/issues/426)):
+`inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`,
+`inner_optimizer`, `ebe_warm_start` and the six `ode_*` settings, as the stage
+that produced the estimates ran them. `run_covariance` takes each one the caller
+leaves at its default from here. It is decoded and checked like `sir.settings`.
+The key is additive: a bundle saved before #426 has none and loads
+`scoring_settings = None`. A `sir.settings` saved before #426 has no
+`inner_restarts` and loads with the default.
 
 `environment` is absent (the key is omitted) on bundles saved before #704
 added this field; loaders default it to an `"unknown"` placeholder rather

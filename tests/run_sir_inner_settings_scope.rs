@@ -52,7 +52,10 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     };
     let lbfgs = core(InnerOptimizer::Lbfgs);
     let auto = core(InnerOptimizer::Auto);
-    assert_eq!(lbfgs.settings.inner_optimizer, InnerOptimizer::Lbfgs);
+    assert_eq!(
+        lbfgs.settings.scoring.inner_optimizer,
+        InnerOptimizer::Lbfgs
+    );
     assert_ne!(
         lbfgs.effective_sample_size.to_bits(),
         auto.effective_sample_size.to_bits(),
@@ -116,7 +119,10 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     let mut no_cov = fitted.clone();
     no_cov.covariance_matrix = None;
     no_cov.sir_settings = Some(ferx_core::estimation::sir::SirSettings {
-        inner_optimizer: InnerOptimizer::Lbfgs,
+        scoring: ferx_core::ScoringSettings {
+            inner_optimizer: InnerOptimizer::Lbfgs,
+            ..Default::default()
+        },
         ..Default::default()
     });
     let err = run_sir(

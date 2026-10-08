@@ -84,17 +84,28 @@ use crate::types::*;
 ///   `iov_column` constraint above for IOV models), routed by the model so a
 ///   joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
-/// - `options`: covariance-relevant fields read are `covariance_method`,
-///   `fd_hessian_step`, `cov_inner_tol`, `mu_referencing`, the inner-loop
-///   settings, and `cancel`. `run_covariance_step` on `options` is
-///   **ignored** — calling this function is itself the request to run the step.
-///   `method` and `interaction` are not read from `options` either: they come from
+/// - `options`: the step's own settings — `covariance_method`, `fd_hessian_step`,
+///   `analytic_cov_hessian`, `cov_inner_tol` — and `cancel` are the
+///   caller's, as given. The scoring settings in [`ScoringSettings`](crate::ScoringSettings)
+///   (`inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`,
+///   `inner_optimizer`, `ebe_warm_start` and the six `ode_*` overrides) are **taken from
+///   `fit.scoring_settings` wherever the caller leaves them at their
+///   [`FitOptions::default`] value** (#426), so `run_covariance` with default options
+///   reconverges the EBEs and scores the objective as the fit's inline step did. The test
+///   is by value, as in [`run_sir`](crate::run_sir): an explicit default
+///   (`inner_optimizer = Auto` on a fit recorded `lbfgs`) cannot be told from an unset one
+///   and yields to the record; to override with a default value, clear or edit
+///   `fit.scoring_settings` first. A fit without that record (a `.fitrx` written before
+///   #426) falls back to `fit.sir_settings.scoring`, then to `options` as given. The step
+///   settings are not recorded: on a fit that ran a non-default `covariance_method`,
+///   default options compute the default step, not the fit's. `run_covariance_step` on
+///   `options` is **ignored** — calling this function is itself the request to run the
+///   step. `method` and `interaction` are not read from `options` either: they come from
 ///   the fit (`fit.method`, then `fit.interaction`), so the Hessian is taken of the
-///   objective the estimates minimise (#1710, #1755); `n_agq` is still the caller's
-///   (#1758). A `[mixture]` fit's per-class overrides are rebuilt from the fit, with
-///   the same error as `run_sir` when they are not available (#1704).
-///   `iov_occasion` is not read either: the population is prepared as `fit()`
-///   prepared it — occasions derived under the fit's recorded rule
+///   objective the estimates minimise (#1710, #1755). A `[mixture]` fit's per-class
+///   overrides are rebuilt from the fit, with the same error as `run_sir` when they are
+///   not available (#1704). `iov_occasion` is not read either: the population is
+///   prepared as `fit()` prepared it — occasions derived under the fit's recorded rule
 ///   (`fit.iov_occasion`), DV log-transformed for a `log(DV) ~ …` model (#1783).
 pub fn run_covariance(
     fit: &FitResult,
@@ -102,6 +113,10 @@ pub fn run_covariance(
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
+    // #426: the scoring settings the fit's objective ran under, wherever the caller left the
+    // default. Resolved first, so the scope below carries the resolved inner and ODE settings
+    // to every reconvergence, and the step differentiates the objective the fit minimised.
+    let options = &crate::estimation::fit_inputs::resolve_scoring_options(fit, options);
     // #1710: differentiate the fit's own marginal, whatever `interaction` the caller carries.
     let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
@@ -113,7 +128,7 @@ pub fn run_covariance(
     // re-read paths, and puts the per-subject fan-out on a pool whose workers carry the same
     // settings — arming alone would reach this thread and leave the workers on the model
     // file's. #426: the scope carries this call's `inner_optimizer` / `ebe_warm_start` the
-    // same way, so the reconverged EBEs use the caller's inner solver — the same source as
+    // same way, so the reconverged EBEs use the resolved inner solver — the same source as
     // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
     crate::api::with_fit_scope(options, || {
         run_covariance_scoped(fit, model, population, options)

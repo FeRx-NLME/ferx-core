@@ -55,7 +55,10 @@ fn run_sir_uses_the_recorded_inner_optimizer_not_the_last_fits() {
     let ess_a = fit_a.sir_ess.expect("in-fit SIR ran");
     assert!(ess_a.is_finite(), "in-fit ESS {ess_a}");
     assert_eq!(
-        fit_a.sir_settings.as_ref().map(|s| s.inner_optimizer),
+        fit_a
+            .sir_settings
+            .as_ref()
+            .map(|s| s.scoring.inner_optimizer),
         Some(InnerOptimizer::Lbfgs)
     );
 
