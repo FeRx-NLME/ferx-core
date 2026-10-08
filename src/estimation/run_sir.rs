@@ -117,8 +117,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   record (`sir_settings = None`: no SIR ran, or a `.fitrx` written before #1758)
 ///   uses `options` as given, except that an unset `sir_seed` falls back to
 ///   `fit.sir_seed` (the seed such a fit was given). `inner_optimizer` and
-///   `ebe_warm_start` hold for the draws only: the process's previous values are
-///   restored when SIR returns.
+///   `ebe_warm_start` hold for this call's draws only; nothing outlives the call (#426).
 ///   `method` and `interaction` are **not** read from `options`: they come from the
 ///   fit (`fit.method`, then `fit.interaction` for a method that does not fix it), so
 ///   the draws are weighted with the objective the estimates minimise (#1710, #1755)
@@ -142,10 +141,9 @@ pub fn run_sir(
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
-    // first, so every reader below sees them: this ODE scope and the one `run_sir_core` opens
-    // itself (#1212), which is the one the draws' solves run under. The resolved
-    // `inner_optimizer` / `ebe_warm_start` reach the draws through `run_sir_core`, which sets
-    // those process globals for its run and restores them (#1767).
+    // first, so every reader below sees them: this fit scope and the one `run_sir_core` opens
+    // itself (#1212, #426), which is the one the draws' solves run under — the resolved ODE
+    // settings and `inner_optimizer` / `ebe_warm_start` alike.
     let options = &resolve_sir_options(fit, options);
     // #1710: score the fit's own marginal, whatever `interaction` the caller carries.
     let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
@@ -154,7 +152,7 @@ pub fn run_sir(
     // `ode_method` would be ignored and the sampled OFVs would come from a different
     // integration accuracy than the fit being refined. The scope also puts the sample
     // fan-out on a pool whose workers carry the same settings.
-    crate::api::with_fit_ode_scope(options, || run_sir_scoped(fit, model, population, options))?
+    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
 }
 
 /// `options` with every SIR setting the caller left at its default taken from
@@ -1112,9 +1110,9 @@ mod tests {
     /// bit, for each setting ferx-r#472 found ignored. Warfarin FOCEI, FD
     /// inner gradients. Mutations, one per row: delete `recorded!(sir_scale …)`,
     /// `recorded!(sir_df …)`, `recorded!(inner_maxiter …)` — that row's ESS
-    /// assertion dies. (The process-global `inner_optimizer` row lives in its
-    /// own binary, `tests/run_sir_inner_optimizer_global.rs`, so no concurrent
-    /// test's `fit()` can move the global under it.)
+    /// assertion dies. (The `inner_optimizer` row lives in
+    /// `tests/run_sir_inner_optimizer_global.rs`, written when the setting was a
+    /// process global; since #426 it is per call.)
     #[test]
     fn run_sir_with_default_options_repeats_the_in_fit_sir() {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))

@@ -1282,7 +1282,7 @@ fn argmin_inner_fallback_keeps_better_basin() {
             (v - 2.0).powi(2) - 1.0
         }
     };
-    set_ebe_warm_start(false);
+    let cold = arm_inner_settings(InnerSettings::default());
 
     // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
     // keeps the lower-objective partial rather than overwriting with the shallow NM
@@ -1306,13 +1306,17 @@ fn argmin_inner_fallback_keeps_better_basin() {
 
     // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
     // from the deep well it stays there even though the cold seed is far away.
-    set_ebe_warm_start(true);
+    let warm = arm_inner_settings(InnerSettings {
+        warm: true,
+        ..Default::default()
+    });
     let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
     assert!(
         (eta4[0] + 2.0).abs() < 1e-2,
         "warm seed held the deep well, got {eta4:?}"
     );
-    set_ebe_warm_start(false);
+    drop(warm);
+    drop(cold);
 }
 
 #[test]
@@ -2302,11 +2306,15 @@ fn inner_optimizer_pin_reaches_same_ebe() {
     };
     let params = model.default_params.clone();
 
-    set_inner_optimizer(InnerOptimizer::Bfgs);
-    let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
-    set_inner_optimizer(InnerOptimizer::Lbfgs);
-    let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
-    set_inner_optimizer(InnerOptimizer::Auto);
+    let solve = |mode| {
+        let _mode = arm_inner_settings(InnerSettings {
+            mode,
+            ..Default::default()
+        });
+        find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0)
+    };
+    let bfgs = solve(InnerOptimizer::Bfgs);
+    let lbfgs = solve(InnerOptimizer::Lbfgs);
 
     assert!(bfgs.converged && lbfgs.converged, "both must converge");
     for k in 0..model.n_eta {
@@ -3003,15 +3011,40 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
     }
 }
 
-/// `set_ebe_warm_start` round-trips through the fit-scoped global the EBE
-/// fallback reads, and defaults to `false` (matching `FitOptions::default`).
+/// The inner settings the EBE solves read are armed per thread and restored LIFO, a panic
+/// included, and an unarmed thread reads the defaults (`Auto`, warm start off — matching
+/// `FitOptions::default`). #426: they were process globals that every `fit()` wrote and none
+/// restored. Mutation: make the guard's `drop` a no-op → the post-drop reads keep the armed
+/// value.
 #[test]
-fn ebe_warm_start_flag_round_trips() {
-    assert!(!ebe_warm_start_enabled(), "default must be off");
-    set_ebe_warm_start(true);
-    assert!(ebe_warm_start_enabled());
-    set_ebe_warm_start(false);
-    assert!(!ebe_warm_start_enabled());
+fn inner_settings_guard_round_trips() {
+    let read = || (inner_optimizer_mode(), ebe_warm_start_enabled());
+    assert_eq!(read(), (InnerOptimizer::Auto, false), "default");
+    let outer = arm_inner_settings(InnerSettings {
+        mode: InnerOptimizer::Lbfgs,
+        warm: true,
+    });
+    assert_eq!(read(), (InnerOptimizer::Lbfgs, true), "armed");
+    let nested = arm_inner_settings(InnerSettings::default());
+    assert_eq!(
+        read(),
+        (InnerOptimizer::Auto, false),
+        "a nested default arm reads the default, not the enclosing call's settings"
+    );
+    drop(nested);
+    assert_eq!(read(), (InnerOptimizer::Lbfgs, true), "nested restored");
+    drop(outer);
+    assert_eq!(read(), (InnerOptimizer::Auto, false), "outer restored");
+
+    let unwound = std::panic::catch_unwind(|| {
+        let _armed = arm_inner_settings(InnerSettings {
+            mode: InnerOptimizer::NelderMead,
+            warm: true,
+        });
+        panic!("inside the scope");
+    });
+    assert!(unwound.is_err());
+    assert_eq!(read(), (InnerOptimizer::Auto, false), "restored on unwind");
 }
 
 /// A minimal non-IOV 1-cpt IV model (`CL = TVCL·exp(η)`, `V = TVV`) shared by
@@ -3555,7 +3588,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         !skip_ode_iov_nm_fallback(&model),
         "fixture must take the closed-form NM fallback arm"
     );
-    set_ebe_warm_start(false);
+    let _cold = arm_inner_settings(InnerSettings::default());
 
     // Two occasions, one 100 mg IV bolus each; observations simulated at
     // CL = 5·exp(−1.5), V = 50 (see the test doc) so the mode is far from the zero seed.
@@ -3676,7 +3709,7 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
             (v - 2.0).powi(2) - 1.0
         }
     };
-    set_ebe_warm_start(false);
+    let _cold = arm_inner_settings(InnerSettings::default());
     let partial = [-1.5];
     let f_partial = obj(&partial);
 

@@ -2531,75 +2531,76 @@ const LBFGS_MEMORY: usize = 8;
 /// in [`InnerOptimizer::Auto`]; an explicit `inner_optimizer` pins the solver.
 pub const INNER_LBFGS_MIN_DIM: usize = 32;
 
-/// Fit-scoped inner-loop optimizer mode, set once per fit from
-/// `FitOptions::inner_optimizer` via [`set_inner_optimizer`] and read by the inner
-/// dispatch. Stored as the [`InnerOptimizer`] discriminant (`0 = Auto`, the
-/// default), so a fit that never sets it behaves exactly as before. A plain
-/// process-global (not threaded through every `find_ebe` caller) because the
-/// inner loop fans out over subjects via rayon and they all read one fit setting.
-static INNER_OPT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The inner-loop settings an EBE solve runs under: `FitOptions::inner_optimizer` and
+/// `FitOptions::ebe_warm_start` of the call that scheduled it. The default (`Auto`, warm
+/// start off) is what a thread outside any fit-scoped call reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct InnerSettings {
+    pub(crate) mode: crate::types::InnerOptimizer,
+    pub(crate) warm: bool,
+}
 
-/// Set the inner-loop optimizer for the current fit. Call once at fit start.
-pub fn set_inner_optimizer(mode: crate::types::InnerOptimizer) {
-    use crate::types::InnerOptimizer::*;
-    let code = match mode {
-        Auto => 0,
-        Bfgs => 1,
-        Lbfgs => 2,
-        NelderMead => 3,
-    };
-    INNER_OPT_MODE.store(code, std::sync::atomic::Ordering::Relaxed);
+impl InnerSettings {
+    /// True for the settings a thread with nothing armed reads, i.e. arming this is a no-op.
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+// Where the settings live: one thread-local, and the pool that carries it — the same shape,
+// for the same reasons, as the ODE solver override (`ode::solver::LOCAL_OVERRIDE`). They were
+// process globals until #426, written by every `fit()` and never restored, so a fit in one
+// thread could switch the inner solver of a fit, SIR or covariance step running in another,
+// mid-run. The per-subject solves fan out over rayon, so arming the calling thread is not
+// enough: a call with non-default settings runs on a pool whose workers were started with the
+// same value installed (`api::pool::FitScope`), and a worker of the shared pool installs
+// nothing and reads the default.
+thread_local! {
+    /// `None` outside any fit-scoped call (and on every worker of the shared pool), which
+    /// reads as [`InnerSettings::default`].
+    static LOCAL_INNER: std::cell::Cell<Option<InnerSettings>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The inner settings in force on this thread.
+pub(crate) fn current_inner_settings() -> InnerSettings {
+    LOCAL_INNER.get().unwrap_or_default()
 }
 
 fn inner_optimizer_mode() -> crate::types::InnerOptimizer {
-    use crate::types::InnerOptimizer::*;
-    match INNER_OPT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => Bfgs,
-        2 => Lbfgs,
-        3 => NelderMead,
-        _ => Auto,
-    }
-}
-
-/// Fit-scoped flag for [`FitOptions::ebe_warm_start`](crate::types::FitOptions),
-/// set via [`set_ebe_warm_start`] and read in the EBE Nelder–Mead fallback. Defaults
-/// to `false` to match `FitOptions::default()` (the historical cold-restart
-/// behaviour); a plain process-global for the same reason as [`INNER_OPT_MODE`]
-/// (the inner loop fans out over subjects via rayon).
-static EBE_WARM_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Set whether the inner NM fallback warm-starts from the BFGS partial. Call once
-/// at fit start.
-pub fn set_ebe_warm_start(on: bool) {
-    EBE_WARM_START.store(on, std::sync::atomic::Ordering::Relaxed);
+    current_inner_settings().mode
 }
 
 fn ebe_warm_start_enabled() -> bool {
-    EBE_WARM_START.load(std::sync::atomic::Ordering::Relaxed)
+    current_inner_settings().warm
 }
 
-/// Run `f` with the inner-loop optimizer and the EBE warm start set to `mode` / `warm`,
-/// then put back whatever the process held before — also when `f` panics. For a post-hoc
-/// step (SIR) that must re-solve EBEs with the settings it records, without leaking them
-/// into the next standalone call the way an unscoped `set_*` does (#1767). Not a fix for
-/// concurrent callers: the globals stay process-wide (#426).
-pub(crate) fn with_inner_settings<R>(
-    mode: crate::types::InnerOptimizer,
-    warm: bool,
-    f: impl FnOnce() -> R,
-) -> R {
-    use std::sync::atomic::Ordering::Relaxed;
-    struct Restore(u8, bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            INNER_OPT_MODE.store(self.0, Relaxed);
-            EBE_WARM_START.store(self.1, Relaxed);
-        }
+/// Install `s` for a pool worker's whole lifetime (its `start_handler`).
+pub(crate) fn install_worker_inner_settings(s: InnerSettings) {
+    LOCAL_INNER.set(Some(s));
+}
+
+/// Arms the inner settings on this thread until the guard drops, restoring whatever was in
+/// force before — on every exit path, a panic included. Arming reaches this thread only; work
+/// that fans out over rayon goes through `api::pool::with_fit_scope` or
+/// `api::pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
+#[must_use = "the inner settings are disarmed as soon as this guard drops"]
+pub(crate) struct InnerSettingsGuard {
+    prev: Option<InnerSettings>,
+}
+
+/// See [`InnerSettingsGuard`]. A default `s` arms `Some(default)`, so a nested call that
+/// expressed no opinion reads the default, not the enclosing call's settings.
+pub(crate) fn arm_inner_settings(s: InnerSettings) -> InnerSettingsGuard {
+    InnerSettingsGuard {
+        prev: LOCAL_INNER.replace(Some(s)),
     }
-    let _restore = Restore(INNER_OPT_MODE.load(Relaxed), EBE_WARM_START.load(Relaxed));
-    set_inner_optimizer(mode);
-    set_ebe_warm_start(warm);
-    f()
+}
+
+impl Drop for InnerSettingsGuard {
+    fn drop(&mut self) {
+        LOCAL_INNER.set(self.prev);
+    }
 }
 
 /// `FERX_PROFILE=1` attribution counters for the inner loop: how many EBE solves

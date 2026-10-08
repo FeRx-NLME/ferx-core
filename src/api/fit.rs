@@ -547,11 +547,11 @@ fn fit_unstamped(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
-    // Apply the fit-scoped inner-loop optimizer choice before any EBE solve runs.
-    // `Auto` (the default) reproduces the historical size-based dispatch, so this
-    // is a no-op unless the user pinned `inner_optimizer`.
-    crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
-    crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #426: this call's `inner_optimizer` / `ebe_warm_start` are armed by `install_on_fit_pool`
+    // (on the thread that runs the fit, and on the workers of the pool it picks), not here: unlike the ODE
+    // override below, nothing before the pool solves an EBE. They were process globals that
+    // every fit wrote and none restored, so a fit in another thread could switch this one's
+    // inner solver mid-run.
     // #1212: carry this call's ODE solver settings the last hop to the integrator. The
     // spec's `solver_opts` is stamped at parse time by `sync_ode_solver_opts`, every
     // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
@@ -561,8 +561,11 @@ fn fit_unstamped(
     // same options as the fit; the guard disarms on every exit path, including an early `?`,
     // so a later `predict` on the same model is unaffected. The fan-out is covered separately,
     // by `install_on_fit_pool`: arming reaches this thread only, and the workers that do the
-    // integrating get the value from the pool built for it.
-    let _ode_solver_override =
+    // integrating get the value from the pool built for it. The guard is dropped right before
+    // `install_on_fit_pool`, which arms it again on the thread that runs the fit: held across
+    // that `install`, a worker blocked in it would hand this value to the jobs of its own pool
+    // that it runs while waiting (#1801 review, finding 2).
+    let ode_solver_override =
         crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
@@ -909,6 +912,9 @@ fn fit_unstamped(
             ));
         }
     }
+
+    // Pre-pool validation is over; `install_on_fit_pool` re-arms on the thread it runs on.
+    drop(ode_solver_override);
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {

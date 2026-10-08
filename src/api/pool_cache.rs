@@ -1,6 +1,5 @@
 //! Persistent shared pools and exclusive leases for fit worker reuse.
-use super::fit_thread_pool_builder;
-use crate::ode::solver::OdeSolverOverride;
+use super::{fit_thread_pool_builder, FitScope};
 use std::collections::VecDeque;
 use std::ops::Deref;
 #[cfg(test)]
@@ -9,23 +8,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 struct CachedPool {
     pool: rayon::ThreadPool,
-    ov: OdeSolverOverride,
+    scope: FitScope,
 }
 
 struct SharedCachedPool {
     pool: OnceLock<Result<Arc<rayon::ThreadPool>, String>>,
     threads: usize,
-    ov: OdeSolverOverride,
+    scope: FitScope,
 }
 
-fn build_pool(threads: usize, ov: OdeSolverOverride) -> Result<rayon::ThreadPool, String> {
+fn build_pool(threads: usize, scope: FitScope) -> Result<rayon::ThreadPool, String> {
     fit_thread_pool_builder()
         .num_threads(threads)
-        .start_handler(move |_| {
-            if !ov.is_empty() {
-                crate::ode::solver::install_worker_ode_override(ov);
-            }
-        })
+        .start_handler(move |_| scope.install_on_worker())
         .build()
         .map_err(|e| format!("failed to build rayon pool with {threads} threads: {e}"))
 }
@@ -50,12 +45,12 @@ impl PoolCache {
     pub(super) fn acquire(
         &self,
         threads: usize,
-        ov: OdeSolverOverride,
+        scope: FitScope,
     ) -> Result<FitPoolLease<'_>, String> {
         if threads == 0 {
             return Err("thread count must be positive".to_string());
         }
-        ov.validate()?;
+        scope.validate()?;
         let cached = {
             let mut idle = self
                 .idle
@@ -63,7 +58,9 @@ impl PoolCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Search newest first to keep recently used workers hot.
             idle.iter()
-                .rposition(|p| p.pool.current_num_threads() == threads && p.ov.same_pool_key(&ov))
+                .rposition(|p| {
+                    p.pool.current_num_threads() == threads && p.scope.same_pool_key(&scope)
+                })
                 .and_then(|i| idle.remove(i))
         };
         let entry = match cached {
@@ -71,8 +68,8 @@ impl PoolCache {
             None => CachedPool {
                 // Build outside the lock: unrelated fits can acquire/return
                 // their leases while OS threads are being started.
-                pool: build_pool(threads, ov)?,
-                ov,
+                pool: build_pool(threads, scope)?,
+                scope,
             },
         };
         Ok(FitPoolLease {
@@ -106,7 +103,7 @@ impl PoolCache {
 }
 
 /// Shared pools for unpinned calls. Such calls did not request an independent
-/// worker budget, so callers with identical ODE settings may use one pool
+/// worker budget, so callers with identical ODE and inner settings may use one pool
 /// concurrently instead of multiplying the process worker count.
 pub(super) struct SharedPoolCache {
     pools: Mutex<VecDeque<Arc<SharedCachedPool>>>,
@@ -128,12 +125,12 @@ impl SharedPoolCache {
     pub(super) fn acquire(
         &self,
         threads: usize,
-        ov: OdeSolverOverride,
+        scope: FitScope,
     ) -> Result<Arc<rayon::ThreadPool>, String> {
         if threads == 0 {
             return Err("thread count must be positive".to_string());
         }
-        ov.validate()?;
+        scope.validate()?;
         let entry = {
             let mut pools = self
                 .pools
@@ -141,7 +138,7 @@ impl SharedPoolCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(index) = pools
                 .iter()
-                .rposition(|p| p.threads == threads && p.ov.same_pool_key(&ov))
+                .rposition(|p| p.threads == threads && p.scope.same_pool_key(&scope))
             {
                 let entry = pools.remove(index).expect("matching shared pool");
                 let entry = Arc::clone(&entry);
@@ -151,7 +148,7 @@ impl SharedPoolCache {
                 let entry = Arc::new(SharedCachedPool {
                     pool: OnceLock::new(),
                     threads,
-                    ov,
+                    scope,
                 });
                 pools.push_back(Arc::clone(&entry));
                 let mut workers: usize = pools.iter().map(|p| p.threads).sum();
@@ -172,7 +169,7 @@ impl SharedPoolCache {
             .get_or_init(|| {
                 #[cfg(test)]
                 self.build_count.fetch_add(1, Ordering::Relaxed);
-                build_pool(threads, ov).map(Arc::new)
+                build_pool(threads, scope).map(Arc::new)
             })
             .clone();
         if result.is_err() {

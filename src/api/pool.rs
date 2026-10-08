@@ -166,6 +166,91 @@ pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
 mod cache;
 use cache::{FitPoolLease, PoolCache, SharedPoolCache};
 
+/// Everything a fit-scoped call's workers must carry so that a per-subject solve reads the
+/// call's own settings: the ODE solver override (#1212) and the inner-loop settings (#426).
+/// It is the key of the fit pools, so a worker serves only calls with exactly this value and
+/// "which call am I serving?" has one answer per thread. The empty scope (no ODE override,
+/// default inner settings) is what the shared pool's workers carry, by installing nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct FitScope {
+    pub(crate) ode: crate::ode::solver::OdeSolverOverride,
+    pub(crate) inner: crate::estimation::inner_optimizer::InnerSettings,
+}
+
+impl FitScope {
+    pub(crate) fn of(options: &FitOptions) -> Self {
+        Self {
+            ode: options.ode_solver_override(),
+            inner: options.inner_settings(),
+        }
+    }
+
+    /// True when a worker carrying this scope installs nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ode.is_empty() && self.inner.is_default()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.ode.validate()
+    }
+
+    /// Pool-key equality: the ODE half bit-compared (see
+    /// [`OdeSolverOverride::same_pool_key`](crate::ode::solver::OdeSolverOverride)), the
+    /// inner half by value.
+    pub(crate) fn same_pool_key(&self, other: &Self) -> bool {
+        self.ode.same_pool_key(&other.ode) && self.inner == other.inner
+    }
+
+    /// `f` with both halves armed on whichever thread runs it, for the duration of the call.
+    ///
+    /// Arm inside the closure an `install` moves, never on the calling thread before it. A
+    /// Rayon worker blocked in a cross-pool `install` keeps running its own pool's queued jobs
+    /// while it waits, and those jobs belong to *its* pool's scope: a guard armed on it across
+    /// the `install` is what they would read (#1801 review, finding 1 — a job stolen during a
+    /// default-options nested call on an `(Lbfgs, warm)` worker read `(Auto, false)`).
+    fn armed<R>(self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+        move || {
+            let _ode = crate::ode::solver::arm_ode_solver_override(self.ode);
+            let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
+            f()
+        }
+    }
+
+    /// Install this scope for a pool worker's whole lifetime (its `start_handler`).
+    pub(super) fn install_on_worker(self) {
+        if !self.ode.is_empty() {
+            crate::ode::solver::install_worker_ode_override(self.ode);
+        }
+        if !self.inner.is_default() {
+            crate::estimation::inner_optimizer::install_worker_inner_settings(self.inner);
+        }
+        WORKER_SCOPE.set(Some(self));
+    }
+}
+
+impl From<crate::ode::solver::OdeSolverOverride> for FitScope {
+    fn from(ode: crate::ode::solver::OdeSolverOverride) -> Self {
+        Self {
+            ode,
+            ..Default::default()
+        }
+    }
+}
+
+thread_local! {
+    /// The scope this thread's pool installed at worker start. `None` on any thread that is
+    /// not a worker of a fit pool built by `pool_cache::build_pool` — the shared default pool,
+    /// a plain Rayon pool, a caller thread — all of which carry the empty scope. Distinct from
+    /// what a guard has armed on this thread: the jobs a `par_iter` spawns run on this
+    /// thread's *siblings*, which read what the pool installed, not this thread's guards.
+    static WORKER_SCOPE: std::cell::Cell<Option<FitScope>> = const { std::cell::Cell::new(None) };
+}
+
+/// The scope the current thread's pool gave its workers (empty when there is none).
+fn worker_scope() -> FitScope {
+    WORKER_SCOPE.get().unwrap_or_default()
+}
+
 fn fit_pool_cache() -> &'static PoolCache {
     static CACHE: std::sync::OnceLock<PoolCache> = std::sync::OnceLock::new();
     // Ordinarily retain at most twice the automatic worker budget (at most 16
@@ -179,39 +264,43 @@ fn shared_override_pool_cache() -> &'static SharedPoolCache {
     CACHE.get_or_init(|| SharedPoolCache::new(default_thread_count() * 2))
 }
 
-/// Lease a pool carrying exactly this override. Idle pools are reused, but active
+/// Lease a pool carrying exactly this scope. Idle pools are reused, but active
 /// callers never share one: identical settings must not collapse a batch's
-/// independently budgeted fits onto a single pool. Workers keep immutable ODE
-/// settings for their lifetime; eviction bounds ordinary idle workers across
+/// independently budgeted fits onto a single pool. Workers keep immutable ODE and
+/// inner settings for their lifetime; eviction bounds ordinary idle workers across
 /// all keys while retaining one most-recent oversized pool.
 /// Acquisition never waits for a busy pool, including inside nested fits.
-pub(crate) fn ode_override_pool(
-    ov: crate::ode::solver::OdeSolverOverride,
+pub(crate) fn fit_scope_pool(
+    scope: FitScope,
     n_threads: usize,
 ) -> Result<FitPoolLease<'static>, String> {
-    fit_pool_cache().acquire(n_threads, ov)
+    fit_pool_cache().acquire(n_threads, scope)
 }
 
-fn shared_ode_override_pool(
-    ov: crate::ode::solver::OdeSolverOverride,
+fn shared_fit_scope_pool(
+    scope: FitScope,
     n_threads: usize,
 ) -> Result<std::sync::Arc<rayon::ThreadPool>, String> {
-    shared_override_pool_cache().acquire(n_threads, ov)
+    shared_override_pool_cache().acquire(n_threads, scope)
 }
-/// Run `f` with `options`' ODE solver settings reaching every thread that can integrate for
-/// it: armed on this thread, and — when the caller actually set one — on a pool whose workers
-/// carry the same value (see [`ode_override_pool`]).
+
+/// Run `f` with `options`' fit scope — its ODE solver settings and its inner-loop settings —
+/// reaching every thread that can solve for it: armed on whichever thread runs `f`, and run on
+/// a pool whose workers carry the same value (see [`fit_scope_pool`]).
 ///
 /// Used by the standalone `run_covariance` / `run_sir` / `run_sir_core` entry points, which
-/// integrate exactly as `fit` does but may have no pool of their own. When `run_sir_core` is
-/// reached from inside `fit`, the current worker already carries the override and this runs
-/// inline, avoiding a second full-width pool.
-pub(crate) fn with_fit_ode_scope<R: Send>(
+/// re-solve the inner loop exactly as `fit` does but may have no pool of their own. Runs
+/// inline only when the current thread is a worker of a pool that already carries this exact
+/// scope — `run_sir_core` reached from inside `fit` — so no second full-width pool is leased.
+/// A worker carrying a *different* scope is left, also when the requested one is empty:
+/// otherwise the `par_iter` jobs inside `f` would run on that worker's siblings and read the
+/// enclosing call's settings (#426).
+pub(crate) fn with_fit_scope<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
 ) -> Result<R, String> {
-    let ov = options.ode_solver_override();
-    ov.validate()?;
+    let scope = FitScope::of(options);
+    scope.validate()?;
     let requested_threads = options
         .threads
         .filter(|&n| n > 0)
@@ -219,23 +308,25 @@ pub(crate) fn with_fit_ode_scope<R: Send>(
     // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
     // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
     // CPU, which is the pool this engine never wants to own (#1460).
-    let on_worker = rayon::current_thread_index().is_some();
-    let already_scoped = on_worker
-        && crate::ode::solver::worker_carries_ode_override(ov)
-        && rayon::current_num_threads() == requested_threads;
-    let _armed = crate::ode::solver::arm_ode_solver_override(ov);
-    if already_scoped {
+    let carried = rayon::current_thread_index().is_some() && worker_scope().same_pool_key(&scope);
+    let f = scope.armed(f);
+    if scope.is_empty() {
+        // Nothing for workers to carry, but `f` still `par_iter`s (SIR weighting, the
+        // covariance step's per-subject passes). On a worker that also carries nothing, stay
+        // there, keeping an enclosing tool's budget as `install_on_pool_sized` does; anywhere
+        // else, a ferx pool of the width the caller asked for.
+        return Ok(if carried {
+            f()
+        } else {
+            install_on_ferx_pool_sized(requested_threads, f)
+        });
+    }
+    if carried && rayon::current_num_threads() == requested_threads {
         return Ok(f());
     }
-    if ov.is_empty() {
-        // No override for workers to carry, but `f` still `par_iter`s (SIR weighting, the
-        // covariance step's per-subject passes). Off a worker that would be the global
-        // pool, so put it on a ferx pool of the width the caller asked for.
-        return Ok(install_on_pool_sized(requested_threads, f));
-    }
     match options.threads.filter(|&n| n > 0) {
-        Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
-        None => Ok(shared_ode_override_pool(ov, requested_threads)?.install(f)),
+        Some(n) => Ok(fit_scope_pool(scope, n)?.install(f)),
+        None => Ok(shared_fit_scope_pool(scope, requested_threads)?.install(f)),
     }
 }
 
@@ -265,39 +356,47 @@ pub(crate) fn install_on_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() 
     if rayon::current_thread_index().is_some() {
         return f();
     }
+    install_on_ferx_pool_sized(n_threads, f)
+}
+
+/// [`install_on_pool_sized`] without the stay-on-the-current-worker shortcut: always a pool
+/// whose workers carry the empty scope.
+fn install_on_ferx_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R + Send) -> R {
     match default_fit_pool() {
         Some(pool) if pool.current_num_threads() == n_threads => pool.install(f),
-        _ => match fit_pool_cache().acquire(n_threads, Default::default()) {
+        _ => match fit_pool_cache().acquire(n_threads, FitScope::default()) {
             Ok(lease) => lease.install(f),
             Err(_) => f(),
         },
     }
 }
 
-/// Run `f` on the pool this `fit()` call should use, with its ODE settings armed.
+/// Run `f` on the pool this `fit()` call should use, with its fit scope armed on the thread
+/// that runs it (never on this one across the `install`; see `FitScope::armed`).
 ///
-/// Pool choice, in order: a pool carrying this call's ODE override when it set one (shared for
-/// unpinned fits, exclusive for a positive `threads` budget); an exclusively leased plain pool
-/// sized to a pinned `threads`; otherwise the shared big-stack pool, falling back to the ambient
-/// one only if that one-time build failed. One pool serves both levels of a multi-start fan-out,
-/// which is why this is called once per `fit()` and not per start.
+/// Pool choice, in order: a pool carrying this call's scope when it is not empty — an ODE
+/// override or non-default inner settings (shared for unpinned fits, exclusive for a positive
+/// `threads` budget); an exclusively leased plain pool sized to a pinned `threads`; otherwise
+/// the shared big-stack pool, falling back to the ambient one only if that one-time build
+/// failed. One pool serves both levels of a multi-start fan-out, which is why this is called
+/// once per `fit()` and not per start.
 pub(crate) fn install_on_fit_pool<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
 ) -> Result<R, String> {
-    let ov = options.ode_solver_override();
-    ov.validate()?;
-    let _armed = crate::ode::solver::arm_ode_solver_override(ov);
-    if !ov.is_empty() {
+    let scope = FitScope::of(options);
+    scope.validate()?;
+    let f = scope.armed(f);
+    if !scope.is_empty() {
         return match options.threads.filter(|&n| n > 0) {
-            Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
-            None => Ok(shared_ode_override_pool(ov, effective_default_threads())?.install(f)),
+            Some(n) => Ok(fit_scope_pool(scope, n)?.install(f)),
+            None => Ok(shared_fit_scope_pool(scope, effective_default_threads())?.install(f)),
         };
     }
     match options.threads.filter(|&n| n > 0) {
         // A pinned positive `threads` leases an idle pool or builds a new one,
         // preserving independently budgeted concurrent fits.
-        Some(n) => Ok(fit_pool_cache().acquire(n, Default::default())?.install(f)),
+        Some(n) => Ok(fit_pool_cache().acquire(n, FitScope::default())?.install(f)),
         None => Ok(match default_fit_pool() {
             Some(pool) => pool.install(f),
             None => f(),

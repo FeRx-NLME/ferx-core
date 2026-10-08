@@ -9241,6 +9241,15 @@ pub(crate) fn interaction_for(method: EstimationMethod, inherited: bool) -> bool
 }
 
 impl FitOptions {
+    /// The inner-loop settings this call's EBE solves run under (#426), armed by `fit` and
+    /// by the post-hoc entry points through `api::pool::with_fit_scope`.
+    pub(crate) fn inner_settings(&self) -> crate::estimation::inner_optimizer::InnerSettings {
+        crate::estimation::inner_optimizer::InnerSettings {
+            mode: self.inner_optimizer,
+            warm: self.ebe_warm_start,
+        }
+    }
+
     /// The ODE solver fields this caller moved away from their defaults (#1212).
     ///
     /// [`fit`](crate::fit) takes `&CompiledModel` and so cannot restamp the spec that

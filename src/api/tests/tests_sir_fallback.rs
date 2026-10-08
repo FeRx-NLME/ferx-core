@@ -317,14 +317,14 @@ fn apply_sir_result_clears_every_field_when_sir_did_not_run() {
 /// model returns a κ interval, and records the settings it scored under.
 /// `warfarin_iov` (one kappa), a tame PD proposal as in `warfarin_fixture`,
 /// FOCE as the file declares it — FD inner gradients. Every recorded setting
-/// is off its default except the two process-global ones, `inner_optimizer`
-/// and `ebe_warm_start`: `run_sir_core` now applies them for its run (#1767),
-/// and a non-default value written here would reach a concurrent test's fit in
-/// this shared binary. They are pinned in `tests/run_sir_inner_settings_scope.rs`
-/// and by the resolve test. So a `run_sir_core` that stamped `Default` (or read
-/// a field from the defaults in `SirSettings::from_options`) fails the
-/// equality. Mutations: stamp `SirSettings::default()` in `run_sir_core`; drop
-/// κ from the SIR.
+/// is off its default, `inner_optimizer` and `ebe_warm_start` included: since
+/// #426 they are per call, so a non-default value here reaches only this
+/// test's own draws. So a `run_sir_core` that stamped `Default` fails the
+/// equality with `from_options`; that equality cannot see a field
+/// `from_options` itself drops, so the two inner settings are also asserted
+/// against the options directly. Mutations: stamp `SirSettings::default()` in
+/// `run_sir_core`; read `inner_optimizer` or `ebe_warm_start` from the defaults
+/// in `SirSettings::from_options`; drop κ from the SIR.
 #[test]
 fn resolve_sir_fallback_records_its_settings_and_kappa() {
     let prep = crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
@@ -350,6 +350,8 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
         inner_tol: 2e-5,
         mu_referencing: false,
         n_agq: 3,
+        inner_optimizer: crate::types::InnerOptimizer::Lbfgs,
+        ebe_warm_start: true,
         ode_reltol: 2e-4,
         ode_abstol: 2e-6,
         ode_max_steps: 9_000,
@@ -386,6 +388,13 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     );
     assert_eq!(sir.settings, want);
     assert_eq!(sir.settings.seed, 1713);
+    // `want` comes from `from_options` itself, so the equality above cannot see a field
+    // `from_options` drops; the per-call inner settings are pinned against the options directly.
+    assert_eq!(
+        (sir.settings.inner_optimizer, sir.settings.ebe_warm_start),
+        (crate::types::InnerOptimizer::Lbfgs, true),
+        "the recorded inner settings must be the ones passed"
+    );
 }
 
 /// T8 (#1758): a fit whose SIR did not run reports neither a seed nor

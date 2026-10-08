@@ -1,5 +1,7 @@
 use super::*;
-use crate::ode::solver::{effective_solver_options, OdeMethod, OdeSolverOptions};
+use crate::ode::solver::{
+    effective_solver_options, OdeMethod, OdeSolverOptions, OdeSolverOverride,
+};
 use std::collections::HashSet;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -34,7 +36,7 @@ fn settings_and_width_are_part_of_the_key() {
         ..Default::default()
     };
     let id = {
-        let p = cache.acquire(1, base).unwrap();
+        let p = cache.acquire(1, base.into()).unwrap();
         worker(&p)
     };
     for ov in [
@@ -68,7 +70,7 @@ fn settings_and_width_are_part_of_the_key() {
             ..base
         },
     ] {
-        let p = cache.acquire(1, ov).unwrap();
+        let p = cache.acquire(1, ov.into()).unwrap();
         assert_ne!(id, worker(&p));
         let baked = OdeSolverOptions::default();
         p.install(|| {
@@ -82,10 +84,10 @@ fn settings_and_width_are_part_of_the_key() {
             assert_eq!(actual.auto_switch, expected.auto_switch);
         });
     }
-    let wide = cache.acquire(2, base).unwrap();
+    let wide = cache.acquire(2, base.into()).unwrap();
     assert_eq!(wide.current_num_threads(), 2);
     assert_ne!(worker(&wide), id);
-    assert_eq!(worker(&cache.acquire(1, base).unwrap()), id);
+    assert_eq!(worker(&cache.acquire(1, base.into()).unwrap()), id);
 }
 
 #[test]
@@ -96,13 +98,13 @@ fn idle_worker_budget_evicts_oldest_settings_and_keeps_one_oversized_pool() {
             max_steps: Some(n),
             ..Default::default()
         };
-        drop(cache.acquire(1, ov).unwrap());
+        drop(cache.acquire(1, ov.into()).unwrap());
     }
     {
         let idle = cache.idle.lock().unwrap();
         assert_eq!(idle.len(), 2);
-        assert_eq!(idle[0].ov.max_steps, Some(4));
-        assert_eq!(idle[1].ov.max_steps, Some(5));
+        assert_eq!(idle[0].scope.ode.max_steps, Some(4));
+        assert_eq!(idle[1].scope.ode.max_steps, Some(5));
     }
     let wide_workers = {
         let wide = cache.acquire(3, Default::default()).unwrap();
@@ -129,9 +131,67 @@ fn shared_cache_reuses_one_live_pool_for_identical_unpinned_calls() {
         reltol: Some(1e-9),
         ..Default::default()
     };
-    let first = cache.acquire(2, ov).unwrap();
-    let second = cache.acquire(2, ov).unwrap();
+    let first = cache.acquire(2, ov.into()).unwrap();
+    let second = cache.acquire(2, ov.into()).unwrap();
     assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+/// #426 T2: the inner-loop settings are part of the key, in both caches, so a pool whose
+/// workers were started with one call's inner solver never serves a call asking for another.
+/// Mutation: `FitScope::same_pool_key` ignores `inner` → the idle `(Lbfgs, true)` lease is
+/// handed to the default request (same worker), and the shared cache returns one `Arc` for
+/// both keys.
+#[test]
+fn inner_settings_are_part_of_the_key() {
+    use crate::estimation::inner_optimizer::{current_inner_settings, InnerSettings};
+    use crate::types::InnerOptimizer;
+    let lbfgs = FitScope {
+        inner: InnerSettings {
+            mode: InnerOptimizer::Lbfgs,
+            warm: true,
+        },
+        ..Default::default()
+    };
+    let cache = PoolCache::new(16);
+    let id = {
+        let p = cache.acquire(1, lbfgs).unwrap();
+        assert_eq!(p.install(current_inner_settings), lbfgs.inner, "premise");
+        worker(&p)
+    };
+    for other in [
+        FitScope::default(),
+        FitScope {
+            inner: InnerSettings {
+                warm: false,
+                ..lbfgs.inner
+            },
+            ..lbfgs
+        },
+        FitScope {
+            inner: InnerSettings {
+                mode: InnerOptimizer::Bfgs,
+                ..lbfgs.inner
+            },
+            ..lbfgs
+        },
+    ] {
+        let p = cache.acquire(1, other).unwrap();
+        assert_ne!(id, worker(&p), "{other:?} reused the {lbfgs:?} pool");
+        assert_eq!(p.install(current_inner_settings), other.inner);
+    }
+    assert_eq!(
+        worker(&cache.acquire(1, lbfgs).unwrap()),
+        id,
+        "same key reuses"
+    );
+
+    let shared = SharedPoolCache::new(8);
+    let a = shared.acquire(2, lbfgs).unwrap();
+    let b = shared.acquire(2, FitScope::default()).unwrap();
+    assert!(
+        !Arc::ptr_eq(&a, &b),
+        "shared cache collapsed two inner keys"
+    );
 }
 
 #[test]
@@ -215,7 +275,7 @@ fn invalid_rust_api_overrides_are_rejected_before_pool_build() {
             "ode_max_steps",
         ),
     ] {
-        let err = cache.acquire(1, ov).err().expect("invalid override");
+        let err = cache.acquire(1, ov.into()).err().expect("invalid override");
         assert!(err.contains(field), "{err}");
     }
     assert!(cache.idle.lock().unwrap().is_empty());

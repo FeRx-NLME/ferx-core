@@ -65,11 +65,11 @@ pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{
     configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
 };
-pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_ode_scope};
+pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope};
 // Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
 // private to `api`, so a test elsewhere in the crate needs the re-export.
 #[cfg(test)]
-pub(crate) use pool::{default_fit_pool, ode_override_pool};
+pub(crate) use pool::{default_fit_pool, fit_scope_pool};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, apply_sir_result, boundary_estimate_warning,
     compute_eps_shrinkage, compute_eta_shrinkage, compute_kappa_shrinkage,

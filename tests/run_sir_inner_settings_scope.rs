@@ -1,20 +1,18 @@
-//! #1767 findings 1 and 2: SIR's inner solver is the one its `SirSettings` records, and
-//! it does not leak into the next standalone call.
+//! #1767 findings 1 and 2, restated for #426: SIR's inner solver is the one its
+//! `SirSettings` records, and nothing it or a `fit()` sets reaches the next standalone call.
 //!
-//! `inner_optimizer` / `ebe_warm_start` reach the EBE re-solves through process globals
-//! (#426). Before #1767, `run_sir_core` stamped them from `options` but never applied
-//! them, so a direct caller's record could name a solver that did not run; and `run_sir`
-//! applied them unscoped, before validation, so they outlived the call — even an `Err`.
+//! `inner_optimizer` / `ebe_warm_start` used to reach the EBE re-solves through process
+//! globals that every `fit()` wrote and none restored, so a post-hoc step scored with
+//! whichever solver the most recent fit in the process used. Since #426 they are carried by
+//! the call's own fit scope (a thread-local, and pools whose workers carry the same value), so
+//! each call reads its own options.
 //!
-//! Its own test binary, with one test, because the globals are process-wide: a
-//! concurrent test's `fit()` in a shared binary could move them mid-run.
-//!
-//! Fixture: warfarin, FD inner gradients. Mutations: drop `with_inner_settings` from
-//! `run_sir_core` (part 1: the draws follow the global); drop its `Restore` guard (part 2:
-//! the covariance step after SIR re-solves with lbfgs); set the globals in `run_sir`
-//! before validation again (part 3: the `Err` call leaks lbfgs).
+//! Fixture: warfarin, analytic (`Dual2`) inner gradients (measured). Mutations: drop the inner settings from the scope
+//! `run_sir_core` opens (part 1: the lbfgs draws come out as the default solver's); write a
+//! fit's inner settings to a global again (part 2: the default-options covariance step after
+//! an lbfgs fit re-solves with lbfgs); set them in `run_sir` before validation again (part 3:
+//! the `Err` call leaks lbfgs).
 
-use ferx_core::estimation::inner_optimizer::set_inner_optimizer;
 use ferx_core::estimation::parameterization::pack_params;
 use ferx_core::estimation::sir::run_sir_core;
 use ferx_core::{fit, prepare_run, run_covariance, run_sir, FitOptions, InnerOptimizer};
@@ -29,7 +27,7 @@ fn bits(m: &Option<DMatrix<f64>>) -> Vec<u64> {
 }
 
 #[test]
-fn sir_runs_with_its_recorded_inner_solver_and_restores_the_process_one() {
+fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     let prep = prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv")).expect("prepare");
     let model = &prep.parsed.model;
     let pop = &prep.population;
@@ -52,81 +50,86 @@ fn sir_runs_with_its_recorded_inner_solver_and_restores_the_process_one() {
         run_sir_core(model, pop, &params, &etas, &proposal, 0.0, &sir_opts(mode))
             .expect("run_sir_core")
     };
-    set_inner_optimizer(InnerOptimizer::Bfgs);
-    let lbfgs_under_bfgs = core(InnerOptimizer::Lbfgs);
-    let bfgs = core(InnerOptimizer::Bfgs);
-    set_inner_optimizer(InnerOptimizer::Lbfgs);
-    let lbfgs_under_lbfgs = core(InnerOptimizer::Lbfgs);
-    assert_eq!(
-        lbfgs_under_bfgs.settings.inner_optimizer,
-        InnerOptimizer::Lbfgs
-    );
+    let lbfgs = core(InnerOptimizer::Lbfgs);
+    let auto = core(InnerOptimizer::Auto);
+    assert_eq!(lbfgs.settings.inner_optimizer, InnerOptimizer::Lbfgs);
     assert_ne!(
-        bfgs.effective_sample_size.to_bits(),
-        lbfgs_under_lbfgs.effective_sample_size.to_bits(),
-        "premise: the inner solver must move the ESS on this fixture"
-    );
-    assert_eq!(
-        lbfgs_under_bfgs.effective_sample_size.to_bits(),
-        lbfgs_under_lbfgs.effective_sample_size.to_bits(),
-        "the recorded lbfgs must be what ran, whatever the process global held: {} vs {}",
-        lbfgs_under_bfgs.effective_sample_size,
-        lbfgs_under_lbfgs.effective_sample_size
+        lbfgs.effective_sample_size.to_bits(),
+        auto.effective_sample_size.to_bits(),
+        "the recorded lbfgs must be what the draws ran, not the unarmed default: {} vs {}",
+        lbfgs.effective_sample_size,
+        auto.effective_sample_size
     );
 
-    // ── 2. …and leaves the process's solver as it found it ────────────────────────
-    let fit_opts = FitOptions {
+    // ── 2. A default-options covariance step reads the default, whatever ran before ─
+    let fit_opts = |mode| FitOptions {
         verbose: false,
         run_covariance_step: true,
         sir: false,
+        inner_optimizer: mode,
         ..prep.parsed.fit_options.clone()
     };
-    let fitted = fit(model, pop, &prep.init_params, &fit_opts).expect("fit");
-    let quiet = FitOptions {
+    let fitted = fit(
+        model,
+        pop,
+        &prep.init_params,
+        &fit_opts(InnerOptimizer::Auto),
+    )
+    .expect("fit");
+    let quiet = |mode| FitOptions {
         verbose: false,
+        inner_optimizer: mode,
         ..FitOptions::default()
     };
-    let cov_under = |mode| {
-        set_inner_optimizer(mode);
+    let cov = |mode| {
         bits(
-            &run_covariance(&fitted, Some(model), Some(pop), &quiet)
+            &run_covariance(&fitted, Some(model), Some(pop), &quiet(mode))
                 .expect("run_covariance")
                 .covariance_matrix,
         )
     };
-    let cov_lbfgs = cov_under(InnerOptimizer::Lbfgs);
-    let cov_bfgs = cov_under(InnerOptimizer::Bfgs);
+    let cov_default = cov(InnerOptimizer::Auto);
     assert_ne!(
-        cov_bfgs, cov_lbfgs,
-        "premise: the covariance step must see the process's inner solver"
+        cov(InnerOptimizer::Lbfgs),
+        cov_default,
+        "premise: the covariance step must see the caller's inner solver on this fixture"
     );
-    core(InnerOptimizer::Lbfgs); // the global holds Bfgs going in
-    let after_core = bits(
-        &run_covariance(&fitted, Some(model), Some(pop), &quiet)
-            .expect("run_covariance")
-            .covariance_matrix,
-    );
+    core(InnerOptimizer::Lbfgs);
     assert_eq!(
-        after_core, cov_bfgs,
-        "run_sir_core must restore the process's inner solver"
+        cov(InnerOptimizer::Auto),
+        cov_default,
+        "run_sir_core's lbfgs must not outlive the call"
+    );
+    let short = FitOptions {
+        outer_maxiter: 2,
+        run_covariance_step: false,
+        ..fit_opts(InnerOptimizer::Lbfgs)
+    };
+    fit(model, pop, &prep.init_params, &short).expect("lbfgs fit");
+    assert_eq!(
+        cov(InnerOptimizer::Auto),
+        cov_default,
+        "an lbfgs fit must not change the inner solver of a later default-options call"
     );
 
-    // ── 3. A failing `run_sir` leaves it untouched too ────────────────────────────
+    // ── 3. A failing `run_sir` leaves nothing behind either ───────────────────────
     let mut no_cov = fitted.clone();
     no_cov.covariance_matrix = None;
     no_cov.sir_settings = Some(ferx_core::estimation::sir::SirSettings {
         inner_optimizer: InnerOptimizer::Lbfgs,
         ..Default::default()
     });
-    let err = run_sir(&no_cov, Some(model), Some(pop), &quiet).expect_err("no covariance");
+    let err = run_sir(
+        &no_cov,
+        Some(model),
+        Some(pop),
+        &quiet(InnerOptimizer::Auto),
+    )
+    .expect_err("no covariance");
     assert!(err.to_string().contains("covariance_matrix"), "{err}");
-    let after_err = bits(
-        &run_covariance(&fitted, Some(model), Some(pop), &quiet)
-            .expect("run_covariance")
-            .covariance_matrix,
-    );
     assert_eq!(
-        after_err, cov_bfgs,
-        "a run_sir that returned Err must not have moved the process's inner solver"
+        cov(InnerOptimizer::Auto),
+        cov_default,
+        "a run_sir that returned Err must not have moved the inner solver"
     );
 }
