@@ -341,8 +341,8 @@ parse with `bind_theta_levels`
 ([#1647](https://github.com/FeRx-NLME/ferx-core/issues/1647)). To simulate with the model's own initial
 estimates, bind a design the same way, on the population from
 `read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
-the fit instead, as described in
-[the next section](#simulate-with-fit-theta).
+the fit instead, as described
+[below](#simulate-with-fit-theta).
 
 ### Binding a bound model again
 
