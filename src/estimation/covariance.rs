@@ -554,6 +554,7 @@ pub(crate) fn assemble_score_cross_product(
                     i,
                     &eta_hats[i],
                     &h_matrices[i],
+                    kap_i,
                     bounds,
                     options,
                 ) {

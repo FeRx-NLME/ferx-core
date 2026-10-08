@@ -1661,10 +1661,19 @@ fn logdet_htilde_beta(d: f64, d2: f64, inv_r: f64) -> f64 {
 /// large-IIV components — see issue #274.
 ///
 /// `cache` carries the per-subject Laplace intermediates (`R`, `d`, `d2`, `G`,
-/// `H̃⁻¹`, `q`) the FOCEI gradient already formed at this point. The covariance
-/// step passes `Some(..)` so the correction does not recompute the predictions
-/// or re-factorise `H̃`. Pass `None` to have the correction re-derive them
-/// itself (used by the unit test and any FD-fallback subject).
+/// `H̃⁻¹`, `q`) the FOCEI gradient already formed at this point. The outer
+/// optimizer's fixed-EBE gradient passes `Some(..)` so the correction does not
+/// recompute the predictions or re-factorise `H̃`. Pass `None` to have the
+/// correction re-derive them itself (the covariance step's score assembly and
+/// the unit tests).
+///
+/// Also returns `None` wherever [`closed_form_fixed_ebe_grad_ok`] refuses, so the
+/// correction and the score it corrects share one predicate (#1779). The cache is
+/// the Almquist closed form's, which carries none of the terms that gate excludes:
+/// on a joint PK + TTE subject it has no hazard term, on an IOV subject no κ. The
+/// correction is zero today (#338 Part A); once #335 makes it non-zero, a cache
+/// built past the gate would make it wrong there silently.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_eta_response_correction(
     cache: Option<&LaplaceGradCache>,
     x: &[f64],
@@ -1674,6 +1683,7 @@ pub(crate) fn subject_eta_response_correction(
     subj_idx: usize,
     eta_hat: &DVector<f64>,
     h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Option<Vec<f64>> {
@@ -1688,6 +1698,9 @@ pub(crate) fn subject_eta_response_correction(
         "subject_eta_response_correction called with options.interaction=false; \
          the log|H̃| EBE-response correction is a FOCEI-only term"
     );
+    if !closed_form_fixed_ebe_grad_ok(model, template, kappas) {
+        return None;
+    }
     let n = x.len();
     let n_eta = model.n_eta;
     let n_obs = population.subjects[subj_idx].observations.len();
@@ -1695,8 +1708,8 @@ pub(crate) fn subject_eta_response_correction(
         return Some(vec![0.0; n]);
     }
 
-    // Reuse the gradient's per-subject intermediates when the covariance step
-    // already formed them (the common path); otherwise re-derive them by running
+    // Reuse the gradient's per-subject intermediates when the outer gradient
+    // already formed them; otherwise re-derive them by running
     // the cached Laplace gradient here. Either way the intermediates are the same
     // `R/d/d2/G/H̃⁻¹/q` the gradient uses, so the correction is unchanged. The
     // cache is kept live for #335 (the ω/σ blocks below will reuse it).
@@ -2017,10 +2030,11 @@ fn masked_fd_component(
 }
 
 /// [`subject_nll_pop_grad`] that additionally returns the [`LaplaceGradCache`]
-/// when this subject took the FOCEI Laplace analytical path — letting the
-/// covariance step's #274 EBE-response correction reuse the predictions and `H̃`
+/// when this subject took the FOCEI Laplace analytical path — letting the outer
+/// gradient's #274 EBE-response correction reuse the predictions and `H̃`
 /// factorisation rather than recomputing them. The cache is `None` for FOCE, for
-/// the M3/IOV/FD-fallback path, and when the Laplace gradient bails (non-PD `H̃`);
+/// anything [`closed_form_fixed_ebe_grad_ok`] excludes (the FD-fallback path), and
+/// when the Laplace gradient bails (non-PD `H̃`);
 /// in every `None` case the returned `(nll, grad)` is exactly what
 /// [`subject_nll_pop_grad`] returns, so callers can treat this as a drop-in.
 ///
@@ -2441,13 +2455,124 @@ mod tests {
         let x = pack_params(&template);
         let bounds = compute_bounds(&template);
         let t = subject_eta_response_correction(
-            None, &x, &template, &model, &pop, 0, &eta_hat, &h, &bounds, &opts,
+            None,
+            &x,
+            &template,
+            &model,
+            &pop,
+            0,
+            &eta_hat,
+            &h,
+            &[],
+            &bounds,
+            &opts,
         )
         .expect("correction computes");
         for (k, &v) in t.iter().enumerate() {
             assert_eq!(
                 v, 0.0,
                 "EBE-response correction must be zero at packed param {k}"
+            );
+        }
+    }
+
+    /// #1779: the `log|H̃|` EBE-response correction must decline through
+    /// `closed_form_fixed_ebe_grad_ok` itself, on every arm. Called with `cache = None`
+    /// (the covariance step's score assembly does) it re-derives the Almquist Laplace
+    /// cache, which carries none of the terms the gate excludes.
+    ///
+    /// Each closed cell shuts one arm of the open cell's model, so a guard spelled as
+    /// any subset of the gate fails the cell it leaves out — including the `kappas`
+    /// argument dropped for `&[]`, which the IOV cell (a real `kappa`, two occasions)
+    /// catches. The open cell fails a
+    /// guard stuck closed. Every cell has PK rows and an η, so none is decided by the
+    /// `n_eta == 0 || n_obs == 0` early return. The non-Gaussian arm needs `survival`
+    /// and is `non_gaussian::eta_response_correction_declines_through_the_fixed_ebe_gate`.
+    #[test]
+    fn eta_response_correction_follows_every_arm_of_the_fixed_ebe_gate() {
+        let combined = "DV ~ combined(PROP_ERR, ADD_ERR)";
+        let open = weighted_gn_model(combined, "");
+        let mut m3 = weighted_gn_model(combined, "");
+        m3.bloq_method = BloqMethod::M3;
+        let ruv_eta = weighted_gn_model(
+            &format!("{combined}\n  iiv_on_ruv = ETA_RUV"),
+            "  omega ETA_RUV ~ 0.05\n",
+        );
+        assert!(
+            ruv_eta.residual_error_eta.is_some(),
+            "fixture precondition: an η on the residual error"
+        );
+        let theta_ruv = weighted_gn_model(
+            "DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + RUV_W * WPSE))",
+            "  theta RUV_W(0.30, 0.01, 5.0)\n",
+        );
+        assert!(
+            theta_ruv.has_theta_dependent_ruv_magnitude(),
+            "fixture precondition: a θ-dependent RUV magnitude"
+        );
+        let block_sigma = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n  \
+             omega ETA_CL ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.02, 0.25]\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ combined(PROP_ERR, ADD_ERR)\n[covariates]\n  WPSE continuous\n",
+        )
+        .expect("block_sigma model parses");
+        assert!(
+            !block_sigma.default_params.residual_correlations.is_empty(),
+            "fixture precondition: a live residual correlation"
+        );
+        // The open model with a κ on CL, and a subject whose third row is a second
+        // occasion — the shape `kappas_per_subject[i]` is non-empty for in production.
+        let iov = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n  \
+             omega ETA_CL ~ 0.04\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.10 (sd)\n  \
+             sigma ADD_ERR ~ 0.50 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + \
+             KAPPA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[covariates]\n  WPSE continuous\n",
+        )
+        .expect("IOV model parses");
+        assert_eq!(iov.n_kappa, 1, "fixture precondition: one κ");
+        let iov_kappas = [DVector::from_vec(vec![0.1]), DVector::from_vec(vec![-0.1])];
+        let pop = weighted_gn_population();
+        let mut iov_pop = weighted_gn_population();
+        iov_pop.subjects[0].occasions = vec![1, 1, 2];
+        iov_pop.subjects[0].dose_occasions = vec![1];
+        let mut opts = FitOptions::default();
+        opts.interaction = true;
+        for (label, model, pop, kappas, gate_open) in [
+            ("open", &open, &pop, &[][..], true),
+            ("IOV κ", &iov, &iov_pop, &iov_kappas[..], false),
+            ("M3", &m3, &pop, &[][..], false),
+            ("η on RUV", &ruv_eta, &pop, &[][..], false),
+            (
+                "θ-dependent RUV magnitude",
+                &theta_ruv,
+                &pop,
+                &[][..],
+                false,
+            ),
+            ("block_sigma", &block_sigma, &pop, &[][..], false),
+        ] {
+            let template = model.default_params.clone();
+            assert_eq!(
+                closed_form_fixed_ebe_grad_ok(model, &template, kappas),
+                gate_open,
+                "{label}: fixture precondition: the gate's state"
+            );
+            let n_eta = model.n_eta;
+            assert!(n_eta >= 1, "{label}: fixture precondition: an η");
+            let eta_hat = DVector::from_element(n_eta, 0.15);
+            let h = DMatrix::from_fn(3, n_eta, |r, _| -0.2 * (r + 1) as f64);
+            let x = pack_params(&template);
+            let bounds = compute_bounds(&template);
+            let t = subject_eta_response_correction(
+                None, &x, &template, model, pop, 0, &eta_hat, &h, kappas, &bounds, &opts,
+            );
+            assert_eq!(
+                t.is_some(),
+                gate_open,
+                "{label}: the correction must follow closed_form_fixed_ebe_grad_ok, got {t:?}"
             );
         }
     }
@@ -4550,26 +4675,20 @@ mod tests {
             }
         }
 
-        /// Joint PK + TTE: the Gaussian rows are what the closed forms do carry, so the
-        /// PK components of the gradient were right all along and only the hazard θ
-        /// (`TVLAM`) read zero. The default one-η / three-observation shape of
-        /// [`check_gn_grad_matches_fd_on`] applies, with a non-zero η̂ and η-Jacobian.
-        #[test]
-        fn joint_pk_tte_fixed_ebe_grad_matches_fd_via_fallback() {
-            let model = parse(
-                "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, \
-                 500.0)\n  theta TVLAM(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma \
-                 PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
-                 V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
-                 DV ~ proportional(PROP_ERR)\n[event_model]\n  cmt    = 2\n  family = \
-                 exponential\n  scale  = TVLAM\n",
-            );
-            assert!(model.has_tte(), "fixture precondition: a TTE endpoint");
-            assert!(!closed_form_fixed_ebe_grad_ok(
-                &model,
-                &model.default_params,
-                &[]
-            ));
+        /// The Gaussian half of the joint PK + TTE fixture; [`JOINT_TTE_BLOCK`] appended
+        /// makes it joint. `TVLAM` is declared here so both spellings pack alike.
+        const JOINT_GAUSSIAN: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta \
+                                      TVV(10.0, 0.1, 500.0)\n  theta TVLAM(0.05, 0.001, \
+                                      10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 \
+                                      (sd)\n[individual_parameters]\n  CL = TVCL * \
+                                      exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk \
+                                      one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ \
+                                      proportional(PROP_ERR)\n";
+        const JOINT_TTE_BLOCK: &str =
+            "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAM\n";
+
+        /// One subject with three PK rows and, under the joint model, one exact event.
+        fn joint_subject() -> Subject {
             let mut s = Subject {
                 id: "1".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -4580,7 +4699,23 @@ mod tests {
                 ..Default::default()
             };
             s.obs_records = vec![event(7.0, true)];
-            let pop = population(&[], vec![s]);
+            s
+        }
+
+        /// Joint PK + TTE: the Gaussian rows are what the closed forms do carry, so the
+        /// PK components of the gradient were right all along and only the hazard θ
+        /// (`TVLAM`) read zero. The default one-η / three-observation shape of
+        /// [`check_gn_grad_matches_fd_on`] applies, with a non-zero η̂ and η-Jacobian.
+        #[test]
+        fn joint_pk_tte_fixed_ebe_grad_matches_fd_via_fallback() {
+            let model = parse(&format!("{JOINT_GAUSSIAN}{JOINT_TTE_BLOCK}"));
+            assert!(model.has_tte(), "fixture precondition: a TTE endpoint");
+            assert!(!closed_form_fixed_ebe_grad_ok(
+                &model,
+                &model.default_params,
+                &[]
+            ));
+            let pop = population(&[], vec![joint_subject()]);
             check_gn_grad_matches_fd_on(&model, &pop, true);
             check_gn_grad_matches_fd_on(&model, &pop, false);
         }
@@ -4674,6 +4809,120 @@ mod tests {
             let (eta, h) = (DVector::zeros(0), DMatrix::zeros(0, 0));
             for interaction in [true, false] {
                 check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
+            }
+        }
+
+        /// #1779, the gate's non-Gaussian arm: the `log|H̃|` EBE-response correction
+        /// re-derives the Almquist Laplace cache from the Gaussian rows when called with
+        /// `cache = None` (the covariance step's score assembly does). On a joint subject
+        /// that cache has no hazard or transition term, so the correction must decline
+        /// through the same gate as the score it corrects. The Gaussian-only spelling of
+        /// the same model is the open side, so a gate stuck closed fails here too. One
+        /// cell per endpoint kind `has_non_gaussian` covers, so a guard spelled
+        /// `has_tte()` fails the binary cell and `has_tte() || has_discrete()` the CTMM
+        /// one, as for the gate itself in the two tests above. The Gaussian arms are
+        /// `tests::eta_response_correction_follows_every_arm_of_the_fixed_ebe_gate`.
+        ///
+        /// Without the gate the joint subject got `Some(zeros)` — it has three PK rows and
+        /// an η, so it passed the `n_eta == 0 || n_obs == 0` early return. The value is
+        /// zero either way today (#338 Part A); the regression this catches is the cache
+        /// being built at all, which #335 would turn into a wrong number.
+        ///
+        /// The second subject has the endpoint records and no PK rows, so it is the one
+        /// that early return sees. It pins the gate *before* that return: moved after it,
+        /// the subject reads `Some(zeros)` under a joint model, a correction the gate
+        /// refused.
+        #[test]
+        fn eta_response_correction_declines_through_the_fixed_ebe_gate() {
+            let states = |cmt: usize, path: &[(f64, usize)]| -> Vec<ObsRecord> {
+                path.iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt,
+                    })
+                    .collect()
+            };
+            // Only the CTMM cell below pushes, and only under `markov`.
+            #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+            let mut cases = vec![
+                ("Gaussian-only", String::new(), vec![], true),
+                (
+                    "joint PK + TTE",
+                    JOINT_TTE_BLOCK.to_string(),
+                    vec![event(7.0, true)],
+                    false,
+                ),
+                (
+                    "joint PK + binary",
+                    "[binary_model]\n  cmt   = 3\n  logit = TVLAM\n".to_string(),
+                    states(3, &[(2.0, 1), (6.0, 0)]),
+                    false,
+                ),
+            ];
+            #[cfg(feature = "markov")]
+            cases.push((
+                "joint PK + CTMM",
+                "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
+                 asleep=1]\n  transition awake  -> asleep = TVLAM\n  transition asleep -> \
+                 awake  = TVLAM\n"
+                    .to_string(),
+                states(5, &[(0.0, 0), (3.0, 1), (6.0, 0)]),
+                false,
+            ));
+            let eta_hat = DVector::from_vec(vec![0.15]);
+            let h = [
+                DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]),
+                DMatrix::zeros(0, 1),
+            ];
+            let mut opts = FitOptions::default();
+            opts.interaction = true;
+            for (label, endpoint, records, gate_open) in cases {
+                let model = parse(&format!("{JOINT_GAUSSIAN}{endpoint}"));
+                let template = model.default_params.clone();
+                assert_eq!(
+                    closed_form_fixed_ebe_grad_ok(&model, &template, &[]),
+                    gate_open,
+                    "{label}: fixture precondition: the gate's state"
+                );
+                assert_eq!(model.n_eta, 1, "{label}: fixture precondition: one η");
+                let mut joint = joint_subject();
+                joint.obs_records = records.clone();
+                let endpoint_only = Subject {
+                    id: "2".into(),
+                    obs_records: records,
+                    ..Default::default()
+                };
+                let pop = population(&[], vec![joint, endpoint_only]);
+                assert!(
+                    pop.subjects[1].observations.is_empty(),
+                    "{label}: fixture precondition: subject 2 reaches the n_obs == 0 early return"
+                );
+                let x = pack_params(&template);
+                let bounds = compute_bounds(&template);
+                for (subj, h) in h.iter().enumerate() {
+                    let id = &pop.subjects[subj].id;
+                    let t = subject_eta_response_correction(
+                        None,
+                        &x,
+                        &template,
+                        &model,
+                        &pop,
+                        subj,
+                        &eta_hat,
+                        h,
+                        &[],
+                        &bounds,
+                        &opts,
+                    );
+                    assert_eq!(
+                        t.is_some(),
+                        gate_open,
+                        "{label}, subject {id}: the correction must follow \
+                         closed_form_fixed_ebe_grad_ok, got {t:?}"
+                    );
+                }
             }
         }
     }
