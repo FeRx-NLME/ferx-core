@@ -572,7 +572,7 @@ fn analytic_inner_seed_hessian(
         ) {
             let mut htilde = params.omega.inv.clone();
             let mut gradient = vec![0.0; model.n_eta];
-            let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+            let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
             let mut valid = sens.len() == subject.observations.len();
             for (j, obs) in sens.iter().enumerate() {
                 if !valid || obs.df_deta.len() != model.n_eta {
@@ -3257,7 +3257,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         return result;
     }
     let n_eta = model.n_eta;
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
     // IIV on residual error (`Y = IPRED + EPS·EXP(η_ruv)`, #409/#474): the residual
     // variance of every observation scales by `s = exp(2·η_ruv)`, so `v` and
     // `dv_df` carry that factor. `η_ruv` enters the likelihood only through the
@@ -3558,7 +3558,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // `ruv_active`, `residual_inner_obs` also returns the `h·z` residual-eta column
     // (the `η_ruv` index lives in the BSV block of the stacked vector). The ODE triple is
     // analytic as well (#486/#623) — every `iiv_on_ruv` combination is served.
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).

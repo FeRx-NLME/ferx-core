@@ -913,7 +913,7 @@ pub(crate) fn score_core(
     } else {
         None
     };
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
     // Custom magnitude threads its direct-θ chain through `iiv_on_ruv` (the residual-eta
     // `c̃`-column `d/R` gets its `∂/∂θ` terms in `theta_block`). The stacked residual-eta
     // assembly below (`m_vec[rr]`, `prep.w[j][rr]`) loops over every stacked axis, so it is
@@ -2534,7 +2534,7 @@ pub fn subject_packed_gradient_foce(
     // form are built over the quantified rows only) and re-enter as
     // `−logΦ((LLOQ − f(η̂))/√R⁰)` data terms — the same objective as
     // `foce_subject_nll_standard`. `quant` maps SB-local row i → original obs index.
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
         && subject.cens.iter().any(|&c| c != 0);
     let quant: Vec<usize> = (0..n_obs)
         .filter(|&j| !(m3 && subject.cens.get(j).copied().unwrap_or(0) != 0))
@@ -3114,7 +3114,7 @@ pub(crate) fn subject_eta_dx_foce(
         corr_rd0.as_ref(),
         params.theta.len(),
     );
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
         && subject.cens.iter().any(|&c| c != 0);
     let resp = frozen_eta_response(
         subject,
@@ -3445,7 +3445,7 @@ pub fn subject_packed_gradient_foce_iov(
     // `foce_subject_nll_iov(interaction = false)`. `quant` maps an SB-local row `i` →
     // original obs index `j`. (FOCE-IOV-M3 no longer promotes to interaction as of #591,
     // so this is the gradient of the actual objective.)
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
+    let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
         && subject.cens.iter().any(|&c| c != 0);
     let quant: Vec<usize> = (0..n_obs)
         .filter(|&j| !(m3 && subject.cens.get(j).copied().unwrap_or(0) != 0))

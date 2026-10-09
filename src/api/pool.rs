@@ -167,12 +167,12 @@ mod cache;
 use cache::{FitPoolLease, PoolCache, SharedPoolCache};
 
 /// Everything a fit-scoped call's workers must carry so that a per-subject solve reads the
-/// call's own settings: the ODE solver override (#1212), the inner-loop settings (#426) and
-/// whether the call asked for `gradient = fd` (#1613).
+/// call's own settings: the ODE solver override (#1212), the inner-loop settings (#426),
+/// whether the call asked for `gradient = fd` (#1613) and its `bloq_method` override (#1824).
 /// It is the key of the fit pools, so a worker serves only calls with exactly this value and
 /// "which call am I serving?" has one answer per thread. The empty scope (no ODE override,
-/// default inner settings, gradient not forced) is what the shared pool's workers carry, by
-/// installing nothing.
+/// default inner settings, gradient not forced, no `bloq_method` override) is what the shared
+/// pool's workers carry, by installing nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct FitScope {
     pub(crate) ode: crate::ode::solver::OdeSolverOverride,
@@ -180,6 +180,8 @@ pub(crate) struct FitScope {
     /// Beside `inner` rather than inside it: it gates the outer gradient, the `auto` optimizer
     /// pick and the covariance R-matrix scope too, not only the EBE solve.
     pub(crate) fd: bool,
+    /// `FitOptions::bloq_method`: `None` scores each model under its own method.
+    pub(crate) bloq: Option<crate::types::BloqMethod>,
 }
 
 impl FitScope {
@@ -188,12 +190,13 @@ impl FitScope {
             ode: options.ode_solver_override(),
             inner: options.inner_settings(),
             fd: options.forces_fd(),
+            bloq: options.bloq_method,
         }
     }
 
     /// True when a worker carrying this scope installs nothing.
     pub(crate) fn is_empty(&self) -> bool {
-        self.ode.is_empty() && self.inner.is_default() && !self.fd
+        self.ode.is_empty() && self.inner.is_default() && !self.fd && self.bloq.is_none()
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -202,9 +205,12 @@ impl FitScope {
 
     /// Pool-key equality: the ODE half bit-compared (see
     /// [`OdeSolverOverride::same_pool_key`](crate::ode::solver::OdeSolverOverride)), the
-    /// inner half and the forced-FD flag by value.
+    /// inner half, the forced-FD flag and the `bloq_method` override by value.
     pub(crate) fn same_pool_key(&self, other: &Self) -> bool {
-        self.ode.same_pool_key(&other.ode) && self.inner == other.inner && self.fd == other.fd
+        self.ode.same_pool_key(&other.ode)
+            && self.inner == other.inner
+            && self.fd == other.fd
+            && self.bloq == other.bloq
     }
 
     /// `f` with every member armed on whichever thread runs it, for the duration of the call.
@@ -219,6 +225,7 @@ impl FitScope {
             let _ode = crate::ode::solver::arm_ode_solver_override(self.ode);
             let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
             let _fd = crate::types::arm_forced_fd(self.fd);
+            let _bloq = crate::types::arm_bloq_override(self.bloq);
             f()
         }
     }
@@ -233,6 +240,9 @@ impl FitScope {
         }
         if self.fd {
             crate::types::install_worker_forced_fd(true);
+        }
+        if self.bloq.is_some() {
+            crate::types::install_worker_bloq_override(self.bloq);
         }
         WORKER_SCOPE.set(Some(self));
     }
@@ -294,8 +304,8 @@ fn shared_fit_scope_pool(
     shared_override_pool_cache().acquire(n_threads, scope)
 }
 
-/// Run `f` with `options`' fit scope — its ODE solver settings, its inner-loop settings and its
-/// `gradient = fd` —
+/// Run `f` with `options`' fit scope — its ODE solver settings, its inner-loop settings, its
+/// `gradient = fd` and its `bloq_method` override —
 /// reaching every thread that can solve for it: armed on whichever thread runs `f`, and run on
 /// a pool whose workers carry the same value (see [`fit_scope_pool`]).
 ///
@@ -386,7 +396,7 @@ fn install_on_ferx_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R +
 /// that runs it (never on this one across the `install`; see `FitScope::armed`).
 ///
 /// Pool choice, in order: a pool carrying this call's scope when it is not empty — an ODE
-/// override, non-default inner settings or `gradient = fd` (shared for unpinned fits, exclusive for a positive
+/// override, non-default inner settings, `gradient = fd` or a `bloq_method` override (shared for unpinned fits, exclusive for a positive
 /// `threads` budget); an exclusively leased plain pool sized to a pinned `threads`; otherwise
 /// the shared big-stack pool, falling back to the ambient one only if that one-time build
 /// failed. One pool serves both levels of a multi-start fan-out, which is why this is called

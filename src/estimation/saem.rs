@@ -722,7 +722,7 @@ fn numerical_mstep_scope_gap(
     if is_mixture {
         return Some("the model is a mixture");
     }
-    if matches!(model.bloq_method, BloqMethod::M3) {
+    if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
     if !model.residual_correlations.is_empty() {
@@ -1419,7 +1419,7 @@ fn scalar_residual_mstep_model(
     // M-step. Same predicate as the likelihood and the residual diagnostics
     // (#1499); the `M3` case is additionally rejected outright above.
     let plain_gaussian_rows = population.subjects.iter().all(|subject| {
-        !model.bloq_method.has_censored_row(&subject.cens)
+        !model.bloq_in_force().has_censored_row(&subject.cens)
             && subject.obs_records.is_empty()
             && !subject.observations.is_empty()
     });

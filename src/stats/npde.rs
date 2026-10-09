@@ -285,13 +285,13 @@ pub fn compute_npde_npd(
                     &subject.observations,
                     &subject.cens,
                     &sims,
-                    model.bloq_method,
+                    model.bloq_in_force(),
                 );
                 let npde = npde_scores(
                     &subject.observations,
                     &subject.cens,
                     &sims,
-                    model.bloq_method,
+                    model.bloq_in_force(),
                 );
                 SubjectNpde { npd, npde }
             })

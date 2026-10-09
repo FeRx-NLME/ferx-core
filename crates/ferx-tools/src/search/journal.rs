@@ -585,6 +585,13 @@ fn fit_options_fingerprint(options: &FitOptions) -> String {
     normalised.cancel = None;
     normalised.n_starts = 1;
     normalised.user_set_keys.clear();
+    // The runner's own pin (`compile_and_fit`, #1824): caller options replace the file's
+    // wholesale, so no `bloq_method` means `drop`. Both spellings run the same fit.
+    normalised.bloq_method = Some(
+        normalised
+            .bloq_method
+            .unwrap_or(ferx_core::BloqMethod::Drop),
+    );
     ferx_core::io::hash::sha256_bytes(format!("{normalised:?}").as_bytes())
 }
 

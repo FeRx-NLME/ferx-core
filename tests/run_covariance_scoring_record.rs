@@ -418,11 +418,6 @@ fn in_fit_sir_scores_under_the_stage_record_focei_nagq3() {
         "focei_nagq3",
         with_sir(FitOptions {
             n_agq: 3,
-            // The analytic AGQ covariance Hessian trips a debug-build symmetry assert
-            // (`agq_cov_hessian.rs`, `S_kl must be symmetric`) on this fit with or without
-            // SIR, measured at `d43afca9` (#1821); the FD stencil scores the same objective.
-            // Drop this pin once #1821 is fixed.
-            analytic_cov_hessian: false,
             ..quiet(EstimationMethod::FoceI)
         }),
         true,

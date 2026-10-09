@@ -1095,6 +1095,87 @@ fn agq_covariance_step_produces_finite_standard_errors() {
     );
 }
 
+/// **#1821: the analytic FOCEI `n_agq > 1` covariance Hessian completes in a debug build and
+/// agrees with the FD stencil.** On `d43afca9`..`160cc9a3` this exact fit panicked in
+/// `factor_second_derivative` (`S_kl must be symmetric`): warfarin.ferx's σ = 0.02 sd makes the
+/// σ-direction summands of `∂²H̃` ~1e9 cancel to an `S_kl` of ~1e2, and an ulp of asymmetry in
+/// the summands passed the `1e-10` relative gate. Release builds compiled the assert out.
+///
+/// Three things are asserted, each against a distinct failure:
+/// * the fit returns `Ok` with SEs — the debug panic (red before the fix);
+/// * the analytic SEs are **not** bit-identical to the stencil's, and no
+///   `W_COV_ANALYTIC_SALVAGE` was emitted — so the comparison below is between two routes, not
+///   an FD fallback compared with itself;
+/// * every SE agrees with `analytic_cov_hessian = false` to `2e-3` relative (3.9× headroom).
+///   Realised 5.1254e-4 on Linux aarch64 (`ci-test` profile) and on macOS debug alike. That
+///   is the FD stencil's own floor: the already-validated `n_agq = 1` FOCEI analytic Hessian
+///   sits at 5.124e-4 on the same fit.
+#[test]
+fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
+    let prep = ferx_core::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("warfarin example must load");
+    let run = |analytic: bool| -> FitResult {
+        let opts = FitOptions {
+            verbose: false,
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            run_covariance_step: true,
+            sir: false,
+            outer_maxiter: 3,
+            analytic_cov_hessian: analytic,
+            ..FitOptions::default()
+        };
+        fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .unwrap_or_else(|e| panic!("analytic_cov_hessian = {analytic}: fit failed: {e}"))
+    };
+    let ses = |r: &FitResult, label: &str| -> Vec<f64> {
+        let all: Vec<f64> = [&r.se_theta, &r.se_omega, &r.se_sigma]
+            .into_iter()
+            .flat_map(|v| {
+                v.clone()
+                    .unwrap_or_else(|| panic!("{label}: covariance step reported no SEs"))
+            })
+            .collect();
+        assert!(
+            all.iter().all(|s| s.is_finite() && *s > 0.0),
+            "{label}: SEs must be finite and positive: {all:?}"
+        );
+        all
+    };
+    let analytic = run(true);
+    let stencil = run(false);
+    assert!(
+        !analytic
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
+        "premise: every subject must take the analytic AGQ route: {:?}",
+        analytic.warnings
+    );
+    let (a, s) = (ses(&analytic, "analytic"), ses(&stencil, "stencil"));
+    assert_eq!(a.len(), s.len(), "same parameter vector on both routes");
+    assert_ne!(
+        a, s,
+        "premise: the analytic route must actually run — bit-identical SEs mean it fell back to FD"
+    );
+    let worst = a
+        .iter()
+        .zip(&s)
+        .map(|(x, y)| (x - y).abs() / y.abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        worst < 2e-3,
+        "analytic AGQ SEs must match the FD stencil: worst relative diff {worst:e}\n\
+         analytic {a:?}\n stencil {s:?}"
+    );
+    eprintln!("#1821 worst relative SE diff (analytic vs stencil): {worst:e}");
+}
+
 /// The standard errors of a fit, `θ` then `Ω` then `σ`, in report order.
 fn standard_errors(r: &FitResult) -> Vec<f64> {
     let mut v = r.se_theta.clone().expect("θ SEs");

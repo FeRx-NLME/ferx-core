@@ -3773,6 +3773,10 @@ pub(crate) fn all_uncertainty_draws_skipped_diags(
 /// the historical inline guards. Check order matches `fit_inner` so the first
 /// error is unchanged.
 pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
+    // #1824: the M3 gates below ask `bloq_in_force`, which `fit()` arms for its own call. A
+    // standalone caller of this `pub fn` arms nothing, so arm `options.bloq_method` here —
+    // inside `fit()` it is the same value, re-armed and restored on return.
+    let _bloq = crate::types::arm_bloq_override(options.bloq_method);
     let chain = options.method_chain();
     let mut diags = Vec::new();
 
@@ -4419,7 +4423,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 }
             }
         }
-        if matches!(model.bloq_method, BloqMethod::M3) {
+        if matches!(model.bloq_in_force(), BloqMethod::M3) {
             diags.push(
                 Diagnostic::error(
                     "E_BLOCK_SIGMA_M3_UNSUPPORTED",

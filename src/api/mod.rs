@@ -211,6 +211,10 @@ mod auto_optimizer_gradient_coupling_tests;
 mod gradient_scope_tests;
 
 #[cfg(test)]
+#[path = "tests/bloq_scope_tests.rs"]
+mod bloq_scope_tests;
+
+#[cfg(test)]
 #[path = "tests/no_scored_observations_tests.rs"]
 mod no_scored_observations_tests;
 

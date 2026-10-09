@@ -1062,6 +1062,14 @@ pub(crate) fn fixed_b_natural_score(
 }
 
 /// Symmetry to a relative tolerance, for the debug preconditions on the factor differentials.
+///
+/// Every `S_k` / `S_kl` reaching these asserts is symmetric **by construction**: the `∂H̃`
+/// matrices are built bitwise symmetric (lower triangle, mirrored — `subject_anchor_derivatives`
+/// and the `focei_htilde_dx` / `laplace_h_deriv` builders) and only scalar-weighted sums and a
+/// diagonal jitter are applied after. So the `1e-10` is never stressed and any asymmetry that
+/// trips it is structural. Do not loosen it: scaled by `‖S‖` it cannot see that `S_kl` is a
+/// cancellation of summands up to 1e7× larger (σ² = 4e-4, #1821), and no bound in `‖S‖` both
+/// admits that rounding and stays fixture-independent.
 fn is_symmetric(a: &DMatrix<f64>) -> bool {
     if a.nrows() != a.ncols() {
         return false;
