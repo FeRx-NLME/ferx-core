@@ -113,8 +113,14 @@ fn note_suffix(note: Option<String>, show_cv: bool) -> String {
 /// Whether the console shows a CV%/SD parenthetical: not when the covariance
 /// step failed or fell back to SIR.
 fn shows_cv(result: &FitResult) -> bool {
+    status_shows_cv(&result.covariance_status)
+}
+
+/// [`shows_cv`] on the status alone, for [`format_kappa_rows_from`], whose
+/// input is not a `FitResult`.
+fn status_shows_cv(status: &CovarianceStatus) -> bool {
     !matches!(
-        result.covariance_status,
+        status,
         CovarianceStatus::Failed | CovarianceStatus::SirFallback
     )
 }
@@ -153,32 +159,106 @@ fn format_omega_rows(result: &FitResult) -> String {
 /// the SD of a typical arm. `None` for an unweighted kappa. The console's
 /// weight line and the fit YAML's `weight*` keys (#1660) both read this, so
 /// the two cannot print different numbers.
-fn kappa_weight_facts(
-    result: &FitResult,
+fn kappa_weight_facts<'a>(
+    weights: &'a [Option<String>],
+    weight_typical: &[Option<f64>],
     i: usize,
     var: f64,
-) -> Option<(&str, Option<(f64, f64)>)> {
-    let w = result.kappa_weights.get(i).and_then(|w| w.as_deref())?;
-    let typical = match result.kappa_weight_typical.get(i).copied().flatten() {
+) -> Option<(&'a str, Option<(f64, f64)>)> {
+    let w = weights.get(i).and_then(|w| w.as_deref())?;
+    let typical = match weight_typical.get(i).copied().flatten() {
         Some(n) if n > 0.0 && var >= 0.0 => Some((n, var.sqrt() / n.sqrt())),
         _ => None,
     };
     Some((w, typical))
 }
 
+/// The facts a `--- KAPPA (IOV) Estimates ---` row reads, borrowed from
+/// wherever they live: a [`FitResult`] ([`KappaRowsInput::from_result`]), or a
+/// wrapper's own copy of the fit at print time (ferx-r's `print.ferx_fit()`,
+/// #1825). Both then print through [`format_kappa_rows_from`], so the rows
+/// cannot drift between the CLI, [`format_summary`] and a wrapper.
+///
+/// Every slice is indexed by kappa; a short or empty slice reads as the field's
+/// default for the missing kappas (not fixed, no SE, unknown type, unweighted).
+#[derive(Debug, Clone)]
+pub struct KappaRowsInput<'a> {
+    /// The IOV covariance matrix; one row per kappa, its diagonal printed.
+    pub omega_iov: &'a nalgebra::DMatrix<f64>,
+    /// Kappa names; a missing name prints as `KAPPA`.
+    pub kappa_names: &'a [String],
+    /// Per-kappa FIX flag: a fixed kappa is labelled `[FIX]` with `SE = ---`.
+    pub kappa_fixed: &'a [bool],
+    /// Diagonal SEs, one per kappa, as `run_covariance` writes them; `None`
+    /// (or a missing entry) prints `SE = N/A`.
+    pub se_kappa: Option<&'a [f64]>,
+    /// Per-kappa scale (#1643). Empty means unknown (a fit saved before #1643)
+    /// and prints the log-normal CV%.
+    pub kappa_param_types: &'a [EtaParamType],
+    /// Per-kappa weight column of a sample-size-weighted kappa (#1031); `None`
+    /// for an unweighted one.
+    pub kappa_weights: &'a [Option<String>],
+    /// Per-kappa typical (median-arm) weight, for the weight line's spread.
+    pub kappa_weight_typical: &'a [Option<f64>],
+    /// The covariance step's status: a failed or SIR-fallback step suppresses
+    /// every CV%/SD (#1698).
+    pub covariance_status: CovarianceStatus,
+}
+
+impl<'a> KappaRowsInput<'a> {
+    /// The input view of `r`, or `None` when the fit has no IOV.
+    pub fn from_result(r: &'a FitResult) -> Option<Self> {
+        Some(Self {
+            omega_iov: r.omega_iov.as_ref()?,
+            kappa_names: &r.kappa_names,
+            kappa_fixed: &r.kappa_fixed,
+            se_kappa: r.se_kappa.as_deref(),
+            kappa_param_types: &r.kappa_param_types,
+            kappa_weights: &r.kappa_weights,
+            kappa_weight_typical: &r.kappa_weight_typical,
+            covariance_status: r.covariance_status.clone(),
+        })
+    }
+}
+
+/// How [`format_kappa_rows_from`] renders its rows. `Default` is what the CLI
+/// and [`format_summary`] print.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KappaRowsOptions {
+    /// Spell the formatter's own two non-ASCII glyphs in ASCII: `→` as `->`
+    /// and `κ` as `kappa`. For a console that cannot print UTF-8 (R in a C
+    /// locale prints them as `<U+2192>` / `<U+03BA>`). Names and weight
+    /// columns are printed as given either way.
+    pub ascii: bool,
+}
+
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
+    KappaRowsInput::from_result(result).map_or_else(String::new, |input| {
+        format_kappa_rows_from(&input, KappaRowsOptions::default())
+    })
+}
+
+/// The KAPPA (IOV) rows the CLI's `--- KAPPA (IOV) Estimates ---` section and
+/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
+/// kappa, each weighted kappa (#1031) followed by its weight line. One line per
+/// `\n`; empty for a zero-row `omega_iov`. Off-diagonal `block_kappa`
+/// correlations are not part of the rows.
+pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) -> String {
     use std::fmt::Write;
-    let Some(iov) = result.omega_iov.as_ref() else {
-        return String::new();
+    let (arrow, kappa) = if opts.ascii {
+        ("->", "kappa")
+    } else {
+        ("→", "κ")
     };
-    let show_cv = shows_cv(result);
+    let iov = input.omega_iov;
+    let show_cv = status_shows_cv(&input.covariance_status);
     let mut out = String::new();
     for i in 0..iov.nrows() {
         let var = iov[(i, i)];
-        let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
-        let name = kappa_name(result, i);
+        let is_fixed = input.kappa_fixed.get(i).copied().unwrap_or(false);
+        let name = kappa_name_in(input.kappa_names, i);
         let label = if is_fixed {
             fixed_label(name)
         } else {
@@ -187,13 +267,13 @@ fn format_kappa_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match &result.se_kappa {
+            match input.se_kappa {
                 Some(se) if i < se.len() => format!("{:.6}", se[i]),
                 _ => "N/A".to_string(),
             }
         };
-        let weight = kappa_weight_facts(result, i, var);
-        let kappa_type = result.kappa_param_types.get(i).copied();
+        let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
+        let kappa_type = input.kappa_param_types.get(i).copied();
         let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
         // Sample-size-weighted IOV (#1031): the estimate above is the
@@ -213,13 +293,13 @@ fn format_kappa_rows(result: &FitResult) -> String {
             let _ = match spread {
                 Some(spread) => writeln!(
                     out,
-                    "  {:<20}   weight = {}  →  {} (κ ~ N(0, {}/{}))",
-                    "", w, spread, name, w
+                    "  {:<20}   weight = {}  {}  {} ({} ~ N(0, {}/{}))",
+                    "", w, arrow, spread, kappa, name, w
                 ),
                 None => writeln!(
                     out,
-                    "  {:<20}   weight = {} (κ ~ N(0, {}/{}))",
-                    "", w, name, w
+                    "  {:<20}   weight = {} ({} ~ N(0, {}/{}))",
+                    "", w, kappa, name, w
                 ),
             };
         }
@@ -229,11 +309,12 @@ fn format_kappa_rows(result: &FitResult) -> String {
 
 /// The name of kappa `k`, or `"KAPPA"` when the result carries none.
 fn kappa_name(result: &FitResult, k: usize) -> &str {
-    result
-        .kappa_names
-        .get(k)
-        .map(|s| s.as_str())
-        .unwrap_or("KAPPA")
+    kappa_name_in(&result.kappa_names, k)
+}
+
+/// [`kappa_name`] over the bare name list.
+fn kappa_name_in(names: &[String], k: usize) -> &str {
+    names.get(k).map(|s| s.as_str()).unwrap_or("KAPPA")
 }
 
 /// The name of ETA `k`, or `"ETA"` when the result carries none.
@@ -2629,7 +2710,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             }
             // A weighted kappa (#1660): `variance`/`sd` are the weight-1 γ², so
             // add the weight and the typical arm's SD the console prints.
-            if let Some((w, typical)) = kappa_weight_facts(result, i, var) {
+            if let Some((w, typical)) =
+                kappa_weight_facts(&result.kappa_weights, &result.kappa_weight_typical, i, var)
+            {
                 writeln!(f, "    weight: {}", yaml_quote(w)).map_err(|e| e.to_string())?;
                 if let Some((n, sd)) = typical {
                     writeln!(f, "    weight_typical: {:.6}", n).map_err(|e| e.to_string())?;
@@ -5742,6 +5825,103 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         assert_eq!(stripped, plain);
+    }
+
+    /// #1825: the public `format_kappa_rows_from`, over an input a wrapper
+    /// builds field by field from its own copy of the fit (here: from the
+    /// `FitResult`'s fields by hand, not through `from_result`), prints exactly
+    /// what the CLI's `format_kappa_rows` prints — across every cell of
+    /// `variance_note_input_space` (type × weighted × covariance status) plus a
+    /// FIX kappa with SEs on the others. A field dropped or mis-wired in
+    /// `from_result` reddens the equality; so does one ignored by the new fn.
+    ///
+    /// `ascii: true` is the same text with exactly `→` → `->` and `κ` → `kappa`:
+    /// no byte above 127, and equal to the default with those two
+    /// substitutions, so the ASCII path cannot drift in wording. Both glyphs
+    /// must occur in some default output (`saw_*`), or the substitution check
+    /// would compare text that never contained them.
+    #[test]
+    fn kappa_rows_from_input_matches_fit_result_rows() {
+        use EtaParamType::*;
+        let mut saw_arrow = false;
+        let mut saw_kappa = false;
+        let mut cells = 0;
+        for typed in [false, true] {
+            for weighted in [false, true] {
+                for fix in [false, true] {
+                    for status in [
+                        CovarianceStatus::Computed,
+                        CovarianceStatus::NotRequested,
+                        CovarianceStatus::Failed,
+                        CovarianceStatus::SirFallback,
+                    ] {
+                        let mut r = classified_result();
+                        r.omega_iov =
+                            Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+                                0.050133, 156.036966, 156.036966, 0.3,
+                            ])));
+                        r.kappa_names =
+                            ["K_LN", "K_ADD", "K_LGT", "K_C"].map(String::from).to_vec();
+                        r.kappa_fixed = vec![false, fix, false, false];
+                        if fix {
+                            r.se_kappa = Some(vec![0.011, 0.022, 0.033, 0.044]);
+                        }
+                        if typed {
+                            r.kappa_param_types = vec![LogNormal, Additive, Logit, Custom];
+                        }
+                        if weighted {
+                            r.kappa_weights = vec![Some("NARM".into()); 4];
+                            r.kappa_weight_typical = vec![Some(4.0), Some(4.0), None, Some(4.0)];
+                        }
+                        r.covariance_status = status.clone();
+                        let input = KappaRowsInput {
+                            omega_iov: r.omega_iov.as_ref().unwrap(),
+                            kappa_names: &r.kappa_names,
+                            kappa_fixed: &r.kappa_fixed,
+                            se_kappa: r.se_kappa.as_deref(),
+                            kappa_param_types: &r.kappa_param_types,
+                            kappa_weights: &r.kappa_weights,
+                            kappa_weight_typical: &r.kappa_weight_typical,
+                            covariance_status: r.covariance_status.clone(),
+                        };
+                        let cell =
+                            format!("typed={typed} weighted={weighted} fix={fix} {status:?}");
+                        let cli = format_kappa_rows(&r);
+                        let default = format_kappa_rows_from(&input, KappaRowsOptions::default());
+                        assert_eq!(default, cli, "{cell}");
+                        let via_result = KappaRowsInput::from_result(&r).expect("has IOV");
+                        assert_eq!(
+                            format_kappa_rows_from(&via_result, KappaRowsOptions::default()),
+                            cli,
+                            "from_result {cell}"
+                        );
+                        if fix {
+                            assert!(cli.contains("K_ADD [FIX]"), "{cell}:\n{cli}");
+                            assert!(cli.contains("SE = 0.011000"), "{cell}:\n{cli}");
+                        }
+
+                        let ascii =
+                            format_kappa_rows_from(&input, KappaRowsOptions { ascii: true });
+                        assert!(ascii.is_ascii(), "{cell}:\n{ascii}");
+                        assert_eq!(
+                            ascii,
+                            default.replace('→', "->").replace('κ', "kappa"),
+                            "{cell}"
+                        );
+                        saw_arrow |= default.contains('→');
+                        saw_kappa |= default.contains('κ');
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 32);
+        assert!(saw_arrow && saw_kappa, "no fixture printed a weight line");
+        // No IOV: no input, and the CLI rows are empty.
+        let mut none = classified_result();
+        none.omega_iov = None;
+        assert!(KappaRowsInput::from_result(&none).is_none());
+        assert_eq!(format_kappa_rows(&none), "");
     }
 
     /// #1667: `format_summary`'s KAPPA section carries a block kappa's
