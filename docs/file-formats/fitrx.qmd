@@ -345,7 +345,10 @@ non-finite as `null`.
 
 It is written by FOCE, FOCEI, Laplace and Gauss-Newton fits, and absent for
 SAEM, IMP and Bayes, on a bundle saved before #1815, and on one written by
-ferx-r; all of those load it as `None`. Consumers use it only when it unpacks
+ferx-r; all of those load it as `None`. VI writes it too, but its vector never
+matches its stored Ω (one ULP off,
+[#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)), so a reloaded VI
+fit takes the fallback. Consumers use it only when it unpacks
 bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV and correlations
 under the supplied model. An edited bundle, or a model with another layout of
 the same length, falls back to the stored estimates; a `[mixture]` fit with an

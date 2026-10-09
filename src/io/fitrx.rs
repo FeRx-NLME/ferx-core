@@ -264,9 +264,11 @@ struct FitWire {
     /// post-hoc `run_covariance` / `run_sir` on the reloaded fit centres on the
     /// same point the inline step did. Absent for engines with no packed vector
     /// (SAEM / IMP / Bayes) and on bundles saved before the field existed; both
-    /// load as `None`. Consumers use it only when it unpacks bit-for-bit to the
-    /// stored estimates (`fit_packed_estimate`), so an edited fit cannot be
-    /// evaluated at a stale centre. Additive: no `FORMAT_VERSION` bump.
+    /// load as `None`. VI writes it too, but its vector never matches its stored Ω
+    /// (#1847), so a reloaded VI fit takes the fallback. Consumers use it only when
+    /// it unpacks bit-for-bit to the stored estimates (`fit_packed_estimate`), so an
+    /// edited fit cannot be evaluated at a stale centre. Additive: no
+    /// `FORMAT_VERSION` bump.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

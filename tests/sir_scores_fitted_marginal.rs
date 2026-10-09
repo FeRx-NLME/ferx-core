@@ -709,7 +709,7 @@ fn mixture_override_run_covariance_is_identical_to_in_fit() {
 /// |-------------|-------------------|---------------------------------------------|
 /// | override    | `None`            | `Err`: names the override and why it is gone |
 /// | override    | shorter / longer  | `Err`: layout mismatch, no `.fitrx` story   |
-/// | override    | right length, θ edited | `Err`: stale, no layout / `.fitrx` story (#1815) |
+/// | override    | right length, θ edited or vector damaged | `Err`: stale, no layout / `.fitrx` story (#1815) |
 /// | no override | `None`            | `Ok`, identical to the in-fit SIR            |
 ///
 /// Each sentence of each message is asserted by a substring, so deleting one reddens
@@ -783,41 +783,47 @@ fn mixture_without_packed_estimate() {
         );
     }
 
-    // Row 2b (#1815): a packed estimate of the right length that no longer unpacks to
-    // the fit's reported estimates — θ edited after the fit. Its override slot cannot be
-    // trusted, and the message says so without the length or `.fitrx` stories.
+    // Row 2b (#1815): a packed estimate of the right length that does not unpack to the
+    // fit's reported estimates. Two causes, one message: θ edited after the fit, and a
+    // damaged vector (the override slot NaN) beside unchanged estimates (review r1 #1 —
+    // before the pre-check that one panicked). The override cannot be trusted, and the
+    // message says so without the length or `.fitrx` stories.
     let mut edited = cleared(&r);
     edited.theta[0] *= 1.01;
-    assert_eq!(edited.packed_estimate.as_ref().map(Vec::len), Some(7));
-    for (entry, res) in [
-        (
-            "run_sir",
-            run_sir(&edited, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
-        ),
-        (
-            "run_covariance",
-            run_covariance(&edited, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
-        ),
-    ] {
-        let e = res.expect_err("an edited override fit must be refused");
-        for must in [
-            format!("{entry}: the fit's packed estimate no longer reproduces its reported"),
-            "theta / Omega / Sigma".to_string(),
-            "so the [mixture] override values it carries cannot be trusted".to_string(),
-            "the estimates were changed after the fit, or this is not the model the fit was \
-             estimated with"
-                .to_string(),
+    let mut damaged = cleared(&r);
+    damaged.packed_estimate.as_mut().unwrap()[6] = f64::NAN;
+    for (cause, stale) in [("theta edited", &edited), ("vector damaged", &damaged)] {
+        assert_eq!(stale.packed_estimate.as_ref().map(Vec::len), Some(7));
+        for (entry, res) in [
+            (
+                "run_sir",
+                run_sir(stale, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
+            ),
+            (
+                "run_covariance",
+                run_covariance(stale, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
+            ),
         ] {
-            assert!(
-                e.to_string().contains(&must),
-                "{entry} stale message lacks {must:?}: {e}"
-            );
-        }
-        for must_not in ["layout", "coordinates", ".fitrx", "lacks them"] {
-            assert!(
-                !e.to_string().contains(must_not),
-                "{entry} stale message says {must_not:?}: {e}"
-            );
+            let e = res.expect_err("a stale override fit must be refused");
+            for must in [
+                format!("{entry}: the fit's packed estimate does not reproduce its reported"),
+                "estimates (theta / Omega / Sigma / Omega_IOV / residual correlations)".to_string(),
+                "so the [mixture] override values it carries cannot be trusted".to_string(),
+                "the estimates or the packed estimate were changed after the fit, or this is \
+                 not the model the fit was estimated with"
+                    .to_string(),
+            ] {
+                assert!(
+                    e.to_string().contains(&must),
+                    "{cause}: {entry} stale message lacks {must:?}: {e}"
+                );
+            }
+            for must_not in ["layout", "coordinates", ".fitrx", "lacks them"] {
+                assert!(
+                    !e.to_string().contains(must_not),
+                    "{cause}: {entry} stale message says {must_not:?}: {e}"
+                );
+            }
         }
     }
 
@@ -847,9 +853,12 @@ fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
 
     let mut legacy = cleared(&loaded);
     legacy.packed_estimate = None;
+    let e = run_sir(&legacy, Some(&model), Some(&pop), &sir_defaults())
+        .expect_err("premise: a reloaded override fit without its packed vector is refused");
     assert!(
-        run_sir(&legacy, Some(&model), Some(&pop), &sir_defaults()).is_err(),
-        "premise: a reloaded override fit without its packed vector is refused"
+        e.to_string()
+            .contains("a FitResult does not store their fitted values"),
+        "premise: the refusal must be the #1765 one, not another error: {e}"
     );
 
     let c = run_covariance(&loaded, Some(&model), Some(&pop), &sir_defaults())

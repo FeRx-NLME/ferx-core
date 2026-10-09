@@ -260,10 +260,10 @@ fn fitted_mixture_overrides<'a>(
             segs.total()
         )),
         PackedEstimate::Stale => Err(
-            "the fit's packed estimate no longer reproduces its reported theta / Omega / \
-             Sigma, so the [mixture] override values it carries cannot be trusted: the \
-             estimates were changed after the fit, or this is not the model the fit was \
-             estimated with."
+            "the fit's packed estimate does not reproduce its reported estimates (theta / \
+             Omega / Sigma / Omega_IOV / residual correlations), so the [mixture] override \
+             values it carries cannot be trusted: the estimates or the packed estimate were \
+             changed after the fit, or this is not the model the fit was estimated with."
                 .to_string(),
         ),
         PackedEstimate::Absent => {
