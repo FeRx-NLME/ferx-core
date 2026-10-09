@@ -27,7 +27,10 @@
 //!   `L2` was unknown when #1733 was planned. Measured: it does. Its NPDE matches
 //!   ferx's joint draw at the fitted ρ and disagrees with an independent one.
 //!
-//! # Measured (macOS arm64, debug, at the commit that adds this file)
+//! # Measured
+//!
+//! Linux x86_64 (`slow-tests.yml` run 37947001684, `nocapture`, at `42ec2252`) and
+//! macOS arm64 (debug) agree with each other on every printed digit below.
 //!
 //! | arm | ρ ferx draws at | worst \|ΔNPD\| | worst \|ΔNPDE\| |
 //! |---|---|---|---|

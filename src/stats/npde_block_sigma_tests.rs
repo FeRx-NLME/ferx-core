@@ -406,6 +406,10 @@ fn npd_carries_a_custom_magnitude_through_the_correlated_draw() {
     );
 }
 
+// Realised worst over seeds 1..=10, identical on Linux x86_64 (`slow-tests.yml` run
+// 37947001684 at `42ec2252`) and macOS arm64: arm A 0.0758, FREM 0.0596, η_RUV
+// 0.0428, magnitude 0.0758, arm B NPD₂ 0.0432 (all against TOL_A = 0.15); arm B
+// NPDE₂ 0.1237 (against TOL_B = 0.25). The FIX pin's bits hold on both.
 const NSIM: usize = 2000;
 const SEEDS: u64 = 10;
 const TOL_A: f64 = 0.15;
