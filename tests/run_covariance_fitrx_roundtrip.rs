@@ -153,6 +153,16 @@ fn two_cpt_oral_cov_focei_reload_repeats_inline_covariance() {
     );
 }
 
+#[test]
+fn warfarin_laplace_reload_repeats_inline_covariance() {
+    roundtrip_row(
+        "examples/warfarin.ferx",
+        "data/warfarin.csv",
+        EstimationMethod::Laplace,
+        true,
+    );
+}
+
 /// The issue's "done when" fixture. Claim only: its premise holds on Linux and not on
 /// macOS (module doc).
 #[test]
