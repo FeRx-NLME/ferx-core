@@ -260,6 +260,19 @@ struct FitWire {
     /// before the field existed, which load it as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     iov_occasion: Option<crate::types::IovOccasionRule>,
+    /// The outer optimizer's packed parameter vector at the estimate (#1815), so a
+    /// post-hoc `run_covariance` / `run_sir` on the reloaded fit centres on the
+    /// same point the inline step did. Absent for engines with no packed vector
+    /// (SAEM / IMP / Bayes) and on bundles saved before the field existed; both
+    /// load as `None`. Consumers use it only when it unpacks bit-for-bit to the
+    /// stored estimates (`fit_packed_estimate`), so an edited fit cannot be
+    /// evaluated at a stale centre. Additive: no `FORMAT_VERSION` bump.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    packed_estimate: Option<Vec<f64>>,
 }
 
 /// Wire form of [`DataBindings`]: the same fields, keyed by `BTreeMap` so
@@ -1014,6 +1027,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         reader_settings: r.reader_settings.clone(),
         population_fingerprint: r.population_fingerprint.clone(),
         iov_occasion: r.iov_occasion.clone(),
+        packed_estimate: r.packed_estimate.clone(),
     }
 }
 
@@ -2443,9 +2457,10 @@ fn wire_to_fit_result(
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
         exclusions: None,
-        // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
-        // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
-        packed_estimate: None,
+        // Persisted in the bundle since #1815 (`FitResult`'s own serde still skips
+        // it). `None` for SAEM / IMP / Bayes and for older bundles; consumers
+        // validate it against the estimates above before reusing it.
+        packed_estimate: w.packed_estimate,
         left_init: w.left_init,
         omega_is_diagonal: w.omega_is_diagonal,
         kappa_is_diagonal: w.kappa_is_diagonal,
@@ -3830,6 +3845,63 @@ mod tests {
         let old: FitWire = serde_json::from_value(value).unwrap();
         assert!(old.reader_settings.is_none() && old.population_fingerprint.is_none());
         assert!(old.iov_occasion.is_none());
+    }
+
+    /// #1815 T1: the optimizer's packed vector round-trips through the bundle bit
+    /// for bit — including a non-finite element, which goes out as `null` and comes
+    /// back as `NaN` like every other float vector in `fit.json`. A fit without one
+    /// writes no key, and a bundle from before #1815 (key deleted) loads `None`.
+    ///
+    /// Mutations — read `packed_estimate: None` on load: the bit comparison dies;
+    /// drop `skip_serializing_if`: the absent-key assert dies (written as `null`);
+    /// drop the `opt_vec` adapter: the NaN element cannot be read back and
+    /// `load_fit` fails.
+    #[test]
+    fn roundtrip_packed_estimate_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("packed.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        let packed = vec![
+            0.1 + 0.2,
+            -0.0,
+            5e-324,
+            -1.797_693_134_862_315_7e308,
+            f64::NAN,
+        ];
+        let mut r = minimal_fit_result();
+        r.packed_estimate = Some(packed.clone());
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let back = load_fit(&path)
+            .unwrap()
+            .fit
+            .packed_estimate
+            .expect("a bundle saved with a packed vector loads one");
+        assert_eq!(back.len(), packed.len());
+        for (i, (got, want)) in back.iter().zip(&packed).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "[{i}]: NaN must come back as NaN, got {got}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "[{i}]: {got} vs {want}");
+            }
+        }
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("packed_estimate").is_none(),
+            "packed_estimate: written when absent"
+        );
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["packed_estimate"][4], serde_json::Value::Null);
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("packed_estimate")
+                .is_some(),
+            "must be written when set, or the removal tests nothing"
+        );
+        let old: FitWire = serde_json::from_value(value).unwrap();
+        assert!(old.packed_estimate.is_none());
     }
 
     /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects

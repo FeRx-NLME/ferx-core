@@ -61,8 +61,10 @@ pub enum UncertaintyMethod {
 /// The per-class Ω/Σ are rebuilt from the fitted base, so a class that overrides
 /// nothing is exact. A class **override** (`omega(2) ETA_CL ~ …` in `[mixture]`) is
 /// estimated, but its fitted value is not a `FitResult` field: it is read from
-/// [`FitResult::packed_estimate`], which only the in-memory result of a packed-space
-/// `fit()` (FOCE / FOCEI / Laplace / Gauss-Newton) carries.
+/// [`FitResult::packed_estimate`], which the result of a packed-space `fit()` (FOCE /
+/// FOCEI / Laplace / Gauss-Newton) carries in memory, and a `.fitrx` bundle
+/// [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload (#1815). It is read
+/// only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ / Ω_IOV / ρ.
 ///
 /// # Errors
 ///
@@ -71,8 +73,10 @@ pub enum UncertaintyMethod {
 /// initial Ω_IOV is never substituted for a missing one.
 ///
 /// For a `[mixture]` model with at least one override, when `packed_estimate` is
-/// `None` (a fit read from `.fitrx`, built in R, or estimated by SAEM / IMP / Bayes) or
-/// does not have this model's packed length (a different model).
+/// `None` (a fit built in R, a `.fitrx` bundle saved before #1815 or written by
+/// ferx-r, or a fit estimated by SAEM / IMP / Bayes), does not have this model's
+/// packed length (a different model), or no longer unpacks to the fit's reported
+/// estimates (they were edited after the fit, or the model's layout differs).
 pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
@@ -142,6 +146,74 @@ pub fn fitted_params_from_result(
     })
 }
 
+/// Whether a fit's [`FitResult::packed_estimate`] may stand in for its reported
+/// estimates under a given model (#1815). See [`fit_packed_estimate`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PackedEstimate<'a> {
+    /// Has this model's packed length and unpacks bit-for-bit to the fit's θ, Ω, σ,
+    /// Ω_IOV and ρ: the optimizer's own point, safe to reuse as the centre.
+    Usable(&'a [f64]),
+    /// The fit carries none (SAEM / IMP / Bayes, a fit built in R, a `.fitrx`
+    /// bundle saved before #1815 or written by ferx-r).
+    Absent,
+    /// Has this many coordinates, which is not this model's packed length.
+    WrongLength(usize),
+    /// Has the right length but no longer unpacks to the fit's reported estimates:
+    /// they were edited after the fit, or the model's layout differs (a θ bound
+    /// moved across 0 flips `theta_packs_log` without changing the length).
+    Stale,
+}
+
+/// Classify `fit.packed_estimate` against `template`'s packed layout (#1815).
+///
+/// `template` supplies only structure (bounds, diagonal flags, masks, IOV and
+/// `block_sigma` shape); [`unpack_params`] takes every value from the vector. The
+/// vector is [`PackedEstimate::Usable`] only when its length is `packed_len(template)`
+/// **and** its unpack is bit-equal to the fit's `theta`, `omega`, `sigma`,
+/// `omega_iov` and `residual_correlations` ρ. That equality holds for every
+/// packed-space engine's own vector except VI's (its stored Ω is 1 ULP off the
+/// unpack), and it is what makes the vector safe to persist: a `.fitrx` bundle
+/// whose estimates were edited, or a model of the same length with another layout,
+/// is `Stale`, never evaluated at the wrong centre. A `[mixture]` override segment
+/// has no stored counterpart, so only its length is checked.
+pub(crate) fn fit_packed_estimate<'a>(
+    fit: &'a FitResult,
+    template: &ModelParameters,
+) -> PackedEstimate<'a> {
+    let Some(v) = fit.packed_estimate.as_deref() else {
+        return PackedEstimate::Absent;
+    };
+    if v.len() != crate::estimation::parameterization::packed_len(template) {
+        return PackedEstimate::WrongLength(v.len());
+    }
+    let p = unpack_params(v, template);
+    let same = |a: &[f64], b: &[f64]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    let same_mat = |a: &DMatrix<f64>, b: &DMatrix<f64>| {
+        a.shape() == b.shape() && same(a.as_slice(), b.as_slice())
+    };
+    let theta_ok = same(&p.theta, &fit.theta);
+    let omega_ok = same_mat(&p.omega.matrix, &fit.omega);
+    let sigma_ok = same(&p.sigma.values, &fit.sigma);
+    let iov_ok = match (&p.omega_iov, &fit.omega_iov) {
+        (None, None) => true,
+        (Some(a), Some(b)) => same_mat(&a.matrix, b),
+        _ => false,
+    };
+    let rho =
+        |cs: &[crate::types::ResidualCorrelation]| cs.iter().map(|c| c.rho).collect::<Vec<_>>();
+    let rho_ok = same(
+        &rho(&p.residual_correlations),
+        &rho(&fit.residual_correlations),
+    );
+    if theta_ok && omega_ok && sigma_ok && iov_ok && rho_ok {
+        PackedEstimate::Usable(v)
+    } else {
+        PackedEstimate::Stale
+    }
+}
+
 /// The packed `[mixture]` override segment of `fit_result`'s estimate (#1704): empty
 /// for a model without overrides, the `packed_estimate` slice otherwise. See
 /// [`fitted_params_from_result`] for when that is unavailable.
@@ -154,16 +226,23 @@ fn fitted_mixture_overrides<'a>(
         return Ok(&[]);
     }
     let segs = packed_segments(template);
-    match fit_result.packed_estimate.as_deref() {
-        Some(v) if v.len() == segs.total() => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
-        Some(v) => Err(format!(
+    match fit_packed_estimate(fit_result, template) {
+        PackedEstimate::Usable(v) => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
+        PackedEstimate::WrongLength(n) => Err(format!(
             "the fit's packed estimate has {} coordinates but this model's parameter layout \
              has {}, so the [mixture] override values cannot be read from it. Supply the \
              model the fit was estimated with.",
-            v.len(),
+            n,
             segs.total()
         )),
-        None => {
+        PackedEstimate::Stale => Err(
+            "the fit's packed estimate no longer reproduces its reported theta / Omega / \
+             Sigma, so the [mixture] override values it carries cannot be trusted: the \
+             estimates were changed after the fit, or this is not the model the fit was \
+             estimated with."
+                .to_string(),
+        ),
+        PackedEstimate::Absent => {
             let names: Vec<String> = tmpl
                 .omega_override_addr
                 .iter()
@@ -176,9 +255,11 @@ fn fitted_mixture_overrides<'a>(
                 .collect();
             Err(format!(
                 "this [mixture] fit estimates the per-class override(s) {}, and a FitResult \
-                 does not store their fitted values. They are carried only by the in-memory \
-                 result of a FOCE, FOCEI, Laplace or Gauss-Newton fit(); a fit read from \
-                 .fitrx, built in R, or estimated by SAEM, IMP or Bayes lacks them (#1765).",
+                 does not store their fitted values. They are carried by the result of a \
+                 FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a .fitrx bundle save_fit \
+                 wrote from one; a fit built in R, a .fitrx bundle saved before #1815 or \
+                 written by ferx-r, or a fit estimated by SAEM, IMP or Bayes lacks them \
+                 (#1765).",
                 names.join(", ")
             ))
         }
@@ -853,6 +934,99 @@ mod tests {
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
         }
+    }
+
+    /// A fit at `template`'s own packed point: its reported θ/Ω/σ/Ω_IOV/ρ are the
+    /// unpack of `pack_params(template)`, and it carries that vector — what a
+    /// packed-space `fit()` produces, so `Usable` by construction.
+    fn fit_at_own_pack(path: &str) -> (FitResult, ModelParameters) {
+        let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(path))
+            .expect("model");
+        let template = model.default_params.clone();
+        let packed = crate::estimation::parameterization::pack_params(&template);
+        let at = unpack_params(&packed, &template);
+        let n = packed.len();
+        let mut fit = fit_with_cov(&at, DMatrix::identity(n, n));
+        fit.omega_iov = at.omega_iov.as_ref().map(|o| o.matrix.clone());
+        fit.residual_correlations = at.residual_correlations.clone();
+        fit.packed_estimate = Some(packed);
+        (fit, template)
+    }
+
+    fn one_ulp(x: &mut f64) {
+        *x = f64::from_bits(x.to_bits() + 1);
+    }
+
+    /// #1815 T2: the classifier's four answers, and one `Stale` per stored field.
+    /// `warfarin_iov` carries θ, Ω, σ and Ω_IOV; `correlated_residual_combined`
+    /// carries the `block_sigma` ρ. Each field is edited by one ULP on its own, so
+    /// each comparison in `fit_packed_estimate` has a row that only it can redden.
+    ///
+    /// Mutations — delete any one of the five comparisons: that field's row stays
+    /// `Usable`; make the length check `<=` / `>=`: a ±1 row is `Stale` or panics
+    /// in the unpack instead of `WrongLength`.
+    #[test]
+    fn fit_packed_estimate_classifies_each_field() {
+        let (fit, template) = fit_at_own_pack("examples/warfarin_iov.ferx");
+        assert!(template.omega_iov.is_some(), "fixture must carry Ω_IOV");
+        let v = fit.packed_estimate.clone().unwrap();
+        assert_eq!(
+            fit_packed_estimate(&fit, &template),
+            PackedEstimate::Usable(&v)
+        );
+
+        let mut absent = fit.clone();
+        absent.packed_estimate = None;
+        assert_eq!(
+            fit_packed_estimate(&absent, &template),
+            PackedEstimate::Absent
+        );
+
+        for n in [v.len() - 1, v.len() + 1] {
+            let mut wrong = fit.clone();
+            wrong.packed_estimate = Some(vec![0.0; n]);
+            assert_eq!(
+                fit_packed_estimate(&wrong, &template),
+                PackedEstimate::WrongLength(n),
+                "length {n} against {}",
+                v.len()
+            );
+        }
+
+        let edits: [(&str, fn(&mut FitResult)); 4] = [
+            ("theta[0]", |f| one_ulp(&mut f.theta[0])),
+            ("omega(0,0)", |f| one_ulp(&mut f.omega[(0, 0)])),
+            ("sigma[0]", |f| one_ulp(&mut f.sigma[0])),
+            ("omega_iov(0,0)", |f| {
+                one_ulp(&mut f.omega_iov.as_mut().unwrap()[(0, 0)])
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut stale = fit.clone();
+            edit(&mut stale);
+            assert_eq!(
+                fit_packed_estimate(&stale, &template),
+                PackedEstimate::Stale,
+                "{field} edited by 1 ULP must be Stale"
+            );
+        }
+
+        let (fit, template) = fit_at_own_pack("examples/correlated_residual_combined.ferx");
+        assert!(
+            !fit.residual_correlations.is_empty(),
+            "fixture must carry a block_sigma ρ"
+        );
+        assert!(matches!(
+            fit_packed_estimate(&fit, &template),
+            PackedEstimate::Usable(_)
+        ));
+        let mut stale = fit.clone();
+        one_ulp(&mut stale.residual_correlations[0].rho);
+        assert_eq!(
+            fit_packed_estimate(&stale, &template),
+            PackedEstimate::Stale,
+            "rho[0] edited by 1 ULP must be Stale"
+        );
     }
 
     #[test]

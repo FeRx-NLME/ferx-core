@@ -709,6 +709,7 @@ fn mixture_override_run_covariance_is_identical_to_in_fit() {
 /// |-------------|-------------------|---------------------------------------------|
 /// | override    | `None`            | `Err`: names the override and why it is gone |
 /// | override    | shorter / longer  | `Err`: layout mismatch, no `.fitrx` story   |
+/// | override    | right length, θ edited | `Err`: stale, no layout / `.fitrx` story (#1815) |
 /// | no override | `None`            | `Ok`, identical to the in-fit SIR            |
 ///
 /// Each sentence of each message is asserted by a substring, so deleting one reddens
@@ -735,9 +736,10 @@ fn mixture_without_packed_estimate() {
             format!("{entry}: this [mixture] fit"),
             "per-class override(s) omega(2) ETA_CL".to_string(),
             "a FitResult does not store their fitted values".to_string(),
-            "carried only by the in-memory result of a FOCE, FOCEI, Laplace or Gauss-Newton fit()"
-                .to_string(),
-            "a fit read from .fitrx, built in R, or estimated by SAEM, IMP or Bayes lacks them"
+            "carried by the result of a FOCE, FOCEI, Laplace or Gauss-Newton fit()".to_string(),
+            "and by a .fitrx bundle save_fit wrote from one".to_string(),
+            "a fit built in R, a .fitrx bundle saved before #1815 or written by ferx-r, or a \
+             fit estimated by SAEM, IMP or Bayes lacks them (#1765)"
                 .to_string(),
         ] {
             assert!(
@@ -745,7 +747,7 @@ fn mixture_without_packed_estimate() {
                 "{entry} message lacks {must:?}: {e}"
             );
         }
-        for must_not in ["refit", "declared", "layout"] {
+        for must_not in ["refit", "declared", "layout", "a fit read from .fitrx"] {
             assert!(
                 !e.to_string().contains(must_not),
                 "{entry} message says {must_not:?}: {e}"
@@ -781,6 +783,44 @@ fn mixture_without_packed_estimate() {
         );
     }
 
+    // Row 2b (#1815): a packed estimate of the right length that no longer unpacks to
+    // the fit's reported estimates — θ edited after the fit. Its override slot cannot be
+    // trusted, and the message says so without the length or `.fitrx` stories.
+    let mut edited = cleared(&r);
+    edited.theta[0] *= 1.01;
+    assert_eq!(edited.packed_estimate.as_ref().map(Vec::len), Some(7));
+    for (entry, res) in [
+        (
+            "run_sir",
+            run_sir(&edited, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
+        ),
+        (
+            "run_covariance",
+            run_covariance(&edited, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
+        ),
+    ] {
+        let e = res.expect_err("an edited override fit must be refused");
+        for must in [
+            format!("{entry}: the fit's packed estimate no longer reproduces its reported"),
+            "theta / Omega / Sigma".to_string(),
+            "so the [mixture] override values it carries cannot be trusted".to_string(),
+            "the estimates were changed after the fit, or this is not the model the fit was \
+             estimated with"
+                .to_string(),
+        ] {
+            assert!(
+                e.to_string().contains(&must),
+                "{entry} stale message lacks {must:?}: {e}"
+            );
+        }
+        for must_not in ["layout", "coordinates", ".fitrx", "lacks them"] {
+            assert!(
+                !e.to_string().contains(must_not),
+                "{entry} stale message says {must_not:?}: {e}"
+            );
+        }
+    }
+
     // Row 3: no override — the base is exact, so nothing is missing.
     let (model0, pop0, r0) = mixture_sir_fit(false);
     let mut stored0 = cleared(&r0);
@@ -788,4 +828,45 @@ fn mixture_without_packed_estimate() {
     let s0 = run_sir(&stored0, Some(&model0), Some(&pop0), &sir_defaults())
         .expect("a no-override mixture fit needs no packed estimate");
     assert_sir_identical(&s0, &r0, "run_sir vs in-fit (no-override mixture)");
+}
+
+/// #1815 T4. The mixture-override fit saved to `.fitrx` and loaded back: `run_covariance`
+/// and `run_sir` reproduce the in-fit covariance and SIR bit for bit, because the bundle
+/// carries the packed vector that holds the override's fitted value. Premise: the same
+/// reloaded fit without the vector — every bundle before #1815 — is refused (#1765).
+///
+/// Mutation — `load_fit` reads `packed_estimate: None`: both claims are refused.
+#[test]
+fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let (model, pop, r) = mixture_sir_fit(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixture.fitrx");
+    save_fit(&r, &pop, MIX_OVERRIDE, &path, SaveFitOptions::default()).expect("save_fit");
+    let loaded = load_fit(&path).expect("load_fit").fit;
+
+    let mut legacy = cleared(&loaded);
+    legacy.packed_estimate = None;
+    assert!(
+        run_sir(&legacy, Some(&model), Some(&pop), &sir_defaults()).is_err(),
+        "premise: a reloaded override fit without its packed vector is refused"
+    );
+
+    let c = run_covariance(&loaded, Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_covariance on the reloaded mixture fit must run");
+    let (a, b) = (
+        r.covariance_matrix.as_ref().expect("in-fit covariance"),
+        c.covariance_matrix
+            .as_ref()
+            .expect("run_covariance on the reloaded fit returned no matrix"),
+    );
+    assert_eq!(a.shape(), b.shape());
+    for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(x.is_finite(), "covariance[{k}] not finite");
+        assert_eq!(x.to_bits(), y.to_bits(), "covariance[{k}]: {x} vs {y}");
+    }
+
+    let s = run_sir(&cleared(&loaded), Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_sir on the reloaded mixture fit must run");
+    assert_sir_identical(&s, &r, "run_sir on reloaded vs in-fit (mixture override)");
 }

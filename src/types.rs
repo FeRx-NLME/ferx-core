@@ -7390,11 +7390,16 @@ pub struct FitResult {
     /// matrix, so both paths re-decompose identically and already agree), for Bayes
     /// (no Hessian covariance step), and for hand-built results.
     ///
-    /// **Transient (`#[serde(skip)]`):** it is an in-process optimisation for a
-    /// `run_covariance` called right after a fit; a fit reloaded from `.fitrx`
-    /// carries `None` and `run_covariance` falls back to re-packing from `omega`
-    /// (the documented "~1e-5, platform dependent" path). Never serialized, so no
-    /// `.fitrx` / ferx-r format change.
+    /// **Persisted by the `.fitrx` bundle** (#1815): [`save_fit`](crate::io::fitrx::save_fit)
+    /// writes it as `fit.json`'s `packed_estimate` key and
+    /// [`load_fit`](crate::io::fitrx::load_fit) reads it back bit-for-bit, so a
+    /// `run_covariance` on a reloaded fit repeats the inline step. `FitResult`'s own
+    /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. A
+    /// bundle saved before #1815, or written by ferx-r, loads `None`. Every consumer
+    /// reads it only when it unpacks bit-for-bit to this result's `theta` / `omega` /
+    /// `sigma` / `omega_iov` / `residual_correlations` under the supplied model, so
+    /// estimates edited after the fit are evaluated where they now say, never at this
+    /// stale centre.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial

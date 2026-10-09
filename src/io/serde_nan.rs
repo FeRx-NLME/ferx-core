@@ -12,6 +12,7 @@
 //! - `crate::io::serde_nan::vec`     for `Vec<f64>`
 //! - `crate::io::serde_nan::vec_vec` for `Vec<Vec<f64>>`
 //! - `crate::io::serde_nan::opt`     for `Option<f64>`
+//! - `crate::io::serde_nan::opt_vec` for `Option<Vec<f64>>`
 
 use serde::{Serialize, Serializer};
 
@@ -110,5 +111,26 @@ pub mod opt {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
         Option::<f64>::deserialize(de)
+    }
+}
+
+/// `Option<Vec<f64>>` field: `None` -> `null`, `Some(v)` -> `v` with each
+/// non-finite element -> `null`, and back. Pair it with
+/// `skip_serializing_if = "Option::is_none"` + `default` so an absent vector is
+/// an absent key rather than a `null` one.
+pub mod opt_vec {
+    use super::NanNullSlice;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<Vec<f64>>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => ser.serialize_some(&NanNullSlice(v.as_slice())),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Vec<f64>>, D::Error> {
+        let opts: Option<Vec<Option<f64>>> = Option::deserialize(de)?;
+        Ok(opts.map(|v| v.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect()))
     }
 }

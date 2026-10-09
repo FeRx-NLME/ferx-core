@@ -330,6 +330,28 @@ bundle saved before #1783, which loads it as `None`. The steps then use the mode
 file's rule when they read the file, with a warning naming it; set
 `fit.iov_occasion` when the fit ran under another rule.
 
+### `packed_estimate`
+
+The outer optimizer's parameter vector at the estimate, in its own packed space
+(`ln θ`, the log-diagonal Cholesky factor of Ω, `ln σ`, then Ω_IOV, any
+`[mixture]` override and the `block_sigma` correlations;
+[#1815](https://github.com/FeRx-NLME/ferx-core/issues/1815)). It lets
+`run_covariance` on a reloaded fit unpack the same Cholesky factor the inline
+covariance step used, and so repeat that step bit for bit; re-decomposing the
+stored `omega` instead lands on a factor a few ULP away, which the
+finite-difference Hessian amplifies. It also carries a `[mixture]` fit's fitted
+override values, which have no other field. Elements are full-precision floats,
+non-finite as `null`.
+
+It is written by FOCE, FOCEI, Laplace and Gauss-Newton fits, and absent for
+SAEM, IMP and Bayes, on a bundle saved before #1815, and on one written by
+ferx-r; all of those load it as `None`. Consumers use it only when it unpacks
+bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV and correlations
+under the supplied model. An edited bundle, or a model with another layout of
+the same length, falls back to the stored estimates; a `[mixture]` fit with an
+override is then refused, since its override value lives only in this vector.
+The format version did not change.
+
 ## `ebes.csv`
 
 ```
