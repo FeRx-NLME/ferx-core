@@ -269,6 +269,7 @@ fn a_frem_subject_draws_its_pk_rows_at_the_fitted_correlation() {
         assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
         worst = worst.max((npd - 1.0).abs());
     }
+    eprintln!("FREM: worst |npd − 1| = {worst}");
     assert!(
         worst < TOL_A,
         "npde: the FREM subject's PK row is not drawn at the fitted ρ: worst |npd − 1| = \
