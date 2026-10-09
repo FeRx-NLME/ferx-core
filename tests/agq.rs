@@ -1106,9 +1106,9 @@ fn agq_covariance_step_produces_finite_standard_errors() {
 /// * the analytic SEs are **not** bit-identical to the stencil's, and no
 ///   `W_COV_ANALYTIC_SALVAGE` was emitted — so the comparison below is between two routes, not
 ///   an FD fallback compared with itself;
-/// * every SE agrees with `analytic_cov_hessian = false` to `2e-3` relative. Measured on
-///   `160cc9a3` (macOS, release) at 5.125e-4, which is the FD stencil's own floor: the
-///   already-validated `n_agq = 1` FOCEI analytic Hessian sits at 5.124e-4 on the same fit.
+/// * every SE agrees with `analytic_cov_hessian = false` to `2e-3` relative (3.9× headroom).
+///   Realised 5.1254e-4 on Linux aarch64 (`ci-test` profile) and on macOS debug alike. That is the FD stencil's own floor: the already-validated
+///   `n_agq = 1` FOCEI analytic Hessian sits at 5.124e-4 on the same fit.
 #[test]
 fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
     let prep = ferx_core::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
