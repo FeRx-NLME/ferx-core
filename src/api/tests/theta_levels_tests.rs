@@ -7051,26 +7051,30 @@ mod absorption {
         (tag, "STUDY", ip, format!("E0 + {EMAXY}"), kappa)
     }
 
-    /// A1 (#1836: R1, R6, R10, R14, R16; control R7; twins R9, R11). The block
-    /// absorbs `ETA_E0` through `E0` in each refused row, whether a
+    /// A1 (#1836: R1, R6, R10, R12, R14, R16, Q2, R18; control R7; twins R9,
+    /// R11). The block absorbs `ETA_E0` through `E0`'s first assignment
+    /// `TVE0 + PLACEBO + ETA_E0` in each refused row, whether a
     /// self-reassignment scales it by a factor reading neither (R1, and R16
     /// with a kappa in the factor), leaves it unchanged (R6), adds a term
-    /// constant within each subject (R10), or reads it back through a copy
-    /// (R14). Each is refused under every contrast naming `E0`, and agrees with
-    /// the joint oracle. R7, the fresh-name form, is unchanged. The twins put
-    /// the varying factor on the block (R9) or on a second η term (R11): the η
-    /// is identified, and they bind.
+    /// constant within each subject (R10), doubles it on a varying condition
+    /// (R12), reads it back through a copy (R14), or a second parameter `C2`
+    /// reads it before the reassignment (Q2, #1848 review). Each funnel is one
+    /// assignment, cut alone. R18 assigns `E0` in both branches of an `if` on
+    /// `STUDY`, constant within each subject: neither assignment alone is a
+    /// funnel, the pair is. Each row is refused under every contrast naming
+    /// `E0`, and agrees with the joint oracle. R7, the fresh-name form, is
+    /// unchanged. The twins put the varying factor on the block (R9) or on a
+    /// second η term (R11): the η is identified, and they bind.
     ///
-    /// The message cells: R1's site names `E0` and nothing it reads, since the
-    /// η reached `E0`'s second assignment from `E0`'s own first one; R14's
-    /// names the copy `E0B`; R7's names `E0A`, its first funnel in source
-    /// order, with no "through", as before #1836.
+    /// The message cells: R1's and R14's sites name `E0` with no "through",
+    /// since the funnel is `E0`'s first assignment, which reads the η itself;
+    /// R7's names `E0A`, its own funnel, the same rule.
     ///
     /// Mutations, measured — `resolve` returning every assignment of the name
     /// (the `debug_assert!` that a resolved assignment comes before its reader
-    /// fires); `own` = every assignment of `E0`; no kill in the reach sets;
-    /// `eta_via` free to name `E0` itself (R1 says "(through `E0`)"). Each
-    /// reddens this test.
+    /// fires); no kill in the reach sets; `eta_via` free to name `E0` itself;
+    /// candidates one per name at the end of the block (Q2, R12 bind); no
+    /// multi-assignment candidate (R18 binds). Each reddens this test.
     #[test]
     fn a_self_reassigned_funnel_is_refused() {
         let pop = arms_pop();
@@ -7091,6 +7095,26 @@ mod absorption {
                 "R16 kappa factor",
                 format!("  E0 = {S}\n  E0 = E0 * exp(KAPPA_E0) * {FAC}"),
                 true,
+            ),
+            row_1836(
+                "R12 varying branch",
+                format!("  E0 = {S}\n  if (OCC > 1) {{\n    E0 = E0 * 2\n  }}"),
+                false,
+            ),
+            (
+                "Q2 second reader",
+                "STUDY",
+                format!("  E0 = {S}\n  C2 = E0 * {FAC}\n  E0 = E0 * {FAC}"),
+                format!("E0 + {EMAXY} + 0.01 * C2 * TIME"),
+                false,
+            ),
+            row_1836(
+                "R18 both branches",
+                format!(
+                    "  if (STUDY > 1) {{\n    E0 = {S}\n  }} else {{\n    \
+                     E0 = TVE0 + PLACEBO + 2 * ETA_E0\n  }}"
+                ),
+                false,
             ),
         ];
         let r7 = row_1836(
@@ -7134,8 +7158,8 @@ mod absorption {
             ),
             (
                 &refused[3],
-                "`E0` reads this block and carries a random effect (through `E0B`)",
-                Some("(through `E0`)"),
+                "the individual parameter `E0` reads this block and carries a random effect",
+                Some("(through"),
             ),
             (
                 &r7,
@@ -7167,9 +7191,16 @@ mod absorption {
     /// second assignment. Both are refused naming `E0`, and agree with the
     /// joint oracle.
     ///
-    /// Mutations — `own` = every assignment of `E0` (R13 and R13b bind); no
-    /// kill in the reach sets, so an assignment adds to its name's set (R13b
-    /// binds: its read reaches the dead store).
+    /// The straddle (Q1, #1848 review): the overwritten assignment is not dead
+    /// when another parameter reads it first. `C2 = E0` carries the varying
+    /// first assignment to `y` through `0.01 * C2 * TIME`, so cutting `E0`'s
+    /// last assignment leaves the block and the η reaching `y`: the η is
+    /// identified, and Q1 binds and agrees, like its fresh-name twin. A cut by
+    /// name, which also cut the first assignment, refused it.
+    ///
+    /// Mutations, measured — no kill in the reach sets (R13b binds: its read
+    /// reaches the dead store); the cut by name, every assignment of the
+    /// candidate's parameter (Q1 is refused).
     #[test]
     fn a_dead_store_does_not_count() {
         let pop = arms_pop();
@@ -7182,11 +7213,20 @@ mod absorption {
                 false,
             ),
         ];
+        let q1: Row = (
+            "Q1 read before it is overwritten",
+            "STUDY",
+            format!("  E0 = TVE0 + PLACEBO * {FAC} + ETA_E0\n  C2 = E0\n  E0 = {S}"),
+            format!("E0 + {EMAXY} + 0.01 * C2 * TIME"),
+            false,
+        );
         let mut wrong = Vec::new();
         for r in &rows {
             refused_everywhere(r, &pop, PARAM_SITE, &mut wrong);
             agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
         }
+        binds(&q1, &pop, &mut wrong);
+        agrees_with_joint_oracle(q1.0, &row_text(&q1), &pop, &mut wrong);
         assert!(wrong.is_empty(), "dead store:\n{}", wrong.join("\n"));
     }
 

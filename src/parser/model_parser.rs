@@ -21110,6 +21110,10 @@ impl StateInputs {
 /// of its assignments that can reach that point, ascending.
 type Reach<'a> = HashMap<&'a str, Vec<usize>>;
 
+/// A branch condition with the reaching definitions at its `if`, shared by
+/// every assignment the branch guards.
+type CondAt<'a> = (&'a Condition, std::rc::Rc<Reach<'a>>);
+
 /// One `[individual_parameters]` assignment, with the conditions of the `if`
 /// branches it sits in and what each name it reads resolves to.
 struct CouplingAssign<'a> {
@@ -21117,7 +21121,7 @@ struct CouplingAssign<'a> {
     rhs: &'a Expression,
     /// Each condition with the reaching definitions at its `if`, where it is
     /// evaluated: an assignment earlier in the same branch does not reach it.
-    conds: Vec<(&'a Condition, std::rc::Rc<Reach<'a>>)>,
+    conds: Vec<CondAt<'a>>,
     /// The reaching definitions at this assignment, so a read of a name inside
     /// it resolves to the assignments of that name before it, never to itself
     /// or a later one (#1836).
@@ -21140,7 +21144,7 @@ fn coupling_defs(stmts: &[Statement]) -> (Vec<CouplingAssign<'_>>, Reach<'_>) {
 
 fn coupling_assigns<'a>(
     stmts: &'a [Statement],
-    conds: &[(&'a Condition, std::rc::Rc<Reach<'a>>)],
+    conds: &[CondAt<'a>],
     reach: &mut Reach<'a>,
     out: &mut Vec<CouplingAssign<'a>>,
 ) {
@@ -21259,11 +21263,11 @@ fn level_block_eta_coupling(
         token: states.tokens.contains(eta_name),
     };
 
-    let taint_e = ctx.taint(&eta_src, None);
-    let taint_b = ctx.taint(&block_src, None);
+    let taint_e = ctx.taint(&eta_src, &[]);
+    let taint_b = ctx.taint(&block_src, &[]);
     let reach = ctx.route(&eta_src, &taint_e);
     let mut funnels = Vec::new();
-    if reach.is_some() && ctx.reaches(&block_src, None) {
+    if reach.is_some() && ctx.reaches(&block_src, &[]) {
         // An individual parameter is a funnel when each of its assignments is:
         // one that reads both the block and the random effect through the
         // operands `funnel_operands` finds, any other as a whole. The branch
@@ -21306,27 +21310,36 @@ fn level_block_eta_coupling(
             }
             Some(covs)
         };
-        // Individual parameters, in source order.
+        // The candidates are sets of assignments, cut together (#1836): each
+        // assignment alone, in source order, and then each parameter's
+        // assignments reaching the end of the block when there are several
+        // (`if` branches that all assign it). A candidate is a set, not a name:
+        // cutting every assignment of a name would also cut an earlier one
+        // another parameter still reads, and a later assignment can be read
+        // before the name's last one is written.
+        let mut candidates: Vec<Vec<usize>> = (0..assigns.len()).map(|d| vec![d]).collect();
         let mut seen: Vec<&str> = Vec::new();
         for a in &assigns {
-            let v = a.lhs;
-            if seen.contains(&v) {
+            if seen.contains(&a.lhs) {
                 continue;
             }
-            seen.push(v);
+            seen.push(a.lhs);
+            let out = ctx.resolve(ctx.out(), a.lhs);
+            if out.len() > 1 {
+                candidates.push(out.to_vec());
+            }
+        }
+        for own in &candidates {
+            let own = own.as_slice();
+            let v = assigns[own[0]].lhs;
             // No "carries both" pre-filter: the cut test below already rejects a
-            // parameter that carries only one, since the other still reaches `y`
+            // candidate that carries only one, since the other still reaches `y`
             // without it. Two gates rejecting the same inputs would each be
             // untestable (AGENTS.md).
-            //
-            // The parameter is the value its assignments leave at the end of the
-            // block: those reaching it, not a dead store an unconditional
-            // reassignment overwrote (#1836).
-            let own = ctx.resolve(ctx.out(), v);
             let Some(mut covariates) = param_funnel_covariates(own) else {
                 continue;
             };
-            if ctx.reaches(&block_src, Some(v)) || ctx.reaches(&eta_src, Some(v)) {
+            if ctx.reaches(&block_src, own) || ctx.reaches(&eta_src, own) {
                 continue;
             }
             let direct = own.iter().any(|&d| {
@@ -21523,14 +21536,16 @@ impl<'a> CouplingCtx<'a> {
         })
     }
 
-    /// The assignments carrying `src`, never through `cut`: per assignment, not
-    /// per name, so a name's later assignment that reads the source does not
-    /// taint an earlier read of it (#1836). One pass in source order is exact,
-    /// since every definition a read resolves to comes before the reader.
-    fn taint(&self, src: &Source, cut: Option<&str>) -> HashSet<usize> {
+    /// The assignments carrying `src`, never through the assignments `cut`: per
+    /// assignment, not per name, so a name's later assignment that reads the
+    /// source does not taint an earlier read of it, and cutting one assignment
+    /// of a name leaves its others live (#1836). One pass in source order is
+    /// exact, since every definition a read resolves to comes before the
+    /// reader.
+    fn taint(&self, src: &Source, cut: &[usize]) -> HashSet<usize> {
         let mut t: HashSet<usize> = HashSet::new();
         for (d, a) in self.assigns.iter().enumerate() {
-            if Some(a.lhs) == cut {
+            if cut.contains(&d) {
                 continue;
             }
             let at = self.at(d);
@@ -21557,8 +21572,8 @@ impl<'a> CouplingCtx<'a> {
                     .any(|f| self.var_tainted(f, tainted, self.out())))
     }
 
-    /// Whether `src` reaches some readout, never through `cut`.
-    fn reaches(&self, src: &Source, cut: Option<&str>) -> bool {
+    /// Whether `src` reaches some readout, never through the assignments `cut`.
+    fn reaches(&self, src: &Source, cut: &[usize]) -> bool {
         let t = self.taint(src, cut);
         let s = self.state_tainted(src, &t);
         self.readout

@@ -295,12 +295,18 @@ read, in statement order. Inside `E0 = E0 * (1 + 0.1 * OCC)`, the `E0` on the
 right is the value assigned before that line, so writing
 `E0 = TVE0 + PLACEBO + ETA_E0` and then `E0 = E0 * (1 + 0.1 * OCC)` counts
 exactly as the one-line form above does, and so does the same model written
-through a fresh name (`E0A = ...`, then `E0 = E0A * ...`). An assignment that a
-later unconditional one overwrites before anything reads it does not count. One
-inside an `if` reaches past it alongside the value from before, unless an
-`else` overwrites that value too, and a branch condition that varies within a
-subject then keeps the parameter from counting, even when the branches happen to
-be proportional (#1834).
+through a fresh name (`E0A = ...`, then `E0 = E0A * ...`). Each assignment is
+judged on its own: it is the shared expression when it is constant within a
+subject and every route of the block and the random effect to `y` passes through
+it. So `E0 = TVE0 + PLACEBO + ETA_E0` counts even when a later line doubles `E0`
+on a condition that varies within a subject. An earlier assignment that a later
+one overwrites before anything reads it is on no route and does not matter. One
+that another parameter reads first is a route of its own: with `C2 = E0` written
+before `E0` is reassigned, and `y` reading `C2`, the reassigned `E0` alone is
+not the shared expression. When every branch of an `if` assigns the parameter,
+the branch assignments are also judged together, and a branch condition that
+varies within a subject keeps them from counting, even when the branches happen
+to be proportional (#1834).
 
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in
