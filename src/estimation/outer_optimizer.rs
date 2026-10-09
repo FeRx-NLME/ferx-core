@@ -4631,6 +4631,7 @@ fn subject_fixed_ebe_gradient(
             subj_idx,
             eta_hat,
             h_matrix,
+            kappas,
             bounds,
             options,
         ) {
