@@ -1206,8 +1206,8 @@ fn subject_nll_pop_grad_analytical_laplace(
 }
 
 /// Per-subject Laplace intermediates the FOCEI θ/Ω/σ gradient already forms,
-/// captured so the #274 covariance EBE-response correction can reuse them
-/// instead of recomputing the predictions and re-factorising `H̃`. Every field
+/// captured so the outer optimizer's #274 EBE-response correction can reuse
+/// them instead of recomputing the predictions and re-factorising `H̃`. Every field
 /// is evaluated at the same `(η̂, parameter)` point as the gradient that
 /// produced it, so a correction built from the cache is bit-identical to one
 /// that recomputes from scratch. See [`subject_eta_response_correction`].
@@ -1228,7 +1228,7 @@ pub(crate) struct LaplaceGradCache {
     /// Per-packed-parameter GN gradient EBE-response correction:
     /// `t_i[k] = −½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k`
     /// where `q̃ⱼ = (H̃⁻¹ gη)' aⱼ` and `gη[m] = Σⱼ βⱼ qⱼ a_{j,m}`.
-    /// Only the theta block (indices `0..n_theta`) is filled; omega/sigma stay zero (#335).
+    /// Only the theta block (indices `0..n_theta`) is filled; omega/sigma stay zero (#1817).
     /// Used by `build_gn_system` to correct the fixed-η̂ Laplace gradient for the
     /// `log|H̃|` EBE-response term the envelope theorem drops.
     pub gn_theta_correction: Vec<f64>,
@@ -1671,7 +1671,7 @@ fn logdet_htilde_beta(d: f64, d2: f64, inv_r: f64) -> f64 {
 /// correction and the score it corrects share one predicate (#1779). The cache is
 /// the Almquist closed form's, which carries none of the terms that gate excludes:
 /// on a joint PK + TTE subject it has no hazard term, on an IOV subject no κ. The
-/// correction is zero today (#338 Part A); once #335 makes it non-zero, a cache
+/// correction is zero today (#338 Part A); once #1817 makes it non-zero, a cache
 /// built past the gate would make it wrong there silently.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_eta_response_correction(
@@ -1712,7 +1712,7 @@ pub(crate) fn subject_eta_response_correction(
     // already formed them; otherwise re-derive them by running
     // the cached Laplace gradient here. Either way the intermediates are the same
     // `R/d/d2/G/H̃⁻¹/q` the gradient uses, so the correction is unchanged. The
-    // cache is kept live for #335 (the ω/σ blocks below will reuse it).
+    // cache is kept live for #1817 (the ω/σ blocks below will reuse it).
     let owned;
     let c: &LaplaceGradCache = match cache {
         Some(c) => c,
@@ -1744,7 +1744,7 @@ pub(crate) fn subject_eta_response_correction(
     // because the `gη = ∂log|H̃|/∂η` factor is itself a-fixed (an exact correction
     // needs 3rd-order sensitivities). `u` is still formed (binding `_u`) so the
     // full cache — including its `hrh`/`htilde_inv` blocks — stays live for the
-    // #335 ω/σ work; the returned correction is zero.
+    // #1817 ω/σ work; the returned correction is zero.
     let _u = &c.hrh * (&c.htilde_inv * &g_eta);
     let t = vec![0.0f64; n];
 
@@ -1753,7 +1753,7 @@ pub(crate) fn subject_eta_response_correction(
     // block's G·H̃⁻¹≈I cancellation, it is exposed to the dropped ∂²f/∂η² and
     // overshoots weakly-identified ω — it adds nothing for the optimizer (slsqp
     // reaches the true minimum on the θ block alone) and is below the covariance
-    // step's FD-conditioning noise floor. Deferred to #335 (needs analytic
+    // step's FD-conditioning noise floor. Deferred to #1817 (needs analytic
     // second-order sensitivities). The σ SE is corrected indirectly via the θ/σ
     // off-diagonals.
 
@@ -2448,7 +2448,7 @@ mod tests {
 
         // The theta-block EBE-response correction (mu-ref shortcut) was removed
         // in #338 Part A. The omega and sigma blocks are intentionally omitted
-        // (#335). The correction now always returns zero.
+        // (#1817). The correction now always returns zero.
         let mut model = make_model();
         model.mu_refs = mu();
         let template = model.default_params.clone();
@@ -4826,7 +4826,7 @@ mod tests {
         /// Without the gate the joint subject got `Some(zeros)` — it has three PK rows and
         /// an η, so it passed the `n_eta == 0 || n_obs == 0` early return. The value is
         /// zero either way today (#338 Part A); the regression this catches is the cache
-        /// being built at all, which #335 would turn into a wrong number.
+        /// being built at all, which #1817 would turn into a wrong number.
         ///
         /// The second subject has the endpoint records and no PK rows, so it is the one
         /// that early return sees. It pins the gate *before* that return: moved after it,
