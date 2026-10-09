@@ -907,6 +907,7 @@ fn emit_subject_rows<R: rand::Rng>(
                 j,
                 ipred,
                 &params.sigma.values,
+                draw_correlations,
                 ruv_scale,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
             );

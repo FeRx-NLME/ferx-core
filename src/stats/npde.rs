@@ -171,6 +171,10 @@ pub fn compute_npde_npd(
                 // only), so build the per-observation multiplier matrix once and
                 // reuse it across all replicates.
                 let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+                let draw_correlations = crate::api::draw_correlations(model, params);
+                let correlated_draw = !draw_correlations.is_empty()
+                    && n_obs > 0
+                    && !subject.fremtype.iter().any(|&ft| ft > 0);
                 // IOV (#734): the per-occasion κ draw needs the subject's occasion
                 // groups in the exact order `predict_iov` indexes its `kappas`
                 // argument by. A function of the subject alone, so this side builds
@@ -238,17 +242,42 @@ pub fn compute_npde_npd(
                     // the residual-error eta, so scale the residual variance by
                     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
                     let ruv_scale = model.residual_var_scale(&eta_slice);
-                    for (j, &ip) in ipreds.iter().enumerate() {
-                        let var = model.sim_residual_variance(
+                    // `block_sigma` (#1733): draw through `simulate()`'s own
+                    // correlated draw, at the parameter set's ρ. Paired rows
+                    // (cross-endpoint `L2` / same time) need the dense `R`; a
+                    // per-row draw would score them as independent, and reading
+                    // the model's ρ would score a fitted model at its declaration.
+                    // Same gate as `simulate()`: FREM covariate rows sit outside
+                    // `R`, so such a subject keeps the per-row draw.
+                    if correlated_draw {
+                        let eps = crate::api::correlated_residual_draw(
+                            model,
                             subject,
-                            j,
-                            ip,
                             &params.sigma.values,
+                            draw_correlations,
+                            &ipreds,
                             ruv_scale,
-                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                            ruv_mult.as_deref(),
+                            normal,
+                            &mut rng,
                         );
-                        let eps: f64 = normal.sample(&mut rng);
-                        sims[(j, k)] = ip + var.sqrt() * eps;
+                        for (j, &ip) in ipreds.iter().enumerate() {
+                            sims[(j, k)] = ip + eps[j];
+                        }
+                    } else {
+                        for (j, &ip) in ipreds.iter().enumerate() {
+                            let var = model.sim_residual_variance(
+                                subject,
+                                j,
+                                ip,
+                                &params.sigma.values,
+                                draw_correlations,
+                                ruv_scale,
+                                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                            );
+                            let eps: f64 = normal.sample(&mut rng);
+                            sims[(j, k)] = ip + var.sqrt() * eps;
+                        }
                     }
                 }
 
@@ -402,6 +431,10 @@ fn clamp_prob(p: f64, k: usize) -> f64 {
     let hi = 1.0 - lo;
     p.clamp(lo, hi)
 }
+
+#[cfg(test)]
+#[path = "npde_block_sigma_tests.rs"]
+mod block_sigma_tests;
 
 #[cfg(test)]
 mod tests {

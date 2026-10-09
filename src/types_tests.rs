@@ -217,16 +217,16 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     let f = 2.0;
 
     // PK row: (f·σ_pk)² · ruv_scale.
-    let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv, None);
+    let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, &[], ruv, None);
     assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
 
     // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
-    let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv, None);
+    let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, &[], ruv, None);
     assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
 
     // Without a FREM config every row uses the PK error model.
     model.frem_config = None;
-    let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0, None);
+    let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, &[], 1.0, None);
     assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 }
 
@@ -267,15 +267,15 @@ fn sim_residual_variance_applies_custom_magnitude() {
     let f = 2.0;
 
     // Bare row: (f·σ)².
-    let bare = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, None);
+    let bare = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, None);
     assert!((bare - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 
     // Magnitude 2 on the proportional slot: (f·2·σ)² = 4·bare.
-    let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[2.0]));
+    let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[2.0]));
     assert!((scaled - 4.0 * (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 
     // An all-ones multiplier reproduces the bare variance.
-    let unit = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[1.0]));
+    let unit = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[1.0]));
     assert!((unit - bare).abs() < 1e-12);
 }
 
@@ -2664,6 +2664,51 @@ fn residual_variance_at_threads_correlations_from_model() {
     }];
     let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
     assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+}
+
+/// #1733: `sim_residual_variance` draws at the correlations it is *handed*, not
+/// the model's declared `block_sigma` ρ. Closed form for `combined(PROP, ADD)`
+/// at f = 10, σ = (0.2, 1.0): `0.04·f² + 1 + 2ρ·0.2·1·f` = 7 at the declared
+/// ρ = 0.5 and 1.4 at ρ = −0.9. Both multiplier arms are checked, since each
+/// dispatches to its own `ErrorSpec` method.
+#[test]
+fn sim_residual_variance_uses_the_correlations_it_is_passed() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+    model.error_model = ErrorModel::Combined;
+    model.frem_config = None;
+    let corr = |rho| {
+        vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho,
+        }]
+    };
+    model.residual_correlations = corr(0.5);
+    let subject = Subject {
+        obs_times: vec![1.0],
+        observations: vec![0.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        fremtype: vec![0],
+        ..Default::default()
+    };
+    let sigma = [0.2, 1.0];
+    let fitted = corr(-0.9);
+    for mult in [None, Some(&[1.0, 1.0][..])] {
+        let at_fitted = model.sim_residual_variance(&subject, 0, 10.0, &sigma, &fitted, 1.0, mult);
+        let at_declared = model.sim_residual_variance(
+            &subject,
+            0,
+            10.0,
+            &sigma,
+            &model.residual_correlations,
+            1.0,
+            mult,
+        );
+        assert_relative_eq!(at_fitted, 1.4, epsilon = 1e-12);
+        assert_relative_eq!(at_declared, 7.0, epsilon = 1e-12);
+    }
 }
 
 #[test]
