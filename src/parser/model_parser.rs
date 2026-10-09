@@ -21108,40 +21108,93 @@ impl StateInputs {
     }
 }
 
+/// The reaching definitions at one point of `[individual_parameters]` (#1836):
+/// per individual parameter, the indices (into the [`coupling_assigns`] list)
+/// of its assignments that can reach that point, ascending.
+type Reach<'a> = HashMap<&'a str, Vec<usize>>;
+
+/// A branch condition with the reaching definitions at its `if`, shared by
+/// every assignment the branch guards.
+type CondAt<'a> = (&'a Condition, std::rc::Rc<Reach<'a>>);
+
 /// One `[individual_parameters]` assignment, with the conditions of the `if`
-/// branches it sits in.
+/// branches it sits in and what each name it reads resolves to.
 struct CouplingAssign<'a> {
     lhs: &'a str,
     rhs: &'a Expression,
-    conds: Vec<&'a Condition>,
+    /// Each condition with the reaching definitions at its `if`, where it is
+    /// evaluated: an assignment earlier in the same branch does not reach it.
+    conds: Vec<CondAt<'a>>,
+    /// The reaching definitions at this assignment, so a read of a name inside
+    /// it resolves to the assignments of that name before it, never to itself
+    /// or a later one (#1836).
+    reach_in: Reach<'a>,
+}
+
+/// The assignments of `stmts` in source order, each with its reaching
+/// definitions, and the reaching definitions at the end of the block — what
+/// the readout and the states read. The AST is structured and has no loops,
+/// so one pass is exact: an unconditional assignment kills the earlier
+/// definitions of its name; each `if` branch starts from the definitions
+/// reaching the `if`; after it, a name's set is the union over the branches,
+/// with the incoming set too when there is no `else`.
+fn coupling_defs(stmts: &[Statement]) -> (Vec<CouplingAssign<'_>>, Reach<'_>) {
+    let mut out = Vec::new();
+    let mut reach = Reach::new();
+    coupling_assigns(stmts, &[], &mut reach, &mut out);
+    (out, reach)
 }
 
 fn coupling_assigns<'a>(
     stmts: &'a [Statement],
-    conds: &[&'a Condition],
+    conds: &[CondAt<'a>],
+    reach: &mut Reach<'a>,
     out: &mut Vec<CouplingAssign<'a>>,
 ) {
     for s in stmts {
         match s {
-            Statement::Assign(n, e) => out.push(CouplingAssign {
-                lhs: n.as_str(),
-                rhs: e,
-                conds: conds.to_vec(),
-            }),
+            Statement::Assign(n, e) => {
+                out.push(CouplingAssign {
+                    lhs: n.as_str(),
+                    rhs: e,
+                    conds: conds.to_vec(),
+                    reach_in: reach.clone(),
+                });
+                reach.insert(n.as_str(), vec![out.len() - 1]);
+            }
             Statement::If {
                 branches,
                 else_body,
             } => {
+                let incoming = std::rc::Rc::new(reach.clone());
+                let mut merged = if else_body.is_some() {
+                    Reach::new()
+                } else {
+                    reach.clone()
+                };
+                let mut join = |r: Reach<'a>| {
+                    for (n, defs) in r {
+                        let m = merged.entry(n).or_default();
+                        m.extend(defs);
+                        m.sort_unstable();
+                        m.dedup();
+                    }
+                };
                 // A later branch is reached only when the earlier conditions fail,
                 // so it reads them too.
-                let mut seen: Vec<&'a Condition> = conds.to_vec();
+                let mut seen = conds.to_vec();
                 for (cond, body) in branches {
-                    seen.push(cond);
-                    coupling_assigns(body, &seen, out);
+                    seen.push((cond, incoming.clone()));
+                    let mut r = (*incoming).clone();
+                    coupling_assigns(body, &seen, &mut r, out);
+                    join(r);
                 }
                 if let Some(eb) = else_body {
-                    coupling_assigns(eb, &seen, out);
+                    let mut r = (*incoming).clone();
+                    coupling_assigns(eb, &seen, &mut r, out);
+                    join(r);
                 }
+                *reach = merged;
             }
             _ => {}
         }
@@ -21153,7 +21206,13 @@ fn coupling_assigns<'a>(
 /// block `block` through the `[individual_parameters]` statements `stmts`, the
 /// readouts `readout` (`StateInputs::readout`), and the states.
 ///
-/// Two answers, both read off the expression trees by name:
+/// Two answers, both read off the expression trees. A name is read at its
+/// **reaching definitions** ([`coupling_defs`], #1836): inside an assignment,
+/// the assignments of that name that can reach it, so `E0 = E0 * F` reads the
+/// `E0` before it; at the readout, and for a parameter's own funnel, those
+/// that reach the end of the block, so a dead store does not count.
+///
+/// The two answers:
 ///
 /// - **reach**: whether the random effect gets to `y` at all, and by its most
 ///   direct route. States count: a random effect on `CL` reaches `y` through
@@ -21186,10 +21245,10 @@ fn level_block_eta_coupling(
     eta_name: &str,
     states: &StateInputs,
 ) -> EtaCoupling {
-    let mut assigns = Vec::new();
-    coupling_assigns(stmts, &[], &mut assigns);
+    let (assigns, reach_out) = coupling_defs(stmts);
     let ctx = CouplingCtx {
         assigns: &assigns,
+        reach_out: &reach_out,
         readout,
         block,
         states,
@@ -21207,11 +21266,11 @@ fn level_block_eta_coupling(
         token: states.tokens.contains(eta_name),
     };
 
-    let taint_e = ctx.taint(&eta_src, None);
-    let taint_b = ctx.taint(&block_src, None);
+    let taint_e = ctx.taint(&eta_src, &[]);
+    let taint_b = ctx.taint(&block_src, &[]);
     let reach = ctx.route(&eta_src, &taint_e);
     let mut funnels = Vec::new();
-    if reach.is_some() && ctx.reaches(&block_src, None) {
+    if reach.is_some() && ctx.reaches(&block_src, &[]) {
         // An individual parameter is a funnel when each of its assignments is:
         // one that reads both the block and the random effect through the
         // operands `funnel_operands` finds, any other as a whole. The branch
@@ -21223,62 +21282,83 @@ fn level_block_eta_coupling(
         // The parameter path passes `false` for both: an individual parameter
         // does not read a state.
         let (c, bs, es, taint_bs, taint_es) = (&ctx, &block_src, &eta_src, &taint_b, &taint_e);
-        let reads = move |tb: bool, te: bool| {
-            let block = move |e: &Expression| c.expr_reads(e, bs, taint_bs, tb);
-            let eta = move |e: &Expression| c.expr_reads(e, es, taint_es, te);
+        let reads = move |tb: bool, te: bool, at| {
+            let block = move |e: &Expression| c.expr_reads(e, bs, taint_bs, at, tb);
+            let eta = move |e: &Expression| c.expr_reads(e, es, taint_es, at, te);
             (
                 move |e: &Expression| block(e) || eta(e),
                 move |e: &Expression| block(e) && eta(e),
             )
         };
-        let (p_any, p_both) = reads(false, false);
-        let param_funnel_covariates = |own: &[&CouplingAssign]| -> Option<Vec<String>> {
+        let param_funnel_covariates = |own: &[usize]| -> Option<Vec<String>> {
             let mut covs = Vec::new();
-            for a in own {
+            for &d in own {
+                let (a, at) = (&assigns[d], ctx.at(d));
+                let (p_any, p_both) = reads(false, false, at);
                 let ops = if p_both(a.rhs) {
                     ctx.funnel_operands(a.rhs, &p_any, &p_both)?
                 } else {
                     vec![a.rhs]
                 };
                 for o in ops {
-                    if !ctx.expr_constant(o, &mut covs, &mut Vec::new()) {
+                    if !ctx.expr_constant(o, at, &mut covs) {
                         return None;
                     }
                 }
-                for c in &a.conds {
-                    if !ctx.cond_constant(c, &mut covs, &mut Vec::new()) {
+                for (c, r) in &a.conds {
+                    if !ctx.cond_constant(c, ctx.at_if(r, d), &mut covs) {
                         return None;
                     }
                 }
             }
             Some(covs)
         };
-        // Individual parameters, in source order.
+        // The candidates are sets of assignments, cut together (#1836): each
+        // assignment alone, in source order, and then each parameter's
+        // assignments reaching the end of the block when there are several
+        // (`if` branches that all assign it). A candidate is a set, not a name:
+        // cutting every assignment of a name would also cut an earlier one
+        // another parameter still reads, and a later assignment can be read
+        // before the name's last one is written.
+        let mut candidates: Vec<Vec<usize>> = (0..assigns.len()).map(|d| vec![d]).collect();
         let mut seen: Vec<&str> = Vec::new();
         for a in &assigns {
-            let v = a.lhs;
-            if seen.contains(&v) {
+            if seen.contains(&a.lhs) {
                 continue;
             }
-            seen.push(v);
+            seen.push(a.lhs);
+            let out = ctx.resolve(ctx.out(), a.lhs);
+            if out.len() > 1 {
+                candidates.push(out.to_vec());
+            }
+        }
+        for own in &candidates {
+            let own = own.as_slice();
+            let v = assigns[own[0]].lhs;
             // No "carries both" pre-filter: the cut test below already rejects a
-            // parameter that carries only one, since the other still reaches `y`
+            // candidate that carries only one, since the other still reaches `y`
             // without it. Two gates rejecting the same inputs would each be
             // untestable (AGENTS.md).
-            let own: Vec<&CouplingAssign> = assigns.iter().filter(|a| a.lhs == v).collect();
-            let Some(mut covariates) = param_funnel_covariates(&own) else {
+            let Some(mut covariates) = param_funnel_covariates(own) else {
                 continue;
             };
-            if ctx.reaches(&block_src, Some(v)) || ctx.reaches(&eta_src, Some(v)) {
+            if ctx.reaches(&block_src, own) || ctx.reaches(&eta_src, own) {
                 continue;
             }
-            let direct = own.iter().any(|a| {
-                reads_node(a.rhs, &is_eta) || a.conds.iter().any(|c| cond_reads_node(c, &is_eta))
+            let direct = own.iter().any(|&d| {
+                let a = &assigns[d];
+                reads_node(a.rhs, &is_eta)
+                    || a.conds.iter().any(|(c, _)| cond_reads_node(c, &is_eta))
             });
+            // Through another variable, never `v` itself: a self-read
+            // (`E0 = E0 * …`) carries the random effect from `v`'s own earlier
+            // assignment, which the site already names.
             let via = if direct {
                 None
             } else {
-                own.iter().find_map(|a| first_tainted_var(a.rhs, &taint_e))
+                own.iter().find_map(|&d| {
+                    ctx.first_tainted_var(assigns[d].rhs, &taint_e, ctx.at(d), Some(v))
+                })
             };
             covariates.sort();
             covariates.dedup();
@@ -21293,7 +21373,7 @@ fn level_block_eta_coupling(
         // The readout: only when a single one reads either.
         let te_states = ctx.state_tainted(&eta_src, &taint_e);
         let tb_states = ctx.state_tainted(&block_src, &taint_b);
-        let (reads_any, reads_both) = reads(tb_states, te_states);
+        let (reads_any, reads_both) = reads(tb_states, te_states, ctx.out());
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
             let mut covariates = Vec::new();
@@ -21301,14 +21381,15 @@ fn level_block_eta_coupling(
                 .funnel_operands(y, &reads_any, &reads_both)
                 .filter(|ops| {
                     ops.iter()
-                        .all(|o| ctx.expr_constant(o, &mut covariates, &mut Vec::new()))
+                        .all(|o| ctx.expr_constant(o, ctx.out(), &mut covariates))
                 });
             if let Some(ops) = ops {
                 let direct = ops.iter().any(|o| reads_node(o, &is_eta));
                 let via = if direct {
                     None
                 } else {
-                    ops.iter().find_map(|o| first_tainted_var(o, &taint_e))
+                    ops.iter()
+                        .find_map(|o| ctx.first_tainted_var(o, &taint_e, ctx.out(), None))
                 };
                 covariates.sort();
                 covariates.dedup();
@@ -21349,53 +21430,97 @@ fn cond_reads_node(c: &Condition, f: &dyn Fn(&Expression) -> bool) -> bool {
     hit
 }
 
-/// The first variable `e` reads that is in `tainted`, in visit order.
-fn first_tainted_var(e: &Expression, tainted: &HashSet<&str>) -> Option<String> {
-    let mut found: Option<String> = None;
-    visit_expr_nodes(e, &mut |n| {
-        if let Expression::Variable(v) = n {
-            if found.is_none() && tainted.contains(v.as_str()) {
-                found = Some(v.clone());
-            }
-        }
-    });
-    found
-}
-
 /// The model one [`level_block_eta_coupling`] call walks.
 struct CouplingCtx<'a> {
     assigns: &'a [CouplingAssign<'a>],
+    /// The reaching definitions at the end of the block, where the readout and
+    /// the states read the individual parameters.
+    reach_out: &'a Reach<'a>,
     readout: &'a [Expression],
     block: &'a str,
     states: &'a StateInputs,
-    /// [`Self::var_constant`]'s answer per variable, for this call: the
+    /// [`Self::def_constant`]'s answer per assignment, for this call: the
     /// covariates it reads (sorted, deduplicated) when it is constant, `None`
-    /// when it varies. A variable reached along many paths (a diamond of
+    /// when it varies. An assignment reached along many paths (a diamond of
     /// intermediates) is walked once, not once per path (#1676).
-    constant: std::cell::RefCell<HashMap<String, Option<Vec<String>>>>,
+    constant: std::cell::RefCell<HashMap<usize, Option<Vec<String>>>>,
+}
+
+/// Where a read happens: the reaching definitions there, and the assignment
+/// doing the reading (`None` at the end of the block). Every definition that
+/// reaches an assignment lies strictly before it, which is what makes the walk
+/// terminate without a cycle guard (#1836).
+#[derive(Clone, Copy)]
+struct At<'s> {
+    reach: &'s Reach<'s>,
+    reader: Option<usize>,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Calls of [`CouplingCtx::var_constant`] on this thread, so a test can pin
-    /// that the walk is linear in the variables, not in the paths (#1676).
-    static VAR_CONSTANT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Calls of [`CouplingCtx::def_constant`] on this thread, so a test can pin
+    /// that the walk is linear in the assignments, not in the paths (#1676).
+    static DEF_CONSTANT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> CouplingCtx<'a> {
-    /// Whether node `n` carries the source: is it, names a tainted variable, or
-    /// is a state while the states are tainted.
+    /// Inside assignment `d`.
+    fn at(&self, d: usize) -> At<'_> {
+        At {
+            reach: &self.assigns[d].reach_in,
+            reader: Some(d),
+        }
+    }
+
+    /// In a condition of assignment `d`, evaluated at its `if` with `reach`.
+    fn at_if<'s>(&self, reach: &'s Reach<'s>, d: usize) -> At<'s> {
+        At {
+            reach,
+            reader: Some(d),
+        }
+    }
+
+    /// At the end of the block.
+    fn out(&self) -> At<'_> {
+        At {
+            reach: self.reach_out,
+            reader: None,
+        }
+    }
+
+    /// The assignments a read of `name` at `at` resolves to; empty for a name
+    /// no assignment reaching `at` defines.
+    fn resolve<'s>(&self, at: At<'s>, name: &str) -> &'s [usize] {
+        let defs = at.reach.get(name).map_or(&[][..], Vec::as_slice);
+        debug_assert!(
+            at.reader.is_none_or(|r| defs.iter().all(|&d| d < r)),
+            "coupling: `{name}` read in assignment {:?} resolves to {defs:?}, not all before it",
+            at.reader
+        );
+        defs
+    }
+
+    /// Whether `name`, read at `at`, carries a source tainting the assignments
+    /// `tainted`.
+    fn var_tainted(&self, name: &str, tainted: &HashSet<usize>, at: At<'_>) -> bool {
+        self.resolve(at, name).iter().any(|d| tainted.contains(d))
+    }
+
+    /// Whether node `n`, read at `at`, carries the source: is it, names a
+    /// variable whose reaching assignments carry it, or is a state while the
+    /// states are tainted.
     fn node_carries(
         &self,
         n: &Expression,
         src: &Source,
-        tainted: &HashSet<&str>,
+        tainted: &HashSet<usize>,
+        at: At<'_>,
         states_tainted: bool,
     ) -> bool {
         (src.node)(n)
             || match n {
                 Expression::Variable(v) | Expression::Covariate(v) => {
-                    tainted.contains(v.as_str()) || (states_tainted && self.states.is_state(v))
+                    self.var_tainted(v, tainted, at) || (states_tainted && self.states.is_state(v))
                 }
                 _ => false,
             }
@@ -21405,54 +21530,62 @@ impl<'a> CouplingCtx<'a> {
         &self,
         e: &Expression,
         src: &Source,
-        tainted: &HashSet<&str>,
+        tainted: &HashSet<usize>,
+        at: At<'_>,
         states_tainted: bool,
     ) -> bool {
-        reads_node(e, &|n| self.node_carries(n, src, tainted, states_tainted))
+        reads_node(e, &|n| {
+            self.node_carries(n, src, tainted, at, states_tainted)
+        })
     }
 
-    /// The individual parameters carrying `src`, never through `cut`. A fixpoint
-    /// over assignment order, so a forward reference cannot be missed.
-    fn taint(&self, src: &Source, cut: Option<&str>) -> HashSet<&'a str> {
-        let mut t: HashSet<&'a str> = HashSet::new();
-        loop {
-            let before = t.len();
-            for a in self.assigns {
-                if Some(a.lhs) == cut || t.contains(a.lhs) {
-                    continue;
-                }
-                let carries = |n: &Expression| self.node_carries(n, src, &t, false);
-                if reads_node(a.rhs, &carries)
-                    || a.conds.iter().any(|c| cond_reads_node(c, &carries))
-                {
-                    t.insert(a.lhs);
-                }
+    /// The assignments carrying `src`, never through the assignments `cut`: per
+    /// assignment, not per name, so a name's later assignment that reads the
+    /// source does not taint an earlier read of it, and cutting one assignment
+    /// of a name leaves its others live (#1836). One pass in source order is
+    /// exact, since every definition a read resolves to comes before the
+    /// reader.
+    fn taint(&self, src: &Source, cut: &[usize]) -> HashSet<usize> {
+        let mut t: HashSet<usize> = HashSet::new();
+        for (d, a) in self.assigns.iter().enumerate() {
+            if cut.contains(&d) {
+                continue;
             }
-            if t.len() == before {
-                return t;
+            let at = self.at(d);
+            let carries = |n: &Expression| self.node_carries(n, src, &t, at, false);
+            if reads_node(a.rhs, &carries)
+                || a.conds.iter().any(|(c, r)| {
+                    let at = self.at_if(r, d);
+                    cond_reads_node(c, &|n| self.node_carries(n, src, &t, at, false))
+                })
+            {
+                t.insert(d);
             }
         }
+        t
     }
 
-    fn state_tainted(&self, src: &Source, tainted: &HashSet<&str>) -> bool {
+    fn state_tainted(&self, src: &Source, tainted: &HashSet<usize>) -> bool {
         !self.states.stateless
             && (src.token
                 || self
                     .states
                     .feeds
                     .iter()
-                    .any(|f| tainted.contains(f.as_str())))
+                    .any(|f| self.var_tainted(f, tainted, self.out())))
     }
 
-    /// Whether `src` reaches some readout, never through `cut`.
-    fn reaches(&self, src: &Source, cut: Option<&str>) -> bool {
+    /// Whether `src` reaches some readout, never through the assignments `cut`.
+    fn reaches(&self, src: &Source, cut: &[usize]) -> bool {
         let t = self.taint(src, cut);
         let s = self.state_tainted(src, &t);
-        self.readout.iter().any(|e| self.expr_reads(e, src, &t, s))
+        self.readout
+            .iter()
+            .any(|e| self.expr_reads(e, src, &t, self.out(), s))
     }
 
     /// The most direct route by which `src` reaches a readout.
-    fn route(&self, src: &Source, tainted: &HashSet<&str>) -> Option<EtaRoute> {
+    fn route(&self, src: &Source, tainted: &HashSet<usize>) -> Option<EtaRoute> {
         let states_tainted = self.state_tainted(src, tainted);
         let is_state_leaf = |n: &Expression| matches!(n, Expression::Variable(v) | Expression::Covariate(v) if self.states.is_state(v));
         self.readout
@@ -21460,7 +21593,7 @@ impl<'a> CouplingCtx<'a> {
             .filter_map(|e| {
                 if reads_node(e, src.node) {
                     Some(EtaRoute::Direct)
-                } else if let Some(v) = first_tainted_var(e, tainted) {
+                } else if let Some(v) = self.first_tainted_var(e, tainted, self.out(), None) {
                     Some(EtaRoute::Via(v))
                 } else if states_tainted && reads_node(e, &is_state_leaf) {
                     Some(EtaRoute::State)
@@ -21471,19 +21604,39 @@ impl<'a> CouplingCtx<'a> {
             .min()
     }
 
-    /// Whether every assignment of individual parameter `v` is subject-constant
-    /// (see [`level_block_eta_coupling`]), recording the covariates it reads.
-    /// `stack` guards a cycle, which is treated as varying.
+    /// The first variable `e` reads at `at` whose reaching assignments are in
+    /// `tainted`, in visit order, other than `except`.
+    fn first_tainted_var(
+        &self,
+        e: &Expression,
+        tainted: &HashSet<usize>,
+        at: At<'_>,
+        except: Option<&str>,
+    ) -> Option<String> {
+        let mut found: Option<String> = None;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) = n {
+                if found.is_none() && Some(v.as_str()) != except && self.var_tainted(v, tainted, at)
+                {
+                    found = Some(v.clone());
+                }
+            }
+        });
+        found
+    }
+
+    /// Whether assignment `d` is subject-constant (see
+    /// [`level_block_eta_coupling`]), recording the covariates it reads. Its
+    /// reads resolve to the assignments reaching it, all before it, so the
+    /// recursion ends without a cycle guard (#1836).
     ///
-    /// The answer is memoised per variable (`constant`). That is sound although
-    /// the cycle guard reads `stack`: a variable that met the guard lies on a
-    /// cycle, so walked afresh it meets the guard again and varies either way;
-    /// and a variable found constant met no cycle, so the covariates it
-    /// recorded are all of them. Callers read `covs` only on a `true`.
-    fn var_constant(&self, v: &str, covs: &mut Vec<String>, stack: &mut Vec<String>) -> bool {
+    /// The answer is memoised per assignment (`constant`): it depends on the
+    /// assignment alone, not on who reads it. Callers read `covs` only on a
+    /// `true`.
+    fn def_constant(&self, d: usize, covs: &mut Vec<String>) -> bool {
         #[cfg(test)]
-        VAR_CONSTANT_CALLS.with(|c| c.set(c.get() + 1));
-        if let Some(done) = self.constant.borrow().get(v) {
+        DEF_CONSTANT_CALLS.with(|c| c.set(c.get() + 1));
+        if let Some(done) = self.constant.borrow().get(&d) {
             return match done {
                 Some(read) => {
                     covs.extend(read.iter().cloned());
@@ -21492,50 +21645,36 @@ impl<'a> CouplingCtx<'a> {
                 None => false,
             };
         }
-        if stack.iter().any(|s| s == v) {
-            return false;
-        }
-        stack.push(v.to_string());
+        let a = &self.assigns[d];
         let start = covs.len();
-        let ok = self.assigns.iter().filter(|a| a.lhs == v).all(|a| {
-            self.expr_constant(a.rhs, covs, stack)
-                && a.conds.iter().all(|c| self.cond_constant(c, covs, stack))
-        });
-        stack.pop();
+        let ok = self.expr_constant(a.rhs, self.at(d), covs)
+            && a.conds
+                .iter()
+                .all(|(c, r)| self.cond_constant(c, self.at_if(r, d), covs));
         let done = ok.then(|| {
             let mut read = covs[start..].to_vec();
             read.sort();
             read.dedup();
             read
         });
-        self.constant.borrow_mut().insert(v.to_string(), done);
+        self.constant.borrow_mut().insert(d, done);
         ok
     }
 
-    fn cond_constant(
-        &self,
-        c: &Condition,
-        covs: &mut Vec<String>,
-        stack: &mut Vec<String>,
-    ) -> bool {
+    fn cond_constant(&self, c: &Condition, at: At<'_>, covs: &mut Vec<String>) -> bool {
         match c {
             Condition::Compare(l, _, r) => {
-                self.expr_constant(l, covs, stack) && self.expr_constant(r, covs, stack)
+                self.expr_constant(l, at, covs) && self.expr_constant(r, at, covs)
             }
             Condition::And(l, r) | Condition::Or(l, r) => {
-                self.cond_constant(l, covs, stack) && self.cond_constant(r, covs, stack)
+                self.cond_constant(l, at, covs) && self.cond_constant(r, at, covs)
             }
-            Condition::Not(c) => self.cond_constant(c, covs, stack),
-            Condition::Present(e) => self.expr_constant(e, covs, stack),
+            Condition::Not(c) => self.cond_constant(c, at, covs),
+            Condition::Present(e) => self.expr_constant(e, at, covs),
         }
     }
 
-    fn expr_constant(
-        &self,
-        e: &Expression,
-        covs: &mut Vec<String>,
-        stack: &mut Vec<String>,
-    ) -> bool {
+    fn expr_constant(&self, e: &Expression, at: At<'_>, covs: &mut Vec<String>) -> bool {
         match e {
             // A random effect is constant within its own unit. The one inexact
             // case is a kappa inside an η's funnel that does not separate from
@@ -21555,20 +21694,25 @@ impl<'a> CouplingCtx<'a> {
                     // but lands here too, which only costs a funnel nobody writes.
                     false
                 } else if self.assigns.iter().any(|a| a.lhs == n.as_str()) {
-                    self.var_constant(n, covs, stack)
+                    // An individual parameter is constant when every assignment
+                    // reaching this read is. One read before any of them (a
+                    // forward reference, which the parser rejects) counts as
+                    // varying.
+                    let defs = self.resolve(at, n);
+                    !defs.is_empty() && defs.iter().all(|&d| self.def_constant(d, covs))
                 } else {
                     covs.push(n.clone());
                     true
                 }
             }
             Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
-                self.expr_constant(l, covs, stack) && self.expr_constant(r, covs, stack)
+                self.expr_constant(l, at, covs) && self.expr_constant(r, at, covs)
             }
-            Expression::UnaryFn(_, a) => self.expr_constant(a, covs, stack),
+            Expression::UnaryFn(_, a) => self.expr_constant(a, at, covs),
             Expression::Conditional(c, t, f) => {
-                self.cond_constant(c, covs, stack)
-                    && self.expr_constant(t, covs, stack)
-                    && self.expr_constant(f, covs, stack)
+                self.cond_constant(c, at, covs)
+                    && self.expr_constant(t, at, covs)
+                    && self.expr_constant(f, at, covs)
             }
             Expression::Time
             | Expression::MixNum
