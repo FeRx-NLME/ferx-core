@@ -2095,6 +2095,17 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
     // against).
     if let Some(iov) = &w.iov {
         let n_kappa = iov.kappa_names.len();
+        // Ω_IOV's shape, as Ω's above (#1833): a 1×2 loaded `Ok` and panicked in the
+        // first post-hoc Cholesky.
+        let (rows, cols) = (iov.omega_iov.rows, iov.omega_iov.cols);
+        if rows != cols {
+            return bail(format!("iov.omega_iov is {rows}×{cols}; expected square"));
+        }
+        if rows != n_kappa {
+            return bail(format!(
+                "iov.omega_iov dim ({rows}) does not match iov.kappa_names ({n_kappa})"
+            ));
+        }
         if !iov.kappa_init_as_sd.is_empty() && iov.kappa_init_as_sd.len() != n_kappa {
             return bail(format!(
                 "iov.kappa_init_as_sd ({}) does not match iov.kappa_names ({})",
@@ -3637,6 +3648,52 @@ mod tests {
             err.contains("iov.kappa_param_types (2) does not match iov.kappa_names (1)"),
             "{err}"
         );
+    }
+
+    /// A bundle whose `iov.omega_iov` is not square, or whose dimension is not
+    /// `iov.kappa_names`' length, is `Corrupt` (#1833), as `omega.matrix` already is.
+    ///
+    /// Measured before on `160cc9a3`: a saved IOV fit with `iov.omega_iov` edited to 1×2
+    /// loaded `Ok`, and the first post-hoc call panicked in its Cholesky. The control arm
+    /// decodes the unedited wire, so the two edited arms differ from it by the shape alone.
+    /// Mutation — delete the new check in `validate_parallel_lengths` and both edited arms
+    /// decode `Ok`.
+    #[test]
+    fn fit_wire_rejects_a_non_square_or_mis_sized_omega_iov() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[0.05]));
+        r.kappa_names = vec!["KAPPA_CL".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        let value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        let decode = |v: serde_json::Value| {
+            let w: FitWire = serde_json::from_value(v).unwrap();
+            wire_to_fit_result(w, Vec::new(), Vec::new())
+        };
+        let ok = decode(value.clone()).expect("the unedited wire decodes");
+        assert_eq!(ok.omega_iov.as_ref().map(|m| m.shape()), Some((1, 1)));
+
+        for (rows, cols, data, want) in [
+            (
+                1,
+                2,
+                vec![0.05, 0.0],
+                "iov.omega_iov is 1×2; expected square",
+            ),
+            (
+                2,
+                2,
+                vec![0.05, 0.0, 0.0, 0.05],
+                "iov.omega_iov dim (2) does not match iov.kappa_names (1)",
+            ),
+        ] {
+            let mut v = value.clone();
+            v["iov"]["omega_iov"] = serde_json::json!({"rows": rows, "cols": cols, "data": data});
+            match decode(v) {
+                Err(FitrxError::Corrupt(msg)) => assert!(msg.contains(want), "{msg}"),
+                other => panic!("{rows}×{cols}: expected Corrupt({want:?}), got {other:?}"),
+            }
+        }
     }
 
     /// Bindings that exercise every shape the wire carries: a one-level block

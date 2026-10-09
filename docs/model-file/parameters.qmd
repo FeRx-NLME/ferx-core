@@ -134,9 +134,13 @@ in a level column, or any block keyed on `TIME`, since such a subject has no
 observation time), binding is
 refused with `E_THETA_LEVEL_BINDING` if anything that subject is scored on reads
 the block, and binds otherwise. Whether it reads the block is measured on its
-likelihood at two θ points, with the same caveat as
-[Levels with no effect](#levels-with-no-effect): a read that a θ switches off at
-both points looks like no read. Earlier versions indexed every such subject at
+likelihood at two points, with the same θ as
+[Levels with no effect](#levels-with-no-effect): the initial estimates with the
+random effects at 0, and every non-`FIX` θ moved, here with each random effect
+moved by a different amount from 0.05 (so a gate on a difference of two random
+effects does not cancel). So a read that another θ or a random effect switches off at the
+initial estimates is refused when the moved point opens it, and the same caveat
+applies: a read that is switched off at both points looks like no read. Earlier versions indexed every such subject at
 the first level, whatever its columns said (#1797).
 
 ### Where a block may be read

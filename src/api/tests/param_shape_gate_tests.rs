@@ -48,6 +48,9 @@ pub(super) const SIGMA_BY_POSITION: &str = "the model reads it by position, so i
 pub(super) const NO_IOV: &str = "without it every occasion would get the same parameters";
 /// The reason clause of an Ω_IOV on a model without κ.
 pub(super) const EXTRA_IOV: &str = "the inter-occasion variability it describes would be dropped";
+/// The reason clause of a non-square Ω or Ω_IOV (#1833).
+pub(super) const NOT_SQUARE: &str =
+    "a variance-covariance matrix has one row and one column per random effect";
 
 /// Four subjects, two doses, two occasions when `iov`.
 fn population(iov: bool) -> Population {
@@ -95,9 +98,19 @@ pub(super) struct Cell {
     pub message: String,
 }
 
+/// `m` with its matrix replaced by an `r×c` one, set without a Cholesky — the shape an
+/// `OmegaMatrix` struct literal or a hand-built `FitResult` can carry (#1833).
+fn non_square(m: &OmegaMatrix, (r, c): (usize, usize), v: f64) -> OmegaMatrix {
+    let mut q = m.clone();
+    q.matrix = nalgebra::DMatrix::from_element(r, c, v);
+    q
+}
+
 /// Every block mis-shaped one at a time against `p`, each FIX vector resized with it so the
-/// shape is the only thing wrong. On a model with κ the Ω_IOV cells are mis-sized and absent;
-/// without κ, one present Ω_IOV. Assumes one η, one σ and at most one κ, as every fixture here.
+/// shape is the only thing wrong. On a model with κ the Ω_IOV cells are mis-sized, non-square
+/// and absent; without κ, one present Ω_IOV. Ω is also non-square, 1×2 (the model's row
+/// count, which a row check admits) and 2×1 (which a size-first check reports as "2×2").
+/// Assumes one η, one σ and at most one κ, as every fixture here.
 pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
     assert_eq!((p.omega.dim(), p.sigma.values.len()), (1, 1));
     let mut cells = Vec::new();
@@ -133,7 +146,14 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
             ETA_BY_POSITION,
         );
     }
-    if p.omega_iov.is_some() {
+    for (r, c) in [(1usize, 2usize), (2, 1)] {
+        let mut q = p.clone();
+        q.omega = non_square(&p.omega, (r, c), 0.09);
+        q.omega_fixed.resize(r, false);
+        let lead = format!("the supplied omega is {r}×{c}, which is not square");
+        push(if r == 1 { "Ω 1×2" } else { "Ω 2×1" }, q, &lead, NOT_SQUARE);
+    }
+    if let Some(iov) = p.omega_iov.as_ref() {
         for n in [0usize, 2] {
             let mut q = p.clone();
             q.omega_iov = Some(diag(n, 0.04, "K"));
@@ -148,6 +168,18 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
                 q,
                 &lead,
                 ETA_BY_POSITION,
+            );
+        }
+        for (r, c) in [(1usize, 2usize), (2, 1)] {
+            let mut q = p.clone();
+            q.omega_iov = Some(non_square(iov, (r, c), 0.04));
+            q.kappa_fixed.resize(r, false);
+            let lead = format!("the supplied omega_iov is {r}×{c}, which is not square");
+            push(
+                if r == 1 { "Ω_IOV 1×2" } else { "Ω_IOV 2×1" },
+                q,
+                &lead,
+                NOT_SQUARE,
             );
         }
         let mut q = p.clone();
@@ -199,8 +231,15 @@ fn fit_of(params: &ModelParameters) -> FitResult {
 /// delete the `check_param_shape` call from any one site and that site's arms go red, each
 /// naming its entry: `fit_unstamped` (`fit`, every cell); `compute_npde_npd`;
 /// `check_simulate_preconditions` (`simulate`, `simulate_with_seed`,
-/// `simulate_with_options_diag`); the up-front call in `simulate_with_uncertainty_diag`
+/// `simulate_with_options_diag`); the one in `fitted_params_from_result`
 /// (`simulate_with_uncertainty`, zero draws, so the per-draw chokepoint never runs).
+///
+/// The non-square cells (#1833) need the gate to read both dimensions. Mutations — drop the
+/// not-square arms and every non-square cell panics in a Cholesky; check the size before
+/// squareness and the 2×1 cells read "2×2"; print `{r}×{r}` and the message assert fails;
+/// leave `ParamBlock::all_of` on `dim()` (rows only) and the `fit` / `simulate*` / npde arms
+/// panic; read the fit's blocks in `fitted_params_from_result` by `nrows()` and the
+/// `simulate_with_uncertainty` arm does.
 ///
 /// On `simulate*` an absent Ω_IOV keeps #1019's message: `validate_iov_simulatable` runs
 /// first, and the arm asserts so — move the shape check above it and that arm reddens. On
@@ -290,16 +329,20 @@ fn fit_refuses_initial_theta_of_the_wrong_length() {
     }
 }
 
-/// `run_sir` and `run_covariance` refuse a fit whose σ or Ω_IOV is not the model's.
+/// `run_sir` and `run_covariance` refuse a fit whose Ω, σ or Ω_IOV is not the model's.
 ///
 /// Measured before on this IOV fit: an absent Ω_IOV ran both to `Ok` with the model's
 /// initial Ω_IOV in its place; on
 /// `run_covariance` a short σ and a mis-sized Ω_IOV panicked and a long σ ran to `Ok`;
-/// on `run_sir` the mis-sized ones were an `Err` about the covariance matrix. Ω is not
-/// in this list: both already refuse it by `n_eta`. Mutation — delete the
-/// `check_param_shape` call in `resolve_fit_inputs` and both arms of every cell go red.
+/// on `run_sir` the mis-sized ones were an `Err` about the covariance matrix. A mis-sized
+/// Ω was an uncoded `n_eta` `Err`, and a 1×2 Ω or Ω_IOV panicked in both (#1833).
+/// Both refuse through the one gate they share, `fitted_params_from_result`'s (a second copy
+/// in `resolve_fit_inputs` rejected the same inputs and no test could see it go). Mutations
+/// — delete that call and both arms of every cell go red; gate Ω_IOV only (the #1789
+/// slice) and the σ and Ω cells do; move either function's call back below its uncoded
+/// `subjects[0].eta` check and that function's wrong-model arms get the EBE message.
 #[test]
-fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_sigma_or_omega_iov() {
+fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_block() {
     let model = parse_model_string(ODE_IOV).expect("parse");
     let pop = population(true);
     let opts = FitOptions {
@@ -311,50 +354,68 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_sigma_or_omega_iov(
     };
     let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit");
     assert!(fitted.covariance_matrix.is_some() && fitted.omega_iov.is_some());
-    let mut n = 0;
+    let (mut n, mut wrong_model) = (0, 0);
     for cell in shape_cells(&model.default_params) {
-        if cell.label.starts_with('Ω') && !cell.label.starts_with("Ω_IOV") {
-            continue;
-        }
-        n += 1;
         let mut f = fitted.clone();
+        f.omega = cell.params.omega.matrix.clone();
+        f.omega_fixed = cell.params.omega_fixed.clone();
         f.sigma = cell.params.sigma.values.clone();
         f.sigma_names = cell.params.sigma.names.clone();
         f.sigma_fixed = cell.params.sigma_fixed.clone();
         f.omega_iov = cell.params.omega_iov.as_ref().map(|m| m.matrix.clone());
-        let e = crate::run_sir(&f, Some(&model), Some(&pop), &opts).expect_err("run_sir");
-        assert_refused(&e, &cell, "run_sir");
-        let e =
-            crate::run_covariance(&f, Some(&model), Some(&pop), &opts).expect_err("run_covariance");
-        assert_refused(&e, &cell, "run_covariance");
+        // Each cell twice: EBEs of the model's width (a hand-edited Ω), and — where Ω's
+        // row count is not the model's — EBEs as wide as Ω, the fit of a different model.
+        // The second is the realistic wrong-model case, and it reaches the shape gate only
+        // if the gate runs before the uncoded `subjects[0].eta` check (PR #1843 review r1).
+        let rows = f.omega.nrows();
+        let mut variants = vec![f.clone()];
+        if rows != model.n_eta {
+            wrong_model += 1;
+            for s in &mut f.subjects {
+                s.eta = nalgebra::DVector::from_element(rows, 0.01);
+            }
+            variants.push(f);
+        }
+        for f in variants {
+            n += 1;
+            let e = crate::run_sir(&f, Some(&model), Some(&pop), &opts).expect_err("run_sir");
+            assert_refused(&e, &cell, "run_sir");
+            let e = crate::run_covariance(&f, Some(&model), Some(&pop), &opts)
+                .expect_err("run_covariance");
+            assert_refused(&e, &cell, "run_covariance");
+        }
     }
-    assert_eq!(n, 5, "σ short/long and the three Ω_IOV cells");
+    assert_eq!(
+        wrong_model, 3,
+        "Ω short, Ω long and Ω 2×1 carry EBEs as wide as Ω"
+    );
+    assert_eq!(
+        n, 14,
+        "11 cells (σ ×2, Ω ×4, Ω_IOV ×5) plus the three wrong-model fits"
+    );
 }
 
-/// `fitted_params_from_result` refuses a fit whose Ω_IOV is not the model's (#1789), with
-/// `E_PARAM_SHAPE`, on a model with κ and on one without.
+/// `fitted_params_from_result` refuses a fit whose Ω, σ or Ω_IOV is not the model's
+/// (#1789, #1833), with `E_PARAM_SHAPE`, on a model with κ and on one without.
 ///
 /// Measured before on `d43afca9`: an absent Ω_IOV on the κ model rebuilt `Ok` with the
 /// model's *initial* Ω_IOV in its place; a present one on the κ-free model rebuilt `Ok` with
-/// it dropped; a mis-sized one was copied in unchecked. The in-core callers are gated
-/// upstream (`resolve_fit_inputs`, `simulate_with_uncertainty_diag`), so only a direct call
-/// reaches this. Mutation — delete the `check_param_shape` call and all four cells go `Ok`;
-/// restore the `unwrap_or_else` as well and the absent cell is `Ok` again with the initial
-/// Ω_IOV, the defect itself.
+/// it dropped; a mis-sized one was copied in unchecked. On `160cc9a3` a mis-sized σ or Ω
+/// rebuilt `Ok`, carried at the wrong size, and a 1×2 Ω or Ω_IOV panicked. Mutations —
+/// delete the `check_param_shape` call and every cell goes `Ok` or panics; gate Ω_IOV only
+/// (the #1789 slice) and the σ and Ω cells do.
 ///
-/// The own-shape arm pins the other side: a fitted Ω_IOV that differs from the model's
-/// initial one is carried through bit for bit. Mutation — read `iov_template.matrix`
-/// instead of the fit's and it reddens, since the fixture asserts the two differ.
+/// The own-shape arm pins the other side: a fitted Ω, σ and Ω_IOV that differ from the
+/// model's initial ones are carried through bit for bit. Mutation — read
+/// `template.omega.matrix`, `template.sigma` or `iov_template.matrix` instead of the fit's
+/// and it reddens, since the fixture asserts each pair differs.
 #[test]
-fn fitted_params_from_result_refuses_a_fit_with_a_mis_shaped_omega_iov() {
+fn fitted_params_from_result_refuses_a_fit_with_a_mis_shaped_block() {
     use crate::estimation::uncertainty_samples::fitted_params_from_result;
     let mut n = 0;
     for (text, iov) in [(ONE_CPT_IV, false), (ODE_IOV, true)] {
         let model = parse_model_string(text).expect("parse");
         for cell in shape_cells(&model.default_params) {
-            if !cell.label.starts_with("Ω_IOV") {
-                continue;
-            }
             n += 1;
             let e = fitted_params_from_result(&fit_of(&cell.params), &model)
                 .expect_err("fitted_params_from_result");
@@ -362,11 +423,20 @@ fn fitted_params_from_result_refuses_a_fit_with_a_mis_shaped_omega_iov() {
         }
 
         let mut own = model.default_params.clone();
+        own.omega.matrix[(0, 0)] = 0.16;
+        own.sigma.values[0] = 0.3;
         if let Some(m) = own.omega_iov.as_mut() {
             m.matrix[(0, 0)] = 0.25;
         }
         let rebuilt = fitted_params_from_result(&fit_of(&own), &model)
             .unwrap_or_else(|e| panic!("own shape refused, iov = {iov}: {e}"));
+        let template = &model.default_params;
+        assert_ne!(template.omega.matrix[(0, 0)], 0.16, "fixture must differ");
+        assert_ne!(template.sigma.values[0], 0.3, "fixture must differ");
+        assert_eq!(rebuilt.omega.matrix.shape(), (1, 1));
+        assert_eq!(rebuilt.omega.matrix[(0, 0)].to_bits(), 0.16f64.to_bits());
+        assert_eq!(rebuilt.sigma.values.len(), 1);
+        assert_eq!(rebuilt.sigma.values[0].to_bits(), 0.3f64.to_bits());
         match (&model.default_params.omega_iov, &rebuilt.omega_iov) {
             (None, None) => assert!(!iov),
             (Some(template), Some(got)) => {
@@ -378,8 +448,9 @@ fn fitted_params_from_result_refuses_a_fit_with_a_mis_shaped_omega_iov() {
         }
     }
     assert_eq!(
-        n, 4,
-        "the κ model's short / long / absent and the κ-free model's present"
+        n, 18,
+        "7 cells on the κ-free model (σ ×2, Ω ×4, Ω_IOV present) and 11 on the κ model \
+         (σ ×2, Ω ×4, Ω_IOV short / long / 1×2 / 2×1 / absent)"
     );
 }
 
