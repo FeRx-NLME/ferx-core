@@ -622,6 +622,27 @@ pub(crate) fn prepare(
     )
 }
 
+/// [`prepare`]'s point half: the same arguments into [`prepare_point_stacked`], so the mode and
+/// node preparations of a no-IOV model cannot drift apart (#1844).
+pub(crate) fn prepare_point(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    eta_hat: &[f64],
+) -> Option<PointPrep> {
+    prepare_point_stacked(
+        model,
+        subject,
+        params,
+        sens,
+        model.n_eta,
+        params.omega.inv.clone(),
+        eta_hat,
+        model.residual_error_eta,
+    )
+}
+
 /// Direct-θ derivatives of a magnitude-scaled residual variance at prediction `f`.
 ///
 /// A custom / time-varying σ magnitude `mult(θ)` (#484/#576/#486) makes the

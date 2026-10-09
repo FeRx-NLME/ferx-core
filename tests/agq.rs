@@ -1184,53 +1184,55 @@ fn standard_errors(r: &FitResult) -> Vec<f64> {
     v
 }
 
-/// **#1844.** An FOCEI `n_agq = 3` covariance step serves every subject analytically, even
-/// though one tail node per subject has an indefinite exact Hessian.
+/// `two_cpt_oral_cov` under FOCEI `n_agq = 3` with the covariance step on, on the analytic
+/// R-matrix (`analytic = true`) or the FD stencil.
 ///
-/// Before the fix, `node_jet` ran the mode's preparation, whose Cholesky of the exact `H`
-/// refused that tail node, and 14 of `two_cpt_oral_cov`'s 30 subjects went to the per-subject
-/// FD salvage (`W_COV_ANALYTIC_SALVAGE`). A node only contracts `H_j` and never inverts it.
-///
-/// No public field names the covariance route, so the route is pinned by two observations
-/// that together exclude both wrong ones:
-///
-/// * **no salvage note** excludes the hybrid route (the pre-fix 14/30);
-/// * **SEs not bit-identical to `analytic_cov_hessian = false`** excludes the whole-population
-///   FD fallback, which is that arm's own computation and so would match it exactly. This is
-///   also what a regression to ≥ half declines would produce, silently, with no note at all.
-///
-/// The SE bound is the FD reference's own noise: the 13 SEs are compared against the FD
-/// stencil, whose error dominates.
-#[test]
-fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
+/// Tier-2: a handful of outer steps. The planning measurement found 3 and 200 iterations give
+/// identical decline sets (14/30 before #1844, 0/30 after).
+fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
     let prep = ferx_core::prepare_run(
         "examples/two_cpt_oral_cov.ferx",
         Some("data/two_cpt_oral_cov.csv"),
     )
     .expect("two_cpt_oral_cov must load");
-    let opts = |analytic: bool| FitOptions {
+    let opts = FitOptions {
         method: EstimationMethod::FoceI,
         n_agq: 3,
         run_covariance_step: true,
         sir: false,
-        // Tier-2: a handful of outer steps. The planning measurement found 3 and 200
-        // iterations give identical decline sets (14/30 before the fix, 0/30 after).
         outer_maxiter: 3,
         analytic_cov_hessian: analytic,
         ..FitOptions::default()
     };
-    let fit_with = |analytic: bool| {
-        fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts(analytic),
-        )
-        .expect("FOCEI n_agq = 3 fit with covariance")
-    };
-    let analytic = fit_with(true);
-    let fd = fit_with(false);
+    let res = fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("FOCEI n_agq = 3 fit with covariance");
+    eprintln!(
+        "#1844 two_cpt_oral_cov n_agq=3 analytic_cov_hessian={analytic}: covariance {:.2} s",
+        res.covariance_wall_time_secs
+    );
+    res
+}
 
+/// **#1844, T4 (per PR).** An FOCEI `n_agq = 3` covariance step on `two_cpt_oral_cov` salvages
+/// no subject, even though one tail node per subject has an indefinite exact Hessian.
+///
+/// Before the fix, `node_jet` ran the mode's preparation, whose Cholesky of the exact `H`
+/// refused that tail node, and 14 of the 30 subjects went to the per-subject FD salvage
+/// (`W_COV_ANALYTIC_SALVAGE`). A node only contracts `H_j` and never inverts it.
+///
+/// Analytic arm only: the FD-stencil comparison is the expensive half and lives in
+/// [`focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes`] behind
+/// `slow-tests`. What this test cannot see on its own, a regression to ≥ half declines (which
+/// takes the whole-population stencil with no note), is pinned per PR at Tier 1 by
+/// `sens_cov_hessian::tests::the_population_assembly_is_fully_analytic_at_an_indefinite_node`.
+#[test]
+fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
+    let analytic = two_cpt_oral_cov_agq3(true);
     let salvage: Vec<&String> = analytic
         .warnings
         .iter()
@@ -1240,7 +1242,40 @@ fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
         salvage.is_empty(),
         "no subject may decline to the FD salvage: {salvage:?}"
     );
+    let se = standard_errors(&analytic);
+    assert_eq!(se.len(), 13, "premise: every parameter carries an SE");
+    assert!(
+        se.iter().all(|s| s.is_finite() && *s > 0.0),
+        "SEs must be finite and positive: {se:?}"
+    );
+}
 
+/// **#1844, T4 (slow half).** The analytic standard errors of
+/// [`focei_agq_covariance_serves_indefinite_tail_nodes_analytically`] agree with the FD
+/// stencil to the stencil's own noise, and are not bit-identical to it.
+///
+/// Not bit-identical excludes the whole-population FD fallback, which is the stencil's own
+/// computation and so would match it exactly.
+///
+/// Gated on measured CI cost (AGENTS.md, Tier 3 "the gate marks…"): in `Tests + coverage
+/// (core)` the `agq` binary went from 86.50 s on `main` (run 37985481657) to 300.06 s with this
+/// test ungated (run 37988181162), its FD arm being the expensive one. The per-PR tests that die
+/// on the same mutations:
+///
+/// * `node_jet` back on the mode's preparation: T1 `node_jet_serves_an_indefinite_quadrature_node`,
+///   T2 `agq_cov_hessian_matches_fd_at_an_indefinite_quadrature_node`, T5
+///   `the_population_assembly_is_fully_analytic_at_an_indefinite_node`, and the per-PR T4 above
+///   (its "14 of 30" salvage note);
+/// * a fallback to the whole-population stencil, the one failure only `worst > 0` sees here:
+///   T5, which asserts the assembly is `Full`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: FD-stencil covariance arm; opt in with --features slow-tests"
+)]
+fn focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes() {
+    let analytic = two_cpt_oral_cov_agq3(true);
+    let fd = two_cpt_oral_cov_agq3(false);
     let (sa, sf) = (standard_errors(&analytic), standard_errors(&fd));
     assert_eq!(sa.len(), sf.len());
     assert_eq!(sa.len(), 13, "premise: every parameter carries an SE");
@@ -1263,13 +1298,13 @@ fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
     );
 }
 
-/// Measured bound for [`focei_agq_covariance_serves_indefinite_tail_nodes_analytically`].
+/// Measured bound for [`focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes`].
 ///
 /// Realised worst relative SE difference: **4.0367e-4** on Linux aarch64 (the reference
 /// platform), 4.0365e-4 on macOS arm64. That is the FD stencil's own noise: the same comparison
 /// at `n_agq = 1`, where no node is involved, measures 4.05e-4. Before the fix (14/30 salvaged)
 /// it was 2.177e-4, lower only because those 14 subjects shared the reference's estimator.
-/// `1e-3` is ~2.5× headroom and the bound the sibling salvage test uses for the same comparison.
+/// `1e-3` is ~2.5× headroom.
 const T4_SE_BOUND: f64 = 1e-3;
 
 /// AGQ over a **non-Gaussian endpoint** — the capability the method exists for and which every

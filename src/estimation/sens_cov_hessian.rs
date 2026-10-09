@@ -549,18 +549,9 @@ pub(crate) fn prepare_covariance_point(
     sens: &SubjectSens,
     b: &[f64],
 ) -> Option<PointPrep> {
-    use crate::estimation::sens_outer_gradient::prepare_point_stacked;
+    use crate::estimation::sens_outer_gradient::{prepare_point, prepare_point_stacked};
     let Some(stack) = iov_stack(model, subject, params, b)? else {
-        return prepare_point_stacked(
-            model,
-            subject,
-            params,
-            sens,
-            model.n_eta,
-            params.omega.inv.clone(),
-            b,
-            model.residual_error_eta,
-        );
+        return prepare_point(model, subject, params, sens, b);
     };
     let mut point =
         prepare_point_stacked(model, subject, params, sens, stack.d, stack.inv, b, None)?;
@@ -4554,8 +4545,8 @@ mod tests {
     /// sparse design, at `n_agq = 3`. Found by a scan over Ω×{1,3,10} × DV-scale × sparse/dense
     /// × `n_agq` ∈ {3,5} at `160cc9a3`: **Ω×1 has no indefinite node at `n_agq = 3`**, which is
     /// why every existing AGQ parity fixture passed while the population fit declined 14/30.
-    /// Here 4 of the 27 nodes are indefinite, the heaviest at `π = 6.46e-2`, worst
-    /// `λ_min(H_j) = −0.678`.
+    /// Here 4 of the 27 nodes are indefinite (the heaviest at `π = 6.46e-2`). The most
+    /// indefinite, which the tests use, is node `j* = 0`: `π = 1.524e-2`, `λ_min(H_j) = −0.678`.
     ///
     /// Returns `(model, subject, params, η̂, grid, π, j*, b_{j*})`, with `j*` the most indefinite
     /// node of positive weight.
@@ -4621,6 +4612,13 @@ mod tests {
         assert!(
             min_eig < 0.0,
             "premise: some weighted node's exact H is indefinite; most negative λ_min = {min_eig}"
+        );
+        // Liveness, not just `π > 0`: a node at π ≈ 1e-300 passes `!= 0.0` yet contributes
+        // nothing T2's oracle could see.
+        assert!(
+            pi[j_star] > 1e-3,
+            "premise: node {j_star} carries real weight; π = {:.3e}",
+            pi[j_star]
         );
         (model, subject, params, eta, grid, pi, j_star, b_star)
     }
@@ -4726,14 +4724,18 @@ mod tests {
     /// as a mode.
     ///
     /// `b̂_ζ = −H⁻¹M_ζ` needs `H` positive-definite at the mode, so the fix must not leak into
-    /// `prepare_mode`. Every *other* reason to decline is ruled out first — `H̃` factors and the
-    /// anchor is well-conditioned at `b_{j*}` — so `None` can only be the exact-`H` gate.
+    /// `prepare_mode`. The gate itself is asserted: `prepare_mode` at `b_{j*}` is `None`, with
+    /// `H̃` factoring and the anchor well-conditioned there so that the exact `H` is the only
+    /// thing it can be refusing. The end-to-end `subject_agq_cov_hessian` refusal is kept as a
+    /// second assertion, but alone it could also come from any of the 27 `node_jet` calls.
     ///
     /// Regression caught: `prepare_mode` relaxed to the point preparation (or
     /// `invert_inner_hessian` relaxed past its Cholesky) → `Some` here.
     #[test]
     fn an_indefinite_node_is_still_refused_as_the_mode() {
-        use crate::estimation::agq_cov_hessian::{regularised_anchor, subject_agq_cov_hessian};
+        use crate::estimation::agq_cov_hessian::{
+            prepare_mode, regularised_anchor, subject_agq_cov_hessian,
+        };
 
         let (model, subject, params, _eta, grid, pi, _j, b_star) = indefinite_node_fixture();
         let sens = covariance_sensitivities(&model, &subject, &params.theta, &b_star).unwrap();
@@ -4761,9 +4763,58 @@ mod tests {
             "premise: the anchor at b passes the conditioning screen"
         );
         assert!(
+            prepare_mode(&model, &subject, &params, &b_star).is_none(),
+            "the mode preparation must refuse an indefinite exact H"
+        );
+        assert!(
             subject_agq_cov_hessian(&model, &subject, &params, &b_star, &grid, &pi).is_none(),
             "a mode with an indefinite exact H must decline to the FD salvage"
         );
+    }
+
+    /// **#1844, T5.** The population covariance assembly serves the indefinite-node subject
+    /// **entirely analytically**: `analytic_cov_assembly` returns `Full`.
+    ///
+    /// The route pin the per-PR Tier-2 test cannot carry. A subject that declines is a
+    /// `Partial` assembly, and its salvage note is visible from `fit()`. But at ≥ half declines
+    /// the step takes the whole-population FD stencil and says nothing, which from `fit()` can
+    /// only be told apart by comparing against the stencil itself: the expensive arm, gated
+    /// behind `slow-tests`. Here the route is read directly, with no FD at all. A one-subject
+    /// population makes any decline a whole-population one, so this pins the silent route.
+    ///
+    /// Regression caught: `node_jet` back on the mode's preparation → `Unavailable` here.
+    #[test]
+    fn the_population_assembly_is_fully_analytic_at_an_indefinite_node() {
+        use crate::estimation::covariance::analytic_cov_assembly;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+
+        let (model, subject, params, eta, ..) = indefinite_node_fixture();
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        let x = pack_params(&params);
+        let hess = analytic_cov_assembly(
+            &model,
+            &pop,
+            &params,
+            &x,
+            &[DVector::from_vec(eta)],
+            &[],
+            &opts,
+        )
+        .full();
+        let hess = hess.expect("every subject must be assembled analytically");
+        assert!(hess.iter().all(|v| v.is_finite()));
     }
 
     /// Block-Ω (correlated CL/V): exercises the off-diagonal ΩΩ curvature and the

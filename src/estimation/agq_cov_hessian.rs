@@ -669,7 +669,9 @@ pub(crate) struct NodeJet {
 /// `theta_block`, not here"* — and `theta_block` is exactly what this path does **not** call:
 /// [`subject_cov_hessian_parts`] reads `prep.et`, `prep.omega_inv` and `z = Ω⁻¹·b`, all of which
 /// are ordinary functions of the evaluation point. `node_jet_at_the_mode_reproduces_the_focei_parts`
-/// pins the mode case against #436 so a future mode-only assumption in `prepare` fails loudly.
+/// pins the mode case against #436, so a drift between this path's
+/// `prepare_covariance_point` → `prepare_point_stacked` and the mode's `prepare` fails loudly
+/// there.
 ///
 /// **A node factors nothing** (#1844). The preparation here is the [`PointPrep`] half, not the
 /// full `Prep`: the mode's `Prep` Cholesky-factors the exact `H`, which is the mode's
@@ -710,8 +712,9 @@ pub(crate) fn node_jet(
     )?;
     // The one half of the mode's Cholesky a node does need: an `H_j` the provider could not
     // evaluate (a far tail overflowing to NaN) is out of scope, not merely indefinite. Before
-    // #1844 the factorisation refused it as a side effect; the population assembly's
-    // `is_finite` backstop would still decline the subject, but the node says so itself.
+    // #1844 the factorisation refused it as a side effect. Only `H_j` is guarded here; a
+    // non-finite `s`, `g` or `parts` with a finite `H_j` is declined by the population
+    // assembly's `is_finite` backstop in `covariance::analytic_cov_assembly`.
     if !core.h_inner.iter().all(|v| v.is_finite()) {
         return None;
     }
