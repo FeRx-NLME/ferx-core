@@ -7051,15 +7051,17 @@ mod absorption {
         (tag, "STUDY", ip, format!("E0 + {EMAXY}"), kappa)
     }
 
-    /// A1 (#1836: R1, R6, R10, R12, R14, R16, Q2, R18; control R7; twins R9,
-    /// R11). The block absorbs `ETA_E0` through `E0`'s first assignment
-    /// `TVE0 + PLACEBO + ETA_E0` in each refused row, whether a
+    /// A1 (#1836: R1, R6, R10, R12, R14, R16, Q2, R19, R18; control R7; twins
+    /// R9, R11). The block absorbs `ETA_E0` through `E0`'s first assignment
+    /// `TVE0 + PLACEBO + ETA_E0` in each refused row but R19 and R18, whether a
     /// self-reassignment scales it by a factor reading neither (R1, and R16
     /// with a kappa in the factor), leaves it unchanged (R6), adds a term
     /// constant within each subject (R10), doubles it on a varying condition
     /// (R12), reads it back through a copy (R14), or a second parameter `C2`
     /// reads it before the reassignment (Q2, #1848 review). Each funnel is one
-    /// assignment, cut alone. R18 assigns `E0` in both branches of an `if` on
+    /// assignment, cut alone. In R19 `E0`'s first assignment carries only the
+    /// η, and the block joins on the self-read `E0 = E0 + PLACEBO`, which is
+    /// the funnel. R18 assigns `E0` in both branches of an `if` on
     /// `STUDY`, constant within each subject: neither assignment alone is a
     /// funnel, the pair is. Each row is refused under every contrast naming
     /// `E0`, and agrees with the joint oracle. R7, the fresh-name form, is
@@ -7068,13 +7070,16 @@ mod absorption {
     ///
     /// The message cells: R1's and R14's sites name `E0` with no "through",
     /// since the funnel is `E0`'s first assignment, which reads the η itself;
-    /// R7's names `E0A`, its own funnel, the same rule.
+    /// R7's names `E0A`, its own funnel, the same rule. R19's names `E0` with
+    /// no "through" either: the η reaches the funnel from `E0`'s own earlier
+    /// assignment, and "(through `E0`)" on `E0` would say nothing.
     ///
     /// Mutations, measured — `resolve` returning every assignment of the name
     /// (the `debug_assert!` that a resolved assignment comes before its reader
-    /// fires); no kill in the reach sets; `eta_via` free to name `E0` itself;
-    /// candidates one per name at the end of the block (Q2, R12 bind); no
-    /// multi-assignment candidate (R18 binds). Each reddens this test.
+    /// fires); `eta_via` free to name `E0` itself (R19 says "(through `E0`)");
+    /// the cut by name; candidates one per name at the end of the block (Q2,
+    /// R12 bind); no multi-assignment candidate (R18 binds). Each reddens this
+    /// test.
     #[test]
     fn a_self_reassigned_funnel_is_refused() {
         let pop = arms_pop();
@@ -7106,6 +7111,11 @@ mod absorption {
                 "STUDY",
                 format!("  E0 = {S}\n  C2 = E0 * {FAC}\n  E0 = E0 * {FAC}"),
                 format!("E0 + {EMAXY} + 0.01 * C2 * TIME"),
+                false,
+            ),
+            row_1836(
+                "R19 block joins on the self-read",
+                "  E0 = TVE0 + ETA_E0\n  E0 = E0 + PLACEBO".into(),
                 false,
             ),
             row_1836(
@@ -7158,6 +7168,11 @@ mod absorption {
             ),
             (
                 &refused[3],
+                "the individual parameter `E0` reads this block and carries a random effect",
+                Some("(through"),
+            ),
+            (
+                &refused[7],
                 "the individual parameter `E0` reads this block and carries a random effect",
                 Some("(through"),
             ),
