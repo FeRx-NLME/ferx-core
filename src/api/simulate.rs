@@ -880,21 +880,8 @@ fn emit_subject_rows<R: rand::Rng>(
     // `block_sigma` + M3 model is rejected at fit by `check_model_options`
     // regardless, so the two paths can only differ on an unfitted fixed model.)
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    // The **live** correlations (#847). `params` is the fitted (or drawn) vector,
-    // so reading `model.residual_correlations` here would draw residuals at the
-    // declared rho while using the fitted sigmas — exactly the mismatch that
-    // would make a VPC of an estimated `block_sigma` fail to reproduce it.
-    // Prefer the parameter vector's correlations, falling back to the model's
-    // declaration when a caller supplied a `ModelParameters` without them (a
-    // hand-built one, or an artifact predating the field). Dropping a declared
-    // `block_sigma` silently — independent draws for a model that asks for
-    // correlated ones — is the worse of the two failures.
-    let draw_correlations: &[crate::types::ResidualCorrelation] =
-        if params.residual_correlations.is_empty() {
-            &model.residual_correlations
-        } else {
-            &params.residual_correlations
-        };
+    // The **live** correlations (#847), resolved once in `draw_correlations`.
+    let draw_correlations = draw_correlations(model, params);
     if !draw_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
             model,
@@ -973,33 +960,51 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
+/// The `block_sigma` correlations a residual draw under `params` must use
+/// (#847, #1733). `params` is the fitted (or drawn) vector, so reading
+/// `model.residual_correlations` would draw residuals at the declared rho while
+/// using the fitted sigmas — exactly the mismatch that would make a VPC or an
+/// NPDE of an estimated `block_sigma` fail to reproduce it. Prefer the parameter
+/// vector's correlations, falling back to the model's declaration when a caller
+/// supplied a `ModelParameters` without them (a hand-built one, or an artifact
+/// predating the field). Dropping a declared `block_sigma` silently —
+/// independent draws for a model that asks for correlated ones — is the worse of
+/// the two failures.
+pub(crate) fn draw_correlations<'a>(
+    model: &'a CompiledModel,
+    params: &'a ModelParameters,
+) -> &'a [crate::types::ResidualCorrelation] {
+    if params.residual_correlations.is_empty() {
+        &model.residual_correlations
+    } else {
+        &params.residual_correlations
+    }
+}
+
 /// Draw the correlated residual vector for one subject's Gaussian observation
 /// rows from the dense `R` built by [`compute_r_matrix_with_correlations`] (the
 /// same matrix FOCE/FOCEI/SAEM/`imp` evaluate the likelihood against), instead
-/// of the per-row independent draw `emit_subject_rows` otherwise uses. Callers
-/// must already have excluded FREM rows and the empty-correlation case.
+/// of the per-row independent draw. Callers must already have excluded FREM
+/// rows and the empty-correlation case. Shared by `simulate()` and the NPDE
+/// reference simulation (#1733), so both draw one distribution.
 ///
 /// R is factored with a PSD-safe symmetric-eigen square root, so a singular
 /// (e.g. `rho = ±1`) or mildly indefinite fixed `block_sigma` yields a valid
 /// draw instead of a Cholesky panic. Subjects whose R is diagonal (no paired
 /// rows) take a cheap per-row draw and skip the factorization entirely.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
+pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
-    params: &ModelParameters,
+    sigma_values: &[f64],
     /* live correlations, resolved by the caller */
     correlations: &[crate::types::ResidualCorrelation],
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
-    draw: usize,
-    sim: usize,
     normal: rand_distr::Normal<f64>,
     rng: &mut R,
-    results: &mut Vec<SimulationResult>,
-) {
+) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
     let mut r = match ruv_mult {
         Some(mult) => compute_r_matrix_with_correlations_scaled(
@@ -1010,7 +1015,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
-            &params.sigma.values,
+            sigma_values,
             correlations,
             mult,
         ),
@@ -1022,7 +1027,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
-            &params.sigma.values,
+            sigma_values,
             correlations,
         ),
     };
@@ -1040,7 +1045,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     // endpoint of a `block_sigma` model cheap, and reproduces the scalar path's
     // RNG-for-RNG output for such subjects.
     let has_offdiag = (0..n).any(|j| ((j + 1)..n).any(|k| r[(j, k)] != 0.0));
-    let eps = if !has_offdiag {
+    if !has_offdiag {
         DVector::from_iterator(n, (0..n).map(|j| r[(j, j)].max(0.0).sqrt() * z[j]))
     } else {
         // A fitted or fixed `block_sigma` can be positive-SEMIdefinite rather
@@ -1058,7 +1063,38 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             factor.column_mut(k).scale_mut(s);
         }
         factor * z
-    };
+    }
+}
+
+/// Emit one subject's Gaussian observation rows with the residual vector drawn
+/// by [`correlated_residual_draw`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    /* live correlations, resolved by the caller */
+    correlations: &[crate::types::ResidualCorrelation],
+    ipreds: &[f64],
+    ruv_scale: f64,
+    ruv_mult: Option<&[Vec<f64>]>,
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    let eps = correlated_residual_draw(
+        model,
+        subject,
+        &params.sigma.values,
+        correlations,
+        ipreds,
+        ruv_scale,
+        ruv_mult,
+        normal,
+        rng,
+    );
     for (j, &ipred) in ipreds.iter().enumerate() {
         let value = ipred + eps[j];
         results.push(SimulationResult {
