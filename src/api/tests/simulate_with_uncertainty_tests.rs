@@ -836,6 +836,34 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
     );
 }
 
+/// #1485: a point estimate that is itself in the flip-flop regime of a twin-less transit
+/// closed form is refused with the code `simulate()` gives at that θ, before any draw —
+/// pre-fix it returned `Ok` with 28 of 30 draws skipped.
+#[test]
+fn uncertainty_refuses_a_flip_flop_point_estimate() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.theta[0] = 1.0; // TVCL = 1.0 → ke = 0.25 ≥ KTR = 0.2
+    let mut fit = synthetic_fit(&params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 0.01;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 30,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(7),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("a flip-flop point estimate must be refused");
+    assert_eq!(err.code(), Some("E_TRANSIT_FLIP_FLOP"), "{err}");
+    // The same refusal `simulate()` gives at that θ — not the all-draws-skipped one.
+    let point = simulate(&model, &pop, &params, 1).expect_err("simulate refuses too");
+    assert_eq!(err.to_string(), point.to_string());
+    assert!(!err.to_string().contains("uncertainty draws"), "{err}");
+}
+
 #[test]
 fn asymptotic_row_count_and_draw_range() {
     let model = tiny_model();

@@ -1309,6 +1309,14 @@ pub fn simulate_with_uncertainty_diag(
 
     let template =
         crate::estimation::uncertainty_samples::fitted_params_from_result(fit_result, model)?;
+    // The point estimate itself must be simulatable (#1485): `simulate()` refuses a θ in the
+    // flip-flop regime of a twin-less transit / IG closed form, and drawing around it would
+    // otherwise skip most draws and return the rest as if the point estimate were sound.
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model,
+        population,
+        &template.theta,
+    ))?;
     let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
         fit_result,
         &template,
