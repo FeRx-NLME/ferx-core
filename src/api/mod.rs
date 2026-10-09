@@ -203,6 +203,14 @@ mod quiet_fit_tests;
 mod auto_optimizer_gradient_coupling_tests;
 
 #[cfg(test)]
+#[path = "tests/gradient_scope_tests.rs"]
+mod gradient_scope_tests;
+
+#[cfg(test)]
+#[path = "tests/no_scored_observations_tests.rs"]
+mod no_scored_observations_tests;
+
+#[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
 

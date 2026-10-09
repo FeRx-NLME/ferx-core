@@ -466,7 +466,6 @@ fn read_composable(
     bind: bool,
 ) -> (ferx_core::ParsedModel, ferx_core::Population) {
     use ferx_core::io::datareader::SelectionFilter;
-    use ferx_core::GradientMethod;
 
     let mut parsed = ferx_core::parse_full_model_file(model_path).expect("parse");
     let opts = &parsed.fit_options;
@@ -493,13 +492,8 @@ fn read_composable(
         ferx_core::api::bind_covariate_stats(&mut parsed, &model_text, &population)
             .expect("bind covariate stats");
     }
-    // `fit` reads the gradient method off the model, not the options, and an
-    // SDE model is always FD. After the binds, which re-parse the model.
-    parsed.model.gradient_method = if parsed.model.is_sde() {
-        GradientMethod::Fd
-    } else {
-        parsed.fit_options.gradient_method
-    };
+    // No `gradient_method` stamp: `fit` reads `gradient` from the options it is
+    // given (#1613), which is what the next test pins.
     (parsed, population)
 }
 
@@ -574,9 +568,10 @@ fn file_and_composable(model: &str) -> ((f64, usize), (f64, usize)) {
 
 #[test]
 fn the_composable_path_honours_the_files_gradient_setting() {
-    // `fit` reads `gradient` off the model, which only the file entry points
-    // stamp, so the documented path has to stamp it too. Before it did, the
-    // composable fit here was bit-identical to the run *without* `gradient = fd`.
+    // `fit` reads `gradient` from its options (#1613), so the documented path needs
+    // no stamp. Before #1613 it read the model, which only the file entry points
+    // stamped, and the composable fit here was bit-identical to the run *without*
+    // `gradient = fd`; `read_composable` carried a hand stamp, now deleted.
     let fd_model =
         level_block_model().replace("covariance = false", "covariance = false\n  gradient = fd");
     assert_ne!(fd_model, level_block_model(), "the replace must take");

@@ -1010,7 +1010,7 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
 /// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
-    !matches!(model.gradient_method, GradientMethod::Fd) && analytic_outer_gradient_in_scope(model)
+    !GradientMethod::forced_fd(model) && analytic_outer_gradient_in_scope(model)
 }
 
 /// The *scope* half of [`analytic_outer_gradient_available`]: whether the model's
@@ -5671,7 +5671,7 @@ fn walk_covariance_scope(
     // `Dual2` result and set this must not still receive a covariance R-matrix built from
     // third-order differences of those same jets.
     if sink.hit(
-        matches!(model.gradient_method, GradientMethod::Fd),
+        GradientMethod::forced_fd(model),
         CovScopeDecline::GradientFd,
     ) {
         return;

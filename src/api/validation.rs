@@ -1651,7 +1651,65 @@ pub fn check_model_data_rule(
     diags.extend(check_dose_compartments(model, population));
     diags.extend(check_dose_attr_finiteness(model, population));
     diags.extend(validate_output_columns(model, population));
+    // Last, so every more specific data code — `E_NONFINITE_DV`, `E_ENDPOINT_NO_RECORDS`,
+    // `E_ENDPOINT_UNROUTED` — still wins `first_error` in `fit()` with its old text (#1491).
+    diags.extend(check_scored_observations(population));
     diags
+}
+
+/// A population must carry at least one record the likelihood scores (#1491).
+///
+/// "Scored" is exactly what the objective reads: `observations` (the reader has already
+/// dropped `DV = .`, `MDV = 1` and filtered rows; CENS rows are in it under both
+/// `bloq_method`s) plus `obs_records` (TTE — a censoring-only row included — binary,
+/// categorical and CTMM records). With none, the data term of the objective is identically 0:
+/// only a `[priors]` / NN-regularization penalty could move an estimate (#1829 review r1),
+/// and without one `fit()` used to return OFV 0 at the initial estimates while `ferx check`
+/// called the pair valid.
+///
+/// One population-level finding. The reader's per-subject "all observation records were
+/// excluded" warnings stay as they are. The message's second sentence is one of two,
+/// behind one gate: whether `[data_selection]` removed a row classed as an observation. A
+/// filter that removed only doses (or whole dose-only subjects) did not take anything the
+/// likelihood could have scored, so it gets the other sentence, about what makes a row
+/// scored. Its counts are the filter's
+/// own classification (`ExclusionSummary::n_obs_excluded` counts a `DV = .` row too, #1405
+/// r2), so it says what the filter removed, not that it removed every *scored* observation.
+fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
+    let n_scored: usize = population
+        .subjects
+        .iter()
+        .map(|s| s.observations.len() + s.obs_records.len())
+        .sum();
+    if n_scored > 0 {
+        return Vec::new();
+    }
+    let count = format!(
+        "The population has {} subject(s) but nothing the likelihood can score: 0 Gaussian \
+         observations and 0 endpoint (TTE / binary / categorical / Markov) records. The data \
+         would contribute nothing to the objective, so no estimate could move off its initial \
+         value except under a prior or a regularization penalty.",
+        population.subjects.len()
+    );
+    let cause = match population
+        .exclusions
+        .as_ref()
+        .filter(|x| x.n_obs_excluded > 0)
+    {
+        Some(x) => format!(
+            "`[data_selection]` removed {} row(s) classed as observations and {} subject(s) \
+             entirely; check its `ignore` / `accept` clauses.",
+            x.n_obs_excluded,
+            x.excluded_subject_ids.len()
+        ),
+        None => "A row is scored when it has `EVID = 0`, `MDV = 0` and a `DV` (a `DV = .` \
+                 row is skipped), or when it is routed to a declared endpoint."
+            .to_string(),
+    };
+    vec![Diagnostic::error(
+        "E_NO_SCORED_OBSERVATIONS",
+        format!("{count} {cause}"),
+    )]
 }
 
 /// Every scored observation must be a finite number.

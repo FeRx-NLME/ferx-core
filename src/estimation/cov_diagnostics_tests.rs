@@ -1004,12 +1004,65 @@ fn the_scope_gate_names_the_clause_it_declines_on() {
         Some(CovScopeDecline::ExpressionScale),
     );
 
-    // `gradient = fd` reaches the model through `GradientMethod::effective` in `fit()`, not
-    // through the parser, so the field is what the gate reads and what the test sets.
+    // `gradient = fd` on the model itself — set by hand, or by `run_model_with_data`'s stamp.
+    // The per-call half (`FitOptions::gradient_method`) is the next test.
     in_scope.gradient_method = crate::types::GradientMethod::Fd;
     assert_eq!(
         covariance_scope_decline(&in_scope, &subject, false),
         Some(CovScopeDecline::GradientFd),
+    );
+}
+
+/// #1613 G4: the R-matrix scope reads the **call's** `gradient = fd`, not only the model's.
+/// A direct `fit()` / post-hoc `run_covariance` with `FitOptions { gradient_method: Fd, .. }`
+/// on an unstamped model used to build the analytic R-matrix from the very `Dual2` jets the
+/// caller had opted out of. Both arming routes in one test — the guard `fit` holds, and the
+/// scope `run_covariance` / `run_sir` enter through `with_fit_scope` — against the unarmed
+/// control on the same model, so a predicate stuck either way fails one side.
+///
+/// Mutation: revert `provider.rs`'s `GradientFd` clause to `model.gradient_method` → both
+/// armed asserts fail; drop `fd` from `FitScope::of` → only the `with_fit_scope` one fails.
+#[test]
+fn the_scope_gate_reads_the_calls_gradient_fd() {
+    use crate::sens::provider::covariance_scope_decline;
+
+    let subject = Subject {
+        id: "1".to_string(),
+        ..Default::default()
+    };
+    let model = crate::parser::model_parser::parse_model_string(CLOSED_FORM_MODEL).unwrap();
+    assert_eq!(model.gradient_method, crate::types::GradientMethod::Auto);
+    assert_eq!(
+        covariance_scope_decline(&model, &subject, false),
+        None,
+        "control: unarmed, the in-scope model declines nothing"
+    );
+    {
+        let _fd = crate::types::arm_forced_fd(true);
+        assert_eq!(
+            covariance_scope_decline(&model, &subject, false),
+            Some(CovScopeDecline::GradientFd),
+            "fit's guard: the call's gradient = fd must decline the analytic R-matrix"
+        );
+    }
+    let fd_opts = crate::types::FitOptions {
+        gradient_method: crate::types::GradientMethod::Fd,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let posthoc = crate::api::with_fit_scope(&fd_opts, || {
+        covariance_scope_decline(&model, &subject, false)
+    })
+    .expect("scope");
+    assert_eq!(
+        posthoc,
+        Some(CovScopeDecline::GradientFd),
+        "run_covariance's scope: with_fit_scope must carry gradient = fd"
+    );
+    assert_eq!(
+        covariance_scope_decline(&model, &subject, false),
+        None,
+        "the guard and the scope disarm on exit"
     );
 }
 

@@ -18,10 +18,10 @@ use crate::types::{EstimationMethod, GradientMethod, Optimizer};
 
 const CODE: &str = "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT";
 
-/// `fit()` / `run_*` mirror `options.gradient_method` onto `model.gradient_method`
-/// before the fit; the check reads the option for "did the user ask?" and
-/// `GradientMethod::effective` for "what will the loop use?". This mirrors both, as
-/// the stamped engine path does — the *unstamped* path each source covers alone is
+/// `run_model_with_data` mirrors `options.gradient_method` onto `model.gradient_method`
+/// before the fit, and `fit()` reads the option per call (#1613); the check reads the
+/// option for "did the user ask?" and `GradientMethod::effective` for "what will the
+/// loop use?". This sets both, as the stamped engine path does — the *unstamped* path each source covers alone is
 /// what `an_unstamped_model_still_warns…` and `an_engine_forced_fd_is_silent…` take.
 fn coupled_case(
     gradient: GradientMethod,

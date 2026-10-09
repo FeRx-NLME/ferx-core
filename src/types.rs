@@ -4553,19 +4553,74 @@ pub enum GradientMethod {
     Fd,
 }
 
+// Where a call's `gradient = fd` lives while it runs (#1613): one thread-local, and the pool
+// that carries it — the shape `estimation::inner_optimizer::LOCAL_INNER` has, for the same
+// reasons. `fit` takes `&CompiledModel` and `CompiledModel` is not `Clone`, so the call cannot
+// stamp its options onto the model; before #1613 only the file entry points did, and a direct
+// `fit()` with `FitOptions { gradient_method: Fd, .. }` ran on the analytic gradient with no
+// warning. The flag is per thread rather than per model, so it also reaches a closed-form
+// absorption model's ODE twin (`CompiledModel::effective_for`), a separate `CompiledModel`
+// no stamp ever touched.
+thread_local! {
+    /// `None` outside any fit-scoped call (and on every worker of the shared pool), which
+    /// reads as "not forced".
+    static LOCAL_FORCED_FD: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install `fd` for a pool worker's whole lifetime (its `start_handler`).
+pub(crate) fn install_worker_forced_fd(fd: bool) {
+    LOCAL_FORCED_FD.set(Some(fd));
+}
+
+/// Arms this call's `gradient = fd` on this thread until the guard drops, restoring whatever
+/// was in force before on every exit path. Arming reaches this thread only; the fan-out is
+/// carried by `api::pool::FitScope`, exactly as for the inner settings.
+#[must_use = "the forced-FD flag is disarmed as soon as this guard drops"]
+pub(crate) struct ForcedFdGuard {
+    prev: Option<bool>,
+}
+
+/// See [`ForcedFdGuard`]. `false` arms `Some(false)`, so a nested call that did not ask for
+/// FD reads "not forced", not the enclosing call's flag.
+pub(crate) fn arm_forced_fd(fd: bool) -> ForcedFdGuard {
+    ForcedFdGuard {
+        prev: LOCAL_FORCED_FD.replace(Some(fd)),
+    }
+}
+
+impl Drop for ForcedFdGuard {
+    fn drop(&mut self) {
+        LOCAL_FORCED_FD.set(self.prev);
+    }
+}
+
 impl GradientMethod {
+    /// Whether the running call must use finite differences for every gradient it takes:
+    /// the model says `gradient = fd`, **or** the fit-scoped call this thread is serving
+    /// does (`FitOptions::gradient_method`, armed by `fit`, `run_covariance` and `run_sir`).
+    ///
+    /// **The one predicate** every consumer of the flag reads — the outer gradient and the
+    /// `auto` optimizer pick, the inner η-gradient route, the covariance R-matrix scope and
+    /// the IOV FD reason. A union, like [`GradientMethod::effective`]: `Fd` from either side
+    /// wins and `Auto` is neutral. SDE is not folded in here — each reader already declines
+    /// an SDE model on its own scope.
+    pub(crate) fn forced_fd(model: &CompiledModel) -> bool {
+        model.gradient_method == GradientMethod::Fd || LOCAL_FORCED_FD.get().unwrap_or(false)
+    }
+
     /// The gradient method the outer loop will actually use for this
     /// `(model, options)` pair — **the** answer to "is this fit on finite
     /// differences?", for a caller that has both.
     ///
-    /// The outer loop reads `model.gradient_method`, and the production entry
-    /// points (`fit_from_files`, `run_model_with_data`) stamp it from
-    /// `options.gradient_method` — forcing `Fd` for an SDE model, which has no
-    /// analytic-sensitivity path — before calling `fit()`. Both of those now stamp
-    /// *this* function, so there is one rule rather than three copies of it.
+    /// `fit()`, `run_covariance` and `run_sir` resolve this per call (#1613): each arms
+    /// its own `options.gradient_method` for the duration of the run, and every reader
+    /// asks [`GradientMethod::forced_fd`], which also reads the model's flag; an SDE model
+    /// is declined by each reader's own scope. This function is the same rule for a
+    /// caller that holds the pair but runs nothing — `check` mirrors it — and
+    /// `run_model_with_data` still stamps it onto the model it hands back, which outlives
+    /// the fit.
     ///
-    /// It is deliberately the **union** of the three sources rather than a replay
-    /// of the stamp, because not every caller has run the stamp:
+    /// It is deliberately the **union** of the three sources:
     ///
     /// - `validate_model_file` (`ferx check`) hands `check_model_options` the model
     ///   straight out of the parser, whose `gradient_method` is still `Auto` while
@@ -9260,6 +9315,13 @@ impl FitOptions {
             mode: self.inner_optimizer,
             warm: self.ebe_warm_start,
         }
+    }
+
+    /// Whether this call asked for finite-difference gradients (#1613), armed by `fit` and by
+    /// the post-hoc entry points through `api::pool::with_fit_scope` and read through
+    /// [`GradientMethod::forced_fd`].
+    pub(crate) fn forces_fd(&self) -> bool {
+        self.gradient_method == GradientMethod::Fd
     }
 
     /// The ODE solver fields this caller moved away from their defaults (#1212).
