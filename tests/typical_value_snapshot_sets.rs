@@ -1003,3 +1003,463 @@ fn predict_returns_the_control_curve_for_an_absorption_value_reached_only_at_an_
         "the observation-row `MTT` is never applied, so the curve is the control's"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the states pass reads every dose quantity at its dose record — #1575
+// ---------------------------------------------------------------------------
+//
+// `compute_predictions_with_states` routes a TV-covariate ODE subject through
+// `ode_predictions_event_driven_with_states`, whose compartment states come from a second,
+// dense pass integrated under the **first observation's** snapshot (the disposition). Until
+// #1575 that pass read every dose-record quantity — kernel, pathway fraction, route lag,
+// zero-order `dur`, compartment lag, `F`, `D{n}`, the SS run-in — at that snapshot too, so a
+// covariate that differed at observation 1 moved the states by up to the whole dose while
+// IPRED (read per dose since #1569) stayed bit-identical and no `E_` fired.
+//
+// Every arm below puts the off value at observation **1**, the one snapshot the pass reads.
+// The `…_only_at_an_observation…` arms above put it at observation 2, which `first()` never
+// reads — which is why they stayed green through this defect. Every dose record is in domain
+// in both arms, and `WT` reaches nothing but the one dose quantity under test, so bad and
+// control differ only in a snapshot no dose read takes: their states must be bit-identical.
+
+/// Two doses (0 and 12 — the second lands on residual drug) into compartment 1, observations
+/// at 1, 8, 14, 30 on `obs_cmt`, every dose record at `WT = 0`, and `WT = wt_obs1` at
+/// observation 1 only.
+fn states_subject(doses: Vec<DoseEvent>, obs_cmt: usize, wt_obs1: f64) -> Subject {
+    let n_doses = doses.len();
+    let mut s = common::subject(
+        "1",
+        doses,
+        vec![1.0, 8.0, 14.0, 30.0],
+        vec![0.0; 4],
+        vec![obs_cmt; 4],
+    );
+    s.covariates = wt(0.0);
+    s.dose_covariates = vec![wt(0.0); n_doses];
+    s.obs_covariates = vec![wt(wt_obs1), wt(0.0), wt(0.0), wt(0.0)];
+    s
+}
+
+fn two_bolus_doses() -> Vec<DoseEvent> {
+    vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ]
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// The states arm, shared by S1–S8. Asserts, for `arm`:
+///
+/// - **the straddle**, through the model's own `$PK` (`pk_param_fn`): `param` at observation
+///   1 differs between bad and control, and equals the control's value at the dose records
+///   — so the arm cannot silently become a tautology (both arms reading the same value) or a
+///   fixture the pass never reads;
+/// - no `E_` diagnostic on the bad arm (every dose record is in domain);
+/// - IPRED bit-identical (the per-dose engine, the #1569 control);
+/// - **the states bit-identical**, which is the #1575 assertion;
+/// - the control's states finite and the dosed drug live at every observation, so a pass
+///   that lost the dose in both arms cannot pass by agreeing on zero.
+///
+/// Returns the control's states.
+fn states_arm(
+    arm: &str,
+    src: &str,
+    doses: Vec<DoseEvent>,
+    obs_cmt: usize,
+    wt_bad: f64,
+    param: &str,
+) -> Vec<Vec<f64>> {
+    let model = parse_full_model(src)
+        .unwrap_or_else(|e| panic!("{arm}: model parses: {e:?}"))
+        .model;
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.0; model.n_eta];
+    let slot = model.pk_indices[model
+        .indiv_param_names
+        .iter()
+        .position(|n| n == param)
+        .unwrap_or_else(|| panic!("{arm}: no individual parameter {param}"))];
+    let at = |w: f64, t: f64| (model.pk_param_fn)(&theta, &eta, &wt(w), t).values[slot];
+    let dose_times: Vec<f64> = doses.iter().map(|d| d.time).collect();
+    let (bad_obs1, ctl_obs1) = (at(wt_bad, 1.0), at(0.0, 1.0));
+    assert_ne!(
+        bad_obs1.to_bits(),
+        ctl_obs1.to_bits(),
+        "{arm}: the straddle is gone — {param} at observation 1 is {bad_obs1} in both arms"
+    );
+    for &t in &dose_times {
+        assert_eq!(
+            at(0.0, t).to_bits(),
+            ctl_obs1.to_bits(),
+            "{arm}: {param} at the dose record must be the control's in-domain value"
+        );
+    }
+
+    let bad = population(states_subject(doses.clone(), obs_cmt, wt_bad), &["WT"]);
+    let ctl = population(states_subject(doses, obs_cmt, 0.0), &["WT"]);
+    assert!(
+        bad.subjects[0].has_tv_covariates(),
+        "{arm}: the subject must take the event-driven (per-dose) path"
+    );
+    let diags = check_model_data(&model, &bad);
+    assert!(
+        !diags.iter().any(|d| d.code.starts_with("E_")),
+        "{arm}: every dose record is in domain, got {:?}",
+        codes(&diags)
+    );
+
+    let run = |pop: &Population| {
+        ferx_core::pk::compute_predictions_with_states(&model, &pop.subjects[0], &theta, &eta)
+    };
+    let ((ipred_b, states_b), (ipred_c, states_c)) = (run(&bad), run(&ctl));
+    assert_eq!(
+        bits(&ipred_b),
+        bits(&ipred_c),
+        "{arm}: IPRED reads every dose quantity per dose: {ipred_b:?} vs {ipred_c:?}"
+    );
+    assert_eq!(states_c.len(), 4, "{arm}: one state vector per observation");
+    for (i, (b, c)) in states_b.iter().zip(&states_c).enumerate() {
+        assert!(
+            c.iter().all(|x| x.is_finite()) && c.iter().sum::<f64>() > 0.0,
+            "{arm}: the control's dosed drug must be live at observation {i}: {c:?}"
+        );
+        assert_eq!(
+            bits(b),
+            bits(c),
+            "{arm}: the states pass read {param} at observation 1 instead of at the dose \
+             record — observation {i}: {b:?} vs control {c:?}"
+        );
+    }
+    states_c
+}
+
+/// S1 — transit kernel. `MTT = 1 − WT` is −9 at observation 1, where the pass once read it:
+/// the clamped kernel delivered no mass and every state came back 0 (measured, #1575 P1).
+/// Dies if `ode_predictions_event_driven_with_states` hands the dense pass `Shared` reads.
+#[test]
+fn states_read_the_transit_kernel_at_the_dose_record() {
+    states_arm(
+        "S1 transit",
+        TV_COV_TRANSIT_MODEL,
+        two_bolus_doses(),
+        2,
+        10.0,
+        "MTT",
+    );
+}
+
+/// [`TV_COV_PARALLEL_MODEL`] at a tolerance tight enough for S2's closed form to outrank the
+/// difference it is asked to judge.
+const TV_COV_PARALLEL_TIGHT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  FR1 = TVFR1 + WT
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 1000000
+"#;
+
+/// S2 — pathway fraction, plus the external reference. `FR1 = 0.6 + WT` is 5.6 at
+/// observation 1 (once +436…+681 % on central, #1575 P2).
+///
+/// The control's central amount is then checked **outside both engines**, against the
+/// Bateman sum for two first-order pathways into one compartment (`k = CL/V = 0.1`,
+/// `0.6·first_order(1.5) + 0.4·first_order(0.3)`, 100 at 0 and 12), computed in 40-digit
+/// decimal arithmetic. A bit-identity with the control alone agrees with a wrong answer
+/// whenever both arms share it; the closed form is what sees the value itself.
+///
+/// Measured realised error (macOS arm64), worst point t = 14, two hours after the second
+/// dose: 2.020e-9 at `ode_reltol 1e-12 / abstol 1e-14`, 2.061e-7 at `1e-10 / 1e-12`, and
+/// 2.3e-3 at the defaults. It falls with the tolerance — a hundredfold per hundredfold — so
+/// it is the integrator's, not a defect. Bound 1e-8 at `1e-12`: ~5× headroom over the
+/// measurement, and 2e5× under the smallest error the defect produced (+436 %).
+///
+/// Dies if the input-rate forcings (`PreparedForcings`) stay on the shared snapshot while
+/// everything else goes per dose.
+#[test]
+fn states_read_the_pathway_fraction_at_the_dose_record_and_match_bateman() {
+    let ctl = states_arm(
+        "S2 parallel",
+        TV_COV_PARALLEL_TIGHT_MODEL,
+        two_bolus_doses(),
+        1,
+        5.0,
+        "FR1",
+    );
+    let want = [
+        (1.0, 53.665189848309986),
+        (8.0, 50.401699072124362),
+        (14.0, 95.375986182313731),
+        (30.0, 26.453712302623201),
+    ];
+    let mut worst = 0.0f64;
+    for (state, &(t, a)) in ctl.iter().zip(&want) {
+        let got = state[0];
+        assert!(got.is_finite(), "S2: central at t = {t} is {got}");
+        let err = (got - a).abs();
+        eprintln!("S2 Bateman: t = {t:>4}: got {got:.15} want {a:.15} |err| {err:.3e}");
+        worst = worst.max(err);
+    }
+    assert!(
+        worst < 1e-8,
+        "S2: the control's central departs from the Bateman closed form by {worst:.3e}"
+    );
+}
+
+/// S3 — zero-order `dur`. `DUR = 4 − WT` is −1 at observation 1. Dies if
+/// `zero_order_windows` reads `dur` from the disposition snapshot.
+#[test]
+fn states_read_the_zero_order_duration_at_the_dose_record() {
+    states_arm(
+        "S3 zero-order",
+        TV_COV_ZERO_ORDER_MODEL,
+        two_bolus_doses(),
+        1,
+        5.0,
+        "DUR",
+    );
+}
+
+/// `first_order` absorption with a per-route lag `LR = 0.5 + WT`.
+const TV_COV_ROUTE_LAG_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLR(0.5, 0.0, 12.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  LR = TVLR + WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// S4 — the route-lag **break**. `LR = 0.5 + WT` is 1.5 at observation 1, **in domain**:
+/// the forcing reads its lag per dose, but a break left on the disposition snapshot lands at
+/// `d.time + 1.5` instead of the onset at `d.time + 0.5`, which re-segments the walk and
+/// leaves the onset kink inside a step. Dies if `build_segment_break_times` reads the route
+/// lag from the disposition snapshot.
+#[test]
+fn states_break_at_the_route_onset_of_the_dose_record() {
+    states_arm(
+        "S4 route lag",
+        TV_COV_ROUTE_LAG_MODEL,
+        two_bolus_doses(),
+        1,
+        1.0,
+        "LR",
+    );
+}
+
+/// Depot → central with a compartment lag `ALAG1 = 0.3 + WT`.
+const TV_COV_ALAG_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.3, 0.0, 12.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAG + WT
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// S5 — compartment lag, **in domain** everywhere: `ALAG1 = 0.3 + WT` is 2.3 at
+/// observation 1, a lag that once shifted every dose (−100…+639 %, #1575 P3) with no value
+/// out of domain anywhere for a check to see. Dies if `subject_dose_attrs` reads the lag
+/// from the disposition snapshot.
+#[test]
+fn states_read_the_compartment_lag_at_the_dose_record() {
+    states_arm(
+        "S5 ALAG1",
+        TV_COV_ALAG_MODEL,
+        two_bolus_doses(),
+        2,
+        2.0,
+        "ALAG1",
+    );
+}
+
+/// One-compartment bolus with bioavailability `F1 = 0.8 − WT`.
+const TV_COV_F_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F1 = TVF - WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// S6 — bioavailability. `F1 = 0.8 − WT` is −0.2 at observation 1. Dies if
+/// `subject_dose_attrs` reads `F` from the disposition snapshot.
+#[test]
+fn states_read_the_bioavailability_at_the_dose_record() {
+    states_arm("S6 F1", TV_COV_F_MODEL, two_bolus_doses(), 1, 1.0, "F1");
+}
+
+/// A modeled infusion duration `D1 = 2 + WT` (`RATE = −2`).
+const TV_COV_MODELED_DURATION_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD(2.0, 0.01, 48.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD + WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// S7 — modeled duration. `D1 = 2 + WT` is 5 at observation 1, in domain. Dies if
+/// `resolve_subject_doses` resolves `RATE = −2` against the disposition snapshot.
+#[test]
+fn states_resolve_a_modeled_duration_at_the_dose_record() {
+    let doses = (0..2)
+        .map(|k| {
+            DoseEvent::modeled(
+                12.0 * k as f64,
+                100.0,
+                1,
+                false,
+                0.0,
+                RateMode::ModeledDuration,
+            )
+        })
+        .collect();
+    states_arm("S7 D1", TV_COV_MODELED_DURATION_MODEL, doses, 1, 3.0, "D1");
+}
+
+fn steady_state_then_plain_dose() -> Vec<DoseEvent> {
+    vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ]
+}
+
+/// S8 — the steady-state run-in at the arrival. An unlagged `SS = 1, II = 12` dose into the
+/// transit compartment at 0, a plain dose at 12: the periodic trough is equilibrated on the
+/// SS dose's own snapshot, where `MTT = 1`, not observation 1's `MTT = −9` — as the
+/// event-driven engine equilibrates it. Dies if `equilibrate_ss_state` reads the
+/// disposition snapshot.
+#[test]
+fn states_equilibrate_a_steady_state_dose_on_its_own_record() {
+    states_arm(
+        "S8 SS",
+        TV_COV_TRANSIT_MODEL,
+        steady_state_then_plain_dose(),
+        2,
+        10.0,
+        "MTT",
+    );
+}
+
+/// [`TV_COV_F_MODEL`] with a constant compartment lag, so an `SS = 1` dose is seeded at its
+/// **record** (`ss_state_at_phase`, #1121) rather than equilibrated at its arrival. (A lagged
+/// SS dose into a built-in absorption compartment is refused, `E_ABSORPTION_SS_LAG`, so the
+/// seed's dose quantity here is `F`.)
+const TV_COV_F_LAGGED_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  theta TVLAG(0.5, 0.0, 12.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  F1    = TVF - WT
+  ALAG1 = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// S8b — the steady-state seed at the record. An `SS = 1, II = 12` bolus lagged by 0.5,
+/// then a plain dose: the trough is seeded at the SS record from its own snapshot
+/// (`F1 = 0.8`), not observation 1's (`F1 = −0.2`). Dies if the record seed
+/// `ss_state_at_phase` reads the disposition snapshot — which S8 cannot see, since an
+/// unlagged SS dose never takes that branch.
+#[test]
+fn states_seed_a_lagged_steady_state_dose_on_its_own_record() {
+    states_arm(
+        "S8b SS lagged",
+        TV_COV_F_LAGGED_MODEL,
+        steady_state_then_plain_dose(),
+        1,
+        1.0,
+        "F1",
+    );
+}

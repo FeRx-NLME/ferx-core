@@ -142,6 +142,7 @@ jobs:
             --test nn_fit_smoke \
             --test nn_regularization \
             --test non_gaussian_score \
+            --test one_snapshot_dose_reads_survival \
             --test pktte_prestart_entry \
             --test pktte_tdep_nonmem_anchor \
             --test ss_chz_nonmem_anchor \

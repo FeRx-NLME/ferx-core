@@ -171,7 +171,15 @@ fn until_chz_threshold_bolus_crossing_matches_closed_form() {
     let ode = one_cpt_chz_ode_spec();
     let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
     let pk = pk_one(10.0, 100.0);
-    match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 50.0, 1000.0) {
+    match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        50.0,
+        1000.0,
+    ) {
         ThresholdOutcome::Crossed(t) => {
             assert_relative_eq!(t, 10.0 * std::f64::consts::LN_2, epsilon = 1e-4)
         }
@@ -190,7 +198,15 @@ fn until_chz_threshold_parity_with_dense_solve() {
     let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
     let pk = pk_one(10.0, 100.0);
     let threshold = 37.0;
-    let t = match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, threshold, 1000.0) {
+    let t = match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        threshold,
+        1000.0,
+    ) {
         ThresholdOutcome::Crossed(t) => t,
         other => panic!("expected Crossed, got {other:?}"),
     };
@@ -419,7 +435,15 @@ fn until_chz_threshold_censors_when_unreached() {
     let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
     let pk = pk_one(10.0, 100.0);
     assert_eq!(
-        ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 200.0, 50.0),
+        ode_solve_until_chz_threshold(
+            &ode,
+            &pk.values,
+            DoseReads::Shared(&pk.values),
+            &subject,
+            1,
+            200.0,
+            50.0
+        ),
         ThresholdOutcome::CensoredAtHorizon
     );
 }
@@ -438,7 +462,15 @@ fn until_chz_threshold_infusion_parity_with_dense_solve() {
     );
     let pk = pk_one(10.0, 100.0);
     let threshold = 50.0;
-    let t = match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, threshold, 1000.0) {
+    let t = match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        threshold,
+        1000.0,
+    ) {
         ThresholdOutcome::Crossed(t) => t,
         other => panic!("expected Crossed, got {other:?}"),
     };
@@ -469,7 +501,15 @@ fn until_chz_threshold_negative_hazard_fails() {
     let ode = one_cpt_neg_chz_ode_spec();
     let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
     let pk = pk_one(10.0, 100.0);
-    match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 5.0, 1000.0) {
+    match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        5.0,
+        1000.0,
+    ) {
         ThresholdOutcome::SolveFailed(msg) => {
             assert!(msg.contains("non-monotone"), "msg: {msg}")
         }
@@ -5352,6 +5392,7 @@ fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
     let outcome = ode_solve_until_chz_threshold(
         &make_spec(),
         &pk.values,
+        DoseReads::Shared(&pk.values),
         &make_subject(vec![dose.clone()], vec![]),
         1,
         threshold,
@@ -9367,7 +9408,15 @@ fn route_lagged_zero_order_break_builders_agree() {
     });
     let from_predictions = normalize(from_predictions);
 
-    let from_dense = build_segment_break_times(&ode, &pk, &subject, &lags, &f_bio, &windows, 24.0);
+    let from_dense = build_segment_break_times(
+        &ode,
+        DoseReads::Shared(&pk),
+        &subject,
+        &lags,
+        &f_bio,
+        &windows,
+        24.0,
+    );
 
     assert_eq!(
         from_predictions, from_dense,
@@ -9506,7 +9555,15 @@ fn route_lagged_first_order_onset_reaches_both_dense_builders() {
          cannot discriminate the route-onset push from the window pusher"
     );
 
-    let breaks = build_segment_break_times(&ode, &pk, &subject, &lags, &f_bio, &windows, 24.0);
+    let breaks = build_segment_break_times(
+        &ode,
+        DoseReads::Shared(&pk),
+        &subject,
+        &lags,
+        &f_bio,
+        &windows,
+        24.0,
+    );
     for want in [LAG_CMT + LAG_ROUTE, 12.0 + LAG_CMT + LAG_ROUTE] {
         assert!(
             breaks.iter().any(|&t| (t - want).abs() < 1e-12),
@@ -10972,7 +11029,15 @@ mod break_collision_1186 {
             // event-time search, reached in production only from `simulate()`'s latent-event
             // draw, and nothing else in the suite can see its counter.
             let scope = crate::ode::solver::SolverStatsScope::enter();
-            let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+            let got = ode_solve_until_chz_threshold(
+                &ode,
+                &pkv,
+                DoseReads::Shared(&pkv),
+                &s,
+                1,
+                0.5,
+                24.0,
+            );
             let stats = scope.collected();
             assert!(
                 matches!(got, ThresholdOutcome::SolveFailed(_)),
@@ -10991,7 +11056,15 @@ mod break_collision_1186 {
         // nothing. Without it a recorder that fired on every call would pass above.
         let s = make_subject(doses(8.2), obs.clone());
         let scope = crate::ode::solver::SolverStatsScope::enter();
-        let got = ode_solve_until_chz_threshold(&ode, &pk(7.9, 0.3), &s, 1, 0.5, 24.0);
+        let got = ode_solve_until_chz_threshold(
+            &ode,
+            &pk(7.9, 0.3),
+            DoseReads::Shared(&pk(7.9, 0.3)),
+            &s,
+            1,
+            0.5,
+            24.0,
+        );
         let clean = scope.collected();
         assert!(
             !matches!(got, ThresholdOutcome::SolveFailed(_)),
@@ -11030,7 +11103,8 @@ mod break_collision_1186 {
         ode.chz_state_slots = vec![1];
         let pkv = pk(7.9, 0.3);
         let s = make_subject(doses(8.2), vec![4.0, 8.0, 12.0]);
-        let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+        let got =
+            ode_solve_until_chz_threshold(&ode, &pkv, DoseReads::Shared(&pkv), &s, 1, 0.5, 24.0);
         assert!(
             !matches!(got, ThresholdOutcome::SolveFailed(_)),
             "a finite timeline must not be reported as SolveFailed, got {got:?}"
