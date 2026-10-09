@@ -1470,6 +1470,48 @@ fn gradient_method_record_is_the_union_with_the_caller() {
     }
 }
 
+/// #1860 review r1 #2: `ScoringSettings` is serialised inside `FitResult` itself (the fit JSON
+/// `read_fit_estimates` reads, the ferx-tools search journal), not only through the `.fitrx`
+/// wire. A `FitResult` written before #1835 has no `gradient_method` in either record and must
+/// still deserialise, reading `Auto` in both. The fixture records `Fd`, so a key that was
+/// silently not written cannot pass as the default. Mutation: drop
+/// `#[serde(default)]` on the field → `from_value` fails with "missing field".
+#[test]
+fn a_fit_result_without_gradient_method_deserialises_as_auto() {
+    let mut fit = crate::types::test_helpers::minimal_fit_result();
+    fit.scoring_settings = Some(off_default_scoring());
+    fit.sir_settings = Some(crate::estimation::sir::SirSettings {
+        scoring: off_default_scoring(),
+        ..Default::default()
+    });
+    let mut v = serde_json::to_value(&fit).expect("serialise");
+    let removed = [
+        v["scoring_settings"]
+            .as_object_mut()
+            .expect("stage record object")
+            .remove("gradient_method"),
+        v["sir_settings"]["scoring"]
+            .as_object_mut()
+            .expect("SIR record's scoring object")
+            .remove("gradient_method"),
+    ];
+    assert_eq!(
+        removed,
+        [Some(serde_json::json!("fd")), Some(serde_json::json!("fd"))],
+        "premise: both records wrote fd"
+    );
+    let back: crate::types::FitResult =
+        serde_json::from_value(v).expect("a pre-#1835 FitResult deserialises");
+    assert_eq!(
+        back.scoring_settings.map(|s| s.gradient_method),
+        Some(crate::types::GradientMethod::Auto)
+    );
+    assert_eq!(
+        back.sir_settings.map(|s| s.scoring.gradient_method),
+        Some(crate::types::GradientMethod::Auto)
+    );
+}
+
 /// #1806 T5: `ScoringSettings::overwrite` replaces every scoring field unconditionally, where
 /// `with_scoring_record` lets a caller's non-default value win. The caller differs from the
 /// record on every field (non-default numerics, default `bool`s against the record's

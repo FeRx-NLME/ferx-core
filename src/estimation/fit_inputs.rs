@@ -729,6 +729,10 @@ pub struct ScoringSettings {
     /// the model's flag, the options', or an SDE model ([`GradientMethod`]'s one rule) —
     /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
     /// wins (#1835).
+    ///
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
+    #[serde(default)]
     pub gradient_method: GradientMethod,
 }
 
@@ -757,9 +761,17 @@ impl ScoringSettings {
     /// with `gradient_method` the route the run actually took — `Fd` when the model's own
     /// flag, the options' or an SDE model put it on finite differences (#1835).
     /// `from_options` stays a pure copy of the options; this is what a fit records.
+    ///
+    /// The retired `Ad` records as `Auto`: only `fit()` refuses it (`E_AD_RETIRED`), and a
+    /// post-hoc `run_sir` handed it runs the analytic route, which is what `Auto` names. So a
+    /// record holds `Auto` or `Fd`, the two values the `.fitrx` decode accepts (#1860 review).
     pub(crate) fn of_run(model: &CompiledModel, options: &FitOptions) -> Self {
+        let gradient_method = match GradientMethod::effective(model, options) {
+            GradientMethod::Ad => GradientMethod::Auto,
+            g => g,
+        };
         Self {
-            gradient_method: GradientMethod::effective(model, options),
+            gradient_method,
             ..Self::from_options(options)
         }
     }

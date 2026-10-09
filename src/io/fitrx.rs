@@ -542,8 +542,10 @@ impl ScoringSettingsWire {
                 "0".to_string(),
             );
         }
-        // `ad` parses as a token but no fit can record it (`E_AD_RETIRED`), and a recorded
-        // value is adopted wherever the caller left `auto`; so it is refused here.
+        // `ad` parses as a token but no run records it: `fit()` refuses it (`E_AD_RETIRED`)
+        // and `ScoringSettings::of_run` records a post-hoc step's retired `ad` as the `auto`
+        // it ran. A recorded value is adopted wherever the caller left `auto`, so a
+        // hand-edited `ad` is refused here.
         let gradient_method: crate::types::GradientMethod =
             enum_from_token(block, "gradient_method", self.gradient_method)?;
         if gradient_method == crate::types::GradientMethod::Ad {

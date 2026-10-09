@@ -552,3 +552,40 @@ fn an_analytic_fit_records_auto_and_stays_analytic() {
         None
     );
 }
+
+/// **#1860 review r1 #1 — a post-hoc `run_sir` with the retired `gradient_method = Ad` records
+/// `auto`, and its bundle loads.** Only `fit()` refuses `Ad` (`E_AD_RETIRED`); `run_sir` runs it
+/// as the analytic route (`inner_optimizer.rs`, "AD (retired → analytic)"). Recording it
+/// verbatim made `save_fit` succeed and `load_fit` fail with `sir.settings.gradient_method must
+/// be auto or fd`, on a bundle that loaded before #1835.
+///
+/// Mutation: drop the `Ad → Auto` arm in `ScoringSettings::of_run` → the record says `Ad` and
+/// `load_fit` is `Corrupt`.
+#[test]
+fn a_posthoc_run_sir_with_retired_ad_records_auto_and_its_bundle_loads() {
+    let (model, population, base) = posthoc_base();
+    let o = FitOptions {
+        sir_samples: 20,
+        sir_resamples: 10,
+        sir_seed: Some(7),
+        gradient_method: GradientMethod::Ad,
+        ..FitOptions::default()
+    };
+    let r = crate::run_sir(&base, Some(&model), Some(&population), &o).expect("run_sir(Ad)");
+    assert_eq!(
+        r.sir_settings.as_ref().map(|s| s.scoring.gradient_method),
+        Some(GradientMethod::Auto),
+        "the run went analytic, and the record says so"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("sir_ad.fitrx");
+    crate::io::fitrx::save_fit(&r, &population, "src\n", &bundle, Default::default())
+        .expect("save_fit");
+    let loaded = crate::io::fitrx::load_fit(&bundle)
+        .unwrap_or_else(|e| panic!("a bundle from run_sir(Ad) must load: {e}"))
+        .fit;
+    assert_eq!(
+        loaded.sir_settings.map(|s| s.scoring.gradient_method),
+        Some(GradientMethod::Auto)
+    );
+}
