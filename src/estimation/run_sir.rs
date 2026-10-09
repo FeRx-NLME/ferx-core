@@ -117,8 +117,8 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   SIR record (`sir_settings = None`: no SIR ran) takes the inner-loop and ODE
 ///   settings from `fit.scoring_settings`, the stage that produced the estimates, the
 ///   same way (#1806): its draws are re-scored under the inner-loop and ODE settings
-///   `sir = true` would have used. The SIR-only settings have no record on such a fit
-///   and come from `options`. A fit with neither record (a `.fitrx` written before #1758) uses `options` as
+///   `sir = true` would have used. The SIR-only settings, seed included, have no record
+///   on such a fit and come from `options`. A fit with neither record (a `.fitrx` written before #1758) uses `options` as
 ///   given. Without a SIR record, an unset `sir_seed` falls back to `fit.sir_seed`
 ///   (the seed such a fit was given). `inner_optimizer` and
 ///   `ebe_warm_start` hold for this call's draws only; nothing outlives the call (#426).
