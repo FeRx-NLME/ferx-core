@@ -174,16 +174,7 @@ fn run_covariance_scoped(
     ))?;
 
     // --- Sanity-check dimensions ------------------------------------------
-    if model_ref.n_eta != fit.omega.nrows() {
-        return Err(crate::diagnostics::EngineError::from(format!(
-            "supplied model has n_eta = {} but fit.omega is {}×{}. \
-             Verify you supplied the same model used for the fit.",
-            model_ref.n_eta,
-            fit.omega.nrows(),
-            fit.omega.ncols()
-        ))
-        .in_context("run_covariance"));
-    }
+    // Ω, σ and Ω_IOV against the model: `fitted_params_from_result` below (#1833).
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
         return Err(crate::diagnostics::EngineError::from(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
