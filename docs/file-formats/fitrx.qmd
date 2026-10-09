@@ -230,15 +230,19 @@ and, flat beside them, the scoring settings below. The enums are written as thei
 a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance,
 `n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed`
 fails the load as corrupt. The key is additive, so `format_version` stays `"1"`:
-a bundle saved before #1758 has no `settings` and loads `sir_settings = None`,
-and `run_sir` on it uses the caller's options as given.
+a bundle saved before #1758 has no `settings` and loads `sir_settings = None`.
+`run_sir` on a fit without it takes its scoring settings from `scoring_settings`
+(below) when the bundle has one, and uses the caller's options as given when it
+has neither ([#1806](https://github.com/FeRx-NLME/ferx-core/issues/1806)).
 
 `scoring_settings` records the settings of the stage that produced the estimates
 (`FitResult::scoring_settings`, [#426](https://github.com/FeRx-NLME/ferx-core/issues/426)):
 `inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`,
 `inner_optimizer`, `ebe_warm_start` and the six `ode_*` settings, as the stage
 that produced the estimates ran them. `run_covariance` takes each one the caller
-leaves at its default from here. It is decoded and checked like `sir.settings`.
+leaves at its default from here, and so does `run_sir` on a fit with no
+`sir.settings`. A fit saved since #1806 scored its SIR under this record, so the
+scoring half of `sir.settings` equals it. It is decoded and checked like `sir.settings`.
 The key is additive: a bundle saved before #426 has none and loads
 `scoring_settings = None`. A `sir.settings` saved before #426 has no
 `inner_restarts` and loads with the default.
