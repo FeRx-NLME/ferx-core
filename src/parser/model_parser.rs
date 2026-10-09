@@ -21214,14 +21214,21 @@ fn level_block_eta_coupling(
         // operands `funnel_operands` finds, any other as a whole. The branch
         // conditions count in full either way, since a varying condition can
         // switch between expressions that are not proportional.
-        let p_any = |e: &Expression| {
-            ctx.expr_reads(e, &block_src, &taint_b, false)
-                || ctx.expr_reads(e, &eta_src, &taint_e, false)
+        //
+        // `reads(tb, te)` is the pair "reads either" / "reads both", with the
+        // states carrying the block when `tb` and the random effect when `te`.
+        // The parameter path passes `false` for both: an individual parameter
+        // does not read a state.
+        let (c, bs, es, taint_bs, taint_es) = (&ctx, &block_src, &eta_src, &taint_b, &taint_e);
+        let reads = move |tb: bool, te: bool| {
+            let block = move |e: &Expression| c.expr_reads(e, bs, taint_bs, tb);
+            let eta = move |e: &Expression| c.expr_reads(e, es, taint_es, te);
+            (
+                move |e: &Expression| block(e) || eta(e),
+                move |e: &Expression| block(e) && eta(e),
+            )
         };
-        let p_both = |e: &Expression| {
-            ctx.expr_reads(e, &block_src, &taint_b, false)
-                && ctx.expr_reads(e, &eta_src, &taint_e, false)
-        };
+        let (p_any, p_both) = reads(false, false);
         let param_funnel_covariates = |own: &[&CouplingAssign]| -> Option<Vec<String>> {
             let mut covs = Vec::new();
             for a in own {
@@ -21283,10 +21290,7 @@ fn level_block_eta_coupling(
         // The readout: only when a single one reads either.
         let te_states = ctx.state_tainted(&eta_src, &taint_e);
         let tb_states = ctx.state_tainted(&block_src, &taint_b);
-        let reads_block = |e: &Expression| ctx.expr_reads(e, &block_src, &taint_b, tb_states);
-        let reads_eta = |e: &Expression| ctx.expr_reads(e, &eta_src, &taint_e, te_states);
-        let reads_any = |e: &Expression| reads_block(e) || reads_eta(e);
-        let reads_both = |e: &Expression| reads_block(e) && reads_eta(e);
+        let (reads_any, reads_both) = reads(tb_states, te_states);
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
             let mut covariates = Vec::new();

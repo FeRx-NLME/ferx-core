@@ -6946,6 +6946,55 @@ mod absorption {
         );
     }
 
+    /// #1832 review, finding 3. The readout's funnel reads the states as
+    /// carrying the random effect when the η reaches them: with `ETA_E0` on
+    /// both `CL` and `E0`, `y = central / V + E0 + PLACEBO` has the varying
+    /// operand `central / V` alongside `E0` and `PLACEBO`, so there is no
+    /// funnel, and the η, which also shapes the curve, is identified on one
+    /// study per subject: it binds. The control drops the η from `CL`, so the
+    /// state reads neither, the funnel is `E0 + PLACEBO`, and it is refused
+    /// naming the readout. Both agree with the joint oracle.
+    ///
+    /// Mutation — the readout reads the states as carrying neither
+    /// (`reads(false, false)` at the readout): `central / V` is dropped as an
+    /// operand reading neither, and the η-on-`CL` row is refused. Swapping the
+    /// two flags is an equivalent mutant: "reads either" is unchanged, so an
+    /// operand reading a state stays an operand, and a state is never constant.
+    #[test]
+    fn a_state_the_eta_reaches_keeps_the_readout_funnel_varying() {
+        let pop = cf_pop(4, 1, &T6);
+        let text = |ip: &str, c: &str| {
+            let modifier = if c.is_empty() {
+                String::new()
+            } else {
+                format!(", contrast = {c}")
+            };
+            scaling_model(ip).replace("PLACEBO[STUDY, TIME]", &format!("PLACEBO[STUDY{modifier}]"))
+        };
+        let on_cl = |c: &str| {
+            text(
+                "  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0 + ETA_E0",
+                c,
+            )
+        };
+        let control = |c: &str| text("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0", c);
+        let mut wrong = Vec::new();
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            if let Err(e) = try_bind(&on_cl(c), &pop) {
+                wrong.push(format!("η on CL {c:?}: refused: {e}"));
+            }
+        }
+        for c in ALL {
+            match try_bind(&control(c), &pop) {
+                Err(e) if e.contains(READOUT_SITE) => {}
+                got => wrong.push(format!("control {c:?}: {got:?}")),
+            }
+        }
+        agrees_with_joint_oracle("η on CL", &on_cl, &pop, &mut wrong);
+        agrees_with_joint_oracle("control", &control, &pop, &mut wrong);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// T5 (#1712: P17, P18). The descent sheds only what reads neither. A
     /// branch condition on `OCC` still counts in full: P17's branches load the
     /// η differently, the oracle identifies it, and it binds. A factor that
