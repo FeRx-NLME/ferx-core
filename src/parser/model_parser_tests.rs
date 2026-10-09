@@ -28953,6 +28953,100 @@ fn the_coupling_walk_is_linear_on_a_diamond() {
     }
 }
 
+/// #1712: the funnels `level_block_eta_coupling` records for `ETA_E0` and the
+/// block `PLACEBO[STUDY]`, given `E0`'s assignment and the readout's leading
+/// term, in a full parse.
+fn funnels_1712(e0: &str, y: &str) -> Vec<Funnel> {
+    let src = format!(
+        r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  EMAX = TVEMAX
+  ET50 = TVET50
+  E0 = {e0}
+[structural_model]
+  y = {y} + EMAX * TIME / (TIME + ET50)
+[error_model]
+  DV ~ additive(ADD)
+"#
+    );
+    let parsed = parse_full_model(&src).expect("parses");
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.eta_couplings.len(), 1, "one random effect");
+    decl.eta_couplings[0].funnels.clone()
+}
+
+/// #1712: only the operands of the smallest sum or product collecting both the
+/// block and the random effect record covariates. A factor reading neither
+/// (`(1 + 0.1 * OCC)`) records nothing; the same factor on the block alone is
+/// an operand, and records `OCC`. One pair per side:
+///
+/// - **parameter**: `E0 = (TVE0 + PLACEBO + ETA_E0) * fac` records `[]`; the
+///   twin `TVE0 + PLACEBO * fac + ETA_E0` records `["OCC"]`. The readout's
+///   funnel stops at the variable `E0` and reads all of it, so it records
+///   `["OCC"]` for both.
+/// - **readout**: `E0 = TVE0 + ETA_E0` with `y = (E0 + PLACEBO) * fac`
+///   records `[]`; the twin `E0 + PLACEBO * fac` records `["OCC"]`.
+///
+/// Dies under, each side separately: the parameter loop back to
+/// `var_constant(v)` over the whole of `E0` (the parameter row records
+/// `["OCC"]`, the readout rows unchanged); the early `expr_constant(e)`
+/// return restored for the readout call only (the readout row records
+/// `["OCC"]`, the parameter rows unchanged).
+#[test]
+fn a_funnel_records_only_its_operands_covariates() {
+    let fac = "(1 + 0.1 * OCC)";
+    let param = |covs: &[&str]| Funnel {
+        site: ScaleShare {
+            param: Some("E0".to_string()),
+            eta_via: None,
+        },
+        covariates: covs.iter().map(|s| s.to_string()).collect(),
+    };
+    let readout = |covs: &[&str]| Funnel {
+        site: ScaleShare {
+            param: None,
+            eta_via: Some("E0".to_string()),
+        },
+        covariates: covs.iter().map(|s| s.to_string()).collect(),
+    };
+    let cases: [(&str, String, String, Vec<Funnel>); 4] = [
+        (
+            "parameter, common factor",
+            format!("(TVE0 + PLACEBO + ETA_E0) * {fac}"),
+            "E0".to_string(),
+            vec![param(&[]), readout(&["OCC"])],
+        ),
+        (
+            "parameter, twin",
+            format!("TVE0 + PLACEBO * {fac} + ETA_E0"),
+            "E0".to_string(),
+            vec![param(&["OCC"]), readout(&["OCC"])],
+        ),
+        (
+            "readout, common factor",
+            "TVE0 + ETA_E0".to_string(),
+            format!("(E0 + PLACEBO) * {fac}"),
+            vec![readout(&[])],
+        ),
+        (
+            "readout, twin",
+            "TVE0 + ETA_E0".to_string(),
+            format!("E0 + PLACEBO * {fac}"),
+            vec![readout(&["OCC"])],
+        ),
+    ];
+    for (tag, e0, y, want) in cases {
+        assert_eq!(funnels_1712(&e0, &y), want, "{tag}");
+    }
+}
+
 /// A self-reassignment (`E0 = E0 + 1`) is a cycle for `var_constant`: it still
 /// terminates, and the parameter still varies, the cycle guard's answer, now
 /// memoised.
