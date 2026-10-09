@@ -1517,6 +1517,30 @@ impl DeadLevels {
     }
 }
 
+/// The two points at which the level checks measure the likelihood: the initial θ
+/// with the random effects at 0, and every non-`FIX` θ jittered inside its bounds
+/// with the random effects at 0.05. One point is not enough — a θ initialised at 0,
+/// or a random effect at 0, can switch a block off there alone. `dead_levels` and
+/// `refuse_read_unindexed` share this one definition, so the two checks cannot
+/// drift apart (#1822).
+fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
+    let p = &model.default_params;
+    let theta0 = p.theta.clone();
+    let mut jittered = theta0.clone();
+    for (k, x) in jittered.iter_mut().enumerate() {
+        if !p.theta_fixed.get(k).copied().unwrap_or(false) {
+            *x = toward_interior(*x, p.theta_lower[k], p.theta_upper[k], jitter_step(k, *x));
+        }
+    }
+    [(theta0, 0.0), (jittered, 0.05)]
+}
+
+/// How far the level checks move θ `k` from `x`: distinct per θ, so no two
+/// jitters cancel and no two levels of a block moved together coincide.
+fn jitter_step(k: usize, x: f64) -> f64 {
+    (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0)
+}
+
 /// Rule 1 (#1679): the non-`FIX` levels of `decl` whose θ the likelihood never
 /// reads, and which random effects read their records.
 ///
@@ -1541,16 +1565,7 @@ fn dead_levels(
     population: &Population,
 ) -> DeadLevels {
     let p = &model.default_params;
-    let theta0 = p.theta.clone();
-    let mut jittered = theta0.clone();
-    for (k, x) in jittered.iter_mut().enumerate() {
-        if !p.theta_fixed.get(k).copied().unwrap_or(false) {
-            // Distinct per θ, so no two jitters cancel.
-            let step = (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0);
-            *x = toward_interior(*x, p.theta_lower[k], p.theta_upper[k], step);
-        }
-    }
-    let points = [(theta0, 0.0), (jittered, 0.05)];
+    let points = probe_points(model);
     let column = level_index_column(decl.name());
     let readers: Vec<Vec<f64>> = population
         .subjects
@@ -2379,16 +2394,21 @@ enum LevelSource {
 /// never showed it, the fit never estimated it, or the block is keyed on `TIME` — the
 /// writer gives it index 1, which is harmless only if nothing it is scored on reads
 /// the block. That is measured, not inferred from which endpoint reads which
-/// parameter: the engine's own `individual_nll` at η = 0, on the subject with its
-/// index set to each level of `model`'s block in turn, with every free θ of the block
-/// moved inside its bounds (so that no two levels share a value, a reference level
-/// fixed at 0 included), and at index 1 under the initial θ (so a one-level block is
-/// measured too). The block is read when any two of those differ. Only a measured,
-/// finite "no change" binds; a non-finite value measures nothing and counts as a
-/// read. That branch is defensive: the endpoint likelihoods map an ill-defined term
-/// to the finite `1e20` sentinel (`crate::survival`) before it reaches here, so no
-/// fixture has reached it (#1820 review r1). Like the dead-level check, two θ points
-/// can miss a read that a θ switches off at both (#1822).
+/// parameter: the engine's own `individual_nll`, at each of the dead-level check's
+/// two points (`probe_points`: the initial θ with η = 0, and every free θ jittered
+/// with η = 0.05), on the subject with its index set to each level of `model`'s
+/// block in turn, with every free θ of the block moved inside its bounds from that
+/// point (so that no two levels share a value, a reference level fixed at 0
+/// included), against index 1 at the point itself (so a one-level block is measured
+/// too). The block is read when, at either point, any of those differ: a read that
+/// another θ or a random effect switches off at the initial estimates is still
+/// seen at the jitter (#1822). Only a measured, finite "no change" binds; a
+/// non-finite value measures nothing and counts as a read. That branch is
+/// defensive: the endpoint likelihoods map an ill-defined term to the finite `1e20`
+/// sentinel (`crate::survival`) before it reaches here, so no fixture has reached
+/// it (#1820 review r1). Like the dead-level check, the two points can miss a read
+/// that is switched off at both — a threshold both values sit behind — and a read
+/// through κ, which `individual_nll` does not take.
 ///
 /// Reads `population` and writes nothing: only the subjects with no Gaussian
 /// observation are copied, so a binder can call this before it writes any column.
@@ -2413,7 +2433,7 @@ fn refuse_read_unindexed(
         unindexed.push(write_index_column(decl, table, &mut subjects)?);
     }
     let p = &model.default_params;
-    let eta = vec![0.0; model.n_eta];
+    let points = probe_points(model);
     for (decl, unindexed) in decls.iter().zip(&unindexed) {
         if unindexed.is_empty() {
             continue;
@@ -2425,36 +2445,48 @@ fn refuse_read_unindexed(
             .find(|d| d.name() == decl.name())
             .map_or(1, |d| d.labels().len().max(1));
         let prefix = format!("{}[", decl.name());
-        let mut moved = p.theta.clone();
-        for (k, x) in moved.iter_mut().enumerate() {
-            if model.theta_names[k].starts_with(&prefix)
-                && !p.theta_fixed.get(k).copied().unwrap_or(false)
-            {
-                // Distinct per θ, as in `dead_levels`, so no two levels coincide.
-                let step = (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0);
-                *x = toward_interior(*x, p.theta_lower[k], p.theta_upper[k], step);
-            }
-        }
+        // Each probe point with the block's free θ moved from it.
+        let probes: Vec<(&Vec<f64>, Vec<f64>, Vec<f64>)> = points
+            .iter()
+            .map(|(base, re)| {
+                let mut moved = base.clone();
+                for (k, x) in moved.iter_mut().enumerate() {
+                    if model.theta_names[k].starts_with(&prefix)
+                        && !p.theta_fixed.get(k).copied().unwrap_or(false)
+                    {
+                        *x = toward_interior(
+                            *x,
+                            p.theta_lower[k],
+                            p.theta_upper[k],
+                            jitter_step(k, *x),
+                        );
+                    }
+                }
+                (base, moved, vec![*re; model.n_eta])
+            })
+            .collect();
         let column = level_index_column(decl.name());
         let reads = |subject: &Subject| -> bool {
-            let nll = |theta: &[f64], index: f64| {
+            let nll = |theta: &[f64], eta: &[f64], index: f64| {
                 let mut s = subject.clone();
                 set_index(&mut s, &column, index);
                 crate::stats::likelihood::individual_nll(
                     model,
                     &s,
                     theta,
-                    &eta,
+                    eta,
                     &p.omega,
                     &p.sigma.values,
                 )
             };
-            let at_init = nll(&p.theta, 1.0);
-            !at_init.is_finite()
-                || (1..=n_levels).any(|i| {
-                    let v = nll(&moved, i as f64);
-                    !v.is_finite() || v.to_bits() != at_init.to_bits()
-                })
+            probes.iter().any(|(base, moved, eta)| {
+                let at = nll(base, eta, 1.0);
+                !at.is_finite()
+                    || (1..=n_levels).any(|i| {
+                        let v = nll(moved, eta, i as f64);
+                        !v.is_finite() || v.to_bits() != at.to_bits()
+                    })
+            })
         };
         let read: Vec<&Unindexed> = unindexed
             .iter()
