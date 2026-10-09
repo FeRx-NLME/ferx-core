@@ -468,8 +468,9 @@ fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
     );
 }
 
-/// #1806 T3: `run_sir` on a fit with no SIR record takes the stage record, so it repeats the
-/// SIR the same fit would have run with `sir = true` (ferx-r#511). Each row's premise is the
+/// #1806 T3: `run_sir` on a fit with no SIR record takes the stage record, so, given the same
+/// SIR-only settings (draws, seed), it repeats the SIR the same fit would have run with
+/// `sir = true` (ferx-r#511). Each row's premise is the
 /// straddle: with the stage record cleared too, the same call scores at the defaults and
 /// lands on different bits. Mutation: drop the stage-record fallback in `resolve_sir_options`
 /// → every row's claim dies.

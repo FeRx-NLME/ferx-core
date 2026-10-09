@@ -2601,15 +2601,17 @@ fn fit_inner(
     // stage's record too, overwritten onto the top-level options (#1806): a quadrature stage
     // ran at `inner_tol <= 1e-8`, and the draws are re-solved at what the objective was
     // minimised at. So `sir_settings.scoring == scoring_settings` on every fit. One binding
-    // feeds both the SIR run and its non-PD fallback below.
+    // feeds both the SIR run and its non-PD fallback below. Always `Some`: `method_chain()` is
+    // never empty, a checkpoint resume requires `stage_idx < n_stages`, and every stage that
+    // runs writes `last_scoring` before it can exit.
     let scoring_settings = estimating_scoring.or(last_scoring);
     let sir_opts = crate::estimation::fit_inputs::scoring_options(
         final_method,
         options.interaction,
-        &match scoring_settings.as_ref() {
-            Some(rec) => rec.overwrite(options),
-            None => options.clone(),
-        },
+        &scoring_settings
+            .as_ref()
+            .expect("every stage that runs records its scoring settings")
+            .overwrite(options),
     );
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
