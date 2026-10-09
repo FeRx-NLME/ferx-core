@@ -1256,13 +1256,18 @@ pub fn simulate_with_uncertainty(
 /// [`simulate_with_options_diag`].
 ///
 /// `results` is exactly what [`simulate_with_uncertainty`] returns. `warnings` carries, in this
-/// order: the per-draw and per-subject simulation diagnostics (a draw skipped because it landed
-/// in the flip-flop regime, #786; a degenerate hazard draw, #763 / #762), capped steady-state
+/// order: the per-subject simulation diagnostics (a degenerate hazard draw, #763 / #762), one
+/// `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every draw skipped because it landed in the
+/// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), capped steady-state
 /// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
 /// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
 /// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
 /// collected over every draw. `postfit::non_fit_diagnostics` documents what that bundle
 /// includes and leaves out.
+///
+/// Refuses, with the `E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP` code `simulate()` uses, when the
+/// fit's point estimate is itself in that flip-flop regime, or when every one of `n > 0` draws
+/// is skipped.
 ///
 /// A caller relaying data-reader findings should take them from here, never from
 /// [`Population::warnings`] directly: the raw list still holds the findings the shared filter
@@ -1309,6 +1314,14 @@ pub fn simulate_with_uncertainty_diag(
 
     let template =
         crate::estimation::uncertainty_samples::fitted_params_from_result(fit_result, model)?;
+    // The point estimate itself must be simulatable (#1485): `simulate()` refuses a θ in the
+    // flip-flop regime of a twin-less transit / IG closed form, and drawing around it would
+    // otherwise skip most draws and return the rest as if the point estimate were sound.
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model,
+        population,
+        &template.theta,
+    ))?;
     let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
         fit_result,
         &template,
@@ -1365,18 +1378,23 @@ fn simulate_uncertainty_draws(
     results: &mut Vec<SimulationResult>,
     sim_warnings: &mut Vec<String>,
 ) -> Result<(), EngineError> {
+    // 1-based indices of the skipped draws, and the first one's reason (#1485).
+    let mut skipped: Vec<usize> = Vec::new();
+    let mut first_reason: Option<String> = None;
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
         // `simulate_inner_with_draw`'s own flip-flop check would then return `Err` —
         // and the `?` below would fail the *entire* uncertainty run on one draw. Skip
-        // such a draw with a recorded warning instead, so the remaining draws still
-        // yield results (#786). **This check must stay ahead of that `?`** (#898).
-        // The single-shot `predict()`/`simulate()` paths keep the failure (there is no
-        // other draw to fall back on). Twin-carrying models return `None` here and proceed
-        // (they reroute per-eval), so this only skips genuinely un-simulatable draws.
+        // such a draw instead, so the remaining draws still yield results (#786), and
+        // report every skip in one warning after the loop (#1485). **This check must
+        // stay ahead of that `?`** (#898). The single-shot `predict()`/`simulate()`
+        // paths keep the failure (there is no other draw to fall back on).
+        // Twin-carrying models return `None` here and proceed (they reroute per-eval),
+        // so this only skips genuinely un-simulatable draws.
         if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, &params.theta) {
-            sim_warnings.push(format!("uncertainty draw {} skipped — {}", k + 1, msg));
+            skipped.push(k + 1);
+            first_reason.get_or_insert(msg);
             continue;
         }
         let mut rows = simulate_inner_with_draw(
@@ -1391,6 +1409,20 @@ fn simulate_uncertainty_draws(
             sim_warnings,
         )?;
         results.append(&mut rows);
+    }
+    if let Some(reason) = first_reason {
+        if skipped.len() == draws.len() {
+            first_error(&all_uncertainty_draws_skipped_diags(
+                model,
+                draws.len(),
+                &reason,
+            ))?;
+        }
+        sim_warnings.push(uncertainty_draws_skipped_warning(
+            model,
+            &skipped,
+            draws.len(),
+        ));
     }
     Ok(())
 }

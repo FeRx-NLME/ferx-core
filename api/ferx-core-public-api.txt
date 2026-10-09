@@ -2610,6 +2610,7 @@ pub ferx_core::types::WarningCode::Simulation
 pub ferx_core::types::WarningCode::Sir
 pub ferx_core::types::WarningCode::StalledAtInit
 pub ferx_core::types::WarningCode::Threads
+pub ferx_core::types::WarningCode::UncertaintyDrawsSkipped
 pub ferx_core::types::WarningCode::ViBadBasin
 impl ferx_core::WarningCode
 pub fn ferx_core::WarningCode::as_str(&self) -> &'static str
@@ -3963,6 +3964,7 @@ pub ferx_core::WarningCode::Simulation
 pub ferx_core::WarningCode::Sir
 pub ferx_core::WarningCode::StalledAtInit
 pub ferx_core::WarningCode::Threads
+pub ferx_core::WarningCode::UncertaintyDrawsSkipped
 pub ferx_core::WarningCode::ViBadBasin
 impl ferx_core::WarningCode
 pub fn ferx_core::WarningCode::as_str(&self) -> &'static str

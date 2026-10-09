@@ -15,6 +15,9 @@ mod validation;
 // *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
+pub(crate) use validation::{
+    all_uncertainty_draws_skipped_diags, uncertainty_draws_skipped_warning,
+};
 #[allow(unused_imports)]
 pub(crate) use validation::{
     apply_iov_occasion_rule, check_absorption_closed_form_support,

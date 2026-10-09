@@ -6385,6 +6385,12 @@ pub enum WarningCode {
     /// from the optimizer codes — it says the *integration* under the final estimates was not
     /// clean, whatever the optimizer made of it.
     OdeSolver,
+    /// `simulate_with_uncertainty` skipped some of its parameter draws because they fell in
+    /// the flip-flop regime of a twin-less transit / inverse-Gaussian closed form (#1485).
+    /// One warning per run, carrying the count and the 1-based draw indices. Distinct from
+    /// [`WarningCode::FlipFlop`]: the rows returned are a sample of a truncated parameter
+    /// distribution, so intervals built from them are biased, not merely fewer.
+    UncertaintyDrawsSkipped,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -6430,6 +6436,7 @@ impl WarningCode {
             WarningCode::AbsorptionTwinDeclined => "absorption_twin_declined",
             WarningCode::FlatParameter => "flat_parameter",
             WarningCode::OdeSolver => "ode_solver",
+            WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
             WarningCode::General => "general",
         }
     }
@@ -6525,6 +6532,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
+        )
+    } else if lower.contains("w_uncertainty_draws_skipped") {
+        // #1485: skipped uncertainty draws, one warning per run. A token arm ahead of the
+        // prose ones because the message says "flip-flop regime" — the `FlipFlop` arm below
+        // would otherwise claim it and lose the count's own category.
+        (
+            WarningSeverity::Warning,
+            WarningCode::UncertaintyDrawsSkipped,
         )
     } else if lower.contains("w_init_not_representable") {
         // #1307: a declared value the *packer* altered before any box existed —
