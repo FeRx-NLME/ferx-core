@@ -7253,8 +7253,7 @@ mod absorption {
     /// identifies.
     ///
     /// Mutation, measured — `resolve` returning every assignment (the
-    /// `debug_assert!` fires); the parameter funnel taken as the whole
-    /// assignment (#1832's M1: the read of `E0` with its `W` factor varies).
+    /// `debug_assert!` fires).
     #[test]
     fn a_self_reassigned_kappa_funnel() {
         let pop = arms_pop();
