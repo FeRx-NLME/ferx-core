@@ -1092,7 +1092,12 @@ fn run_sir_in_box(
     // density computation). Uses n_free, matching the Student-t dimensionality.
     let log_det_proposal = conditioned.log_det;
 
-    let settings = SirSettings::from_options(options);
+    // The record of this run: `from_options`, with `gradient_method` the route the draws
+    // were actually scored on — the model's `gradient = fd` included (#1835).
+    let settings = SirSettings {
+        scoring: crate::ScoringSettings::of_run(model, options),
+        ..SirSettings::from_options(options)
+    };
     let mut rng = StdRng::seed_from_u64(settings.seed);
 
     if options.verbose {

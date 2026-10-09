@@ -927,6 +927,7 @@ mod tests {
                 ode_method: crate::ode::OdeMethod::Rodas5P,
                 ode_stiff_abort_after: Some(9),
                 ode_auto_switch: false,
+                gradient_method: crate::types::GradientMethod::Fd,
             },
         }
     }
