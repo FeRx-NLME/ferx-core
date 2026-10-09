@@ -1654,9 +1654,10 @@ pub fn check_model_data_rule(
 /// "Scored" is exactly what the objective reads: `observations` (the reader has already
 /// dropped `DV = .`, `MDV = 1` and filtered rows; CENS rows are in it under both
 /// `bloq_method`s) plus `obs_records` (TTE — a censoring-only row included — binary,
-/// categorical and CTMM records). With none, the objective is identically 0 and no parameter
-/// can move: `fit()` used to return OFV 0 at the initial estimates and `ferx check` called
-/// the pair valid.
+/// categorical and CTMM records). With none, the data term of the objective is identically 0:
+/// only a `[priors]` / NN-regularization penalty could move an estimate (#1829 review r1),
+/// and without one `fit()` used to return OFV 0 at the initial estimates while `ferx check`
+/// called the pair valid.
 ///
 /// One population-level finding. The reader's per-subject "all observation records were
 /// excluded" warnings stay as they are. The message's second sentence is one of two,
@@ -1677,8 +1678,9 @@ fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
     }
     let count = format!(
         "The population has {} subject(s) but nothing the likelihood can score: 0 Gaussian \
-         observations and 0 endpoint (TTE / binary / categorical / Markov) records. The \
-         objective would be 0 and no parameter could move.",
+         observations and 0 endpoint (TTE / binary / categorical / Markov) records. The data \
+         would contribute nothing to the objective, so no estimate could move off its initial \
+         value except under a prior or a regularization penalty.",
         population.subjects.len()
     );
     let cause = match population

@@ -28,10 +28,19 @@ use super::*;
 const CODE: &str = "E_NO_SCORED_OBSERVATIONS";
 /// S1: the count, which every refusal carries.
 const S1: &str = "but nothing the likelihood can score";
+/// S1's second sentence, also on every refusal: the consequence, which holds under a
+/// `[priors]` / NN-regularization penalty too (#1829 review r1 row 1).
+const S1_CONSEQUENCE: &str = "The data would contribute nothing to the objective, so no \
+                              estimate could move off its initial value except under a prior \
+                              or a regularization penalty.";
 /// S2: the filter, behind the gate.
 const S2: &str = "`[data_selection]` removed";
+/// S2's tail: the action.
+const S2_ACTION: &str = "check its `ignore` / `accept` clauses.";
 /// S3: what makes a row scored, the other side of the gate.
 const S3: &str = "A row is scored when it has `EVID = 0`, `MDV = 0` and a `DV`";
+/// S3's tail: the endpoint alternative.
+const S3_ENDPOINT: &str = "or when it is routed to a declared endpoint.";
 
 const MODEL: &str = "\
 [parameters]
@@ -110,6 +119,7 @@ fn refused(selection: Option<&str>, csv: &str) -> (String, String) {
         .map(|(r, _)| r.ofv)
         .expect_err("fit must refuse a population with nothing to score");
     assert_eq!(err, hits[0].message, "fit() and check carry one message");
+    assert!(err.contains(S1_CONSEQUENCE), "S1's consequence: {err}");
     (hits[0].message.clone(), err)
 }
 
@@ -127,6 +137,7 @@ fn doses_only_and_filtered_out_observations_are_refused_with_the_right_branch() 
         "R1 S1: {r1}"
     );
     assert!(r1.contains(S3), "R1 S3: {r1}");
+    assert!(r1.contains(S3_ENDPOINT), "R1 S3's endpoint clause: {r1}");
     assert!(!r1.contains("[data_selection]"), "R1 has no filter: {r1}");
 
     let (r3, _) = refused(Some("ignore = EVID == 0"), WITH_OBS);
@@ -135,6 +146,7 @@ fn doses_only_and_filtered_out_observations_are_refused_with_the_right_branch() 
         "R3 S1: {r3}"
     );
     assert!(r3.contains(S2), "R3 S2: {r3}");
+    assert!(r3.contains(S2_ACTION), "R3 S2's action: {r3}");
     assert!(
         r3.contains("8 row(s) classed as observations"),
         "R3 S2 count, phrased as what the filter could see: {r3}"
@@ -211,6 +223,7 @@ fn an_empty_in_memory_population_is_refused_by_fit() {
     .map(|r| r.ofv)
     .expect_err("fit must refuse an empty population");
     assert_eq!(err, hits[0].message);
+    assert!(err.contains(S1_CONSEQUENCE), "R6 S1's consequence: {err}");
     assert!(
         err.contains(S1) && err.contains("has 0 subject(s)"),
         "R6 S1: {err}"
