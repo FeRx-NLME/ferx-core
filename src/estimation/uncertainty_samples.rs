@@ -16,6 +16,7 @@
 //! Each draw is unpacked via [`unpack_params`] so theta, Omega, and Sigma are
 //! perturbed coherently (they share one packed vector).
 
+use crate::api::ParamBlock;
 use crate::diagnostics::EngineError;
 use crate::estimation::parameterization::{
     lower_tri_iter, pack_with_bounds, packed_segments, theta_packs_log, unpack_params,
@@ -66,9 +67,10 @@ pub enum UncertaintyMethod {
 ///
 /// # Errors
 ///
-/// `E_PARAM_SHAPE` when the fit's Ω_IOV does not match the model's κ (#1789): absent
-/// on a model with κ, present on one without, or of the wrong dimension. The model's
-/// initial Ω_IOV is never substituted for a missing one.
+/// `E_PARAM_SHAPE` when the fit's Ω, σ or Ω_IOV does not match the model (#1789,
+/// #1833): an Ω or Ω_IOV that is not square, or whose dimension is not the model's η
+/// / κ count; a σ of the wrong length; an Ω_IOV absent on a model with κ, or present
+/// on one without. The model's initial Ω_IOV is never substituted for a missing one.
 ///
 /// For a `[mixture]` model with at least one override, when `packed_estimate` is
 /// `None` (a fit read from `.fitrx`, built in R, or estimated by SAEM / IMP / Bayes) or
@@ -77,8 +79,14 @@ pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
 ) -> Result<ModelParameters, EngineError> {
-    let [_, _, omega_iov_block] = crate::api::ParamBlock::all_of_fit(fit_result);
-    crate::api::check_param_shape(model, &[omega_iov_block])?;
+    // The one `E_PARAM_SHAPE` gate on a fit (#1833): `run_covariance`, `run_sir` and
+    // `simulate_with_uncertainty` reach their blocks only through this function.
+    let blocks = [
+        ParamBlock::Omega(fit_result.omega.shape()),
+        ParamBlock::Sigma(fit_result.sigma.len()),
+        ParamBlock::OmegaIov(fit_result.omega_iov.as_ref().map(|m| m.shape())),
+    ];
+    crate::api::check_param_shape(model, &blocks)?;
     let template = &model.default_params;
     let omega_diagonal = template.omega.diagonal;
     let omega = OmegaMatrix::from_matrix_with_mask(

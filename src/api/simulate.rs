@@ -371,40 +371,45 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
     first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
 }
 
-/// The dimension of one random-effect or residual block a caller supplied, for
+/// The shape of one random-effect or residual block a caller supplied, for
 /// [`check_param_shape`] (#1764). Each entry point passes the blocks it reads.
+///
+/// Ω and Ω_IOV carry `(rows, cols)`, not one dimension (#1833): a 1×2 block has the
+/// model's row count, and a row-count check admitted it into a Cholesky that panicked.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ParamBlock {
-    /// Ω's dimension.
-    Omega(usize),
+    /// Ω's `(rows, cols)`.
+    Omega((usize, usize)),
     /// σ's length.
     Sigma(usize),
-    /// Ω_IOV's dimension, `None` when absent.
-    OmegaIov(Option<usize>),
+    /// Ω_IOV's `(rows, cols)`, `None` when absent.
+    OmegaIov(Option<(usize, usize)>),
 }
 
 impl ParamBlock {
-    /// Ω, σ and Ω_IOV of a parameter set.
+    /// Ω, σ and Ω_IOV of a parameter set. An `OmegaMatrix`'s fields are `pub`, so a
+    /// struct-literal one can be non-square too: read the matrix, not `dim()`.
     pub(crate) fn all_of(params: &ModelParameters) -> [ParamBlock; 3] {
+        let shape = |m: &crate::types::OmegaMatrix| m.matrix.shape();
         [
-            ParamBlock::Omega(params.omega.dim()),
+            ParamBlock::Omega(shape(&params.omega)),
             ParamBlock::Sigma(params.sigma.values.len()),
-            ParamBlock::OmegaIov(params.omega_iov.as_ref().map(|m| m.dim())),
-        ]
-    }
-
-    /// Ω, σ and Ω_IOV of a fit.
-    pub(crate) fn all_of_fit(fit: &FitResult) -> [ParamBlock; 3] {
-        [
-            ParamBlock::Omega(fit.omega.nrows()),
-            ParamBlock::Sigma(fit.sigma.len()),
-            ParamBlock::OmegaIov(fit.omega_iov.as_ref().map(|m| m.nrows())),
+            ParamBlock::OmegaIov(params.omega_iov.as_ref().map(shape)),
         ]
     }
 }
 
-/// Refuse an Ω, σ or Ω_IOV whose dimension is not the model's (#1764), as
-/// `E_PARAM_SHAPE` — the sibling of [`check_theta_length`].
+/// Refuse an Ω, σ or Ω_IOV whose dimension is not the model's (#1764), or an Ω /
+/// Ω_IOV that is not square (#1833), as `E_PARAM_SHAPE` — the sibling of
+/// [`check_theta_length`].
+///
+/// One gate per boundary where a block enters, never one per entry point (#1833). A
+/// caller handing over `ModelParameters` gates them here through [`ParamBlock::all_of`];
+/// a `FitResult` is gated inside `fitted_params_from_result`, the one way a post-hoc step
+/// gets parameters from a fit. Do not add a second gate on a fit: route through
+/// `fitted_params_from_result`, which checks the fit's blocks before anything reads them.
+/// A copy ahead of it rejects exactly the same inputs, so the tests cannot tell when
+/// either copy is removed.
 ///
 /// Measured before this gate: a mis-sized Ω panicked in the η draw or the inner
 /// solve (`Gemv: dimensions mismatch`), a short σ panicked indexing the residual
@@ -422,10 +427,19 @@ pub(crate) fn check_param_shape(
             "the model reads it by position, so its values would be read against the wrong {what}"
         )
     };
+    // Squareness first, so a 2×1 is never reported as "2×2" (#1833).
+    let not_square = |name: &str, (r, c): (usize, usize)| {
+        format!(
+            "the supplied {name} is {r}×{c}, which is not square; a variance-covariance \
+             matrix has one row and one column per random effect"
+        )
+    };
     let want = &model.default_params;
     for block in supplied {
         let message = match *block {
-            ParamBlock::Omega(got) if got != want.omega.dim() => format!(
+            ParamBlock::Omega((r, c)) if r != c => not_square("omega", (r, c)),
+            ParamBlock::OmegaIov(Some((r, c))) if r != c => not_square("omega_iov", (r, c)),
+            ParamBlock::Omega((got, _)) if got != want.omega.dim() => format!(
                 "the supplied omega is {got}×{got} but this model has {} eta; {}",
                 want.omega.dim(),
                 by_position("random effects")
@@ -435,7 +449,10 @@ pub(crate) fn check_param_shape(
                 want.sigma.values.len(),
                 by_position("residual errors")
             ),
-            ParamBlock::OmegaIov(got) => match (got, want.omega_iov.as_ref().map(|m| m.dim())) {
+            ParamBlock::OmegaIov(got) => match (
+                got.map(|(r, _)| r),
+                want.omega_iov.as_ref().map(|m| m.dim()),
+            ) {
                 (Some(g), Some(w)) if g != w => format!(
                     "the supplied omega_iov is {g}×{g} but this model has {w} kappa; {}",
                     by_position("random effects")
@@ -1325,9 +1342,8 @@ pub fn simulate_with_uncertainty_diag(
     // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
     // would first be handed to the draw machinery, and a zero-draw run never reaches it.
     check_theta_length(model, &fit_result.theta)?;
-    // …and Ω / σ / Ω_IOV (#1764): a mis-sized Ω panicked in the draw, and a fit
-    // with no Ω_IOV on an IOV model simulated with the model's initial Ω_IOV.
-    check_param_shape(model, &ParamBlock::all_of_fit(fit_result))?;
+    // Ω / σ / Ω_IOV (#1764, #1833) are refused by `fitted_params_from_result` below,
+    // before any draw: a second gate here rejected exactly the same inputs.
 
     // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
     // uncertainty path does not yet expose — validate once here rather than per

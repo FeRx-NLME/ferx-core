@@ -399,7 +399,8 @@ fn run_covariance_and_run_sir_reject_an_unrouted_population() {
 /// With `population = None` both re-read `fit.data_path` — routed, since #1199 (this
 /// is the path the R wrapper takes). The re-read is checked by what fails *next*:
 /// `run_sir` stops at the missing covariance matrix and `run_covariance` at a
-/// deliberately mis-sized `omega`, both downstream of the routing guard, so an
+/// deliberately mis-sized `omega` (`E_PARAM_SHAPE` from `fitted_params_from_result`,
+/// #1833), both downstream of the routing guard, so an
 /// unrouted re-read — the pre-fix behaviour — surfaces here as `E_ENDPOINT_UNROUTED`
 /// instead (observed by mutation: re-reading through `read_nonmem_csv_mapped` turns
 /// both arms red with that code).
@@ -415,7 +416,7 @@ fn run_covariance_and_run_sir_reread_the_dataset_routed() {
     wrong.omega = nalgebra::DMatrix::zeros(2, 2);
     let err = crate::run_covariance(&wrong, None, None, &opts).expect_err("mis-sized omega");
     assert!(!err.to_string().contains("E_ENDPOINT_"), "{err}");
-    assert!(err.to_string().contains("n_eta"), "{err}");
+    assert_eq!(err.code(), Some("E_PARAM_SHAPE"), "{err}");
 }
 
 /// `predict_categorical` walks `obs_records`, so on a model-blind population it would

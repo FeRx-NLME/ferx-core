@@ -487,9 +487,12 @@ initial parameters), every `simulate*` and adaptive entry point,
 model's (`E_PARAM_SHAPE`), as well as an Ω~IOV~ on a model with no κ and a
 missing one on a model with κ. Previously a mis-sized block panicked, and a
 long σ or a missing Ω~IOV~ ran to completion with the block silently ignored
-([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)). `run_sir()` and
-`run_covariance()` check the fit's σ and Ω~IOV~; they already refused an Ω of
-the wrong dimension. `predict` and the survival predictors read none of the
+([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)). An Ω or Ω~IOV~
+that is not square is refused first, with its own message, even when its row
+count matches the model; before, it panicked
+([#1833](https://github.com/FeRx-NLME/ferx-core/issues/1833)). `run_sir()`,
+`run_covariance()` and `fitted_params_from_result()` check all three blocks of
+the fit. `predict` and the survival predictors read none of the
 three, so they do not check them. On `simulate*` a missing Ω~IOV~ keeps its
 own message ([#1019](https://github.com/FeRx-NLME/ferx-core/issues/1019)), and
 `compute_npde_npd` keeps its documented fallback to κ = 0 for one. On
