@@ -229,8 +229,13 @@ fn run_sir_scoped(
         model_ref, pop_ref, true,
     ))?;
 
+    // --- Reconstruct ModelParameters (the shape gate) ----------------------
+    // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
+    // different model has EBEs as wide as its Ω, and must get `E_PARAM_SHAPE`, not the
+    // uncoded EBE message.
+    let params = fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_sir"))?;
+
     // --- Sanity-check dimensions ------------------------------------------
-    // Ω, σ and Ω_IOV against the model: `fitted_params_from_result` below (#1833).
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
         return Err(crate::diagnostics::EngineError::from(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
@@ -241,8 +246,7 @@ fn run_sir_scoped(
         .in_context("run_sir"));
     }
 
-    // --- Reconstruct ModelParameters and eta_hats -------------------------
-    let params = fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_sir"))?;
+    // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
 
     // --- Now require a covariance matrix to seed the proposal -------------

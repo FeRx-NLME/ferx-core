@@ -173,8 +173,14 @@ fn run_covariance_scoped(
         model_ref, pop_ref, true,
     ))?;
 
+    // --- The shape gate ----------------------------------------------------
+    // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
+    // different model has EBEs as wide as its Ω, and must get `E_PARAM_SHAPE`, not the
+    // uncoded EBE message. `base_params` is used further down (see the comment there).
+    let base_params =
+        fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_covariance"))?;
+
     // --- Sanity-check dimensions ------------------------------------------
-    // Ω, σ and Ω_IOV against the model: `fitted_params_from_result` below (#1833).
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
         return Err(crate::diagnostics::EngineError::from(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
@@ -225,8 +231,7 @@ fn run_covariance_scoped(
     // values from `x_hat`. A `FitResult` whose `theta`/`omega`/`sigma` were mutated
     // in-process *after* the fit is therefore evaluated at the original packed
     // point; recompute the fit rather than editing its estimates in place.
-    let base_params =
-        fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_covariance"))?;
+    // (`base_params` is built above, ahead of the EBE check, as the shape gate.)
     let (params, x_hat) = match &fit.packed_estimate {
         // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
         // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.

@@ -339,7 +339,8 @@ fn fit_refuses_initial_theta_of_the_wrong_length() {
 /// Both refuse through the one gate they share, `fitted_params_from_result`'s (a second copy
 /// in `resolve_fit_inputs` rejected the same inputs and no test could see it go). Mutations
 /// — delete that call and both arms of every cell go red; gate Ω_IOV only (the #1789
-/// slice) and the σ and Ω cells do.
+/// slice) and the σ and Ω cells do; move either function's call back below its uncoded
+/// `subjects[0].eta` check and that function's wrong-model arms get the EBE message.
 #[test]
 fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_block() {
     let model = parse_model_string(ODE_IOV).expect("parse");
@@ -353,9 +354,8 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_block() {
     };
     let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit");
     assert!(fitted.covariance_matrix.is_some() && fitted.omega_iov.is_some());
-    let mut n = 0;
+    let (mut n, mut wrong_model) = (0, 0);
     for cell in shape_cells(&model.default_params) {
-        n += 1;
         let mut f = fitted.clone();
         f.omega = cell.params.omega.matrix.clone();
         f.omega_fixed = cell.params.omega_fixed.clone();
@@ -363,13 +363,36 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_block() {
         f.sigma_names = cell.params.sigma.names.clone();
         f.sigma_fixed = cell.params.sigma_fixed.clone();
         f.omega_iov = cell.params.omega_iov.as_ref().map(|m| m.matrix.clone());
-        let e = crate::run_sir(&f, Some(&model), Some(&pop), &opts).expect_err("run_sir");
-        assert_refused(&e, &cell, "run_sir");
-        let e =
-            crate::run_covariance(&f, Some(&model), Some(&pop), &opts).expect_err("run_covariance");
-        assert_refused(&e, &cell, "run_covariance");
+        // Each cell twice: EBEs of the model's width (a hand-edited Ω), and — where Ω's
+        // row count is not the model's — EBEs as wide as Ω, the fit of a different model.
+        // The second is the realistic wrong-model case, and it reaches the shape gate only
+        // if the gate runs before the uncoded `subjects[0].eta` check (PR #1843 review r1).
+        let rows = f.omega.nrows();
+        let mut variants = vec![f.clone()];
+        if rows != model.n_eta {
+            wrong_model += 1;
+            for s in &mut f.subjects {
+                s.eta = nalgebra::DVector::from_element(rows, 0.01);
+            }
+            variants.push(f);
+        }
+        for f in variants {
+            n += 1;
+            let e = crate::run_sir(&f, Some(&model), Some(&pop), &opts).expect_err("run_sir");
+            assert_refused(&e, &cell, "run_sir");
+            let e = crate::run_covariance(&f, Some(&model), Some(&pop), &opts)
+                .expect_err("run_covariance");
+            assert_refused(&e, &cell, "run_covariance");
+        }
     }
-    assert_eq!(n, 11, "σ short/long, four Ω cells and five Ω_IOV cells");
+    assert_eq!(
+        wrong_model, 3,
+        "Ω short, Ω long and Ω 2×1 carry EBEs as wide as Ω"
+    );
+    assert_eq!(
+        n, 14,
+        "11 cells (σ ×2, Ω ×4, Ω_IOV ×5) plus the three wrong-model fits"
+    );
 }
 
 /// `fitted_params_from_result` refuses a fit whose Ω, σ or Ω_IOV is not the model's
