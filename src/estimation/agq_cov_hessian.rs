@@ -1004,7 +1004,7 @@ pub(crate) fn fixed_b_natural_score(
     subject: &Subject,
     params: &ModelParameters,
     sens: &crate::sens::provider::SubjectSens,
-    prep: &crate::estimation::sens_outer_gradient::Prep,
+    prep: &crate::estimation::sens_outer_gradient::PointPrep,
     core: &crate::estimation::sens_outer_gradient::ScoreCore,
     b: &[f64],
 ) -> Vec<f64> {

@@ -30,7 +30,7 @@
 //! packed-space chain and M3 are layered on top in later units.
 #![allow(clippy::needless_range_loop)]
 
-use super::sens_outer_gradient::{mixed_eta_theta, subject_natural_gradient, Prep};
+use super::sens_outer_gradient::{mixed_eta_theta, subject_natural_gradient, PointPrep, Prep};
 use crate::estimation::parameterization::{theta_packs_log, unpack_params};
 use crate::estimation::sens_outer_gradient::prepare;
 use crate::sens::provider::{subject_sensitivities_cov, SubjectSens};
@@ -210,24 +210,13 @@ fn foce_tail_jet(y: f64, mu: f64, var: f64, cens: i8) -> TailJet {
     }
 }
 
-/// `M_θm = ∂²Φ/∂η∂θ_m` for every θ_m, and the paired `H⁻¹ M_θm`. The mixed term
-/// is exactly `mixed_eta_theta` (the inner Hessian's θ-derivative), reused so the
-/// θ EBE-response is identical to the gradient's `dη̂/dθ` denominator.
-fn theta_m_and_u(
-    prep: &Prep,
-    sens: &SubjectSens,
-    n_theta: usize,
-) -> (Vec<DVector<f64>>, Vec<DVector<f64>>) {
-    let n_eta = prep.n_eta;
-    let mut mvec = Vec::with_capacity(n_theta);
-    let mut uvec = Vec::with_capacity(n_theta);
-    for m in 0..n_theta {
-        let mm = mixed_eta_theta(&sens.obs, &prep.et, n_eta, prep.n_obs, m, prep.ruv);
-        let u = &prep.h_inner_inv * &mm;
-        mvec.push(mm);
-        uvec.push(u);
-    }
-    (mvec, uvec)
+/// `M_θm = ∂²Φ/∂η∂θ_m` for every θ_m. The mixed term is exactly `mixed_eta_theta` (the inner
+/// Hessian's θ-derivative), reused so the θ EBE-response is identical to the gradient's `dη̂/dθ`
+/// denominator. Takes a [`PointPrep`]: it needs no `H⁻¹`, so it is defined at a quadrature node.
+fn theta_m(prep: &PointPrep, sens: &SubjectSens, n_theta: usize) -> Vec<DVector<f64>> {
+    (0..n_theta)
+        .map(|m| mixed_eta_theta(&sens.obs, &prep.et, prep.n_eta, prep.n_obs, m, prep.ruv))
+        .collect()
 }
 
 /// The **θθ** explicit data-curvature `∂²Φ/∂θ_n∂θ_m|_η̂`, per subject:
@@ -236,7 +225,7 @@ fn theta_m_and_u(
 /// through `½α = ∂L/∂f`, `½α' = ∂²L/∂f²` (set in `prepare`). The full θθ block
 /// subtracts the EBE-response coupling `M_θnᵀ H⁻¹ M_θm` in the assembler below.
 fn theta_theta_explicit(
-    prep: &Prep,
+    prep: &PointPrep,
     sens: &SubjectSens,
     n_theta: usize,
     n: usize,
@@ -271,7 +260,7 @@ fn sigma_derivs(
     subject: &Subject,
     params: &ModelParameters,
     sens: &SubjectSens,
-    prep: &Prep,
+    prep: &PointPrep,
 ) -> SigmaDerivs {
     let n_eta = prep.n_eta;
     let sigma = &params.sigma.values;
@@ -436,7 +425,7 @@ fn e_matrix(r: usize, c: usize, n: usize) -> DMatrix<f64> {
 /// every occasion block; off-block zeroes never become artificial parameters.
 pub(crate) fn covariance_basis<'a>(
     params: &ModelParameters,
-    prep: &'a Prep,
+    prep: &'a PointPrep,
 ) -> std::borrow::Cow<'a, [DMatrix<f64>]> {
     match &prep.covariance_prior {
         Some(prior) => std::borrow::Cow::Borrowed(&prior.basis),
@@ -462,19 +451,27 @@ pub(crate) fn covariance_sensitivities(
     }
 }
 
-/// Joint eta/kappa preparation, without duplicating the shared IOV parameters.
-pub(crate) fn prepare_covariance(
+/// The IOV-stacked prior a covariance preparation runs on: the joint dimension, the joint prior
+/// precision, and the tied covariance directions.
+struct IovStack {
+    d: usize,
+    inv: DMatrix<f64>,
+    prior: crate::estimation::sens_outer_gradient::CovariancePrior,
+}
+
+/// The stacking [`prepare_covariance`] and [`prepare_covariance_point`] share: `None` declines,
+/// `Some(None)` is the plain no-IOV path, `Some(Some(_))` the joint η/κ one.
+fn iov_stack(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    sens: &SubjectSens,
     b: &[f64],
-) -> Option<Prep> {
+) -> Option<Option<IovStack>> {
     if model.n_kappa == 0 {
         if params.omega_iov.is_some() {
             return None;
         }
-        return prepare(model, subject, params, sens, b);
+        return Some(None);
     }
     let iov = params.omega_iov.as_ref()?;
     let (ne, nk) = (model.n_eta, model.n_kappa);
@@ -512,12 +509,63 @@ pub(crate) fn prepare_covariance(
         }
         basis.push(e);
     }
+    Some(Some(IovStack {
+        d,
+        inv,
+        prior: crate::estimation::sens_outer_gradient::CovariancePrior { matrix, basis },
+    }))
+}
+
+/// Joint eta/kappa preparation, without duplicating the shared IOV parameters.
+///
+/// Factors `H̃` and the exact `H`, so it is for the **mode** only; a quadrature node uses
+/// [`prepare_covariance_point`].
+pub(crate) fn prepare_covariance(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    b: &[f64],
+) -> Option<Prep> {
+    let Some(stack) = iov_stack(model, subject, params, b)? else {
+        return prepare(model, subject, params, sens, b);
+    };
     let mut prep = crate::estimation::sens_outer_gradient::prepare_stacked(
-        model, subject, params, sens, d, inv, b, None,
+        model, subject, params, sens, stack.d, stack.inv, b, None,
     )?;
-    prep.covariance_prior =
-        Some(crate::estimation::sens_outer_gradient::CovariancePrior { matrix, basis });
+    prep.point.covariance_prior = Some(stack.prior);
     Some(prep)
+}
+
+/// [`prepare_covariance`]'s point values at an arbitrary `b`, factoring nothing (#1844).
+///
+/// An AGQ quadrature node's exact `H_j` may be indefinite away from the mode; term (C)
+/// contracts it directly and never inverts it, so requiring it positive-definite here would
+/// decline a subject the assembly can serve. Only the mode needs `H⁻¹`.
+pub(crate) fn prepare_covariance_point(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    b: &[f64],
+) -> Option<PointPrep> {
+    use crate::estimation::sens_outer_gradient::prepare_point_stacked;
+    let Some(stack) = iov_stack(model, subject, params, b)? else {
+        return prepare_point_stacked(
+            model,
+            subject,
+            params,
+            sens,
+            model.n_eta,
+            params.omega.inv.clone(),
+            b,
+            model.residual_error_eta,
+        );
+    };
+    let mut point =
+        prepare_point_stacked(model, subject, params, sens, stack.d, stack.inv, b, None)?;
+    point.covariance_prior = Some(stack.prior);
+    Some(point)
 }
 
 /// FOCEI score in the same natural direction order as the Hessian: theta,
@@ -622,7 +670,7 @@ pub(crate) fn subject_cov_hessian_parts(
     subject: &Subject,
     params: &ModelParameters,
     sens: &SubjectSens,
-    prep: &Prep,
+    prep: &PointPrep,
     eta_hat: &[f64],
 ) -> CovHessianParts {
     let n_theta = params.theta.len();
@@ -637,7 +685,7 @@ pub(crate) fn subject_cov_hessian_parts(
     let z = omega_inv * DVector::from_column_slice(eta_hat);
 
     // Mode-coupling vectors M_ζ = ∂²Φ/∂η∂ζ for every natural parameter, in order.
-    let (m_theta, _) = theta_m_and_u(prep, sens, n_theta);
+    let m_theta = theta_m(prep, sens, n_theta);
     let sd = sigma_derivs(model, subject, params, sens, prep);
     let m_omega: Vec<DVector<f64>> = e_mats.iter().map(|e| -(omega_inv * (e * &z))).collect();
 
@@ -872,7 +920,7 @@ fn inner_eta_responses(
     let t_deta3 =
         |j: usize, r: usize, l: usize, m: usize| sens.obs[j].d3f_deta3[(r * ne + l) * ne + m];
 
-    let (m_theta, _) = theta_m_and_u(prep, sens, nt);
+    let m_theta = theta_m(prep, sens, nt);
     let sd = sigma_derivs(model, subject, params, sens, prep);
     let m_omega: Vec<DVector<f64>> = e_mats.iter().map(|e| -(omega_inv * (e * &z))).collect();
     let mut mall: Vec<DVector<f64>> = Vec::with_capacity(dim);
@@ -4312,12 +4360,6 @@ mod tests {
     }
 
     fn check_agq_cov_hessian_objective(model_text: &str, n_agq: usize, m3: bool) {
-        use crate::estimation::agq::{
-            agq_subject_objective, gauss_hermite, subject_grid_and_weights,
-        };
-        use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
-        use crate::estimation::parameterization::{pack_params, unpack_params};
-
         let mut model = parse_model_string(model_text).expect("parse");
         if m3 {
             model.bloq_method = BloqMethod::M3;
@@ -4330,30 +4372,48 @@ mod tests {
         }
         let mut params = model.default_params.clone();
         params.theta = theta;
+        agq_cov_hessian_objective_worst(&model, &subject, &params, n_agq, 1e-4);
+    }
+
+    /// The body of [`check_agq_cov_hessian_objective`] on a caller-built `(model, subject,
+    /// params)`: asserts every packed entry within `tol·scale` of the reconverged FD-of-objective
+    /// and returns the realised worst `|analytic − fd| / scale`, so a caller can record it.
+    fn agq_cov_hessian_objective_worst(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        n_agq: usize,
+        tol: f64,
+    ) -> f64 {
+        use crate::estimation::agq::{
+            agq_subject_objective, gauss_hermite, subject_grid_and_weights,
+        };
+        use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
+        use crate::estimation::parameterization::{pack_params, unpack_params};
+
         let template = params.clone();
-        let x = pack_params(&params);
+        let x = pack_params(params);
         let n = x.len();
 
         // Analytic, on the grid the objective evaluates.
-        let eta = precise_ebe(&model, &subject, &params);
+        let eta = precise_ebe(model, subject, params);
         let (nodes, weights) = gauss_hermite(n_agq);
-        let (grid, pi) =
-            subject_grid_and_weights(&model, &subject, &params, &eta, &nodes, &weights)
-                .expect("warfarin is in the Gauss-Newton anchor's scope");
+        let (grid, pi) = subject_grid_and_weights(model, subject, params, &eta, &nodes, &weights)
+            .expect("warfarin is in the Gauss-Newton anchor's scope");
         assert_eq!(
             grid.len(),
             n_agq.pow(model.n_eta as u32),
             "premise: the tensor grid really has more than one node"
         );
         let analytic =
-            subject_packed_agq_cov_hessian(&model, &subject, &template, &params, &eta, &grid, &pi)
+            subject_packed_agq_cov_hessian(model, subject, &template, params, &eta, &grid, &pi)
                 .expect("analytic AGQ covariance is in scope");
 
         // Oracle: F_i(x) with the mode reconverged at every perturbed point.
         let f = |xv: &[f64]| -> f64 {
             let q = unpack_params(xv, &template);
-            let e = precise_ebe(&model, &subject, &q);
-            agq_subject_objective(&model, &subject, &q, &e, n_agq)
+            let e = precise_ebe(model, subject, &q);
+            agq_subject_objective(model, subject, &q, &e, n_agq)
         };
         let f0 = f(&x);
         let step: Vec<f64> = x.iter().map(|v| 1e-4 * (1.0 + v.abs())).collect();
@@ -4365,6 +4425,7 @@ mod tests {
         };
 
         let scale = analytic.amax().max(1.0);
+        let mut worst = 0.0f64;
         for i in 0..n {
             for j in i..n {
                 let fd = if i == j {
@@ -4375,12 +4436,226 @@ mod tests {
                         / (4.0 * step[i] * step[j])
                 };
                 assert!(
-                    (analytic[(i, j)] - fd).abs() < 1e-4 * scale,
+                    (analytic[(i, j)] - fd).abs() < tol * scale,
                     "∂²F/∂x{i}∂x{j}: analytic {} vs FD-of-objective {fd}",
                     analytic[(i, j)]
                 );
+                // Finite by the assertion above (a NaN fails `<`), so the fold cannot hide one.
+                worst = worst.max((analytic[(i, j)] - fd).abs() / scale);
             }
         }
+        worst
+    }
+
+    /// The #1844 fixture: an AGQ grid with a quadrature node whose **exact** `H_j` is indefinite
+    /// at a positive weight, around a mode whose `H` is positive-definite.
+    ///
+    /// Plain [`WARFARIN`] with every `Ω` entry ×3, on [`check_agq_cov_hessian_objective`]'s
+    /// sparse design, at `n_agq = 3`. Found by a scan over Ω×{1,3,10} × DV-scale × sparse/dense
+    /// × `n_agq` ∈ {3,5} at `160cc9a3`: **Ω×1 has no indefinite node at `n_agq = 3`**, which is
+    /// why every existing AGQ parity fixture passed while the population fit declined 14/30.
+    /// Here 4 of the 27 nodes are indefinite, the heaviest at `π = 6.46e-2`, worst
+    /// `λ_min(H_j) = −0.678`.
+    ///
+    /// Returns `(model, subject, params, η̂, grid, π, j*, b_{j*})`, with `j*` the most indefinite
+    /// node of positive weight.
+    #[allow(clippy::type_complexity)]
+    fn indefinite_node_fixture() -> (
+        CompiledModel,
+        Subject,
+        ModelParameters,
+        Vec<f64>,
+        Vec<Vec<f64>>,
+        Vec<f64>,
+        usize,
+        Vec<f64>,
+    ) {
+        use crate::estimation::agq::{gauss_hermite, subject_grid_and_weights};
+        use crate::estimation::agq_cov_hessian::prepare_mode;
+        use std::f64::consts::SQRT_2;
+
+        let text = WARFARIN
+            .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.27")
+            .replace("omega ETA_V  ~ 0.04", "omega ETA_V  ~ 0.12")
+            .replace("omega ETA_KA ~ 0.30", "omega ETA_KA ~ 0.90");
+        let model = parse_model_string(&text).expect("parse");
+        let om = &model.default_params.omega.matrix;
+        assert!(
+            (om[(0, 0)] - 0.27).abs() < 1e-12
+                && (om[(1, 1)] - 0.12).abs() < 1e-12
+                && (om[(2, 2)] - 0.90).abs() < 1e-12,
+            "premise: every Ω entry was scaled ×3"
+        );
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 2.0, 8.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+
+        let eta = precise_ebe(&model, &subject, &params);
+        let (nodes, weights) = gauss_hermite(3);
+        let (grid, pi) =
+            subject_grid_and_weights(&model, &subject, &params, &eta, &nodes, &weights)
+                .expect("in the anchor's scope");
+        let (_, _, anchor) = prepare_mode(&model, &subject, &params, &eta)
+            .expect("premise: the mode prepares, i.e. its exact H is positive-definite");
+        let scale = anchor.node_scale();
+        let mut best: Option<(usize, f64, Vec<f64>)> = None;
+        for (j, z) in grid.iter().enumerate() {
+            if pi[j] == 0.0 {
+                continue;
+            }
+            let b: Vec<f64> = (DVector::from_column_slice(&eta)
+                + SQRT_2 * (&scale * DVector::from_column_slice(z)))
+            .iter()
+            .copied()
+            .collect();
+            let e = exact_inner_hessian(&model, &subject, &params, &b)
+                .symmetric_eigen()
+                .eigenvalues
+                .min();
+            if best.as_ref().is_none_or(|(_, m, _)| e < *m) {
+                best = Some((j, e, b));
+            }
+        }
+        let (j_star, min_eig, b_star) = best.expect("a weighted node");
+        assert!(
+            min_eig < 0.0,
+            "premise: some weighted node's exact H is indefinite; most negative λ_min = {min_eig}"
+        );
+        (model, subject, params, eta, grid, pi, j_star, b_star)
+    }
+
+    /// The exact conditional Hessian `H = ∂²nll/∂b²` at `b`, straight from `score_core` — no
+    /// factorisation, so it is defined wherever the provider is.
+    fn exact_inner_hessian(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        b: &[f64],
+    ) -> DMatrix<f64> {
+        let sens = covariance_sensitivities(model, subject, &params.theta, b).expect("in scope");
+        crate::estimation::sens_outer_gradient::score_core(
+            model,
+            subject,
+            params,
+            &sens,
+            model.n_eta,
+            &params.omega.inv,
+            b,
+            model.residual_error_eta,
+        )
+        .expect("score core")
+        .h_inner
+    }
+
+    /// **#1844, T1.** `node_jet` serves a quadrature node whose exact `H_j` is indefinite.
+    ///
+    /// Term (C) contracts `H_j` as `β_lᵀH_jβ_k` and never inverts it, so the node needs no
+    /// positive-definiteness; before the fix `node_jet` ran the mode's full preparation, whose
+    /// Cholesky of `H` declined here and sent the whole subject to the FD salvage.
+    ///
+    /// The straddle is asserted, not assumed: the same `H` builder factors at the mode and fails
+    /// at `b_{j*}`, so the fixture cannot quietly drift to a PD node and test nothing. `π_{j*} > 0`
+    /// because a zero-weight node is skipped before `node_jet` is reached.
+    ///
+    /// Regression caught: `node_jet` back on `prepare_covariance` → `None` here.
+    #[test]
+    fn node_jet_serves_an_indefinite_quadrature_node() {
+        use crate::estimation::agq_cov_hessian::node_jet;
+
+        let (model, subject, params, eta, _grid, pi, j_star, b_star) = indefinite_node_fixture();
+        assert!(pi[j_star] > 0.0, "premise: node {j_star} carries weight");
+        assert!(
+            exact_inner_hessian(&model, &subject, &params, &eta)
+                .cholesky()
+                .is_some(),
+            "straddle: the mode's exact H factors"
+        );
+        assert!(
+            exact_inner_hessian(&model, &subject, &params, &b_star)
+                .cholesky()
+                .is_none(),
+            "straddle: node {j_star}'s exact H does not"
+        );
+
+        let jet = node_jet(
+            &model,
+            &subject,
+            &params,
+            &b_star,
+            &mut Vec::new(),
+            &mut DVector::zeros(model.n_eta),
+            &mut DVector::zeros(model.n_eta),
+        )
+        .expect("a quadrature node needs no positive-definite H");
+        let lmin = jet.h.clone().symmetric_eigen().eigenvalues.min();
+        assert!(
+            lmin < 0.0,
+            "the jet carries the exact, indefinite H_j (λ_min = {lmin}), not a regularised one"
+        );
+        assert!(jet.s.iter().all(|v| v.is_finite()));
+        assert!(jet.parts.c.iter().all(|v| v.is_finite()));
+    }
+
+    /// **#1844, T2.** On the indefinite-node fixture the packed AGQ covariance Hessian matches the
+    /// reconverged second difference of the AGQ objective.
+    ///
+    /// T1 shows the node is served; this shows it is served *correctly*, i.e. that contracting an
+    /// indefinite `H_j` is the right curvature and not merely a finite one. Same oracle as
+    /// `agq_cov_hessian_matches_fd_of_the_agq_objective_at_three_nodes`, whose Ω×1 fixture has no
+    /// indefinite node and so never reached this path.
+    ///
+    /// Regressions caught: `node_jet` back on `prepare_covariance` (the `expect` panics), and
+    /// term (C) contracting the anchor `H̃_j` instead of `H_j`.
+    #[test]
+    fn agq_cov_hessian_matches_fd_at_an_indefinite_quadrature_node() {
+        let (model, subject, params, ..) = indefinite_node_fixture();
+        let worst = agq_cov_hessian_objective_worst(&model, &subject, &params, 3, 1e-4);
+        eprintln!("#1844 T2 realised worst |analytic − fd| / scale = {worst:.3e}");
+    }
+
+    /// **#1844, T3.** The mode keeps its requirement: the very `b` T1 serves as a node is refused
+    /// as a mode.
+    ///
+    /// `b̂_ζ = −H⁻¹M_ζ` needs `H` positive-definite at the mode, so the fix must not leak into
+    /// `prepare_mode`. Every *other* reason to decline is ruled out first — `H̃` factors and the
+    /// anchor is well-conditioned at `b_{j*}` — so `None` can only be the exact-`H` gate.
+    ///
+    /// Regression caught: `prepare_mode` relaxed to the point preparation (or
+    /// `invert_inner_hessian` relaxed past its Cholesky) → `Some` here.
+    #[test]
+    fn an_indefinite_node_is_still_refused_as_the_mode() {
+        use crate::estimation::agq_cov_hessian::{regularised_anchor, subject_agq_cov_hessian};
+
+        let (model, subject, params, _eta, grid, pi, _j, b_star) = indefinite_node_fixture();
+        let sens = covariance_sensitivities(&model, &subject, &params.theta, &b_star).unwrap();
+        let core = crate::estimation::sens_outer_gradient::score_core(
+            &model,
+            &subject,
+            &params,
+            &sens,
+            model.n_eta,
+            &params.omega.inv,
+            &b_star,
+            model.residual_error_eta,
+        )
+        .unwrap();
+        assert!(
+            core.h_inner.clone().cholesky().is_none(),
+            "premise: H indefinite at b"
+        );
+        assert!(
+            core.htilde.clone().cholesky().is_some(),
+            "premise: H̃ factors at b"
+        );
+        assert!(
+            regularised_anchor(&core.htilde).is_some_and(|a| a.is_well_conditioned()),
+            "premise: the anchor at b passes the conditioning screen"
+        );
+        assert!(
+            subject_agq_cov_hessian(&model, &subject, &params, &b_star, &grid, &pi).is_none(),
+            "a mode with an indefinite exact H must decline to the FD salvage"
+        );
     }
 
     /// Block-Ω (correlated CL/V): exercises the off-diagonal ΩΩ curvature and the
