@@ -316,12 +316,26 @@ let sims = simulate_with_uncertainty(
 `simulate_with_uncertainty_diag()` takes the same arguments and returns a
 `SimulationOutput { results, warnings }`. `results` holds exactly the rows
 `simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same
-bundle `simulate_with_options_diag()` reports, plus a line for every parameter
-draw skipped in the flip-flop regime. Data-reader warnings reach it through the
+bundle `simulate_with_options_diag()` reports, plus one
+`W_UNCERTAINTY_DRAWS_SKIPPED` warning when draws were skipped in the flip-flop
+regime (below). Data-reader warnings reach it through the
 same filter `fit()` uses. So a caller that relays them should take them from
 here, not from `Population::warnings`, which still holds the ones the filter
 withholds (`W_NO_DOSES` on a compartment-free model, for example). See
 [Which entry points report warnings](../warnings.qmd#entry-points).
+
+#### Draws in the flip-flop regime
+
+A twin-less transit or inverse-Gaussian closed form (one carrying a user
+`[odes]` / `[scaling]` / `[initial_conditions]` block) has no solution where
+elimination is at least as fast as absorption. A draw that lands there is
+skipped, and the run reports one `W_UNCERTAINTY_DRAWS_SKIPPED` warning with the
+count and the draw indices. The rest of the draws are a truncated sample of the
+uncertainty distribution, so the interval they give is biased toward slower
+elimination. A point estimate already in that regime is refused with
+`E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`), as `simulate()` refuses it, and so is
+a run in which every draw is skipped. Writing the model as an explicit ODE
+`transit()` / `igd()` model avoids the skip altogether.
 
 ## Result Types
 

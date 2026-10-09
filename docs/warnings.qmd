@@ -44,7 +44,7 @@ for an `AMT` column with dose rows) does not apply.
 | `ferx check` | the check report | everything below except the solver diagnostics (nothing has been integrated yet), plus the option warnings |
 | `predict_diag()` | `PredictionOutput::warnings` | the non-fit bundle (below) |
 | `simulate_with_options_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics |
-| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus each parameter draw skipped in the flip-flop regime |
+| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus one `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every parameter draw skipped in the flip-flop regime |
 | `simulate_adaptive()` | `AdaptiveSimulationResult::warnings` | the non-fit bundle, except `W_NO_DOSES` |
 | `predict()`, `simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` | — | nothing; each is a thin wrapper over its `_diag` form above |
 | `predict_survival()`, `predict_categorical()` | — | nothing yet |
@@ -73,7 +73,7 @@ the same list on each:
 | `fit()`, `ferx check` | every item below that is about the model or the data. **Not** the simulate-only ones (TTE simulatable, Ω~IOV~ in the supplied parameters, `horizon`), and **not** the CTMM ones: `fit()` *supports* a `[markov_model]` endpoint — it is prediction and simulation that have no CTMM path yet. |
 | `predict_diag()` | coded `RATE`, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, `[covariate_model]` bound, covariate levels, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
 | `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
-| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights); then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
+| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), flip-flop without an ODE twin at the point estimate; then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
 | `predict_survival()` | time-varying covariate on a hazard, θ levels bound, θ length, population bound for the θ levels, covariates present, dose compartment, covariate levels |
 | `predict_categorical()` | time-varying covariate on the linear predictor, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, covariate levels |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
@@ -101,9 +101,17 @@ that wording is gone.
 #### A skipped draw is not a refusal
 
 One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
-*draw* that lands in a twin-less transit model's flip-flop regime is skipped and
-the run continues. The point estimate was in-domain; one draw out of it is not a
-reason to lose the others.
+*draw* that lands in a twin-less transit or IG model's flip-flop regime is
+skipped and the run continues. The point estimate is checked first and refused
+with the same code `simulate()` gives, so the skip only ever drops draws around
+an in-domain estimate. A run in which **every** draw is skipped is refused as
+well, with `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`).
+
+Otherwise the skips are reported as one `uncertainty_draws_skipped` warning: how
+many of the requested draws were dropped, and which. The dropped draws are not a
+random subset — they are the tail in which elimination is at least as fast as
+absorption — so intervals built from the rest are biased, not just wider. An
+explicit ODE `transit()` / `igd()` model simulates every draw.
 
 #### Matching on the code {#entry-point-error-codes}
 
@@ -302,6 +310,7 @@ a code never moves between groups in a way that changes its `category` string.
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
 | `flip_flop` | Warning | A transit / inverse-Gaussian absorption closed form entered the flip-flop regime (disposition rate ≥ the tilting abscissa). Either auto-rerouted to the ODE twin (informational) or — for a twin-less model at a subject's fitted EBE (#785) — a silently degenerate likelihood contribution. | Rewrite as an explicit ODE `transit()`/`igd()` model (which reroutes per subject), or check the named subject's MTT/CL (transit) or MAT/CV²/CL (IG) estimates. |
+| `uncertainty_draws_skipped` | Warning | `simulate_with_uncertainty_diag()` skipped some parameter draws because they fell in the flip-flop regime of a twin-less transit / inverse-Gaussian closed form (#1485). One warning per run, with the count and the 1-based draw indices. The surviving draws are a truncated sample, so intervals built from them are biased. | Rewrite as an explicit ODE `transit()`/`igd()` model, which simulates every draw; otherwise treat the interval as one-sided. |
 | `absorption_twin_declined` | Warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model keeps no ODE fallback (#1008). The fit itself is an ordinary closed-form fit; what is lost is the reroute, so a subject needing it (time-varying covariates, a `TIME`-dependent parameter, IOV, SS / infusion doses, the flip-flop regime) is rejected with an explicit error. | Read the quoted reason — usually an individual parameter named after a twin state (`CENTRAL`, `PERIPH`); rename it to restore the twin. |
 
 ### Solver, numerics, and unclassified {#codes-solver}
