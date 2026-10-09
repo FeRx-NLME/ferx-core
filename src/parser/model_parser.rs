@@ -4940,10 +4940,13 @@ pub fn parse_full_model_with(
         }
     }
 
-    // Mirror fit-level BLOQ method onto the compiled model so the likelihood
-    // functions can branch without threading bloq_method through every call.
+    // The file's `bloq_method` is also the model's own (#1824): a caller that parses this file
+    // and fits it with options that set no override scores it under the file's method. The
+    // options keep `Some` too, so a file entry point passing them on states it explicitly.
     let mut model = model;
-    model.bloq_method = fit_options.bloq_method;
+    if let Some(bloq) = fit_options.bloq_method {
+        model.bloq_method = bloq;
+    }
     // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
     // `[data] path` above, only the raw value is read here;
     // `parse_full_model_file` resolves it relative to the model file's directory
@@ -10282,8 +10285,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
-                "m3" => BloqMethod::M3,
-                "drop" | "none" | "ignore" => BloqMethod::Drop,
+                "m3" => Some(BloqMethod::M3),
+                "drop" | "none" | "ignore" => Some(BloqMethod::Drop),
                 other => {
                     return Err(format!(
                         "fit option `bloq_method`: unknown value `{other}` — expected 'm3' or 'drop'"

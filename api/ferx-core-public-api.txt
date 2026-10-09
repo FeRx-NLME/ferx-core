@@ -2914,7 +2914,7 @@ pub ferx_core::types::FitOptions::bayes_iters: usize
 pub ferx_core::types::FitOptions::bayes_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::bayes_thin: usize
 pub ferx_core::types::FitOptions::bayes_warmup: usize
-pub ferx_core::types::FitOptions::bloq_method: ferx_core::BloqMethod
+pub ferx_core::types::FitOptions::bloq_method: core::option::Option<ferx_core::BloqMethod>
 pub ferx_core::types::FitOptions::cancel: core::option::Option<ferx_core::cancel::CancelFlag>
 pub ferx_core::types::FitOptions::checkpoint: bool
 pub ferx_core::types::FitOptions::checkpoint_data_hash: core::option::Option<alloc::string::String>
@@ -4401,7 +4401,7 @@ pub ferx_core::FitOptions::bayes_iters: usize
 pub ferx_core::FitOptions::bayes_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::bayes_thin: usize
 pub ferx_core::FitOptions::bayes_warmup: usize
-pub ferx_core::FitOptions::bloq_method: ferx_core::BloqMethod
+pub ferx_core::FitOptions::bloq_method: core::option::Option<ferx_core::BloqMethod>
 pub ferx_core::FitOptions::cancel: core::option::Option<ferx_core::cancel::CancelFlag>
 pub ferx_core::FitOptions::checkpoint: bool
 pub ferx_core::FitOptions::checkpoint_data_hash: core::option::Option<alloc::string::String>

@@ -121,7 +121,7 @@ fn observation_err_d2(
     let f = sens.obs[j].f;
     let y = subject.observations[j];
     let cens = subject.cens.get(j).copied().unwrap_or(0);
-    if model.bloq_method != crate::types::BloqMethod::M3 || cens == 0 {
+    if model.bloq_in_force() != crate::types::BloqMethod::M3 || cens == 0 {
         return err_d2(
             model.error_spec.variance_at(cmt, f, sigma),
             model.error_spec.dvar_df(cmt, f, sigma),
@@ -174,7 +174,7 @@ fn observation_data_loss(
     let y = subject.observations[j];
     let r = model.error_spec.variance_at(cmt, f, sigma);
     let cens = subject.cens.get(j).copied().unwrap_or(0);
-    if model.bloq_method == crate::types::BloqMethod::M3 && cens != 0 {
+    if model.bloq_in_force() == crate::types::BloqMethod::M3 && cens != 0 {
         -crate::stats::likelihood::m3_logcdf(y, f, r.sqrt(), cens)
     } else {
         0.5 * ((y - f).powi(2) / r + r.ln())
@@ -304,7 +304,7 @@ fn sigma_derivs(
                 - model.error_spec.dvar_df(cmt, f, &sm))
                 / (2.0 * hk);
             // ∂α/∂σ_k = [2ε/R² + d(2ε²−R)/R³] R_k + [(R−ε²)/R²] d_k.
-            let cens = model.bloq_method == crate::types::BloqMethod::M3
+            let cens = model.bloq_in_force() == crate::types::BloqMethod::M3
                 && subject.cens.get(j).copied().unwrap_or(0) != 0;
             let da = if cens {
                 (observation_err_d2(model, subject, sens, &sp, j).alpha
@@ -352,7 +352,7 @@ fn sigma_derivs(
         }
     }
     for j in 0..n_obs {
-        let cens = model.bloq_method == crate::types::BloqMethod::M3
+        let cens = model.bloq_in_force() == crate::types::BloqMethod::M3
             && subject.cens.get(j).copied().unwrap_or(0) != 0;
         for k in 0..n_sigma {
             for l in k..n_sigma {
@@ -1209,13 +1209,21 @@ pub(crate) fn subject_anchor_derivatives(
     }
 
     // ∂H̃/∂(dir d): Σ_j[ pa a aᵀ + p(av aᵀ + a avᵀ) ]  (+ Ω part for Ω directions).
+    //
+    // `first` and `second` build only the lower triangle and mirror it, so `dh`/`d2h` are
+    // **bitwise** symmetric (#1821). The formulas are symmetric on paper, but `pp·a_r·a_c`
+    // rounds as `(pp·a_r)·a_c`, so `(r,c)` and `(c,r)` differ by an ulp of the summands — and in
+    // the σ directions (summands ~1e9 at σ² = 4e-4, cancelling to an `S_kl` of ~1e2) that ulp
+    // reaches 1e-9 of `‖S_kl‖` and trips `factor_second_derivative`'s symmetry assert. Every
+    // downstream consumer (`total_first`/`total_second`, `propagate`) combines these with scalar
+    // weights only, so exact symmetry here is exact symmetry of `S_k`/`S_kl`.
     let first = |d: usize| -> DMatrix<f64> {
         let mut m = DMatrix::zeros(ne, ne);
         for j in 0..n_obs {
             let aj = &a[j];
             let avj = &av[d][j];
             for r in 0..ne {
-                for c in 0..ne {
+                for c in 0..=r {
                     m[(r, c)] +=
                         pa[d][j] * aj[r] * aj[c] + p[j] * (avj[r] * aj[c] + aj[r] * avj[c]);
                 }
@@ -1224,6 +1232,7 @@ pub(crate) fn subject_anchor_derivatives(
         if let Dir::Omega(e) = dir_of(d) {
             m -= omega_inv * &e_mats[e] * omega_inv;
         }
+        m.fill_upper_triangle_with_lower_triangle();
         m
     };
     let dh: Vec<DMatrix<f64>> = (0..nd).map(first).collect();
@@ -1284,7 +1293,7 @@ pub(crate) fn subject_anchor_derivatives(
             let avt = &av[t][j];
             let (pp, aa) = pp_aa(s, t, j);
             for r in 0..ne {
-                for c in 0..ne {
+                for c in 0..=r {
                     m[(r, c)] += pp * aj[r] * aj[c]
                         + pa[s][j] * (avt[r] * aj[c] + aj[r] * avt[c])
                         + pa[t][j] * (avs[r] * aj[c] + aj[r] * avs[c])
@@ -1299,6 +1308,7 @@ pub(crate) fn subject_anchor_derivatives(
             let inner = ee * omega_inv * ef + ef * omega_inv * ee;
             m += omega_inv * inner * omega_inv;
         }
+        m.fill_upper_triangle_with_lower_triangle();
         m
     };
 
@@ -1444,7 +1454,8 @@ fn foce_sb_fixed_natural(
     let nt = params.theta.len();
     let n_obs = subject.observations.len();
     // No-BLOQ scope: all observation rows are quantified.
-    if model.bloq_method == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0) {
+    if model.bloq_in_force() == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0)
+    {
         return None;
     }
     let nq = n_obs;
@@ -1677,7 +1688,7 @@ fn subject_cov_hessian_foce_natural(
     let nq = subject.observations.len();
     let is_cens: Vec<bool> = (0..nq)
         .map(|i| {
-            model.bloq_method == crate::types::BloqMethod::M3
+            model.bloq_in_force() == crate::types::BloqMethod::M3
                 && subject.cens.get(i).copied().unwrap_or(0) != 0
         })
         .collect();
@@ -4309,6 +4320,95 @@ mod tests {
             )
             .replace("proportional(PROP_ERR)", "combined(PROP_ERR, ADD_ERR)");
         check_agq_cov_hessian_objective(&model, 5, false);
+    }
+
+    /// `WARFARIN` at warfarin.ferx's residual size, σ = 0.02 sd (σ² = 4e-4) — 100× smaller than
+    /// the harness default. That is the regime of #1821: `p ∝ 1/σ²` puts the σ-direction
+    /// summands of `∂²H̃` near 1e9 while `S_kl` cancels to ~1e2.
+    fn warfarin_small_sigma() -> String {
+        let model = WARFARIN.replace("sigma PROP_ERR ~ 0.04", "sigma PROP_ERR ~ 4e-4");
+        assert_ne!(model, WARFARIN);
+        model
+    }
+
+    /// The FD-of-objective parity of the AGQ covariance Hessian in the small-σ regime where
+    /// #1821's cancellation lives: making `dh`/`d2h` exactly symmetric must not move the
+    /// derivative. Measured analytic-vs-FD at 7.8e-9 (3 nodes) / 8.6e-9 (5 nodes) of the
+    /// Hessian's max on `160cc9a3`, against the harness's `1e-4`.
+    #[test]
+    fn agq_cov_hessian_matches_fd_with_small_sigma_three_nodes() {
+        check_agq_cov_hessian_objective(&warfarin_small_sigma(), 3, false);
+    }
+
+    #[test]
+    fn agq_cov_hessian_matches_fd_with_small_sigma_five_nodes() {
+        check_agq_cov_hessian_objective(&warfarin_small_sigma(), 5, false);
+    }
+
+    /// #1821: every `∂H̃/∂s`, `∂²H̃/∂s∂t`, and the mode-chained totals that `propagate` turns
+    /// into AGQ's `S_k` / `S_kl`, is **bitwise** symmetric — not merely to a tolerance.
+    /// `factor_derivative` / `factor_second_derivative` debug-assert symmetry against
+    /// `1e-10·‖S‖`, which an ulp of 1e9 summands cancelling to ~1e2 exceeds; exact symmetry is
+    /// what makes that assert mean "a structural defect" again.
+    ///
+    /// On `160cc9a3` (before the fix) the σ² = 4e-4 subject has 24 asymmetric `d2h` and 49
+    /// asymmetric `total_second` (plan measurement). The block-Ω case is the only one reaching an
+    /// off-diagonal `Ω⁻¹` product, so it is what sees the Ω terms' own rounding.
+    #[test]
+    fn anchor_derivatives_are_exactly_symmetric() {
+        use crate::estimation::agq_cov_hessian::prepare_mode;
+        let block = warfarin_small_sigma().replace(
+            "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+        );
+        assert!(block.contains("block_omega"), "premise: block-Ω fixture");
+        let cases = [
+            ("sigma2=0.04", WARFARIN.to_string()),
+            ("sigma2=4e-4", warfarin_small_sigma()),
+            ("block omega, sigma2=4e-4", block),
+        ];
+        for (label, text) in cases {
+            let model = parse_model_string(&text).expect("parse");
+            let theta = vec![0.2, 10.0, 1.5];
+            let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+            let mut params = model.default_params.clone();
+            params.theta = theta;
+            let eta = precise_ebe(&model, &subject, &params);
+            let (sens, prep, _) = prepare_mode(&model, &subject, &params, &eta)
+                .expect("warfarin is in the analytic AGQ covariance scope");
+            let ad = subject_anchor_derivatives(&model, &subject, &params, &sens, &prep, &eta);
+            let nd = ad.dh.len();
+            assert_eq!(nd, ad.dim + ad.n_eta, "{label}: one dh per direction");
+
+            let mut bad: Vec<String> = Vec::new();
+            let mut check = |what: String, m: &DMatrix<f64>| {
+                assert!(
+                    m.iter().all(|v| v.is_finite()),
+                    "{label}: {what} is not finite"
+                );
+                if m != &m.transpose() {
+                    let worst = (m - m.transpose()).amax();
+                    bad.push(format!("{what} (|M − Mᵀ| = {worst:e})"));
+                }
+            };
+            for s in 0..nd {
+                check(format!("dh[{s}]"), &ad.dh[s]);
+                for t in 0..nd {
+                    check(format!("d2h[{s}][{t}]"), &ad.d2h[s][t]);
+                }
+            }
+            for z in 0..ad.dim {
+                check(format!("total_first({z})"), &ad.total_first(z));
+                for x in 0..ad.dim {
+                    check(format!("total_second({z},{x})"), &ad.total_second(z, x));
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "{label}: {} matrices are not bitwise symmetric: {bad:?}",
+                bad.len()
+            );
+        }
     }
 
     fn check_agq_cov_hessian_objective(model_text: &str, n_agq: usize, m3: bool) {

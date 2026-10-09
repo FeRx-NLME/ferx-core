@@ -188,7 +188,7 @@ pub(crate) fn subject_h_inner_dx(
     }
     // The `−logΦ(z)` censored kernel has its own `q`/`w` chain (`2·g1`, `2·g2`); `err_terms`
     // below would silently score such a row as if it were quantified.
-    if matches!(model.bloq_method, BloqMethod::M3) && subject.cens.iter().any(|&c| c != 0) {
+    if matches!(model.bloq_in_force(), BloqMethod::M3) && subject.cens.iter().any(|&c| c != 0) {
         return None;
     }
 

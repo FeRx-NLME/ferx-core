@@ -850,7 +850,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
         model.residual_var_scale(eta)
     };
     let mut data_ll = 0.0;
-    let has_censored_m3 = model.bloq_method.has_censored_row(&subject.cens);
+    let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
@@ -909,7 +909,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if model.bloq_method.is_censored_row(cens) {
+            if model.bloq_in_force().is_censored_row(cens) {
                 data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
             } else {
                 let resid = y - f_pred;
@@ -1125,7 +1125,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     eta: &[f64],
     semantics: PredNllSemantics,
 ) -> f64 {
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let m3 = matches!(model.bloq_in_force(), BloqMethod::M3);
     // FREM covariate rows use EPSCOV, not the PK residual error (see
     // build_frem_r_override); FREM covariate rows are never BLOQ.
     let frem_ov =
@@ -1222,7 +1222,7 @@ fn obs_nll_subject_from_preds_with_semantics(
                 }
             };
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if model.bloq_method.is_censored_row(cens) {
+            if model.bloq_in_force().is_censored_row(cens) {
                 nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
@@ -1537,7 +1537,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            model.bloq_method,
+            model.bloq_in_force(),
             &p_obs,
             tte_nll_at_mode,
             tte_h,
@@ -1578,7 +1578,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                model.bloq_method,
+                model.bloq_in_force(),
                 &p_obs,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
@@ -1617,7 +1617,7 @@ pub fn foce_subject_nll(
             sigma_values,
             &model.error_spec,
             residual_correlations,
-            model.bloq_method,
+            model.bloq_in_force(),
             &p_obs,
             frem_r_override.as_deref(),
             pop_preds.as_deref(),
@@ -2509,7 +2509,7 @@ pub fn foce_subject_nll_iov(
             &sigma_b,
             sigma_values,
             &model.error_spec,
-            model.bloq_method,
+            model.bloq_in_force(),
             &p_obs_iov,
             None, // IOV + FREM unsupported (guarded above)
             model.residual_error_eta,
@@ -2534,7 +2534,7 @@ pub fn foce_subject_nll_iov(
             // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
             // practice and the estimated-ρ threading (#847) never reaches here.
             &model.residual_correlations,
-            model.bloq_method,
+            model.bloq_in_force(),
             &p_obs_iov,
             None,
             pop_preds.as_deref(),
@@ -3071,7 +3071,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
             }
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if model.bloq_method.is_censored_row(cens) {
+        if model.bloq_in_force().is_censored_row(cens) {
             data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
         } else {
             let resid = y - f_pred;

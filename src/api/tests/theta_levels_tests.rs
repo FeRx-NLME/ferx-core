@@ -8283,6 +8283,178 @@ mod no_gaussian_subjects {
         bind_from_fit(&mut parsed, &c4, &mut pop, &fitted_c4).expect("C4 binds");
         assert_eq!(index(&pop, "97"), Some(1.0));
     }
+
+    /// Fixture F with the hazard `H0 = h0`, and `extra` θ lines after `TVH0` (#1822).
+    fn gated(h0: &str, extra: &str) -> String {
+        let tvh0 = format!("  theta TVH0({TVH0}, 1e-5, 10.0)\n");
+        let text = model_f(true)
+            .replace("H0 = TVH0 * exp(PLACEBO)", &format!("H0 = {h0}"))
+            .replace(&tvh0, &format!("{tvh0}{extra}"));
+        assert!(text.contains(h0) && text.contains(extra), "{text}");
+        text
+    }
+
+    const GATE_OPEN_AT_JITTER: &str = "  theta GATE(0.0, -10.0, 10.0)\n";
+
+    /// `text` refuses TTE-only subject 97 at `STUDY=4` on all three binders that read
+    /// a level table: `bind_theta_levels`, `bind_from_fit` and the fit data's re-read.
+    fn refused_everywhere(text: &str) {
+        let data = csv(&[(97, 4)], &|_| true);
+        let mut parsed = parse_full_model(text).unwrap();
+        let mut pop = read(&parsed.model, &data);
+        let e = bind_theta_levels(&mut parsed, text, &mut pop).expect_err("bind_theta_levels");
+        assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
+        has(&e.to_string(), &[WHO]);
+
+        let fit = bound(text, &csv(&[(98, 1)], &|_| true)).unwrap().0;
+        let design = csv(&[(97, 4)], &|i| i == 1);
+        let mut parsed = parse_full_model(text).unwrap();
+        let mut pop = read(&parsed.model, &design);
+        let e = bind_from_fit(&mut parsed, text, &mut pop, fit.model.data_bindings())
+            .expect_err("bind_from_fit");
+        assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
+        has(&e.to_string(), &[WHO]);
+
+        let mut reread = read(&fit.model, &design);
+        let d =
+            write_fitted_level_columns(&fit.model, &mut reread, &fit.model.data_bindings().levels)
+                .expect_err("write_fitted_level_columns");
+        assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
+        has(&d.message, &[WHO]);
+    }
+
+    /// #1822 T1. `H0 = TVH0·exp(PLACEBO·GATE)` with `GATE` initialised at 0: at the
+    /// initial θ the hazard ignores the block, so a one-point measurement bound 97 at
+    /// index 1. Refused on every binder. The straddle: the same expression with `GATE`
+    /// fixed at 0 never reads the block, and binds.
+    ///
+    /// Mutations — measure at the θ₀ point only (`main`): P1 binds. Do not jitter the
+    /// second point's base (move only the block, η = 0.05): P1 binds.
+    #[test]
+    fn a_theta_gated_read_is_refused() {
+        refused_everywhere(&gated("TVH0 * exp(PLACEBO * GATE)", GATE_OPEN_AT_JITTER));
+        let fixed = gated(
+            "TVH0 * exp(PLACEBO * GATE)",
+            "  theta GATE(0.0, -10.0, 10.0, FIX)\n",
+        );
+        let (_, pop) = bound(&fixed, &csv(&[(97, 4)], &|_| true)).expect("a closed gate binds");
+        assert_eq!(index(&pop, "97"), Some(1.0));
+    }
+
+    /// #1822 T2. `H0 = TVH0·exp(PLACEBO·ETA_CL)`: at η = 0 the hazard ignores the block,
+    /// whatever θ. Refused. The straddle, on subject 99 (`STUDY=3`, bindable): its
+    /// `individual_nll` at η = 0 is bitwise unchanged when `PLACEBO[STUDY=3]` moves
+    /// 0 → 1, so the gate is closed at the first point, and changes at η = 0.05.
+    ///
+    /// Mutation — η = 0 at the jittered point: P2 binds (only this test dies).
+    #[test]
+    fn an_eta_gated_read_is_refused() {
+        let text = gated("TVH0 * exp(PLACEBO * ETA_CL)", "");
+        refused_everywhere(&text);
+
+        let (parsed, pop) = bound(&text, &csv(&[(99, 3)], &|_| true)).unwrap();
+        let model = &parsed.model;
+        let (p0, p1) = (model.default_params.clone(), params(model));
+        let nll_at = |p: &crate::types::ModelParameters, re: f64| {
+            let v = individual_nll(
+                model,
+                subject(&pop, "99"),
+                &p.theta,
+                &vec![re; model.n_eta],
+                &p.omega,
+                &p.sigma.values,
+            );
+            assert!(v.is_finite(), "nll = {v}");
+            v
+        };
+        assert_ne!(p0.theta, p1.theta, "PLACEBO[STUDY=3] moved");
+        assert_eq!(nll_at(&p0, 0.0).to_bits(), nll_at(&p1, 0.0).to_bits());
+        assert_ne!(nll_at(&p0, 0.05).to_bits(), nll_at(&p1, 0.05).to_bits());
+    }
+
+    /// #1822 T3. `if (GATE < 1.05)` with `GATE(1.0)`: open at the initial θ, closed at
+    /// the jitter, so only the θ₀ point sees the read. Refused. The straddle is
+    /// asserted on `probe_points` itself, so the fixture cannot silently stop
+    /// isolating that point.
+    ///
+    /// Mutation — drop the θ₀ point: P6 binds. The only test that dies (measured: the
+    /// rest of the level suite stays green).
+    #[test]
+    fn a_read_open_only_at_the_initial_point_is_refused() {
+        let text = gated(
+            "if (GATE < 1.05) TVH0 * exp(PLACEBO) else TVH0",
+            "  theta GATE(1.0, -10.0, 10.0)\n",
+        );
+        refused_everywhere(&text);
+        let model = bound(&text, &csv(&[], &|_| true)).unwrap().0.model;
+        let k = model.theta_names.iter().position(|n| n == "GATE").unwrap();
+        let [(theta0, _), (jittered, _)] = probe_points(&model);
+        assert!(theta0[k] < 1.05, "open at θ₀: {}", theta0[k]);
+        assert!(jittered[k] >= 1.05, "closed at the jitter: {}", jittered[k]);
+    }
+
+    /// #1822 T6 (review r1 #1). `H0 = TVH0·exp(PLACEBO·(ETA_CL − ETA_V))`: the gate is
+    /// a difference of two random effects, so it is closed at η = 0 and stays closed at
+    /// any η that moves every random effect by the same amount. Refused. The straddle is
+    /// asserted on the η the measurement uses: distinct per index, so the difference is
+    /// open at the moved point.
+    ///
+    /// Mutation — move every random effect to the same value at the jittered point:
+    /// binds (only this test dies).
+    #[test]
+    fn a_gate_on_a_difference_of_random_effects_is_refused() {
+        let text = gated("TVH0 * exp(PLACEBO * (ETA_CL - ETA_V))", "")
+            .replace("  V  = TVV\n", "  V  = TVV * exp(ETA_V)\n")
+            .replace(
+                "  omega ETA_CL ~ 0.09\n",
+                "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n",
+            );
+        assert!(text.contains("TVV * exp(ETA_V)") && text.contains("ETA_V ~ 0.04"));
+        refused_everywhere(&text);
+        let eta = probe_etas(0.05, 2);
+        assert_ne!(eta[0], eta[1], "the difference is open at the moved point");
+    }
+
+    /// `csv` with an `ACTIVE` column: `active_97` on subject 97, 1 elsewhere.
+    fn with_active(csv: &str, active_97: u32) -> String {
+        csv.lines()
+            .map(|l| match l {
+                _ if l.starts_with("ID,") => format!("{l},ACTIVE\n"),
+                _ if l.starts_with("97,") => format!("{l},{active_97}\n"),
+                _ => format!("{l},1\n"),
+            })
+            .collect()
+    }
+
+    /// #1822 T4. `H0 = TVH0·exp(PLACEBO·ACTIVE)`: a subject whose own data closes the
+    /// gate (`ACTIVE=0`) reads no level at any θ or η, and binds at index 1; the same
+    /// subject with `ACTIVE=1` is refused. The straddle is the data, not the model.
+    ///
+    /// Mutations — refuse every unindexed subject: `ACTIVE=0` is refused. Drop the
+    /// `refuse_read_unindexed` call: `ACTIVE=1` binds.
+    #[test]
+    fn a_subject_whose_data_closes_the_gate_still_binds() {
+        let text = gated("TVH0 * exp(PLACEBO * ACTIVE)", "");
+        let data = csv(&[(97, 4)], &|_| true);
+        let (_, pop) = bound(&text, &with_active(&data, 0)).expect("ACTIVE=0 reads nothing");
+        assert_eq!(index(&pop, "97"), Some(1.0));
+        let Err(e) = bound(&text, &with_active(&data, 1)) else {
+            panic!("ACTIVE=1 reads the block, and binds");
+        };
+        has(&e, &[WHO]);
+    }
+
+    /// #1822 T5. The gate sits only on 97's branch (`STUDY > 3`); the joint subjects'
+    /// branch reads the block unconditionally. Refused.
+    ///
+    /// Mutation — measure at the θ₀ point only: P5 binds.
+    #[test]
+    fn a_gate_on_one_branch_is_refused() {
+        refused_everywhere(&gated(
+            "if (STUDY > 3) TVH0 * exp(PLACEBO * GATE) else TVH0 * exp(PLACEBO)",
+            GATE_OPEN_AT_JITTER,
+        ));
+    }
 }
 
 /// #1797, the cells past fixture F: a `TIME`-keyed block, a binary endpoint, and the

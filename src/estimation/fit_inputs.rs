@@ -418,12 +418,10 @@ fn resolve_fit_inputs_unattributed<'a>(
             fit.theta.len()
         )));
     }
-    // σ and Ω_IOV against the model (#1764): a mis-sized σ panicked or was dropped in
-    // `run_covariance`, and a fit with no Ω_IOV on an IOV model ran both with the
-    // model's initial Ω_IOV in its place (`fitted_params_from_result`, #1789).
-    // Ω keeps the n_eta checks `run_sir` / `run_covariance` already make.
-    let [_, sigma, omega_iov] = crate::api::ParamBlock::all_of_fit(fit);
-    crate::api::check_param_shape(inputs.model(), &[sigma, omega_iov])?;
+    // Ω, σ and Ω_IOV are not checked here: both callers rebuild their parameters with
+    // `fitted_params_from_result` before anything reads a block, and that is the one
+    // `E_PARAM_SHAPE` gate on the fit's shape (#1764, #1789, #1833). A second copy here
+    // rejected exactly the same inputs, so deleting either left every test green.
     // The same subjects can carry a recoded covariate: a categorical value outside
     // the model's levels would be scored as the reference level (#1740).
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(
@@ -673,8 +671,17 @@ pub(crate) fn scoring_options(
 /// 4.9 / 1000 and a covariance step reporting SE(TVKA) = 7576 against the fit's 0.74.
 ///
 /// [`interaction_for`]: crate::types::interaction_for
+///
+/// The LOQ-censoring method rides along (#1824): the one the fit reports
+/// ([`FitResult::bloq_method`]) is part of the marginal it minimised, and since `fit()`
+/// honours a per-call `FitOptions::bloq_method` the model a post-hoc step is handed need
+/// not carry it. Only a fit recording none (an empty label) leaves the caller's.
 pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
-    scoring_options(fit.method, fit.interaction, options)
+    let mut scored = scoring_options(fit.method, fit.interaction, options);
+    if let Some(bloq) = crate::types::BloqMethod::from_label(&fit.bloq_method) {
+        scored.bloq_method = Some(bloq);
+    }
+    scored
 }
 
 /// The [`FitOptions`] of the stage that produced a fit's estimates (and ran its inline

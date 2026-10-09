@@ -4241,11 +4241,11 @@ pub struct CompiledModel {
     /// the index of the ODE state it applies to. Parallel to the diffusion
     /// theta slice of `theta`. Empty when `diffusion_theta_start` is `None`.
     pub diffusion_state_indices: Vec<usize>,
-    /// Mirror of [`FitOptions::bloq_method`] so likelihood/AD paths can read
-    /// it without threading the options struct through every call site.
-    /// Set by [`fit_from_files`](crate::fit_from_files) automatically;
-    /// callers invoking [`fit`](crate::fit) with a hand-built `CompiledModel`
-    /// must set this field to match `options.bloq_method` themselves.
+    /// The model's own LOQ-censoring method: the file's `[fit_options] bloq_method`
+    /// when the parser read one, `Drop` otherwise. It is what a call that leaves
+    /// [`FitOptions::bloq_method`] at `None` runs under; a call setting it `Some`
+    /// overrides this for that call only (#1824). Engine code reads the method in
+    /// force through `CompiledModel::bloq_in_force`, never this field.
     pub bloq_method: BloqMethod,
     /// Covariate names referenced by any expression in the model (preserved
     /// in the case the modeller wrote). Validated against the data's covariate
@@ -8285,10 +8285,18 @@ pub struct FitOptions {
     /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
     /// flags fewer subjects).
     pub imp_defensive_alpha: f64,
-    /// How LOQ-censored observations are handled.
-    /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
-    /// when the data has no CENS column).
-    pub bloq_method: BloqMethod,
+    /// How LOQ-censored observations are handled for this call. See [`BloqMethod`].
+    ///
+    /// `None` (the default) runs under the model's own method,
+    /// [`CompiledModel::bloq_method`] — the file's `bloq_method` key, or `Drop` when
+    /// it has none. `Some(m)` runs under `m` whatever the model says, so an explicit
+    /// `Some(Drop)` turns M3 off on a model parsed from an `m3` file (#1824). The
+    /// parser sets `Some` exactly when the file has the key. `fit` honours it per
+    /// call. `run_covariance` and `run_sir` do not read it: like `method`, it comes
+    /// from the fit ([`FitResult::bloq_method`]), so the post-hoc step scores the
+    /// objective the estimates minimise; only a fit recording no method falls back
+    /// to this field.
+    pub bloq_method: Option<BloqMethod>,
     /// Number of Monte-Carlo replicates per subject used to compute the
     /// simulation-based NPDE/NPD diagnostics after the fit. `0` (default)
     /// disables the computation entirely — no `NPDE`/`NPD` columns are emitted.
@@ -8639,7 +8647,7 @@ impl Default for FitOptions {
             iscale_min: 0.1,
             iscale_max: 10.0,
             imp_defensive_alpha: 0.0,
-            bloq_method: BloqMethod::Drop,
+            bloq_method: None,
             npde_nsim: 0,
             npde_seed: None,
             steihaug_max_iters: None,
@@ -8759,6 +8767,70 @@ impl BloqMethod {
     /// dataset with no `CENS` column) never does.
     pub fn has_censored_row(self, cens: &[i8]) -> bool {
         cens.iter().any(|&c| self.is_censored_row(c))
+    }
+
+    /// The method a [`label`](Self::label) names; `None` for anything else (an
+    /// empty [`FitResult::bloq_method`] on a result that recorded none).
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "drop" => Some(BloqMethod::Drop),
+            "m3" => Some(BloqMethod::M3),
+            _ => None,
+        }
+    }
+}
+
+// Where a call's `bloq_method` override lives while it runs (#1824): one thread-local, and the
+// pool that carries it — the shape `LOCAL_FORCED_FD` has (#1613), for the same reasons. `fit`
+// takes `&CompiledModel` and `CompiledModel` is not `Clone`, so the call cannot stamp its
+// options onto the model; before #1824 the file entry points did, and a direct `fit()` with
+// `FitOptions { bloq_method: M3, .. }` on a `drop` model scored the censored rows as ordinary
+// observations, reported `drop`, and warned nothing. Per thread rather than per model, so it
+// also reaches an absorption model's ODE twin (`CompiledModel::effective_for`).
+thread_local! {
+    /// `None` outside any fit-scoped call, on every worker of the shared pool, and inside a
+    /// call that set no override: each reads as "the model's own method".
+    static LOCAL_BLOQ_OVERRIDE: std::cell::Cell<Option<BloqMethod>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install `bloq` for a pool worker's whole lifetime (its `start_handler`).
+pub(crate) fn install_worker_bloq_override(bloq: Option<BloqMethod>) {
+    LOCAL_BLOQ_OVERRIDE.set(bloq);
+}
+
+/// Arms this call's `bloq_method` override on this thread until the guard drops, restoring
+/// whatever was in force before on every exit path. Reaches this thread only; the fan-out is
+/// carried by `api::pool::FitScope`.
+#[must_use = "the bloq_method override is disarmed as soon as this guard drops"]
+pub(crate) struct BloqOverrideGuard {
+    prev: Option<BloqMethod>,
+}
+
+/// See [`BloqOverrideGuard`]. `None` arms `None`, so a nested call that set no override reads
+/// its own model's method, not the enclosing call's override.
+pub(crate) fn arm_bloq_override(bloq: Option<BloqMethod>) -> BloqOverrideGuard {
+    BloqOverrideGuard {
+        prev: LOCAL_BLOQ_OVERRIDE.replace(bloq),
+    }
+}
+
+impl Drop for BloqOverrideGuard {
+    fn drop(&mut self) {
+        LOCAL_BLOQ_OVERRIDE.set(self.prev);
+    }
+}
+
+impl CompiledModel {
+    /// The LOQ-censoring method the running call scores this model under: the call's
+    /// `FitOptions::bloq_method` override when it set one, else the model's own
+    /// [`bloq_method`](Self::bloq_method) (#1824).
+    ///
+    /// **The one reader.** Every likelihood, gradient, Hessian and diagnostic path asks this,
+    /// never the field: a reader of the field ignores a direct `fit()` caller's override.
+    /// `tests/bloq_in_force_is_the_one_reader.rs` fails on a new production read of the field.
+    pub(crate) fn bloq_in_force(&self) -> BloqMethod {
+        LOCAL_BLOQ_OVERRIDE.get().unwrap_or(self.bloq_method)
     }
 }
 

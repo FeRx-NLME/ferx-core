@@ -422,7 +422,7 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             o.run_covariance_step = !o.run_covariance_step;
         }),
         ("the BLOQ convention", &|o: &mut FitOptions| {
-            o.bloq_method = BloqMethod::M3;
+            o.bloq_method = Some(BloqMethod::M3);
         }),
         ("the gradient method", &|o: &mut FitOptions| {
             o.gradient_method = GradientMethod::Fd;
@@ -445,6 +445,29 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             "a resume against changed {what} was accepted"
         );
     }
+}
+
+#[test]
+fn the_fit_settings_fingerprint_does_not_move_between_spellings_of_the_same_bloq_method() {
+    // #1824 review r1 #2: the runner pins caller options' `bloq_method: None` to
+    // `Some(Drop)` before fitting, so the two run the same fit and must fingerprint
+    // alike — a resume switching between them is the same run. The control: `Some(M3)`
+    // still moves it (also pinned above), so the equality is not a fingerprint that
+    // ignores the field.
+    let spelled = |bloq: Option<BloqMethod>| {
+        with_fit_options(Some(FitOptions {
+            bloq_method: bloq,
+            ..FitOptions::default()
+        }))
+    };
+    let none = spelled(None);
+    let drop = spelled(Some(BloqMethod::Drop));
+    let m3 = spelled(Some(BloqMethod::M3));
+    assert_eq!(none.fit_options_fingerprint, drop.fit_options_fingerprint);
+    assert!(none
+        .check_compatible(&drop, std::path::Path::new("."))
+        .is_ok());
+    assert_ne!(none.fit_options_fingerprint, m3.fit_options_fingerprint);
 }
 
 #[test]
