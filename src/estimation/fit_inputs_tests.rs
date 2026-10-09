@@ -13,25 +13,36 @@ use crate::estimation::run_covariance::run_covariance;
 use crate::estimation::run_sir::run_sir;
 use crate::types::CovarianceStatus;
 
-const SUPPLIED: &str = "Pass the population the fit was given, or `population = None` to \
-                        re-read it from `fit.data_path` with the fit's reader settings.";
-const RECORDED: &str = "Re-reading `fit.data_path` with the fit's recorded reader settings did \
-                        not reproduce the fitted population, so this version of ferx reads \
-                        the file differently from the one that made the fit. Pass the fit's \
-                        population as `population = Some(&pop)`, or refit.";
-const FILE: &str = "The fit records no reader settings (it was given its population in \
-                    memory), so `fit.data_path` was re-read with the model file's `[data]` \
-                    renames and `[data_selection]`, which did not reproduce it. Pass the \
-                    fit's population as `population = Some(&pop)`.";
-const ROUTED: &str = "The fit records neither reader settings nor a `model_path`, so \
-                      `fit.data_path` was re-read with the model's endpoint routing only: no \
-                      `[data]` renames and no `[data_selection]` were applied. Pass the fit's \
-                      population as `population = Some(&pop)`.";
+// #1813: the source sentences say how the population was obtained and nothing
+// else; the remedy is the suggestion, the same in every cell.
+const SUPPLIED: &str = "";
+const RECORDED: &str = " It was re-read from `fit.data_path` with the fit's recorded reader \
+                        settings.";
+const FILE: &str = " The fit records no reader settings, so it was re-read from \
+                    `fit.data_path` with the model file's `[data]` renames and \
+                    `[data_selection]`.";
+const ROUTED: &str = " The fit records neither reader settings nor a `model_path`, so it was \
+                      re-read from `fit.data_path` with the model's endpoint routing only: no \
+                      `[data]` renames and no `[data_selection]` were applied.";
+const HASHED: &str = " The file matches the SHA-256 the fit recorded.";
+const UNHASHED: &str = " The fit records no SHA-256 of the file, so it may have changed since \
+                        the fit.";
 const DOSE_CAUSE: &str = " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose \
                           record changes the doses without changing any observation.";
+const LEAD: &str = "this population is not the one the fit was given: ";
+const FIX: &str = "use the population the fit was given, or refit";
 
-fn refusal(entry: &str, what: &str, advice: &str) -> String {
-    format!("{entry}: this population is not the one the fit was given: {what} {advice}")
+/// The `message()` of an `E_POPULATION_MISMATCH` refusal.
+fn mismatch(what: &str, how: &str) -> String {
+    format!("{LEAD}{what}{how}")
+}
+
+/// Its `to_string()` from `entry`: the context, the message, the suggestion.
+fn refusal(entry: &str, what: &str, how: &str) -> String {
+    format!(
+        "{entry}: {} Use the population the fit was given, or refit.",
+        mismatch(what, how)
+    )
 }
 
 fn bits(v: &[f64]) -> Vec<u64> {
@@ -145,12 +156,18 @@ fn a_caller_row_filter_is_replayed_on_the_re_read() {
         .ignore_exprs
         .clear();
     let err = err_of(run_covariance(&drifted, None, None, &c.opts));
-    assert_eq!(err, refusal("run_covariance", &records, RECORDED));
+    assert_eq!(
+        err,
+        refusal("run_covariance", &records, &format!("{RECORDED}{HASHED}"))
+    );
 
     let mut in_memory = c.fit.clone();
     in_memory.reader_settings = None;
     let err = err_of(run_sir(&in_memory, None, None, &c.opts));
-    assert_eq!(err, refusal("run_sir", &records, FILE));
+    assert_eq!(
+        err,
+        refusal("run_sir", &records, &format!("{FILE}{HASHED}"))
+    );
 }
 
 /// T1, the SIR half: the recorded filter reaches the SIR re-read too (probe A: SIR
@@ -203,6 +220,19 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
             _ => run_sir(&c.fit, Some(model), Some(&never_bound), &c.opts),
         };
         let e = r.map(|_| ()).expect_err("refused");
+        // #1814 T4: `verify` gives the resolver's refusal on the same population.
+        let v = c
+            .fit
+            .population_fingerprint
+            .as_ref()
+            .unwrap()
+            .verify(model, &never_bound);
+        let v = v.expect_err("verify refuses");
+        assert_eq!(
+            (v.code(), v.message(), v.context()),
+            (e.code(), e.message(), None),
+            "{entry}"
+        );
         // #1746: the #1647 refusal keeps its `ferx check` code through the resolver.
         assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
         assert_eq!(e.context(), Some(entry), "{e}");
@@ -260,6 +290,19 @@ fn a_partly_bound_population_hears_k_of_n_on_a_post_hoc_step() {
             _ => run_sir(&c.fit, Some(model), Some(&partly), &c.opts),
         };
         let e = r.map(|_| ()).expect_err("refused");
+        // #1814 T4: `verify` gives the resolver's refusal on the same population.
+        let v = c
+            .fit
+            .population_fingerprint
+            .as_ref()
+            .unwrap()
+            .verify(model, &partly);
+        let v = v.expect_err("verify refuses");
+        assert_eq!(
+            (v.code(), v.message(), v.context()),
+            (e.code(), e.message(), None),
+            "{entry}"
+        );
         assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
         assert_eq!(e.context(), Some(entry), "{e}");
         let err = e.to_string();
@@ -320,15 +363,27 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
             _ => run_sir(&c.fit, Some(model), Some(&other), &c.opts),
         };
         let e = r.map(|_| ()).expect_err("refused");
-        assert_eq!((e.code(), e.context()), (None, Some(entry)), "{e}");
-        let err = e.to_string();
-        assert!(
-            err.starts_with(&format!(
-                "{entry}: this population is not the one the fit was given: "
-            )),
-            "{err}"
+        // #1814 T4: `verify` gives the resolver's refusal on the same population.
+        let v = c
+            .fit
+            .population_fingerprint
+            .as_ref()
+            .unwrap()
+            .verify(model, &other);
+        let v = v.expect_err("verify refuses");
+        assert_eq!(
+            (v.code(), v.message(), v.context()),
+            (e.code(), e.message(), None),
+            "{entry}"
         );
-        assert!(err.ends_with(SUPPLIED), "{err}");
+        assert_eq!(
+            (e.code(), e.context()),
+            (Some("E_POPULATION_MISMATCH"), Some(entry)),
+            "{e}"
+        );
+        let err = e.to_string();
+        assert!(err.starts_with(&format!("{entry}: {LEAD}")), "{err}");
+        assert_eq!(e.suggestion(), Some(FIX), "{err}");
         for never in ["a fit of a model bound on this population", "level(s)"] {
             assert!(!err.contains(never), "{entry}: says {never}: {err}");
         }
@@ -377,10 +432,10 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
     let e = run_covariance(&c.fit, Some(model), Some(&unfiltered), &c.opts)
         .map(|_| ())
         .expect_err("refused");
-    // #1746: no `ferx check` code for a population mismatch; attributed to the entry.
+    // #1813: coded, though `ferx check` has no fit to raise it; attributed to the entry.
     assert_eq!(
         (e.code(), e.context()),
-        (None, Some("run_covariance")),
+        (Some("E_POPULATION_MISMATCH"), Some("run_covariance")),
         "{e}"
     );
     let err = e.to_string();
@@ -454,7 +509,10 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
     routed.model_path = None;
     routed.reader_settings = None;
     let err = err_of(run_covariance(&routed, Some(model), None, &c.opts));
-    assert_eq!(err, refusal("run_covariance", &what, ROUTED));
+    assert_eq!(
+        err,
+        refusal("run_covariance", &what, &format!("{ROUTED}{HASHED}"))
+    );
 }
 
 /// T9: an IOV model with recorded settings. `(Some(model), None)` was refused (the
@@ -1555,5 +1613,380 @@ fn resolve_scoring_options_prefers_the_fits_record_then_the_sir_records() {
     assert_eq!(
         ScoringSettings::from_options(&resolve_scoring_options(&fit, &caller)),
         ScoringSettings::from_options(&caller)
+    );
+}
+
+/// The three ways to hand a population to the mismatch check (#1813, #1814), and a
+/// fourth: `run_covariance` on a fit whose `subjects` are empty, the shape of the R
+/// fit skeleton, where only the fingerprint can name a subject-list mismatch.
+#[derive(Clone, Copy, Debug)]
+enum Entry {
+    RunCovariance,
+    RunSir,
+    Verify,
+    RunCovarianceNoSubjects,
+}
+
+impl Entry {
+    const ALL: [Entry; 4] = [
+        Entry::RunCovariance,
+        Entry::RunSir,
+        Entry::Verify,
+        Entry::RunCovarianceNoSubjects,
+    ];
+
+    /// The entry point the error names, if any.
+    fn context(self) -> Option<&'static str> {
+        match self {
+            Entry::RunCovariance | Entry::RunCovarianceNoSubjects => Some("run_covariance"),
+            Entry::RunSir => Some("run_sir"),
+            Entry::Verify => None,
+        }
+    }
+
+    fn refuse(self, c: &Case, skeleton: &FitResult, pop: &Population) -> EngineError {
+        let model = &c.prep.parsed.model;
+        match self {
+            Entry::RunCovariance => run_covariance(&c.fit, Some(model), Some(pop), &c.opts)
+                .map(|_| ())
+                .expect_err("refused"),
+            Entry::RunSir => run_sir(&c.fit, Some(model), Some(pop), &c.opts)
+                .map(|_| ())
+                .expect_err("refused"),
+            Entry::Verify => c
+                .fit
+                .population_fingerprint
+                .as_ref()
+                .unwrap()
+                .verify(model, pop)
+                .expect_err("refused"),
+            Entry::RunCovarianceNoSubjects => {
+                run_covariance(skeleton, Some(model), Some(pop), &c.opts)
+                    .map(|_| ())
+                    .expect_err("refused")
+            }
+        }
+    }
+}
+
+/// #1813 T1: every way a supplied population can differ from the fit's — the eight
+/// `Display` arms, the new equal-count dose arm among them — gets the same coded
+/// refusal from `run_covariance`, `run_sir` and `PopulationFingerprint::verify`: one
+/// `code()`, one `message()`, one `suggestion()`, the context only on the entry
+/// points. Before, a subject-list mismatch never reached the fingerprint refusal
+/// (`check_subjects` had its own uncoded text, P1–P3), and its wording changed with
+/// whether `fit.subjects` was filled (P4): the fourth column is that skeleton.
+///
+/// The control, in the same test: the fitted population passes `verify` with no
+/// notes and runs `run_covariance`.
+///
+/// Every fixture refuses before any inner solve, so no FD or dual engine is reached.
+///
+/// Mutations — the builder back to an uncoded `EngineError::from`: every cell;
+/// `check_subjects` with its old text: missing / extra / swapped on the `run_*`
+/// columns; `verify` without its subject check: missing and extra pass (`Ok`), and
+/// swapped reports records; the subject prefix dropped from
+/// `check_subjects`' fingerprint leg: the no-subjects column of missing / extra /
+/// swapped; delete the dose sentence: both dose cells; drop the equal-count dose
+/// arm: doses =; delete the suggestion: every cell; `verify` attributed to an
+/// entry: its `context()`.
+#[test]
+fn every_mismatch_cell_is_coded_by_every_entry() {
+    let c = super::test_fixtures::sir_case(Kind::Plain);
+    let model = &c.prep.parsed.model;
+    let fitted = &c.prep.population;
+    let fp = c.fit.population_fingerprint.as_ref().expect("fit() stamps");
+    let mut skeleton = c.fit.clone();
+    skeleton.subjects.clear();
+    assert_eq!(fitted.subjects[0].id, "1");
+    assert_eq!(fitted.subjects[0].doses.len(), 1, "one dose per subject");
+
+    // The control: the fitted population is accepted by every entry.
+    assert_eq!(
+        fp.verify(model, fitted).expect("the fit's population"),
+        Vec::<String>::new()
+    );
+    run_covariance(&c.fit, Some(model), Some(fitted), &c.opts).expect("the fit's population");
+
+    let mut missing = fitted.clone();
+    missing.subjects.pop();
+    let mut extra = fitted.clone();
+    let mut newcomer = extra.subjects[0].clone();
+    newcomer.id = "999".to_string();
+    extra.subjects.push(newcomer);
+    let mut swapped = fitted.clone();
+    swapped.subjects.swap(0, 1);
+    let mut settings = c.fit.reader_settings.clone().expect("recorded");
+    settings.ignore_exprs.push("TIME > 24".to_string());
+    let filtered = crate::api::read_population_with(model, &settings, data(&c))
+        .unwrap()
+        .0;
+    let (n_filtered, n_fit) = (
+        filtered.subjects[0].observations.len(),
+        fitted.subjects[0].observations.len(),
+    );
+    assert!(n_filtered < n_fit, "{n_filtered} vs {n_fit}");
+    let mut nudged = fitted.clone();
+    nudged.subjects[0].observations[3] *= 1.5;
+    let mut edited_dose = fitted.clone();
+    edited_dose.subjects[0].doses[0].amt *= 2.0;
+    let mut second_dose = fitted.clone();
+    let mut dose = second_dose.subjects[0].doses[0].clone();
+    dose.time += 12.0;
+    second_dose.subjects[0].doses.push(dose);
+    let mut heavier = fitted.clone();
+    *heavier.subjects[0].covariates.get_mut("WT").unwrap() += 1.0;
+    let mut renamed = fitted.clone();
+    renamed.covariate_names.push("EXTRA".to_string());
+
+    let cells: [(&str, &Population, String); 9] = [
+        (
+            "missing",
+            &missing,
+            "it has 29 subjects, the fit's has 30.".into(),
+        ),
+        (
+            "extra",
+            &extra,
+            "it has 31 subjects, the fit's has 30.".into(),
+        ),
+        (
+            "swapped",
+            &swapped,
+            "its subject 1 is `2`, the fit's is `1`.".into(),
+        ),
+        (
+            "records ≠",
+            &filtered,
+            format!(
+                "the records of subject `1` differ: {n_filtered} observations in this \
+                 population, {n_fit} in the fit's."
+            ),
+        ),
+        (
+            "records =",
+            &nudged,
+            format!(
+                "the records of subject `1` differ with the same {n_fit} observations: an \
+                 observation time, value, compartment, censoring flag or occasion, or an \
+                 `EVID = 2` or reset row."
+            ),
+        ),
+        (
+            "doses =",
+            &edited_dose,
+            format!(
+                "the doses of subject `1` differ with the same 1 dose: a dose time, amount, \
+                 compartment, rate, duration, `SS`, `II` or infusion coding.{DOSE_CAUSE}"
+            ),
+        ),
+        (
+            "doses ≠",
+            &second_dose,
+            format!(
+                "the doses of subject `1` differ: 2 in this population, 1 in the fit's, with \
+                 the same observation records.{DOSE_CAUSE}"
+            ),
+        ),
+        (
+            "covariates",
+            &heavier,
+            "the covariate values of subject `1` differ, with the same records and doses.".into(),
+        ),
+        (
+            "covariate names",
+            &renamed,
+            "its covariate columns are not the fit's: missing none, extra `EXTRA`.".into(),
+        ),
+    ];
+    for (cell, pop, what) in &cells {
+        let want = mismatch(what, SUPPLIED);
+        for entry in Entry::ALL {
+            let e = entry.refuse(&c, &skeleton, pop);
+            let at = format!("{cell}, {entry:?}");
+            assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{at}: {e}");
+            assert_eq!(e.message(), want, "{at}");
+            assert_eq!(e.suggestion(), Some(FIX), "{at}");
+            assert_eq!(e.context(), entry.context(), "{at}");
+            let shown = match entry.context() {
+                Some(name) => refusal(name, what, SUPPLIED),
+                None => format!("{want} Use the population the fit was given, or refit."),
+            };
+            assert_eq!(e.to_string(), shown, "{at}");
+        }
+    }
+}
+
+/// #1813 T2: a re-read names how it read the data and whether the fit recorded the
+/// file's SHA-256 — and no cause it did not establish. Before, a re-read with the
+/// recorded settings said "this version of ferx reads the file differently" when the
+/// data had changed (P9) or the settings had (P10), and one with the model file's said
+/// the fit "was given its population in memory" of a `fit_from_files` fit (P11).
+///
+/// Two real cells: the recorded settings edited, with the hash recorded and matching
+/// (P10), and the data repointed at a copy with `WT + 1` on subject `4`, with no hash
+/// (P9). The model-file and routed re-reads cannot differ from a `fit_from_files` fit
+/// of a filter-free model on unchanged data, so there the fit's fingerprint is made
+/// of the population with that `WT + 1`: the re-read is then the population that
+/// differs. Each of those two sources is run with the hash recorded and without, so
+/// both sides of the hash clause's gate are asserted in this one test.
+///
+/// Mutations — delete any source sentence: its cells; swap the two hash clauses or
+/// hard-wire either: the other side's cells; bring back either false clause: the
+/// `!contains`.
+#[test]
+fn a_re_read_names_only_what_it_did() {
+    let c = case(Kind::Plain);
+    let model = &c.prep.parsed.model;
+    assert!(c.fit.data_hash.is_some(), "fit_from_files records the hash");
+
+    let mut heavier_rows = String::new();
+    for (i, line) in super::test_fixtures::data_text().lines().enumerate() {
+        let mut cols: Vec<String> = line.split(',').map(str::to_string).collect();
+        if i > 0 && cols[0] == "4" {
+            let wt: f64 = cols[8].parse().unwrap();
+            cols[8] = format!("{}", wt + 1.0);
+        }
+        heavier_rows.push_str(&cols.join(","));
+        heavier_rows.push('\n');
+    }
+    let heavier_path = c.model_path.parent().unwrap().join("heavier.csv");
+    std::fs::write(&heavier_path, heavier_rows).unwrap();
+    let mut heavier = c.prep.population.clone();
+    assert_eq!(heavier.subjects[3].id, "4");
+    *heavier.subjects[3].covariates.get_mut("WT").unwrap() += 1.0;
+    let tampered = PopulationFingerprint::of(&heavier);
+
+    let mut edited = c.fit.clone();
+    edited
+        .reader_settings
+        .as_mut()
+        .unwrap()
+        .ignore_exprs
+        .push("TIME > 24".to_string());
+    let n_fit = c.prep.population.subjects[0].observations.len();
+    let n_edited =
+        crate::api::read_population_with(model, edited.reader_settings.as_ref().unwrap(), data(&c))
+            .unwrap()
+            .0
+            .subjects[0]
+            .observations
+            .len();
+    let mut repointed = c.fit.clone();
+    repointed.data_path = heavier_path.to_str().map(String::from);
+    repointed.data_hash = None;
+
+    let records = format!(
+        "the records of subject `1` differ: {n_edited} observations in this population, \
+         {n_fit} in the fit's."
+    );
+    let wt = "the covariate values of subject `4` differ, with the same records and doses.";
+    let variant = |settings: bool, model_path: bool, hash: bool| {
+        let mut f = c.fit.clone();
+        f.population_fingerprint = Some(tampered.clone());
+        if !settings {
+            f.reader_settings = None;
+        }
+        if !model_path {
+            f.model_path = None;
+        }
+        if !hash {
+            f.data_hash = None;
+        }
+        f
+    };
+    let cells: [(&str, FitResult, &str, String); 6] = [
+        (
+            "P10",
+            edited,
+            records.as_str(),
+            format!("{RECORDED}{HASHED}"),
+        ),
+        ("P9", repointed, wt, format!("{RECORDED}{UNHASHED}")),
+        (
+            "file, hash",
+            variant(false, true, true),
+            wt,
+            format!("{FILE}{HASHED}"),
+        ),
+        (
+            "file, no hash",
+            variant(false, true, false),
+            wt,
+            format!("{FILE}{UNHASHED}"),
+        ),
+        (
+            "routed, hash",
+            variant(false, false, true),
+            wt,
+            format!("{ROUTED}{HASHED}"),
+        ),
+        (
+            "routed, no hash",
+            variant(false, false, false),
+            wt,
+            format!("{ROUTED}{UNHASHED}"),
+        ),
+    ];
+    for (cell, fit, what, how) in &cells {
+        // The routed re-read needs the model in hand: there is no file to rebuild it.
+        let m = fit.model_path.is_none().then_some(model);
+        let e = run_covariance(fit, m, None, &c.opts)
+            .map(|_| ())
+            .expect_err(cell);
+        assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{cell}: {e}");
+        assert_eq!(e.message(), mismatch(what, how), "{cell}");
+        assert_eq!(e.suggestion(), Some(FIX), "{cell}");
+        let err = e.to_string();
+        for never in ["reads the file differently", "in memory", "Some(&pop)"] {
+            assert!(!err.contains(never), "{cell}: says {never}: {err}");
+        }
+    }
+}
+
+/// #1814 T3: `verify` on a fingerprint of another scheme compares nothing and says
+/// so; the straddle, the same population against the current scheme, is refused. And
+/// a fit with no fingerprint at all still refuses a missing subject, from
+/// `fit.subjects`, with the same code and text.
+///
+/// Mutations — `verify` ignores the scheme: the stale cell is refused; `verify`
+/// drops the note: the `Ok` vector differs; delete `check_subjects`' `fit.subjects`
+/// leg: the fingerprint-less cell returns `Ok`.
+#[test]
+fn verify_notes_what_it_could_not_compare() {
+    let c = case(Kind::Plain);
+    let model = &c.prep.parsed.model;
+    let fp = c.fit.population_fingerprint.clone().expect("fit() stamps");
+    let mut heavier = c.prep.population.clone();
+    *heavier.subjects[0].covariates.get_mut("WT").unwrap() += 1.0;
+
+    let stale = fp
+        .clone()
+        .with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1);
+    assert_eq!(
+        stale
+            .verify(model, &heavier)
+            .expect("another scheme is not compared"),
+        vec![STALE_FINGERPRINT_WARNING.to_string()]
+    );
+    let e = fp.verify(model, &heavier).expect_err("the straddle");
+    assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{e}");
+
+    let mut legacy = c.fit.clone();
+    legacy.population_fingerprint = None;
+    legacy.reader_settings = None;
+    let mut missing = c.prep.population.clone();
+    missing.subjects.pop();
+    let e = run_covariance(&legacy, Some(model), Some(&missing), &c.opts)
+        .map(|_| ())
+        .expect_err("refused from fit.subjects");
+    assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{e}");
+    assert_eq!(
+        e.to_string(),
+        refusal(
+            "run_covariance",
+            "it has 29 subjects, the fit's has 30.",
+            SUPPLIED
+        )
     );
 }

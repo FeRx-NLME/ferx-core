@@ -3337,6 +3337,8 @@ impl ferx_core::Population
 pub fn ferx_core::Population::n_obs(&self) -> usize
 pub fn ferx_core::Population::prune_irrelevant_tv_covariates(&mut self, referenced: &[alloc::string::String]) -> usize
 #[non_exhaustive] pub struct ferx_core::types::PopulationFingerprint
+impl ferx_core::PopulationFingerprint
+pub fn ferx_core::PopulationFingerprint::verify(&self, model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, ferx_core::diagnostics::EngineError>
 pub struct ferx_core::types::PosteriorSummary
 pub ferx_core::types::PosteriorSummary::ess_bulk: f64
 pub ferx_core::types::PosteriorSummary::ess_tail: f64
@@ -4872,6 +4874,8 @@ impl ferx_core::Population
 pub fn ferx_core::Population::n_obs(&self) -> usize
 pub fn ferx_core::Population::prune_irrelevant_tv_covariates(&mut self, referenced: &[alloc::string::String]) -> usize
 #[non_exhaustive] pub struct ferx_core::PopulationFingerprint
+impl ferx_core::PopulationFingerprint
+pub fn ferx_core::PopulationFingerprint::verify(&self, model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, ferx_core::diagnostics::EngineError>
 pub struct ferx_core::PosteriorSummary
 pub ferx_core::PosteriorSummary::ess_bulk: f64
 pub ferx_core::PosteriorSummary::ess_tail: f64

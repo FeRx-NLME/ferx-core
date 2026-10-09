@@ -27,8 +27,8 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    CompiledModel, FitOptions, FitResult, InnerOptimizer, IovOccasionRule, ParsedModel, Population,
-    PopulationDifference,
+    subject_list_difference, CompiledModel, FitOptions, FitResult, InnerOptimizer, IovOccasionRule,
+    ParsedModel, Population, PopulationDifference, PopulationFingerprint,
 };
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
@@ -116,36 +116,66 @@ fn read_model_file(
     Ok((src.parsed, src.text))
 }
 
-/// Refuse a population that is not the fit's subjects in the fit's order: the
-/// fit's EBEs are matched to subjects by position. One message per cause, the
-/// order one naming the first position that differs.
-fn check_subjects(fit: &FitResult, population: &Population) -> Result<(), String> {
-    if fit.subjects.is_empty() {
-        return Ok(());
+/// Refuse a population that is not the fit's subjects in the fit's order, before
+/// any binding: such a population hears that it is not the fit's, not a level
+/// refusal worded for a simulation design (#1680 r1 #7). The subject list is the
+/// current fingerprint's when the fit carries one, else `fit.subjects` (a fit
+/// saved before #1685, or a fingerprint of another scheme); a fit with neither
+/// accepts any. Either way the refusal is [`population_mismatch`]'s text and code
+/// (#1813), without its pre-emption, since nothing is bound yet.
+fn check_subjects(
+    fit: &FitResult,
+    fingerprint: Option<&PopulationFingerprint>,
+    population: &Population,
+    source: PopulationSource,
+) -> Result<(), EngineError> {
+    let d = match fingerprint {
+        Some(fp) => fp.first_subject_difference(population),
+        None if fit.subjects.is_empty() => None,
+        None => subject_list_difference(
+            population.subjects.iter().map(|s| s.id.as_str()),
+            fit.subjects.iter().map(|s| s.id.as_str()),
+        ),
+    };
+    match d {
+        Some(d) => Err(mismatch_refusal(&d, source)),
+        None => Ok(()),
     }
-    const WHY: &str = "The fit's EBEs are matched to subjects by position, so the population \
-                       must be the one the fit saw.";
-    if population.subjects.len() != fit.subjects.len() {
-        return Err(format!(
-            "the population has {} subjects but the fit has {}. {WHY}",
-            population.subjects.len(),
-            fit.subjects.len()
-        ));
+}
+
+/// The checks after the subject list and the binding, in order: every categorical
+/// covariate value against the model's levels (`E_COV_LEVEL_UNKNOWN`, #1740: the
+/// subject IDs can match while a column was recoded), then, on a fit with a
+/// current fingerprint, the population's content against it (#1685).
+fn check_levels_and_content(
+    fingerprint: Option<&PopulationFingerprint>,
+    model: &CompiledModel,
+    population: &Population,
+    source: PopulationSource,
+) -> Result<(), EngineError> {
+    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    match fingerprint.and_then(|fp| fp.first_content_difference(population)) {
+        Some(d) => Err(population_mismatch(&d, model, population, source)),
+        None => Ok(()),
     }
-    let first = population
-        .subjects
-        .iter()
-        .zip(&fit.subjects)
-        .position(|(p, f)| p.id != f.id);
-    if let Some(i) = first {
-        return Err(format!(
-            "subject {} of the population is `{}`, but the fit's is `{}`. {WHY}",
-            i + 1,
-            population.subjects[i].id,
-            fit.subjects[i].id
-        ));
+}
+
+/// [`PopulationFingerprint::verify`]: the resolver's checks on a population the
+/// caller already bound, in the resolver's order and through its refusals.
+pub(crate) fn verify_given_population(
+    fingerprint: &PopulationFingerprint,
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<Vec<String>, EngineError> {
+    if !fingerprint.is_current() {
+        return Ok(vec![STALE_FINGERPRINT_WARNING.to_string()]);
     }
-    Ok(())
+    let source = PopulationSource::Verify;
+    if let Some(d) = fingerprint.first_subject_difference(population) {
+        return Err(mismatch_refusal(&d, source));
+    }
+    check_levels_and_content(Some(fingerprint), model, population, source)?;
+    Ok(Vec::new())
 }
 
 /// #1729: refuse a lent model whose covariate statistics the population it will be
@@ -225,8 +255,10 @@ fn check_lent_stats(
 /// (`E_COV_LEVEL_UNKNOWN`, #1740): the subject IDs can match while a covariate
 /// column was recoded. Last, on a fit that carries a population fingerprint
 /// (#1685), the population — supplied, or re-read and bound — must be the one the
-/// fit was given, record for record: [`population_refusal`] names the first
-/// difference.
+/// fit was given, record for record: [`population_mismatch`] names the first
+/// difference, with code `E_POPULATION_MISMATCH` (#1813). A subject list that is not
+/// the fit's gets the same refusal, from the fingerprint's list or else from
+/// `fit.subjects`. [`PopulationFingerprint::verify`] runs the same checks.
 ///
 /// Then the population is prepared as `fit()` prepared the one it was given
 /// (#1783), by the same `fitted_population`: time-varying covariates the model
@@ -246,7 +278,9 @@ fn check_lent_stats(
 /// Every refusal is attributed to `entry` as the [`EngineError`]'s context, so it
 /// prints as `"{entry}: {message}"`; a refusal `ferx check` codes
 /// (`E_COV_LEVEL_UNKNOWN`, `E_COVSTAT_UNRESOLVED`, `E_ENDPOINT_UNROUTED`,
-/// `E_THETA_LEVELS_DATA_UNBOUND`) keeps its diagnostic (#1746).
+/// `E_THETA_LEVELS_DATA_UNBOUND`) keeps its diagnostic (#1746), and a population
+/// that is not the fit's carries `E_POPULATION_MISMATCH`, which has no `ferx check`
+/// counterpart (#1813).
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult,
     model: Option<&'a CompiledModel>,
@@ -357,9 +391,18 @@ fn resolve_fit_inputs_unattributed<'a>(
     let file_rule = file
         .as_ref()
         .map(|(parsed, _)| parsed.fit_options.iov_occasion.clone());
+    // How the population was obtained, for the mismatch refusal: every input is
+    // known here, before the first check that can raise it.
+    let data_hash = fit.data_hash.is_some();
+    let source = match (supplied, settings.is_some(), file_settings) {
+        (true, _, _) => PopulationSource::Supplied,
+        (false, true, _) => PopulationSource::RecordedSettings { data_hash },
+        (false, false, true) => PopulationSource::ModelFileSettings { data_hash },
+        (false, false, false) => PopulationSource::Routed { data_hash },
+    };
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
-    check_subjects(fit, &population)?;
+    check_subjects(fit, fingerprint, &population, source)?;
 
     // --- Model -------------------------------------------------------------
     let model: ModelRef<'a> = match model {
@@ -422,29 +465,11 @@ fn resolve_fit_inputs_unattributed<'a>(
     // `fitted_params_from_result` before anything reads a block, and that is the one
     // `E_PARAM_SHAPE` gate on the fit's shape (#1764, #1789, #1833). A second copy here
     // rejected exactly the same inputs, so deleting either left every test green.
-    // The same subjects can carry a recoded covariate: a categorical value outside
-    // the model's levels would be scored as the reference level (#1740).
-    crate::diagnostics::first_error(&crate::api::check_covariate_levels(
-        inputs.model(),
-        &inputs.population,
-    ))?;
-    // Last (#1685): the population the step runs on is the one the fit was given.
-    if let Some(fp) = fingerprint {
-        if let Some(d) = fp.first_difference(&inputs.population) {
-            let source = match (supplied, settings.is_some(), file_settings) {
-                (true, _, _) => PopulationSource::Supplied,
-                (false, true, _) => PopulationSource::RecordedSettings,
-                (false, false, true) => PopulationSource::ModelFileSettings,
-                (false, false, false) => PopulationSource::Routed,
-            };
-            return Err(population_refusal(
-                &d,
-                inputs.model(),
-                &inputs.population,
-                source,
-            ));
-        }
-    }
+    // A recoded categorical value would be scored as the reference level (#1740);
+    // last (#1685), the population the step runs on is the one the fit was given.
+    // `PopulationFingerprint::verify` runs the same function after the same subject
+    // check.
+    check_levels_and_content(fingerprint, inputs.model(), &inputs.population, source)?;
     // Then (#1783) the population the fit scored: `fit()`'s own preparation of the
     // one it was given, under the fit's rule. After the check, which is of the given
     // population: on a natural-DV re-read, before any log transform. The notes are
@@ -542,33 +567,41 @@ pub(crate) fn file_rule_warning(rule: &IovOccasionRule) -> String {
     )
 }
 
-/// Where the population a post-hoc step was about to run on came from, for
-/// [`population_refusal`]'s advice.
+/// How the population a post-hoc step was about to run on was obtained, for
+/// [`mismatch_refusal`]'s source sentence. A re-read also says whether the fit
+/// recorded the data file's SHA-256: a recorded one that did not match was refused
+/// before the read, so a recorded one here is one the file matches.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PopulationSource {
-    /// Passed as `population = Some(&pop)`.
+    /// Passed as `population = Some(&pop)`: the caller knows where it came from.
     Supplied,
+    /// Handed to [`PopulationFingerprint::verify`]: ferx does not know where it
+    /// came from.
+    Verify,
     /// Re-read from `fit.data_path` with the fit's recorded reader settings.
-    RecordedSettings,
-    /// Re-read with the model file's settings: the fit recorded none (it was given
-    /// its population in memory).
-    ModelFileSettings,
+    RecordedSettings { data_hash: bool },
+    /// Re-read with the model file's settings: the fit records none.
+    ModelFileSettings { data_hash: bool },
     /// Re-read with the model's endpoint routing only: the fit records neither
     /// settings nor a `model_path` (review r1 #3).
-    Routed,
+    Routed { data_hash: bool },
 }
 
-/// The refusal for a population that is not the one the fit was given (#1685): what
-/// differs, on which subject, and what to do. The lead sentence names the difference;
-/// the advice depends on where the population came from.
+/// The one remedy for `E_POPULATION_MISMATCH`, whatever the cell (#1813): true and
+/// actionable from every front end, and in no front end's syntax.
+pub(crate) const POPULATION_MISMATCH_SUGGESTION: &str =
+    "use the population the fit was given, or refit";
+
+/// The refusal for a population that is not the one the fit was given (#1685),
+/// after the binding: [`mismatch_refusal`], unless an earlier cause pre-empts it.
 ///
-/// Two causes keep their own text, since there the fix is a reader or a binder, not
-/// another population: a population read without the model's endpoint routing
-/// (`E_ENDPOINT_UNROUTED`), and one never bound — or only partly bound — for the
-/// model's level block (#1647's and #1762's `E_THETA_LEVELS_DATA_UNBOUND`, from
-/// `check_level_index_columns`). One bound for other levels gets this function's text:
-/// for a post-hoc step the fix is the fit's population, not a refit.
-fn population_refusal(
+/// Two causes keep their own text and code, since there the fix is a reader or a
+/// binder, not another population: a population read without the model's endpoint
+/// routing (`E_ENDPOINT_UNROUTED`), and one never bound — or only partly bound — for
+/// the model's level block (#1647's and #1762's `E_THETA_LEVELS_DATA_UNBOUND`, from
+/// `check_level_index_columns`). One bound for other levels gets the mismatch: for a
+/// post-hoc step the fix is the fit's population, not a refit.
+fn population_mismatch(
     d: &PopulationDifference,
     model: &CompiledModel,
     population: &Population,
@@ -593,40 +626,59 @@ fn population_refusal(
     if let Err(e) = crate::diagnostics::first_error(&unbound) {
         return e;
     }
-    let cause = match d {
-        PopulationDifference::Doses { .. } => {
+    mismatch_refusal(d, source)
+}
+
+/// `E_POPULATION_MISMATCH` (#1813): what differs, then how the population was
+/// obtained — never a cause the comparison did not establish. The data may have
+/// changed, the settings may have, or the reader may have; the fingerprint cannot
+/// tell them apart, so the message names none. The remedy is
+/// [`POPULATION_MISMATCH_SUGGESTION`], in `suggestion()` and folded into `Display`.
+fn mismatch_refusal(d: &PopulationDifference, source: PopulationSource) -> EngineError {
+    let mut msg = format!("this population is not the one the fit was given: {d}.");
+    if let PopulationDifference::Doses { .. } = d {
+        msg.push_str(
             " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose record \
-             changes the doses without changing any observation."
+             changes the doses without changing any observation.",
+        );
+    }
+    let data_hash = match source {
+        PopulationSource::Supplied | PopulationSource::Verify => None,
+        PopulationSource::RecordedSettings { data_hash } => {
+            msg.push_str(
+                " It was re-read from `fit.data_path` with the fit's recorded reader \
+                 settings.",
+            );
+            Some(data_hash)
         }
-        _ => "",
+        PopulationSource::ModelFileSettings { data_hash } => {
+            msg.push_str(
+                " The fit records no reader settings, so it was re-read from \
+                 `fit.data_path` with the model file's `[data]` renames and \
+                 `[data_selection]`.",
+            );
+            Some(data_hash)
+        }
+        PopulationSource::Routed { data_hash } => {
+            msg.push_str(
+                " The fit records neither reader settings nor a `model_path`, so it was \
+                 re-read from `fit.data_path` with the model's endpoint routing only: no \
+                 `[data]` renames and no `[data_selection]` were applied.",
+            );
+            Some(data_hash)
+        }
     };
-    let advice = match source {
-        PopulationSource::Supplied => {
-            "Pass the population the fit was given, or `population = None` to re-read it \
-             from `fit.data_path` with the fit's reader settings."
-        }
-        PopulationSource::RecordedSettings => {
-            "Re-reading `fit.data_path` with the fit's recorded reader settings did not \
-             reproduce the fitted population, so this version of ferx reads the file \
-             differently from the one that made the fit. Pass the fit's population as \
-             `population = Some(&pop)`, or refit."
-        }
-        PopulationSource::ModelFileSettings => {
-            "The fit records no reader settings (it was given its population in memory), \
-             so `fit.data_path` was re-read with the model file's `[data]` renames and \
-             `[data_selection]`, which did not reproduce it. Pass the fit's population as \
-             `population = Some(&pop)`."
-        }
-        PopulationSource::Routed => {
-            "The fit records neither reader settings nor a `model_path`, so `fit.data_path` \
-             was re-read with the model's endpoint routing only: no `[data]` renames and no \
-             `[data_selection]` were applied. Pass the fit's population as \
-             `population = Some(&pop)`."
-        }
-    };
-    EngineError::from(format!(
-        "this population is not the one the fit was given: {d}.{cause} {advice}"
-    ))
+    match data_hash {
+        Some(true) => msg.push_str(" The file matches the SHA-256 the fit recorded."),
+        Some(false) => msg.push_str(
+            " The fit records no SHA-256 of the file, so it may have changed since the fit.",
+        ),
+        None => {}
+    }
+    EngineError::with_suggestion_in_display(
+        crate::diagnostics::Diagnostic::error("E_POPULATION_MISMATCH", msg)
+            .with_suggestion(POPULATION_MISMATCH_SUGGESTION),
+    )
 }
 
 /// The caller's options scoring the objective a stage running `method` minimised:

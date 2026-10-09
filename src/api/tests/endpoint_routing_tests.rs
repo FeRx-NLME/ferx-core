@@ -394,6 +394,13 @@ fn run_covariance_and_run_sir_reject_an_unrouted_population() {
     let err = crate::run_sir(&fit, Some(&m), Some(&u), &opts)
         .expect_err("unrouted population is refused");
     assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "{err}");
+    // #1814 T4: `verify` keeps the pre-emption, so it names the reader too.
+    // Mutation — `verify` refuses through the bare mismatch builder:
+    // `E_POPULATION_MISMATCH` instead.
+    let fp = fit.population_fingerprint.as_ref().expect("fit() stamps");
+    let v = fp.verify(&m, &u).expect_err("verify refuses");
+    assert_eq!(v.code(), Some("E_ENDPOINT_UNROUTED"), "{v}");
+    assert_eq!((v.message(), v.context()), (err.message(), None), "{v}");
 }
 
 /// With `population = None` both re-read `fit.data_path` — routed, since #1199 (this

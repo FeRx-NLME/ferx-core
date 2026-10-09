@@ -374,6 +374,22 @@ A fit records how it read its data and what it was given ([#1685](https://github
 
 With recorded settings, an IOV model passed as `Some(model)` with `population = None` runs too, since the fit records its `iov_column`. A fit without either record — a `.fitrx` saved before #1685 — is resolved as before, without the check. A fingerprint written by a ferx version with another encoding scheme is not compared: the recorded settings are still replayed, the population is not verified, and the result carries a warning saying so.
 
+The refusal carries the code `E_POPULATION_MISMATCH` ([#1813](https://github.com/FeRx-NLME/ferx-core/issues/1813)). Its `message()` names what differs and how the population was obtained (supplied, or re-read with the fit's recorded settings, the model file's, or the model's routing alone, and whether the fit recorded the file's SHA-256); it does not guess why. Its `suggestion()` is the remedy: use the population the fit was given, or refit. A subject list that is not the fit's gets the same code and text, whether or not the fit carries a fingerprint.
+
+#### Checking a population yourself
+
+`PopulationFingerprint::verify` runs the same check on a population you hold ([#1814](https://github.com/FeRx-NLME/ferx-core/issues/1814)), for a post-hoc step that does not go through `run_sir` or `run_covariance`:
+
+```rust
+if let Some(fp) = &fit.population_fingerprint {
+    let notes = fp.verify(&model, &population)?;
+}
+```
+
+It compares, in this order: the subject list, every categorical covariate value against the model's levels (`E_COV_LEVEL_UNKNOWN`), then the covariate columns and each subject's records, doses and covariate values. A mismatch is the same `E_POPULATION_MISMATCH` error, with the same `message()` and `suggestion()` that `run_sir` and `run_covariance` give, but without their entry-point `context()`. The population is compared as the model scores it, so on a model with a `theta NAME[...]` block it must be bound first, with `bind_from_fit` and the fit's `data_bindings`. A population never bound for the block gets `E_THETA_LEVELS_DATA_UNBOUND`, and one read without the model's endpoint routing `E_ENDPOINT_UNROUTED`, as on the two steps.
+
+`Ok` carries notes: none on a match, and one when the fingerprint was written with another encoding scheme, in which case nothing was compared. A fit with no fingerprint (`population_fingerprint` is `None`) has nothing to check against.
+
 ### Hash storage on `FitResult`
 
 When you go through `fit_from_files` or `run_model_with_data`, the resulting `FitResult` carries:
