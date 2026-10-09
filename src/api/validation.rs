@@ -332,13 +332,21 @@ pub(crate) fn check_level_index_columns(
                         Some(g) => format!("its index says {g}"),
                         None => "it carries no index".to_string(),
                     };
+                    // #1797: a subject with no Gaussian observation has no record time
+                    // its level comes from.
+                    let at = match time {
+                        Some(time) => format!(" at time {time}"),
+                        None => ", which has no Gaussian observation (its level is read from \
+                                 its baseline columns),"
+                            .to_string(),
+                    };
                     (
                         "E_THETA_LEVELS_DATA_MISMATCH",
                         format!(
                             "`theta {name}[...]` is bound, but this population's index into \
-                             its levels was written for another level table: subject {id} at \
-                             time {time} is level `{label}`, level {want} of the model's block, \
-                             and {got}. {binder}"
+                             its levels was written for another level table: subject {id}{at} \
+                             is level `{label}`, level {want} of the model's block, and \
+                             {got}. {binder}"
                         ),
                     )
                 }
