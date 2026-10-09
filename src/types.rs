@@ -5559,13 +5559,24 @@ impl CompiledModel {
     /// of ones) reproduces the legacy unscaled variance. FREM covariate rows are
     /// never magnitude-scaled — the multiplier acts on the PK residual only,
     /// mirroring the likelihood and IWRES paths.
+    ///
+    /// `correlations` are the `block_sigma` correlations of the parameter set
+    /// being simulated — normally `ModelParameters::residual_correlations`, or
+    /// the model's declaration when that set carries none. They are an explicit
+    /// argument, not read from `self`, because `self.residual_correlations` is
+    /// the *declared* ρ: drawing a fitted model's residuals at it while using
+    /// the fitted σ was the NPDE defect of #1733. Only the within-observation
+    /// cross term enters here; covariance *between* rows needs the dense `R`
+    /// draw `simulate()` uses for paired rows.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn sim_residual_variance(
         &self,
         subject: &Subject,
         j: usize,
         f_pred: f64,
         sigma: &[f64],
+        correlations: &[ResidualCorrelation],
         ruv_scale: f64,
         mult: Option<&[f64]>,
     ) -> f64 {
@@ -5575,8 +5586,16 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        self.residual_variance_at_scaled(self.error_spec.obs_key(subject, j), f_pred, sigma, mult)
-            * ruv_scale
+        let cmt = self.error_spec.obs_key(subject, j);
+        let v = match mult {
+            Some(m) => self
+                .error_spec
+                .variance_at_scaled(cmt, f_pred, sigma, correlations, m),
+            None => self
+                .error_spec
+                .variance_at_with_correlations(cmt, f_pred, sigma, correlations),
+        };
+        v * ruv_scale
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.

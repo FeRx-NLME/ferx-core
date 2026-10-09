@@ -608,12 +608,8 @@ where
             // that compartment (S1.5 edge a). The base seed keys this
             // (subject, replicate)'s controller-assay substream.
             let ruv_scale = model.residual_var_scale(&eta_slice);
-            let sigma = &params.sigma.values;
             let resid_var = |cmt: usize, ipred: f64| -> Option<f64> {
-                if !model.has_residual_error_for_cmt(cmt, sigma) {
-                    return None;
-                }
-                Some(model.residual_variance_at(cmt, ipred, sigma) * ruv_scale)
+                assay_resid_var(model, params, cmt, ipred, ruv_scale)
             };
             let assay = crate::sim::adaptive::AssayNoise {
                 resid_var: &resid_var,
@@ -983,6 +979,31 @@ pub(crate) fn verify_adaptive_snapshots(
 
     // ── Constant-covariate path: only the baseline `pk` (checked above) applies. ─
     Ok(())
+}
+
+/// The controller-assay residual variance of one `Dv` reading at `ipred` on
+/// `cmt`, or `None` when no `[error_model]` covers that compartment (S1.5 edge
+/// a). It uses the `block_sigma` correlations of the parameter set being
+/// simulated (`draw_correlations`, #1733), not the model's declared ρ. One
+/// reading is one row, so only the within-observation cross term applies.
+pub(crate) fn assay_resid_var(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    cmt: usize,
+    ipred: f64,
+    ruv_scale: f64,
+) -> Option<f64> {
+    let sigma = &params.sigma.values;
+    if !model.has_residual_error_for_cmt(cmt, sigma) {
+        return None;
+    }
+    let correlations = super::simulate::draw_correlations(model, params);
+    Some(
+        model
+            .error_spec
+            .variance_at_with_correlations(cmt, ipred, sigma, correlations)
+            * ruv_scale,
+    )
 }
 
 /// Two `f64`s are the same to the bit (so two runs of the *same* deterministic

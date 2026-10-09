@@ -8028,3 +8028,40 @@ fn both_adaptive_entries_refuse_a_mis_shaped_omega_sigma_or_omega_iov() {
     )
     .expect("simulate_adaptive_from_spec, the model's own shape");
 }
+
+/// #1733: the controller-assay noise draws at the parameter set's `block_sigma`
+/// ρ, not the model's declared one. `combined(PROP, ADD)`, σ = (0.2, 1.0),
+/// f = 10: the closed form `0.04·f² + 1 + 2ρ·0.2·1·f` is 1.4 at the fitted
+/// ρ = −0.9 and 7 at the declared ρ = 0.5, which a `ModelParameters` without
+/// correlations falls back to.
+#[test]
+fn assay_residual_variance_reads_the_parameter_sets_correlation() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/correlated_residual_combined.ferx"
+    ))
+    .expect("read model");
+    let model = parse_model_string(&src).expect("parse correlated combined model");
+    assert_eq!(model.residual_correlations.len(), 1);
+    assert!((model.residual_correlations[0].rho - 0.5).abs() < 1e-12);
+    let mut params = model.default_params.clone();
+    params.residual_correlations = vec![crate::types::ResidualCorrelation {
+        rho: -0.9,
+        ..model.residual_correlations[0].clone()
+    }];
+    let fitted = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0)
+        .expect("cmt 1 has an error model");
+    assert!((fitted - 1.4).abs() < 1e-12, "fitted ρ: {fitted}, want 1.4");
+    // ruv_scale multiplies the whole variance.
+    let scaled = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 2.0).unwrap();
+    assert!(
+        (scaled - 2.8).abs() < 1e-12,
+        "ruv_scale 2: {scaled}, want 2.8"
+    );
+    params.residual_correlations.clear();
+    let declared = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0).unwrap();
+    assert!(
+        (declared - 7.0).abs() < 1e-12,
+        "fallback: {declared}, want 7"
+    );
+}

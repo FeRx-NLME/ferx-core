@@ -136,6 +136,7 @@ pub(crate) use predict::grid_median_from_cumhaz;
 pub(crate) use run::derive_output_occasions;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
+pub(crate) use simulate::{correlated_residual_draw, draw_correlations};
 
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same

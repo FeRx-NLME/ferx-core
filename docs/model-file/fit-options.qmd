@@ -385,6 +385,27 @@ sides, `ESAMPLE = nsim = 2000`. Row by row, ferx and NONMEM agree to a worst
 independent 2000-draw empirical CDFs. Forcing $\Omega_{\text{IOV}}$ to zero (the
 old behaviour) breaks that agreement to 0.895 and 4.389.
 
+### Correlated residuals (`block_sigma`)
+
+For a model with a `block_sigma`, the reference distribution draws its residuals
+at the correlation of the parameter set being scored. After a fit, that is the
+fitted ρ, not the value declared in the model file. Rows that `simulate()` pairs
+(the same time and occasion, or the same `L2` id) are drawn jointly from the dense
+residual covariance, as `simulate()` draws them. The pairing shows in NPDE, the
+decorrelated score. A paired row's NPD is its own marginal and does not depend on
+the pairing. A `FIX`ed `block_sigma` on unpaired rows is drawn exactly as before,
+so its scores are unchanged. A `ModelParameters` built without correlations falls
+back to the model's declaration. Earlier versions drew every row independently at
+the declared ρ (#1733).
+
+The cross-tool check is `tests/npde_block_sigma_nonmem_anchor.rs`, with NONMEM's
+`$SIGMA BLOCK(2)` fixed at the fitted ρ. A `combined` error at ρ = −0.9 agrees to
+a worst `|ΔNPDE|` of 0.286, and a total/unbound pair sharing an `L2` id at
+ρ = −0.8 agrees to 0.288. Drawing at the declared ρ instead breaks these to 1.75
+and 2.55. On the second row of an `L2` record NONMEM's NPD is not that row's
+marginal: it follows the partner row's score, about 2 apart from ferx's. Compare
+NPDE there, not NPD.
+
 ### NPDE decorrelation: ferx follows the `npde` package, not NONMEM's default
 
 NONMEM *does* emit NPDE and NPD natively — `$TABLE ID TIME DV NPDE NPD

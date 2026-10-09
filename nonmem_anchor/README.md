@@ -1038,3 +1038,42 @@ pair whose penalties must differ by exactly 4×. Anchoring Ω would need the
 `$OMEGA 1 FIX` + `EXP(THETA(k))·ETA(1)` reparameterisation, which rests on FOCE's
 marginal being invariant under a linear rescaling of η; that is a separate null
 control and is not yet run.
+
+## NPDE with a correlated `block_sigma` (#1733)
+
+`compute_npde_npd` drew every simulated residual at the model's **declared**
+`block_sigma` ρ, one row at a time. A fit that estimated ρ was scored at its
+starting value, and a cross-endpoint pair as if its residuals were independent.
+Each ferx twin declares ρ = 0.5 (free) and is scored at the fitted ρ; each NONMEM
+stream FIXes the fitted ρ in `$SIGMA BLOCK(2)` and tables `NPDE NPD` with
+`ESAMPLE=2000 SEED=1733 WRESCHOL` (the Cholesky decorrelation ferx uses).
+
+| Arm | What is correlated | NONMEM | ferx twin | Data |
+|---|---|---|---|---|
+| A | `combined(PROP, ADD)` within one observation, fitted ρ = −0.9 | `npde_block_sigma_a.ctl` | `tests/fixtures/npde_block_sigma_a.ferx` | `npde_block_sigma_a.csv` |
+| B | total / unbound pair across an `L2` record, fitted ρ = −0.8 | `npde_block_sigma_b.ctl` | `tests/fixtures/npde_block_sigma_b.ferx` | `npde_block_sigma_b.csv` |
+
+Data: `simulate_npde_block_sigma_data.py` (stdlib), 30 subjects, two doses (the
+second on residual drug). Results: `results/npde_block_sigma_{a,b}.{tab,lst,ext}`
+from the `nonmem:7.6.0-anchor` image. `nm3`'s verdict line cannot parse a
+`MAXEVAL=0` listing (no `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`), so it exits 1
+after a successful run. The anchor outputs are used directly (#OBJV A 217.0685,
+B 179.2387).
+
+Worst |Δ| against NONMEM (`tests/npde_block_sigma_nonmem_anchor.rs`, bounds 2×):
+
+| Arm | ρ ferx draws at | NPD | NPDE |
+|---|---|---|---|
+| A | fitted −0.9 | **0.43894** | **0.28557** |
+| A | declared 0.5 / 0 (controls) | 1.69 / 1.43 | 1.75 / 1.63 |
+| B | fitted −0.8 | **0.11838** (`FREE = 0`) | **0.28835** |
+| B | declared 0.5 / 0 (controls) | — | 2.55 / 1.73 |
+
+Two measured results:
+
+- **NONMEM's `$TABLE NPDE` simulation honours `L2`.** Its NPDE matches ferx's joint
+  draw at the fitted ρ and disagrees with an independent one (1.73).
+- **NONMEM's NPD on the second row of an `L2` record is not the row's marginal.**
+  It tracks the partner row's score, and differs from ferx's by 2.13 at every ρ
+  tried. ferx's NPD is the row's own marginal (Brendel/Comets). The test pins the
+  gap, so a change toward NONMEM's convention has to be deliberate.

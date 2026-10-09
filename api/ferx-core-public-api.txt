@@ -2740,7 +2740,7 @@ pub fn ferx_core::CompiledModel::residual_variance_at(&self, cmt: usize, f_pred:
 pub fn ferx_core::CompiledModel::residual_variance_at_scaled(&self, cmt: usize, f_pred: f64, sigma: &[f64], mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::ruv_obs_mult(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub fn ferx_core::CompiledModel::ruv_obs_mult_theta_grad(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<alloc::vec::Vec<f64>>>>
-pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
+pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], correlations: &[ferx_core::ResidualCorrelation], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::sync_ode_solver_opts(&mut self, opts: &ferx_core::FitOptions)
 pub fn ferx_core::CompiledModel::theta_blocks(&self) -> &ferx_core::parser::model_parser::ThetaBlocks
 pub fn ferx_core::CompiledModel::tte_cmts(&self) -> alloc::vec::Vec<usize>
@@ -4159,7 +4159,7 @@ pub fn ferx_core::CompiledModel::residual_variance_at(&self, cmt: usize, f_pred:
 pub fn ferx_core::CompiledModel::residual_variance_at_scaled(&self, cmt: usize, f_pred: f64, sigma: &[f64], mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::ruv_obs_mult(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub fn ferx_core::CompiledModel::ruv_obs_mult_theta_grad(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<alloc::vec::Vec<f64>>>>
-pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
+pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], correlations: &[ferx_core::ResidualCorrelation], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::sync_ode_solver_opts(&mut self, opts: &ferx_core::FitOptions)
 pub fn ferx_core::CompiledModel::theta_blocks(&self) -> &ferx_core::parser::model_parser::ThetaBlocks
 pub fn ferx_core::CompiledModel::tte_cmts(&self) -> alloc::vec::Vec<usize>
