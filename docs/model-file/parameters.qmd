@@ -124,6 +124,20 @@ so it is refused rather than read at another level's θ. To simulate a design wi
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
+Levels are discovered from **Gaussian observation records** only. A subject with
+no Gaussian observation — only time-to-event, binary, categorical or Markov
+records — reads the level its own baseline columns name (the first non-missing
+value of each, as for any covariate its hazard or logit reads). So a TTE-only
+subject in study 3 reads `PLACEBO[STUDY=3]`. When its columns name no level the
+block has (a study with no Gaussian records, a study the fit never saw, or any
+block keyed on `TIME`, since such a subject has no observation time), binding is
+refused with `E_THETA_LEVEL_BINDING` if anything that subject is scored on reads
+the block, and binds otherwise. Whether it reads the block is measured on its
+likelihood at two θ points, with the same caveat as
+[Levels with no effect](#levels-with-no-effect): a read that a θ switches off at
+both points looks like no read. Earlier versions indexed every such subject at
+the first level, whatever its columns said (#1797).
+
 ### Where a block may be read
 
 Read a level block in `[individual_parameters]`, or directly in the

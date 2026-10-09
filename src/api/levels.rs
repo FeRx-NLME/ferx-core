@@ -113,6 +113,7 @@ fn bind_levels_on_data(
     // scratch copy, so a refusal below leaves `population` untouched.
     let mut bound = population.clone();
     let mut discovered: Vec<Vec<Level>> = Vec::with_capacity(decls.len());
+    let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
     for decl in &decls {
         let levels = discover_levels(decl, &bound)?;
         let table: Vec<(Level, usize)> = levels
@@ -120,8 +121,9 @@ fn bind_levels_on_data(
             .enumerate()
             .map(|(i, l)| (l.clone(), i + 1))
             .collect();
-        write_index_column(decl, &table, &mut bound)?;
+        write_index_column(decl, &table, &mut bound.subjects)?;
         discovered.push(levels);
+        tables.push(table);
     }
 
     // A kappa's unit is a subject-occasion, so the binder needs the occasions
@@ -175,6 +177,15 @@ fn bind_levels_on_data(
     let mut all = base;
     all.levels = bindings;
     let rebound = parse_full_model_with(model_text, &all)?;
+    // #1797: on the model as it will be fitted, so the measurement is the contrast the
+    // block resolved to.
+    refuse_read_unindexed(
+        &rebound.model,
+        &decls,
+        &tables,
+        population,
+        LevelSource::Data,
+    )?;
     parsed.bindings = all;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
@@ -246,9 +257,6 @@ fn bind_levels_from_fit_layout(
         return Ok(());
     }
     let tables = fitted_level_tables(&decls, population, fitted)?;
-    for (decl, table) in decls.iter().zip(&tables) {
-        write_index_column(decl, table, population)?;
-    }
     let model_name = parsed.model.name.clone();
     // The statistics are the caller's, as they always were for this binder: the
     // sequence it was documented with installs the fit's statistics by hand, and
@@ -257,6 +265,16 @@ fn bind_levels_from_fit_layout(
     bindings.covariate_stats = parsed.bindings.covariate_stats.clone();
     bindings.levels = fitted.clone();
     let rebound = parse_full_model_with(model_text, &bindings)?;
+    refuse_read_unindexed(
+        &rebound.model,
+        &decls,
+        &tables,
+        population,
+        LevelSource::Fit,
+    )?;
+    for (decl, table) in decls.iter().zip(&tables) {
+        write_index_column(decl, table, &mut population.subjects)?;
+    }
     parsed.bindings = bindings;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
@@ -351,8 +369,17 @@ pub(crate) fn bind_from_fit_on(
         }
     };
     if let Some(population) = population {
+        refuse_read_unindexed(
+            &layout.model,
+            &layout.decls,
+            &tables,
+            population,
+            LevelSource::Fit,
+        )
+        .map_err(level_binding_error)?;
         for (decl, table) in layout.decls.iter().zip(&tables) {
-            write_index_column(decl, table, population).map_err(level_binding_error)?;
+            write_index_column(decl, table, &mut population.subjects)
+                .map_err(level_binding_error)?;
         }
     }
     layout.apply(parsed);
@@ -581,8 +608,9 @@ pub(crate) fn write_fitted_level_columns(
     (|| -> Result<(), String> {
         validate_fitted_levels(&decls, fitted)?;
         let tables = fitted_level_tables(&decls, population, fitted)?;
+        refuse_read_unindexed(model, &decls, &tables, population, LevelSource::Fit)?;
         for (decl, table) in decls.iter().zip(&tables) {
-            write_index_column(decl, table, population)?;
+            write_index_column(decl, table, &mut population.subjects)?;
         }
         Ok(())
     })()
@@ -819,10 +847,11 @@ pub(crate) enum LevelIndexFinding {
     Unseen { labels: Vec<String> },
     /// The first record whose index is not its label's position in the model's table:
     /// subject `id` at record time `time` is level `label`, position `want`, and
-    /// carries `got` (`None`: no index on that record).
+    /// carries `got` (`None`: no index on that record). `time` is `None` for a subject
+    /// with no Gaussian observation, whose level is its baseline columns' (#1797).
     Misindexed {
         id: String,
-        time: f64,
+        time: Option<f64>,
         label: String,
         want: usize,
         got: Option<f64>,
@@ -837,10 +866,14 @@ pub(crate) enum LevelIndexFinding {
 /// from the record's own level values, so the index is re-derived here the same way,
 /// through the binder's own label matcher ([`match_level_table`]), and compared with the
 /// index the predictors read on that record (`Subject::obs_cov`: the record's snapshot,
-/// else the subject's baseline). Only the Gaussian observation records are compared:
-/// they define the block's levels. A dose, `EVID=2` or reset record carries an LOCF copy
-/// written by the same binder and is not re-checked, so an edit to only such a snapshot
-/// is out of this check's reach.
+/// else the subject's baseline). The Gaussian observation records are compared: they
+/// define the block's levels. So is every subject with no Gaussian observation whose
+/// baseline columns name a level of the table (#1797), against its baseline index, which
+/// is what its likelihood reads; one whose columns name no level is skipped, since the
+/// binder decided it (it binds at index 1 only when nothing it is scored on reads the
+/// block). A dose, `EVID=2` or reset record carries an LOCF copy written by the same
+/// binder and is not re-checked, so an edit to only such a snapshot is out of this
+/// check's reach.
 pub(crate) fn level_index_finding(
     decl: &LevelBlockDecl,
     population: &Population,
@@ -874,6 +907,9 @@ pub(crate) fn level_index_finding(
         // No record defines a level, so no index can be wrong.
         return None;
     }
+    if let Some(finding) = no_gaussian_misindexed(decl, population, &column) {
+        return Some(finding);
+    }
     let (table, unseen) = match_level_table(decl, population, decl.labels())
         .expect("every level column is present and finite on every record");
     if !unseen.is_empty() {
@@ -897,16 +933,57 @@ pub(crate) fn level_index_finding(
             if got != Some(want as f64) {
                 return Some(LevelIndexFinding::Misindexed {
                     id: subject.id.clone(),
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
+                    time: Some(
+                        subject
+                            .obs_raw_times
+                            .get(j)
+                            .copied()
+                            .unwrap_or(subject.obs_times[j]),
+                    ),
                     label: level.label(decl.columns()),
                     want,
                     got,
                 });
             }
+        }
+    }
+    None
+}
+
+/// [`level_index_finding`]'s arm for subjects with no Gaussian observation (#1797): the
+/// first whose baseline columns name a level of the model's table but whose index is not
+/// that level's position. The level is matched by label, as [`match_level_table`] does.
+fn no_gaussian_misindexed(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    column: &str,
+) -> Option<LevelIndexFinding> {
+    for subject in population
+        .subjects
+        .iter()
+        .filter(|s| s.obs_times.is_empty())
+    {
+        let Ok(values) = baseline_level(decl, subject) else {
+            continue;
+        };
+        let label = Level { values }.label(decl.columns());
+        let Some(want) = decl
+            .labels()
+            .iter()
+            .position(|l| *l == label)
+            .map(|i| i + 1)
+        else {
+            continue;
+        };
+        let got = subject.covariates.get(column).copied();
+        if got != Some(want as f64) {
+            return Some(LevelIndexFinding::Misindexed {
+                id: subject.id.clone(),
+                time: None,
+                label,
+                want,
+                got,
+            });
         }
     }
     None
@@ -2082,11 +2159,17 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 /// keeps whatever fast path it had. When it varies (the unstructured-placebo
 /// case, where the index moves with the timepoint) the per-event snapshots are
 /// materialised, which is exactly what a genuinely per-record parameter needs.
+///
+/// A subject with no Gaussian observation (#1797) has no record that defines a level,
+/// and its other records carry no covariate snapshot, so it is indexed at the level its
+/// baseline `covariates` name — the values its likelihood reads. When `table` holds no
+/// such level (or the block is keyed on `TIME`, which such a subject cannot name) it
+/// gets index 1 and is returned, for [`refuse_read_unindexed`] to measure.
 fn write_index_column(
     decl: &LevelBlockDecl,
     table: &[(Level, usize)],
-    population: &mut Population,
-) -> Result<(), String> {
+    subjects: &mut [Subject],
+) -> Result<Vec<Unindexed>, String> {
     let column = level_index_column(decl.name());
     let index_of = |values: &[f64]| -> Option<f64> {
         table
@@ -2095,7 +2178,8 @@ fn write_index_column(
             .map(|&(_, i)| i as f64)
     };
 
-    for subject in population.subjects.iter_mut() {
+    let mut unindexed = Vec::new();
+    for subject in subjects.iter_mut() {
         let n_obs = subject.obs_times.len();
         let mut obs_index = Vec::with_capacity(n_obs);
         for j in 0..n_obs {
@@ -2115,7 +2199,31 @@ fn write_index_column(
             obs_index.push(idx);
         }
 
-        let first = obs_index.first().copied().unwrap_or(1.0);
+        // A subject with no Gaussian observation (TTE, binary, categorical or Markov
+        // records only, #1797) has no record defining a level, and its records carry no
+        // covariate snapshot of their own: what its likelihood reads is its baseline
+        // `covariates`, so that is the level it is indexed at. A level the table does
+        // not hold gets index 1, and the subject is returned so the caller can refuse
+        // the binding if anything that subject is scored on reads the block.
+        let first = match obs_index.first() {
+            Some(&i) => i,
+            None => match baseline_level(decl, subject) {
+                Ok(values) => index_of(&values).unwrap_or_else(|| {
+                    unindexed.push(Unindexed {
+                        id: subject.id.clone(),
+                        why: Why::NoLevel(Level { values }.label(decl.columns())),
+                    });
+                    1.0
+                }),
+                Err(why) => {
+                    unindexed.push(Unindexed {
+                        id: subject.id.clone(),
+                        why,
+                    });
+                    1.0
+                }
+            },
+        };
         subject.covariates.insert(column.clone(), first);
         let varies = obs_index.iter().any(|&v| v != first);
         if !varies {
@@ -2202,7 +2310,222 @@ fn write_index_column(
     // synthesized column is engine plumbing (#1644). The binder rejects a
     // population with no observations, so every bound population has subjects
     // to carry it.
+    Ok(unindexed)
+}
+
+/// A subject with no Gaussian observation whose own level the writer could not index
+/// (#1797): [`write_index_column`] gave it index 1, a value only a likelihood that
+/// does not read the block may carry.
+#[derive(Debug, Clone, PartialEq)]
+struct Unindexed {
+    id: String,
+    why: Why,
+}
+
+/// Why a subject with no Gaussian observation has no index of its own.
+#[derive(Debug, Clone, PartialEq)]
+enum Why {
+    /// Its baseline columns name this level, which the table does not hold.
+    NoLevel(String),
+    /// The block is keyed on `TIME`, and the subject has no observation time.
+    Time,
+    /// Its baseline carries no finite value in this level column.
+    Missing(String),
+}
+
+impl Why {
+    fn item(&self, id: &str) -> String {
+        match self {
+            Why::NoLevel(label) => format!("subject {id} (`{label}`)"),
+            Why::Time => format!("subject {id} (no observation time)"),
+            Why::Missing(c) => format!("subject {id} (no value in level column `{c}`)"),
+        }
+    }
+}
+
+/// The level a subject with no Gaussian observation names: its baseline value in each
+/// level column, the first non-missing one in its records (`Subject::covariates`).
+fn baseline_level(decl: &LevelBlockDecl, subject: &Subject) -> Result<Vec<f64>, Why> {
+    decl.columns()
+        .iter()
+        .map(|c| {
+            if c.eq_ignore_ascii_case(TIME_COLUMN) {
+                return Err(Why::Time);
+            }
+            subject
+                .covariates
+                .get(c)
+                .copied()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| Why::Missing(c.clone()))
+        })
+        .collect()
+}
+
+/// Where a binding's level table came from, for [`refuse_read_unindexed`]'s text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelSource {
+    /// Discovered from the population itself ([`bind_theta_levels`]).
+    Data,
+    /// A fit's bindings ([`bind_from_fit`] and the re-read of a fit's data).
+    Fit,
+}
+
+/// Refuse a binding that would score a subject with no Gaussian observation at a
+/// level other than its own (#1797).
+///
+/// Such a subject is indexed at the level its baseline columns name. When the table
+/// (`tables`, parallel to `decls`) holds no such level — the data's Gaussian records
+/// never showed it, the fit never estimated it, or the block is keyed on `TIME` — the
+/// writer gives it index 1, which is harmless only if nothing it is scored on reads
+/// the block. That is measured, not inferred from which endpoint reads which
+/// parameter: the engine's own `individual_nll` at η = 0, on the subject with its
+/// index set to each level of `model`'s block in turn, with every free θ of the block
+/// moved inside its bounds (so that no two levels share a value, a reference level
+/// fixed at 0 included), and at index 1 under the initial θ (so a one-level block is
+/// measured too). The block is read when any two of those differ. Only a measured,
+/// finite "no change" binds; a non-finite value measures nothing and counts as a
+/// read. Like the dead-level check, two θ points can miss a read that a θ switches
+/// off at both.
+///
+/// Reads `population` and writes nothing: only the subjects with no Gaussian
+/// observation are copied, so a binder can call this before it writes any column.
+fn refuse_read_unindexed(
+    model: &CompiledModel,
+    decls: &[LevelBlockDecl],
+    tables: &[Vec<(Level, usize)>],
+    population: &Population,
+    source: LevelSource,
+) -> Result<(), String> {
+    let mut subjects: Vec<Subject> = population
+        .subjects
+        .iter()
+        .filter(|s| s.obs_times.is_empty())
+        .cloned()
+        .collect();
+    if subjects.is_empty() {
+        return Ok(());
+    }
+    let mut unindexed: Vec<Vec<Unindexed>> = Vec::with_capacity(decls.len());
+    for (decl, table) in decls.iter().zip(tables) {
+        unindexed.push(write_index_column(decl, table, &mut subjects)?);
+    }
+    let p = &model.default_params;
+    let eta = vec![0.0; model.n_eta];
+    for (decl, unindexed) in decls.iter().zip(&unindexed) {
+        if unindexed.is_empty() {
+            continue;
+        }
+        let n_levels = model
+            .theta_blocks()
+            .level_blocks()
+            .iter()
+            .find(|d| d.name() == decl.name())
+            .map_or(1, |d| d.labels().len().max(1));
+        let prefix = format!("{}[", decl.name());
+        let mut moved = p.theta.clone();
+        for (k, x) in moved.iter_mut().enumerate() {
+            if model.theta_names[k].starts_with(&prefix)
+                && !p.theta_fixed.get(k).copied().unwrap_or(false)
+            {
+                // Distinct per θ, as in `dead_levels`, so no two levels coincide.
+                let step = (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0);
+                *x = toward_interior(*x, p.theta_lower[k], p.theta_upper[k], step);
+            }
+        }
+        let column = level_index_column(decl.name());
+        let reads = |subject: &Subject| -> bool {
+            let nll = |theta: &[f64], index: f64| {
+                let mut s = subject.clone();
+                set_index(&mut s, &column, index);
+                crate::stats::likelihood::individual_nll(
+                    model,
+                    &s,
+                    theta,
+                    &eta,
+                    &p.omega,
+                    &p.sigma.values,
+                )
+            };
+            let at_init = nll(&p.theta, 1.0);
+            !at_init.is_finite()
+                || (1..=n_levels).any(|i| {
+                    let v = nll(&moved, i as f64);
+                    !v.is_finite() || v.to_bits() != at_init.to_bits()
+                })
+        };
+        let read: Vec<&Unindexed> = unindexed
+            .iter()
+            .filter(|u| subjects.iter().find(|s| s.id == u.id).is_some_and(&reads))
+            .collect();
+        if !read.is_empty() {
+            return Err(unindexed_read_message(decl, &read, source));
+        }
+    }
     Ok(())
+}
+
+/// `index` on every record of `subject`, for the readership measurement.
+fn set_index(subject: &mut Subject, column: &str, index: f64) {
+    subject.covariates.insert(column.to_string(), index);
+    for maps in [
+        &mut subject.obs_covariates,
+        &mut subject.dose_covariates,
+        &mut subject.pk_only_covariates,
+        &mut subject.reset_covariates,
+    ] {
+        for m in maps.iter_mut() {
+            m.insert(column.to_string(), index);
+        }
+    }
+}
+
+/// The refusal for subjects with no Gaussian observation that read a level block at a
+/// level it has no θ for (#1797). Every subject is listed, as for unseen levels.
+fn unindexed_read_message(
+    decl: &LevelBlockDecl,
+    read: &[&Unindexed],
+    source: LevelSource,
+) -> String {
+    let items: Vec<String> = read.iter().map(|u| u.why.item(&u.id)).collect();
+    let mut message = format!(
+        "theta {}[{}]: {} subject(s) with no Gaussian observation are scored on something \
+         that reads this block, at a level it has no theta for: {}.",
+        decl.name(),
+        decl.columns().join(", "),
+        read.len(),
+        items.join(", ")
+    );
+    message.push_str(
+        " A subject with no Gaussian observation takes its level from its baseline columns.",
+    );
+    message.push_str(match source {
+        LevelSource::Data => {
+            " The block's levels are discovered from Gaussian observation records only, \
+             so a level that only such subjects show is not one of them."
+        }
+        LevelSource::Fit => {
+            " A level's theta exists only for a combination the fit's Gaussian \
+             observations showed."
+        }
+    });
+    if read.iter().any(|u| u.why == Why::Time) {
+        message.push_str(&format!(
+            " `{TIME_COLUMN}` is a level column of this block, and a subject with no \
+             Gaussian observation has no observation time to name a level of it."
+        ));
+    }
+    message.push_str(match source {
+        LevelSource::Data if read.iter().any(|u| matches!(u.why, Why::NoLevel(_))) => {
+            " Give each such level Gaussian observations, drop those subjects, or stop \
+             reading the block in what they are scored on."
+        }
+        LevelSource::Data => {
+            " Drop those subjects, or stop reading the block in what they are scored on."
+        }
+        LevelSource::Fit => " Drop those subjects: the fit has no theta for what they read.",
+    });
+    message
 }
 
 /// Complete level labels of every bound level block, keyed by block name.

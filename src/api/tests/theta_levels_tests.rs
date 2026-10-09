@@ -7596,3 +7596,562 @@ mod binding_codes {
         }
     }
 }
+
+/// #1797: a subject with no Gaussian observation (TTE / binary records only) is indexed
+/// at the level its own baseline columns name, and refused when it names no level and
+/// something it is scored on reads the block.
+///
+/// Every fixture here runs on the **value** path: `predict_survival` and
+/// `individual_nll` read the index through the one gather (`index_covariate`), so the
+/// writers exercised below (`bind_theta_levels`, `bind_from_fit`,
+/// `write_fitted_level_columns`) are callers of one reader, not independent references.
+#[cfg(feature = "survival")]
+mod no_gaussian_subjects {
+    use super::*;
+    use crate::api::validation::{check_level_index_columns, LevelDataEntry};
+    use crate::api::{bind_from_fit, bind_theta_levels, read_population_for};
+    use crate::stats::likelihood::individual_nll;
+    use std::io::Write as _;
+
+    const TVH0: f64 = 0.05;
+    const P2: f64 = 0.5;
+    const P3: f64 = 1.0;
+    /// The event time of every TTE-only subject.
+    const T_EVENT: f64 = 7.0;
+
+    /// Fixture F (plan §0): ODE PK on `central`, a constant hazard
+    /// `H0 = TVH0 * exp(PLACEBO)` keyed on `STUDY` under `contrast = ref`. Level 1 is
+    /// the reference, fixed at 0, so a readership measurement that only tries index 1
+    /// sees nothing. `hazard_reads = false` is C4: the block moves to `CL`, which the
+    /// hazard never reads.
+    pub(super) fn model_f(hazard_reads: bool) -> String {
+        let (cl, h0) = if hazard_reads {
+            ("TVCL * exp(ETA_CL)", "TVH0 * exp(PLACEBO)")
+        } else {
+            ("TVCL * exp(ETA_CL) * exp(PLACEBO)", "TVH0")
+        };
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVH0({TVH0}, 1e-5, 10.0)
+  theta PLACEBO[STUDY, contrast = ref](0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = {cl}
+  V  = TVV
+  H0 = {h0}
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+
+    /// Studies 1–3, two joint subjects each (dose, three PK observations, one exact
+    /// event), plus one TTE-only subject per `(id, study)` in `tte_only`, with an
+    /// exact event at [`T_EVENT`]. `keep` filters the joint subjects by id.
+    pub(super) fn csv(tte_only: &[(u32, u32)], keep: &dyn Fn(u32) -> bool) -> String {
+        let mut rows = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n");
+        for id in (1..=6u32).filter(|&i| keep(i)) {
+            let study = id.div_ceil(2);
+            rows.push_str(&format!("{id},0,.,1,100,1,1,{study}\n"));
+            for (t, dv) in [(1.0, 4.6), (2.0, 4.1), (4.0, 3.3)] {
+                rows.push_str(&format!("{id},{t},{dv},0,.,1,0,{study}\n"));
+            }
+            rows.push_str(&format!("{id},{},1,0,.,3,0,{study}\n", 4 + id));
+        }
+        for &(id, study) in tte_only {
+            rows.push_str(&format!("{id},{T_EVENT},1,0,.,3,0,{study}\n"));
+        }
+        rows
+    }
+
+    pub(super) fn read(model: &CompiledModel, csv: &str) -> Population {
+        let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        read_population_for(model, &None, &path, None, None, None, &[])
+            .expect("fixture data reads")
+            .0
+    }
+
+    /// Parse `text`, read `csv` for it and bind its levels on that data.
+    pub(super) fn bound(text: &str, csv: &str) -> Result<(ParsedModel, Population), String> {
+        let mut parsed = parse_full_model(text).unwrap();
+        let mut pop = read(&parsed.model, csv);
+        bind_theta_levels(&mut parsed, text, &mut pop).map_err(|e| e.to_string())?;
+        Ok((parsed, pop))
+    }
+
+    fn subject<'a>(pop: &'a Population, id: &str) -> &'a Subject {
+        pop.subjects.iter().find(|s| s.id == id).unwrap()
+    }
+
+    pub(super) fn index(pop: &Population, id: &str) -> Option<f64> {
+        subject(pop, id)
+            .covariates
+            .get(&level_index_column("PLACEBO"))
+            .copied()
+    }
+
+    /// The model's initial parameters with `PLACEBO[STUDY=2]` = [`P2`] and
+    /// `PLACEBO[STUDY=3]` = [`P3`].
+    pub(super) fn params(model: &CompiledModel) -> crate::types::ModelParameters {
+        let mut p = model.default_params.clone();
+        for (name, v) in [("PLACEBO[STUDY=2]", P2), ("PLACEBO[STUDY=3]", P3)] {
+            let k = model
+                .theta_names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("{name} in {:?}", model.theta_names));
+            p.theta[k] = v;
+        }
+        p
+    }
+
+    fn cum_hazard(model: &CompiledModel, pop: &Population, id: &str) -> f64 {
+        let rows = crate::api::predict_survival(model, pop, &params(model), &[T_EVENT]).unwrap();
+        let r = rows.iter().find(|r| r.id == id).unwrap();
+        assert!(
+            r.cum_hazard.is_finite(),
+            "subject {id}: H = {}",
+            r.cum_hazard
+        );
+        r.cum_hazard
+    }
+
+    fn nll(model: &CompiledModel, pop: &Population, id: &str) -> f64 {
+        let p = params(model);
+        let v = individual_nll(
+            model,
+            subject(pop, id),
+            &p.theta,
+            &vec![0.0; model.n_eta],
+            &p.omega,
+            &p.sigma.values,
+        );
+        assert!(v.is_finite(), "subject {id}: nll = {v}");
+        v
+    }
+
+    fn close(got: f64, want: f64, what: &str) {
+        assert!(
+            ((got - want) / want).abs() <= 1e-12,
+            "{what}: got {got:.15}, want {want:.15}"
+        );
+    }
+
+    /// T1. Subject 99 (TTE only, `STUDY=3`) is indexed at level 3 and its hazard reads
+    /// `PLACEBO[STUDY=3]`: `H(7) = 0.05·e·7`. Subject 98 (TTE only, `STUDY=1`), the
+    /// control, is level 1 either way. The straddle is asserted: before the fix both read
+    /// level 1 and the two `H` were equal.
+    ///
+    /// Mutation — restore `obs_index.first().copied().unwrap_or(1.0)`: 99 → 1, `H` equal.
+    #[test]
+    fn a_tte_only_subject_reads_its_own_level() {
+        let text = model_f(true);
+        let (parsed, pop) = bound(&text, &csv(&[(98, 1), (99, 3)], &|_| true)).unwrap();
+        assert_eq!(index(&pop, "99"), Some(3.0));
+        assert_eq!(index(&pop, "98"), Some(1.0));
+        let h99 = cum_hazard(&parsed.model, &pop, "99");
+        let h98 = cum_hazard(&parsed.model, &pop, "98");
+        close(h99, TVH0 * P3.exp() * T_EVENT, "H(7), subject 99");
+        close(h98, TVH0 * T_EVENT, "H(7), subject 98");
+        assert_ne!(h99, h98, "the straddle: 99 and 98 name different levels");
+    }
+
+    /// T2. The likelihood consumer: for a constant hazard and an exact event,
+    /// `nll = λt − ln λ + ½ ln ω²` at η = 0, so `2·(nll₉₉ − nll₉₈)` is
+    /// `2·[(λ₃ − λ₁)·t − (ln λ₃ − ln λ₁)]` = −0.797202…, the constant cancelling.
+    ///
+    /// Mutation — the T1 mutation: the difference is 0.
+    #[test]
+    fn a_tte_only_subject_is_scored_at_its_own_level() {
+        let text = model_f(true);
+        let (parsed, pop) = bound(&text, &csv(&[(98, 1), (99, 3)], &|_| true)).unwrap();
+        let (l1, l3) = (TVH0, TVH0 * P3.exp());
+        let want = 2.0 * ((l3 - l1) * T_EVENT - (l3.ln() - l1.ln()));
+        let got = 2.0 * (nll(&parsed.model, &pop, "99") - nll(&parsed.model, &pop, "98"));
+        assert!(
+            (got - want).abs() <= 1e-12,
+            "2·Δnll: got {got:.15}, want {want:.15}"
+        );
+        assert!((want + 0.797202).abs() < 1e-6, "closed form {want}");
+    }
+
+    /// The fit's bindings: fixture F bound on its own data (98 at `STUDY=1`).
+    fn fitted() -> crate::parser::model_parser::DataBindings {
+        let (parsed, _) = bound(&model_f(true), &csv(&[(98, 1)], &|_| true)).unwrap();
+        parsed.model.data_bindings().clone()
+    }
+
+    /// T3 (C7). `bind_from_fit` on a design holding only joint subject 5 and TTE-only
+    /// subject 99, both `STUDY=3`: each gets the **fit's** index of `STUDY=3`, 3 — a
+    /// rediscovery on the design would give 1.
+    ///
+    /// Mutation — the T1 mutation (one writer serves every binder): 99 → 1.
+    #[test]
+    fn bind_from_fit_indexes_a_tte_only_subject_at_the_fits_level() {
+        let text = model_f(true);
+        let mut parsed = parse_full_model(&text).unwrap();
+        let mut design = read(&parsed.model, &csv(&[(99, 3)], &|i| i == 5));
+        bind_from_fit(&mut parsed, &text, &mut design, &fitted()).unwrap();
+        assert_eq!(index(&design, "5"), Some(3.0));
+        assert_eq!(index(&design, "99"), Some(3.0));
+        close(
+            cum_hazard(&parsed.model, &design, "99"),
+            TVH0 * P3.exp() * T_EVENT,
+            "H(7), subject 99, from fit",
+        );
+    }
+
+    /// T4. `write_fitted_level_columns`, the `run_sir` / `run_covariance` re-read of a
+    /// fit's data: 99 → 3.
+    ///
+    /// Mutation — the T1 mutation: 99 → 1.
+    #[test]
+    fn the_fit_data_re_read_indexes_a_tte_only_subject_at_its_level() {
+        let text = model_f(true);
+        let (parsed, _) = bound(&text, &csv(&[(98, 1), (99, 3)], &|_| true)).unwrap();
+        let mut reread = read(&parsed.model, &csv(&[(98, 1), (99, 3)], &|_| true));
+        write_fitted_level_columns(
+            &parsed.model,
+            &mut reread,
+            &parsed.model.data_bindings().levels,
+        )
+        .unwrap();
+        assert_eq!(index(&reread, "99"), Some(3.0));
+        assert_eq!(index(&reread, "98"), Some(1.0));
+    }
+
+    /// The refusal's sentences, each asserted where it applies (§3 text table).
+    const WHO: &str = "1 subject(s) with no Gaussian observation are scored on something \
+                       that reads this block, at a level it has no theta for: subject 97 \
+                       (`STUDY=4`).";
+    const BASELINE: &str =
+        "A subject with no Gaussian observation takes its level from its baseline columns.";
+    const DISCOVERED: &str = "The block's levels are discovered from Gaussian observation \
+                              records only, so a level that only such subjects show is not \
+                              one of them.";
+    const REMEDY_DATA: &str = "Give each such level Gaussian observations, drop those \
+                               subjects, or stop reading the block in what they are scored on.";
+    const FIT_LEVEL: &str = "A level's theta exists only for a combination the fit's \
+                             Gaussian observations showed.";
+    const REMEDY_FIT: &str = "Drop those subjects: the fit has no theta for what they read.";
+
+    fn has(err: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(err.contains(p), "missing {p:?} in:\n{err}");
+        }
+    }
+
+    /// T5 + T6, both sides of the gate in one test. Subject 97 is TTE only at `STUDY=4`,
+    /// a level no Gaussian record shows. With the hazard reading the block (F) the binding
+    /// is refused and the population is left untouched; with the block on `CL` only (C4)
+    /// nothing 97 is scored on reads it, so it binds at index 1 and the check finds
+    /// nothing. The refusal names no "observations" it lacks and no changed data.
+    ///
+    /// Mutations — drop the `refuse_read_unindexed` call: F binds. Refuse every
+    /// unindexed subject: C4 is refused. Measure only index 1 under the initial θ (the
+    /// reference level is 0 under `ref`): F binds. Delete any sentence of the message:
+    /// its `has` dies.
+    #[test]
+    fn an_undiscovered_level_is_refused_only_where_it_is_read() {
+        let data = csv(&[(97, 4)], &|_| true);
+        let text = model_f(true);
+        let mut parsed = parse_full_model(&text).unwrap();
+        let mut pop = read(&parsed.model, &data);
+        let e = bind_theta_levels(&mut parsed, &text, &mut pop).expect_err("F reads the block");
+        assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
+        let err = e.to_string();
+        has(
+            &err,
+            &[
+                "theta PLACEBO[STUDY]: ",
+                WHO,
+                BASELINE,
+                DISCOVERED,
+                REMEDY_DATA,
+            ],
+        );
+        for absent in ["has no observations", "changed between passes", "TIME"] {
+            assert!(!err.contains(absent), "{absent:?} in:\n{err}");
+        }
+        assert!(
+            pop.subjects
+                .iter()
+                .all(|s| !s.covariates.contains_key(&level_index_column("PLACEBO"))),
+            "a refusal writes nothing"
+        );
+
+        let (parsed, pop) = bound(&model_f(false), &data).expect("C4: the hazard reads no level");
+        assert_eq!(index(&pop, "97"), Some(1.0));
+        assert!(
+            check_level_index_columns(&parsed.model, &pop, LevelDataEntry::Run).is_empty(),
+            "no finding on a subject the binder decided"
+        );
+    }
+
+    /// T5′, the from-fit cell: a design with TTE-only subject 97 at `STUDY=4`, a level the
+    /// fit estimated no θ for. F refuses, in the fit's terms (no "discovered" remedy);
+    /// C4 binds.
+    ///
+    /// Mutations — drop the call in `bind_from_fit_on`: F binds. Delete a sentence: its
+    /// `has` dies.
+    #[test]
+    fn a_level_the_fit_never_saw_is_refused_only_where_it_is_read() {
+        let design = csv(&[(97, 4)], &|i| i == 1);
+        let text = model_f(true);
+        let mut parsed = parse_full_model(&text).unwrap();
+        let mut pop = read(&parsed.model, &design);
+        let e = bind_from_fit(&mut parsed, &text, &mut pop, &fitted()).expect_err("F reads");
+        assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
+        let err = e.to_string();
+        has(&err, &[WHO, BASELINE, FIT_LEVEL, REMEDY_FIT]);
+        assert!(!err.contains("discovered"), "{err}");
+        assert!(
+            pop.subjects
+                .iter()
+                .all(|s| !s.covariates.contains_key(&level_index_column("PLACEBO"))),
+            "a refusal writes nothing"
+        );
+        // The `run_sir` / `run_covariance` re-read of a fit's data refuses alike.
+        let (fit_model, _) = bound(&text, &csv(&[(98, 1)], &|_| true)).unwrap();
+        let mut reread = read(&fit_model.model, &design);
+        let d = write_fitted_level_columns(
+            &fit_model.model,
+            &mut reread,
+            &fit_model.model.data_bindings().levels,
+        )
+        .expect_err("the re-read reads");
+        assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
+        has(&d.message, &[WHO, BASELINE, FIT_LEVEL, REMEDY_FIT]);
+
+        let c4 = model_f(false);
+        let fitted_c4 = bound(&c4, &csv(&[], &|_| true))
+            .unwrap()
+            .0
+            .model
+            .data_bindings()
+            .clone();
+        let mut parsed = parse_full_model(&c4).unwrap();
+        let mut pop = read(&parsed.model, &design);
+        bind_from_fit(&mut parsed, &c4, &mut pop, &fitted_c4).expect("C4 binds");
+        assert_eq!(index(&pop, "97"), Some(1.0));
+    }
+}
+
+/// #1797, the cells past fixture F: a `TIME`-keyed block, a binary endpoint, and the
+/// `ferx check` arm for a subject with no Gaussian observation.
+#[cfg(feature = "survival")]
+mod no_gaussian_cells {
+    use super::no_gaussian_subjects::{bound, csv, index, params};
+    use super::*;
+    use crate::api::bind_theta_levels;
+    use crate::api::validation::{check_level_index_columns, LevelDataEntry};
+    use crate::stats::likelihood::individual_nll;
+
+    /// A joint PK-TTE model with `PLACEBO[STUDY, TIME]`. `hazard_reads`: the block
+    /// sits in the hazard; otherwise on `V`, which the constant hazard never reads.
+    fn time_keyed(hazard_reads: bool) -> String {
+        let (v, h0) = if hazard_reads {
+            ("TVV", "TVH0 * exp(PLACEBO)")
+        } else {
+            ("TVV * exp(PLACEBO)", "TVH0")
+        };
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVH0(0.05, 1e-5, 10.0)
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = {v}
+  H0 = {h0}
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+
+    /// T7. A block keyed on `TIME` cannot index a subject with no observation time:
+    /// read by the hazard, the binding is refused with the `TIME` sentence (and no
+    /// "give the level observations" remedy, since there is no level to name); with the
+    /// block on `V` only, it binds at index 1.
+    ///
+    /// Mutations — treat `TIME` as `covariates["TIME"]` in `baseline_level`: the item
+    /// reads "no value in level column `TIME`" and the `TIME` sentence is gone. Delete the
+    /// `TIME` sentence or the second data remedy: its `has` dies.
+    #[test]
+    fn a_time_keyed_block_cannot_index_a_subject_with_no_observation_time() {
+        let data = csv(&[(99, 3)], &|_| true);
+        let Err(err) = bound(&time_keyed(true), &data) else {
+            panic!("the hazard reads the block: it must be refused");
+        };
+        for p in [
+            "theta PLACEBO[STUDY, TIME]: 1 subject(s) with no Gaussian observation",
+            "subject 99 (no observation time).",
+            "`TIME` is a level column of this block, and a subject with no Gaussian \
+             observation has no observation time to name a level of it.",
+            "Drop those subjects, or stop reading the block in what they are scored on.",
+        ] {
+            assert!(err.contains(p), "missing {p:?} in:\n{err}");
+        }
+        for absent in [
+            "Give each such level",
+            "`STUDY=3,TIME",
+            "no value in level column",
+        ] {
+            assert!(!err.contains(absent), "{absent:?} in:\n{err}");
+        }
+        let (_, pop) = bound(&time_keyed(false), &data).expect("the hazard reads no level");
+        assert_eq!(index(&pop, "99"), Some(1.0));
+    }
+
+    /// The third cell of the refusal: a TTE-only subject with no value in the level
+    /// column names no level at all. Read by the hazard it is refused, naming the column;
+    /// with the block on `CL` only it binds at index 1.
+    ///
+    /// Mutation — drop the `Missing` item text, or let a missing column bind silently:
+    /// this test dies.
+    #[test]
+    fn a_subject_with_no_level_value_is_refused_where_read() {
+        let data = csv(&[(97, 1)], &|_| true);
+        let unset = |text: &str| {
+            let mut parsed = parse_full_model(text).unwrap();
+            let mut pop = super::no_gaussian_subjects::read(&parsed.model, &data);
+            let s97 = pop.subjects.iter_mut().find(|s| s.id == "97").unwrap();
+            s97.covariates.remove("STUDY");
+            bind_theta_levels(&mut parsed, text, &mut pop).map(|()| pop)
+        };
+        let e = unset(&super::no_gaussian_subjects::model_f(true)).expect_err("read");
+        let err = e.to_string();
+        assert!(
+            err.contains("subject 97 (no value in level column `STUDY`)."),
+            "{err}"
+        );
+        let pop = unset(&super::no_gaussian_subjects::model_f(false)).expect("not read");
+        assert_eq!(index(&pop, "97"), Some(1.0));
+    }
+
+    /// T8. The fix is not TTE-specific: a `[binary_model]` whose logit reads
+    /// `PLACEBO[STUDY]`, and one binary-only subject at `STUDY=3` (99) beside one at
+    /// `STUDY=1` (98). 99 is indexed at 3, and `nll₉₉ − nll₉₈` is the closed-form
+    /// `ln σ(TH0) − ln σ(TH0 + P₃)` for an observed 1, the constant cancelling.
+    ///
+    /// Mutation — the T1 mutation (`unwrap_or(1.0)`): 99 → 1, the difference is 0.
+    #[test]
+    fn a_binary_only_subject_reads_its_own_level() {
+        let text = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TH0(-0.5, -10.0, 10.0)
+  theta PLACEBO[STUDY, contrast = ref](0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LP = TH0 + PLACEBO
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[binary_model]
+  cmt   = 3
+  logit = LP
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let (parsed, pop) = bound(text, &csv(&[(98, 1), (99, 3)], &|_| true)).unwrap();
+        assert!(
+            pop.subjects
+                .iter()
+                .find(|s| s.id == "99")
+                .unwrap()
+                .obs_times
+                .is_empty(),
+            "the binary record is not a Gaussian observation"
+        );
+        assert_eq!(index(&pop, "99"), Some(3.0));
+        assert_eq!(index(&pop, "98"), Some(1.0));
+        let m = &parsed.model;
+        let p = params(m);
+        let nll = |id: &str| {
+            let v = individual_nll(
+                m,
+                pop.subjects.iter().find(|s| s.id == id).unwrap(),
+                &p.theta,
+                &vec![0.0; m.n_eta],
+                &p.omega,
+                &p.sigma.values,
+            );
+            assert!(v.is_finite(), "subject {id}: nll = {v}");
+            v
+        };
+        let ln_sigmoid = |x: f64| -(1.0 + (-x).exp()).ln();
+        let want = ln_sigmoid(-0.5) - ln_sigmoid(-0.5 + 1.0);
+        let got = nll("99") - nll("98");
+        assert!(
+            (got - want).abs() <= 1e-12,
+            "Δnll: got {got:.15}, want {want:.15}"
+        );
+        assert!(want.abs() > 0.1, "the straddle: the levels differ ({want})");
+    }
+
+    /// T9. `ferx check`'s level-index check re-derives a subject with no Gaussian
+    /// observation from its baseline columns: F bound with 99 at `STUDY=3`, then 99's
+    /// index hand-set to 1. Before the fix the check read only Gaussian records and found
+    /// nothing (P5).
+    ///
+    /// Mutations — drop the `no_gaussian_misindexed` call: no finding. Delete the
+    /// no-Gaussian clause of the `Misindexed` text, or render `at time`: the `contains`
+    /// dies.
+    #[test]
+    fn the_check_sees_a_misindexed_subject_with_no_gaussian_observation() {
+        let text = super::no_gaussian_subjects::model_f(true);
+        let (parsed, mut pop) = bound(&text, &csv(&[(98, 1), (99, 3)], &|_| true)).unwrap();
+        let decl = parsed.model.theta_blocks().level_blocks()[0].clone();
+        assert_eq!(level_index_finding(&decl, &pop), None, "bound as written");
+        let column = level_index_column("PLACEBO");
+        let s99 = pop.subjects.iter_mut().find(|s| s.id == "99").unwrap();
+        s99.covariates.insert(column.clone(), 1.0);
+        assert_eq!(
+            level_index_finding(&decl, &pop),
+            Some(LevelIndexFinding::Misindexed {
+                id: "99".into(),
+                time: None,
+                label: "STUDY=3".into(),
+                want: 3,
+                got: Some(1.0),
+            })
+        );
+        let d = check_level_index_columns(&parsed.model, &pop, LevelDataEntry::Run);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, "E_THETA_LEVELS_DATA_MISMATCH");
+        let want = "subject 99, which has no Gaussian observation (its level is read from \
+                    its baseline columns), is level `STUDY=3`, level 3 of the model's block, \
+                    and its index says 1.";
+        assert!(d[0].message.contains(want), "{}", d[0].message);
+        assert!(!d[0].message.contains("at time"), "{}", d[0].message);
+    }
+}
