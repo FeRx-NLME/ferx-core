@@ -2385,8 +2385,10 @@ enum LevelSource {
 /// fixed at 0 included), and at index 1 under the initial θ (so a one-level block is
 /// measured too). The block is read when any two of those differ. Only a measured,
 /// finite "no change" binds; a non-finite value measures nothing and counts as a
-/// read. Like the dead-level check, two θ points can miss a read that a θ switches
-/// off at both.
+/// read. That branch is defensive: the endpoint likelihoods map an ill-defined term
+/// to the finite `1e20` sentinel (`crate::survival`) before it reaches here, so no
+/// fixture has reached it (#1820 review r1). Like the dead-level check, two θ points
+/// can miss a read that a θ switches off at both (#1822).
 ///
 /// Reads `population` and writes nothing: only the subjects with no Gaussian
 /// observation are copied, so a binder can call this before it writes any column.
