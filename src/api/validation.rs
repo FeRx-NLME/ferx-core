@@ -3641,6 +3641,62 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     None
 }
 
+/// The one `W_UNCERTAINTY_DRAWS_SKIPPED` warning `simulate_with_uncertainty_diag` returns
+/// when `skipped` (1-based, ascending) of its `n` parameter draws landed in the flip-flop
+/// regime of a twin-less transit / IG closed form and were not simulated (#786, #1485).
+/// The survivors are a sample of a *truncated* distribution, so the message says the
+/// intervals built from them are biased — the reason a skip may not pass silently.
+pub(crate) fn uncertainty_draws_skipped_warning(
+    model: &CompiledModel,
+    skipped: &[usize],
+    n: usize,
+) -> String {
+    let (domain, ode_fn) = match model.pk_model {
+        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
+        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
+    };
+    let confluent = if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
+        ", or with coincident disposition eigenvalues"
+    } else {
+        ""
+    };
+    let list = skipped
+        .iter()
+        .map(|k| k.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "W_UNCERTAINTY_DRAWS_SKIPPED: {k} of {n} uncertainty draws were skipped (draws {list}). \
+         Each drew typical values in the flip-flop regime (disposition rate ≥ {domain}){confluent}, \
+         where the twin-less {model_name} closed form has no solution. \
+         The remaining draws exclude the tail of the parameter uncertainty in which elimination is \
+         at least as fast as absorption, so prediction intervals built from them are biased, not \
+         just noisier. \
+         Rewrite the model as an explicit ODE `{ode_fn}` model to simulate every draw.",
+        k = skipped.len(),
+        model_name = model.pk_model.canonical_name(),
+    )
+}
+
+/// The refusal `simulate_with_uncertainty_diag` returns when **every** one of its `n > 0`
+/// draws was skipped (#1485): an empty `Ok` would read as a run that produced nothing to
+/// report. Carries the family's flip-flop code and the first draw's own reason.
+pub(crate) fn all_uncertainty_draws_skipped_diags(
+    model: &CompiledModel,
+    n: usize,
+    first_reason: &str,
+) -> Vec<Diagnostic> {
+    let code = absorption_family_code(model, "E_IG_FLIP_FLOP", "E_TRANSIT_FLIP_FLOP");
+    vec![Diagnostic::error(
+        code,
+        format!(
+            "all {n} uncertainty draws landed in the flip-flop regime and none could be \
+             simulated, although the point estimate is in-domain — the parameter uncertainty \
+             reaches far past the closed form's convergence domain. First draw: {first_reason}"
+        ),
+    )]
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a

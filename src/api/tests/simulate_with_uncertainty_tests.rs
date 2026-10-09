@@ -804,23 +804,32 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         draws.len()
     );
 
-    // Since #1645 the `_diag` form returns the per-draw skip warnings the row-only
-    // form drops: one per draw missing from the rows, naming that draw.
+    // #1485: the `_diag` form reports the skips as ONE warning carrying the count and the
+    // 1-based indices of exactly the draws missing from the rows — no per-draw lines.
     let diag = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("diag");
     let skipped: Vec<usize> = (1..=30).filter(|k| !draws.contains(k)).collect();
-    let named: Vec<usize> = diag
-        .warnings
-        .iter()
-        .filter_map(|w| {
-            w.strip_prefix("uncertainty draw ")?
-                .split_once(" skipped — ")?
-                .0
-                .parse()
-                .ok()
-        })
-        .collect();
-    assert!(!skipped.is_empty());
-    assert_eq!(named, skipped, "{:#?}", diag.warnings);
+    assert_eq!(skipped, vec![7, 16, 19, 22, 23, 24], "measured at d43afca9");
+    let msg = only_skip_warning(&diag.warnings);
+    assert!(msg.contains("6 of 30 uncertainty draws"), "{msg}");
+    assert!(msg.contains("(draws 7, 16, 19, 22, 23, 24)"), "{msg}");
+    assert!(
+        !diag
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("uncertainty draw ")),
+        "the per-draw lines are gone: {:#?}",
+        diag.warnings
+    );
+    // The wrapper's rows are the `_diag` rows, and every surviving draw ran.
+    assert_eq!(rows.len(), 144);
+    assert_eq!(rows.len(), diag.results.len());
+    for (a, b) in rows.iter().zip(&diag.results) {
+        assert_eq!((a.draw, a.sim, &a.id), (b.draw, b.sim, &b.id));
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+        assert_eq!(format!("{:?}", a.outcome), format!("{:?}", b.outcome));
+    }
+    let expected_draws: Vec<usize> = (1..=30).filter(|k| !skipped.contains(k)).collect();
+    assert_eq!(draws, expected_draws);
 
     // Pin the skip *predicate* directly too: a flip-flop-theta draw is flagged,
     // the in-domain point estimate is not.
@@ -835,6 +844,241 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         "the in-domain point estimate must not be flagged"
     );
 }
+
+/// The single `W_UNCERTAINTY_DRAWS_SKIPPED` warning in `warnings` (#1485).
+fn only_skip_warning(warnings: &[String]) -> &str {
+    let hits: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED"))
+        .collect();
+    assert_eq!(hits.len(), 1, "exactly one skip warning: {warnings:#?}");
+    hits[0]
+}
+
+/// Run `simulate_with_uncertainty_diag` with cov(log TVCL) = `var` and return the skip
+/// warning plus the skipped draw indices read off the rows.
+fn skip_run(model: &CompiledModel, var: f64, n: usize, seed: u64) -> (String, Vec<usize>) {
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = var;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: n,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(seed),
+    };
+    let out = simulate_with_uncertainty_diag(model, &pop, &fit, &opts).expect("some draws run");
+    let skipped: Vec<usize> = (1..=n)
+        .filter(|k| !out.results.iter().any(|r| r.draw == *k))
+        .collect();
+    (only_skip_warning(&out.warnings).to_string(), skipped)
+}
+
+// 2-cpt transit, in-domain at the point estimate: k10 = k12 = 0.125, k21 = 0.0625 →
+// α ≈ 0.285 < KTR = (3+1)/10 = 0.4. Twin-less through the inert `[scaling]` block.
+const INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV1(4.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(8.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(10.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// #1485: every sentence of the skip warning, on all three families, with both sides of
+/// each wording gate asserted in the same test — transit vs IG (domain + ODE rewrite) and
+/// 1-cpt vs 2-cpt (the confluent-eigenvalue clause).
+#[test]
+fn uncertainty_skip_warning_wording_per_family() {
+    let transit = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+    let transit2 = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC);
+    assert!(transit2.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        check_absorption_flip_flop_no_twin(
+            &transit2,
+            &tiny_population(),
+            &transit2.default_params.theta
+        )
+        .is_none(),
+        "the 2-cpt point estimate is in-domain"
+    );
+
+    let (t1, t1_skipped) = skip_run(&transit, 4.0, 30, 7);
+    let (ig1, ig1_skipped) = skip_run(&ig, 4.0, 30, 7);
+    let (t2, t2_skipped) = skip_run(&transit2, 4.0, 30, 7);
+
+    for (msg, skipped, n_name) in [
+        (&t1, &t1_skipped, "one_cpt_transit"),
+        (&ig1, &ig1_skipped, "one_cpt_ig"),
+        (&t2, &t2_skipped, "two_cpt_transit"),
+    ] {
+        // Count + indices sentence: exactly the draws missing from the rows.
+        let list = skipped
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            !skipped.is_empty() && skipped.len() < 30,
+            "{n_name}: {skipped:?}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "{} of 30 uncertainty draws were skipped (draws {list})",
+                skipped.len()
+            )),
+            "{n_name}: {msg}"
+        );
+        // Cause sentence.
+        assert!(msg.contains("flip-flop regime"), "{n_name}: {msg}");
+        assert!(
+            msg.contains(&format!("twin-less {n_name} closed form")),
+            "{msg}"
+        );
+        // Bias sentence.
+        assert!(
+            msg.contains("exclude the tail of the parameter uncertainty"),
+            "{n_name}: {msg}"
+        );
+        assert!(msg.contains("biased, not just noisier"), "{n_name}: {msg}");
+        // The remaining rows are not claimed correct, and CL is not named as the cause.
+        assert!(!msg.contains("high CL"), "{n_name}: {msg}");
+        // A token-carrying message classifies on the token, not the "flip-flop" prose.
+        let entry = crate::types::classify_warning(msg);
+        assert_eq!(
+            entry.category,
+            crate::types::WarningCode::UncertaintyDrawsSkipped
+        );
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+    // Transit vs IG: the domain and the ODE rewrite.
+    for m in [&t1, &t2] {
+        assert!(m.contains("transit rate KTR = (n+1)/mtt"), "{m}");
+        assert!(m.contains("explicit ODE `transit()` model"), "{m}");
+        assert!(!m.contains("igd()") && !m.contains("MAT"), "{m}");
+    }
+    assert!(ig1.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{ig1}");
+    assert!(ig1.contains("explicit ODE `igd()` model"), "{ig1}");
+    assert!(!ig1.contains("KTR") && !ig1.contains("transit()"), "{ig1}");
+    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge.
+    assert!(
+        t2.contains("or with coincident disposition eigenvalues"),
+        "{t2}"
+    );
+    assert!(!t1.contains("coincident"), "{t1}");
+    assert!(!ig1.contains("coincident"), "{ig1}");
+}
+
+/// #1485: an in-domain point estimate whose every draw is skipped is refused rather than
+/// returning an empty `Ok`. Fixture chosen by measurement: point estimate TVCL = 0.75 (ke =
+/// 0.1875 < KTR = 0.2) with a log-variance wide enough that, at this seed, all draws cross.
+#[test]
+fn uncertainty_refuses_when_every_draw_is_skipped() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.theta[0] = 0.75;
+    assert!(check_absorption_flip_flop_no_twin(&model, &pop, &params.theta).is_none());
+    let mut fit = synthetic_fit(&params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = ALL_SKIP_VAR;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: ALL_SKIP_N,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(ALL_SKIP_SEED),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("every draw skipped must be refused");
+    assert_eq!(err.code(), Some("E_TRANSIT_FLIP_FLOP"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("all {ALL_SKIP_N} uncertainty draws")),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("although the point estimate is in-domain"),
+        "{msg}"
+    );
+    assert!(msg.contains("First draw: one_cpt_transit"), "{msg}");
+    assert!(!msg.contains("W_UNCERTAINTY_DRAWS_SKIPPED"), "{msg}");
+    // Straddle: the same fixture at a seed where not every draw crosses still runs.
+    let partial = SimulateUncertaintyOptions {
+        seed: Some(7),
+        ..opts
+    };
+    simulate_with_uncertainty_diag(&model, &pop, &fit, &partial)
+        .expect("a run with a surviving draw is not refused");
+}
+
+// Measured by a seed scan over 0..300 at this var / n: 7 seeds skip every draw, seed 9 the
+// first; seed 7 does not, which is the test's straddle partner.
+/// #1485: no skipped draw, no warning — on the twin-carrying twin of the M1 fixture (same
+/// wide covariance, every draw reroutes to the ODE `transit()`), and on a non-absorption
+/// model. And a zero-draw run stays `Ok` (k = n = 0 is not "every draw skipped").
+#[test]
+fn uncertainty_without_skips_carries_no_skip_warning() {
+    let pop = tiny_population();
+    for (name, model) in [
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC)),
+        ("tiny", tiny_model()),
+    ] {
+        let mut fit = synthetic_fit(&model.default_params);
+        if name == "twin" {
+            if let Some(cov) = fit.covariance_matrix.as_mut() {
+                cov[(0, 0)] = 4.0;
+            }
+        }
+        for n in [0usize, 30] {
+            let opts = SimulateUncertaintyOptions {
+                n_uncertainty_draws: n,
+                n_sim_per_draw: 1,
+                method: UncertaintyMethod::Asymptotic,
+                seed: Some(7),
+            };
+            let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+                .unwrap_or_else(|e| panic!("{name} n={n}: {e}"));
+            let mut draws: Vec<usize> = out.results.iter().map(|r| r.draw).collect();
+            draws.dedup();
+            assert_eq!(draws, (1..=n).collect::<Vec<_>>(), "{name} n={n}");
+            assert!(
+                !out.warnings
+                    .iter()
+                    .any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
+                "{name} n={n}: {:#?}",
+                out.warnings
+            );
+        }
+    }
+}
+
+const ALL_SKIP_VAR: f64 = 0.01;
+const ALL_SKIP_N: usize = 5;
+const ALL_SKIP_SEED: u64 = 9;
 
 /// #1485: a point estimate that is itself in the flip-flop regime of a twin-less transit
 /// closed form is refused with the code `simulate()` gives at that θ, before any draw —
