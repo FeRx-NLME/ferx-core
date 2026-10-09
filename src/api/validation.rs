@@ -3672,9 +3672,10 @@ pub(crate) fn uncertainty_draws_skipped_warning(
          The remaining draws exclude the tail of the parameter uncertainty in which elimination is \
          at least as fast as absorption, so prediction intervals built from them are biased, not \
          just noisier. \
-         Rewrite the model as an explicit ODE `{ode_fn}` model to simulate every draw.",
+         Rewrite the model as an explicit ODE `{ode_fn}` model to simulate every draw.{decline}",
         k = skipped.len(),
         model_name = model.pk_model.canonical_name(),
+        decline = twin_decline_clause(model),
     )
 }
 

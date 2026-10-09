@@ -992,6 +992,40 @@ fn uncertainty_skip_warning_wording_per_family() {
     assert!(!ig1.contains("coincident"), "{ig1}");
 }
 
+/// #1485 review finding 3: on a model whose ODE twin was built and then declined (#1008),
+/// the aggregate keeps the decline clause the per-draw lines used to carry — it names the
+/// easier fix. The `[scaling]` fixture, whose twin was never built, must not carry it.
+#[test]
+fn uncertainty_skip_warning_carries_the_twin_decline_clause() {
+    // The M1 transit fixture with `[scaling]` swapped for an individual parameter named
+    // after the twin's own `central` state: the twin's parse rejects the collision.
+    let declined_src = INDOMAIN_TWINLESS_TRANSIT_SRC
+        .replace("  MTT = TVMTT\n", "  MTT = TVMTT\n  CENTRAL = TVX\n")
+        .replace(
+            "  theta TVMTT(20.0, 0.05, 200.0)\n",
+            "  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVX(1.0, 0.0, 10.0)\n",
+        )
+        .replace("[scaling]\n  obs_scale = 1\n\n", "");
+    let declined = parse_fixture(&declined_src);
+    assert!(declined.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        crate::types::absorption_twin_decline_reason(&declined).is_some(),
+        "the twin was built and declined"
+    );
+    let scaling = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(crate::types::absorption_twin_decline_reason(&scaling).is_none());
+
+    let clause = "its twin was built and then rejected by its own parse";
+    let (with, _) = skip_run(&declined, 4.0, 30, 7);
+    let (without, _) = skip_run(&scaling, 4.0, 30, 7);
+    assert!(with.contains(clause), "{with}");
+    assert!(
+        with.contains("CENTRAL"),
+        "the twin parser's reason is quoted: {with}"
+    );
+    assert!(!without.contains(clause), "{without}");
+}
+
 /// #1485: an in-domain point estimate whose every draw is skipped is refused rather than
 /// returning an empty `Ok`. Fixture chosen by measurement: point estimate TVCL = 0.75 (ke =
 /// 0.1875 < KTR = 0.2) with a log-variance wide enough that, at this seed, all draws cross.
@@ -1026,17 +1060,24 @@ fn uncertainty_refuses_when_every_draw_is_skipped() {
     );
     assert!(msg.contains("First draw: one_cpt_transit"), "{msg}");
     assert!(!msg.contains("W_UNCERTAINTY_DRAWS_SKIPPED"), "{msg}");
-    // Straddle: the same fixture at a seed where not every draw crosses still runs.
+    // Straddle on the `k = n` boundary: the same fixture at a seed that skips n − 1 draws
+    // still runs, and says so — a refusal at `k ≥ n − 1` reddens this half.
     let partial = SimulateUncertaintyOptions {
-        seed: Some(7),
+        seed: Some(ALL_BUT_ONE_SKIP_SEED),
         ..opts
     };
-    simulate_with_uncertainty_diag(&model, &pop, &fit, &partial)
+    let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &partial)
         .expect("a run with a surviving draw is not refused");
+    let warn = only_skip_warning(&out.warnings);
+    assert!(
+        warn.contains(&format!(
+            "{} of {ALL_SKIP_N} uncertainty draws",
+            ALL_SKIP_N - 1
+        )),
+        "{warn}"
+    );
 }
 
-// Measured by a seed scan over 0..300 at this var / n: 7 seeds skip every draw, seed 9 the
-// first; seed 7 does not, which is the test's straddle partner.
 /// #1485: no skipped draw, no warning — on the twin-carrying twin of the M1 fixture (same
 /// wide covariance, every draw reroutes to the ODE `transit()`), and on a non-absorption
 /// model. And a zero-draw run stays `Ok` (k = n = 0 is not "every draw skipped").
@@ -1076,6 +1117,9 @@ fn uncertainty_without_skips_carries_no_skip_warning() {
     }
 }
 
+// Measured by seed scans at this var / n: over 0..300, 7 seeds skip every draw (9 the
+// first); over 0..60, seed 2 skips 4 of 5 (also 45, 50, 52) — the straddle partner.
+const ALL_BUT_ONE_SKIP_SEED: u64 = 2;
 const ALL_SKIP_VAR: f64 = 0.01;
 const ALL_SKIP_N: usize = 5;
 const ALL_SKIP_SEED: u64 = 9;
