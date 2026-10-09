@@ -6698,6 +6698,341 @@ mod absorption {
         // the κ magnitude.
         assert!(sp >= 100.0 * sc, "M straddle: {sp:.1e} vs {sc:.1e}");
     }
+
+    // ── #1712: a factor common to the whole funnel ──────────────────────────
+    //
+    // A factor, term or outer function that reads neither the block nor the
+    // random effect cancels from `∂y/∂η ÷ ∂y/∂block`, so the covariates it reads
+    // do not count against the funnel. Each refused row has a twin that differs
+    // only in where the factor sits — next to the block alone, outside the
+    // funnel — and binds, so a fix that drops every covariate is visible too.
+
+    /// The varying factor of #1712's rows.
+    const FAC: &str = "(1 + 0.1 * OCC)";
+
+    /// [`occ_pop`] in the MBMA arms layout (`OCC` varies within each subject,
+    /// one study per subject), plus `W`, the record index, which varies within
+    /// each occasion too.
+    fn arms_pop() -> Population {
+        let mut p = occ_pop(4, 1, &T6, 3, true);
+        for s in p.subjects.iter_mut() {
+            for (j, m) in s.obs_covariates.iter_mut().enumerate() {
+                m.insert("W".to_string(), 1.0 + j as f64);
+            }
+        }
+        p
+    }
+
+    /// One #1712 row: tag, block columns, `[individual_parameters]` (after
+    /// [`BASE`]), readout, and whether `KAPPA_E0` is declared.
+    type Row = (&'static str, &'static str, String, String, bool);
+
+    fn row_text(r: &Row) -> impl Fn(&str) -> String + '_ {
+        move |c: &str| {
+            let text = cf_model(c, r.1, &format!("{BASE}{}", r.2), &r.3);
+            if r.4 {
+                text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+                )
+            } else {
+                text
+            }
+        }
+    }
+
+    const ALL: [&str; 5] = ["", "sum_to_zero", "sum_to_zero_within", "ref", "none"];
+
+    /// `E0`'s funnel, when it is an individual parameter.
+    const PARAM_SITE: &str = "`E0` reads this block and carries a random effect";
+    /// The readout's funnel.
+    const READOUT_SITE: &str = "the `y` readout reads this block and a random effect";
+
+    /// Refused under every contrast and auto, each refusal containing `site`.
+    fn refused_everywhere(r: &Row, pop: &Population, site: &str, wrong: &mut Vec<String>) {
+        let text = row_text(r);
+        for c in ALL {
+            match try_bind(&text(c), pop) {
+                Err(e) if e.contains(site) => {}
+                Err(e) => wrong.push(format!("{} {c:?}: refusal lacks {site:?}: {e}", r.0)),
+                Ok(b) => wrong.push(format!("{} {c:?}: bound {b:?}", r.0)),
+            }
+        }
+    }
+
+    /// Bound under auto and every explicit contrast but within.
+    fn binds(r: &Row, pop: &Population, wrong: &mut Vec<String>) {
+        let text = row_text(r);
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            if let Err(e) = try_bind(&text(c), pop) {
+                wrong.push(format!("{} {c:?}: refused: {e}", r.0));
+            }
+        }
+    }
+
+    /// T1 + T3, parameter side (#1712: P1, P5, P7, P8; twin P4, control P3). On
+    /// one study per subject with `OCC` varying within each subject, `E0`'s
+    /// expression carries the block and the η through `TVE0 + PLACEBO +
+    /// ETA_E0`, scaled by a factor (P1), shifted by a term (P5), or wrapped in a
+    /// function (P8) that reads `OCC` and neither of the two; or scaled by a
+    /// `TIME` factor (P7). The block absorbs the η in each, and the binder
+    /// refuses under every contrast, naming `E0`. The twin P4 puts the factor
+    /// on the block alone, which the η no longer shares: identified, and it
+    /// binds. P19 is a leaf of the descent: a conditional expression whose
+    /// condition reads `STUDY`, constant within each subject, so each subject
+    /// takes one branch and the block absorbs the η. Every row also agrees with
+    /// the joint oracle.
+    ///
+    /// Mutations — the parameter loop back to `var_constant(v)` over the whole
+    /// of `E0` (P1, P5, P8 bind; the readout test stays green); the leaf arm of
+    /// `funnel_operands` returning `None` (P19 binds); the early
+    /// `expr_constant(e)` return restored in `funnel_operands` (P1 binds, and
+    /// the readout test dies too).
+    #[test]
+    fn a_common_factor_does_not_count_in_a_parameter_funnel() {
+        let pop = arms_pop();
+        let row = |tag, e0: String| -> Row {
+            (
+                tag,
+                "STUDY",
+                format!("  E0 = {e0}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            )
+        };
+        let s = "TVE0 + PLACEBO + ETA_E0";
+        let refused = [
+            row("P1 factor", format!("({s}) * {FAC}")),
+            row("P5 term", format!("{s} + 0.1 * OCC")),
+            row("P7 TIME factor", format!("({s}) * (1 + 0.01 * TIME)")),
+            row("P8 outer function", format!("exp(({s}) / 10 + 0.1 * OCC)")),
+            row("P3 control", s.to_string()),
+            row(
+                "P19 conditional leaf",
+                format!("if (STUDY > 1) {s} else TVE0 + PLACEBO + 2 * ETA_E0"),
+            ),
+        ];
+        let twin = row("P4 twin", format!("TVE0 + PLACEBO * {FAC} + ETA_E0"));
+        let mut wrong = Vec::new();
+        for r in &refused {
+            refused_everywhere(r, &pop, PARAM_SITE, &mut wrong);
+            agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
+        }
+        // The straddle: the twin binds, and the oracle calls it identified.
+        binds(&twin, &pop, &mut wrong);
+        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
+        assert!(wrong.is_empty(), "parameter side:\n{}", wrong.join("\n"));
+    }
+
+    /// T2 + T3, readout side (#1712: P13; twin P15, control P2). `E0` carries
+    /// only the η, and the readout `(E0 + PLACEBO) * (1 + 0.1 * OCC)` is the
+    /// funnel: the block absorbs the η, and the binder refuses naming the
+    /// readout. The twin P15 scales `PLACEBO` alone and binds; P2 puts the
+    /// factor on a parameter funnel the readout reads, and stays refused.
+    ///
+    /// Mutations — the early `expr_constant(e)` return restored in
+    /// `funnel_operands` for the readout call only (P13 binds; the parameter
+    /// test stays green); restored for both callers (both tests die).
+    #[test]
+    fn a_common_factor_does_not_count_in_a_readout_funnel() {
+        let pop = arms_pop();
+        let row =
+            |tag, e0: &str, y: String| -> Row { (tag, "STUDY", format!("  E0 = {e0}"), y, false) };
+        let p13 = row(
+            "P13 readout factor",
+            "TVE0 + ETA_E0",
+            format!("(E0 + PLACEBO) * {FAC} + {EMAXY}"),
+        );
+        let p2 = row(
+            "P2 control",
+            "TVE0 + PLACEBO + ETA_E0",
+            format!("E0 * {FAC} + {EMAXY}"),
+        );
+        let p15 = row(
+            "P15 twin",
+            "TVE0 + ETA_E0",
+            format!("E0 + PLACEBO * {FAC} + {EMAXY}"),
+        );
+        let mut wrong = Vec::new();
+        refused_everywhere(&p13, &pop, READOUT_SITE, &mut wrong);
+        refused_everywhere(&p2, &pop, PARAM_SITE, &mut wrong);
+        binds(&p15, &pop, &mut wrong);
+        for r in [&p13, &p2, &p15] {
+            agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "readout side:\n{}", wrong.join("\n"));
+    }
+
+    /// T4 (#1712: P6, P9, P10; control P11, twin P12). A kappa as the common
+    /// factor of an η's funnel (P6, one column) cancels like any other factor:
+    /// refused everywhere. On `[STUDY, OCC]`, which does not resolve the
+    /// observations, a factor `(1 + 0.1 * W)` varying within each occasion
+    /// does not count against the η's funnel (P9) nor against the kappa's own
+    /// (P10): each is refused under `sum_to_zero`, `ref` and `none`, and auto
+    /// goes within, which the oracle identifies. P11 is P10 without the
+    /// factor; the twin P12 scales `PLACEBO` alone and binds global.
+    ///
+    /// Mutation — the parameter loop back to `var_constant(v)` (P6, P9, P10
+    /// bind; auto → `sum_to_zero`).
+    #[test]
+    fn a_common_factor_does_not_count_for_a_kappa_or_a_two_column_block() {
+        let pop = arms_pop();
+        let y = format!("E0 + {EMAXY}");
+        let wf = "(1 + 0.1 * W)";
+        let unread = "\n  Z = TVE0 * exp(ETA_E0)";
+        let p6: Row = (
+            "P6 kappa factor",
+            "STUDY",
+            format!("  E0 = (TVE0 + PLACEBO + ETA_E0) * exp(KAPPA_E0) * {FAC}"),
+            y.clone(),
+            true,
+        );
+        let within: [Row; 3] = [
+            (
+                "P9 two columns",
+                "STUDY, OCC",
+                format!("  E0 = (TVE0 + PLACEBO + ETA_E0) * {wf}"),
+                y.clone(),
+                false,
+            ),
+            (
+                "P10 kappa's own funnel",
+                "STUDY, OCC",
+                format!("  E0 = (TVE0 + PLACEBO + KAPPA_E0) * {wf}{unread}"),
+                y.clone(),
+                true,
+            ),
+            (
+                "P11 kappa control",
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + KAPPA_E0{unread}"),
+                y.clone(),
+                true,
+            ),
+        ];
+        let p12: Row = (
+            "P12 twin",
+            "STUDY, OCC",
+            format!("  E0 = TVE0 + PLACEBO * {wf} + KAPPA_E0{unread}"),
+            y.clone(),
+            true,
+        );
+        let mut wrong = Vec::new();
+        refused_everywhere(&p6, &pop, PARAM_SITE, &mut wrong);
+        agrees_with_joint_oracle(p6.0, &row_text(&p6), &pop, &mut wrong);
+        for r in &within {
+            let text = row_text(r);
+            for c in ["sum_to_zero", "ref", "none"] {
+                if let Ok(b) = try_bind(&text(c), &pop) {
+                    wrong.push(format!("{} {c}: bound {b:?}", r.0));
+                }
+            }
+            match try_bind(&text(""), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("{} auto: {got:?}, want within", r.0)),
+            }
+            agrees_with_joint_oracle(r.0, &text, &pop, &mut wrong);
+        }
+        let text = row_text(&p12);
+        match try_bind(&text(""), &pop) {
+            Ok((LevelContrast::SumToZero, _)) => {}
+            got => wrong.push(format!("P12 twin auto: {got:?}, want global")),
+        }
+        agrees_with_joint_oracle(p12.0, &text, &pop, &mut wrong);
+        assert!(
+            wrong.is_empty(),
+            "kappa / two columns:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// #1832 review, finding 3. The readout's funnel reads the states as
+    /// carrying the random effect when the η reaches them: with `ETA_E0` on
+    /// both `CL` and `E0`, `y = central / V + E0 + PLACEBO` has the varying
+    /// operand `central / V` alongside `E0` and `PLACEBO`, so there is no
+    /// funnel, and the η, which also shapes the curve, is identified on one
+    /// study per subject: it binds. The control drops the η from `CL`, so the
+    /// state reads neither, the funnel is `E0 + PLACEBO`, and it is refused
+    /// naming the readout. Both agree with the joint oracle.
+    ///
+    /// Mutation — the readout reads the states as carrying neither
+    /// (`reads(false, false)` at the readout): `central / V` is dropped as an
+    /// operand reading neither, and the η-on-`CL` row is refused. Swapping the
+    /// two flags is an equivalent mutant: "reads either" is unchanged, so an
+    /// operand reading a state stays an operand, and a state is never constant.
+    #[test]
+    fn a_state_the_eta_reaches_keeps_the_readout_funnel_varying() {
+        let pop = cf_pop(4, 1, &T6);
+        let text = |ip: &str, c: &str| {
+            let modifier = if c.is_empty() {
+                String::new()
+            } else {
+                format!(", contrast = {c}")
+            };
+            scaling_model(ip).replace("PLACEBO[STUDY, TIME]", &format!("PLACEBO[STUDY{modifier}]"))
+        };
+        let on_cl = |c: &str| {
+            text(
+                "  CL = TVEMAX * exp(ETA_E0)\n  V = TVET50\n  E0 = TVE0 + ETA_E0",
+                c,
+            )
+        };
+        let control = |c: &str| text("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0", c);
+        let mut wrong = Vec::new();
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            if let Err(e) = try_bind(&on_cl(c), &pop) {
+                wrong.push(format!("η on CL {c:?}: refused: {e}"));
+            }
+        }
+        for c in ALL {
+            match try_bind(&control(c), &pop) {
+                Err(e) if e.contains(READOUT_SITE) => {}
+                got => wrong.push(format!("control {c:?}: {got:?}")),
+            }
+        }
+        agrees_with_joint_oracle("η on CL", &on_cl, &pop, &mut wrong);
+        agrees_with_joint_oracle("control", &control, &pop, &mut wrong);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// T5 (#1712: P17, P18). The descent sheds only what reads neither. A
+    /// branch condition on `OCC` still counts in full: P17's branches load the
+    /// η differently, the oracle identifies it, and it binds. A factor that
+    /// reads the η is not dropped either: P18's `(1 + 0.1 * OCC * ETA_E0)` is
+    /// identified, and binds.
+    ///
+    /// Mutations — the conditions' covariates dropped from the parameter
+    /// funnel (P17 is refused); an operand reading only one of the two dropped
+    /// like one reading neither (P18 is refused).
+    #[test]
+    fn what_reads_the_funnel_still_counts() {
+        let pop = arms_pop();
+        let y = format!("E0 + {EMAXY}");
+        let rows: [Row; 2] = [
+            (
+                "P17 condition",
+                "STUDY",
+                "  if (OCC > 1) {\n    E0 = TVE0 + PLACEBO + ETA_E0\n  } else {\n    \
+                 E0 = TVE0 + PLACEBO + 2 * ETA_E0\n  }"
+                    .into(),
+                y.clone(),
+                false,
+            ),
+            (
+                "P18 factor reads the η",
+                "STUDY",
+                "  E0 = (TVE0 + PLACEBO) * (1 + 0.1 * OCC * ETA_E0)".into(),
+                y.clone(),
+                false,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for r in &rows {
+            binds(r, &pop, &mut wrong);
+            agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }
 
 // ── #1730: re-binding a model already bound ─────────────────────────────────
