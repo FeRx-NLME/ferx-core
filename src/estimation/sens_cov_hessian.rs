@@ -4607,10 +4607,18 @@ mod tests {
     ///
     /// Regressions caught: `node_jet` back on `prepare_covariance` (the `expect` panics), and
     /// term (C) contracting the anchor `H̃_j` instead of `H_j`.
+    ///
+    /// # Tolerance (measured)
+    ///
+    /// Realised worst `|analytic − fd| / scale`: **2.544e-7**, on Linux aarch64 and macOS arm64
+    /// alike. The `H̃_j`-for-`H_j` mutation measures **4.64e-1**. `1e-5` keeps ~40× headroom
+    /// over the FD reference's own noise and sits four decades below the mutation: tighter than
+    /// the sibling fixtures' `1e-4`, which would also kill it, because the realised error says
+    /// the oracle supports it.
     #[test]
     fn agq_cov_hessian_matches_fd_at_an_indefinite_quadrature_node() {
         let (model, subject, params, ..) = indefinite_node_fixture();
-        let worst = agq_cov_hessian_objective_worst(&model, &subject, &params, 3, 1e-4);
+        let worst = agq_cov_hessian_objective_worst(&model, &subject, &params, 3, 1e-5);
         eprintln!("#1844 T2 realised worst |analytic − fd| / scale = {worst:.3e}");
     }
 

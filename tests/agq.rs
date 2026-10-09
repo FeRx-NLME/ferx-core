@@ -1095,6 +1095,102 @@ fn agq_covariance_step_produces_finite_standard_errors() {
     );
 }
 
+/// The standard errors of a fit, `θ` then `Ω` then `σ`, in report order.
+fn standard_errors(r: &FitResult) -> Vec<f64> {
+    let mut v = r.se_theta.clone().expect("θ SEs");
+    v.extend(r.se_omega.clone().expect("Ω SEs"));
+    v.extend(r.se_sigma.clone().expect("σ SEs"));
+    v
+}
+
+/// **#1844.** An FOCEI `n_agq = 3` covariance step serves every subject analytically, even
+/// though one tail node per subject has an indefinite exact Hessian.
+///
+/// Before the fix, `node_jet` ran the mode's preparation, whose Cholesky of the exact `H`
+/// refused that tail node, and 14 of `two_cpt_oral_cov`'s 30 subjects went to the per-subject
+/// FD salvage (`W_COV_ANALYTIC_SALVAGE`). A node only contracts `H_j` and never inverts it.
+///
+/// No public field names the covariance route, so the route is pinned by two observations
+/// that together exclude both wrong ones:
+///
+/// * **no salvage note** excludes the hybrid route (the pre-fix 14/30);
+/// * **SEs not bit-identical to `analytic_cov_hessian = false`** excludes the whole-population
+///   FD fallback, which is that arm's own computation and so would match it exactly. This is
+///   also what a regression to ≥ half declines would produce, silently, with no note at all.
+///
+/// The SE bound is the FD reference's own noise: the 13 SEs are compared against the FD
+/// stencil, whose error dominates.
+#[test]
+fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
+    let prep = ferx_core::prepare_run(
+        "examples/two_cpt_oral_cov.ferx",
+        Some("data/two_cpt_oral_cov.csv"),
+    )
+    .expect("two_cpt_oral_cov must load");
+    let opts = |analytic: bool| FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        run_covariance_step: true,
+        sir: false,
+        // Tier-2: a handful of outer steps. The planning measurement found 3 and 200
+        // iterations give identical decline sets (14/30 before the fix, 0/30 after).
+        outer_maxiter: 3,
+        analytic_cov_hessian: analytic,
+        ..FitOptions::default()
+    };
+    let fit_with = |analytic: bool| {
+        fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts(analytic),
+        )
+        .expect("FOCEI n_agq = 3 fit with covariance")
+    };
+    let analytic = fit_with(true);
+    let fd = fit_with(false);
+
+    let salvage: Vec<&String> = analytic
+        .warnings
+        .iter()
+        .filter(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+        .collect();
+    assert!(
+        salvage.is_empty(),
+        "no subject may decline to the FD salvage: {salvage:?}"
+    );
+
+    let (sa, sf) = (standard_errors(&analytic), standard_errors(&fd));
+    assert_eq!(sa.len(), sf.len());
+    assert_eq!(sa.len(), 13, "premise: every parameter carries an SE");
+    let mut worst = 0.0f64;
+    for (k, (a, f)) in sa.iter().zip(&sf).enumerate() {
+        assert!(
+            a.is_finite() && f.is_finite() && *f > 0.0,
+            "SE {k}: analytic {a}, FD {f}"
+        );
+        worst = worst.max(((a - f) / f).abs());
+    }
+    eprintln!("#1844 T4 worst relative SE, analytic vs FD stencil = {worst:.4e}");
+    assert!(
+        worst > 0.0,
+        "SEs bit-identical to the FD stencil: the whole population fell back to it"
+    );
+    assert!(
+        worst < T4_SE_BOUND,
+        "analytic SEs must agree with the FD stencil to its noise: worst relative Δ = {worst:.4e}"
+    );
+}
+
+/// Measured bound for [`focei_agq_covariance_serves_indefinite_tail_nodes_analytically`].
+///
+/// Realised worst relative SE difference: **4.0367e-4** on Linux aarch64 (the reference
+/// platform), 4.0365e-4 on macOS arm64. That is the FD stencil's own noise: the same comparison
+/// at `n_agq = 1`, where no node is involved, measures 4.05e-4. Before the fix (14/30 salvaged)
+/// it was 2.177e-4, lower only because those 14 subjects shared the reference's estimator.
+/// `1e-3` is ~2.5× headroom and the bound the sibling salvage test uses for the same comparison.
+const T4_SE_BOUND: f64 = 1e-3;
+
 /// AGQ over a **non-Gaussian endpoint** — the capability the method exists for and which every
 /// other test in this file (all Gaussian warfarin PK) leaves unexercised (review #821, point 3).
 ///
