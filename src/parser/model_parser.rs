@@ -21162,12 +21162,16 @@ fn coupling_assigns<'a>(
 ///   identifies subjects reproduces the random effect exactly. Two kinds are
 ///   found: an individual parameter that, taken out of the graph, cuts both
 ///   from `y`; and, in the one readout that reads either, the smallest sum or
-///   product of operands collecting every read of both, when those operands
-///   are all subject-constant (the chain rule carries it through a unary
-///   function, or a power whose exponent reads neither). "Subject-constant"
-///   excludes `TIME`, states, other blocks and network outputs; the block
-///   itself is allowed, and the data covariates read are recorded for the
-///   binder to check.
+///   product collecting every read of both. One rule decides constancy for
+///   both kinds (`CouplingCtx::funnel_operands`, #1712): only the operands of
+///   that smallest sum or product have to be subject-constant (the chain rule
+///   carries it through a unary function, or a power whose exponent reads
+///   neither). A factor, term or outer function reading neither cancels from
+///   `∂y/∂η ÷ ∂y/∂block` and contributes nothing, whatever it reads. For a
+///   parameter this applies per assignment, and the conditions of the `if`
+///   branches it sits in count in full. "Subject-constant" excludes `TIME`,
+///   states, other blocks and network outputs; the block itself is allowed,
+///   and the data covariates read are recorded for the binder to check.
 ///
 /// Sufficient, not necessary: proportionality the walk does not see (an
 /// algebraic cancellation, say) is not found, and the binder stays silent.
@@ -21205,6 +21209,40 @@ fn level_block_eta_coupling(
     let reach = ctx.route(&eta_src, &taint_e);
     let mut funnels = Vec::new();
     if reach.is_some() && ctx.reaches(&block_src, None) {
+        // An individual parameter is a funnel when each of its assignments is:
+        // one that reads both the block and the random effect through the
+        // operands `funnel_operands` finds, any other as a whole. The branch
+        // conditions count in full either way, since a varying condition can
+        // switch between expressions that are not proportional.
+        let p_any = |e: &Expression| {
+            ctx.expr_reads(e, &block_src, &taint_b, false)
+                || ctx.expr_reads(e, &eta_src, &taint_e, false)
+        };
+        let p_both = |e: &Expression| {
+            ctx.expr_reads(e, &block_src, &taint_b, false)
+                && ctx.expr_reads(e, &eta_src, &taint_e, false)
+        };
+        let param_funnel_covariates = |own: &[&CouplingAssign]| -> Option<Vec<String>> {
+            let mut covs = Vec::new();
+            for a in own {
+                let ops = if p_both(a.rhs) {
+                    ctx.funnel_operands(a.rhs, &p_any, &p_both)?
+                } else {
+                    vec![a.rhs]
+                };
+                for o in ops {
+                    if !ctx.expr_constant(o, &mut covs, &mut Vec::new()) {
+                        return None;
+                    }
+                }
+                for c in &a.conds {
+                    if !ctx.cond_constant(c, &mut covs, &mut Vec::new()) {
+                        return None;
+                    }
+                }
+            }
+            Some(covs)
+        };
         // Individual parameters, in source order.
         let mut seen: Vec<&str> = Vec::new();
         for a in &assigns {
@@ -21217,14 +21255,13 @@ fn level_block_eta_coupling(
             // parameter that carries only one, since the other still reaches `y`
             // without it. Two gates rejecting the same inputs would each be
             // untestable (AGENTS.md).
-            let mut covariates = Vec::new();
-            if !ctx.var_constant(v, &mut covariates, &mut Vec::new()) {
+            let own: Vec<&CouplingAssign> = assigns.iter().filter(|a| a.lhs == v).collect();
+            let Some(mut covariates) = param_funnel_covariates(&own) else {
                 continue;
-            }
+            };
             if ctx.reaches(&block_src, Some(v)) || ctx.reaches(&eta_src, Some(v)) {
                 continue;
             }
-            let own: Vec<&CouplingAssign> = assigns.iter().filter(|a| a.lhs == v).collect();
             let direct = own.iter().any(|a| {
                 reads_node(a.rhs, &is_eta) || a.conds.iter().any(|c| cond_reads_node(c, &is_eta))
             });
@@ -21252,7 +21289,7 @@ fn level_block_eta_coupling(
         let reads_both = |e: &Expression| reads_block(e) && reads_eta(e);
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
-            if let Some(ops) = ctx.readout_funnel(y, &reads_any, &reads_both) {
+            if let Some(ops) = ctx.funnel_operands(y, &reads_any, &reads_both) {
                 let direct = ops.iter().any(|o| reads_node(o, &is_eta));
                 let via = if direct {
                     None
@@ -21531,9 +21568,16 @@ impl<'a> CouplingCtx<'a> {
         }
     }
 
-    /// The operands of the smallest subject-constant sum or product in `e` that
-    /// collects every read of the block and of the random effect, if any.
-    fn readout_funnel<'e>(
+    /// The operands of the smallest sum or product in `e` that collects every
+    /// read of the block and of the random effect, when they are all
+    /// subject-constant; `None` when they are not. A unary function, or a power
+    /// whose exponent reads neither, is descended through. An operand that
+    /// reads neither is dropped, whatever it reads (`TIME` included): for any
+    /// `f(S, c)` with `c` reading neither, `∂f/∂η ÷ ∂f/∂block` is
+    /// `∂S/∂η ÷ ∂S/∂block`, so only `S` has to be constant (#1712). Descending
+    /// never loses constancy, since [`Self::expr_constant`] is a conjunction
+    /// over the children; it only sheds covariates.
+    fn funnel_operands<'e>(
         &self,
         e: &'e Expression,
         reads_any: &dyn Fn(&Expression) -> bool,
@@ -21542,22 +21586,23 @@ impl<'a> CouplingCtx<'a> {
         if !reads_both(e) {
             return None;
         }
-        if self.expr_constant(e, &mut Vec::new(), &mut Vec::new()) {
-            return Some(vec![e]);
-        }
         let mut ops: Vec<&Expression> = Vec::new();
         match e {
             Expression::BinOp(_, BinOp::Add | BinOp::Sub, _) => flatten_binop(e, true, &mut ops),
             Expression::BinOp(_, BinOp::Mul | BinOp::Div, _) => flatten_binop(e, false, &mut ops),
-            Expression::UnaryFn(_, a) => return self.readout_funnel(a, reads_any, reads_both),
+            Expression::UnaryFn(_, a) => return self.funnel_operands(a, reads_any, reads_both),
             Expression::Power(b, x) if !reads_any(x) => {
-                return self.readout_funnel(b, reads_any, reads_both)
+                return self.funnel_operands(b, reads_any, reads_both)
             }
-            _ => return None,
+            _ => {
+                return self
+                    .expr_constant(e, &mut Vec::new(), &mut Vec::new())
+                    .then(|| vec![e])
+            }
         }
         let rel: Vec<&Expression> = ops.into_iter().filter(|o| reads_any(o)).collect();
         if let [one] = rel.as_slice() {
-            return self.readout_funnel(one, reads_any, reads_both);
+            return self.funnel_operands(one, reads_any, reads_both);
         }
         rel.iter()
             .all(|o| self.expr_constant(o, &mut Vec::new(), &mut Vec::new()))
