@@ -2379,6 +2379,8 @@ fn parse_subject(
     // honor NONMEM record order at equal TIME (see the obs/dose tie-break pass).
     let mut dose_rec: Vec<usize> = Vec::new();
     let mut obs_rec: Vec<usize> = Vec::new();
+    // The same for each pk-only record, parallel to `pk_only_times` (#1810).
+    let mut pk_only_rec: Vec<usize> = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
@@ -3313,6 +3315,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            pk_only_rec.push(row_seq);
             if any_tv {
                 pk_only_covariates.push(locf_state.clone());
             }
@@ -3359,6 +3362,75 @@ fn parse_subject(
         }
         if occ_col.is_some() {
             reset_occasions = rperm.iter().map(|&i| reset_occasions[i]).collect();
+        }
+    }
+
+    // ── Honor NONMEM record order for the record that ends an interval (#1810) ──
+    // NONMEM advances the system into a shared TIME once, at the first record there in
+    // file order, under that record's `$PK` values; every later record at that TIME
+    // advances by zero. ferx's engines order co-timed records by kind (`kind_order`:
+    // Reset < DoseRecord < Dose < PkOnly < Obs, a stable sort within a kind), and the
+    // first event at a tie integrates `(t_prev, t]` under its own snapshot. The two
+    // agree whenever the file lists the kinds in that order. The #614 pass below covers
+    // an observation listed before a dose. This one covers the two ties it leaves out,
+    // both involving a pk-only row (EVID=2, or EVID=0/MDV=1):
+    //
+    // - an observation listed before it, which the engines put after it, so the
+    //   pk-only row's covariates governed the segment the observation should;
+    // - it listed before a dose, which the engines put ahead of it, so the dose row's
+    //   covariates governed the segment instead.
+    //
+    // The remedy is #614's: the first record moves one ULP below the tie, so every
+    // engine reaches it first. Only the first record needs moving, since the later
+    // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
+    // One ULP is always enough, too: the #614 pass below moves only observations, and an
+    // observation sorts last among the kinds, so a pk-only row sharing its ULP still
+    // goes first.
+    //
+    // A tie that carries a reset or an SS dose is left alone. Both replace the state at
+    // the tie, so which record governs the advance into it does not matter, and #614
+    // keeps an observation at an SS dose's time on purpose (see below). Doses are never
+    // moved. `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
+    // This runs before #614, which then finds no dose at a moved observation's time
+    // and leaves it alone.
+    if !pk_only_times.is_empty() {
+        let mut tie_times = pk_only_times.clone();
+        tie_times.sort_by(f64::total_cmp);
+        tie_times.dedup();
+        for t in tie_times {
+            if reset_times.contains(&t) || sorted_doses.iter().any(|d| d.time == t && d.ss) {
+                continue;
+            }
+            // The first record of each kind at `t`, in file order. Each vector was filled
+            // in file order, so its first entry at `t` is that kind's first record.
+            let Some(m) = pk_only_times.iter().position(|&u| u == t) else {
+                continue;
+            };
+            let pk_rec = pk_only_rec[m];
+            let obs_first = obs_times.iter().position(|&u| u == t);
+            let dose_first_rec = sorted_doses
+                .iter()
+                .zip(&sorted_dose_rec)
+                .filter(|(d, _)| d.time == t)
+                .map(|(_, &r)| r)
+                .min();
+            let before_doses = |rec: usize| dose_first_rec.is_none_or(|r| rec < r);
+            match obs_first {
+                // An observation is the first record: the engines would put the pk-only
+                // row (and any dose, which #614 handles alike) ahead of it.
+                Some(j) if obs_rec[j] < pk_rec && before_doses(obs_rec[j]) => {
+                    obs_times[j] = t.next_down();
+                }
+                // The pk-only row is ahead of a dose: the engines would put the dose
+                // ahead of it. (Without a dose it is already first.) It is then the first
+                // record, without testing the observations: an observation listed before
+                // it took the arm above, unless a dose precedes that observation, and then
+                // `before_doses(pk_rec)` fails too.
+                _ if dose_first_rec.is_some() && before_doses(pk_rec) => {
+                    pk_only_times[m] = t.next_down();
+                }
+                _ => {}
+            }
         }
     }
 

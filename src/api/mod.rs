@@ -262,6 +262,10 @@ mod per_cmt_unmatched_tests;
 #[path = "tests/record_clock_tests.rs"]
 mod record_clock_tests;
 
+#[cfg(test)]
+#[path = "tests/cotimed_record_order_tests.rs"]
+mod cotimed_record_order_tests;
+
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.
 //

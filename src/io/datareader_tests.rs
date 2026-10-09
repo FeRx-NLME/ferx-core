@@ -852,6 +852,174 @@ fn test_obs_before_ss_dose_is_not_nudged() {
     assert_eq!(subj.obs_times, vec![24.0]);
 }
 
+// ── #1810: the first record at a shared TIME, when a pk-only row is in the tie ──────────
+// NONMEM advances into a shared TIME at the first record there in file order; the engines
+// order co-timed records by kind (DoseRecord < Dose < PkOnly < Obs). The reader moves the
+// first record one ULP below the tie when the engines would not reach it first. Every
+// fixture carries a varying `X` so the EVID=2 rows have snapshots (the case that matters),
+// except the constant-covariate one, which pins that the rule does not depend on it.
+
+/// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,X` (+ `SS,II` if given).
+fn tie_subject(rows: &str) -> crate::types::Subject {
+    let header = if rows
+        .lines()
+        .next()
+        .is_some_and(|l| l.split(',').count() > 7)
+    {
+        "ID,TIME,DV,EVID,MDV,AMT,X,SS,II\n"
+    } else {
+        "ID,TIME,DV,EVID,MDV,AMT,X\n"
+    };
+    let f = write_csv(&format!("{header}{rows}"));
+    read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0)
+}
+
+#[test]
+fn test_obs_before_cotimed_evid2_is_nudged_below_it() {
+    // #1810 case 1: obs (X=1) then EVID=2 (X=2) at t=4. The observation is the first
+    // record, so it, not the EVID=2 row, governs (0, 4].
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+    assert_eq!(s.obs_raw_times, vec![4.0, 8.0], "the written TIME is kept");
+    assert_eq!(s.pk_only_times, vec![4.0], "the later record is not moved");
+}
+
+#[test]
+fn test_evid2_before_cotimed_obs_is_not_nudged() {
+    // #1810 case 2, the must-stay-green side: EVID=2 then obs. The engines already reach
+    // the EVID=2 row first (PkOnly < Obs), so nothing moves.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,1\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0, 8.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_evid2_before_cotimed_dose_is_nudged_below_it() {
+    // #1810 case 6: EVID=2 (X=2) then dose (X=3) at t=4. The EVID=2 row is the first
+    // record; the engines put the dose ahead of it (DoseRecord < PkOnly), so the EVID=2
+    // row moves. The dose never moves.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n1,8,5,0,0,.,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()]);
+    assert_eq!(
+        s.doses.iter().map(|d| d.time).collect::<Vec<_>>(),
+        vec![0.0, 4.0]
+    );
+    assert_eq!(s.obs_times, vec![8.0]);
+}
+
+#[test]
+fn test_dose_before_cotimed_evid2_is_not_nudged() {
+    // #1810 case 5, the must-stay-green side: dose then EVID=2. The dose is the first
+    // record and the engines already reach it first.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,1,1,50,3\n1,4,.,2,1,.,2\n1,8,5,0,0,.,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    assert_eq!(s.obs_times, vec![8.0]);
+}
+
+#[test]
+fn test_only_the_first_record_of_a_tie_moves() {
+    // #1810 case 4: obs1, EVID=2, obs2 at t=4. obs1 is the first record and moves; the
+    // EVID=2 row and obs2 advance by zero in NONMEM, so they stay at 4 — a second obs
+    // nudged too would also be correct, but is not needed.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,3\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    // Two co-timed observations with no pk-only row are #1810's case 7 control: the stable
+    // sort keeps them in file order, and nothing moves.
+    let s7 = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,5,0,0,.,3\n");
+    assert_eq!(s7.obs_times, vec![4.0, 4.0]);
+}
+
+#[test]
+fn test_three_way_ties_need_one_ulp() {
+    // obs, EVID=2, dose: the observation is first. It moves one ULP (the dose would have
+    // moved it anyway, #614); the EVID=2 row stays, since after the observation it
+    // advances by zero.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down()]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    // EVID=2, obs, dose: the EVID=2 row is first and moves below the dose; #614 moves the
+    // pre-dose observation to the same ULP. Engine order there is PkOnly < Obs, so the
+    // EVID=2 row still goes first without a second ULP.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,1\n1,4,.,1,1,50,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()]);
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down()]);
+    // dose, obs, EVID=2: the dose is first and nothing moves — in particular the
+    // observation is a post-dose sample and must not drop below the dose.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,1,1,50,3\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_an_mdv1_row_is_a_pk_only_record_in_a_tie() {
+    // An EVID=0/MDV=1 row is a pk-only record (#1809), so it takes part in the tie rule
+    // exactly as an EVID=2 row does.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,0,1,.,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_a_tie_with_an_ss_dose_is_left_alone() {
+    // An SS=1 dose replaces the state at the tie, so which record governs the advance into
+    // it does not matter, and #614 keeps an observation at an SS dose's time on purpose
+    // (`test_obs_before_ss_dose_is_not_nudged`). obs, EVID=2, SS dose: nothing moves.
+    let s = tie_subject(
+        "1,0,.,1,1,100,1,1,24\n1,24,5,0,0,.,1,.,.\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n",
+    );
+    assert_eq!(s.obs_times, vec![24.0]);
+    assert_eq!(s.pk_only_times, vec![24.0]);
+    // EVID=2 before an SS dose likewise.
+    let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n");
+    assert_eq!(s.pk_only_times, vec![24.0]);
+}
+
+#[test]
+fn test_a_tie_with_a_reset_is_left_alone() {
+    // A reset zeroes the state at the tie, so the advance into it does not matter. A
+    // reset is always the first record at its effective time (a reset co-timed with an
+    // earlier record is shifted past it), and the engines reach it first.
+    let s = tie_subject(
+        "1,0,.,1,1,100,1\n1,2,5,0,0,.,1\n1,4,.,3,1,.,2\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n",
+    );
+    assert_eq!(s.reset_times, vec![4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_constant_covariate_tie_is_nudged_alike() {
+    // Pinned one way so #1809 (which keeps a constant-covariate subject's EVID=2 times)
+    // and #1810 do not leave it unspecified: the rule reads file order only, never the
+    // snapshots. On such a subject every snapshot is the subject-static map, so the move
+    // changes no prediction by more than the state's change over one ULP.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,1\n1,8,5,0,0,.,1\n");
+    assert!(!s.has_tv_covariates());
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+}
+
+#[test]
+fn test_cotimed_evid2_nudge_holds_at_large_time() {
+    // The #1226 regime: at t = 17520 one ULP is 3.6e-12, above `EVENT_MATCH_TOL` and the
+    // 1e-15 dedup bands, so the moved record is a distinct instant and its sub-ULP interval
+    // is integrated explicitly. The order must still be strict.
+    let t = 17520.0_f64;
+    let s = tie_subject(&format!(
+        "1,0,.,1,1,100,1\n1,{t},5,0,0,.,1\n1,{t},.,2,1,.,2\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"
+    ));
+    assert_eq!(s.obs_times, vec![t.next_down()]);
+    assert!(s.obs_times[0] < s.pk_only_times[0]);
+    assert_eq!(s.pk_only_times, vec![t, t]);
+    let s = tie_subject(&format!(
+        "1,0,.,1,1,100,1\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"
+    ));
+    assert_eq!(s.pk_only_times, vec![t.next_down()]);
+    assert!(s.pk_only_times[0] < s.doses[1].time);
+}
+
 #[test]
 fn test_no_resets_leaves_reset_times_empty() {
     let csv = "ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n";

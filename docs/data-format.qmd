@@ -319,6 +319,30 @@ translation omits, not a structural difference.) Scoring the same model at the
 NONMEM estimates **without** record-order handling gave OFV 3751 — every trough
 mispredicted as a post-dose peak.
 
+### Covariate-change rows at a shared `TIME`
+
+An `EVID=2` row (or an `EVID=0, MDV=1` row) at the same `TIME` as an observation
+or a dose follows the same file-order rule. NONMEM advances the system into a
+shared `TIME` once, at the first record there in file order and under that record's
+covariates, and every later record there advances by zero. So with exposure `X`
+changing at `TIME 4`:
+
+```csv
+ID,TIME,DV,EVID,AMT,MDV,X
+1,4,5.2,0,.,0,1     # observation first: the interval ending at 4 runs on X = 1
+1,4,.,2,.,1,2       # covariate change, takes effect after the observation
+```
+
+Listed the other way round, the interval runs on `X = 2`. The same goes for an
+`EVID=2` row listed before a co-timed dose: the interval runs on the `EVID=2` row's
+covariates, not the dose row's. In each case the observation reads its own
+covariates in the readout, so only the state at the tie depends on the order.
+Before [#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810) ferx ran that
+interval on the `EVID=2` row in the first case and on the dose row in the second,
+whatever the file said. Ties that carry an `SS=1` dose or a reset are unaffected:
+both replace the state at the tie. Measured against NONMEM 7.6.0 on #1810's seven
+tie cases, on an `[odes]` model and on `ADVAN1`.
+
 ## System Resets (EVID=3 / EVID=4)
 
 A reset record empties every compartment at its `TIME`, as if the subject's drug history started over from that point. `EVID=3` is a pure reset; `EVID=4` resets and then administers the row's dose into the freshly emptied system. This matches NONMEM's reset-event semantics and is useful for, e.g., modelling washout between treatment cycles or re-using one subject record for independent dosing episodes.

@@ -36,7 +36,9 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 /// - `1`: #1685.
 /// - `2`: #1809. The reader keeps `EVID=2` and `EVID=0, MDV=1` times on every
 ///   subject (`pk_only_times`). A scheme-1 fingerprint is treated as absent, with a
-///   warning.
+///   warning. The same scheme covers #1810, which landed with it: the reader moves the
+///   first record of a co-timed tie with a pk-only row one ULP down (`obs_times`,
+///   `pk_only_times`).
 pub(crate) const SCHEME: u32 = 2;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
