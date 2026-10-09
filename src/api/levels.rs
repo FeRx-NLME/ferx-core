@@ -1521,8 +1521,10 @@ impl DeadLevels {
 /// with the random effects at 0, and every non-`FIX` θ jittered inside its bounds
 /// with the random effects at 0.05. One point is not enough — a θ initialised at 0,
 /// or a random effect at 0, can switch a block off there alone. `dead_levels` and
-/// `refuse_read_unindexed` share this one definition, so the two checks cannot
-/// drift apart (#1822).
+/// `refuse_read_unindexed` share these θ points, so the two cannot drift apart
+/// (#1822); the second element is the random-effect level, which `dead_levels`
+/// applies to every η and κ alike and `refuse_read_unindexed` spreads per η
+/// (`probe_etas`).
 fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
     let p = &model.default_params;
     let theta0 = p.theta.clone();
@@ -2402,10 +2404,10 @@ enum LevelSource {
 /// never showed it, the fit never estimated it, or the block is keyed on `TIME` — the
 /// writer gives it index 1, which is harmless only if nothing it is scored on reads
 /// the block. That is measured, not inferred from which endpoint reads which
-/// parameter: the engine's own `individual_nll`, at each of the dead-level check's
-/// two points (`probe_points`: the initial θ with η = 0, and every free θ jittered
-/// with each η moved by a distinct amount from 0.05, `probe_etas`), on the subject with its index set to each level of `model`'s
-/// block in turn, with every free θ of the block moved inside its bounds from that
+/// parameter: the engine's own `individual_nll`, at the dead-level check's two θ
+/// points (`probe_points`: the initial θ with η = 0, and every free θ jittered, here
+/// with each η moved by a distinct amount from 0.05, `probe_etas`), on the subject
+/// with its index set to each level of `model`'s block in turn, with every free θ of the block moved inside its bounds from that
 /// point (so that no two levels share a value, a reference level fixed at 0
 /// included), against index 1 at the point itself (so a one-level block is measured
 /// too). The block is read when, at either point, any of those differ: a read that
