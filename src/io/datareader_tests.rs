@@ -1532,22 +1532,92 @@ fn test_evid2_rows_captured_with_locf_covariates() {
 }
 
 #[test]
-fn test_evid2_rows_skipped_when_no_tv_covariates() {
-    // With time-constant covariates, EVID=2 rows are no-ops in
-    // NONMEM ($PK gives the same values), so we don't bother
-    // building snapshots for them — saves allocation. This test
-    // locks in that optimization.
+fn test_evid2_record_time_kept_without_tv_covariates() {
+    // #1809: with time-constant covariates an EVID=2 row re-evaluates `$PK` to the same
+    // values, so no snapshot is built for it, but it is still a record. NONMEM starts the
+    // system at a subject's first record of any type, and `subject_integration_start`
+    // reads that from `pk_only_times`. So the time is kept and only the snapshot is
+    // skipped. Before #1809 the time was dropped with the snapshot, and an ODE subject's
+    // clock started at its first observation.
+    //
+    // The two subjects separate "time kept" from "first record": subject 1's EVID=2 row
+    // sits between a dose and an observation, subject 2's precedes everything else.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
                    1,0,.,1,1,100,70\n\
                    1,5,.,2,1,0,70\n\
-                   1,10,5.0,0,0,.,70\n";
+                   1,10,5.0,0,0,.,70\n\
+                   2,0,.,2,1,0,80\n\
+                   2,2,4.0,0,0,.,80\n\
+                   2,5,.,2,1,0,80\n\
+                   2,8,3.0,0,0,.,80\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let subj = &pop.subjects[0];
 
-    assert!(!subj.has_tv_covariates());
-    assert!(subj.pk_only_times.is_empty());
-    assert!(subj.pk_only_covariates.is_empty());
+    let s1 = &pop.subjects[0];
+    assert!(!s1.has_tv_covariates());
+    assert_eq!(s1.pk_only_times, vec![5.0]);
+    assert!(s1.pk_only_covariates.is_empty());
+    // The fallback, not an empty map, is what a consumer of the record reads.
+    assert_eq!(s1.pk_only_cov(0)["WT"], 70.0);
+
+    let s2 = &pop.subjects[1];
+    assert!(!s2.has_tv_covariates());
+    assert_eq!(s2.pk_only_times, vec![0.0, 5.0]);
+    assert!(s2.pk_only_covariates.is_empty());
+    assert_eq!(s2.obs_times, vec![2.0, 8.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s2), 0.0);
+}
+
+#[test]
+fn test_evid0_mdv1_row_is_a_record_on_both_paths() {
+    // #1809 (option A2): an EVID=0 row with MDV=1 is a record. NONMEM 7.6.0 starts the
+    // clock at it (#1809 triage, subjects 3 and 4), and NONMEM 7 turns a non-dose MDV=1
+    // record into EVID=2 when no EVID is supplied. Before #1809 no reader arm took it, so
+    // it reached neither `obs_times` nor `pk_only_times`, on the constant-covariate path
+    // and on the time-varying path alike. Subject 1 is constant (no snapshot), subject 2
+    // has `EXPO` varying (snapshot = the row's own value). Both keep the time as their
+    // first record.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,EXPO\n\
+                   1,0,.,0,1,.,3\n\
+                   1,2,4.0,0,0,.,3\n\
+                   1,4,5.0,0,0,.,3\n\
+                   2,0,.,0,1,.,0\n\
+                   2,2,4.0,0,0,.,3\n\
+                   2,4,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+    let s1 = &pop.subjects[0];
+    assert!(!s1.has_tv_covariates());
+    assert_eq!(s1.pk_only_times, vec![0.0]);
+    assert!(s1.pk_only_covariates.is_empty());
+    assert_eq!(s1.obs_times, vec![2.0, 4.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s1), 0.0);
+
+    let s2 = &pop.subjects[1];
+    assert!(s2.has_tv_covariates());
+    assert_eq!(s2.pk_only_times, vec![0.0]);
+    assert_eq!(s2.pk_only_covariates.len(), 1);
+    assert_eq!(s2.pk_only_cov(0)["EXPO"], 0.0);
+    assert_eq!(s2.obs_times, vec![2.0, 4.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s2), 0.0);
+}
+
+#[test]
+fn test_missing_dv_observation_is_still_dropped() {
+    // #1809 keeps EVID=2 and EVID=0/MDV=1 rows as records. An EVID=0/MDV=0 row whose DV
+    // cell is missing is a different row: `W_MISSING_DV` skips it under
+    // `MissingDvPolicy::Skip` (#258). Whether NONMEM treats it as a record that starts the
+    // clock has not been measured, so #1809 leaves it out on purpose. This pins that
+    // scope: such a row reaches neither `obs_times` nor `pk_only_times`.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT\n\
+                   1,0,.,0,0,.\n\
+                   1,2,4.0,0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = &pop.subjects[0];
+    assert_eq!(s.obs_times, vec![2.0]);
+    assert!(s.pk_only_times.is_empty());
 }
 
 #[test]
@@ -1581,10 +1651,11 @@ fn test_reset_rows_captured_with_their_own_covariates() {
 
 #[test]
 fn test_reset_covariates_skipped_when_no_tv_covariates() {
-    // Mirrors `test_evid2_rows_skipped_when_no_tv_covariates`: with time-constant
+    // Mirrors `test_evid2_record_time_kept_without_tv_covariates`: with time-constant
     // covariates every snapshot is the subject-static map, so the reader builds none and
-    // `reset_cov` falls back to it. Locks in that the allocation is skipped and that the
-    // fallback — not an empty map — is what consumers see.
+    // `reset_cov` falls back to it, while the record's time is kept. Locks in that the
+    // allocation is skipped and that the fallback — not an empty map — is what consumers
+    // see.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
                    1,0,.,1,1,100,70\n\
                    1,4,.,3,1,0,70\n\

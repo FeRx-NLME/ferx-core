@@ -2494,9 +2494,10 @@ fn parse_subject(
     // Per-event covariate snapshots (only populated when any_tv is true).
     let mut dose_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut obs_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // EVID=2 ("other event") rows — typically covariate-change markers.
-    // Only worth tracking when there are TV covariates, since otherwise
-    // re-evaluating $PK with unchanged values is a no-op.
+    // Non-dose, unscored records: EVID=2 ("other event") rows — typically
+    // covariate-change markers — and EVID=0/MDV=1 rows. The time is kept for
+    // every subject, because it can be where the integration starts (#1809);
+    // the snapshot only when there are TV covariates.
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
     // EVID=3 (reset) and EVID=4 (reset + dose) rows. Both zero every
@@ -3290,21 +3291,31 @@ fn parse_subject(
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_obs(cause);
             }
-        } else if evid == 2 && any_tv {
-            // EVID=2 "other event" — typically a covariate-change marker.
-            // NONMEM/nlmixr2 run $PK at this time with this row's
+        } else if evid == 2 || (evid == 0 && mdv != 0) {
+            // A non-dose record that is not scored: EVID=2 "other event" —
+            // typically a covariate-change marker — or an EVID=0 row with
+            // MDV=1. NONMEM/nlmixr2 run $PK at this time with this row's
             // covariate values, so the rate matrix switches at this
             // time even though the row is neither a dose nor an obs.
             // We capture it as a pk-only event; the analytical / AD /
             // ODE event walkers will refresh `current_pk` from this
             // row's covariates without mutating the compartment state.
             //
-            // Skipped entirely when there are no TV covariates: with
-            // constant covariates re-evaluating $PK gives the same
-            // values, so the row is a true no-op and adding it to the
-            // event timeline would just be wasted work.
+            // The time is kept for every subject, the snapshot only with TV
+            // covariates (#1809). With constant covariates re-evaluating $PK
+            // gives the same values, so no snapshot is needed — `pk_only_cov`
+            // falls back to the subject-static map, the shape
+            // `prune_irrelevant_tv_covariates` already leaves. The time is not
+            // a no-op: NONMEM starts the system at the subject's first record
+            // of any type, and `subject_integration_start` reads it from
+            // `pk_only_times`. Dropping the row moved an ODE subject's clock to
+            // its first observation or dose. NONMEM 7.6.0 starts the clock at
+            // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
+            // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
-            pk_only_covariates.push(locf_state.clone());
+            if any_tv {
+                pk_only_covariates.push(locf_state.clone());
+            }
         }
     }
 

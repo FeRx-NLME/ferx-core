@@ -29,8 +29,15 @@ use super::EventType;
 use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 
 /// The encoding version. Bump it whenever what [`PopulationFingerprint::of`]
-/// hashes, or how, changes.
-pub(crate) const SCHEME: u32 = 1;
+/// hashes, or how, changes — including when the reader starts building a different
+/// `Subject` from the same file, since a fingerprint stored before the change would
+/// otherwise read as a population mismatch on a file that did not change.
+///
+/// - `1`: #1685.
+/// - `2`: #1809. The reader keeps `EVID=2` and `EVID=0, MDV=1` times on every
+///   subject (`pk_only_times`). A scheme-1 fingerprint is treated as absent, with a
+///   warning.
+pub(crate) const SCHEME: u32 = 2;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its

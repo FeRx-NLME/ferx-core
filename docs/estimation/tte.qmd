@@ -273,13 +273,15 @@ the cumulative-hazard grid).
 an interval-censored left bound below the start of the integration contributes nothing:
 nothing has acted on the system yet, so `H = 0` and `h = h(u₀)` there, and the
 left-truncated `H(T) − H(entry)` reduces to the untruncated `H(T)`. `predict_survival()`
-reports the same values at such a grid point. Where the clock starts is worth knowing,
-because it differs from NONMEM: NONMEM integrates from the subject's first record of *any*
-`EVID`, ferx from the first dose or scored observation. An `MDV = 1` row is dropped by the
-reader, and an `EVID = 2` row only joins the timeline on a model with time-varying
-covariates (which a joint PK-TTE model routes away from the shared solve anyway) — neither
-starts the hazard clock. Put a dose or an observation record where the clock should start
-([#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)).
+reports the same values at such a grid point
+([#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)). The clock starts where
+NONMEM's does, at the subject's first record of *any* `EVID`: a dose, a scored
+observation, an `EVID = 2` row or an `EVID = 0, MDV = 1` row. So a baseline hazard
+accumulates from a covariate-marker row ahead of the first dose. Before
+[#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) the reader dropped the last
+two kinds of row (an `EVID = 2` row was kept only with time-varying covariates), and the
+clock started at the first dose or scored observation. One row is still not a record: an
+observation row whose `DV` is missing, which the reader skips under `W_MISSING_DV`.
 
 ### A time-dependent hazard keeps the single shared solve {#time-dependent-hazard}
 

@@ -13128,3 +13128,109 @@ fn ode_wide_theta_only_model_is_analytic_without_an_fd_warning() {
         "an η-free model has no inner gradient to fall back from"
     );
 }
+
+// ── #1809: a static subject's first record is an EVID=2 row ─────────────────────────────
+//
+// Since #1809 the reader keeps an EVID=2 (or EVID=0/MDV=1) row's time on a subject whose
+// covariates are all constant, with no snapshot, so it can be where the integration starts.
+// The analytic walk reads that start from the same `pk_only_times` as the f64 predictor
+// (`ode_provider`'s break timeline and its `init()` start), so the gradient must follow the
+// value path onto the new clock. The parity checks pin the derivative against the value
+// path. The closed-form assertion pins the value path itself, because parity against a
+// predictor on the wrong clock passes against the exact derivative of the wrong function
+// (the AGENTS.md caveat). Before #1809 the first observation's value was the initial state.
+
+/// `d/dt(resp) = KOUT·((PLB·e^{-TF·TIME} + EFF) − resp)` with `EFF` from a constant `EXPO`,
+/// the #1809 model, at solver tolerances well below the closed-form comparison. `prod`
+/// replaces the `TIME` term with a constant production `PLB` (the dense route), and `init`
+/// adds `init(resp) = <expr>`.
+fn evid2_clock_model(prod: bool, init: Option<&str>) -> CompiledModel {
+    let source = if prod { "PLB" } else { "PLB * exp(-TF * TIME)" };
+    let init_line = init
+        .map(|e| format!("  init(resp) = {e}\n"))
+        .unwrap_or_default();
+    let src = format!(
+        "[parameters]\n  theta TVKOUT(0.25, 0.01, 5.0)\n  theta TVPLB(6.0, 0.1, 50.0)\n  \
+         theta TVTF(0.15, 0.001, 2.0)\n  theta TVEMAX(8.0, 0.1, 50.0)\n  \
+         theta TVEC50(2.0, 0.1, 50.0)\n  omega ETA_PLB ~ 0.04\n  omega ETA_KOUT ~ 0.04\n  \
+         sigma ADD ~ 0.5 (sd)\n\
+         [individual_parameters]\n  KOUT = TVKOUT * exp(ETA_KOUT)\n  \
+         PLB = TVPLB * exp(ETA_PLB)\n  TF = TVTF\n  EFF = TVEMAX * EXPO / (TVEC50 + EXPO)\n\
+         [structural_model]\n  ode(obs_cmt=resp, states=[resp])\n\
+         [odes]\n{init_line}  d/dt(resp) = KOUT * (({source} + EFF) - resp)\n\
+         [error_model]\n  DV ~ additive(ADD)\n\
+         [fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n"
+    );
+    parse_model_string(&src).expect("parse the #1809 clock model")
+}
+
+/// One constant-covariate subject read from data: an EVID=2 row at 0, observations at 2/4/8.
+fn evid2_first_static_subject() -> Subject {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"ID,TIME,DV,EVID,MDV,AMT,CMT,EXPO\n\
+          1,0,.,2,1,0,1,3\n1,2,1,0,0,0,1,3\n1,4,1,0,0,0,1,3\n1,8,1,0,0,0,1,3\n",
+    )
+    .unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = pop.subjects.into_iter().next().unwrap();
+    assert!(
+        !s.has_tv_covariates() && s.pk_only_times == vec![0.0] && s.pk_only_covariates.is_empty(),
+        "fixture must be the #1809 shape: static, the EVID=2 time kept, no snapshot"
+    );
+    s
+}
+
+#[test]
+fn ode_provider_static_evid2_first_record_matches_production_and_closed_form() {
+    let subject = evid2_first_static_subject();
+    // Closed form of `dy/dt = k(P e^{-a t} + E − y)` (TIME source) and of
+    // `dy/dt = k(P + E − y)` (constant production), clock at the EVID=2 row (t = 0), at
+    // the typical values (k = 0.25, a = 0.15, P = 6, E = 8·3/5): what NONMEM 7.6.0 printed
+    // in the #1809 triage.
+    let (k, a, p, e) = (0.25_f64, 0.15_f64, 6.0_f64, 4.8_f64);
+    let decay = move |t: f64, y0: f64| {
+        y0 * (-k * t).exp()
+            + e * (1.0 - (-k * t).exp())
+            + p * k / (k - a) * ((-a * t).exp() - (-k * t).exp())
+    };
+    let production = move |t: f64| (p + e) * (1.0 - (-k * t).exp());
+    type Want = Box<dyn Fn(f64) -> f64>;
+    let cases: [(&str, CompiledModel, Want); 3] = [
+        (
+            "event-driven (TIME in RHS)",
+            evid2_clock_model(false, None),
+            Box::new(move |t| decay(t, 0.0)),
+        ),
+        (
+            "dense (constant production)",
+            evid2_clock_model(true, None),
+            Box::new(production),
+        ),
+        (
+            "init(resp) = 5",
+            evid2_clock_model(false, Some("5.0")),
+            Box::new(move |t| decay(t, 5.0)),
+        ),
+    ];
+    for (label, model, want) in cases {
+        let theta = model.default_params.theta.clone();
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &[0.0, 0.0])
+            .unwrap_or_else(|| panic!("{label}: the model must be in analytic scope"));
+        for (j, (obs, &t)) in sens.obs.iter().zip(&subject.obs_times).enumerate() {
+            assert!(
+                (obs.f - want(t)).abs() < 1e-8,
+                "{label}: provider value at obs {j} (t={t}) is {}, closed form {}; the clock \
+                 must start at the EVID=2 row",
+                obs.f,
+                want(t)
+            );
+        }
+        // Derivative vs the value path, away from η = 0 so no entry is degenerate.
+        let eta = [0.15, -0.1];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    }
+}

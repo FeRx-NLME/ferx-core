@@ -343,6 +343,49 @@ fn pure_tte_subject_is_not_validated_against_the_placeholder_pk_model() {
     );
 }
 
+/// A non-dose record does not make a pure-TTE subject a PK subject (#1809). Since #1809 the
+/// reader keeps the time of every EVID=2 and EVID=0/MDV=1 row, constant covariates or not,
+/// so that the record can start the ODE clock. On an analytical model nothing reads a
+/// pk-only time: the predictor produces a value per Gaussian observation and nothing else
+/// (see `subject_feeds_analytical_pk`). So such a row must not re-enable the
+/// dose-compartment check the exemption above skips.
+///
+/// Subject 1's covariates are constant, the shape #1809 creates (before it, the reader
+/// dropped the row). Subject 2's `WT` varies, the shape the reader kept before #1809 too,
+/// and which the exemption therefore already missed. Both must be exempt.
+#[cfg(feature = "survival")]
+#[test]
+fn a_record_row_does_not_make_a_pure_tte_subject_a_pk_subject() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of_routed(
+        &model,
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,WT\n\
+         1,0,.,1,100,2,1,70\n1,2,.,2,.,2,1,70\n1,3,.,0,.,2,1,70\n1,5,1,0,.,2,0,70\n\
+         2,0,.,1,100,2,1,70\n2,2,.,2,.,2,1,80\n2,3,.,0,.,2,1,90\n2,5,1,0,.,2,0,90\n",
+    );
+    for s in &pop.subjects {
+        assert!(
+            s.obs_times.is_empty(),
+            "subject {}: no Gaussian observation",
+            s.id
+        );
+        assert_eq!(
+            s.pk_only_times,
+            vec![2.0, 3.0],
+            "subject {}: the EVID=2 and EVID=0/MDV=1 rows are records",
+            s.id
+        );
+    }
+    assert!(!pop.subjects[0].has_tv_covariates());
+    assert!(pop.subjects[1].has_tv_covariates());
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().all(|d| !d.is_error()),
+        "a pure-TTE subject's record rows must not re-enable the dose-compartment check: \
+         {diags:?}"
+    );
+}
+
 /// …but a subject that *does* carry a Gaussian observation is still checked,
 /// even on a model that also has a TTE endpoint. Guards against the exemption
 /// being too broad and silently disabling the fix for joint PK-TTE models.
