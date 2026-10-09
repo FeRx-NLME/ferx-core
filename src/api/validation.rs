@@ -4419,7 +4419,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 }
             }
         }
-        if matches!(model.bloq_method, BloqMethod::M3) {
+        if matches!(model.bloq_in_force(), BloqMethod::M3) {
             diags.push(
                 Diagnostic::error(
                     "E_BLOCK_SIGMA_M3_UNSUPPORTED",

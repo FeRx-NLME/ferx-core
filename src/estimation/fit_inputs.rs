@@ -673,8 +673,17 @@ pub(crate) fn scoring_options(
 /// 4.9 / 1000 and a covariance step reporting SE(TVKA) = 7576 against the fit's 0.74.
 ///
 /// [`interaction_for`]: crate::types::interaction_for
+///
+/// The LOQ-censoring method rides along (#1824): the one the fit reports
+/// ([`FitResult::bloq_method`]) is part of the marginal it minimised, and since `fit()`
+/// honours a per-call `FitOptions::bloq_method` the model a post-hoc step is handed need
+/// not carry it. Only a fit recording none (an empty label) leaves the caller's.
 pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
-    scoring_options(fit.method, fit.interaction, options)
+    let mut scored = scoring_options(fit.method, fit.interaction, options);
+    if let Some(bloq) = crate::types::BloqMethod::from_label(&fit.bloq_method) {
+        scored.bloq_method = Some(bloq);
+    }
+    scored
 }
 
 /// The [`FitOptions`] of the stage that produced a fit's estimates (and ran its inline

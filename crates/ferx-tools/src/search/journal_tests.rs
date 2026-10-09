@@ -422,7 +422,7 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             o.run_covariance_step = !o.run_covariance_step;
         }),
         ("the BLOQ convention", &|o: &mut FitOptions| {
-            o.bloq_method = BloqMethod::M3;
+            o.bloq_method = Some(BloqMethod::M3);
         }),
         ("the gradient method", &|o: &mut FitOptions| {
             o.gradient_method = GradientMethod::Fd;

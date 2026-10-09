@@ -772,7 +772,7 @@ pub(crate) fn compute_subject_results(
             // ordinary observation, so it keeps its IWRES (and its weight in
             // ε-shrinkage, which counts the finite ones) — #1499.
             for (j, c) in subject.cens.iter().enumerate() {
-                if model.bloq_method.is_censored_row(*c) {
+                if model.bloq_in_force().is_censored_row(*c) {
                     iwres[j] = f64::NAN;
                 }
             }
@@ -808,7 +808,7 @@ pub(crate) fn compute_subject_results(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 r_preds,
-                model.bloq_method,
+                model.bloq_in_force(),
             );
 
             // OFV contribution

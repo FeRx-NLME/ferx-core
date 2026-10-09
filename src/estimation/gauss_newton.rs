@@ -99,7 +99,7 @@ pub fn run_foce_gn(
     // BHHH Information-matrix approximation degrades as the censoring fraction
     // grows — each censored row contributes less Fisher information than its
     // Gaussian counterpart, biasing the outer-product Hessian small-sample.
-    if matches!(model.bloq_method, BloqMethod::M3)
+    if matches!(model.bloq_in_force(), BloqMethod::M3)
         && population
             .subjects
             .iter()
@@ -1787,7 +1787,7 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
     template: &ModelParameters,
     kappas: &[DVector<f64>],
 ) -> bool {
-    !matches!(model.bloq_method, BloqMethod::M3)
+    !matches!(model.bloq_in_force(), BloqMethod::M3)
         && kappas.is_empty()
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()

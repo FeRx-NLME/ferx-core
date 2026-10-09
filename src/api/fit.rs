@@ -164,10 +164,15 @@ pub fn fit_from_files(
     // returns `EngineError`.
     crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
         .map_err(|e| e.to_string())?;
-    let mut model = parsed.model;
-    model.bloq_method = opts.bloq_method;
-    // No `gradient_method` stamp: `fit` resolves `opts.gradient_method` per call (#1613),
-    // and every reader declines an SDE model on its own.
+    let model = parsed.model;
+    // No model stamps: `fit` resolves `opts.gradient_method` (#1613) and `opts.bloq_method`
+    // (#1824) per call. One options-side pin keeps this entry point's contract — the file's
+    // `[fit_options]` are ignored, so a caller with no opinion gets the default `drop`, not the
+    // `bloq_method` the parser read off the file onto the model.
+    let opts = FitOptions {
+        bloq_method: Some(opts.bloq_method.unwrap_or(crate::types::BloqMethod::Drop)),
+        ..opts
+    };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
     if let Some(w) = data_path_warning {
@@ -571,6 +576,13 @@ fn fit_unstamped(
     // `options.gradient_method` onto the model as the file entry points did, and before #1613 a
     // direct `fit()` with `FitOptions { gradient_method: Fd, .. }` ran on the analytic gradient
     // with no warning. A reader added before the pool must arm `crate::types::arm_forced_fd`.
+    // #1824: this call's `bloq_method` override, by contrast, *is* read before the pool — the
+    // data checks and the FOCE-M3 warning below ask `bloq_in_force` — so it is armed here, like
+    // the ODE override, and dropped with it before `install_on_fit_pool` re-arms it through
+    // `FitScope::bloq`. Before #1824 only the file entry points stamped it onto the model, and
+    // a direct `fit()` with `FitOptions { bloq_method: M3, .. }` on a `drop` model scored the
+    // censored rows as ordinary observations and reported `drop`.
+    let bloq_override = crate::types::arm_bloq_override(options.bloq_method);
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the ways out — first the public
@@ -919,6 +931,7 @@ fn fit_unstamped(
 
     // Pre-pool validation is over; `install_on_fit_pool` re-arms on the thread it runs on.
     drop(ode_solver_override);
+    drop(bloq_override);
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
@@ -2579,7 +2592,7 @@ fn fit_inner(
     // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
     // interaction in most practice, surface the non-interaction choice so a user does not
     // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
-    if matches!(model.bloq_method, BloqMethod::M3)
+    if matches!(model.bloq_in_force(), BloqMethod::M3)
         && matches!(
             options.method,
             EstimationMethod::Foce | EstimationMethod::FoceGn
@@ -3037,7 +3050,7 @@ fn fit_inner(
         } else {
             None
         },
-        bloq_method: model.bloq_method.label().to_string(),
+        bloq_method: model.bloq_in_force().label().to_string(),
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
         inits_from_nca: options.inits_from_nca.map(|m| {
