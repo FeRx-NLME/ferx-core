@@ -581,7 +581,7 @@ pub enum ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic
 pub ferx_core::estimation::uncertainty_samples::UncertaintyMethod::Sir
 pub fn ferx_core::estimation::uncertainty_samples::draw_parameter_samples(fit_result: &ferx_core::FitResult, template: &ferx_core::ModelParameters, n_draws: usize, method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod, rng: &mut impl rand_core::Rng) -> core::result::Result<alloc::vec::Vec<ferx_core::ModelParameters>, alloc::string::String>
-pub fn ferx_core::estimation::uncertainty_samples::fitted_params_from_result(fit_result: &ferx_core::FitResult, model: &ferx_core::CompiledModel) -> core::result::Result<ferx_core::ModelParameters, alloc::string::String>
+pub fn ferx_core::estimation::uncertainty_samples::fitted_params_from_result(fit_result: &ferx_core::FitResult, model: &ferx_core::CompiledModel) -> core::result::Result<ferx_core::ModelParameters, ferx_core::diagnostics::EngineError>
 pub mod ferx_core::estimation::vi
 pub mod ferx_core::estimation::vi::adam
 pub struct ferx_core::estimation::vi::adam::AdamConfig

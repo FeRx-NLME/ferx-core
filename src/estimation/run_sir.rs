@@ -251,7 +251,7 @@ fn run_sir_scoped(
     }
 
     // --- Reconstruct ModelParameters and eta_hats -------------------------
-    let params = fitted_params_from_result(fit, model_ref).map_err(|e| format!("run_sir: {e}"))?;
+    let params = fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_sir"))?;
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
 
     // --- Now require a covariance matrix to seed the proposal -------------
