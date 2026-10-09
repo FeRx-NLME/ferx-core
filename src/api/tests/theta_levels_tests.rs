@@ -8393,6 +8393,28 @@ mod no_gaussian_subjects {
         assert!(jittered[k] >= 1.05, "closed at the jitter: {}", jittered[k]);
     }
 
+    /// #1822 T6 (review r1 #1). `H0 = TVH0·exp(PLACEBO·(ETA_CL − ETA_V))`: the gate is
+    /// a difference of two random effects, so it is closed at η = 0 and stays closed at
+    /// any η that moves every random effect by the same amount. Refused. The straddle is
+    /// asserted on the η the measurement uses: distinct per index, so the difference is
+    /// open at the moved point.
+    ///
+    /// Mutation — move every random effect to the same value at the jittered point:
+    /// binds (only this test dies).
+    #[test]
+    fn a_gate_on_a_difference_of_random_effects_is_refused() {
+        let text = gated("TVH0 * exp(PLACEBO * (ETA_CL - ETA_V))", "")
+            .replace("  V  = TVV\n", "  V  = TVV * exp(ETA_V)\n")
+            .replace(
+                "  omega ETA_CL ~ 0.09\n",
+                "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n",
+            );
+        assert!(text.contains("TVV * exp(ETA_V)") && text.contains("ETA_V ~ 0.04"));
+        refused_everywhere(&text);
+        let eta = probe_etas(0.05, 2);
+        assert_ne!(eta[0], eta[1], "the difference is open at the moved point");
+    }
+
     /// `csv` with an `ACTIVE` column: `active_97` on subject 97, 1 elsewhere.
     fn with_active(csv: &str, active_97: u32) -> String {
         csv.lines()

@@ -1541,6 +1541,14 @@ fn jitter_step(k: usize, x: f64) -> f64 {
     (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0)
 }
 
+/// The `n_eta` random effects the readership measurement uses at a probe point whose
+/// level is `re`: 0 at the initial point, and distinct per index at the moved one, so
+/// a read gated by a difference of random effects (`ETA_CL − ETA_V`) does not cancel
+/// there — the same reason `jitter_step` is distinct per θ (#1822 review r1).
+fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
+    (0..n_eta).map(|j| re * (1.0 + 0.3 * j as f64)).collect()
+}
+
 /// Rule 1 (#1679): the non-`FIX` levels of `decl` whose θ the likelihood never
 /// reads, and which random effects read their records.
 ///
@@ -2396,13 +2404,13 @@ enum LevelSource {
 /// the block. That is measured, not inferred from which endpoint reads which
 /// parameter: the engine's own `individual_nll`, at each of the dead-level check's
 /// two points (`probe_points`: the initial θ with η = 0, and every free θ jittered
-/// with η = 0.05), on the subject with its index set to each level of `model`'s
+/// with each η moved by a distinct amount from 0.05, `probe_etas`), on the subject with its index set to each level of `model`'s
 /// block in turn, with every free θ of the block moved inside its bounds from that
 /// point (so that no two levels share a value, a reference level fixed at 0
 /// included), against index 1 at the point itself (so a one-level block is measured
 /// too). The block is read when, at either point, any of those differ: a read that
-/// another θ or a random effect switches off at the initial estimates is still
-/// seen at the jitter (#1822). Only a measured, finite "no change" binds; a
+/// another θ or a random effect switches off at the initial estimates is seen when
+/// the moved point opens it (#1822). Only a measured, finite "no change" binds; a
 /// non-finite value measures nothing and counts as a read. That branch is
 /// defensive: the endpoint likelihoods map an ill-defined term to the finite `1e20`
 /// sentinel (`crate::survival`) before it reaches here, so no fixture has reached
@@ -2462,7 +2470,7 @@ fn refuse_read_unindexed(
                         );
                     }
                 }
-                (base, moved, vec![*re; model.n_eta])
+                (base, moved, probe_etas(*re, model.n_eta))
             })
             .collect();
         let column = level_index_column(decl.name());
