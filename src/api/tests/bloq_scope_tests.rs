@@ -120,7 +120,8 @@ fn a_direct_fit_with_m3_in_the_options_scores_m3_on_a_drop_model() {
 /// **B2 — the other direction, which a union rule (#1613's) could not express: an explicit
 /// `Some(Drop)` turns M3 off on an `m3` model.**
 ///
-/// Mutation: `bloq_in_force` as "M3 from either side wins" → this test, and only this one.
+/// Mutation: `bloq_in_force` as "M3 from either side wins" → this test and B7 (whose `None`
+/// call pins `Drop` on an `m3` model).
 #[test]
 fn an_explicit_drop_in_the_options_overrides_an_m3_model() {
     let m3 = run(BloqMethod::M3, None);
@@ -347,4 +348,49 @@ fn fit_from_files_keeps_ignoring_the_files_bloq_method() {
     let asked = eval(Some(BloqMethod::M3));
     assert_eq!(asked.bloq_method, "m3", "asked for m3");
     assert_eq!(asked.ofv.to_bits(), m3.ofv.to_bits(), "asked: M3 objective");
+}
+
+/// **B8 — the standalone `check_model_options` honours `options.bloq_method` (review r1 #1).**
+/// It is `pub` and takes the options, but its M3 gates read `bloq_in_force`, which only `fit()`
+/// armed: `Some(M3)` on a `drop` + `block_sigma` model returned no error while `fit()` on the
+/// same inputs refused. Both sides of the gate in one test: `Some(M3)` → the code, `None` →
+/// none.
+///
+/// Mutation: delete the arm at the top of `check_model_options` → the `Some(M3)` half.
+#[test]
+fn check_model_options_reads_the_options_bloq_method() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n  \
+         omega ETA_CL ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.02, 0.25]\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+         DV ~ combined(PROP_ERR, ADD_ERR)\n",
+    )
+    .expect("block_sigma model parses");
+    assert_eq!(model.bloq_method, BloqMethod::Drop, "fixture: a drop model");
+    let codes = |bloq: Option<BloqMethod>| -> Vec<String> {
+        crate::api::check_model_options(
+            &model,
+            &FitOptions {
+                bloq_method: bloq,
+                ..Default::default()
+            },
+        )
+        .into_iter()
+        .map(|d| d.code.to_string())
+        .collect()
+    };
+    const CODE: &str = "E_BLOCK_SIGMA_M3_UNSUPPORTED";
+    let with_m3 = codes(Some(BloqMethod::M3));
+    let without = codes(None);
+    assert!(with_m3.iter().any(|c| c == CODE), "Some(M3): {with_m3:?}");
+    assert!(
+        !without.iter().any(|c| c == CODE),
+        "None on a drop model: {without:?}"
+    );
+    assert_eq!(
+        model.bloq_in_force(),
+        BloqMethod::Drop,
+        "nothing outlives the call"
+    );
 }

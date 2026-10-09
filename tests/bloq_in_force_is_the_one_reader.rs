@@ -8,8 +8,8 @@
 //! which is the defect #1824 fixed at ~45 sites. This makes that a red test.
 //!
 //! Scope: production code under `src/` — `*_tests.rs` siblings, `tests/` folders,
-//! `test_helpers` files and everything after a file's first inline
-//! `#[cfg(test)] mod … {` are skipped. A read is `model.bloq_method` (any receiver
+//! `test_helpers` files and the bodies of inline `#[cfg(test)] mod … { }` modules
+//! are skipped. A read is `model.bloq_method` (any receiver
 //! ending in `model`, so `self.model.` and `twin_model.` too) not followed by an
 //! assignment `=`. `FitOptions::bloq_method` and `FitResult::bloq_method` share the
 //! field name but not the receiver, and the accessor itself reads `self.bloq_method`;
@@ -35,23 +35,32 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The production half of a source file: everything before its first inline
-/// `#[cfg(test)]` module (`mod name {`). A `#[path = …] mod` sibling declaration
-/// has no `{` and does not end it.
-fn production_part(src: &str) -> &str {
-    let mut offset = 0;
+/// The production part of a source file: every line outside an inline
+/// `#[cfg(test)] mod name { … }` body, which is blanked (so line numbers still
+/// match the file). The body ends where its braces balance, so production code
+/// *after* a test module is still scanned (review r1 #3: six files have some). A
+/// `#[path = …] mod` sibling declaration has no `{` and blanks nothing. Braces are
+/// counted per character, so one inside a string or char literal in a test module
+/// could end it early or late — the remaining gap; no such module exists today.
+fn production_part(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
     let mut prev_is_cfg_test = false;
+    let mut depth: i64 = 0;
     for line in src.split_inclusive('\n') {
         let t = line.trim();
-        if prev_is_cfg_test && t.contains("mod ") && t.ends_with('{') {
-            return &src[..offset];
+        let opens = prev_is_cfg_test && depth == 0 && t.contains("mod ") && t.ends_with('{');
+        if depth > 0 || opens {
+            depth += line.matches('{').count() as i64 - line.matches('}').count() as i64;
+            out.push('\n');
+            prev_is_cfg_test = false;
+            continue;
         }
         if !t.starts_with("#[path") {
             prev_is_cfg_test = t == "#[cfg(test)]";
         }
-        offset += line.len();
+        out.push_str(line);
     }
-    src
+    out
 }
 
 /// Every `model.bloq_method` read in `src` as `(line number, line)`.
@@ -89,12 +98,20 @@ fn the_classifier_sees_reads_and_skips_assignments_and_test_modules() {
                fn e(o: &O) -> Option<B> { o.bloq_method }\n\
                #[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod sib;\n\
                fn f(model: &M) -> B { model.bloq_method }\n\
-               #[cfg(test)]\nmod tests {\n  fn g(model: &M) -> B { model.bloq_method }\n}\n";
-    let lines: Vec<usize> = field_reads(production_part(src))
+               #[cfg(test)]\nmod tests {\n  fn g(model: &M) -> B { model.bloq_method }\n  \
+               mod inner {\n    fn h(model: &M) -> B { model.bloq_method }\n  }\n}\n\
+               fn k(model: &M) -> B { model.bloq_method }\n";
+    let lines: Vec<usize> = field_reads(&production_part(src))
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(lines, vec![1, 3, 9], "reads on lines 1, 3 and 9 only");
+    // 1, 3, 9: before any test module. 17: production code *after* an inline test
+    // module (with a nested module inside it), which must still be scanned.
+    assert_eq!(
+        lines,
+        vec![1, 3, 9, 17],
+        "reads on lines 1, 3, 9 and 17 only"
+    );
 }
 
 #[test]
@@ -113,7 +130,7 @@ fn no_production_code_reads_the_bloq_method_field() {
     let mut offenders = Vec::new();
     for path in &sources {
         let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
-        for (n, line) in field_reads(production_part(&src)) {
+        for (n, line) in field_reads(&production_part(&src)) {
             offenders.push(format!("{}:{n}: {line}", path.display()));
         }
     }
