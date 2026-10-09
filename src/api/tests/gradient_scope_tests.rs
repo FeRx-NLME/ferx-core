@@ -171,3 +171,104 @@ fn pool_workers_carry_the_calls_gradient_fd() {
         auto_before.ofv
     );
 }
+
+/// The post-hoc fixtures: a FOCEI fit (non-interaction FOCE with a prediction-dependent
+/// residual declines the analytic R-matrix for its own reason, which would hide the
+/// gradient clause) with a covariance matrix, so `run_sir` has a proposal.
+fn posthoc_base() -> (CompiledModel, Population, FitResult) {
+    let (model, population) = warfarin(GradientMethod::Auto);
+    let o = FitOptions {
+        run_covariance_step: true,
+        ..posthoc_opts(GradientMethod::Auto)
+    };
+    let base = fit(&model, &population, &model.default_params, &o).expect("base fit");
+    assert!(
+        base.covariance_matrix.is_some(),
+        "premise: the base fit has a covariance"
+    );
+    (model, population, base)
+}
+
+fn posthoc_opts(gradient: GradientMethod) -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..opts(gradient)
+    }
+}
+
+fn cov_bits(r: &FitResult) -> Vec<u64> {
+    let m = r.covariance_matrix.as_ref().expect("covariance");
+    assert!(
+        m.iter().all(|v| v.is_finite()),
+        "non-finite covariance entry"
+    );
+    m.iter().map(|v| v.to_bits()).collect()
+}
+
+/// **G4b — a post-hoc `run_covariance` honours the `gradient_method` in its own options**
+/// (#1829 review r1 row 2). `Fd` options on an unstamped model must take the FD stencil — bit
+/// for bit the matrix a stamped model gives under `Auto` options, whose flag rides on the
+/// model — while the `Auto` control takes the analytic R-matrix and lands elsewhere.
+///
+/// Mutation: hand `with_fit_scope` a gradient-`Auto` copy of the options
+/// (`run_covariance.rs`) → the `Fd` call equals the control, not the stamped run.
+#[test]
+fn a_posthoc_run_covariance_honours_the_options_gradient_fd() {
+    let (model, population, base) = posthoc_base();
+    let (stamped, _) = warfarin(GradientMethod::Fd);
+    let cov = |m: &CompiledModel, g| {
+        crate::run_covariance(&base, Some(m), Some(&population), &posthoc_opts(g))
+            .expect("run_covariance")
+    };
+    let fd = cov_bits(&cov(&model, GradientMethod::Fd));
+    let reference = cov_bits(&cov(&stamped, GradientMethod::Auto));
+    let control = cov_bits(&cov(&model, GradientMethod::Auto));
+    assert_ne!(
+        control, reference,
+        "premise: the analytic R-matrix and the FD stencil differ on this fit"
+    );
+    assert_eq!(
+        fd, reference,
+        "run_covariance with options Fd must take the FD stencil, as a stamped model does"
+    );
+}
+
+/// **G4c — the same for `run_sir`**, whose importance weights re-solve every subject's EBE:
+/// the inner η-gradient route is what the options' `Fd` changes there.
+///
+/// Mutation: hand `run_sir`'s scope a gradient-`Auto` copy of the options (`run_sir.rs`) →
+/// the `Fd` call equals the control.
+#[test]
+fn a_posthoc_run_sir_honours_the_options_gradient_fd() {
+    let (model, population, base) = posthoc_base();
+    let (stamped, _) = warfarin(GradientMethod::Fd);
+    let sir = |m: &CompiledModel, g| {
+        let o = FitOptions {
+            sir_samples: 40,
+            sir_resamples: 20,
+            sir_seed: Some(7),
+            ..posthoc_opts(g)
+        };
+        let r = crate::run_sir(&base, Some(m), Some(&population), &o).expect("run_sir");
+        let ess = r.sir_ess.expect("ess");
+        assert!(ess.is_finite(), "ess {ess}");
+        r.sir_ci_theta
+            .expect("SIR CIs")
+            .into_iter()
+            .flat_map(|(lo, hi)| [lo.to_bits(), hi.to_bits()])
+            .chain(std::iter::once(ess.to_bits()))
+            .collect::<Vec<u64>>()
+    };
+    let fd = sir(&model, GradientMethod::Fd);
+    let reference = sir(&stamped, GradientMethod::Auto);
+    let control = sir(&model, GradientMethod::Auto);
+    assert_ne!(
+        control, reference,
+        "premise: the analytic and FD inner routes weight the draws differently"
+    );
+    assert_eq!(
+        fd, reference,
+        "run_sir with options Fd must re-solve on FD, as a stamped model does"
+    );
+}

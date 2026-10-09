@@ -227,7 +227,7 @@ pub fn prepare_run_with_inits(
     let init_params = build_init_params(&parsed);
     // `fit` honours `fit_options.gradient_method` by itself (#1613), so this stamp is not what
     // makes the fit run on FD. It stays because `PreparedRun.parsed.model` outlives that call:
-    // a caller hands it to post-hoc steps (`run_covariance`, `run_sir`, `predict`) that it may
+    // a caller hands it to post-hoc steps (`run_covariance`, `run_sir`) that it may
     // drive without the same options, and the model's flag is what keeps those on FD.
     // Idempotent, and the same rule `check` mirrors (SDE forces FD).
     parsed.model.gradient_method =
