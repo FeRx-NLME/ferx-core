@@ -1,0 +1,24 @@
+# ferx twin of nonmem_anchor/npde_block_sigma_a.ctl (#1733, arm A).
+#
+# The block_sigma is FREE and DECLARES rho = 0.5 (0.10 / (0.2 * 1.0)). The
+# anchor scores it at a parameter set carrying the fitted rho = -0.9, which is
+# what the NONMEM stream FIXes. Before #1733 the NPDE reference simulation
+# read this declaration instead.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+
+  omega ETA_CL ~ 0.09 FIX
+
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
