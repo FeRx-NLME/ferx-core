@@ -228,6 +228,15 @@ For a log-normal kappa that key is still the log-scale SD: times 100 it is the C
 the console's weight line prints (0.111952 → 11.2), and no separate CV% key is
 written. An unweighted kappa's entry is unchanged.
 
+A wrapper prints the same rows through the engine's own formatter, at print time
+(#1825). It builds a `ferx_core::io::output::KappaRowsInput` from the fit's
+`omega_iov`, kappa names, FIX flags, `se_kappa`, types, weights and covariance status
+(`KappaRowsInput::from_result` does this for a `FitResult`), then calls
+`format_kappa_rows_from`. A covariance step run later therefore changes the printed
+notes, just as it does in the CLI. `KappaRowsOptions { ascii: true }` spells `→` as `->`
+and `κ` as `kappa` for a console that cannot print UTF-8. Names are printed as
+given.
+
 ### Rules and diagnostics
 
 - The weight may reference **covariates, `FIX`ed thetas and `TIME`** — not

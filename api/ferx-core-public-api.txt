@@ -959,9 +959,23 @@ pub mod ferx_core::io::hash
 pub fn ferx_core::io::hash::sha256_bytes(bytes: &[u8]) -> alloc::string::String
 pub fn ferx_core::io::hash::sha256_file(path: &std::path::Path) -> core::result::Result<alloc::string::String, alloc::string::String>
 pub mod ferx_core::io::output
+pub struct ferx_core::io::output::KappaRowsInput<'a>
+pub ferx_core::io::output::KappaRowsInput::covariance_status: ferx_core::CovarianceStatus
+pub ferx_core::io::output::KappaRowsInput::kappa_fixed: &'a [bool]
+pub ferx_core::io::output::KappaRowsInput::kappa_names: &'a [alloc::string::String]
+pub ferx_core::io::output::KappaRowsInput::kappa_param_types: &'a [ferx_core::EtaParamType]
+pub ferx_core::io::output::KappaRowsInput::kappa_weight_typical: &'a [core::option::Option<f64>]
+pub ferx_core::io::output::KappaRowsInput::kappa_weights: &'a [core::option::Option<alloc::string::String>]
+pub ferx_core::io::output::KappaRowsInput::omega_iov: &'a nalgebra::base::alias::DMatrix<f64>
+pub ferx_core::io::output::KappaRowsInput::se_kappa: core::option::Option<&'a [f64]>
+impl<'a> ferx_core::io::output::KappaRowsInput<'a>
+pub fn ferx_core::io::output::KappaRowsInput<'a>::from_result(r: &'a ferx_core::FitResult) -> core::option::Option<Self>
+pub struct ferx_core::io::output::KappaRowsOptions
+pub ferx_core::io::output::KappaRowsOptions::ascii: bool
 pub const ferx_core::io::output::THETA_BLOCK_COMPACT_MIN: usize
 pub fn ferx_core::io::output::compact_theta_blocks(names: &[alloc::string::String]) -> alloc::vec::Vec<(alloc::string::String, core::ops::range::Range<usize>)>
 pub fn ferx_core::io::output::format_comparison(runs: &[(alloc::string::String, &ferx_core::FitResult)]) -> alloc::string::String
+pub fn ferx_core::io::output::format_kappa_rows_from(input: &ferx_core::io::output::KappaRowsInput<'_>, opts: ferx_core::io::output::KappaRowsOptions) -> alloc::string::String
 pub fn ferx_core::io::output::format_summary(result: &ferx_core::FitResult) -> alloc::string::String
 pub fn ferx_core::io::output::parameter_table(result: &ferx_core::FitResult) -> alloc::string::String
 pub fn ferx_core::io::output::print_results(result: &ferx_core::FitResult)
