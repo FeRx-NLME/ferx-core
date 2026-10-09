@@ -195,8 +195,10 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
 /// Its `R` is diagonal, so the shared correlated draw takes its per-row fast
 /// path, which consumes the RNG stream in the same order as the old scalar loop.
 /// The scores are the ones `d43afca9` produced before the draw moved, pinned to
-/// the bit. A draw that perturbed the stream (the eigen path on a diagonal `R`,
-/// an extra normal) would move them.
+/// the bit. A draw that perturbed the stream (an extra normal, or rows drawn in
+/// another order) would move them. Turning the fast path off does not: the
+/// eigen square root of a diagonal `R` was measured to give the same bits, so
+/// the fast path is a cost saving, not a numerical one.
 #[test]
 fn a_fixed_block_sigma_scores_exactly_as_before_the_shared_draw() {
     let root = env!("CARGO_MANIFEST_DIR");
@@ -228,6 +230,70 @@ fn a_fixed_block_sigma_scores_exactly_as_before_the_shared_draw() {
             assert_eq!(g.to_bits(), p.to_bits(), "row {j}: {g} vs pinned {p}");
         }
     }
+}
+
+/// A FREM subject keeps the per-row draw, because its covariate pseudo-rows sit
+/// outside `R` (the same gate `simulate()` uses). That per-row draw must still
+/// read the parameter set's ρ: arm A's PK row, plus one FREMTYPE row, scored at
+/// the fitted ρ = −0.9 against a declared 0.5. Both consumers of the per-row
+/// fallback are checked, NPDE and `simulate()`, each naming itself on failure.
+#[test]
+fn a_frem_subject_draws_its_pk_rows_at_the_fitted_correlation() {
+    let mut model = parse(ARM_A);
+    // FREMTYPE 100 → (θ TVCL, η ETA_CL); the covariate σ reuses slot 1 (ADD).
+    model.frem_config = Some(crate::types::FremConfig {
+        fremtype_to_indices: HashMap::from([(100u16, (0usize, 0usize))]),
+        covariate_sigma_index: 1,
+    });
+    let mut params = model.default_params.clone();
+    params.residual_correlations = with_rho(&model, -0.9);
+    let mut subject = arm_a_subject();
+    subject.obs_times.push(0.0);
+    subject.observations.push(0.0);
+    subject.obs_cmts.push(1);
+    subject.cens.push(0);
+    subject.fremtype.push(100);
+    let f = ipreds(&model, &subject, &params);
+    assert!(f[0].is_finite() && f[0] > 1.0, "f = {f:?}");
+    let var = |rho: f64| 0.04 * f[0] * f[0] + 1.0 + 2.0 * rho * 0.2 * f[0];
+    let (sd_fit, sd_decl) = (var(-0.9).sqrt(), var(0.5).sqrt());
+    subject.observations = vec![f[0] + sd_fit, f[1]];
+    let cf_decl = sd_fit / sd_decl;
+    assert!((1.0 - cf_decl).abs() > 3.0 * TOL_A, "degenerate fixture");
+    let pop = population(subject, vec![]);
+
+    let mut worst = 0.0f64;
+    for seed in 1..=SEEDS {
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let npd = out[0].npd[0];
+        assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
+        worst = worst.max((npd - 1.0).abs());
+    }
+    assert!(
+        worst < TOL_A,
+        "npde: the FREM subject's PK row is not drawn at the fitted ρ: worst |npd − 1| = \
+         {worst} (declared ρ gives {cf_decl})"
+    );
+
+    let sims = crate::api::simulate_with_seed(&model, &pop, &params, NSIM, 1733).expect("simulate");
+    let pk: Vec<f64> = sims
+        .iter()
+        .filter(|r| r.time == 1.0)
+        .map(|r| r.outcome.continuous_value() - r.ipred)
+        .collect();
+    assert_eq!(pk.len(), NSIM);
+    assert!(
+        pk.iter().all(|e| e.is_finite()),
+        "simulate: non-finite residual"
+    );
+    let sd = (pk.iter().map(|e| e * e).sum::<f64>() / NSIM as f64).sqrt();
+    // sd of 2000 normal draws is within ~1.6% of σ at 1 se; 8% is 5 se, while the
+    // declared ρ is 124% away (sd_decl / sd_fit = 2.24).
+    assert!(
+        (sd / sd_fit - 1.0).abs() < 0.08,
+        "simulate: the FREM subject's PK residual sd {sd} is not the fitted {sd_fit} \
+         (the declared ρ gives {sd_decl})"
+    );
 }
 
 const NSIM: usize = 2000;
