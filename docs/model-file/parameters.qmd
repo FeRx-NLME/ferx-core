@@ -280,9 +280,15 @@ counts when either holds:
   is an individual parameter (`E0 = TVE0 + PLACEBO + ETA_E0`, or
   `TVPL = BASE + PLACEBO` followed by `PL = TVPL * exp(ETA_PL)`), or a sum or
   product in the readout (`y = E0 + PLACEBO + ...` with `E0 = TVE0 + ETA_E0`).
-  Their effects on `y` are then proportional within each subject. The expression
-  may read a data covariate only if it is constant within every subject in the
-  data; one that reads `TIME`, `TAD`, `TAFD` or a state does not qualify.
+  Their effects on `y` are then proportional within each subject. What has to be
+  constant is the smallest sum or product that collects every read of the two:
+  it may read a data covariate only if that covariate is constant within every
+  subject in the data, and it may not read `TIME`, `TAD`, `TAFD` or a state. A
+  factor, term or function around it that reads neither does not matter, since
+  it scales both effects alike: `E0 = (TVE0 + PLACEBO + ETA_E0) * (1 + 0.1 * OCC)`
+  counts even though `OCC` changes within a subject, while
+  `E0 = TVE0 + PLACEBO * (1 + 0.1 * OCC) + ETA_E0` does not, because there the
+  factor sits inside the sum, on the block alone.
 
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in

@@ -6785,8 +6785,9 @@ mod absorption {
     ///
     /// Mutations — the parameter loop back to `var_constant(v)` over the whole
     /// of `E0` (P1, P5, P8 bind; the readout test stays green); the leaf arm of
-    /// `funnel_operands` returning `None` (P19 binds); the operands' constancy
-    /// check skipped (P4 is refused).
+    /// `funnel_operands` returning `None` (P19 binds); the early
+    /// `expr_constant(e)` return restored in `funnel_operands` (P1 binds, and
+    /// the readout test dies too).
     #[test]
     fn a_common_factor_does_not_count_in_a_parameter_funnel() {
         let pop = arms_pop();
@@ -6831,8 +6832,7 @@ mod absorption {
     ///
     /// Mutations — the early `expr_constant(e)` return restored in
     /// `funnel_operands` for the readout call only (P13 binds; the parameter
-    /// test stays green); restored for both callers (both tests die); the
-    /// operands' constancy check skipped (P15 is refused).
+    /// test stays green); restored for both callers (both tests die).
     #[test]
     fn a_common_factor_does_not_count_in_a_readout_funnel() {
         let pop = arms_pop();
@@ -6872,9 +6872,8 @@ mod absorption {
     /// goes within, which the oracle identifies. P11 is P10 without the
     /// factor; the twin P12 scales `PLACEBO` alone and binds global.
     ///
-    /// Mutations — the parameter loop back to `var_constant(v)` (P6, P9, P10
-    /// bind; auto → `sum_to_zero`); the subject as a kappa's unit in
-    /// `constant_within_units` (P10's auto goes global).
+    /// Mutation — the parameter loop back to `var_constant(v)` (P6, P9, P10
+    /// bind; auto → `sum_to_zero`).
     #[test]
     fn a_common_factor_does_not_count_for_a_kappa_or_a_two_column_block() {
         let pop = arms_pop();
@@ -6954,8 +6953,8 @@ mod absorption {
     /// identified, and binds.
     ///
     /// Mutations — the conditions' covariates dropped from the parameter
-    /// funnel (P17 is refused); an operand reading only the η dropped like one
-    /// reading neither (P18 is refused).
+    /// funnel (P17 is refused); an operand reading only one of the two dropped
+    /// like one reading neither (P18 is refused).
     #[test]
     fn what_reads_the_funnel_still_counts() {
         let pop = arms_pop();

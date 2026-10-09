@@ -21289,17 +21289,20 @@ fn level_block_eta_coupling(
         let reads_both = |e: &Expression| reads_block(e) && reads_eta(e);
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
-            if let Some(ops) = ctx.funnel_operands(y, &reads_any, &reads_both) {
+            let mut covariates = Vec::new();
+            let ops = ctx
+                .funnel_operands(y, &reads_any, &reads_both)
+                .filter(|ops| {
+                    ops.iter()
+                        .all(|o| ctx.expr_constant(o, &mut covariates, &mut Vec::new()))
+                });
+            if let Some(ops) = ops {
                 let direct = ops.iter().any(|o| reads_node(o, &is_eta));
                 let via = if direct {
                     None
                 } else {
                     ops.iter().find_map(|o| first_tainted_var(o, &taint_e))
                 };
-                let mut covariates = Vec::new();
-                for o in &ops {
-                    ctx.expr_constant(o, &mut covariates, &mut Vec::new());
-                }
                 covariates.sort();
                 covariates.dedup();
                 funnels.push(Funnel {
@@ -21569,14 +21572,17 @@ impl<'a> CouplingCtx<'a> {
     }
 
     /// The operands of the smallest sum or product in `e` that collects every
-    /// read of the block and of the random effect, when they are all
-    /// subject-constant; `None` when they are not. A unary function, or a power
-    /// whose exponent reads neither, is descended through. An operand that
-    /// reads neither is dropped, whatever it reads (`TIME` included): for any
-    /// `f(S, c)` with `c` reading neither, `∂f/∂η ÷ ∂f/∂block` is
-    /// `∂S/∂η ÷ ∂S/∂block`, so only `S` has to be constant (#1712). Descending
-    /// never loses constancy, since [`Self::expr_constant`] is a conjunction
-    /// over the children; it only sheds covariates.
+    /// read of the block and of the random effect, or `[e]` itself when it is
+    /// neither; `None` when `e` does not read both. A unary function, or a
+    /// power whose exponent reads neither, is descended through. An operand
+    /// that reads neither is dropped, whatever it reads (`TIME` included): for
+    /// any `f(S, c)` with `c` reading neither, `∂f/∂η ÷ ∂f/∂block` is
+    /// `∂S/∂η ÷ ∂S/∂block`, so only `S` has to be constant (#1712).
+    ///
+    /// Structural only: the caller decides whether the operands are constant
+    /// (one gate, not two). Descending never loses constancy, since
+    /// [`Self::expr_constant`] is a conjunction over the children; it only
+    /// sheds covariates.
     fn funnel_operands<'e>(
         &self,
         e: &'e Expression,
@@ -21594,19 +21600,13 @@ impl<'a> CouplingCtx<'a> {
             Expression::Power(b, x) if !reads_any(x) => {
                 return self.funnel_operands(b, reads_any, reads_both)
             }
-            _ => {
-                return self
-                    .expr_constant(e, &mut Vec::new(), &mut Vec::new())
-                    .then(|| vec![e])
-            }
+            _ => return Some(vec![e]),
         }
         let rel: Vec<&Expression> = ops.into_iter().filter(|o| reads_any(o)).collect();
         if let [one] = rel.as_slice() {
             return self.funnel_operands(one, reads_any, reads_both);
         }
-        rel.iter()
-            .all(|o| self.expr_constant(o, &mut Vec::new(), &mut Vec::new()))
-            .then_some(rel)
+        Some(rel)
     }
 }
 
