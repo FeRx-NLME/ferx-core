@@ -327,14 +327,15 @@ withholds (`W_NO_DOSES` on a compartment-free model, for example). See
 #### Draws in the flip-flop regime
 
 A twin-less transit or inverse-Gaussian closed form (one carrying a user
-`[odes]` / `[scaling]` / `[initial_conditions]` block) has no solution where
-elimination is at least as fast as absorption. A draw that lands there is
-skipped, and the run reports one `W_UNCERTAINTY_DRAWS_SKIPPED` warning with the
-count and the draw indices. The rest of the draws are a truncated sample of the
-uncertainty distribution, so the interval they give is biased toward slower
-elimination. A point estimate already in that regime is refused with
-`E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`), as `simulate()` refuses it, and so is
-a run in which every draw is skipped. Writing the model as an explicit ODE
+`[odes]` / `[scaling]` / `[initial_conditions]` block, or whose ODE twin was
+declined) has no solution where elimination is at least as fast as absorption.
+A draw that lands there is skipped, and the run reports one
+`W_UNCERTAINTY_DRAWS_SKIPPED` warning with the count and the draw indices. The
+rest of the draws are a truncated sample of the uncertainty distribution, so
+the interval they give is biased away from the tail in which elimination is at
+least as fast as absorption. A point estimate already in that regime is refused
+with the flip-flop error `simulate()` gives at that θ, `E_TRANSIT_FLIP_FLOP`
+(`E_IG_FLIP_FLOP`), and so is a run in which every draw is skipped. Writing the model as an explicit ODE
 `transit()` / `igd()` model avoids the skip altogether.
 
 ## Result Types
@@ -459,11 +460,13 @@ What actually happens, for `UncertaintyMethod::Asymptotic`:
   to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is
   an `Err`, and usually means an ill-conditioned covariance matrix or an
   estimate sitting on a bound.
-- If a *valid* draw then fails during simulation (e.g. the drawn parameters
-  make the ODE solver fail), that single draw is skipped with a
-  `uncertainty draw k skipped — …` warning rather than aborting the whole
-  run, so the returned set may contain fewer than `n_uncertainty_draws`
-  distinct draws.
+- A *valid* draw that lands in the flip-flop regime of a twin-less transit /
+  inverse-Gaussian closed form is skipped rather than aborting the whole run,
+  so the returned set may contain fewer than `n_uncertainty_draws` distinct
+  draws. All the skips of a run are reported in one
+  `W_UNCERTAINTY_DRAWS_SKIPPED` warning; see
+  [Draws in the flip-flop regime](#draws-in-the-flip-flop-regime). Any other
+  error in a draw fails the run.
 
 `UncertaintyMethod::Sir` makes none of these distributional assumptions: it
 resamples whole parameter vectors from the SIR pool, so its shape is whatever
