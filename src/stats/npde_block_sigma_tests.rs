@@ -296,6 +296,115 @@ fn a_frem_subject_draws_its_pk_rows_at_the_fitted_correlation() {
     );
 }
 
+/// Review #1 (PR #1828): the correlated branch passes `ruv_scale` into the shared
+/// draw, so a `block_sigma` model with IIV on the residual error must widen each
+/// replicate's residual by `exp(η_RUV)`. Arm A plus `ETA_RUV ~ 0.5`, the
+/// observation two fitted SDs above `f`. The oracle is a quadrature outside both
+/// engines: `pd = E_η[Φ(2·e^{−η})]`, `η ~ N(0, 0.5)`, so NPD = Φ⁻¹(pd). Dropping
+/// the scale gives NPD = 2.
+#[test]
+fn npd_carries_iiv_on_ruv_through_the_correlated_draw() {
+    let text = ARM_A.replace(
+        "omega ETA_CL ~ 1e-10 FIX\n",
+        "omega ETA_CL ~ 1e-10 FIX\n  omega ETA_RUV ~ 0.5 FIX\n",
+    ) + "  iiv_on_ruv = ETA_RUV\n";
+    let model = parse(&text);
+    assert!(
+        model.residual_error_eta.is_some(),
+        "the fixture must carry η_RUV"
+    );
+    let mut params = model.default_params.clone();
+    params.residual_correlations = with_rho(&model, -0.9);
+    let mut subject = arm_a_subject();
+    let f = ipreds(&model, &subject, &params)[0];
+    assert!(f.is_finite() && f > 1.0, "f = {f}");
+    let sd_fit = (0.04 * f * f + 1.0 - 2.0 * 0.9 * 0.2 * f).sqrt();
+    subject.observations = vec![f + 2.0 * sd_fit];
+    // Trapezoid over ±10 SD of η: the integrand is smooth and bounded by 1.
+    let omega_sd = 0.5f64.sqrt();
+    let n = 20_001;
+    let (lo, hi) = (-10.0 * omega_sd, 10.0 * omega_sd);
+    let h = (hi - lo) / (n - 1) as f64;
+    let pd: f64 = (0..n)
+        .map(|i| {
+            let eta = lo + i as f64 * h;
+            let w = if i == 0 || i == n - 1 { 0.5 } else { 1.0 };
+            let dens = (-0.5 * (eta / omega_sd).powi(2)).exp()
+                / (omega_sd * (2.0 * std::f64::consts::PI).sqrt());
+            w * h * dens * crate::stats::special::normal_cdf(2.0 * (-eta).exp())
+        })
+        .sum();
+    let cf = crate::stats::special::normal_inv_cdf(pd);
+    let cf_unscaled = 2.0;
+    assert!(
+        (cf - cf_unscaled).abs() > 3.0 * TOL_A,
+        "degenerate fixture: cf {cf}"
+    );
+    let pop = population(subject, vec![]);
+    let mut worst = 0.0f64;
+    for seed in 1..=SEEDS {
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let npd = out[0].npd[0];
+        assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
+        worst = worst.max((npd - cf).abs());
+    }
+    eprintln!("η_RUV: cf {cf}, worst |npd − cf| = {worst}");
+    assert!(
+        worst < TOL_A,
+        "NPD does not carry exp(η_RUV): worst |npd − {cf}| = {worst} (unscaled gives {cf_unscaled})"
+    );
+}
+
+/// Review #1 (PR #1828): the correlated branch passes `ruv_mult` into the shared
+/// draw, so a custom residual magnitude scales the `block_sigma` loadings. Arm A
+/// with `PROP_ERR * MAG`, `MAG = 2`: the variance is `(0.4f)² + 1 + 2ρ·0.4f`, and the
+/// observation sits one such SD above `f` (NPD = 1). Dropping the multiplier
+/// draws from `0.04f² + 1 + 2ρ·0.2f` instead.
+#[test]
+fn npd_carries_a_custom_magnitude_through_the_correlated_draw() {
+    let text = ARM_A
+        .replace(
+            "theta TVV(10.0, 0.1, 100.0) FIX\n",
+            "theta TVV(10.0, 0.1, 100.0) FIX\n  theta MAG(2.0, 0.1, 10.0) FIX\n",
+        )
+        .replace(
+            "combined(PROP_ERR, ADD_ERR)",
+            "combined(PROP_ERR * MAG, ADD_ERR)",
+        );
+    let model = parse(&text);
+    let mut params = model.default_params.clone();
+    params.residual_correlations = with_rho(&model, -0.9);
+    let mut subject = arm_a_subject();
+    assert!(
+        model.ruv_obs_mult(&subject, &params.theta).is_some(),
+        "the fixture must carry a residual magnitude"
+    );
+    let f = ipreds(&model, &subject, &params)[0];
+    assert!(f.is_finite() && f > 1.0, "f = {f}");
+    let var = |c: f64| (c * f).powi(2) + 1.0 - 2.0 * 0.9 * c * f;
+    let sd_fit = var(0.4).sqrt();
+    subject.observations = vec![f + sd_fit];
+    let cf_unscaled = sd_fit / var(0.2).sqrt();
+    assert!(
+        (1.0 - cf_unscaled).abs() > 3.0 * TOL_A,
+        "degenerate fixture"
+    );
+    let pop = population(subject, vec![]);
+    let mut worst = 0.0f64;
+    for seed in 1..=SEEDS {
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let npd = out[0].npd[0];
+        assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
+        worst = worst.max((npd - 1.0).abs());
+    }
+    eprintln!("magnitude: cf_unscaled {cf_unscaled}, worst |npd − 1| = {worst}");
+    assert!(
+        worst < TOL_A,
+        "NPD does not carry the residual magnitude: worst |npd − 1| = {worst} \
+         (without it {cf_unscaled})"
+    );
+}
+
 const NSIM: usize = 2000;
 const SEEDS: u64 = 10;
 const TOL_A: f64 = 0.15;
