@@ -194,6 +194,22 @@ pub(crate) fn fit_packed_estimate<'a>(
     if v.len() != crate::estimation::parameterization::packed_len(template) {
         return PackedEstimate::WrongLength(v.len());
     }
+    // A vector read from disk can hold what no optimizer writes, and `unpack_params`
+    // panics on two of those shapes instead of returning something to compare: a
+    // Cholesky log-diagonal whose `exp` is 0 (singular L → `from_chol_factor`'s
+    // `expect`), and a NaN reaching Ω_IOV's or a `[mixture]` class's re-decomposition.
+    // Neither can be the fit's own point (`pack_params` floors before the log), so
+    // both are `Stale`. Measured (review r1 #1): Ω diagonal at −746 / −1e200 / −∞,
+    // and NaN on Ω_IOV, a mixture-template Ω or a mixture Ω override, all panicked.
+    let kinds = crate::estimation::parameterization::coordinate_kinds(template);
+    let unpackable = v.iter().zip(&kinds).all(|(&x, &kind)| {
+        x.is_finite()
+            && (kind != crate::estimation::parameterization::PackedCoordKind::OmegaDiagonal
+                || x >= f64::MIN_POSITIVE.ln())
+    });
+    if !unpackable {
+        return PackedEstimate::Stale;
+    }
     let p = unpack_params(v, template);
     let same = |a: &[f64], b: &[f64]| {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
@@ -950,6 +966,14 @@ mod tests {
     fn fit_at_own_pack(path: &str) -> (FitResult, ModelParameters) {
         let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(path))
             .expect("model");
+        fit_at_own_pack_model(&model)
+    }
+
+    fn one_ulp(x: &mut f64) {
+        *x = f64::from_bits(x.to_bits() + 1);
+    }
+
+    fn fit_at_own_pack_model(model: &crate::types::CompiledModel) -> (FitResult, ModelParameters) {
         let template = model.default_params.clone();
         let packed = crate::estimation::parameterization::pack_params(&template);
         let at = unpack_params(&packed, &template);
@@ -961,8 +985,111 @@ mod tests {
         (fit, template)
     }
 
-    fn one_ulp(x: &mut f64) {
-        *x = f64::from_bits(x.to_bits() + 1);
+    /// #1815 review r1 #1: a vector read from disk may hold values no optimizer
+    /// writes, and the classifier must answer `Stale` for them instead of panicking
+    /// inside `unpack_params`. Every coordinate of four layouts (diagonal Ω + Ω_IOV;
+    /// block Ω; `block_sigma` ρ; a `[mixture]` with an Ω and a Σ override) is set in
+    /// turn to each extreme value. Measured before the fix: the Ω diagonal panicked at
+    /// −746 / −1e200 / −∞, and NaN panicked on Ω_IOV, a mixture-template Ω and the
+    /// mixture Ω override. The `[mixture]` override segment has no stored counterpart,
+    /// so a finite value there is still `Usable` (length-checked only, as documented) —
+    /// except an Ω-override log-diagonal below `ln(MIN_POSITIVE)`, which the bound catches.
+    ///
+    /// Mutations — drop the `is_finite` half of the pre-check: the NaN rows panic; drop
+    /// the `MIN_POSITIVE.ln()` half: the Ω-diagonal −746 / −∞ rows panic.
+    #[test]
+    fn fit_packed_estimate_is_stale_not_a_panic_on_a_damaged_vector() {
+        const MIX: &str = "
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.30
+  sigma(2) EPS ~ 0.09
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let mut models: Vec<(String, crate::types::CompiledModel)> = [
+            "examples/warfarin_iov.ferx",
+            "examples/warfarin_block_omega.ferx",
+            "examples/correlated_residual_combined.ferx",
+        ]
+        .iter()
+        .map(|p| {
+            (
+                p.to_string(),
+                crate::parser::model_parser::parse_model_file(std::path::Path::new(p)).unwrap(),
+            )
+        })
+        .collect();
+        models.push(("MIX".into(), crate::parse_model_string(MIX).unwrap()));
+        let values = [
+            -1000.0,
+            -746.0,
+            -745.0,
+            -400.0,
+            -372.0,
+            -360.0,
+            -354.0,
+            354.0,
+            360.0,
+            400.0,
+            710.0,
+            1000.0,
+            1e200,
+            -1e200,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut wrong = Vec::new();
+        for (name, model) in &models {
+            let (fit, template) = fit_at_own_pack_model(model);
+            let segs = packed_segments(&template);
+            let kinds = crate::estimation::parameterization::coordinate_kinds(&template);
+            let overrides = segs.mixture_omega_start()..segs.rho_start();
+            let n = fit.packed_estimate.as_ref().unwrap().len();
+            for i in 0..n {
+                for &x in &values {
+                    let mut f = fit.clone();
+                    f.packed_estimate.as_mut().unwrap()[i] = x;
+                    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        format!("{:?}", fit_packed_estimate(&f, &template))
+                    }))
+                    .unwrap_or_else(|_| "PANIC".to_string());
+                    // The Ω override is a log-diagonal too, so the bound applies to it.
+                    let log_diag = kinds[i]
+                        == crate::estimation::parameterization::PackedCoordKind::OmegaDiagonal;
+                    let want = if overrides.contains(&i)
+                        && x.is_finite()
+                        && !(log_diag && x < f64::MIN_POSITIVE.ln())
+                    {
+                        "Usable"
+                    } else {
+                        "Stale"
+                    };
+                    if !got.starts_with(want) {
+                        wrong.push(format!("{name}[{i}] = {x}: {got}, want {want}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} cells wrong: {wrong:#?}", wrong.len());
     }
 
     /// #1815 T2: the classifier's four answers, and one `Stale` per stored field.
