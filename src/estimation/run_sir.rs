@@ -114,9 +114,12 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   (`sir_scale = SirScale::Packed` on a fit recorded `natural`) cannot be told from
 ///   an unset one and yields to the record. To override with a default value, set it
 ///   on `fit.sir_settings` (or clear that field) before calling. A fit without a
-///   record (`sir_settings = None`: no SIR ran, or a `.fitrx` written before #1758)
-///   uses `options` as given, except that an unset `sir_seed` falls back to
-///   `fit.sir_seed` (the seed such a fit was given). `inner_optimizer` and
+///   SIR record (`sir_settings = None`: no SIR ran) takes the inner-loop and ODE
+///   settings from `fit.scoring_settings`, the stage that produced the estimates, the
+///   same way (#1806), so it repeats the SIR the fit would have run with `sir = true`.
+///   A fit with neither record (a `.fitrx` written before #1758) uses `options` as
+///   given. Without a SIR record, an unset `sir_seed` falls back to `fit.sir_seed`
+///   (the seed such a fit was given). `inner_optimizer` and
 ///   `ebe_warm_start` hold for this call's draws only; nothing outlives the call (#426).
 ///   `method` and `interaction` are **not** read from `options`: they come from the
 ///   fit (`fit.method`, then `fit.interaction` for a method that does not fix it), so
@@ -158,24 +161,24 @@ pub fn run_sir(
 /// `options` with every SIR setting the caller left at its default taken from
 /// `fit.sir_settings` (#1758), so `run_sir(fit, …, &FitOptions::default())`
 /// repeats the SIR the fit reports. Value-based, as `ode_solver_override` is: a
-/// field equal to its default reads as "no opinion". A fit with no record (SIR
-/// never ran, or written before #1758) leaves `options` as given, but for an unset
-/// `sir_seed`, which takes `fit.sir_seed`: before #1758 that field echoed the seed
-/// the fit was given, so it is the seed a pre-#1758 SIR drew with (#1767).
+/// field equal to its default reads as "no opinion". The scoring half resolves through
+/// `scoring_record` (#1806): the SIR record, else the stage record
+/// (`fit.scoring_settings`, which a fit made without `sir = true` still carries), else
+/// none. A fit with no SIR record leaves the SIR-only settings as given, but for an
+/// unset `sir_seed`, which takes `fit.sir_seed`: before #1758 that field echoed the
+/// seed the fit was given, so it is the seed a pre-#1758 SIR drew with (#1767).
 fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    use crate::estimation::fit_inputs::{scoring_record, with_scoring_record, PostHocStep};
+    // The scoring half through the resolver `run_covariance` shares (#426, #1806), SIR's own
+    // record first. `fit()` scores its SIR under the stage record, so on a fit it returns the
+    // two are equal, and a fit without SIR still repeats what `sir = true` would have run.
+    let mut o = with_scoring_record(scoring_record(fit, PostHocStep::Sir), options);
     let Some(rec) = fit.sir_settings.as_ref() else {
-        let mut o = options.clone();
         if o.sir_seed.is_none() {
             o.sir_seed = fit.sir_seed;
         }
         return o;
     };
-    // The scoring half through the resolver `run_covariance` shares (#426). From the SIR
-    // record only, never `fit.scoring_settings`: the in-fit SIR scores with the fit's
-    // top-level options, not the producing stage's, and on a quadrature stage the two
-    // part company (`fit()` tightens that stage's `inner_tol` to 1e-8), so the stage's
-    // record would not repeat the reported SIR.
-    let mut o = crate::estimation::fit_inputs::with_scoring_record(Some(&rec.scoring), options);
     let d = FitOptions::default();
     macro_rules! recorded {
         ($field:ident = $value:expr) => {
@@ -1004,29 +1007,36 @@ mod tests {
         assert_eq!(resolve_sir_options(&fit, &explicit).sir_seed, Some(1));
     }
 
-    /// #426: `run_sir` reads the SIR record only, never `fit.scoring_settings` (the
-    /// stage's). A fit with a stage record and no SIR record resolves to the caller's
-    /// options as given; the control is the same fit with a SIR record carrying the same
-    /// scoring half, which does resolve, so the test straddles the source. Mutation: a
-    /// stage-record fallback (`.or(fit.scoring_settings)`) → the first assertion dies.
+    /// #1806: `run_sir`'s scoring half resolves SIR record → stage record → caller. All
+    /// four cells of {SIR record?} × {stage record?} in one test, with two off-default
+    /// records that differ from each other and from the defaults, so each cell names its
+    /// source. Mutations: stage record first → the "both" cell dies; drop the stage-record
+    /// fallback → the "stage only" cell dies; read the stage record only → "SIR only" dies.
     #[test]
-    fn resolve_sir_options_never_reads_the_stage_record() {
-        let rec = off_default_settings();
-        let mut fit = crate::types::test_helpers::minimal_fit_result();
-        fit.scoring_settings = Some(rec.scoring.clone());
-        fit.sir_settings = None;
+    fn resolve_sir_options_reads_the_sir_record_then_the_stage_record() {
+        let sir = off_default_settings();
+        let stage = crate::ScoringSettings {
+            inner_tol: 1e-8,
+            inner_maxiter: 5,
+            ..crate::ScoringSettings::default()
+        };
         let d = FitOptions::default();
-        assert_eq!(
-            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d)),
-            crate::ScoringSettings::from_options(&d),
-            "a stage record alone must not reach run_sir"
+        let caller = crate::ScoringSettings::from_options(&d);
+        assert!(
+            sir.scoring != stage && stage != caller && sir.scoring != caller,
+            "premise: three distinct sources"
         );
-        fit.sir_settings = Some(rec.clone());
-        assert_eq!(
-            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d)),
-            rec.scoring,
-            "control: the SIR record's scoring half does"
-        );
+        let scored = |sir_rec: Option<&crate::estimation::sir::SirSettings>,
+                      stage_rec: Option<&crate::ScoringSettings>| {
+            let mut fit = crate::types::test_helpers::minimal_fit_result();
+            fit.sir_settings = sir_rec.cloned();
+            fit.scoring_settings = stage_rec.cloned();
+            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d))
+        };
+        assert_eq!(scored(Some(&sir), Some(&stage)), sir.scoring, "both: SIR's");
+        assert_eq!(scored(Some(&sir), None), sir.scoring, "SIR only: SIR's");
+        assert_eq!(scored(None, Some(&stage)), stage, "stage only: stage's");
+        assert_eq!(scored(None, None), caller, "neither: the caller's");
     }
 
     /// `fit`'s SIR outputs cleared, its record kept, so a `run_sir` that failed
@@ -1064,9 +1074,11 @@ mod tests {
             "{row}: the fit records what it scored under"
         );
 
-        // Premise: the pre-#1758 call (no record, the draw options only) differs.
+        // Premise: the pre-#1758 call (neither record, the draw options only) differs. Both
+        // records cleared: since #1806 a fit without a SIR record takes the stage's.
         let mut no_record = sir_outputs_cleared(&fit);
         no_record.sir_settings = None;
+        no_record.scoring_settings = None;
         let draws_only = FitOptions {
             verbose: false,
             sir_samples: opts.sir_samples,

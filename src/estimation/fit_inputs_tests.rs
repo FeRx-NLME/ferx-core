@@ -937,18 +937,10 @@ mod fitted_population_1783 {
         }
     }
 
-    /// The caller's options with `inner_tol` pinned to the fit's LTBS tightening,
-    /// until #1786 makes the post-hoc steps apply it themselves (without it,
-    /// measured on #1783: rel 1.7e-9 on se_theta[0]).
-    fn ltbs_opts(f: &FileFit) -> FitOptions {
-        FitOptions {
-            inner_tol: FitOptions::LTBS_FIT_INNER_TOL,
-            ..f.opts.clone()
-        }
-    }
-
     /// T4. On a `log(DV) ~ additive` fit the step scores log predictions against the
-    /// log-transformed DV, as `fit()` did.
+    /// log-transformed DV, as `fit()` did. The caller's options go in as given: the fit's
+    /// stage record (#426) carries the LTBS `inner_tol` tightening, so the step resolves
+    /// it without help (#1806 retired the `ltbs_opts` pin #1786 had asked for).
     ///
     /// Mutation — drop the log transform from `fitted_population`'s post-hoc call
     /// (natural DV): se_theta 777× the inline one (measured on #1783: 5.5113 vs
@@ -959,8 +951,8 @@ mod fitted_population_1783 {
         assert!(f.prep.parsed.model.log_transform && !f.prep.parsed.model.dv_pre_logged);
         assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
         for (p, cell) in cells(f) {
-            let got = run_covariance(&f.fit, None, p, &ltbs_opts(f))
-                .unwrap_or_else(|e| panic!("{cell}: {e}"));
+            let got =
+                run_covariance(&f.fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
             assert_same_cov(&got, &f.fit, cell);
         }
     }
@@ -979,8 +971,8 @@ mod fitted_population_1783 {
         assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
         assert_eq!(f.fit.ofv.to_bits(), ltbs().fit.ofv.to_bits(), "OFV");
         for (p, cell) in cells(f) {
-            let got = run_covariance(&f.fit, None, p, &ltbs_opts(f))
-                .unwrap_or_else(|e| panic!("{cell}: {e}"));
+            let got =
+                run_covariance(&f.fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
             assert_same_cov(&got, &f.fit, cell);
         }
     }
@@ -1440,6 +1432,90 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         resolved.min_obs_for_convergence_check,
         d.min_obs_for_convergence_check
     );
+}
+
+/// #1806 T5: `ScoringSettings::overwrite` replaces every scoring field unconditionally, where
+/// `with_scoring_record` lets a caller's non-default value win. The caller differs from the
+/// record on every field (non-default numerics, default `bool`s against the record's
+/// off-default ones), checked per field as a premise, so the round trip
+/// `from_options(rec.overwrite(caller)) == rec` names a field that was not overwritten. Both
+/// sides of the difference in one test: on the same caller, `with_scoring_record` keeps the
+/// caller's `inner_tol`. Mutations: drop any one field from `overwrite`'s struct literal (it
+/// then comes from `..options`) → the round trip dies, the diff naming the field; `overwrite`
+/// built on `with_scoring_record` → the `inner_tol` contrast dies.
+#[test]
+fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() {
+    let rec = off_default_scoring();
+    let d = FitOptions::default();
+    let caller = FitOptions {
+        inner_maxiter: 18,
+        inner_tol: 4e-4,
+        inner_restarts: 5,
+        n_agq: 6,
+        inner_optimizer: InnerOptimizer::NelderMead,
+        ode_reltol: 2e-7,
+        ode_abstol: 2e-9,
+        ode_max_steps: 778,
+        ode_method: crate::ode::OdeMethod::Rodas4,
+        ode_stiff_abort_after: Some(10),
+        ..FitOptions::default()
+    };
+    let from_caller = ScoringSettings::from_options(&caller);
+    let ScoringSettings {
+        inner_maxiter: _,
+        inner_tol: _,
+        inner_restarts: _,
+        mu_referencing: _,
+        n_agq: _,
+        inner_optimizer: _,
+        ebe_warm_start: _,
+        ode_reltol: _,
+        ode_abstol: _,
+        ode_max_steps: _,
+        ode_method: _,
+        ode_stiff_abort_after: _,
+        ode_auto_switch: _,
+    } = rec.clone();
+    macro_rules! differs {
+        ($f:ident) => {
+            assert_ne!(
+                from_caller.$f,
+                rec.$f,
+                "{}: premise — caller and record differ",
+                stringify!($f)
+            );
+        };
+    }
+    differs!(inner_maxiter);
+    differs!(inner_tol);
+    differs!(inner_restarts);
+    differs!(mu_referencing);
+    differs!(n_agq);
+    differs!(inner_optimizer);
+    differs!(ebe_warm_start);
+    differs!(ode_reltol);
+    differs!(ode_abstol);
+    differs!(ode_max_steps);
+    differs!(ode_method);
+    differs!(ode_stiff_abort_after);
+    differs!(ode_auto_switch);
+
+    let over = rec.overwrite(&caller);
+    assert_eq!(
+        ScoringSettings::from_options(&over),
+        rec,
+        "overwrite round trip"
+    );
+    assert_eq!(over.inner_tol, rec.inner_tol);
+    assert_eq!(
+        with_scoring_record(Some(&rec), &caller).inner_tol,
+        caller.inner_tol,
+        "contrast: the value-based overlay keeps a non-default caller value"
+    );
+    // Nothing outside the record moves.
+    assert_eq!(over.cov_inner_tol, d.cov_inner_tol);
+    assert_eq!(over.sir_samples, caller.sir_samples);
+    assert_eq!(over.method, caller.method);
 }
 
 /// #426 T12, the fallback order of `resolve_scoring_options`: the fit's own record, else the
