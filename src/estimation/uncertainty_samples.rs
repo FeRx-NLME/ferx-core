@@ -16,6 +16,7 @@
 //! Each draw is unpacked via [`unpack_params`] so theta, Omega, and Sigma are
 //! perturbed coherently (they share one packed vector).
 
+use crate::diagnostics::EngineError;
 use crate::estimation::parameterization::{
     lower_tri_iter, pack_with_bounds, packed_segments, theta_packs_log, unpack_params,
     PackedBounds, PackedStart,
@@ -65,13 +66,19 @@ pub enum UncertaintyMethod {
 ///
 /// # Errors
 ///
+/// `E_PARAM_SHAPE` when the fit's Ω_IOV does not match the model's κ (#1789): absent
+/// on a model with κ, present on one without, or of the wrong dimension. The model's
+/// initial Ω_IOV is never substituted for a missing one.
+///
 /// For a `[mixture]` model with at least one override, when `packed_estimate` is
 /// `None` (a fit read from `.fitrx`, built in R, or estimated by SAEM / IMP / Bayes) or
 /// does not have this model's packed length (a different model).
 pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
-) -> Result<ModelParameters, String> {
+) -> Result<ModelParameters, EngineError> {
+    let [_, _, omega_iov_block] = crate::api::ParamBlock::all_of_fit(fit_result);
+    crate::api::check_param_shape(model, &[omega_iov_block])?;
     let template = &model.default_params;
     let omega_diagonal = template.omega.diagonal;
     let omega = OmegaMatrix::from_matrix_with_mask(
@@ -80,18 +87,19 @@ pub fn fitted_params_from_result(
         omega_diagonal,
         template.omega.free_mask.clone(),
     );
-    let omega_iov = template.omega_iov.as_ref().map(|iov_template| {
-        let m = fit_result
-            .omega_iov
-            .clone()
-            .unwrap_or_else(|| iov_template.matrix.clone());
-        OmegaMatrix::from_matrix_with_mask(
-            m,
-            iov_template.eta_names.clone(),
-            iov_template.diagonal,
-            iov_template.free_mask.clone(),
-        )
-    });
+    // Both present, same dimension: the shape check above refused every other cell.
+    let omega_iov = template
+        .omega_iov
+        .as_ref()
+        .zip(fit_result.omega_iov.as_ref())
+        .map(|(iov_template, m)| {
+            OmegaMatrix::from_matrix_with_mask(
+                m.clone(),
+                iov_template.eta_names.clone(),
+                iov_template.diagonal,
+                iov_template.free_mask.clone(),
+            )
+        });
     let sigma = SigmaVector {
         values: fit_result.sigma.clone(),
         names: fit_result.sigma_names.clone(),
@@ -102,7 +110,7 @@ pub fn fitted_params_from_result(
             tmpl,
             &omega,
             &sigma,
-            fitted_mixture_overrides(fit_result, template, tmpl)?,
+            fitted_mixture_overrides(fit_result, template, tmpl).map_err(EngineError::from)?,
         )),
     };
     Ok(ModelParameters {

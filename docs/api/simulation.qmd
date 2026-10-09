@@ -210,7 +210,7 @@ let pop = read_nonmem_csv(Path::new("rwd.csv"), None)?;   // observed data
 let fit = fit(&model, &pop, &model.default_params, &opts)?;
 
 // Recover the fitted ModelParameters (theta/Omega/sigma) from the result.
-let params = fitted_params_from_result(&fit, &model);
+let params = fitted_params_from_result(&fit, &model)?;
 let sims = simulate_with_options(
     &model, &pop, &params, 200,
     &SimulateOptions { seed: Some(42), match_method: Some(MatchMethod::Optimal) },

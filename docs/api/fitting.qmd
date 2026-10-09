@@ -409,7 +409,7 @@ let (mut design, _) = read_population_for_simulation(
 )?;
 bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)
     .map_err(|e| e.to_string())?;
-let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
+let fitted_params = fitted_params_from_result(&result, &design_parsed.model)?;
 let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)
     .map_err(|e| e.to_string())?;
 ```
@@ -499,7 +499,11 @@ own message ([#1019](https://github.com/FeRx-NLME/ferx-core/issues/1019)), and
 `compute_npde_npd` keeps its documented fallback to κ = 0 for one. On
 `run_sir()`, `run_covariance()` and `simulate_with_uncertainty` a fit with no
 Ω~IOV~ is refused: before, they used the model's initial Ω~IOV~ in its place.
-`fit()` returns these refusals as its message only, since its error is a
+`fitted_params_from_result()` refuses the same three Ω~IOV~ cases for a direct
+caller, with the same code; it used to substitute the initial Ω~IOV~ for a
+missing one, drop one on a model with no κ, and copy a mis-sized one unchecked
+([#1789](https://github.com/FeRx-NLME/ferx-core/issues/1789)). Its error type is
+now `EngineError` instead of `String`. `fit()` returns these refusals as its message only, since its error is a
 string.
 
 ### Level labels and values: `theta_level_map`, `theta_level_values` {#level-labels-values}

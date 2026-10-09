@@ -331,6 +331,58 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_sigma_or_omega_iov(
     assert_eq!(n, 5, "σ short/long and the three Ω_IOV cells");
 }
 
+/// `fitted_params_from_result` refuses a fit whose Ω_IOV is not the model's (#1789), with
+/// `E_PARAM_SHAPE`, on a model with κ and on one without.
+///
+/// Measured before on `d43afca9`: an absent Ω_IOV on the κ model rebuilt `Ok` with the
+/// model's *initial* Ω_IOV in its place; a present one on the κ-free model rebuilt `Ok` with
+/// it dropped; a mis-sized one was copied in unchecked. The in-core callers are gated
+/// upstream (`resolve_fit_inputs`, `simulate_with_uncertainty_diag`), so only a direct call
+/// reaches this. Mutation — delete the `check_param_shape` call and all four cells go `Ok`;
+/// restore the `unwrap_or_else` as well and the absent cell is `Ok` again with the initial
+/// Ω_IOV, the defect itself.
+///
+/// The own-shape arm pins the other side: a fitted Ω_IOV that differs from the model's
+/// initial one is carried through bit for bit. Mutation — read `iov_template.matrix`
+/// instead of the fit's and it reddens, since the fixture asserts the two differ.
+#[test]
+fn fitted_params_from_result_refuses_a_fit_with_a_mis_shaped_omega_iov() {
+    use crate::estimation::uncertainty_samples::fitted_params_from_result;
+    let mut n = 0;
+    for (text, iov) in [(ONE_CPT_IV, false), (ODE_IOV, true)] {
+        let model = parse_model_string(text).expect("parse");
+        for cell in shape_cells(&model.default_params) {
+            if !cell.label.starts_with("Ω_IOV") {
+                continue;
+            }
+            n += 1;
+            let e = fitted_params_from_result(&fit_of(&cell.params), &model)
+                .expect_err("fitted_params_from_result");
+            assert_refused(&e, &cell, "fitted_params_from_result");
+        }
+
+        let mut own = model.default_params.clone();
+        if let Some(m) = own.omega_iov.as_mut() {
+            m.matrix[(0, 0)] = 0.25;
+        }
+        let rebuilt = fitted_params_from_result(&fit_of(&own), &model)
+            .unwrap_or_else(|e| panic!("own shape refused, iov = {iov}: {e}"));
+        match (&model.default_params.omega_iov, &rebuilt.omega_iov) {
+            (None, None) => assert!(!iov),
+            (Some(template), Some(got)) => {
+                assert!(iov);
+                assert_ne!(template.matrix[(0, 0)], 0.25, "fixture must differ");
+                assert_eq!(got.matrix[(0, 0)].to_bits(), 0.25f64.to_bits());
+            }
+            (t, g) => panic!("iov = {iov}: template {t:?}, rebuilt {g:?}"),
+        }
+    }
+    assert_eq!(
+        n, 4,
+        "the κ model's short / long / absent and the κ-free model's present"
+    );
+}
+
 /// The other side of every gate: the gate admits parameters of the model's own shape — the
 /// model's `default_params` and a copy whose Ω, σ and Ω_IOV are rebuilt from their values —
 /// on `fit`, `compute_npde_npd`, `simulate_with_seed` and `run_covariance`. The live

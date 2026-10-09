@@ -235,7 +235,7 @@ fn run_covariance_scoped(
     // in-process *after* the fit is therefore evaluated at the original packed
     // point; recompute the fit rather than editing its estimates in place.
     let base_params =
-        fitted_params_from_result(fit, model_ref).map_err(|e| format!("run_covariance: {e}"))?;
+        fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_covariance"))?;
     let (params, x_hat) = match &fit.packed_estimate {
         // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
         // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.
