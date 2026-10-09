@@ -14,11 +14,15 @@ fn rse_pct(est: f64, se: f64) -> f64 {
     }
 }
 
-/// Coefficient of variation as a percent from a variance: `sqrt(var) · 100`, or
-/// `0` for a non-positive variance.
+/// The CV of `P = TV · exp(η)`, `η ~ N(0, var)`, as a percent:
+/// `sqrt(exp(var) − 1) · 100`, exactly (#1858), or `0` for a non-positive
+/// variance. Not the first-order `sqrt(var) · 100`, which runs low and falls
+/// further behind as `var` grows (0.2: 44.7 against 47.1; 2.37: 154 against
+/// 312). The one place a log-normal OMEGA/KAPPA CV% is computed; `exp_m1`
+/// keeps a tiny variance's digits.
 fn cv_pct(var: f64) -> f64 {
     if var > 0.0 {
-        var.sqrt() * 100.0
+        var.exp_m1().sqrt() * 100.0
     } else {
         0.0
     }
@@ -45,21 +49,25 @@ fn sd_from_var(var: f64) -> f64 {
 /// typical weight (#1683), built by the same [`spread_note`].
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
-    spread_note(t, sd_from_var(var), at_weight)
+    spread_note(t, var, at_weight)
 }
 
-/// A spread `sd` (non-negative) on the scale of type `t`, qualified by `at`:
-/// `CV% = 100·sd{at}` for log-normal and unknown, `SD = sd{at}` for additive,
-/// `SD = sd{at}, logit scale` for logit, nothing for custom. The one formatter
-/// behind a kappa's row ([`variance_note`], `at` = `" at weight 1"`) and its
-/// weight line (`at` = `" at NARM = 4.0000"`, #1697), so the two cannot word
-/// the same quantity differently.
-fn spread_note(t: Option<EtaParamType>, sd: f64, at: &str) -> Option<String> {
+/// The spread of a random effect whose variance **at the arm described** is
+/// `var`, on the scale of type `t`, qualified by `at`: `CV% = cv_pct(var){at}`
+/// for log-normal and unknown, `SD = √var{at}` for additive,
+/// `SD = √var{at}, logit scale` for logit, nothing for custom. The one
+/// formatter behind a kappa's row ([`variance_note`], the row's `var`, `at` =
+/// `" at weight 1"`) and its weight line (`var / n`, `at` =
+/// `" at NARM = 4.0000"`, #1697), so the two cannot word the same quantity
+/// differently. It takes the variance, not an SD: the exact log-normal CV is
+/// not linear in the SD, so the typical arm's CV% is `cv_pct(var / n)`, not
+/// `100 · √var / √n` (#1858).
+fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}{}", sd * 100.0, at)),
-        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd, at)),
+        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}{}", cv_pct(var), at)),
+        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at)),
         Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
-            Some(format!("SD = {:.4}{}, logit scale", sd, at))
+            Some(format!("SD = {:.4}{}, logit scale", sd_from_var(var), at))
         }
         Some(EtaParamType::Custom) => None,
     }
@@ -71,8 +79,9 @@ fn spread_note(t: Option<EtaParamType>, sd: f64, at: &str) -> Option<String> {
 ///
 /// For a weighted kappa this is the weight-1 figure, like `variance` beside it
 /// (#1666); the entry's `weight` key marks that, and `sd_at_typical_weight`
-/// carries the typical arm. No `cv_pct_at_typical_weight` is written: with
-/// `cv_pct = √var·100` it would be `100 · sd_at_typical_weight` exactly.
+/// carries the typical arm — with, for log-normal and unknown, a
+/// `cv_pct_at_typical_weight` ([`typical_cv_yaml_line`]), since the exact CV%
+/// is not `100 · sd_at_typical_weight` (#1858).
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
     match t {
         None | Some(EtaParamType::LogNormal) => Some(format!("    cv_pct: {:.2}", cv_pct(var))),
@@ -80,6 +89,20 @@ fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
             Some(format!("    sd: {:.6}", sd_from_var(var)))
         }
         Some(EtaParamType::Custom) => None,
+    }
+}
+
+/// A weighted kappa's `cv_pct_at_typical_weight` YAML line: `cv_pct` of the
+/// typical arm's variance `var_at` (`var / n`), the CV% the console's weight
+/// line prints, for log-normal and unknown types; `None` for the rest, whose
+/// `sd_at_typical_weight` already is the console's figure.
+fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
+    match t {
+        None | Some(EtaParamType::LogNormal) => Some(format!(
+            "    cv_pct_at_typical_weight: {:.2}",
+            cv_pct(var_at)
+        )),
+        _ => None,
     }
 }
 
@@ -155,10 +178,12 @@ fn format_omega_rows(result: &FitResult) -> String {
 }
 
 /// A weighted kappa's (#1031) weight source text and, when the dataset gave a
-/// typical weight `n > 0` and the variance is non-negative, `(n, √var / √n)` —
-/// the SD of a typical arm. `None` for an unweighted kappa. The console's
-/// weight line and the fit YAML's `weight*` keys (#1660) both read this, so
-/// the two cannot print different numbers.
+/// typical weight `n > 0` and the variance is non-negative, `(n, var / n)` —
+/// the variance of a typical arm, from which the weight line's CV% or SD and
+/// the YAML's `sd_at_typical_weight` / `cv_pct_at_typical_weight` are all
+/// derived. `None` for an unweighted kappa. The console's weight line and the
+/// fit YAML's `weight*` keys (#1660) both read this, so the two cannot print
+/// different numbers.
 fn kappa_weight_facts<'a>(
     weights: &'a [Option<String>],
     weight_typical: &[Option<f64>],
@@ -167,7 +192,7 @@ fn kappa_weight_facts<'a>(
 ) -> Option<(&'a str, Option<(f64, f64)>)> {
     let w = weights.get(i).and_then(|w| w.as_deref())?;
     let typical = match weight_typical.get(i).copied().flatten() {
-        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var.sqrt() / n.sqrt())),
+        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var / n)),
         _ => None,
     };
     Some((w, typical))
@@ -287,9 +312,9 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         // note (custom), the bare line as when no typical weight exists. The
         // YAML's `sd_at_typical_weight` is written regardless, like `sd`.
         if let Some((w, typical)) = weight {
-            let spread = typical
-                .filter(|_| show_cv)
-                .and_then(|(n, sd)| spread_note(kappa_type, sd, &format!(" at {} = {:.4}", w, n)));
+            let spread = typical.filter(|_| show_cv).and_then(|(n, var_at)| {
+                spread_note(kappa_type, var_at, &format!(" at {} = {:.4}", w, n))
+            });
             let _ = match spread {
                 Some(spread) => writeln!(
                     out,
@@ -2709,15 +2734,20 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 writeln!(f, "{}", line).map_err(|e| e.to_string())?;
             }
             // A weighted kappa (#1660): `variance`/`sd` are the weight-1 γ², so
-            // add the weight and the typical arm's SD the console prints.
+            // add the weight and the typical arm's spread the console prints:
+            // its SD always, and for a CV% type its exact CV% (#1858).
             if let Some((w, typical)) =
                 kappa_weight_facts(&result.kappa_weights, &result.kappa_weight_typical, i, var)
             {
                 writeln!(f, "    weight: {}", yaml_quote(w)).map_err(|e| e.to_string())?;
-                if let Some((n, sd)) = typical {
+                if let Some((n, var_at)) = typical {
                     writeln!(f, "    weight_typical: {:.6}", n).map_err(|e| e.to_string())?;
-                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd)
+                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd_from_var(var_at))
                         .map_err(|e| e.to_string())?;
+                    let kappa_type = result.kappa_param_types.get(i).copied();
+                    if let Some(line) = typical_cv_yaml_line(kappa_type, var_at) {
+                        writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+                    }
                 }
             }
             if is_fixed {
@@ -5580,18 +5610,39 @@ mod tests {
     #[test]
     fn variance_note_input_space() {
         use EtaParamType::*;
-        let ln = 0.050133; // sqrt = 0.22390
+        let ln = 0.050133; // exact CV% 22.67 (√var·100 would be 22.39)
         let add = 156.036966; // sqrt = 12.491476 — the #1643 MBMA kappa
         let note = |t, v, w| variance_note(t, v, w);
         let s = |x: &str| Some(x.to_string());
 
-        // Unknown type (old bundle / ETA without info) and log-normal: today's CV%.
-        assert_eq!(note(None, ln, false), s("CV% = 22.4"));
-        assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.4"));
+        // Unknown type (old bundle / ETA without info) and log-normal: the CV%.
+        assert_eq!(note(None, ln, false), s("CV% = 22.7"));
+        assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.7"));
         // Weighted log-normal kappa: the CV% of a weight-1 arm, labelled so
         // (#1666) — an unknown type prints the same CV% and gets the same label.
-        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.4 at weight 1"));
-        assert_eq!(note(None, ln, true), s("CV% = 22.4 at weight 1"));
+        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.7 at weight 1"));
+        assert_eq!(note(None, ln, true), s("CV% = 22.7 at weight 1"));
+        // #1858: the CV% is the exact `√(exp(var) − 1)·100`, not `√var·100`. At
+        // var = 0.2 the two differ at print precision (47.1 against 44.7) on
+        // every log-normal / unknown cell, weighted or not, so putting the
+        // first-order form back reddens each.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(note(t, 0.2, false), s("CV% = 47.1"), "{t:?}");
+            assert_eq!(note(t, 0.2, true), s("CV% = 47.1 at weight 1"), "{t:?}");
+            // ... and on the weight line, which is fed the arm's variance.
+            assert_eq!(
+                spread_note(t, 0.2, " at NARM = 4.0000"),
+                s("CV% = 47.1 at NARM = 4.0000"),
+                "{t:?}"
+            );
+        }
+        // Large variances, where the first-order form is furthest off: 2.37
+        // (the warfarin_iov ETA_KA) is 311.4, not 154.0; a tiny one keeps its
+        // digits (`exp_m1`, not `exp(var) − 1`).
+        assert_eq!(note(Some(LogNormal), 2.37, false), s("CV% = 311.4"));
+        // Measured: exp_m1 gives 1.0000000000000250e-4, `exp(v) − 1` gives
+        // 1.0000444e-4 (4.4e-9 off); the bound sits between them.
+        assert!((cv_pct(1e-12) - 1e-4).abs() < 1e-15, "{}", cv_pct(1e-12));
         // Additive: SD, not a CV%; weighted says which arm size the SD is for.
         assert_eq!(note(Some(Additive), add, false), s("SD = 12.4915"));
         assert_eq!(
@@ -5625,11 +5676,24 @@ mod tests {
         assert_eq!(note_suffix(None, true), "");
 
         // YAML key per type.
-        assert_eq!(variance_yaml_line(None, ln), s("    cv_pct: 22.39"));
+        assert_eq!(variance_yaml_line(None, ln), s("    cv_pct: 22.67"));
         assert_eq!(
             variance_yaml_line(Some(LogNormal), ln),
-            s("    cv_pct: 22.39")
+            s("    cv_pct: 22.67")
         );
+        // #1858: the YAML's `cv_pct` and the typical-arm key are the exact CV%
+        // too (44.72 under `√var·100`); the typical-arm key exists only for
+        // the CV% types.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(variance_yaml_line(t, 0.2), s("    cv_pct: 47.05"));
+            assert_eq!(
+                typical_cv_yaml_line(t, 0.2),
+                s("    cv_pct_at_typical_weight: 47.05")
+            );
+        }
+        for t in [Additive, Logit, LogitProbability, Custom] {
+            assert_eq!(typical_cv_yaml_line(Some(t), 0.2), None, "{t:?}");
+        }
         assert_eq!(
             variance_yaml_line(Some(Additive), add),
             s("    sd: 12.491476")
@@ -5675,7 +5739,7 @@ mod tests {
                 ("summary", format_summary(&r)),
             ] {
                 for (name, want) in [
-                    ("K_LN", format!("= 0.050133  (CV% = 22.4{w})  SE =")),
+                    ("K_LN", format!("= 0.050133  (CV% = 22.7{w})  SE =")),
                     ("K_ADD", format!("= 156.036966  (SD = 12.4915{w})  SE =")),
                     (
                         "K_LGT",
@@ -5687,10 +5751,14 @@ mod tests {
                     assert!(row.contains(&want), "{surface} weighted={weighted}: {row}");
                 }
             }
-            // An old bundle (no types): the CV% row carries the same label.
+            // An old bundle (no types): the CV% row carries the same label. The
+            // exact CV% of an additive γ² read as log-normal is ~7.64e35 —
+            // absurd, as the 1249.1 it printed before was; only the leading
+            // digits are pinned, the rest is libm rounding.
             let old = format_kappa_rows(&mk(weighted, false));
-            let want = format!("= 156.036966  (CV% = 1249.1{w})  SE =");
-            assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
+            let row = line_with(&old, "K_ADD");
+            assert!(row.contains("= 156.036966  (CV% = 7638298975"), "{old}");
+            assert!(row.contains(&format!(".0{w})  SE =")), "{old}");
         }
 
         // #1683 / #1697: the weight line under a weighted kappa is its row's
@@ -5703,8 +5771,10 @@ mod tests {
         // printing `SD =`, the additive / logit line printing `CV% =`, the
         // logit tag dropped, moved, or put on the additive line, or a custom
         // spread reappearing, each reddens a cell. The additive line is
-        // byte-identical to before #1697. Typical arm n = 4, so SD = √var / 2;
-        // CV% = 100 · SD.
+        // byte-identical to before #1697. Typical arm n = 4, so the arm's
+        // variance is var / 4: SD = √(var / 4), CV% = cv_pct(var / 4) (#1858).
+        // (K_LN's 11.2 does not separate that from 100·√var/2 = 11.20; the
+        // var = 0.8 block below does.)
         //
         // #1698: the spread follows the row note's `show_cv` gate. Both sides
         // of the gate in this one loop, every status spelled out — a computed
@@ -5736,9 +5806,9 @@ mod tests {
                     false,
                     [
                         ("K_LN", Some("CV% = 11.2 at NARM = 4.0000")),
-                        ("K_ADD", Some("CV% = 624.6 at NARM = 4.0000")),
-                        ("K_LGT", Some("CV% = 624.6 at NARM = 4.0000")),
-                        ("K_C", Some("CV% = 27.4 at NARM = 4.0000")),
+                        ("K_ADD", Some("CV% = 29563044924.4 at NARM = 4.0000")),
+                        ("K_LGT", Some("CV% = 29563044924.4 at NARM = 4.0000")),
+                        ("K_C", Some("CV% = 27.9 at NARM = 4.0000")),
                     ],
                 ),
             ] {
@@ -5762,11 +5832,53 @@ mod tests {
                 }
             }
         }
-        // The other logit spelling gets the same tag.
+        // The other logit spelling gets the same tag (`spread_note` takes the
+        // arm's variance: 39.009242 = 156.036966 / 4, SD 6.2457).
         assert_eq!(
-            spread_note(Some(LogitProbability), 6.245738, " at NARM = 4.0000"),
+            spread_note(Some(LogitProbability), 39.009242, " at NARM = 4.0000"),
             s("SD = 6.2457 at NARM = 4.0000, logit scale")
         );
+
+        // #1858: a weighted log-normal / unknown kappa whose row and weight line
+        // both separate the exact CV% from `√var·100`. γ² = 0.8 at NARM = 4:
+        // the row is cv_pct(0.8) = 110.7 (89.4 first-order); the weight line is
+        // cv_pct(0.8 / 4) = 47.1 — not 100·√0.8/2 = 44.7 (the line computed
+        // from the SD), not 110.7 (the row's variance, n dropped), not 75.1
+        // (the SD handed in where the variance belongs). Console and summary,
+        // typed and untyped, and the YAML's `cv_pct` / `cv_pct_at_typical_weight`.
+        for typed in [true, false] {
+            let mut r = classified_result();
+            r.omega_iov = Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+                0.8,
+            ])));
+            r.kappa_names = vec!["K_W".into()];
+            r.kappa_fixed = vec![false];
+            r.kappa_param_types = if typed { vec![LogNormal] } else { Vec::new() };
+            r.kappa_weights = vec![Some("NARM".into())];
+            r.kappa_weight_typical = vec![Some(4.0)];
+            for (surface, text) in [
+                ("console", format_kappa_rows(&r)),
+                ("summary", format_summary(&r)),
+            ] {
+                assert!(
+                    line_with(&text, "K_W").contains("= 0.800000  (CV% = 110.7 at weight 1)  SE ="),
+                    "{surface} typed={typed}:\n{text}"
+                );
+                assert!(
+                    text.contains(&weight_line("K_W", Some("CV% = 47.1 at NARM = 4.0000"))),
+                    "{surface} typed={typed}:\n{text}"
+                );
+            }
+            let yaml = yaml_of(&r);
+            let entry = "  K_W:\n    variance: 0.800000\n    cv_pct: 110.70\n    \
+                         weight: \"NARM\"\n    weight_typical: 4.000000\n    \
+                         sd_at_typical_weight: 0.447214\n    \
+                         cv_pct_at_typical_weight: 47.05\n    se: ~\n";
+            assert!(
+                yaml.contains(entry),
+                "typed={typed}: missing\n{entry}\nin\n{yaml}"
+            );
+        }
         // Unweighted: no weight line on either surface, and the rows are
         // byte-identical to before #1697 / #1698 on both sides of the gate.
         for status in [CovarianceStatus::Computed, CovarianceStatus::Failed] {
@@ -5774,7 +5886,7 @@ mod tests {
             plain.covariance_status = status.clone();
             let rows = format_kappa_rows(&plain);
             let want = if status == CovarianceStatus::Computed {
-                "  K_LN                 = 0.050133  (CV% = 22.4)  SE = N/A\n\
+                "  K_LN                 = 0.050133  (CV% = 22.7)  SE = N/A\n\
                  \x20 K_ADD                = 156.036966  (SD = 12.4915)  SE = N/A\n\
                  \x20 K_LGT                = 156.036966  (SD = 12.4915, logit scale)  SE = N/A\n\
                  \x20 K_C                  = 0.300000  SE = N/A\n"
@@ -5791,13 +5903,20 @@ mod tests {
         }
 
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
-        // entry, followed by the #1660 weight keys; no typical-arm CV% key.
+        // entry, followed by the #1660 weight keys and (#1858) the typical
+        // arm's exact CV%, which only a CV% type gets: one such key in a file
+        // with a log-normal, an additive, a logit and a custom weighted kappa.
         let yaml = yaml_of(&mk(true, true));
-        let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    \
+        let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
-                     sd_at_typical_weight: 0.111952\n    se: ~\n";
+                     sd_at_typical_weight: 0.111952\n    \
+                     cv_pct_at_typical_weight: 11.23\n    se: ~\n";
         assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
-        assert!(!yaml.contains("cv_pct_at"), "{yaml}");
+        assert_eq!(
+            yaml.matches("cv_pct_at_typical_weight").count(),
+            1,
+            "{yaml}"
+        );
         // #1698: the YAML does not follow the console's `show_cv` gate — a
         // failed covariance step writes the same entry, `cv_pct` and
         // `sd_at_typical_weight` included.
@@ -5812,7 +5931,7 @@ mod tests {
         // and the log-normal entry is the pre-#1666 one.
         let plain = yaml_of(&mk(false, true));
         assert!(
-            plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    se: ~\n"),
+            plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    se: ~\n"),
             "{plain}"
         );
         let stripped: String = yaml
@@ -5820,7 +5939,8 @@ mod tests {
             .filter(|l| {
                 !(l.starts_with("    weight: ")
                     || l.starts_with("    weight_typical: ")
-                    || l.starts_with("    sd_at_typical_weight: "))
+                    || l.starts_with("    sd_at_typical_weight: ")
+                    || l.starts_with("    cv_pct_at_typical_weight: "))
             })
             .map(|l| format!("{l}\n"))
             .collect();
@@ -6028,7 +6148,7 @@ mod tests {
         let r = classified_result();
         let rows = format_kappa_rows(&r);
         let ln = line_with(&rows, "K_LN");
-        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        assert!(ln.contains("= 0.050133  (CV% = 22.7)  SE ="), "{ln}");
         assert!(!ln.contains("SD"), "{ln}");
         let add = line_with(&rows, "K_ADD");
         assert!(add.contains("= 156.036966  (SD = 12.4915)  SE ="), "{add}");
@@ -6054,7 +6174,7 @@ mod tests {
         old.kappa_param_types.clear();
         let rows = format_kappa_rows(&old);
         assert!(
-            line_with(&rows, "K_ADD").contains("(CV% = 1249.1)"),
+            line_with(&rows, "K_ADD").contains("(CV% = 7638298975"),
             "{rows}"
         );
 
@@ -6071,7 +6191,7 @@ mod tests {
         let r = classified_result();
         for text in [format_omega_rows(&r), format_summary(&r)] {
             let cl = line_with(&text, "eta_CL");
-            assert!(cl.contains("= 0.100000  (CV% = 31.6)  SE ="), "{cl}");
+            assert!(cl.contains("= 0.100000  (CV% = 32.4)  SE ="), "{cl}");
             let v = line_with(&text, "eta_V");
             assert!(v.contains("= 0.200000  (SD = 0.4472)  SE ="), "{v}");
         }
@@ -6099,9 +6219,9 @@ mod tests {
         write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
         let yaml = std::fs::read_to_string(&path).expect("yaml read");
         for want in [
-            "  eta_CL:\n    variance: 0.100000\n    cv_pct: 31.62\n",
+            "  eta_CL:\n    variance: 0.100000\n    cv_pct: 32.43\n",
             "  eta_V:\n    variance: 0.200000\n    sd: 0.447214\n",
-            "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n",
+            "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n",
             "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n",
             "  K_C:\n    variance: 0.300000\n    se: ~\n",
         ] {
@@ -6142,7 +6262,7 @@ mod tests {
             "summary drifted from the console rows:\n{summary}"
         );
         let ln = line_with(&summary, "K_LN");
-        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        assert!(ln.contains("= 0.050133  (CV% = 22.7)  SE ="), "{ln}");
         let add = line_with(&summary, "K_ADD");
         assert!(
             add.contains("= 156.036966  (SD = 12.4915 at weight 1)  SE ="),

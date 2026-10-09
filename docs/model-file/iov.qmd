@@ -182,12 +182,15 @@ The next line is on the row's scale (#1683): under a log-normal kappa's CV% row
 it is a CV% too, so the two compare directly:
 
 ```
-  KAPPA_CL             = 0.050133  (CV% = 22.4 at weight 1)  SE = 0.004100
+  KAPPA_CL             = 0.050133  (CV% = 22.7 at weight 1)  SE = 0.004100
                          weight = NARM  →  CV% = 11.2 at NARM = 4.0000 (κ ~ N(0, KAPPA_CL/NARM))
 ```
 
 The line's figure is the row's note at the typical arm, worded the same way with
-`at NARM = …` in place of `at weight 1`. An additive kappa gets `SD = …`, as
+`at NARM = …` in place of `at weight 1`. A CV% is the exact
+$\sqrt{e^{\gamma^2/n} - 1}\cdot 100$ at an arm of size $n$, computed from the
+arm's variance $\gamma^2/n$ (#1858): not the row's CV% divided by $\sqrt{n}$,
+which only the first-order approximation would give. An additive kappa gets `SD = …`, as
 above, and a logit kappa keeps its row's tag in the row's order (#1697):
 
 ```
@@ -224,9 +227,12 @@ omega_iov:
 
 `variance` stays the unweighted $\gamma^2$, and its `cv_pct` (log-normal) or `sd`
 line is the weight-1 figure; the typical arm is read from `sd_at_typical_weight`.
-For a log-normal kappa that key is still the log-scale SD: times 100 it is the CV%
-the console's weight line prints (0.111952 → 11.2), and no separate CV% key is
-written. An unweighted kappa's entry is unchanged.
+For a log-normal (or untyped) kappa that key is still the log-scale SD, and the
+CV% the console's weight line prints is written beside it as
+`cv_pct_at_typical_weight` (#1858) — for `KAPPA_CL` above, `sd_at_typical_weight:
+0.111952` and `cv_pct_at_typical_weight: 11.23`. The two are not related by a
+factor of 100 in general: the exact CV% grows faster than the SD. An unweighted
+kappa's entry is unchanged.
 
 A wrapper prints the same rows through the engine's own formatter, at print time
 (#1825). It builds a `ferx_core::io::output::KappaRowsInput` from the fit's

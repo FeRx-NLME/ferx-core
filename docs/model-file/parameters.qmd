@@ -449,7 +449,7 @@ omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
 
 #### Choosing the scale: variance or SD
 
-Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately `sqrt(variance) * 100` for log-normally distributed parameters. For example, `omega ETA_CL ~ 0.09` corresponds to ~30% CV.
+Each variance represents the between-subject variability for that parameter. For a log-normally distributed parameter the coefficient of variation is `sqrt(exp(variance) - 1) * 100`, which is what ferx reports as CV% (#1858). For a small variance it is close to `sqrt(variance) * 100`: `omega ETA_CL ~ 0.09` is a 30.7% CV (30% by the approximation), while a variance of 1 is 131% (not 100%).
 
 The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
 
