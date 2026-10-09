@@ -290,6 +290,18 @@ counts when either holds:
   `E0 = TVE0 + PLACEBO * (1 + 0.1 * OCC) + ETA_E0` does not, because there the
   factor sits inside the sum, on the block alone.
 
+A parameter assigned more than once is read at the assignments that reach the
+read, in statement order. Inside `E0 = E0 * (1 + 0.1 * OCC)`, the `E0` on the
+right is the value assigned before that line, so writing
+`E0 = TVE0 + PLACEBO + ETA_E0` and then `E0 = E0 * (1 + 0.1 * OCC)` counts
+exactly as the one-line form above does, and so does the same model written
+through a fresh name (`E0A = ...`, then `E0 = E0A * ...`). An assignment that a
+later unconditional one overwrites before anything reads it does not count. One
+inside an `if` reaches past it alongside the value from before, unless an
+`else` overwrites that value too, and a branch condition that varies within a
+subject then keeps the parameter from counting, even when the branches happen to
+be proportional (#1834).
+
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in
 `EMAX * TIME / (TIME + ET50)`, when the block does not take a level at every

@@ -28887,7 +28887,7 @@ fn the_inliner_terminates_on_a_self_reference() {
 
 /// `level_block_eta_coupling` for `src` as `[individual_parameters]`, with
 /// `ETA_E0` the one random effect and the readout `y = E0 + PLACEBO`, where
-/// `PLACEBO` is the level block; and the `var_constant` calls it made.
+/// `PLACEBO` is the level block; and the `def_constant` calls it made.
 fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
     let tn: Vec<String> = vec!["TVE0".to_string()];
     let en: Vec<String> = vec!["ETA_E0".to_string()];
@@ -28905,12 +28905,12 @@ fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
         Box::new(block),
     )];
     let states = StateInputs::new(&[], true, None, PkModel::OneCptIv, &HashMap::new(), &[]);
-    super::VAR_CONSTANT_CALLS.with(|c| c.set(0));
+    super::DEF_CONSTANT_CALLS.with(|c| c.set(0));
     let c = level_block_eta_coupling(&stmts, &readout, "PLACEBO", 0, "ETA_E0", &states);
-    (c, super::VAR_CONSTANT_CALLS.with(|c| c.get()))
+    (c, super::DEF_CONSTANT_CALLS.with(|c| c.get()))
 }
 
-/// #1676: `var_constant` is memoised per variable for one
+/// #1676: `def_constant` is memoised per assignment for one
 /// `level_block_eta_coupling` call, so on a diamond under the random effect's
 /// parameter it makes a fixed number of calls per level, where the walk by
 /// path made `2^depth` (measured before the fix, in a full parse: 28 583
@@ -28919,7 +28919,7 @@ fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
 /// `E0`, and the covariate `WT` at the bottom of the diamond reaches it
 /// through the memo.
 /// Dies under (on the coupling's side only; `the_inliner_is_linear_on_a_diamond`
-/// stays green): removing the memo lookup in `var_constant`; storing the
+/// stays green): removing the memo lookup in `def_constant`; storing the
 /// memo's covariates as `Some(Vec::new())` (the funnel's `WT` goes missing).
 #[test]
 fn the_coupling_walk_is_linear_on_a_diamond() {
@@ -28943,7 +28943,7 @@ fn the_coupling_walk_is_linear_on_a_diamond() {
     };
     let c0 = count(0);
     let per_level = count(1) - c0;
-    assert!(per_level > 0, "coupling: the diamond reaches var_constant");
+    assert!(per_level > 0, "coupling: the diamond reaches def_constant");
     for d in [10, 20, 30] {
         assert_eq!(
             count(d) - c0,
@@ -28995,7 +28995,7 @@ fn funnels_1712(e0: &str, y: &str) -> Vec<Funnel> {
 ///   records `[]`; the twin `E0 + PLACEBO * fac` records `["OCC"]`.
 ///
 /// Dies under, each side separately: the parameter loop back to
-/// `var_constant(v)` over the whole of `E0` (the parameter row records
+/// `def_constant` over the whole of `E0` (the parameter row records
 /// `["OCC"]`, the readout rows unchanged); the early `expr_constant(e)`
 /// return restored for the readout call only (the readout row records
 /// `["OCC"]`, the parameter rows unchanged).
@@ -29047,18 +29047,160 @@ fn a_funnel_records_only_its_operands_covariates() {
     }
 }
 
-/// A self-reassignment (`E0 = E0 + 1`) is a cycle for `var_constant`: it still
-/// terminates, and the parameter still varies, the cycle guard's answer, now
-/// memoised.
-/// Dies under: removing the `stack` cycle guard in `var_constant` (unbounded
-/// recursion; the memo is written only after the walk, so it cannot stand in
-/// for the guard).
+/// #1836: a self-reassignment (`E0 = E0 + 1`) reads the `E0` before it, not
+/// itself, so it is no cycle: the walk terminates, `E0` is subject-constant
+/// (`TVE0 + ETA_E0`, then plus one), and the readout `E0 + PLACEBO` is a
+/// funnel reached through `E0`. Before #1836 the read resolved to every
+/// assignment of `E0`, the cycle guard answered "varies", and no funnel was
+/// recorded.
+/// Dies under: `resolve` returning every assignment of the name (the
+/// `debug_assert!` that a resolved assignment comes before its reader fires: a
+/// clean failure, not a stack overflow).
 #[test]
 fn the_coupling_walk_terminates_on_a_self_reassignment() {
     let (c, calls) = coupling_counted("E0 = TVE0 + ETA_E0\nE0 = E0 + 1\n");
-    assert!(c.funnels.is_empty(), "coupling: E0 varies, so no funnel");
+    let want = vec![Funnel {
+        site: ScaleShare {
+            param: None,
+            eta_via: Some("E0".to_string()),
+        },
+        covariates: vec![],
+    }];
+    assert_eq!(c.funnels, want, "coupling: the readout is a funnel");
     assert_eq!(c.reach, Some(EtaRoute::Via("E0".to_string())));
-    assert!(calls > 0, "coupling: var_constant ran");
+    assert!(calls > 0, "coupling: def_constant ran");
+}
+
+/// The reaching definitions [`coupling_defs`] records, as `(lhs, reach_in,
+/// the reach at each condition's if)` per assignment plus the reach at the
+/// end, sorted by name so the comparison is order-free.
+type ReachShape = (
+    Vec<(
+        String,
+        Vec<(String, Vec<usize>)>,
+        Vec<Vec<(String, Vec<usize>)>>,
+    )>,
+    Vec<(String, Vec<usize>)>,
+);
+
+fn reach_shape(src: &str) -> ReachShape {
+    let sorted = |r: &Reach| {
+        let mut v: Vec<(String, Vec<usize>)> =
+            r.iter().map(|(n, d)| (n.to_string(), d.clone())).collect();
+        v.sort();
+        v
+    };
+    let stmts = stmts_of(src, &[], &[]);
+    let (assigns, out) = coupling_defs(&stmts);
+    let defs = assigns
+        .iter()
+        .map(|a| {
+            (
+                a.lhs.to_string(),
+                sorted(&a.reach_in),
+                a.conds.iter().map(|(_, r)| sorted(r)).collect(),
+            )
+        })
+        .collect();
+    (defs, sorted(&out))
+}
+
+/// #1836: the reaching-definition rules of [`coupling_defs`], one shape each.
+/// `R(...)` below is the reach set as `(name, defs)` pairs.
+///
+/// - **kill**: an unconditional assignment replaces the earlier definitions.
+/// - **if / else**: each branch starts from the incoming set, not from the
+///   previous branch's; after it, the union of the branches.
+/// - **no else**: the union also keeps the incoming set.
+/// - **nested if**: the inner union feeds the outer branch's later reads.
+/// - **conditions**: a condition reads the set at its `if`, not the set at
+///   the assignment it guards.
+///
+/// Dies under, one per rule, each named in the failing message: `insert`
+/// extending instead of replacing (kill); each branch starting from the
+/// previous branch's output (if / else); `merged` starting empty without an
+/// `else` (no else); the inner `*reach = merged` dropped (nested); the
+/// conditions read at `reach_in` (conditions).
+#[test]
+fn reaching_definitions_per_shape() {
+    let r = |pairs: &[(&str, &[usize])]| -> Vec<(String, Vec<usize>)> {
+        pairs
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_vec()))
+            .collect()
+    };
+    // kill
+    let (defs, out) = reach_shape("A = 1\nA = A + 1\nB = A\n");
+    assert_eq!(
+        defs[1].1,
+        r(&[("A", &[0])]),
+        "kill: A's second def reads the first"
+    );
+    assert_eq!(
+        defs[2].1,
+        r(&[("A", &[1])]),
+        "kill: B reads only A's last def"
+    );
+    assert_eq!(out, r(&[("A", &[1]), ("B", &[2])]), "kill: at the end");
+
+    // if / else
+    let (defs, out) = reach_shape("A = 1\nif (X > 1) {\n  A = 2\n} else {\n  A = 3\n}\nB = A\n");
+    assert_eq!(
+        defs[2].1,
+        r(&[("A", &[0])]),
+        "if/else: the else starts from the incoming set"
+    );
+    assert_eq!(
+        defs[3].1,
+        r(&[("A", &[1, 2])]),
+        "if/else: B reads both branches"
+    );
+    assert_eq!(
+        out,
+        r(&[("A", &[1, 2]), ("B", &[3])]),
+        "if/else: at the end"
+    );
+
+    // no else
+    let (defs, _) = reach_shape("A = 1\nif (X > 1) {\n  A = 2\n}\nB = A\n");
+    assert_eq!(
+        defs[2].1,
+        r(&[("A", &[0, 1])]),
+        "no else: B reads the incoming def too"
+    );
+
+    // nested if
+    let (defs, out) = reach_shape(
+        "A = 1\nif (X > 1) {\n  A = 2\n  if (X > 2) {\n    A = 3\n  }\n  C = A\n}\nB = A\n",
+    );
+    assert_eq!(
+        defs[3].1,
+        r(&[("A", &[1, 2])]),
+        "nested: C reads the inner union"
+    );
+    assert_eq!(
+        defs[4].1,
+        r(&[("A", &[0, 1, 2]), ("C", &[3])]),
+        "nested: B reads the outer union"
+    );
+    assert_eq!(
+        out,
+        r(&[("A", &[0, 1, 2]), ("B", &[4]), ("C", &[3])]),
+        "nested: at the end"
+    );
+
+    // conditions
+    let (defs, _) = reach_shape("A = 1\nif (A > 1) {\n  A = 2\n  B = A\n}\n");
+    assert_eq!(
+        defs[2].1,
+        r(&[("A", &[1])]),
+        "conditions: B itself reads A's branch def"
+    );
+    assert_eq!(
+        defs[2].2,
+        vec![r(&[("A", &[0])])],
+        "conditions: B's condition reads A at its if"
+    );
 }
 
 /// The pre-#1684 inliner, kept as the oracle for [`InlineScope`]: each
