@@ -1900,7 +1900,7 @@ fn subject_is_estimate_joint(
         // Compute obs NLL with sampled eta and kappa using predict_iov
         let ipreds = predict_iov(model, subject, theta, eta_sample, &kappas_sampled);
 
-        let m3 = matches!(model.bloq_method, BloqMethod::M3);
+        let m3 = matches!(model.bloq_in_force(), BloqMethod::M3);
         // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
         let ruv_scale = model.residual_var_scale(eta_sample);
         // #658: per-observation residual endpoint keys (covariate selector or CMT).

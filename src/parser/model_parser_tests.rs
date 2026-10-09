@@ -4574,7 +4574,7 @@ fn test_apply_fit_option_optimizer_and_bloq() {
     assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
 
     assert_eq!(apply_fit_option(&mut opts, "bloq", "m3"), Ok(true));
-    assert_eq!(opts.bloq_method, BloqMethod::M3);
+    assert_eq!(opts.bloq_method, Some(BloqMethod::M3));
 }
 
 #[test]

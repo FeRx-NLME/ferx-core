@@ -1125,7 +1125,7 @@ pub fn closed_form_sigma_support(
     if model.frem_config.is_some() {
         return Err("FREM pseudo-observations carry their own residual variance".to_string());
     }
-    if matches!(model.bloq_method, BloqMethod::M3) {
+    if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Err(
             "M3 BLOQ adds a censored log-CDF term in which σ has no closed form".to_string(),
         );

@@ -121,7 +121,7 @@ fn observation_err_d2(
     let f = sens.obs[j].f;
     let y = subject.observations[j];
     let cens = subject.cens.get(j).copied().unwrap_or(0);
-    if model.bloq_method != crate::types::BloqMethod::M3 || cens == 0 {
+    if model.bloq_in_force() != crate::types::BloqMethod::M3 || cens == 0 {
         return err_d2(
             model.error_spec.variance_at(cmt, f, sigma),
             model.error_spec.dvar_df(cmt, f, sigma),
@@ -174,7 +174,7 @@ fn observation_data_loss(
     let y = subject.observations[j];
     let r = model.error_spec.variance_at(cmt, f, sigma);
     let cens = subject.cens.get(j).copied().unwrap_or(0);
-    if model.bloq_method == crate::types::BloqMethod::M3 && cens != 0 {
+    if model.bloq_in_force() == crate::types::BloqMethod::M3 && cens != 0 {
         -crate::stats::likelihood::m3_logcdf(y, f, r.sqrt(), cens)
     } else {
         0.5 * ((y - f).powi(2) / r + r.ln())
@@ -304,7 +304,7 @@ fn sigma_derivs(
                 - model.error_spec.dvar_df(cmt, f, &sm))
                 / (2.0 * hk);
             // ∂α/∂σ_k = [2ε/R² + d(2ε²−R)/R³] R_k + [(R−ε²)/R²] d_k.
-            let cens = model.bloq_method == crate::types::BloqMethod::M3
+            let cens = model.bloq_in_force() == crate::types::BloqMethod::M3
                 && subject.cens.get(j).copied().unwrap_or(0) != 0;
             let da = if cens {
                 (observation_err_d2(model, subject, sens, &sp, j).alpha
@@ -352,7 +352,7 @@ fn sigma_derivs(
         }
     }
     for j in 0..n_obs {
-        let cens = model.bloq_method == crate::types::BloqMethod::M3
+        let cens = model.bloq_in_force() == crate::types::BloqMethod::M3
             && subject.cens.get(j).copied().unwrap_or(0) != 0;
         for k in 0..n_sigma {
             for l in k..n_sigma {
@@ -1444,7 +1444,8 @@ fn foce_sb_fixed_natural(
     let nt = params.theta.len();
     let n_obs = subject.observations.len();
     // No-BLOQ scope: all observation rows are quantified.
-    if model.bloq_method == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0) {
+    if model.bloq_in_force() == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0)
+    {
         return None;
     }
     let nq = n_obs;
@@ -1677,7 +1678,7 @@ fn subject_cov_hessian_foce_natural(
     let nq = subject.observations.len();
     let is_cens: Vec<bool> = (0..nq)
         .map(|i| {
-            model.bloq_method == crate::types::BloqMethod::M3
+            model.bloq_in_force() == crate::types::BloqMethod::M3
                 && subject.cens.get(i).copied().unwrap_or(0) != 0
         })
         .collect();
