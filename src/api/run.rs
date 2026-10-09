@@ -225,9 +225,11 @@ pub fn prepare_run_with_inits(
         .map_err(|e| e.to_string())?;
 
     let init_params = build_init_params(&parsed);
-    // Sync the resolved gradient method from fit_options onto the model so
-    // `resolve_gradient_method` (which reads `model.gradient_method`) honours
-    // the file's `gradient = ...` key. Mirrors `fit_from_files` (SDE forces FD).
+    // `fit` honours `fit_options.gradient_method` by itself (#1613), so this stamp is not what
+    // makes the fit run on FD. It stays because `PreparedRun.parsed.model` outlives that call:
+    // a caller hands it to post-hoc steps (`run_covariance`, `run_sir`, `predict`) that it may
+    // drive without the same options, and the model's flag is what keeps those on FD.
+    // Idempotent, and the same rule `check` mirrors (SDE forces FD).
     parsed.model.gradient_method =
         crate::types::GradientMethod::effective(&parsed.model, &parsed.fit_options);
 

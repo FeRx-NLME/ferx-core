@@ -315,13 +315,6 @@ let (mut population, _) = read_population_for(
 bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
 bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
-// `fit` reads the gradient method off the model, not the options.
-parsed.model.gradient_method = if parsed.model.is_sde() {
-    GradientMethod::Fd
-} else {
-    parsed.fit_options.gradient_method
-};
-
 let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 ```
 
@@ -365,14 +358,17 @@ re-resolve it. To re-bind both halves on new data, call `bind_theta_levels`
 first, as the example does
 ([#1736](https://github.com/FeRx-NLME/ferx-core/issues/1736)).
 
-The other three steps are what the file entry points do besides binding. The
-`[data_selection]` filter and the IOV column go to the reader. The gradient
-stamp makes a file's `gradient = fd` take effect, and forces finite
-differences on an SDE model. Leave any of them out and the fit runs without
-that setting, and nothing warns you. With all three, the example gives the
-same parameter vector and the same objective as `run_model_with_data`, equal
-to the bit. The test suite pins that on a level-block model, alone, with
-`gradient = fd` and with a `[data_selection]` block. A caller that has a model *path* can use
+The other two steps are what the file entry points do besides binding: the
+`[data_selection]` filter and the IOV column go to the reader. Leave either out
+and the fit runs without that setting, and nothing warns you. `gradient` needs
+no step: `fit` reads it from the options it is given, so a file's
+`gradient = fd` takes effect here as it does from the file entry points, and an
+SDE model runs on finite differences whatever it says
+([#1613](https://github.com/FeRx-NLME/ferx-core/issues/1613)). With both steps,
+the example gives the same parameter vector and the same objective as
+`run_model_with_data`, equal to the bit. The test suite pins that on a
+level-block model, alone, with `gradient = fd` and with a `[data_selection]`
+block. A caller that has a model *path* can use
 `prepare_run(model_path, data_path)` instead, which does all of this and
 returns the inputs without fitting.
 

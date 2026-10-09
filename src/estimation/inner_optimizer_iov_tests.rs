@@ -512,6 +512,56 @@ fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
     );
 }
 
+/// #1613 G5: the IOV FD-fallback reason reads the **call's** `gradient = fd`
+/// (`GradientMethod::forced_fd`), so a direct `fit()` with `FitOptions { gradient_method: Fd }`
+/// on an unstamped model attributes its FD subjects to the setting the user chose, not to
+/// whatever scope clause happens to come next. The straddle is on one subject of the fixture
+/// above: unarmed it names its own scope reason, armed it names `gradient = fd`.
+///
+/// Mutation: revert `iov_fd_reason`'s first clause to `model.gradient_method` → the armed
+/// assert reads the modeled-dose reason.
+#[test]
+fn iov_fd_reason_names_the_calls_gradient_fd() {
+    let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV without D1");
+    assert_eq!(
+        model.gradient_method,
+        GradientMethod::Auto,
+        "premise: unstamped"
+    );
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        )],
+        obs_times: vec![1.0, 6.0, 25.0, 30.0],
+        observations: vec![8.0, 6.0, 7.0, 5.0],
+        obs_cmts: vec![1; 4],
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        dose_occasions: vec![1],
+        ..Default::default()
+    };
+    assert_eq!(
+        iov_fd_reason(&model, &subject),
+        "modeled RATE/DURATION dose with missing D/R slot",
+        "control: unarmed, the subject's own scope reason"
+    );
+    let _fd = crate::types::arm_forced_fd(true);
+    assert_eq!(
+        iov_fd_reason(&model, &subject),
+        "gradient = fd",
+        "armed: the call's gradient = fd must be the reason"
+    );
+}
+
 #[test]
 fn iov_fd_reason_attributes_ss_input_rate() {
     // #486: a steady-state dose + a built-in absorption forcing (`zero_order`) declines

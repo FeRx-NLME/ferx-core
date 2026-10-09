@@ -38,13 +38,6 @@ fn main() -> Result<(), String> {
     bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
     bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
-    // `fit` reads the gradient method off the model: stamp the file's `gradient = ...`
-    parsed.model.gradient_method = if parsed.model.is_sde() {
-        GradientMethod::Fd
-    } else {
-        parsed.fit_options.gradient_method
-    };
-
     // Run estimation from the model's own initial estimates and options
     let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
 

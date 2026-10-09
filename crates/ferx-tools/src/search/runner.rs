@@ -70,8 +70,8 @@ use std::time::Instant;
 use ferx_core::cancel::is_cancelled;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{
-    bind_theta_levels, check_strictness, fit, CancelFlag, FitResult, GradientMethod, PoolPlan,
-    Population, StrictnessVerdict,
+    bind_theta_levels, check_strictness, fit, CancelFlag, FitResult, PoolPlan, Population,
+    StrictnessVerdict,
 };
 
 use super::candidate::{Candidate, CandidateError, CandidateResult, RunOptions};
@@ -895,23 +895,18 @@ fn compile_and_fit(
         .clone()
         .unwrap_or_else(|| parsed.fit_options.clone());
 
-    // Two `FitOptions` keys reach the engine through the *model* rather than
-    // through the options, so an override that only lands in `fit_options` is an
-    // override the fit does not see. `fit_from_files` stamps both; so does this.
+    // `bloq_method` reaches the engine through the *model* rather than through the
+    // options, so an override that only lands in `fit_options` is an override the
+    // fit does not see. `fit_from_files` stamps it; so does this. (`gradient` used
+    // to need the same stamp; `fit` reads it from the options since #1613.)
     //
-    // `bloq_method` is the one that bites: the censored-data likelihood reads
+    // The censored-data likelihood reads
     // `model.bloq_method`, so a candidate run with an override from `drop` to
     // `m3` (or back) would report the requested setting and score the other
     // one's likelihood — a wrong ranking, silently. Parsing already stamps the
     // *file's* value, which is why this is invisible until a caller supplies
     // `RunOptions::fit_options`.
     parsed.model.bloq_method = base.bloq_method;
-    // And the file's `gradient = ...`, with an SDE model forced to FD.
-    parsed.model.gradient_method = if parsed.model.is_sde() {
-        GradientMethod::Fd
-    } else {
-        base.gradient_method
-    };
 
     let init_params = parsed.model.default_params.clone();
     let mut fit_options = base.quiet();

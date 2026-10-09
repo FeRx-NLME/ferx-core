@@ -204,7 +204,7 @@ fn iov_inner_subject_route(
 }
 
 fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
-    if matches!(model.gradient_method, GradientMethod::Fd) {
+    if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
     if analytic_inner_common_bail(model) {
@@ -2695,7 +2695,7 @@ pub fn profile_report() {
 /// static-walk and TV-cov-walk `ExpressionScale` that the ODE provider actually applies).
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
-        || matches!(model.gradient_method, GradientMethod::Fd)
+        || GradientMethod::forced_fd(model)
         || model.is_sde()
         // LTBS is served analytically on the inner loop for every combination now — plain,
         // × `ExpressionScale` (the η-quotient then the `ln f` jet, `subject_eta_grad`),

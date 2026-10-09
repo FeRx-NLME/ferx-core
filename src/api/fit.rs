@@ -166,10 +166,8 @@ pub fn fit_from_files(
         .map_err(|e| e.to_string())?;
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
-    // SDE models have no analytic-sensitivity path — force FD. One rule, shared
-    // with `run.rs`'s stamp and with the #1381 coupling check, which has to agree
-    // with what the loop will actually do on a model the parser has not stamped.
-    model.gradient_method = crate::types::GradientMethod::effective(&model, &opts);
+    // No `gradient_method` stamp: `fit` resolves `opts.gradient_method` per call (#1613),
+    // and every reader declines an SDE model on its own.
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
     if let Some(w) = data_path_warning {
@@ -567,6 +565,12 @@ fn fit_unstamped(
     // that it runs while waiting (#1801 review, finding 2).
     let ode_solver_override =
         crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
+    // #1613: this call's `gradient = fd` is carried like the inner settings above — by
+    // `install_on_fit_pool` (`FitScope::fd`), not here: none of the validation before the pool
+    // reaches a gradient reader. `CompiledModel` is not `Clone`, so `fit` cannot stamp
+    // `options.gradient_method` onto the model as the file entry points did, and before #1613 a
+    // direct `fit()` with `FitOptions { gradient_method: Fd, .. }` ran on the analytic gradient
+    // with no warning. A reader added before the pool must arm `crate::types::arm_forced_fd`.
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the ways out — first the public
