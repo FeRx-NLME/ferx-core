@@ -19,6 +19,12 @@
 //!   model, whose resets make every coordinate scanned (default solver at `inner_maxiter` 200
 //!   and 1; Nelder–Mead at 2).
 //!
+//! #1806 T1–T3 (the `in_fit_sir_*` and `run_sir_without_a_sir_record_*` tests): the in-fit
+//! SIR scores under the stage record, so the two records are equal and `run_sir` repeats it;
+//! a fit with no SIR record re-scores under the stage record. The non-PD SIR fallback has no
+//! row: no fixture makes a quadrature Hessian non-PD. It shares the one `sir_opts` binding
+//! with the normal SIR in `fit()`.
+//!
 //! Engines (measured, and asserted per fit through `gradient_method_inner`): every fixture
 //! runs analytic (`Dual2`) inner gradients — warfarin, warfarin_ode, warfarin_iov — under
 //! FOCEI, or Laplace for the quadrature rows. Three outer iterations: the identity holds at whatever
@@ -309,48 +315,217 @@ fn a_callers_non_default_setting_wins_over_the_record() {
     );
 }
 
-/// `run_sir` takes its scoring settings from the SIR record, not from
-/// `fit.scoring_settings`: the in-fit SIR scores with the fit's top-level options, and on a
-/// Laplace fit those differ from the producing stage's (`inner_tol` 1e-5 against 1e-8). The
-/// premise is the difference itself, and that it moves the draws; then default options
-/// repeat the in-fit SIR. Mutation: resolve `run_sir` through the stage record first → dies.
-#[test]
-fn run_sir_scores_with_the_sir_record_not_the_stage_record() {
-    let with = FitOptions {
+/// Every SIR output a `run_sir` must repeat: the ESS and each θ/Ω/σ interval, as bits.
+/// `is_finite` first, so a `NaN` ESS cannot match a `NaN` ESS.
+fn sir_bits(fit: &FitResult, what: &str) -> Vec<u64> {
+    let ess = fit
+        .sir_ess
+        .unwrap_or_else(|| panic!("{what}: SIR produced no ESS"));
+    assert!(ess.is_finite(), "{what}: ESS {ess}");
+    let mut out = vec![ess.to_bits()];
+    for ci in [&fit.sir_ci_theta, &fit.sir_ci_omega, &fit.sir_ci_sigma] {
+        let ci = ci
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: SIR produced no interval"));
+        for (lo, hi) in ci {
+            assert!(lo.is_finite() && hi.is_finite(), "{what}: CI ({lo}, {hi})");
+            out.extend([lo.to_bits(), hi.to_bits()]);
+        }
+    }
+    out
+}
+
+/// `fit` with its SIR outputs cleared, the records left as they are.
+fn sir_cleared(fit: &FitResult) -> FitResult {
+    let mut bare = fit.clone();
+    bare.sir_ess = None;
+    bare.sir_ci_theta = None;
+    bare.sir_ci_omega = None;
+    bare.sir_ci_sigma = None;
+    bare
+}
+
+impl Fitted {
+    fn sir(&self, fit: &FitResult, options: &FitOptions, what: &str) -> Vec<u64> {
+        let out = run_sir(fit, Some(&self.model), Some(&self.population), options)
+            .unwrap_or_else(|e| panic!("{what}: run_sir: {e}"));
+        sir_bits(&out, what)
+    }
+}
+
+fn with_sir(base: FitOptions) -> FitOptions {
+    FitOptions {
         sir: true,
         sir_samples: 200,
         sir_resamples: 100,
         sir_seed: Some(7),
-        ..quiet(EstimationMethod::Laplace)
-    };
-    let f = Fitted::new(&WARFARIN, &with, "run_sir");
-    let ess = f.fit.sir_ess.expect("in-fit SIR ran");
-    assert!(ess.is_finite(), "in-fit ESS {ess}");
+        ..base
+    }
+}
+
+/// #1806 T1 / T2: the in-fit SIR scores under the record of the stage that produced the
+/// estimates, so `sir_settings.scoring == scoring_settings`, and `run_sir` with default
+/// options repeats it bit for bit. The quadrature rows straddle the old behaviour: each
+/// premise asserts the stage ran at a different `inner_tol` from the top-level options, which
+/// is what the in-fit SIR scored at before #1806.
+///
+/// Mutations: build `sir_opts` from the top-level `options` again → every quadrature row's
+/// record equality dies (1e-5 or 1e-6 against 1e-8). Overlay the record with the value-based
+/// `with_scoring_record` instead of `ScoringSettings::overwrite` → only
+/// `laplace_explicit_tol` dies (the caller's non-default 1e-6 would win). `saem_focei` is the
+/// non-quadrature control: there the stage, SIR and top-level settings are equal before and
+/// after.
+fn sir_row(row: &str, options: FitOptions, quadrature: bool) {
+    let f = Fitted::new(&WARFARIN, &options, row);
     let stage = f.fit.scoring_settings.clone().expect("stage record");
+    if quadrature {
+        assert_ne!(
+            stage.inner_tol, options.inner_tol,
+            "{row}: premise — the quadrature stage must run at a tighter inner_tol than the \
+             top-level options"
+        );
+        assert_eq!(
+            stage.inner_tol, 1e-8,
+            "{row}: premise — the stage tolerance"
+        );
+    } else {
+        assert_eq!(
+            stage.inner_tol, options.inner_tol,
+            "{row}: control — no stage tightens on this chain"
+        );
+    }
     let sir = f.fit.sir_settings.clone().expect("SIR record");
-    assert_ne!(
-        stage.inner_tol, sir.scoring.inner_tol,
-        "premise: the stage and SIR records differ on this fixture"
+    assert_eq!(
+        sir.scoring, stage,
+        "{row}: the in-fit SIR must score under the producing stage's record"
     );
-    let rerun = |fit: &FitResult| {
-        let mut bare = fit.clone();
-        bare.sir_ess = None;
-        bare.sir_ci_theta = None;
-        run_sir(&bare, Some(&f.model), Some(&f.population), &defaults())
-            .expect("run_sir")
-            .sir_ess
-            .map(f64::to_bits)
+    let inline = sir_bits(&f.fit, row);
+    assert_eq!(
+        f.sir(&sir_cleared(&f.fit), &defaults(), row),
+        inline,
+        "{row}: run_sir with default options must repeat the in-fit SIR"
+    );
+}
+
+#[test]
+fn in_fit_sir_scores_under_the_stage_record_laplace() {
+    sir_row("laplace", with_sir(quiet(EstimationMethod::Laplace)), true);
+}
+
+#[test]
+fn in_fit_sir_scores_under_the_stage_record_focei_nagq3() {
+    sir_row(
+        "focei_nagq3",
+        with_sir(FitOptions {
+            n_agq: 3,
+            // The analytic AGQ covariance Hessian trips a debug-build symmetry assert
+            // (`agq_cov_hessian.rs`, `S_kl must be symmetric`) on this fit with or without
+            // SIR, measured at `d43afca9` (#1821); the FD stencil scores the same objective.
+            // Drop this pin once #1821 is fixed.
+            analytic_cov_hessian: false,
+            ..quiet(EstimationMethod::FoceI)
+        }),
+        true,
+    );
+}
+
+#[test]
+fn in_fit_sir_scores_under_the_stage_record_chain_focei_laplace() {
+    sir_row(
+        "chain_focei_laplace",
+        with_sir(FitOptions {
+            methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+            ..quiet(EstimationMethod::FoceI)
+        }),
+        true,
+    );
+}
+
+#[test]
+fn in_fit_sir_scores_under_the_stage_record_laplace_explicit_tol() {
+    sir_row(
+        "laplace_explicit_tol",
+        with_sir(FitOptions {
+            inner_tol: 1e-6,
+            ..quiet(EstimationMethod::Laplace)
+        }),
+        true,
+    );
+}
+
+#[test]
+fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
+    sir_row(
+        "saem_focei",
+        with_sir(FitOptions {
+            methods: vec![EstimationMethod::Saem, EstimationMethod::FoceI],
+            inner_tol: 1e-7,
+            saem_n_exploration: 2,
+            saem_n_convergence: 2,
+            ..quiet(EstimationMethod::Saem)
+        }),
+        false,
+    );
+}
+
+/// #1806 T3: `run_sir` on a fit with no SIR record takes the stage record, so, given the same
+/// SIR-only settings (draws, seed), it repeats the SIR the same fit would have run with
+/// `sir = true` (ferx-r#511). Each row's premise is the
+/// straddle: with the stage record cleared too, the same call scores at the defaults and
+/// lands on different bits. Mutation: drop the stage-record fallback in `resolve_sir_options`
+/// → every row's claim dies.
+fn no_sir_record_row(row: &str, fixture: Fixture, base: FitOptions) {
+    let sir_args = FitOptions {
+        sir_samples: 300,
+        sir_resamples: 100,
+        sir_seed: Some(1),
+        ..defaults()
     };
-    let mut stage_scored = f.fit.clone();
-    stage_scored.sir_settings.as_mut().unwrap().scoring = stage;
+    let twin_opts = FitOptions {
+        sir: true,
+        sir_samples: sir_args.sir_samples,
+        sir_resamples: sir_args.sir_resamples,
+        sir_seed: sir_args.sir_seed,
+        ..base.clone()
+    };
+    let twin = Fitted::new(&fixture, &twin_opts, row);
+    let f = Fitted::new(&fixture, &base, row);
+    assert!(f.fit.sir_settings.is_none(), "{row}: premise — no SIR ran");
+    let want = sir_bits(&twin.fit, row);
     assert_ne!(
-        rerun(&stage_scored),
-        Some(ess.to_bits()),
-        "premise: scoring the draws with the stage record must move the ESS"
+        f.sir(&f.unrecorded(), &sir_args, row),
+        want,
+        "{row}: premise — with neither record, run_sir must score elsewhere"
     );
     assert_eq!(
-        rerun(&f.fit),
-        Some(ess.to_bits()),
-        "run_sir with default options must repeat the in-fit SIR"
+        f.sir(&f.fit, &sir_args, row),
+        want,
+        "{row}: run_sir on a fit with no SIR record must score under the stage record"
+    );
+}
+
+#[test]
+fn run_sir_without_a_sir_record_takes_the_stage_record_inner_maxiter() {
+    no_sir_record_row(
+        "focei_inner_maxiter_5",
+        WARFARIN,
+        FitOptions {
+            inner_maxiter: 5,
+            ..quiet(EstimationMethod::FoceI)
+        },
+    );
+}
+
+#[test]
+fn run_sir_without_a_sir_record_takes_the_stage_record_laplace() {
+    no_sir_record_row("laplace", WARFARIN, quiet(EstimationMethod::Laplace));
+}
+
+#[test]
+fn run_sir_without_a_sir_record_takes_the_stage_record_ltbs() {
+    no_sir_record_row(
+        "ltbs",
+        Fixture("examples/warfarin_ltbs.ferx", "data/warfarin.csv"),
+        quiet(EstimationMethod::FoceI),
     );
 }

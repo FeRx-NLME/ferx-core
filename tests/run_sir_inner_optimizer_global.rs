@@ -73,10 +73,12 @@ fn run_sir_uses_the_recorded_inner_optimizer_not_the_last_fits() {
     };
     fit(model, pop, &prep.init_params, &bfgs).expect("bfgs fit");
 
-    // Premise: without the record, default options re-solve with a different
-    // inner solver and the ESS moves.
+    // Premise: without either record, default options re-solve with a different
+    // inner solver and the ESS moves. Both cleared: since #1806 a fit with no SIR
+    // record takes the stage record's settings.
     let mut no_record = sir_outputs_cleared(&fit_a);
     no_record.sir_settings = None;
+    no_record.scoring_settings = None;
     let draws_only = FitOptions {
         verbose: false,
         sir_samples: 200,

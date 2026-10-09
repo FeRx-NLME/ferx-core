@@ -2597,9 +2597,22 @@ fn fit_inner(
     // minimised — its method as well as its interaction flag (#1755) — through the same
     // builder `run_sir` uses on the fit, so the two cannot drift. `post_opts` alone keeps
     // the top-level `method`: on a chain `[focei, laplace]` that weighted the Laplace
-    // estimates with the FOCEI objective.
-    let sir_opts =
-        crate::estimation::fit_inputs::scoring_options(final_method, options.interaction, options);
+    // estimates with the FOCEI objective. Its inner-loop and ODE settings are the producing
+    // stage's record too, overwritten onto the top-level options (#1806): a quadrature stage
+    // ran at `inner_tol <= 1e-8`, and the draws are re-solved at what the objective was
+    // minimised at. So `sir_settings.scoring == scoring_settings` on every fit. One binding
+    // feeds both the SIR run and its non-PD fallback below. Always `Some`: `method_chain()` is
+    // never empty, a checkpoint resume requires `stage_idx < n_stages`, and every stage that
+    // runs writes `last_scoring` before it can exit.
+    let scoring_settings = estimating_scoring.or(last_scoring);
+    let sir_opts = crate::estimation::fit_inputs::scoring_options(
+        final_method,
+        options.interaction,
+        &scoring_settings
+            .as_ref()
+            .expect("every stage that runs records its scoring settings")
+            .overwrite(options),
+    );
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
             if options.verbose {
@@ -3011,7 +3024,7 @@ fn fit_inner(
         saem_seed: options.saem_seed,
         sir_seed: None,
         sir_settings: None,
-        scoring_settings: estimating_scoring.or(last_scoring),
+        scoring_settings,
         imp_seed: options.imp_seed,
         // Record the *resolved* NPDE seed (default included) so the diagnostic
         // is reproducible from the output; `None` when NPDE did not run.

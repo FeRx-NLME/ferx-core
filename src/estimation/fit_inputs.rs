@@ -744,6 +744,50 @@ impl ScoringSettings {
             ode_auto_switch: options.ode_auto_switch,
         }
     }
+
+    /// `options` with every scoring setting replaced by this record's, unconditionally:
+    /// the inverse of [`from_options`](Self::from_options), so
+    /// `from_options(&rec.overwrite(o)) == rec` for any `o`. `fit()` uses it to score
+    /// its in-fit SIR under the producing stage's settings (#1806). Unlike
+    /// [`with_scoring_record`], a caller's non-default value does not win: a Laplace fit
+    /// with an explicit `inner_tol = 1e-6` ran its stage at 1e-8, and that is what the
+    /// draws must be scored at.
+    ///
+    /// Destructured without `..`, like [`with_scoring_record`], so a field added to the
+    /// record and left out here does not compile.
+    pub(crate) fn overwrite(&self, options: &FitOptions) -> FitOptions {
+        let ScoringSettings {
+            inner_maxiter,
+            inner_tol,
+            inner_restarts,
+            mu_referencing,
+            n_agq,
+            inner_optimizer,
+            ebe_warm_start,
+            ode_reltol,
+            ode_abstol,
+            ode_max_steps,
+            ode_method,
+            ode_stiff_abort_after,
+            ode_auto_switch,
+        } = self.clone();
+        FitOptions {
+            inner_maxiter,
+            inner_tol,
+            inner_restarts,
+            mu_referencing,
+            n_agq,
+            inner_optimizer,
+            ebe_warm_start,
+            ode_reltol,
+            ode_abstol,
+            ode_max_steps,
+            ode_method,
+            ode_stiff_abort_after,
+            ode_auto_switch,
+            ..options.clone()
+        }
+    }
 }
 
 impl Default for ScoringSettings {
@@ -809,29 +853,47 @@ pub(crate) fn with_scoring_record(
     o
 }
 
-/// `options` resolved against the settings of the stage that produced `fit`'s estimates, for a
-/// post-hoc step that re-scores it at the fit's estimates ([`run_covariance`]): from
-/// [`FitResult::scoring_settings`], else from the SIR record's
-/// (`sir_settings.scoring`, a fit loaded from a `.fitrx` written between #1758 and
-/// #426), else `options` unchanged. See [`with_scoring_record`] for the convention.
+/// The post-hoc step asking [`scoring_record`] for the settings to re-score a fit under.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PostHocStep {
+    /// [`run_covariance`](crate::run_covariance): no record of its own; the inline
+    /// covariance step ran under the stage record.
+    Covariance,
+    /// [`run_sir`](crate::run_sir): its own record is `sir_settings.scoring`.
+    Sir,
+}
+
+/// The scoring record a post-hoc `step` re-scores `fit` under: the step's own record, then
+/// the other one, then `None` (#1806). One rule for both steps, parameterised by who asks.
 ///
-/// Which record each post-hoc step reads, and why they differ: `run_covariance` reads
-/// this one, stage record first, because the inline covariance step ran under the
-/// producing stage's options. `run_sir` reads `sir_settings.scoring` only, and never
-/// falls back to the stage record (`resolve_sir_options`), because the in-fit SIR
-/// scores with the fit's top-level options, and a quadrature stage tightens its own
-/// `inner_tol` (1e-8 against 1e-5). Do not unify the two while the in-fit SIR still
-/// scores with the top-level options: the stage record would not repeat the reported
-/// SIR (`tests/run_covariance_scoring_record.rs`,
-/// `run_sir_scores_with_the_sir_record_not_the_stage_record`).
+/// - `Covariance`: [`FitResult::scoring_settings`] (the stage that produced the estimates,
+///   which also ran the inline covariance step), else `sir_settings.scoring` (a `.fitrx`
+///   written between #1758 and #426, which carries only that one).
+/// - `Sir`: `sir_settings.scoring`, else `scoring_settings` (a fit made without
+///   `sir = true`). SIR's own record first, so `run_sir` with default options keeps
+///   repeating the SIR a fit reports even where the two records disagree. `fit()` writes
+///   them equal (it scores its SIR under the stage record), but a fit made between #426
+///   and #1806 with a quadrature last stage carries a 1e-5 SIR record next to a 1e-8 stage
+///   record, and a caller may edit either one.
+///
+/// A fit with neither record (written before #1758) yields `None`.
+pub(crate) fn scoring_record(fit: &FitResult, step: PostHocStep) -> Option<&ScoringSettings> {
+    let stage = fit.scoring_settings.as_ref();
+    let sir = fit.sir_settings.as_ref().map(|s| &s.scoring);
+    match step {
+        PostHocStep::Covariance => stage.or(sir),
+        PostHocStep::Sir => sir.or(stage),
+    }
+}
+
+/// `options` resolved for [`run_covariance`] against [`scoring_record`]`(fit, Covariance)`:
+/// the stage record, else the SIR record, else `options` unchanged. See
+/// [`with_scoring_record`] for the convention. `run_sir` resolves through the same
+/// [`scoring_record`], with its own record first.
 ///
 /// [`run_covariance`]: crate::run_covariance
 pub(crate) fn resolve_scoring_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
-    let rec = fit
-        .scoring_settings
-        .as_ref()
-        .or(fit.sir_settings.as_ref().map(|s| &s.scoring));
-    with_scoring_record(rec, options)
+    with_scoring_record(scoring_record(fit, PostHocStep::Covariance), options)
 }
 
 #[cfg(test)]
