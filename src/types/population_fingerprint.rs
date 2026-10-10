@@ -326,8 +326,8 @@ impl PopulationFingerprint {
 
 /// The first difference between two subject-ID lists: the count, then the first
 /// position whose IDs differ. Shared by the fingerprint and by `check_subjects`'
-/// fallback on `fit.subjects` (a fit with no current fingerprint), so both name a
-/// subject-list mismatch the same way.
+/// `fit.subjects` leg, which runs whenever `fit.subjects` is filled (#1868 r1 #1),
+/// so both name a subject-list mismatch the same way.
 pub(crate) fn subject_list_difference<'a>(
     population: impl ExactSizeIterator<Item = &'a str>,
     fit: impl ExactSizeIterator<Item = &'a str>,
