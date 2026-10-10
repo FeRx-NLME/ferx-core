@@ -116,31 +116,81 @@ fn read_model_file(
     Ok((src.parsed, src.text))
 }
 
-/// Refuse a population that is not the fit's subjects in the fit's order, before
+/// Refuse a population whose subjects are not the fit's, in the fit's order, before
 /// any binding: such a population hears that it is not the fit's, not a level
-/// refusal worded for a simulation design (#1680 r1 #7). The subject list is the
-/// current fingerprint's when the fit carries one, else `fit.subjects` (a fit
-/// saved before #1685, or a fingerprint of another scheme); a fit with neither
-/// accepts any. Either way the refusal is [`population_mismatch`]'s text and code
-/// (#1813), without its pre-emption, since nothing is bound yet.
+/// refusal worded for a simulation design (#1680 r1 #7).
+///
+/// Two lists, two questions, so not one gate twice (#1868 r1 #1):
+///
+/// - the current fingerprint's: is this the population the fit was given? A
+///   mismatch is [`mismatch_refusal`]'s `E_POPULATION_MISMATCH`.
+/// - `fit.subjects`, when filled: do the fit's per-subject results, which the step
+///   reads by position (`run_sir`'s η̂ warm starts), line up with it? On a fit with
+///   a matching fingerprint the population *is* the fit's, so a mismatch here is
+///   the fit's rows, `E_FIT_SUBJECTS_MISMATCH` ([`fit_subjects_refusal`]). The two
+///   lists come from one `fit()`, but a front end can rebuild them from separate
+///   fields (ferx-r's fit skeleton), and then they can disagree. Without a current
+///   fingerprint (a fit saved before #1685, or another scheme) nothing says which
+///   side is wrong, so the mismatch is the population's.
+///
+/// A fit with neither accepts any population. No pre-emption: nothing is bound yet.
 fn check_subjects(
     fit: &FitResult,
     fingerprint: Option<&PopulationFingerprint>,
     population: &Population,
     source: PopulationSource,
 ) -> Result<(), EngineError> {
-    let d = match fingerprint {
-        Some(fp) => fp.first_subject_difference(population),
-        None if fit.subjects.is_empty() => None,
-        None => subject_list_difference(
-            population.subjects.iter().map(|s| s.id.as_str()),
-            fit.subjects.iter().map(|s| s.id.as_str()),
-        ),
-    };
-    match d {
-        Some(d) => Err(mismatch_refusal(&d, source)),
-        None => Ok(()),
+    if let Some(d) = fingerprint.and_then(|fp| fp.first_subject_difference(population)) {
+        return Err(mismatch_refusal(&d, source));
     }
+    if fit.subjects.is_empty() {
+        return Ok(());
+    }
+    let rows = subject_list_difference(
+        population.subjects.iter().map(|s| s.id.as_str()),
+        fit.subjects.iter().map(|s| s.id.as_str()),
+    );
+    match (rows, fingerprint) {
+        (None, _) => Ok(()),
+        (Some(d), Some(_)) => Err(fit_subjects_refusal(&d)),
+        (Some(d), None) => Err(mismatch_refusal(&d, source)),
+    }
+}
+
+/// The remedy for `E_FIT_SUBJECTS_MISMATCH`: the population is right, the fit's
+/// per-subject results are not.
+pub(crate) const FIT_SUBJECTS_MISMATCH_SUGGESTION: &str =
+    "pass the fit's subject results as the fit returned them, or refit";
+
+/// `E_FIT_SUBJECTS_MISMATCH` (#1868 r1 #1): the population matched the fit's
+/// fingerprint, but the fit's per-subject results (`fit.subjects`) are another count
+/// or another order. `d` compares the population (`population`) against
+/// `fit.subjects` (`fit`).
+fn fit_subjects_refusal(d: &PopulationDifference) -> EngineError {
+    let what = match d {
+        PopulationDifference::SubjectCount { population, fit } => {
+            format!("the fit has results for {fit} subjects, its population has {population}")
+        }
+        PopulationDifference::SubjectId {
+            position,
+            population,
+            fit,
+        } => format!(
+            "the fit's subject {} is `{fit}`, its population's is `{population}`",
+            position + 1
+        ),
+        _ => unreachable!("a subject-list difference"),
+    };
+    EngineError::with_suggestion_in_display(
+        crate::diagnostics::Diagnostic::error(
+            "E_FIT_SUBJECTS_MISMATCH",
+            format!(
+                "the fit's per-subject results do not line up with the population it was \
+                 given: {what}."
+            ),
+        )
+        .with_suggestion(FIT_SUBJECTS_MISMATCH_SUGGESTION),
+    )
 }
 
 /// The checks after the subject list and the binding, in order: every categorical
@@ -636,11 +686,18 @@ fn population_mismatch(
 /// [`POPULATION_MISMATCH_SUGGESTION`], in `suggestion()` and folded into `Display`.
 fn mismatch_refusal(d: &PopulationDifference, source: PopulationSource) -> EngineError {
     let mut msg = format!("this population is not the one the fit was given: {d}.");
-    if let PopulationDifference::Doses { .. } = d {
-        msg.push_str(
+    // A filter only removes rows, so it can explain another dose count but not an
+    // edited dose under the same count (#1868 r1 #3).
+    match d {
+        PopulationDifference::Doses {
+            population, fit, ..
+        } if population != fit => msg.push_str(
             " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose record \
              changes the doses without changing any observation.",
-        );
+        ),
+        PopulationDifference::Doses { .. } => msg
+            .push_str(" An edited dose record changes the doses without changing any observation."),
+        _ => {}
     }
     let data_hash = match source {
         PopulationSource::Supplied | PopulationSource::Verify => None,

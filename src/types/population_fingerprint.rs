@@ -306,6 +306,12 @@ impl PopulationFingerprint {
     /// reader or a binder rather than another population. The error names no
     /// entry point: the caller does.
     ///
+    /// It compares the population only. `run_sir` and `run_covariance` also check
+    /// that the fit's per-subject results (`fit.subjects`), which they read by
+    /// position, are in the population's order (`E_FIT_SUBJECTS_MISMATCH`); a caller
+    /// that reads per-subject results such as η̂ by position checks that order
+    /// itself.
+    ///
     /// `Ok` carries notes. A fingerprint made with another ferx version's encoding
     /// cannot be compared, so nothing is checked and the one note says so; on a
     /// match the notes are empty.

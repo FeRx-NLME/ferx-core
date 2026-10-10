@@ -29,6 +29,9 @@ const UNHASHED: &str = " The fit records no SHA-256 of the file, so it may have 
                         the fit.";
 const DOSE_CAUSE: &str = " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose \
                           record changes the doses without changing any observation.";
+// #1868 r1 #3: under an unchanged dose count a filter is not a possible cause.
+const DOSE_EDIT: &str = " An edited dose record changes the doses without changing any \
+                         observation.";
 const LEAD: &str = "this population is not the one the fit was given: ";
 const FIX: &str = "use the population the fit was given, or refit";
 
@@ -1857,7 +1860,7 @@ fn every_mismatch_cell_is_coded_by_every_entry() {
             &edited_dose,
             format!(
                 "the doses of subject `1` differ with the same 1 dose: a dose time, amount, \
-                 compartment, rate, duration, `SS`, `II` or infusion coding.{DOSE_CAUSE}"
+                 compartment, rate, duration, `SS`, `II` or infusion coding.{DOSE_EDIT}"
             ),
         ),
         (
@@ -2022,6 +2025,107 @@ fn a_re_read_names_only_what_it_did() {
             assert!(!err.contains(never), "{cell}: says {never}: {err}");
         }
     }
+}
+
+/// #1868 r1 #1: the fingerprint says whether the population is the fit's;
+/// `fit.subjects` is what the step reads **by position** (`run_sir`'s η̂ warm starts).
+/// A front end that rebuilds the two from separate fields (ferx-r's fit skeleton)
+/// can hand a matching fingerprint with `fit.subjects` rotated or short. Both legs
+/// are read: the fitted population with a current fingerprint and those
+/// `fit.subjects` is refused as `E_FIT_SUBJECTS_MISMATCH`, which says the fit's rows
+/// are out of line, not that the population is wrong. Before the fix the rotated
+/// cell ran with every subject warm-starting from its neighbour's η̂ (`Ok`), and the
+/// short cell panicked in the inner loop (index 29 of 29), #1680's panic.
+///
+/// The straddle, in the same test: without a fingerprint nothing says which list
+/// is wrong, so the same rotated `fit.subjects` blames the population
+/// (`E_POPULATION_MISMATCH`). And `verify`, which has no `fit.subjects`, passes the
+/// fitted population: a caller reading η̂ by position checks its own row order.
+///
+/// Mutations — read only the fingerprint when it is current (the round-1 head):
+/// rotated `Ok`, short panics; blame the population on both legs: the code and
+/// message assertions die; delete the suggestion: its assertion dies.
+#[test]
+fn the_fits_subject_rows_must_line_up_with_its_population() {
+    let c = super::test_fixtures::sir_case(Kind::Plain);
+    let model = &c.prep.parsed.model;
+    let fitted = &c.prep.population;
+    assert!(c.fit.population_fingerprint.as_ref().unwrap().is_current());
+    assert_eq!(fitted.subjects[0].id, "1");
+
+    let mut rotated = c.fit.clone();
+    rotated.subjects.rotate_left(1);
+    let mut short = c.fit.clone();
+    short.subjects.pop();
+    // `short` through `run_sir` first: it is the cell that panicked.
+    let cells: [(&str, &FitResult, &str); 2] = [
+        (
+            "short",
+            &short,
+            "the fit has results for 29 subjects, its population has 30",
+        ),
+        (
+            "rotated",
+            &rotated,
+            "the fit's subject 1 is `2`, its population's is `1`",
+        ),
+    ];
+    for (cell, fit, what) in cells {
+        for entry in ["run_sir", "run_covariance"] {
+            let r = match entry {
+                "run_covariance" => run_covariance(fit, Some(model), Some(fitted), &c.opts),
+                _ => run_sir(fit, Some(model), Some(fitted), &c.opts),
+            };
+            let e = r.map(|_| ()).expect_err("refused");
+            let at = format!("{cell}, {entry}");
+            assert_eq!(e.code(), Some("E_FIT_SUBJECTS_MISMATCH"), "{at}: {e}");
+            assert_eq!(
+                e.message(),
+                format!(
+                    "the fit's per-subject results do not line up with the population it \
+                     was given: {what}."
+                ),
+                "{at}"
+            );
+            assert_eq!(
+                e.suggestion(),
+                Some(FIT_SUBJECTS_MISMATCH_SUGGESTION),
+                "{at}"
+            );
+            assert_eq!(e.context(), Some(entry), "{at}");
+        }
+    }
+    let e = run_sir(&rotated, Some(model), Some(fitted), &c.opts)
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(
+        e.to_string(),
+        "run_sir: the fit's per-subject results do not line up with the population it was \
+         given: the fit's subject 1 is `2`, its population's is `1`. Pass the fit's subject \
+         results as the fit returned them, or refit."
+    );
+
+    // The straddle: no fingerprint, so the population is the one blamed.
+    let mut unprinted = rotated.clone();
+    unprinted.population_fingerprint = None;
+    let e = run_covariance(&unprinted, Some(model), Some(fitted), &c.opts)
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{e}");
+    assert_eq!(
+        e.message(),
+        mismatch("its subject 1 is `1`, the fit's is `2`.", SUPPLIED)
+    );
+    // `verify` compares the population only.
+    assert_eq!(
+        c.fit
+            .population_fingerprint
+            .as_ref()
+            .unwrap()
+            .verify(model, fitted)
+            .unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 /// #1814 T3: `verify` on a fingerprint of another scheme compares nothing and says
