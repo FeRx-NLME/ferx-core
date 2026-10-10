@@ -6672,6 +6672,55 @@ fn adaptive_base_dose_after_zero_is_the_origin() {
 }
 
 #[test]
+fn adaptive_static_pk_only_record_is_the_origin() {
+    // #1809. Since the reader keeps the time of an EVID=2 or EVID=0/MDV=1 row on a
+    // constant-covariate subject, a static subject can carry `pk_only_times` with no
+    // snapshots, and its first record can be one of them. Here that record is at 2,
+    // ahead of the first obs at 6, so the base record starts at 2 and the read at 6 is
+    // `50·e^{-0.4}`.
+    //
+    // This pins the shape through every engine the adaptive run uses: the reactive driver
+    // (`t_base0`), the constant-path verifier `ode_predictions_with_extra_breaks` (with
+    // `verify: true`, which must agree bit for bit; it seeds at the same
+    // `subject_integration_start` but, unlike the TV replay, takes no pk-only breaks), and
+    // `predict()`. Mutation that reddens it: drop `pk_only_times` from
+    // `subject_integration_start`, which holds the baseline until 6 (`50` at the first read).
+    let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
+    let decisions = [12.0];
+    let obs = [6.0, 20.0, 40.0];
+    let with_record = |mut s: Subject| -> Subject {
+        s.pk_only_times = vec![2.0];
+        s
+    };
+    let base = with_record(subj("1", obs.to_vec(), vec![]));
+    assert!(
+        !base.has_tv_covariates() && base.pk_only_covariates.is_empty(),
+        "the subject must take the constant path, with the record's time and no snapshot"
+    );
+    let pop = population(vec![base]);
+
+    let (driver, _) = origin_run(&pop, &model, &decisions, vec![0], false).expect("driver");
+    let closed = origin_closed_form(50.0, 2.0, &[12.0], &obs);
+    assert_rel(&driver, &closed, 1e-10, "driver vs closed form");
+
+    let (checked, _) =
+        origin_run(&pop, &model, &decisions, vec![0], true).expect("the verifier agrees");
+    assert_eq!(
+        checked, driver,
+        "verify: true must not change the trajectory"
+    );
+    let static_pred = origin_static(
+        &model,
+        with_record(subj(
+            "1",
+            obs.to_vec(),
+            vec![DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+        )),
+    );
+    assert_rel(&driver, &static_pred, 1e-10, "driver vs predict()");
+}
+
+#[test]
 fn adaptive_tv_origin_matches_predict_and_the_verifier_sees_it() {
     // T5 (#936), cell TV-A. Cell A's shape on `ODE_TV_INIT`: `init = 10·CRCL`, the first
     // record carries CRCL 8 (init 80), later ones 5. This routes the verifier to

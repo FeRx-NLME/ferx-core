@@ -966,16 +966,19 @@ pub struct Subject {
     /// Per-observation covariate snapshot (LOCF), parallel to `obs_times`.
     /// Same fallback semantics as `dose_covariates`.
     pub obs_covariates: Vec<HashMap<String, f64>>,
-    /// Times of EVID=2 "other event" rows (typically covariate-change
-    /// markers). Only populated when the subject has time-varying
-    /// covariates — for time-constant covariates these rows are no-ops
-    /// (NONMEM-equivalent: $PK runs but with the same values).
-    /// The event-driven propagators see them as a third event kind that
-    /// does not mutate compartment amounts but does refresh the
+    /// Times of the non-dose records that are not scored: EVID=2 "other event"
+    /// rows (typically covariate-change markers) and EVID=0/MDV=1 rows. Kept
+    /// for every subject, time-varying covariates or not: a record is where
+    /// NONMEM starts the system when it precedes the first dose and
+    /// observation, and `subject_integration_start` reads it from here
+    /// (#1809). The event-driven propagators see them as a third event kind
+    /// that does not mutate compartment amounts but does refresh the
     /// piecewise-constant rate matrix from the row's covariate values.
     pub pk_only_times: Vec<f64>,
-    /// Per-EVID-2 covariate snapshot (LOCF), parallel to `pk_only_times`.
-    /// Empty when no TV covariates.
+    /// Per-pk-only-record covariate snapshot (LOCF), parallel to
+    /// `pk_only_times`. Empty when no TV covariates (NONMEM-equivalent: `$PK`
+    /// runs at the record but with the same values), and then
+    /// [`Subject::pk_only_cov`] falls back to the subject-static map.
     pub pk_only_covariates: Vec<HashMap<String, f64>>,
     /// Times of system-reset events (NONMEM EVID=3 "reset" and EVID=4
     /// "reset + dose"). At each of these times every compartment amount is
@@ -1281,9 +1284,10 @@ impl Subject {
         }
     }
 
-    /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
-    /// the others — for time-constant covariates this returns the
-    /// subject-static map.
+    /// Covariate snapshot at pk-only record index `m` (an EVID=2 or
+    /// EVID=0/MDV=1 row). Same fallback as the others — for time-constant
+    /// covariates this returns the subject-static map, and since #1809 such a
+    /// subject routinely carries `pk_only_times` with no snapshots.
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
         self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }

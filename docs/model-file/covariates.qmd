@@ -132,7 +132,13 @@ So when a reset restarts the episode, a covariate-driven `init(state) = <expr>` 
 evaluated with **that row's own covariate values** — not the preceding record's, and
 not the next record's (since #1133). The same rule governs every other boundary: a
 segment is parameterised by the record that *terminates* it, and a lagged arrival, an
-infusion end or a zero-order cutoff is not a record at all.
+infusion end or a zero-order cutoff is not a record at all. When several records share
+the segment's end `TIME`, the one that terminates it is the **first in file order**, as
+in NONMEM; the later ones advance by zero. So an observation listed before a co-timed
+`EVID=2` row is advanced under the observation's covariates, and an `EVID=2` row listed
+before a co-timed dose under the `EVID=2` row's
+([#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810); see
+[Record order at a shared `TIME`](../data-format.qmd#record-order-at-a-shared-time-pre-dose-troughs)).
 
 Concretely, for `init(central) = 10*WT` with `WT` stepping 70 → 140 at the reset row,
 the compartment restarts at `1400`, not `700`. The same holds for the row's `OCC` under an

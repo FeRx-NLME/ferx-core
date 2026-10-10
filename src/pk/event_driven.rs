@@ -167,6 +167,10 @@ pub struct EventSchedule {
     /// by nudging a pre-dose observation one ULP below the coincident dose time
     /// (see `io::datareader::parse_subject`), so by the time events reach this
     /// sort the obs already carries a strictly-earlier time and orders correctly.
+    /// The same nudge moves the first record of a tie that carries a pk-only row
+    /// (an observation before it, or it before a dose) below the tie, so the record
+    /// NONMEM advances into the shared time with is the one this sort reaches
+    /// first (#1810).
     ///
     /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
     /// so the schedule already reflects per-dose lagtime.

@@ -18,7 +18,15 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > **`TIME` need not start at zero.** A subject's `TIME` column may begin at any
 > value (e.g. a calendar/clock time). Integration starts at each subject's first
 > record — matching NONMEM — so an off-zero start is **not** integrated over a
-> phantom `[0, first record]` window. `TIME` is used exactly as written
+> phantom `[0, first record]` window. A record is any row the reader keeps: a
+> dose, a scored observation, a reset, an `EVID=2` row, or an `EVID=0` row with
+> `MDV=1`. So on an `[odes]` model whose state moves before the first observation
+> (a production term, `TIME` in the right-hand side, an `init()` that is not an
+> equilibrium), a leading covariate-marker row is where the clock starts. Before
+> [#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) such a row was
+> dropped on a subject whose covariates were all constant, and an `MDV=1` row on
+> every subject, and integration started at the first observation or dose. A row
+> skipped for a missing `DV` (`W_MISSING_DV`, below) is not a record. `TIME` is used exactly as written
 > everywhere it is visible: the model `TIME`/`T` builtin, `[derived]` columns,
 > the survival left-truncation `TENTRY`, and the sdtab / `predict()` /
 > `simulate()` output. ferx does not re-base `TIME` onto a per-subject elapsed
@@ -33,7 +41,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed). A float-formatted integer (`2.0`, as pandas writes a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose's compartment or an observation's readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
 | `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate via an `R{cmt}` `$PK` parameter) and `-2` (modeled duration via a `D{cmt}` `$PK` parameter) are supported on both analytical and ODE models — see [Infusion Doses](#infusion-doses). |
-| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
+| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood). A non-dose `MDV=1` row is still a record, read like an `EVID=2` row: it can start the integration, and its covariate values govern the interval that ends at it, as in NONMEM. |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
 | `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.qmd). Any other whole number is read by its sign and warned about; a cell that is not a whole number (`abc`) is an error — see [out-of-domain values](model-file/bloq.qmd#out-of-domain-values). |
@@ -255,7 +263,7 @@ A `[data_selection]` clause that compares `CMT` is the third thing the column ad
 |------|---------|
 | 0 | Observation record. `DV` is used for estimation. |
 | 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
-| 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops). |
+| 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. It is a record on every subject, time-varying covariates or not: the first one can be where the integration starts (see [`TIME` need not start at zero](#required-columns)). An `EVID=0` row with `MDV=1` is read the same way. |
 | 3 | System reset. All compartment amounts are set to zero at this time, and any ongoing infusion is turned off. No dose is given and `DV` is ignored. |
 | 4 | Reset and dose. Like EVID=3 (zero every compartment, stop ongoing infusions) followed immediately by a dose of `AMT` into compartment `CMT`. |
 
@@ -310,6 +318,30 @@ NONMEM `METHOD=1 INTER` fit once record order is honored:
 translation omits, not a structural difference.) Scoring the same model at the
 NONMEM estimates **without** record-order handling gave OFV 3751 — every trough
 mispredicted as a post-dose peak.
+
+### Covariate-change rows at a shared `TIME`
+
+An `EVID=2` row (or an `EVID=0, MDV=1` row) at the same `TIME` as an observation
+or a dose follows the same file-order rule. NONMEM advances the system into a
+shared `TIME` once, at the first record there in file order and under that record's
+covariates, and every later record there advances by zero. So with exposure `X`
+changing at `TIME 4`:
+
+```csv
+ID,TIME,DV,EVID,AMT,MDV,X
+1,4,5.2,0,.,0,1     # observation first: the interval ending at 4 runs on X = 1
+1,4,.,2,.,1,2       # covariate change, takes effect after the observation
+```
+
+Listed the other way round, the interval runs on `X = 2`. The same goes for an
+`EVID=2` row listed before a co-timed dose: the interval runs on the `EVID=2` row's
+covariates, not the dose row's. In each case the observation reads its own
+covariates in the readout, so only the state at the tie depends on the order.
+Before [#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810) ferx ran that
+interval on the `EVID=2` row in the first case and on the dose row in the second,
+whatever the file said. Ties that carry an `SS=1` dose or a reset are unaffected:
+both replace the state at the tie. Measured against NONMEM 7.6.0 on #1810's seven
+tie cases, on an `[odes]` model and on `ADVAN1`.
 
 ## System Resets (EVID=3 / EVID=4)
 

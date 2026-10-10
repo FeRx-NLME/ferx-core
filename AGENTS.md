@@ -261,7 +261,8 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > to how a hazard time **at or before the subject's first record** is scored (#1223) has no
 > equivalent run to anchor against — the quantity is defined by where ferx starts integrating,
 > which is the very thing NONMEM spells differently (it integrates from the first record of any
-> `EVID`; ferx from the first dose or scored observation). Validate these with: (a) an **exact
+> `EVID`; ferx did so only from the first dose or scored observation until #1809, and still does
+> for a row dropped under `W_MISSING_DV`). Validate these with: (a) an **exact
 > hand-computed value** rather than a second engine — before the first event nothing has acted on
 > the system, so `H = 0` and `h = h(u₀)` are closed forms, not tolerances; (b) **agreement across
 > every production caller** of the quantity (the #570 shared solve, `ode_cumhaz_hazard`, and

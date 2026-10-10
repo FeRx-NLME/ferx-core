@@ -2743,7 +2743,14 @@ pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> boo
 
 /// True when the analytical PK predictor must produce a value for this subject —
 /// it carries at least one Gaussian observation (an obs whose CMT is **not** a
-/// registered non-Gaussian endpoint) or a pk-only prediction time.
+/// registered non-Gaussian endpoint).
+///
+/// A pk-only record (`pk_only_times`: an EVID=2 or EVID=0/MDV=1 row) does not
+/// count. The predictor returns one value per Gaussian observation and none at a
+/// pk-only time, and the list below has no consumer that reads one. Since #1809 the
+/// reader keeps those times on every subject, constant covariates included, so
+/// counting them would re-enable the dose-compartment check for a pure-TTE
+/// population whose records carry, say, a covariate-marker row.
 ///
 /// When this is `false` on an analytical (`ode_spec.is_none()`) model, nothing
 /// consumes the predictor's concentration-time output, so the event-driven walk
@@ -2774,11 +2781,10 @@ pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subje
         if model.endpoints.is_empty() {
             return true;
         }
-        !subject.pk_only_times.is_empty()
-            || subject
-                .obs_cmts
-                .iter()
-                .any(|cmt| !model.endpoints.contains_key(cmt))
+        subject
+            .obs_cmts
+            .iter()
+            .any(|cmt| !model.endpoints.contains_key(cmt))
     }
     #[cfg(not(feature = "survival"))]
     {
