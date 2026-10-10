@@ -879,3 +879,30 @@ fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
         .expect("run_sir on the reloaded mixture fit must run");
     assert_sir_identical(&s, &r, "run_sir on reloaded vs in-fit (mixture override)");
 }
+
+/// #1815 review r1 #2: VI's packed vector is always `Stale` (its stored Ω is 1 ULP off
+/// the unpack, #1847), so an in-memory VI fit of an override model would be refused with
+/// the Stale message. That cannot happen: `fit()` refuses VI on any `[mixture]` model
+/// before a stage runs. Pinned so the disposition stays true if VI is ever wired for
+/// mixtures — this row then fails and says to re-check the Stale message for VI.
+#[test]
+fn vi_never_reaches_a_mixture_override_fit() {
+    let model = ferx_core::parse_model_string(MIX_OVERRIDE).expect("mixture model must parse");
+    let pop = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("mixture data must load");
+    let opts = FitOptions {
+        method: EstimationMethod::Vi,
+        ..sir_defaults()
+    };
+    let e = fit(&model, &pop, &model.default_params, &opts)
+        .map(|_| ())
+        .expect_err("VI on a [mixture] model must be refused up front");
+    assert!(
+        e.to_string().contains("is not yet wired for mixtures"),
+        "VI x [mixture] must be the up-front method refusal: {e}"
+    );
+}
