@@ -1299,7 +1299,20 @@ enum How<'a> {
     Route(&'a EtaRoute),
     /// No site the walk can name, but the span certificate measured the random
     /// effect's effect on `y` inside the block's, unit by unit (#1834).
-    Measured,
+    Measured(Span),
+}
+
+/// What the span certificate measured for one random effect (#1834): in every
+/// unit, its effect on `y` is a combination of the block's level effects there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    /// Some combination: a contrast that leaves each group's mean free absorbs
+    /// it, and `sum_to_zero_within` may not.
+    Levels,
+    /// A combination that sums to zero within each `sum_to_zero_within` group,
+    /// on a nested block: the within-group contrast absorbs it too, so it is
+    /// absorbed under every contrast (#1874 review, F1).
+    Within,
 }
 
 impl Absorbed<'_> {
@@ -1322,11 +1335,16 @@ impl Absorbed<'_> {
                 };
                 format!("the random effect `{}` reaches `y` {how}", self.name())
             }
-            How::Measured => format!(
-                "the random effect `{}` moves `y` in proportion to this block at every record of \
-                 each {} (measured at the initial estimates and at a point near them)",
+            How::Measured(span) => format!(
+                "the random effect `{}` moves `y`, at every record of each {}, exactly as some \
+                 combination of this block's levels does{} (measured at the initial estimates and \
+                 at a point near them)",
                 self.name(),
                 if self.kappa() { "occasion" } else { "subject" },
+                match span {
+                    Span::Levels => "",
+                    Span::Within => ", one that sums to zero within each group",
+                },
             ),
         }
     }
@@ -1382,7 +1400,7 @@ fn structural_site<'a>(
 fn absorbed<'a>(
     decl: &'a LevelBlockDecl,
     population: &Population,
-    spanned: &[bool],
+    spanned: &[Option<Span>],
 ) -> Vec<Absorbed<'a>> {
     let units = nesting_units(decl, population);
     let resolving = resolves_observations(decl, population);
@@ -1391,13 +1409,8 @@ fn absorbed<'a>(
         .enumerate()
         .filter_map(|(k, c)| {
             let unit = units[k]?;
-            let how = structural_site(c, population, unit, resolving).or_else(|| {
-                spanned
-                    .get(k)
-                    .copied()
-                    .unwrap_or(false)
-                    .then_some(How::Measured)
-            })?;
+            let how = structural_site(c, population, unit, resolving)
+                .or_else(|| spanned.get(k).copied().flatten().map(How::Measured))?;
             let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
             Some(Absorbed {
                 coupling: c,
@@ -1456,8 +1469,13 @@ fn record_values(
         Some(r) => kappa[r - model.n_eta] += RE_STEP,
         None => {}
     }
-    let groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    values_at(model, subject, theta, &eta, &vec![kappa; groups.max(1)])
+    let groups = match model.n_kappa {
+        0 => 1,
+        _ => crate::stats::likelihood::iov_occasion_groups(subject)
+            .len()
+            .max(1),
+    };
+    values_at(model, subject, theta, &eta, &vec![kappa; groups])
 }
 
 /// [`record_values`] at explicit random effects: `eta`, and `kappa` per
@@ -1710,11 +1728,13 @@ fn dead_levels(
 }
 
 /// Under this relative residual a unit's random-effect column lies in its
-/// levels' span (#1834). Measured over every unit of the `absorption` tests
-/// (macOS arm64 debug, this module's own differences): absorbed units reach at
-/// most 2.3e-11, identified ones at least 9.0e-3 (#1848's Q1, a parameter read
-/// before it is overwritten); R11, the closest identified #1834 twin, 3.7e-2.
-/// The constant sits 4.6 decades above the one and 3.9 below the other.
+/// levels' span (#1834). Measured over every unit of the `absorption` tests,
+/// this module's own differences, on Linux aarch64 (`tools/linux-test.sh`,
+/// `--profile ci-test`) and macOS arm64 debug alike to the digits printed:
+/// absorbed units reach at most 2.9e-11 (#1874 review F1's `ETA_E0 * (OCC -
+/// 2)`), identified ones at least 9.0e-3 (#1848's Q1, a parameter read before it
+/// is overwritten); R11, the closest identified #1834 twin, 3.7e-2. The constant
+/// sits 4.5 decades above the one and 3.9 below the other.
 const SPAN_TOL: f64 = 1e-6;
 
 /// The central-difference step of the span certificate: on a random effect,
@@ -1786,44 +1806,60 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// residual of the random effect's column against the columns of the levels on
 /// the unit's records, by central differences of the predictions
 /// (`record_diffs` says why not the residual multipliers), at both
-/// [`probe_points`]. One point is not enough: at η = 0 an `ETA * ETA * OCC`
-/// term has derivative 0 and looks proportional. A unit
-/// whose column is zero measures nothing; a random effect counts as absorbed
-/// only when some unit measured it at each point and every unit's residual is
-/// under [`SPAN_TOL`]. Anything non-finite fails the tolerance, so an
-/// inconclusive point binds, never refuses.
+/// [`probe_points`], with the random effects spread by [`probe_res`]. One
+/// point is not enough: at η = 0 an `ETA * ETA * OCC` term has derivative 0
+/// and looks proportional. A unit whose column is zero measures nothing; a
+/// random effect counts as absorbed only when some unit measured it at each
+/// point and every unit's residual is under [`SPAN_TOL`]. Anything non-finite
+/// fails the tolerance, so an inconclusive point binds, never refuses.
+///
+/// On a nested block a second residual decides whether `sum_to_zero_within`
+/// rescues it (#1874 review, F1): against the differences of the unit's level
+/// columns inside each within-group, the directions that contrast leaves free.
+/// A random effect inside those is [`Span::Within`], absorbed under every
+/// contrast; one only inside the full span is [`Span::Levels`].
 fn spanned(
     model: &CompiledModel,
     decl: &LevelBlockDecl,
     levels: &[Level],
     population: &Population,
     silent: &[(usize, Unit)],
-) -> Vec<bool> {
-    let mut out = vec![false; decl.eta_couplings.len()];
+) -> Vec<Option<Span>> {
+    let mut out = vec![None; decl.eta_couplings.len()];
     if silent.is_empty() {
         return out;
     }
     let p = &model.default_params;
     let column = level_index_column(decl.name());
-    // Per level index (1-based, as written to the data): its free θ.
-    let level_theta: HashMap<u64, usize> = levels
+    // Per level index (1-based, as written to the data): its free θ and its
+    // within-group.
+    let groups = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
+    let level_theta: HashMap<u64, (usize, usize)> = levels
         .iter()
         .enumerate()
         .filter_map(|(i, level)| {
             let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
             let k = model.theta_names.iter().position(|n| *n == name)?;
             let fixed = p.theta_fixed.get(k).copied().unwrap_or(false);
-            (!fixed).then_some((((i + 1) as f64).to_bits(), k))
+            (!fixed).then_some((((i + 1) as f64).to_bits(), (k, groups[i])))
         })
         .collect();
+    let nested = decl.columns().len() >= 2;
+    // Per silent random effect: in the levels' span, and in the within span.
     let mut holds: Vec<bool> = vec![true; silent.len()];
+    let mut within: Vec<bool> = vec![nested; silent.len()];
     for (theta, re) in probe_points(model) {
+        if holds.iter().all(|h| !h) {
+            break;
+        }
         let mut measured = vec![false; silent.len()];
         for subject in &population.subjects {
-            let groups = crate::stats::likelihood::iov_occasion_groups(subject);
-            let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&groups);
-            let eta = vec![re; model.n_eta];
-            let kappa = vec![vec![re; model.n_kappa]; groups.len().max(1)];
+            if holds.iter().all(|h| !h) {
+                break;
+            }
+            let occasion_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+            let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occasion_groups);
+            let (eta, kappa) = probe_res(re, model, occasion_groups.len().max(1));
             let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| {
                 predictions_at(model, subject, th, et, ka)
             };
@@ -1840,7 +1876,7 @@ fn spanned(
             let mut level_cols: HashMap<u64, Option<Vec<f64>>> = HashMap::new();
             for j in 0..n_obs {
                 let Some(index) = level_of(j) else { continue };
-                let Some(&k) = level_theta.get(&index) else {
+                let Some(&(k, _)) = level_theta.get(&index) else {
                     continue;
                 };
                 level_cols.entry(index).or_insert_with(|| {
@@ -1892,20 +1928,43 @@ fn spanned(
                     let restrict = |col: &[f64]| -> Vec<f64> {
                         rows.iter().filter_map(|&j| col.get(j).copied()).collect()
                     };
-                    let mut cols: Vec<Vec<f64>> = Vec::new();
                     let mut read: Vec<u64> = rows.iter().filter_map(|&j| level_of(j)).collect();
                     read.sort_unstable();
                     read.dedup();
+                    // The unit's level columns, and per within-group the
+                    // differences from its first level there.
+                    let mut cols: Vec<Vec<f64>> = Vec::new();
+                    let mut firsts: Vec<(usize, Vec<f64>)> = Vec::new();
+                    let mut diffs: Vec<Vec<f64>> = Vec::new();
                     for index in read {
-                        match level_cols.get(&index) {
-                            Some(Some(col)) => cols.push(restrict(col)),
-                            Some(None) => holds[s] = false,
-                            None => {}
+                        let (Some(&(_, group)), Some(col)) =
+                            (level_theta.get(&index), level_cols.get(&index))
+                        else {
+                            continue;
+                        };
+                        let Some(col) = col else {
+                            holds[s] = false;
+                            continue;
+                        };
+                        let col = restrict(col);
+                        match firsts.iter().find(|(g, _)| *g == group) {
+                            Some((_, first)) => {
+                                diffs.push(col.iter().zip(first).map(|(a, b)| a - b).collect())
+                            }
+                            None => firsts.push((group, col.clone())),
                         }
+                        cols.push(col);
                     }
-                    match span_residual(&restrict(&re_col), &cols) {
+                    let g = restrict(&re_col);
+                    match span_residual(&g, &cols) {
                         None => {}
-                        Some(r) if r < SPAN_TOL => measured[s] = true,
+                        Some(r) if r < SPAN_TOL => {
+                            measured[s] = true;
+                            if within[s] && !span_residual(&g, &diffs).is_some_and(|r| r < SPAN_TOL)
+                            {
+                                within[s] = false;
+                            }
+                        }
                         Some(_) => holds[s] = false,
                     }
                     if !holds[s] {
@@ -1918,10 +1977,30 @@ fn spanned(
             *h &= *m;
         }
     }
-    for (&(k, _), h) in silent.iter().zip(holds) {
-        out[k] = h;
+    for ((&(k, _), h), w) in silent.iter().zip(holds).zip(within) {
+        out[k] = match (h, w) {
+            (false, _) => None,
+            (true, false) => Some(Span::Levels),
+            (true, true) => Some(Span::Within),
+        };
     }
     out
+}
+
+/// The random effects the level checks move at a probe point whose level is
+/// `re`: the η by [`probe_etas`], and each κ distinct from them and per
+/// occasion group, so a read gated by a difference of random effects does not
+/// cancel at the moved point (#1874 review, F3; #1822 review r1).
+fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let eta = probe_etas(re, model.n_eta);
+    let kappa = (0..groups)
+        .map(|g| {
+            (0..model.n_kappa)
+                .map(|q| re * (1.0 + 0.3 * (model.n_eta + q) as f64) * (1.0 + 0.11 * g as f64))
+                .collect()
+        })
+        .collect();
+    (eta, kappa)
 }
 
 /// What the binder measures on one block, on the model with every block under
@@ -1930,7 +2009,7 @@ fn spanned(
 /// absorbed (#1834).
 struct Measured {
     dead: DeadLevels,
-    spanned: Vec<bool>,
+    spanned: Vec<Option<Span>>,
 }
 
 /// Run [`dead_levels`] and [`spanned`] on every block, on the model re-parsed
@@ -1964,7 +2043,7 @@ fn measure_levels(
             .iter()
             .map(|decl| Measured {
                 dead: DeadLevels::default(),
-                spanned: vec![false; decl.eta_couplings.len()],
+                spanned: vec![None; decl.eta_couplings.len()],
             })
             .collect());
     }
@@ -2171,6 +2250,20 @@ fn resolve_contrast(
         ));
     }
     let absorbed = absorbed.into_iter().next();
+    // A random effect the levels reproduce through within-group differences
+    // has no rescue: `sum_to_zero_within` leaves exactly those directions free
+    // (#1874 review, F1).
+    if let Some(found) = absorbed
+        .as_ref()
+        .filter(|a| matches!(a.how, How::Measured(Span::Within)))
+    {
+        return Err(format!(
+            "{block}: {}, so the levels reproduce it under every contrast, \
+             `sum_to_zero_within` included: the model is not identified. Remove the block, or \
+             drop the random effect.",
+            found.clause(),
+        ));
+    }
     // A contrast the block can take: one the absorbed random effect allows,
     // that leaves a free θ, and that carries the dead levels.
     let admissible = |c: LevelContrast| {
@@ -2256,7 +2349,7 @@ fn resolve_contrast(
             let why = match found.how {
                 How::Site(_) => format!("{} at that grouping", found.clause()),
                 // The measured clause already names its unit.
-                How::Measured => found.clause(),
+                How::Measured(_) => found.clause(),
                 How::Route(_) => format!(
                     "{}, and the block takes a level at every observation, so it can \
                      reproduce any effect that random effect has",

@@ -336,22 +336,36 @@ Where no single expression collects the two, the binder **measures** instead
 proportional within each subject, but no rule on how the model is written can
 see every such case. So for each random effect the walk above does not settle,
 the binder computes, subject by subject (occasion by occasion, for a kappa), how
-much of the random effect's effect on the predictions lies outside the block's,
-by central differences at the initial estimates (random effects 0) and at a
-nearby point (each θ moved inside its bounds, random effects 0.05). The random
-effect counts when that relative residual is below `1e-6` in every subject at
-both points; on the models in the test suite, absorbed ones come out below
-`1e-10` and identified ones above `5e-3`. Both points are needed: with
+much of the random effect's effect on the predictions lies outside the span of
+the effects of the block's levels there, by central differences at the initial
+estimates (random effects 0) and at a nearby point (each θ moved inside its
+bounds, the random effects near 0.05 and distinct from one another, so a term in
+`ETA_A - ETA_B` does not cancel). The random effect counts when that relative
+residual is below `1e-6` in every subject at both points; on the models in the
+test suite, absorbed ones come out below `1e-10` and identified ones above
+`5e-3`, on macOS and on Linux. Both points are needed: with
 `E0 = S + ETA_E0 * ETA_E0 * OCC` the random effect's derivative is 1 at 0, and
 proportional there by accident. A subject observed once is the plainest case:
 with each level within one subject, a random effect that moves its single
-record is proportional to the level there, whatever the model, and is refused.
-The refusal says the absorption was measured, not where it sits. Like the shared-expression rule, it judges the predictions:
-a block that also scales the residual error is refused when its effect on the
-predictions absorbs the random effect. And like the
-[dead-level check](#levels-with-no-effect), it is skipped for a
-model with a hazard, Markov or binary endpoint, a mixture, or an EKF diffusion
-term: there such an absorption still binds.
+record is a multiple of the level there, whatever the model, and is refused.
+The refusal says the absorption was measured, not where it sits.
+
+On a nested block the measurement also decides whether
+`sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
+helps only when the random effect moves `y` like a shift common to the
+subject's levels. `ETA_E0 * (OCC - 2)` on `[STUDY, OCC]` moves it like the third
+occasion's level minus the first's, a combination that sums to zero within the
+group: the within contrast leaves that free too, so the block is refused under
+every contrast.
+
+Like the shared-expression rule, the measurement judges the predictions: a
+block that also scales the residual error is refused when its effect on the
+predictions absorbs the random effect, and a random effect on the residual
+error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
+judges each random effect alone, not a combination of two. And like the
+[dead-level check](#levels-with-no-effect), it is skipped for a model with a
+hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term: there
+such an absorption still binds.
 
 #### Kappas
 

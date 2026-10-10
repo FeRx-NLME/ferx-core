@@ -7354,9 +7354,15 @@ mod absorption {
     // unit by unit, at two points. Binder-only fixtures: FD of the f64
     // predictor, no fit, no dual engine.
 
-    /// The measured clause on `ETA_E0`, up to its unit.
-    const MEASURED: &str = "the random effect `ETA_E0` moves `y` in proportion to this block at \
-                            every record of each";
+    /// The measured clause on random effect `re` over `unit`, up to its caveat.
+    fn measured(re: &str, unit: &str) -> String {
+        format!(
+            "the random effect `{re}` moves `y`, at every record of each {unit}, exactly as some \
+             combination of this block's levels does"
+        )
+    }
+    /// What the clause adds when the combination sums to zero within each group.
+    const WITHIN: &str = ", one that sums to zero within each group";
     /// The measured clause's caveat: the claim that it was measured, and where.
     const MEASURED_AT: &str = "(measured at the initial estimates and at a point near them)";
 
@@ -7376,7 +7382,7 @@ mod absorption {
         for c in ALL {
             match try_bind(&text(c), pop) {
                 Err(e) => {
-                    for must in [&format!("{MEASURED} subject"), MEASURED_AT] {
+                    for must in [&measured("ETA_E0", "subject"), MEASURED_AT] {
                         if !e.contains(must) {
                             wrong.push(format!("{tag} {c:?}: lacks {must:?}: {e}"));
                         }
@@ -7398,7 +7404,7 @@ mod absorption {
     /// `(S) + (S)` (P16c), `S` and `S` distributed by 2 (P16d). R5 distributes
     /// the factor `(1 + 0.1 * OCC)` over `TVE0 + PLACEBO` and `ETA_E0`. In each
     /// the η moves `y` in proportion to the block at every record of each
-    /// subject, the block absorbs it, and no single expression reads both: the
+    /// subject — a combination of the subject's one level — the block absorbs it, and no single expression reads both: the
     /// walk names no site, and the certificate measures it. Each is refused
     /// under every contrast with the measured clause, and agrees with the joint
     /// oracle. P16 again with the block also scaling the residual error
@@ -7489,13 +7495,12 @@ mod absorption {
         );
         let text = row_text(&r);
         let mut wrong = Vec::new();
-        let clause = "the random effect `KAPPA_E0` moves `y` in proportion to this block at every \
-                      record of each occasion";
+        let clause = measured("KAPPA_E0", "occasion");
         for c in ["sum_to_zero", "ref", "none"] {
             match try_bind(&text(c), &pop) {
                 Err(e) => {
                     for must in [
-                        clause,
+                        clause.as_str(),
                         MEASURED_AT,
                         "reproduce `KAPPA_E0` at every occasion",
                     ] {
@@ -7538,6 +7543,65 @@ mod absorption {
         assert!(wrong.is_empty(), "kappa:\n{}", wrong.join("\n"));
     }
 
+    /// #1874 review F1. On `[STUDY, OCC]`, `ETA_E0 * (OCC - 2)` moves `y` as
+    /// `−level₁ + level₃` of each subject's occasions: a combination that sums
+    /// to zero within the subject's `STUDY` group, which `sum_to_zero_within`
+    /// leaves free. So the block absorbs the η under every contrast, within
+    /// included, and the refusal says so — under all five, with the within
+    /// clause, agreeing with the oracle. The twin `ETA_E0 * (OCC + 1)` is
+    /// `2·level₁ + 3·level₂ + 4·level₃`, with a common shift that within removes:
+    /// refused under the global contrasts with the plain clause, auto goes to
+    /// within, and it agrees. The pair straddles the within test.
+    ///
+    /// Mutations — the within residual never taken (F1 binds `within`); always
+    /// within (the twin is refused under within); the within-clause suffix
+    /// deleted; the "under every contrast" sentence deleted.
+    #[test]
+    fn a_within_group_combination_is_absorbed_under_every_contrast() {
+        let pop = arms_pop();
+        let row = |tag, factor: &str| -> Row {
+            (
+                tag,
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * {factor}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            )
+        };
+        let f1 = row("F1 sums to zero", "(OCC - 2)");
+        let twin = row("F1 twin, a shift", "(OCC + 1)");
+        let within = format!("{}{WITHIN} {MEASURED_AT}", measured("ETA_E0", "subject"));
+        let every = "so the levels reproduce it under every contrast, `sum_to_zero_within` \
+                     included: the model is not identified";
+        let mut wrong = Vec::new();
+        for c in ALL {
+            match try_bind(&row_text(&f1)(c), &pop) {
+                Err(e) => {
+                    for must in [within.as_str(), every] {
+                        if !e.contains(must) {
+                            wrong.push(format!("F1 {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("F1 {c:?}: bound {b:?}")),
+            }
+        }
+        agrees_with_joint_oracle(f1.0, &row_text(&f1), &pop, &mut wrong);
+        let plain = format!("{} {MEASURED_AT}", measured("ETA_E0", "subject"));
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&row_text(&twin)(c), &pop) {
+                Err(e) if e.contains(&plain) && !e.contains(WITHIN) && !e.contains(every) => {}
+                got => wrong.push(format!("twin {c:?}: {got:?}")),
+            }
+        }
+        match try_bind(&row_text(&twin)(""), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("twin auto: {got:?}, want within")),
+        }
+        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
+        assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
     /// B3 (#1834: P17, P18, R5t, R9, R11, Q1). What is identified is not
     /// measured as absorbed: P17's branches load the η differently, P18's
     /// factor reads the η, R5t leaves `ETA_E0` out of the distributed factor,
@@ -7550,8 +7614,18 @@ mod absorption {
     /// straddle, asserted. At the moved point the derivative varies with `OCC`:
     /// Q1 is identified, binds, and agrees with the oracle evaluated there.
     ///
+    /// F3 (#1874 review) is Q1 with the square of `ETA_E0 - ETA_X`, `ETA_X`
+    /// also on `EMAX`: probed with every random effect at one value the
+    /// difference is 0 at both points and the η reads as absorbed; spread per
+    /// random effect (`probe_res`) it is identified, binds under every contrast,
+    /// and agrees with the oracle at the moved point. Its kappa twin, on
+    /// `[STUDY, OCC]` with `(KAPPA_E0 - ETA_E0)²·W`, needs each κ probed
+    /// apart from the ηs: it binds global and agrees.
+    ///
     /// Mutations — the certificate always true (P17 and every other row is
-    /// refused); the certificate at the first point only (Q1 is refused).
+    /// refused); the certificate at the first point only (Q1 is refused); every
+    /// random effect at the probe's level, not spread (F3 is refused); each κ
+    /// at the first η's value (the kappa twin is refused).
     #[test]
     fn what_the_certificate_does_not_refuse() {
         let pop = arms_pop();
@@ -7585,6 +7659,25 @@ mod absorption {
                 false,
             ),
         ];
+        // #1874 review F3: a term in `ETA_E0 - ETA_X` cancels where the two
+        // random effects sit at one value; the moved point spreads them.
+        let f3 = |c: &str| {
+            let r = row_1836(
+                "F3",
+                format!(
+                    "  EMAX = TVEMAX * exp(ETA_X)\n  \
+                     E0 = {S} + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC"
+                ),
+                false,
+            );
+            let text = row_text(&r)(c);
+            let out = text.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n",
+            );
+            assert_ne!(out, text, "ETA_X is declared");
+            out
+        };
         let q1 = row_1836(
             "Q1 a derivative 1 at η = 0",
             format!("  E0 = {S} + ETA_E0 * ETA_E0 * OCC"),
@@ -7601,6 +7694,30 @@ mod absorption {
             per_occasion: true,
         };
         agrees_with_joint_oracle_at(q1.0, &row_text(&q1), &pop, moved, &mut wrong);
+        for c in ALL {
+            if let Err(e) = try_bind(&f3(c), &pop) {
+                wrong.push(format!("F3 {c:?}: refused: {e}"));
+            }
+        }
+        agrees_with_joint_oracle_at("F3", &f3, &pop, moved, &mut wrong);
+        // Its kappa twin: the kappa's funnel plus the square of
+        // `KAPPA_E0 - ETA_E0` scaled by `W`, `ETA_E0` also on `EMAX`. A kappa
+        // probed at the η's value cancels the term; spread, it is identified,
+        // and the block binds global.
+        let f3k: Row = (
+            "F3 kappa",
+            "STUDY, OCC",
+            "  EMAX = TVEMAX * exp(ETA_E0)\n  \
+             E0 = TVE0 + PLACEBO + KAPPA_E0 + (KAPPA_E0 - ETA_E0) * (KAPPA_E0 - ETA_E0) * W"
+                .into(),
+            format!("E0 + {EMAXY}"),
+            true,
+        );
+        match try_bind(&row_text(&f3k)(""), &pop) {
+            Ok((LevelContrast::SumToZero, _)) => {}
+            got => wrong.push(format!("F3 kappa auto: {got:?}, want global")),
+        }
+        agrees_with_joint_oracle_at(f3k.0, &row_text(&f3k), &pop, moved, &mut wrong);
         // The straddle: at η = 0 alone Q1 reads as absorbed.
         let (at_zero, _) = joint_oracle(
             &jacobian(&row_text(&q1)("none"), &pop),
@@ -7690,7 +7807,7 @@ mod absorption {
                 Ok(b) => wrong.push(format!("{tag}: bound {b:?}")),
             }
         }
-        let subject_clause = format!("{MEASURED} subject {MEASURED_AT}");
+        let subject_clause = format!("{} {MEASURED_AT}", measured("ETA_E0", "subject"));
 
         let one = row_1836("P16", p16.clone(), false);
         check(
@@ -7836,8 +7953,7 @@ mod absorption {
         assert_ne!(pk_only, joint, "the event model is removed");
         let err = try_bind(&pk_only, &pop).expect_err("Gaussian only: measured");
         assert!(
-            err.contains("the random effect `ETA_CL` moves `y` in proportion")
-                && err.contains(MEASURED_AT),
+            err.contains(&measured("ETA_CL", "subject")) && err.contains(MEASURED_AT),
             "{err}"
         );
         assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 3)));
