@@ -266,7 +266,7 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 - **cv_pct** / **sd**: how an `omega` / `omega_iov` variance reads on the scale
   its random effect enters (#1643). A log-normal effect (`TVCL * exp(ETA)`) gets
   `cv_pct` = sqrt(exp(variance) - 1) * 100, the exact CV (#1858; formerly the
-  first-order sqrt(variance) * 100: 44.7 for 47.1 at 0.2). So does an untyped one. An
+  first-order sqrt(variance) * 100: 44.7 for 47.1 at 0.2; `.inf` past ~709.8). So does an untyped one. An
   additive (`TVV + ETA`) or logit (`inv_logit(THETA + ETA)`) effect gets `sd` =
   sqrt(variance) instead, since a CV% of an effect that does not multiply its
   parameter means nothing. An effect in any other expression gets neither key.

@@ -18,13 +18,25 @@ fn rse_pct(est: f64, se: f64) -> f64 {
 /// `sqrt(exp(var) − 1) · 100`, exactly (#1858), or `0` for a non-positive
 /// variance. Not the first-order `sqrt(var) · 100`, which runs low and falls
 /// further behind as `var` grows (0.2: 44.7 against 47.1; 2.37: 154 against
-/// 312). The one place a log-normal OMEGA/KAPPA CV% is computed; `exp_m1`
-/// keeps a tiny variance's digits.
+/// 311). The one place a log-normal OMEGA/KAPPA CV% is computed; `exp_m1`
+/// keeps a tiny variance's digits. Above `var ≈ 709.78` `exp_m1` overflows and
+/// this is `+∞`; the YAML writes that through [`yaml_cv_pct`].
 fn cv_pct(var: f64) -> f64 {
     if var > 0.0 {
         var.exp_m1().sqrt() * 100.0
     } else {
         0.0
+    }
+}
+
+/// A CV% as a YAML scalar: `{:.2}` when finite, else `.inf` — YAML's own
+/// spelling of infinity, which a numeric reader parses as a float. Rust's
+/// `inf` would be read back as a string.
+fn yaml_cv_pct(cv: f64) -> String {
+    if cv.is_finite() {
+        format!("{:.2}", cv)
+    } else {
+        ".inf".to_string()
     }
 }
 
@@ -84,7 +96,9 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
 /// is not `100 · sd_at_typical_weight` (#1858).
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("    cv_pct: {:.2}", cv_pct(var))),
+        None | Some(EtaParamType::LogNormal) => {
+            Some(format!("    cv_pct: {}", yaml_cv_pct(cv_pct(var))))
+        }
         Some(EtaParamType::Additive | EtaParamType::Logit | EtaParamType::LogitProbability) => {
             Some(format!("    sd: {:.6}", sd_from_var(var)))
         }
@@ -99,8 +113,8 @@ fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
 fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
     match t {
         None | Some(EtaParamType::LogNormal) => Some(format!(
-            "    cv_pct_at_typical_weight: {:.2}",
-            cv_pct(var_at)
+            "    cv_pct_at_typical_weight: {}",
+            yaml_cv_pct(cv_pct(var_at))
         )),
         _ => None,
     }
@@ -5693,6 +5707,27 @@ mod tests {
         }
         for t in [Additive, Logit, LogitProbability, Custom] {
             assert_eq!(typical_cv_yaml_line(Some(t), 0.2), None, "{t:?}");
+        }
+        // Past var ≈ 709.78 `exp_m1` overflows: both YAML keys write YAML's
+        // `.inf`, never Rust's `inf` (a string to a YAML reader). Straddled:
+        // 709 is still a finite figure on both keys, 710 is not, so a guard
+        // that fires always or never reddens one half; the console keeps `inf`.
+        assert!(cv_pct(709.0).is_finite() && cv_pct(710.0).is_infinite());
+        for t in [None, Some(LogNormal)] {
+            for (line, key) in [
+                (variance_yaml_line(t, 709.0), "cv_pct"),
+                (typical_cv_yaml_line(t, 709.0), "cv_pct_at_typical_weight"),
+            ] {
+                let line = line.expect("a CV% type writes the key");
+                let v = line.strip_prefix(&format!("    {key}: ")).expect(&line);
+                assert!(v.parse::<f64>().is_ok_and(f64::is_finite), "{line}");
+            }
+            assert_eq!(variance_yaml_line(t, 710.0), s("    cv_pct: .inf"));
+            assert_eq!(
+                typical_cv_yaml_line(t, 710.0),
+                s("    cv_pct_at_typical_weight: .inf")
+            );
+            assert_eq!(note(t, 710.0, false), s("CV% = inf"));
         }
         assert_eq!(
             variance_yaml_line(Some(Additive), add),
