@@ -4546,7 +4546,11 @@ pub struct FremConfig {
 /// The analytic `Dual2` gradient is exact up to floating-point roundoff; FD
 /// introduces `O(1e-9)` noise per component. For well-conditioned problems
 /// both converge to the same OFV within line-search tolerance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialised as its `[fit_options]` token (`auto` / `ad` / `fd`), the spelling a fit's
+/// [`ScoringSettings`](crate::ScoringSettings) records it under (#1835).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GradientMethod {
     #[default]
     Auto,
