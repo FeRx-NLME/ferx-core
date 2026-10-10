@@ -27,8 +27,8 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    CompiledModel, FitOptions, FitResult, InnerOptimizer, IovOccasionRule, ParsedModel, Population,
-    PopulationDifference,
+    CompiledModel, FitOptions, FitResult, GradientMethod, InnerOptimizer, IovOccasionRule,
+    ParsedModel, Population, PopulationDifference,
 };
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
@@ -692,7 +692,11 @@ pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> 
 /// (the options SIR's draws were scored under), so [`run_covariance`](crate::run_covariance)
 /// and [`run_sir`](crate::run_sir) with default options score what the fit scored.
 ///
-/// Objective-side only. `method` and `interaction` are not here: they ride on the fit
+/// The settings that decide how a post-hoc step reconverges the EBEs and evaluates the
+/// objective at the fit's estimates. `gradient_method` is here too (#1835): it is the inner
+/// η-gradient route, and it also gates the covariance R-matrix, because `gradient = fd` is
+/// one flag (#1613) — the covariance step must not build an R-matrix from the `Dual2` jets
+/// the fit refused. `method` and `interaction` are not here: they ride on the fit
 /// itself ([`FitResult::method`], [`FitResult::interaction`]). Nor are the settings that
 /// define the covariance *step* rather than the objective it differentiates
 /// (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`;
@@ -730,6 +734,15 @@ pub struct ScoringSettings {
     pub ode_stiff_abort_after: Option<u32>,
     /// `ode_auto_switch`: in-segment stepper switching under `ode_method = auto`.
     pub ode_auto_switch: bool,
+    /// `gradient_method`: `Fd` when the run took its gradients by finite differences —
+    /// the model's flag, the options', or an SDE model ([`GradientMethod`]'s one rule) —
+    /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
+    /// wins (#1835).
+    ///
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
+    #[serde(default)]
+    pub gradient_method: GradientMethod,
 }
 
 impl ScoringSettings {
@@ -749,6 +762,26 @@ impl ScoringSettings {
             ode_method: options.ode_method,
             ode_stiff_abort_after: options.ode_stiff_abort_after,
             ode_auto_switch: options.ode_auto_switch,
+            gradient_method: options.gradient_method,
+        }
+    }
+
+    /// The record of a run of `model` under `options`: [`from_options`](Self::from_options)
+    /// with `gradient_method` the route the run actually took — `Fd` when the model's own
+    /// flag, the options' or an SDE model put it on finite differences (#1835).
+    /// `from_options` stays a pure copy of the options; this is what a fit records.
+    ///
+    /// The retired `Ad` records as `Auto`: only `fit()` refuses it (`E_AD_RETIRED`), and a
+    /// post-hoc `run_sir` handed it runs the analytic route, which is what `Auto` names. So a
+    /// record holds `Auto` or `Fd`, the two values the `.fitrx` decode accepts (#1860 review).
+    pub(crate) fn of_run(model: &CompiledModel, options: &FitOptions) -> Self {
+        let gradient_method = match GradientMethod::effective(model, options) {
+            GradientMethod::Ad => GradientMethod::Auto,
+            g => g,
+        };
+        Self {
+            gradient_method,
+            ..Self::from_options(options)
         }
     }
 
@@ -777,6 +810,7 @@ impl ScoringSettings {
             ode_method,
             ode_stiff_abort_after,
             ode_auto_switch,
+            gradient_method,
         } = self.clone();
         FitOptions {
             inner_maxiter,
@@ -792,6 +826,7 @@ impl ScoringSettings {
             ode_method,
             ode_stiff_abort_after,
             ode_auto_switch,
+            gradient_method,
             ..options.clone()
         }
     }
@@ -835,6 +870,7 @@ pub(crate) fn with_scoring_record(
         ode_method,
         ode_stiff_abort_after,
         ode_auto_switch,
+        gradient_method,
     } = rec.clone();
     let d = FitOptions::default();
     macro_rules! recorded {
@@ -857,6 +893,9 @@ pub(crate) fn with_scoring_record(
     recorded!(ode_method);
     recorded!(ode_stiff_abort_after);
     recorded!(ode_auto_switch);
+    // Over the two values a record can hold, `{Auto, Fd}`, this is the union: a recorded
+    // `Fd` fills a caller's `Auto`, and a caller's `Fd` is kept whatever the record says.
+    recorded!(gradient_method);
     o
 }
 

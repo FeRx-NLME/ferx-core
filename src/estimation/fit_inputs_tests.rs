@@ -1349,14 +1349,17 @@ fn off_default_scoring() -> ScoringSettings {
         ode_method: crate::ode::OdeMethod::Rodas5P,
         ode_stiff_abort_after: Some(9),
         ode_auto_switch: false,
+        gradient_method: crate::types::GradientMethod::Fd,
     }
 }
 
 /// #426 T12, the resolve lines. Default caller options take every recorded field, each
 /// checked under its own name after its premise (the record differs from the default); a
 /// caller's non-default value wins. Both sides of the "caller left the default?" gate in one
-/// test. The three `bool`s have one non-default value, which record and caller share, so
-/// their `caller` check holds either way; the other ten catch an inverted gate. This is the
+/// test. The three `bool`s and `gradient_method` (whose one live non-default is `Fd`) have
+/// one non-default value, which record and caller share, so their `caller` check holds
+/// either way; the other ten catch an inverted gate (`gradient_method`'s is caught by
+/// `gradient_method_record_is_the_union_with_the_caller`). This is the
 /// only test that reaches the `inner_restarts` and `ode_stiff_abort_after` lines: no T9
 /// fixture moves the covariance with them (`tests/run_covariance_scoring_record.rs`). The
 /// record is destructured without `..`, so a new field does not compile here (E0027) until
@@ -1381,6 +1384,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         ode_method: crate::ode::OdeMethod::Rodas4,
         ode_stiff_abort_after: Some(10),
         ode_auto_switch: false,
+        gradient_method: crate::types::GradientMethod::Fd,
         ..FitOptions::default()
     };
     let kept = with_scoring_record(Some(&rec), &caller);
@@ -1398,6 +1402,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         ode_method: _,
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
+        gradient_method: _,
     } = rec.clone();
     macro_rules! field {
         ($f:ident) => {
@@ -1426,11 +1431,84 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
     field!(ode_method);
     field!(ode_stiff_abort_after);
     field!(ode_auto_switch);
+    field!(gradient_method);
     // Nothing outside the record moves: a step setting, and the tally the record leaves out.
     assert_eq!(resolved.cov_inner_tol, d.cov_inner_tol);
     assert_eq!(
         resolved.min_obs_for_convergence_check,
         d.min_obs_for_convergence_check
+    );
+}
+
+/// #1835 T7: `gradient_method` resolves as the union of record and caller over the two values
+/// a record can hold — all four cells in one test, so an inverted gate (caller `Auto` beats a
+/// recorded `Fd`) and an overwrite (a recorded `Auto` beats caller `Fd`) each redden a cell.
+/// Mutations: invert `recorded!`'s gate → `Fd/Auto` dies; take the record unconditionally →
+/// `Auto/Fd` dies; delete `recorded!(gradient_method)` → `Fd/Auto` dies.
+#[test]
+fn gradient_method_record_is_the_union_with_the_caller() {
+    use crate::types::GradientMethod::{Auto, Fd};
+    for (recorded, caller, want) in [
+        (Auto, Auto, Auto),
+        (Fd, Auto, Fd),
+        (Auto, Fd, Fd),
+        (Fd, Fd, Fd),
+    ] {
+        let rec = ScoringSettings {
+            gradient_method: recorded,
+            ..ScoringSettings::default()
+        };
+        let o = FitOptions {
+            gradient_method: caller,
+            ..FitOptions::default()
+        };
+        assert_eq!(
+            with_scoring_record(Some(&rec), &o).gradient_method,
+            want,
+            "record {recorded:?} × caller {caller:?}"
+        );
+    }
+}
+
+/// #1860 review r1 #2: `ScoringSettings` is serialised inside `FitResult` itself (the fit JSON
+/// `read_fit_estimates` reads, the ferx-tools search journal), not only through the `.fitrx`
+/// wire. A `FitResult` written before #1835 has no `gradient_method` in either record and must
+/// still deserialise, reading `Auto` in both. The fixture records `Fd`, so a key that was
+/// silently not written cannot pass as the default. Mutation: drop
+/// `#[serde(default)]` on the field → `from_value` fails with "missing field".
+#[test]
+fn a_fit_result_without_gradient_method_deserialises_as_auto() {
+    let mut fit = crate::types::test_helpers::minimal_fit_result();
+    fit.scoring_settings = Some(off_default_scoring());
+    fit.sir_settings = Some(crate::estimation::sir::SirSettings {
+        scoring: off_default_scoring(),
+        ..Default::default()
+    });
+    let mut v = serde_json::to_value(&fit).expect("serialise");
+    let removed = [
+        v["scoring_settings"]
+            .as_object_mut()
+            .expect("stage record object")
+            .remove("gradient_method"),
+        v["sir_settings"]["scoring"]
+            .as_object_mut()
+            .expect("SIR record's scoring object")
+            .remove("gradient_method"),
+    ];
+    assert_eq!(
+        removed,
+        [Some(serde_json::json!("fd")), Some(serde_json::json!("fd"))],
+        "premise: both records wrote fd"
+    );
+    let back: crate::types::FitResult =
+        serde_json::from_value(v).expect("a pre-#1835 FitResult deserialises");
+    assert_eq!(
+        back.scoring_settings.map(|s| s.gradient_method),
+        Some(crate::types::GradientMethod::Auto)
+    );
+    assert_eq!(
+        back.sir_settings.map(|s| s.scoring.gradient_method),
+        Some(crate::types::GradientMethod::Auto)
     );
 }
 
@@ -1475,6 +1553,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         ode_method: _,
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
+        gradient_method: _,
     } = rec.clone();
     macro_rules! differs {
         ($f:ident) => {
@@ -1499,6 +1578,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
     differs!(ode_method);
     differs!(ode_stiff_abort_after);
     differs!(ode_auto_switch);
+    differs!(gradient_method);
 
     let over = rec.overwrite(&caller);
     assert_eq!(

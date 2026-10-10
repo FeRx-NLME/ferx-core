@@ -1826,7 +1826,10 @@ fn fit_inner(
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
-        let stage_scoring = crate::ScoringSettings::from_options(&stage_opts);
+        // `of_run`, not `from_options`: a model stamped `gradient = fd` (or an SDE model)
+        // ran this stage on finite differences under `Auto` options, and the record must
+        // say so (#1835).
+        let stage_scoring = crate::ScoringSettings::of_run(model, &stage_opts);
         // `is_last_estimating` is also true for the literal last stage when that stage is an
         // evaluator (`agq_eval_only` / `imp_eval_only`): only a stage that estimates may
         // write the record, or a trailing Laplace readout's 1e-8 replaces the 1e-5 the

@@ -272,3 +272,320 @@ fn a_posthoc_run_sir_honours_the_options_gradient_fd() {
         "run_sir with options Fd must re-solve on FD, as a stamped model does"
     );
 }
+
+// ── #1835: the fit's `gradient = fd` is in its stage record ─────────────────────────────
+
+/// The R-matrix route a post-hoc `run_covariance` on `fit` takes under `caller`, read at the
+/// router: the scope `run_covariance` opens on `resolve_scoring_options(fit, caller)`, then the
+/// first covariance-scope clause that declines `model`. `None` is the analytic R-matrix,
+/// `Some(GradientFd)` the FD stencil.
+fn cov_route(
+    fit: &FitResult,
+    model: &CompiledModel,
+    population: &Population,
+    caller: &FitOptions,
+) -> Option<crate::estimation::cov_diagnostics::CovScopeDecline> {
+    let o = crate::estimation::fit_inputs::resolve_scoring_options(fit, caller);
+    crate::api::pool::with_fit_scope(&o, || {
+        crate::sens::provider::covariance_scope_decline(model, &population.subjects[0], false)
+    })
+    .expect("fit scope")
+}
+
+/// `fit` with its stage record's `gradient_method` set to `g`: the straddle's other side,
+/// the same estimates with only the recorded route changed.
+fn with_recorded_gradient(fit: &FitResult, g: GradientMethod) -> FitResult {
+    let mut f = fit.clone();
+    f.scoring_settings
+        .as_mut()
+        .expect("premise: a fit carries its stage record")
+        .gradient_method = g;
+    f
+}
+
+/// A direct `fit()` with `options = Fd` on a parsed (unstamped) model, carrying a covariance
+/// so `run_sir` has a proposal.
+fn direct_fd_fit() -> (CompiledModel, Population, FitResult) {
+    let (model, population) = warfarin(GradientMethod::Auto);
+    let o = FitOptions {
+        run_covariance_step: true,
+        ..posthoc_opts(GradientMethod::Fd)
+    };
+    let f = fit(&model, &population, &model.default_params, &o).expect("fd fit");
+    assert_eq!(f.gradient_method_inner, FD, "premise: the fit ran FD");
+    assert!(
+        f.covariance_matrix.is_some(),
+        "premise: the fd fit has a covariance"
+    );
+    (model, population, f)
+}
+
+fn caller_fd() -> FitOptions {
+    FitOptions {
+        gradient_method: GradientMethod::Fd,
+        ..FitOptions::default()
+    }
+}
+
+/// **G4d (#1835) — a direct FD fit's post-hoc `run_covariance` with default options stays on
+/// the FD stencil.** The fit records `gradient_method = Fd`; default options take it (the
+/// union), so the route is `GradientFd` and the matrix is bit for bit the caller-`Fd` one.
+/// The straddle, asserted: the same fit with its record set to `Auto` takes the analytic
+/// R-matrix and lands elsewhere — the defect at `160cc9a3`, where the record had no field.
+///
+/// Mutation: drop `recorded!(gradient_method)` → route `None`, bits differ.
+#[test]
+fn a_direct_fd_fits_posthoc_run_covariance_with_default_options_stays_fd() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    let (model, population, f) = direct_fd_fit();
+    let d = FitOptions::default();
+    assert_eq!(
+        f.scoring_settings.as_ref().map(|s| s.gradient_method),
+        Some(GradientMethod::Fd),
+        "the stage record says the fit ran FD"
+    );
+    let auto_rec = with_recorded_gradient(&f, GradientMethod::Auto);
+    assert_eq!(
+        cov_route(&f, &model, &population, &d),
+        Some(CovScopeDecline::GradientFd),
+        "default options on an FD fit: FD stencil"
+    );
+    assert_eq!(
+        cov_route(&auto_rec, &model, &population, &d),
+        None,
+        "straddle: a recorded Auto under default options is analytic"
+    );
+    let cov = |fit: &FitResult, o: &FitOptions| {
+        cov_bits(
+            &crate::run_covariance(fit, Some(&model), Some(&population), o)
+                .expect("run_covariance"),
+        )
+    };
+    let default = cov(&f, &d);
+    let reference = cov(&f, &caller_fd());
+    let analytic = cov(&auto_rec, &d);
+    assert_ne!(
+        analytic, reference,
+        "premise: the analytic R-matrix and the FD stencil differ on this fit"
+    );
+    assert_eq!(
+        default, reference,
+        "run_covariance with default options must repeat the fit's FD stencil"
+    );
+}
+
+/// **G4e (#1835) — the `run_sir` twin of G4d.** The fit has no SIR record, so `run_sir`
+/// resolves through the stage record; its draws re-solve every EBE on the recorded FD route.
+///
+/// Mutation: drop `recorded!(gradient_method)` → the default run re-solves analytically and
+/// equals the `Auto`-record run, not the caller-`Fd` one.
+#[test]
+fn a_direct_fd_fits_posthoc_run_sir_with_default_options_stays_fd() {
+    let (model, population, f) = direct_fd_fit();
+    assert!(f.sir_settings.is_none(), "premise: no SIR record");
+    let sir = |fit: &FitResult, g: GradientMethod| {
+        let o = FitOptions {
+            sir_samples: 40,
+            sir_resamples: 20,
+            sir_seed: Some(7),
+            gradient_method: g,
+            ..FitOptions::default()
+        };
+        let r = crate::run_sir(fit, Some(&model), Some(&population), &o).expect("run_sir");
+        let ess = r.sir_ess.expect("ess");
+        assert!(ess.is_finite(), "ess {ess}");
+        r.sir_ci_theta
+            .expect("SIR CIs")
+            .into_iter()
+            .flat_map(|(lo, hi)| [lo.to_bits(), hi.to_bits()])
+            .chain(std::iter::once(ess.to_bits()))
+            .collect::<Vec<u64>>()
+    };
+    let default = sir(&f, GradientMethod::Auto);
+    let reference = sir(&f, GradientMethod::Fd);
+    let analytic = sir(
+        &with_recorded_gradient(&f, GradientMethod::Auto),
+        GradientMethod::Auto,
+    );
+    assert_ne!(
+        analytic, reference,
+        "premise: the analytic and FD inner routes weight the draws differently"
+    );
+    assert_eq!(
+        default, reference,
+        "run_sir with default options must re-solve on the fit's FD route"
+    );
+}
+
+/// **G4f (#1835) — a file's `gradient = fd` survives `.fitrx` and the model rebuild.** The
+/// file entry point stamps the model it fits; the post-hoc rebuild from `model_path` does not
+/// (`resolve_fit_inputs`). The record carries the route through the bundle, so
+/// `run_covariance(&loaded, None, None, &default)` takes the FD stencil — bit for bit the
+/// caller-`Fd` matrix on the same loaded fit — and the loaded fit with its record set to
+/// `Auto` (what a bundle written before the field existed decodes to) takes the analytic one.
+///
+/// Mutations: drop the wire field on save (or decode it as the default) → the loaded record
+/// is `Auto`, asserted first; drop `recorded!(gradient_method)` → the bits.
+#[test]
+fn a_file_gradient_fd_survives_fitrx_and_the_posthoc_rebuild() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("warfarin_fd.ferx");
+    let data_path = dir.path().join("warfarin.csv");
+    let src = std::fs::read_to_string("examples/warfarin.ferx").unwrap();
+    let cut = src.find("[fit_options]").expect("fit_options block");
+    let tail = &src[cut..];
+    let next = tail[1..].find("\n[").map_or(tail.len(), |i| i + 2);
+    let src = format!(
+        "{}[fit_options]\n  method     = focei\n  maxiter    = 3\n  covariance = false\n  \
+         optimizer  = lbfgs\n  gradient   = fd\n\n{}",
+        &src[..cut],
+        &tail[next..]
+    );
+    std::fs::write(&model_path, &src).unwrap();
+    std::fs::copy("data/warfarin.csv", &data_path).unwrap();
+    let (f, population) = crate::run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("file fit");
+    assert_eq!(f.gradient_method_inner, FD, "premise: the file fit ran FD");
+
+    let bundle = dir.path().join("warfarin_fd.fitrx");
+    crate::io::fitrx::save_fit(&f, &population, &src, &bundle, Default::default())
+        .expect("save_fit");
+    let loaded = crate::io::fitrx::load_fit(&bundle).expect("load_fit").fit;
+    assert_eq!(
+        loaded.scoring_settings.as_ref().map(|s| s.gradient_method),
+        Some(GradientMethod::Fd),
+        "the record survives the bundle"
+    );
+
+    // The rebuild's model is unstamped: the route is the record's alone.
+    let (unstamped, _) = warfarin(GradientMethod::Auto);
+    let d = FitOptions::default();
+    assert_eq!(
+        cov_route(&loaded, &unstamped, &population, &d),
+        Some(CovScopeDecline::GradientFd)
+    );
+    let auto_rec = with_recorded_gradient(&loaded, GradientMethod::Auto);
+    assert_eq!(cov_route(&auto_rec, &unstamped, &population, &d), None);
+
+    let cov = |fit: &FitResult, o: &FitOptions| {
+        cov_bits(&crate::run_covariance(fit, None, None, o).expect("run_covariance"))
+    };
+    let default = cov(&loaded, &d);
+    let reference = cov(&loaded, &caller_fd());
+    let analytic = cov(&auto_rec, &d);
+    assert_ne!(analytic, reference, "premise: the two R-matrices differ");
+    assert_eq!(
+        default, reference,
+        "a loaded FD fit's run_covariance with default options must take the FD stencil"
+    );
+}
+
+/// **G4g (#1835) — the record is the route the run took, not a copy of its options.** A model
+/// stamped `gradient = fd` by hand, fitted under `Auto` options, ran FD (G3); its record must
+/// say `Fd`, so a post-hoc step on the **unstamped** model — the `.fitrx` rebuild's position —
+/// stays on FD with default options.
+///
+/// Mutation: record with `ScoringSettings::from_options` instead of `of_run` (`fit.rs`) →
+/// the record says `Auto` and the route is analytic.
+#[test]
+fn a_stamped_models_record_says_fd_under_auto_options() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    let (stamped, population) = warfarin(GradientMethod::Fd);
+    let o = FitOptions {
+        run_covariance_step: true,
+        ..posthoc_opts(GradientMethod::Auto)
+    };
+    let f = fit(&stamped, &population, &stamped.default_params, &o).expect("stamped fit");
+    assert_eq!(
+        f.gradient_method_inner, FD,
+        "premise: the stamped fit ran FD"
+    );
+    assert_eq!(
+        f.scoring_settings.as_ref().map(|s| s.gradient_method),
+        Some(GradientMethod::Fd),
+        "the stage record"
+    );
+    let (unstamped, _) = warfarin(GradientMethod::Auto);
+    assert_eq!(
+        cov_route(&f, &unstamped, &population, &FitOptions::default()),
+        Some(CovScopeDecline::GradientFd)
+    );
+
+    // The SIR record's writer, the same rule: a standalone `run_sir` on the stamped model
+    // under `Auto` options re-solved on FD, and its record says so. The stage record is set
+    // to `Auto` here, so the resolved options say `Auto` and only the model's flag can put
+    // `Fd` in the SIR record. Mutation: build it with `SirSettings::from_options` (`sir.rs`)
+    // → `Auto`.
+    let sir_o = FitOptions {
+        sir_samples: 20,
+        sir_resamples: 10,
+        sir_seed: Some(7),
+        ..FitOptions::default()
+    };
+    let auto_rec = with_recorded_gradient(&f, GradientMethod::Auto);
+    let s = crate::run_sir(&auto_rec, Some(&stamped), Some(&population), &sir_o).expect("run_sir");
+    assert_eq!(
+        s.sir_settings.as_ref().map(|r| r.scoring.gradient_method),
+        Some(GradientMethod::Fd),
+        "the SIR record"
+    );
+}
+
+/// **G4b's control, read at the router (#1835)** — an analytic fit records `Auto` and stays
+/// analytic under default options, so the union adds nothing to a fit that never asked for FD.
+///
+/// Mutation: record `Fd` unconditionally (`of_run`) → the route flips.
+#[test]
+fn an_analytic_fit_records_auto_and_stays_analytic() {
+    let (model, population, base) = posthoc_base();
+    assert_eq!(base.gradient_method_inner, ANALYTIC, "premise");
+    assert_eq!(
+        base.scoring_settings.as_ref().map(|s| s.gradient_method),
+        Some(GradientMethod::Auto)
+    );
+    assert_eq!(
+        cov_route(&base, &model, &population, &FitOptions::default()),
+        None
+    );
+}
+
+/// **#1860 review r1 #1 — a post-hoc `run_sir` with the retired `gradient_method = Ad` records
+/// `auto`, and its bundle loads.** Only `fit()` refuses `Ad` (`E_AD_RETIRED`); `run_sir` runs it
+/// as the analytic route (`inner_optimizer.rs`, "AD (retired → analytic)"). Recording it
+/// verbatim made `save_fit` succeed and `load_fit` fail with `sir.settings.gradient_method must
+/// be auto or fd`, on a bundle that loaded before #1835.
+///
+/// Mutation: drop the `Ad → Auto` arm in `ScoringSettings::of_run` → the record says `Ad` and
+/// `load_fit` is `Corrupt`.
+#[test]
+fn a_posthoc_run_sir_with_retired_ad_records_auto_and_its_bundle_loads() {
+    let (model, population, base) = posthoc_base();
+    let o = FitOptions {
+        sir_samples: 20,
+        sir_resamples: 10,
+        sir_seed: Some(7),
+        gradient_method: GradientMethod::Ad,
+        ..FitOptions::default()
+    };
+    let r = crate::run_sir(&base, Some(&model), Some(&population), &o).expect("run_sir(Ad)");
+    assert_eq!(
+        r.sir_settings.as_ref().map(|s| s.scoring.gradient_method),
+        Some(GradientMethod::Auto),
+        "the run went analytic, and the record says so"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("sir_ad.fitrx");
+    crate::io::fitrx::save_fit(&r, &population, "src\n", &bundle, Default::default())
+        .expect("save_fit");
+    let loaded = crate::io::fitrx::load_fit(&bundle)
+        .unwrap_or_else(|e| panic!("a bundle from run_sir(Ad) must load: {e}"))
+        .fit;
+    assert_eq!(
+        loaded.sir_settings.map(|s| s.scoring.gradient_method),
+        Some(GradientMethod::Auto)
+    );
+}

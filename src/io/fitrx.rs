@@ -416,10 +416,19 @@ struct ScoringSettingsWire {
     ode_method: String,
     ode_stiff_abort_after: Option<u32>,
     ode_auto_switch: bool,
+    /// Absent from a bundle written before #1835, which did not record it: the default
+    /// (`auto`) stands in, and a post-hoc step on such a fit takes the caller's gradient
+    /// route as it did before.
+    #[serde(default = "default_gradient_method")]
+    gradient_method: String,
 }
 
 fn default_inner_restarts() -> usize {
     crate::types::FitOptions::default().inner_restarts
+}
+
+fn default_gradient_method() -> String {
+    enum_token(&crate::types::GradientMethod::default())
 }
 
 /// An enum's serde token: its `[fit_options]` spelling.
@@ -470,6 +479,7 @@ impl From<&crate::ScoringSettings> for ScoringSettingsWire {
             ode_method: enum_token(&s.ode_method),
             ode_stiff_abort_after: s.ode_stiff_abort_after,
             ode_auto_switch: s.ode_auto_switch,
+            gradient_method: enum_token(&s.gradient_method),
         }
     }
 }
@@ -532,6 +542,15 @@ impl ScoringSettingsWire {
                 "0".to_string(),
             );
         }
+        // `ad` parses as a token but no run records it: `fit()` refuses it (`E_AD_RETIRED`)
+        // and `ScoringSettings::of_run` records a post-hoc step's retired `ad` as the `auto`
+        // it ran. A recorded value is adopted wherever the caller left `auto`, so a
+        // hand-edited `ad` is refused here.
+        let gradient_method: crate::types::GradientMethod =
+            enum_from_token(block, "gradient_method", self.gradient_method)?;
+        if gradient_method == crate::types::GradientMethod::Ad {
+            return bad("gradient_method", "auto or fd", "\"ad\"".to_string());
+        }
         Ok(crate::ScoringSettings {
             inner_maxiter: self.inner_maxiter,
             inner_tol: self.inner_tol,
@@ -546,6 +565,7 @@ impl ScoringSettingsWire {
             ode_method: enum_from_token(block, "ode_method", self.ode_method)?,
             ode_stiff_abort_after: self.ode_stiff_abort_after,
             ode_auto_switch: self.ode_auto_switch,
+            gradient_method,
         })
     }
 }
@@ -3368,6 +3388,7 @@ mod tests {
             ode_method: crate::ode::OdeMethod::Rodas5P,
             ode_stiff_abort_after: Some(9),
             ode_auto_switch: false,
+            gradient_method: crate::types::GradientMethod::Fd,
         }
     }
 
@@ -4717,7 +4738,8 @@ mod tests {
     /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
     /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
     /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
-    /// emits exactly those keys plus `inner_restarts`, still flat. Mutations: drop
+    /// emits exactly those keys plus `inner_restarts` and `gradient_method` (#1835), still
+    /// flat; the unrecorded `gradient_method` loads as `auto`. Mutations: drop
     /// `#[serde(flatten)]` (the frozen object fails to load, and the writer nests a `scoring`
     /// key); drop the `inner_restarts` default (the frozen object fails to load).
     #[test]
@@ -4735,6 +4757,7 @@ mod tests {
         let want = crate::estimation::sir::SirSettings {
             scoring: crate::ScoringSettings {
                 inner_restarts: crate::types::FitOptions::default().inner_restarts,
+                gradient_method: crate::types::GradientMethod::Auto,
                 ..off_default_scoring_settings()
             },
             ..off_default_sir_settings()
@@ -4751,6 +4774,8 @@ mod tests {
         let mut want_keys: Vec<&String> = frozen.as_object().unwrap().keys().collect();
         let restarts = "inner_restarts".to_string();
         want_keys.push(&restarts);
+        let gradient = "gradient_method".to_string();
+        want_keys.push(&gradient);
         want_keys.sort();
         assert_eq!(keys, want_keys);
     }
@@ -4792,6 +4817,16 @@ mod tests {
                 serde_json::json!("Lbfgs"),
                 serde_json::json!("lbfgs"),
             ),
+            (
+                "gradient_method",
+                serde_json::json!("bogus"),
+                serde_json::json!("fd"),
+            ),
+            (
+                "gradient_method",
+                serde_json::json!("ad"),
+                serde_json::json!("auto"),
+            ),
         ] {
             match load(field, reject) {
                 Err(FitrxError::Corrupt(msg)) => assert!(
@@ -4803,6 +4838,73 @@ mod tests {
             let loaded = load(field, accept.clone())
                 .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
             assert!(loaded.scoring_settings.is_some(), "{field}");
+        }
+    }
+
+    /// T8 (#1835): `gradient_method` on the wire, in both records. A bundle written before the
+    /// field existed has no key in `scoring_settings` nor in the flattened `sir.settings`, and
+    /// each reads `auto` — the default, so a post-hoc step takes the caller's route as before;
+    /// a recorded `ad`, which no fit can produce (`E_AD_RETIRED`), is `Corrupt` in each, with
+    /// the domain named. The fixture records `fd` in both, so the round trip
+    /// (`roundtrip_keeps_scoring_settings`) and the removal below each see a non-default value.
+    /// Mutations: drop the serde default (the old-bundle arms fail to deserialize); accept
+    /// `ad` (its arms load `Ok`); decode every token as `auto` (the round trip dies).
+    #[test]
+    fn gradient_method_is_optional_on_the_wire_and_ad_is_corrupt() {
+        use crate::types::GradientMethod;
+        let r = {
+            let mut r = sir_fit_with_settings();
+            r.scoring_settings = Some(off_default_scoring_settings());
+            r
+        };
+        let load = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+            edit(&mut value);
+            let wire: FitWire = serde_json::from_value(value).expect("the wire deserializes");
+            wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+        };
+        let written = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(written["scoring_settings"]["gradient_method"], "fd");
+        assert_eq!(written["sir"]["settings"]["gradient_method"], "fd");
+
+        let old = load(&|v: &mut serde_json::Value| {
+            let blocks = [
+                v["scoring_settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("gradient_method"),
+                v["sir"]["settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("gradient_method"),
+            ];
+            assert!(
+                blocks.iter().all(Option::is_some),
+                "premise: the key is written in both blocks"
+            );
+        })
+        .expect("a bundle without gradient_method loads");
+        assert_eq!(
+            old.scoring_settings.map(|s| s.gradient_method),
+            Some(GradientMethod::Auto)
+        );
+        assert_eq!(
+            old.sir_settings.map(|s| s.scoring.gradient_method),
+            Some(GradientMethod::Auto)
+        );
+
+        for block in ["scoring_settings", "sir.settings"] {
+            let got = load(&|v: &mut serde_json::Value| match block {
+                "scoring_settings" => v["scoring_settings"]["gradient_method"] = "ad".into(),
+                _ => v["sir"]["settings"]["gradient_method"] = "ad".into(),
+            });
+            match got {
+                Err(FitrxError::Corrupt(msg)) => assert_eq!(
+                    msg,
+                    format!("{block}.gradient_method must be auto or fd, got \"ad\"")
+                ),
+                other => panic!("{block}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
         }
     }
 }
