@@ -68,7 +68,9 @@ use crate::types::*;
 /// `covariance_matrix = None`, `covariance_status = Failed`, and the diagnostic
 /// appended to `warnings`. `Err` is reserved for input problems: a missing /
 /// hash-mismatched model or dataset, a dimension mismatch, a population that is
-/// not the one the fit was given (#1685), or, on an older fit, an IOV model
+/// not the one the fit was given (#1685; code `E_POPULATION_MISMATCH`, #1813, the
+/// same refusal as [`PopulationFingerprint::verify`](crate::PopulationFingerprint::verify)
+/// gives), or, on an older fit, an IOV model
 /// supplied without its population (see below).
 ///
 /// # IOV models (n_kappa > 0)
@@ -1201,10 +1203,15 @@ mod from_fit_bindings {
 
         // A population that is not the fit's subjects is refused: the EBEs are matched
         // by position, and the inner loop indexed past them. Both causes, one message
-        // each (#1680 review r1, finding 5). First, one subject dropped (the shape a
-        // `FitOptions` row filter the file does not state leaves)…
-        const WHY: &str = "The fit's EBEs are matched to subjects by position, so the \
-                           population must be the one the fit saw.";
+        // each (#1680 review r1, finding 5), now `E_POPULATION_MISMATCH`'s (#1813).
+        // First, one subject dropped (the shape a `FitOptions` row filter the file does
+        // not state leaves)…
+        let why = |what: &str| {
+            format!(
+                "run_covariance: this population is not the one the fit was given: {what}. \
+                 Use the population the fit was given, or refit."
+            )
+        };
         let mut short = level.prep.population.clone();
         short.subjects.pop();
         let err = run_covariance(
@@ -1215,12 +1222,9 @@ mod from_fit_bindings {
         )
         .map(|_| ())
         .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
-        );
-        // #1746: a population that is not the fit's has no `ferx check` code.
-        assert_eq!(err.code(), None, "{err}");
+        assert_eq!(err.to_string(), why("it has 29 subjects, the fit's has 30"));
+        // #1813: coded, though `ferx check` (which has no fit) cannot raise it.
+        assert_eq!(err.code(), Some("E_POPULATION_MISMATCH"), "{err}");
         assert_eq!(err.context(), Some("run_covariance"), "{err}");
         // …then the right count in the wrong order, naming the first position.
         let mut swapped = level.prep.population.clone();
@@ -1235,9 +1239,7 @@ mod from_fit_bindings {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!(
-                "run_covariance: subject 2 of the population is `3`, but the fit's is `2`. {WHY}"
-            )
+            why("its subject 2 is `3`, the fit's is `2`")
         );
         // Finding 7: checked before binding, so a population with a level the fit
         // never saw hears that it is not the fit's, not the design advice of the
@@ -1250,10 +1252,7 @@ mod from_fit_bindings {
         let err = run_covariance(&level.fit, None, Some(&extra), &level.opts)
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!("run_covariance: the population has 31 subjects but the fit has 30. {WHY}")
-        );
+        assert_eq!(err.to_string(), why("it has 31 subjects, the fit's has 30"));
 
         let median = case(Kind::Median);
         let bare = unbound(&median);

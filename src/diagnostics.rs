@@ -84,6 +84,8 @@
 //! | `E_COV_LEVEL_UNKNOWN`     | the data carry a value of a categorical `[covariate_model]` covariate that is not one of the relation's levels, which the generated factor would model as the reference. Raised by `fit()`, `ferx check`, the `simulate*` and adaptive entry points, `predict` / `predict_diag` / `predict_survival` / `predict_categorical`, `compute_npde_npd`, and `run_sir` / `run_covariance` (#1111, #1740); not by the per-method estimators `fit()` dispatches to, which rely on its check |
 //! | `E_THETA_LENGTH`          | an entry point taking a parameter vector was handed a θ whose length is not the model's; refused rather than read by position (a short vector read `0.0` past its end). Raised by the `simulate*` and adaptive entry points (#1614), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and `compute_npde_npd` (#1615); never by `ferx check`, which has no parameter vector. On a level-block model the message says the θ count is set by the bound data, so a fit's θ fits only a design bound against that fit's level bindings (#1614); it names no function, since the R wrapper reaches it too (#1623). `fit()` refuses its initial parameters with the same message (#1764) |
 //! | `E_PARAM_SHAPE`           | an entry point was handed an Ω, σ or Ω_IOV whose dimension is not the model's, an Ω_IOV on a model with no κ, or none on a model with κ; refused rather than read by position (a mis-sized block panicked; a long σ or a missing Ω_IOV was silently ignored). Raised by `fit()` (as its message), the `simulate*` and adaptive entry points, `simulate_with_uncertainty` and `compute_npde_npd`, and — for σ and Ω_IOV — `run_sir` / `run_covariance` (#1764); for Ω_IOV alone, `fitted_params_from_result` (#1789). Not by `predict*`, which read none of the three; on `simulate*` a missing Ω_IOV keeps its own uncoded message (#1019), and `compute_npde_npd` falls back to κ = 0 for one, as documented there |
+//! | `E_POPULATION_MISMATCH`   | a population handed to, or re-read by, a post-hoc step is not the one the fit was given (#1685): another subject list, other covariate columns, or a subject whose records, doses or covariate values differ. Raised by `run_sir` / `run_covariance` and `PopulationFingerprint::verify` (#1813, #1814), from one builder, so the three give the same message and suggestion. The message names what differs and how the population was obtained, never a cause the comparison cannot establish; the suggestion is the remedy. Never by `ferx check`, which has no fit. Pre-empted by `E_ENDPOINT_UNROUTED` and `E_THETA_LEVELS_DATA_UNBOUND`, whose fix is a reader or a binder |
+//! | `E_FIT_SUBJECTS_MISMATCH` | the population matches the fit's fingerprint, so it is the one the fit was given, but the fit's per-subject results (`fit.subjects`), which `run_sir` / `run_covariance` read by position, are another count or another order. Reachable when a front end rebuilds a fit from separate fields (ferx-r's fit skeleton); a `fit()` result carries both lists from one population. Without a current fingerprint the same mismatch is `E_POPULATION_MISMATCH`, since nothing says which side is wrong (#1868) |
 
 use serde::Serialize;
 
@@ -240,16 +242,22 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
 ///
 /// When `ferx check` reports the same refusal with a code, the error carries that
 /// [`Diagnostic`] — so a caller matches on [`code`](Self::code) instead of parsing
-/// the message. A refusal `ferx check` has no code for carries none
-/// ([`diagnostic`](Self::diagnostic) is `None`); a code is never invented at the
-/// entry point.
+/// the message. A few refusals have a code although `ferx check` cannot reach
+/// them, since it has no parameter vector, no fit and no fit's bindings:
+/// `E_THETA_LENGTH`, `E_PARAM_SHAPE`, the binders' `E_THETA_LEVEL_BINDING` /
+/// `E_COVARIATE_STATS_BINDING` on a fit's bindings, `E_POPULATION_MISMATCH` and
+/// `E_FIT_SUBJECTS_MISMATCH`.
+/// Every other refusal `ferx check` has no code for carries none
+/// ([`diagnostic`](Self::diagnostic) is `None`).
 ///
 /// `Display` is the historical `String` error byte for byte: the message, preceded
 /// by `"{context}: "` when the refusal names its entry point (`run_sir`,
 /// `run_covariance`). `.to_string()` therefore recovers the pre-#1746 `Err`.
 ///
-/// One refusal's historical text also folds its suggestion in after the message
-/// (`predict`'s unbound `theta NAME[...]` block). There `Display` appends it, while
+/// Three refusals also fold their suggestion in after the message: `predict`'s
+/// unbound `theta NAME[...]` block, `E_POPULATION_MISMATCH` and
+/// `E_FIT_SUBJECTS_MISMATCH`. There `Display`
+/// appends it, while
 /// [`message`](Self::message) stays the bare message and the suggestion is only in
 /// [`suggestion`](Self::suggestion). So a renderer shows either `to_string()` alone,
 /// or `message()` and `suggestion()` side by side — never the advice twice.

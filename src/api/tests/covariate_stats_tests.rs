@@ -721,6 +721,16 @@ fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() 
         assert_eq!(err.context(), Some(entry), "{entry}: {err}");
         assert!(!err.message().starts_with(entry), "{entry}: {err}");
         assert_eq!(err.to_string(), format!("{entry}: {}", err.message()));
+        // #1814 T4: `verify` checks the levels before the content, as the resolver
+        // does, so it gives the same refusal. Mutation — `verify` without the level
+        // check: `E_POPULATION_MISMATCH` instead.
+        let fp = fit.population_fingerprint.as_ref().expect("fit() stamps");
+        let v = fp.verify(&m, &recoded).expect_err("verify refuses");
+        assert_eq!(
+            (v.code(), v.message(), v.context()),
+            (err.code(), err.message(), None),
+            "{entry}"
+        );
     }
     crate::run_covariance(&fit, Some(&m), Some(&fit_pop), &opts)
         .expect("the fit's own population is not refused");

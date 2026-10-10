@@ -156,10 +156,18 @@ impl std::fmt::Display for Difference {
                 id,
                 population,
                 fit,
-            } => write!(
+            } if population != fit => write!(
                 f,
                 "the doses of subject `{id}` differ: {population} in this population, {fit} \
                  in the fit's, with the same observation records"
+            ),
+            // Equal counts are not a contradiction: the digest covers every field
+            // `dose()` hashes (#1813).
+            Difference::Doses { id, population, .. } => write!(
+                f,
+                "the doses of subject `{id}` differ with the same {population} dose{s}: a dose \
+                 time, amount, compartment, rate, duration, `SS`, `II` or infusion coding",
+                s = if *population == 1 { "" } else { "s" }
             ),
             Difference::Covariates { id } => write!(
                 f,
@@ -215,24 +223,32 @@ impl PopulationFingerprint {
         self.scheme == SCHEME
     }
 
+    /// The first difference in the subject list alone (count, then IDs by
+    /// position) between `population` and this fingerprint. The post-hoc checks
+    /// run it before binding; [`Self::first_difference`] runs it first, so the two
+    /// can never disagree on a subject list (#1813).
+    pub(crate) fn first_subject_difference(&self, population: &Population) -> Option<Difference> {
+        subject_list_difference(
+            population.subjects.iter().map(|s| s.id.as_str()),
+            self.subjects.iter().map(|s| s.id.as_str()),
+        )
+    }
+
     /// The first difference between `population` and the population this
     /// fingerprint was made of, or `None` when they are the same.
     pub(crate) fn first_difference(&self, population: &Population) -> Option<Difference> {
+        self.first_subject_difference(population)
+            .or_else(|| self.first_content_difference(population))
+    }
+
+    /// The first difference past the subject list: covariate columns, then each
+    /// subject's records, doses and covariate values. Only meaningful once
+    /// [`Self::first_subject_difference`] found none, since subjects are paired by
+    /// position. The post-hoc checks run the two halves apart, the subject list
+    /// before binding and this after (#1813); [`Self::first_difference`] is both.
+    pub(crate) fn first_content_difference(&self, population: &Population) -> Option<Difference> {
         let got = Self::of_with(population, self.occasions_derived);
-        if got.subjects.len() != self.subjects.len() {
-            return Some(Difference::SubjectCount {
-                population: got.subjects.len(),
-                fit: self.subjects.len(),
-            });
-        }
         let pairs = || got.subjects.iter().zip(&self.subjects);
-        if let Some((position, (p, f))) = pairs().enumerate().find(|(_, (p, f))| p.id != f.id) {
-            return Some(Difference::SubjectId {
-                position,
-                population: p.id.clone(),
-                fit: f.id.clone(),
-            });
-        }
         if got.covariate_names != self.covariate_names {
             let not_in = |a: &[String], b: &[String]| -> Vec<String> {
                 a.iter().filter(|n| !b.contains(n)).cloned().collect()
@@ -271,6 +287,66 @@ impl PopulationFingerprint {
         self.scheme = scheme;
         self
     }
+
+    /// Check that `population` is the one the fit was given (#1814): the subject
+    /// list, then every categorical covariate value against `model`'s levels
+    /// (`E_COV_LEVEL_UNKNOWN`), then each subject's records, doses and covariate
+    /// values. `run_sir` and `run_covariance` run the same checks, in the same
+    /// order, through the same refusal, so a population gets the same
+    /// [`code`](crate::EngineError::code), [`message`](crate::EngineError::message)
+    /// and [`suggestion`](crate::EngineError::suggestion) from each of the three.
+    ///
+    /// `population` is compared as `model` would score it, so a model with a
+    /// `theta NAME[...]` level block needs a population bound for it, the way
+    /// `bind_from_fit` binds one with the fit's `data_bindings`.
+    ///
+    /// A mismatch is `E_POPULATION_MISMATCH`, unless the population was read
+    /// without the model's endpoint routing (`E_ENDPOINT_UNROUTED`) or never bound
+    /// for its level block (`E_THETA_LEVELS_DATA_UNBOUND`), where the fix is a
+    /// reader or a binder rather than another population. The error names no
+    /// entry point: the caller does.
+    ///
+    /// It compares the population only. `run_sir` and `run_covariance` also check
+    /// that the fit's per-subject results (`fit.subjects`), which they read by
+    /// position, are in the population's order (`E_FIT_SUBJECTS_MISMATCH`); a caller
+    /// that reads per-subject results such as η̂ by position checks that order
+    /// itself.
+    ///
+    /// `Ok` carries notes. A fingerprint made with another ferx version's encoding
+    /// cannot be compared, so nothing is checked and the one note says so; on a
+    /// match the notes are empty.
+    pub fn verify(
+        &self,
+        model: &crate::types::CompiledModel,
+        population: &Population,
+    ) -> Result<Vec<String>, crate::EngineError> {
+        crate::estimation::fit_inputs::verify_given_population(self, model, population)
+    }
+}
+
+/// The first difference between two subject-ID lists: the count, then the first
+/// position whose IDs differ. Shared by the fingerprint and by `check_subjects`'
+/// `fit.subjects` leg, which runs whenever `fit.subjects` is filled (#1868 r1 #1),
+/// so both name a subject-list mismatch the same way.
+pub(crate) fn subject_list_difference<'a>(
+    population: impl ExactSizeIterator<Item = &'a str>,
+    fit: impl ExactSizeIterator<Item = &'a str>,
+) -> Option<Difference> {
+    if population.len() != fit.len() {
+        return Some(Difference::SubjectCount {
+            population: population.len(),
+            fit: fit.len(),
+        });
+    }
+    population
+        .zip(fit)
+        .enumerate()
+        .find(|(_, (p, f))| p != f)
+        .map(|(position, (p, f))| Difference::SubjectId {
+            position,
+            population: p.to_string(),
+            fit: f.to_string(),
+        })
 }
 
 fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {

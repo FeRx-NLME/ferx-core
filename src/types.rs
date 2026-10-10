@@ -12,6 +12,7 @@ pub use crate::parser::model_parser::ThetaBlocks;
 // A child module, so its exhaustive destructure of `DoseEvent` can name the
 // private `cmt` field (#1685).
 mod population_fingerprint;
+pub(crate) use population_fingerprint::subject_list_difference;
 pub(crate) use population_fingerprint::Difference as PopulationDifference;
 pub use population_fingerprint::PopulationFingerprint;
 #[cfg(test)]

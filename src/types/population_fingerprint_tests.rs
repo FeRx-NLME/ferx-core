@@ -433,6 +433,54 @@ fn differences_report_their_counts() {
         fp.first_difference(&population(vec![s])),
         Some(Difference::Doses { .. })
     ));
+
+    // An edited dose leaves the count equal, and equal counts are not a
+    // contradiction: "differ: 2 … 2" was the #1813 wording (P6).
+    let mut s = subject();
+    s.doses[0].amt = 1.0;
+    let d = fp.first_difference(&population(vec![s])).unwrap();
+    assert_eq!(
+        d,
+        Difference::Doses {
+            id: "7".into(),
+            population: 2,
+            fit: 2
+        }
+    );
+    assert_eq!(
+        d.to_string(),
+        "the doses of subject `7` differ with the same 2 doses: a dose time, amount, \
+         compartment, rate, duration, `SS`, `II` or infusion coding"
+    );
+
+    // The subject-list prefix is the one `first_difference` reports on a subject
+    // list, and says nothing about anything else (#1813: one gate, not two).
+    let mut renamed_id = subject();
+    renamed_id.id = "8".into();
+    for (perturbed, is_subject_list) in [
+        (population(vec![subject(), subject()]), true),
+        (population(vec![]), true),
+        (population(vec![renamed_id]), true),
+        (renamed, false),
+        (
+            population(vec![{
+                let mut s = subject();
+                s.observations[0] = 9.0;
+                s
+            }]),
+            false,
+        ),
+    ] {
+        let prefix = fp.first_subject_difference(&perturbed);
+        if is_subject_list {
+            assert!(prefix.is_some());
+            assert_eq!(prefix, fp.first_difference(&perturbed));
+        } else {
+            assert_eq!(prefix, None);
+            assert!(fp.first_difference(&perturbed).is_some());
+        }
+    }
+    assert_eq!(fp.first_subject_difference(&base), None);
 }
 
 /// Neither `HashMap` insertion order nor capacity enters the digest, nor the
