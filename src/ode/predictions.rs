@@ -2866,10 +2866,24 @@ pub(crate) fn dose_lagtimes_for(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
 ) -> Vec<f64> {
+    dose_lagtimes_reading(subject, ode, DoseReads::Shared(pk_params_flat))
+}
+
+/// [`dose_lagtimes_for`] with dose `k`'s lag read through `dose_reads` — the lags the
+/// dense walk ran under when it was handed the same `dose_reads` (#1575), so a `TAD` the
+/// hazard RHS reads afterwards is anchored where the walk's arrivals landed.
+#[cfg(feature = "survival")]
+#[inline]
+pub(crate) fn dose_lagtimes_reading(
+    subject: &Subject,
+    ode: &OdeSpec,
+    dose_reads: DoseReads<'_>,
+) -> Vec<f64> {
     subject
         .doses
         .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_params_flat))
+        .enumerate()
+        .map(|(k, d)| ode.dose_attr_map.lagtime(d.cmt_raw(), dose_reads.at(k)))
         .collect()
 }
 
@@ -7619,13 +7633,16 @@ pub fn ode_predictions_with_states(
 /// # Approximation for TV-covariate subjects
 ///
 /// `ipred` is exact (the event-driven path uses per-event PK parameters). The
-/// compartment `states`, however, are derived from a second pass via
-/// [`ode_dense_solve_states`] using **the first observation's PK parameters held
-/// fixed** for the entire timeline. For subjects with genuinely time-varying
-/// covariates (CL, V, etc. changing between observations) the states will be
-/// approximate. `fit()` emits `W_DERIVED_CMT_TV_ODE` to alert users to this
-/// limitation. For reset-only subjects (no TV covariates) `pk_at_obs` is
-/// uniformly filled, so using the first entry is exact.
+/// compartment `states`, however, are derived from a second pass of the dense walk
+/// behind [`ode_dense_solve_states`], whose **disposition** (CL, V, etc.) and `init()`
+/// are the first observation's PK parameters held fixed for the entire timeline. Every
+/// dose-record quantity — absorption kernel, pathway fraction, route lag, zero-order
+/// `dur`, compartment lag, `F`, `D{n}`/`R{n}` and the SS run-in — is read at its own
+/// dose record (`pk_at_dose`), as `ipred` reads it (#1575). For subjects whose
+/// disposition genuinely varies between observations the states will be approximate.
+/// `fit()` emits `W_DERIVED_CMT_TV_ODE` to alert users to this limitation. For
+/// reset-only subjects (no TV covariates) `pk_at_obs` is uniformly filled, so using the
+/// first entry is exact.
 pub fn ode_predictions_event_driven_with_states(
     ode: &OdeSpec,
     subject: &Subject,
@@ -7651,18 +7668,22 @@ pub fn ode_predictions_event_driven_with_states(
         pk_at_reset,
     );
 
-    // Second pass: extract the full ODE state at each obs time via
-    // `ode_dense_solve_states`. That function runs the standard (non-event-driven)
-    // solver, so it uses a single fixed set of PK params for the entire timeline.
+    // Second pass: extract the full ODE state at each obs time via the dense walk
+    // (`ode_dense_solve_states_reading`), which integrates under one disposition snapshot.
+    //
+    // Every dose-record quantity — absorption kernel, pathway fraction, route lag,
+    // zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`, the SS run-in — is read at
+    // its own dose record (`pk_at_dose`), exactly as the event-driven pass above reads
+    // it (#1575). Only the disposition (CL/V/etc.) and `init()` come from the
+    // first-observation snapshot.
     //
     // For subjects with EVID=3/4 resets but *no* TV covariates, `pk_at_obs` is
     // uniformly filled (every entry identical), so using `first()` is exact.
     //
     // For subjects with genuine TV covariates, `pk_at_obs` varies per timepoint.
-    // Using `first()` here is an approximation: the compartment state trajectory
-    // will be computed with the first-observation PK params (CL/V/etc.) held fixed,
-    // while `ipreds` correctly reflect per-event covariate snapshots. For most PK
-    // contexts this approximation is acceptable post-fit, but the caller
+    // Holding the disposition at `first()` is an approximation: the compartment state
+    // trajectory eliminates under the first-observation snapshot, while `ipreds`
+    // correctly reflect per-event covariate snapshots. The caller
     // (`compute_predictions_with_states`) is the approximate path; `fit()` emits
     // W_DERIVED_CMT_TV_ODE when TV covariates are present so users know.
     //
@@ -7672,7 +7693,13 @@ pub fn ode_predictions_event_driven_with_states(
         .first()
         .map(|p| p.values)
         .unwrap_or([0.0; crate::types::MAX_PK_PARAMS]);
-    let states = ode_dense_solve_states(ode, pk_flat, theta, eta, subject, &subject.obs_times);
+    let states = ode_dense_solve_states_reading(
+        ode,
+        pk_flat,
+        DoseReads::PerDose(pk_at_dose),
+        subject,
+        &subject.obs_times,
+    );
 
     (ipreds, states)
 }
@@ -7696,7 +7723,7 @@ pub fn ode_predictions_event_driven_with_states(
 /// is load-bearing (#1133) — do not delete it to "restore agreement".
 fn build_segment_break_times(
     ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    dose_reads: DoseReads<'_>,
     subject: &Subject,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
@@ -7736,8 +7763,9 @@ fn build_segment_break_times(
     // `tad <= 0`, i.e. a step at the onset, and `weibull` (β < 1) and `transit` (n = 0)
     // likewise. `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind and
     // is pinned bit-identical to this break (#859), so it stays unconditional.
-    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f, _| {
-        f.route_lag(pk_params_flat)
+    // Read at dose `k`'s own record, like the compartment lag above (#1575).
+    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f, k| {
+        f.route_lag(dose_reads.at(k))
     });
     push_zero_order_break_times(&mut break_times, zo_windows);
     break_times.push(terminal);
@@ -7746,14 +7774,62 @@ fn build_segment_break_times(
     break_times
 }
 
+/// Where the dense walks ([`ode_dense_solve_states`], [`ode_solve_until_chz_threshold`])
+/// read each **dose-record quantity** (#1575): the absorption kernel, pathway fraction and
+/// route lag of a built-in input rate, the zero-order `dur`, the compartment lag and `F`,
+/// `D{n}`/`R{n}`, and the SS run-in of an `SS=1` dose.
+///
+/// The disposition — the parameters the `[odes]` RHS integrates under, and `init()` — is a
+/// separate argument and stays one snapshot. These quantities are properties of the dose
+/// record, so the event-driven engine reads every one of them at `pk_at_dose[k]`; a pass
+/// that read them at its one disposition snapshot instead gave a time-varying covariate on
+/// a dose quantity whatever value it held at that snapshot, a whole-dose error invisible
+/// to the dose-record domain check.
+#[derive(Clone, Copy)]
+pub(crate) enum DoseReads<'a> {
+    /// One snapshot serves every dose: the parameter-static callers, where it is exact.
+    Shared(&'a [f64]),
+    /// Dose `k` reads its own record's snapshot; one entry per dose of the subject.
+    PerDose(&'a [PkParams]),
+}
+
+impl<'a> DoseReads<'a> {
+    /// Dose `k`'s snapshot.
+    #[inline]
+    fn at(self, k: usize) -> &'a [f64] {
+        match self {
+            DoseReads::Shared(p) => p,
+            DoseReads::PerDose(per_dose) => &per_dose[k].values,
+        }
+    }
+
+    /// The input-rate forcings for `n_doses` doses, built once per subject. `Shared` keeps
+    /// [`PreparedForcings::shared`]'s factored fraction, so a parameter-static caller's
+    /// arithmetic is bit-for-bit what it was.
+    fn prepare(self, ode: &OdeSpec, n_doses: usize) -> PreparedForcings {
+        match self {
+            DoseReads::Shared(p) => prepare_input_rates(ode, p),
+            DoseReads::PerDose(per_dose) => {
+                debug_assert_eq!(per_dose.len(), n_doses);
+                PreparedForcings::per_dose(
+                    ode,
+                    n_doses,
+                    |k| &per_dose[k].values[..],
+                    InputRateForcing::prepare,
+                )
+            }
+        }
+    }
+}
+
 /// Owned per-segment forcings produced by [`apply_segment_boundary`]: everything
-/// `wrap_rhs_with_forcings` needs for one dose segment, returned by value so the
-/// caller can build (and borrow into) the wrapped RHS without a dangling borrow.
+/// `wrap_rhs_with_forcings` needs for one dose segment besides the per-subject
+/// [`PreparedForcings`], returned by value so the caller can build (and borrow into) the
+/// wrapped RHS without a dangling borrow.
 struct SegmentForcings {
     reset_floor: f64,
     gated: Vec<(usize, f64, f64, f64)>,
     zero_order: Vec<(usize, f64)>,
-    prepared: PreparedForcings,
 }
 
 /// Apply a dose segment's boundary events and resolve its forcings — the shared
@@ -7768,6 +7844,9 @@ struct SegmentForcings {
 /// caller for the same reason `active_infusions` is: they are walk state, not segment
 /// state, and a dose must fire at the first break within [`EVENT_MATCH_TOL`] and at no
 /// other.
+///
+/// `disposition` re-seeds `init()` at an EVID-3/4 reset; an `SS=1` dose's run-in reads its
+/// own record through `dose_reads`, as the event-driven engine's does (#1575).
 #[allow(clippy::too_many_arguments)]
 fn apply_segment_boundary(
     ode: &OdeSpec,
@@ -7775,7 +7854,8 @@ fn apply_segment_boundary(
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
     zo_windows: &[ZeroOrderWindow],
-    pk_params_flat: &[f64],
+    disposition: &[f64],
+    dose_reads: DoseReads<'_>,
     n: usize,
     opts: &OdeSolverOptions,
     t_start: f64,
@@ -7793,7 +7873,7 @@ fn apply_segment_boundary(
     // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
     for &rt in &subject.reset_times {
         if (rt - t_start).abs() < EVENT_MATCH_TOL {
-            *u = ode.initial_state(pk_params_flat);
+            *u = ode.initial_state(disposition);
             break;
         }
     }
@@ -7810,7 +7890,7 @@ fn apply_segment_boundary(
             let chz_before = chz_snapshot(ode, u);
             *u = ss_state_at_phase(
                 ode,
-                pk_params_flat,
+                dose_reads.at(i),
                 dose,
                 ss_seed_phase(dose, lag),
                 opts,
@@ -7857,7 +7937,7 @@ fn apply_segment_boundary(
                 // a lagged one was seeded at its record above and flows here, so a
                 // dose inside the pre-arrival window survives (#1275).
                 let chz_before = chz_snapshot(ode, u);
-                *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts, &chz_before);
+                *u = equilibrate_ss_state(ode, dose_reads.at(dose_idx), dose, opts, &chz_before);
             }
             if !is_real_infusion(dose) {
                 if live && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
@@ -7907,14 +7987,11 @@ fn apply_segment_boundary(
     // pre-reset is off), injected alongside the gated infusions.
     let zero_order =
         active_zero_order_inputs(zo_windows, &subject.doses, t_start, t_end, reset_floor);
-    // Hoist the input-rate constants once per segment (#322 #7).
-    let prepared = prepare_input_rates(ode, ext_params);
 
     SegmentForcings {
         reset_floor,
         gated,
         zero_order,
-        prepared,
     }
 }
 
@@ -7928,11 +8005,42 @@ fn apply_segment_boundary(
 /// Dose events (boluses, infusions, SS) are handled identically to
 /// [`ode_predictions`]. Subject observation times are ignored; only `saveat`
 /// times are returned.
+///
+/// Every quantity — the disposition, `init()` and each dose's absorption, lag, `F`,
+/// `D{n}`/`R{n}` and SS run-in — is read from the one snapshot `pk_params_flat`, which is
+/// exact for a parameter-static subject. The crate's callers that reach a subject whose
+/// dose records differ from that snapshot read each dose-record quantity at its own record
+/// instead (#1575).
 pub fn ode_dense_solve_states(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
     theta: &[f64],
     eta: &[f64],
+    subject: &Subject,
+    saveat: &[f64],
+) -> Vec<Vec<f64>> {
+    // `theta` and `eta` are accepted for API symmetry with sibling ODE functions
+    // (e.g. `ode_predictions_with_states`) but are not consumed here: this
+    // function returns the raw ODE state vector `u` without applying any
+    // `output_fn` / Form-C scaling. A future extension that returns scaled
+    // observables alongside states would use them. Suppress the unused warning.
+    let _ = (theta, eta);
+    ode_dense_solve_states_reading(
+        ode,
+        pk_params_flat,
+        DoseReads::Shared(pk_params_flat),
+        subject,
+        saveat,
+    )
+}
+
+/// [`ode_dense_solve_states`] with the dose-record quantities read through `dose_reads`
+/// (#1575) and the disposition and `init()` from `disposition`. `DoseReads::Shared` of the
+/// disposition is [`ode_dense_solve_states`] itself, bit for bit.
+pub(crate) fn ode_dense_solve_states_reading(
+    ode: &OdeSpec,
+    disposition: &[f64],
+    dose_reads: DoseReads<'_>,
     subject: &Subject,
     saveat: &[f64],
 ) -> Vec<Vec<f64>> {
@@ -7942,35 +8050,37 @@ pub fn ode_dense_solve_states(
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
 
-    let mut u = ode.initial_state(pk_params_flat);
+    let mut u = ode.initial_state(disposition);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
 
-    // Resolve modeled-RATE doses once (#324) before building the timeline so the
-    // states pass sees concrete rate/duration; borrowed for all-`Fixed`.
-    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    // Resolve modeled-RATE doses once (#324), each at its own record, before building the
+    // timeline so the states pass sees concrete rate/duration; borrowed for all-`Fixed`.
+    let resolved = resolve_subject_doses_with(subject, &ode.dose_attr_map, |k| dose_reads.at(k));
     let subject: &Subject = &resolved;
 
     // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
-    // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
-    // this no-TV path, where every dose reads the same `pk_params_flat`.
-    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
+    // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots, read at each dose's
+    // record.
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs_with(subject, ode, |k| dose_reads.at(k));
 
     let first_dose_time = earliest_dose_time(&subject.doses);
-    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
+    let mut ext_params = seed_ext_params(disposition, first_dose_time);
 
     // Build saveat → index map for fast lookup.
     let saveat_map = build_obs_index_map(saveat);
 
     let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
-    // Zero-order absorption windows for this subject (#504): a single PK snapshot,
-    // so per-dose `dur`/`F`/`lag` come from `pk_params_flat`. Reused for both the
-    // segment break points and the per-segment constant-rate injection.
-    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
-        zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
+    // Zero-order absorption windows for this subject (#504), `dur` read at each dose's
+    // record. Reused for both the segment break points and the per-segment constant-rate
+    // injection.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |k, d| {
+        zero_order_dur_and_frac_for_dose(ode, d, dose_reads.at(k))
     });
+    // The input-rate forcings — kernel, pathway fraction, route lag — once per subject.
+    let prepared = dose_reads.prepare(ode, subject.doses.len());
     let break_times = build_segment_break_times(
         ode,
-        pk_params_flat,
+        dose_reads,
         subject,
         &dose_lagtimes,
         &dose_f_bio,
@@ -8046,7 +8156,8 @@ pub fn ode_dense_solve_states(
             &dose_lagtimes,
             &dose_f_bio,
             &zo_windows,
-            pk_params_flat,
+            disposition,
+            dose_reads,
             n,
             &opts,
             t_start,
@@ -8094,7 +8205,7 @@ pub fn ode_dense_solve_states(
             &dose_f_bio,
             forcings.reset_floor,
             t_start,
-            &forcings.prepared,
+            &prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );
@@ -8120,13 +8231,6 @@ pub fn ode_dense_solve_states(
             u.copy_from_slice(&last.u);
         }
     }
-
-    // `theta` and `eta` are accepted for API symmetry with sibling ODE functions
-    // (e.g. `ode_predictions_with_states`) but are not consumed here: this
-    // function returns the raw ODE state vector `u` without applying any
-    // `output_fn` / Form-C scaling. A future extension that returns scaled
-    // observables alongside states would use them. Suppress the unused warning.
-    let _ = (theta, eta);
 
     result
 }
@@ -8178,10 +8282,15 @@ pub enum ThresholdOutcome {
 /// `horizon` cannot move the accumulator before `horizon`, and a one-break timeline —
 /// `horizon` at the integration start — is a censored draw, not a solve; so there is
 /// no post-dose state to read here and nothing for the parity test to miss.
+///
+/// `disposition` and `dose_reads` are read exactly as [`ode_dense_solve_states_reading`]
+/// reads them (#1575): the disposition and `init()` from one snapshot, every dose-record
+/// quantity through `dose_reads`.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_solve_until_chz_threshold(
     ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    disposition: &[f64],
+    dose_reads: DoseReads<'_>,
     subject: &Subject,
     chz_state: usize,
     threshold: f64,
@@ -8191,26 +8300,27 @@ pub(crate) fn ode_solve_until_chz_threshold(
 
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
-    let mut u = ode.initial_state(pk_params_flat);
+    let mut u = ode.initial_state(disposition);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).
-    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let resolved = resolve_subject_doses_with(subject, &ode.dose_attr_map, |k| dose_reads.at(k));
     let subject: &Subject = &resolved;
 
-    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs_with(subject, ode, |k| dose_reads.at(k));
 
     let first_dose_time = earliest_dose_time(&subject.doses);
-    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
+    let mut ext_params = seed_ext_params(disposition, first_dose_time);
 
     // Zero-order windows, reused for the break points and the per-segment injection
     // (same as the dense path). The terminal break is the horizon; doses scheduled
     // after it are dropped — they can never bring an event forward.
-    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
-        zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |k, d| {
+        zero_order_dur_and_frac_for_dose(ode, d, dose_reads.at(k))
     });
+    let prepared = dose_reads.prepare(ode, subject.doses.len());
     let mut break_times = build_segment_break_times(
         ode,
-        pk_params_flat,
+        dose_reads,
         subject,
         &dose_lagtimes,
         &dose_f_bio,
@@ -8252,7 +8362,8 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &dose_lagtimes,
             &dose_f_bio,
             &zo_windows,
-            pk_params_flat,
+            disposition,
+            dose_reads,
             n,
             &opts,
             t_start,
@@ -8271,7 +8382,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &dose_f_bio,
             forcings.reset_floor,
             t_start,
-            &forcings.prepared,
+            &prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );

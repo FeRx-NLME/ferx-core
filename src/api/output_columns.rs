@@ -626,14 +626,27 @@ pub(crate) fn compute_extra_output_columns(
                                 // `compartments[i]` column stayed finite.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                // Time-independent params: one snapshot (t=0) is exact
-                                // across the grid; the ODE solver supplies its own clock.
+                                // Time-independent params: the disposition is one snapshot
+                                // (t=0) across the grid; the ODE solver supplies its own clock.
+                                // Every dose-record quantity — absorption kernel, pathway
+                                // fraction, route lag, zero-order `dur`, compartment lag, `F`,
+                                // `D{n}`/`R{n}`, the SS run-in — is read at its own dose record
+                                // (#1575), as IPRED and the per-obs states read it: a
+                                // time-varying covariate on one of them is not frozen at
+                                // `grid_cov`.
                                 let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov, 0.0);
-                                crate::ode::ode_dense_solve_states(
-                                    ode,
-                                    &pk_j.values,
+                                let mut pk_at_dose = Vec::new();
+                                crate::pk::compute_dose_pk_params_into(
+                                    model,
+                                    subject,
                                     theta,
                                     grid_eta_full,
+                                    &mut pk_at_dose,
+                                );
+                                crate::ode::predictions::ode_dense_solve_states_reading(
+                                    ode,
+                                    &pk_j.values,
+                                    crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
                                     subject,
                                     &grid_times,
                                 )

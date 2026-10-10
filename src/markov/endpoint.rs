@@ -322,9 +322,15 @@ fn ctmm_endpoint_nll_inhomogeneous(
         return SUBJECT_SENTINEL_NLL;
     };
 
-    // PK/PD parameter snapshot at (θ, η) — the ODE solve reads it (baseline covariate
-    // snapshot; a time-varying covariate on the generator is rejected at fit setup).
+    // PK/PD disposition snapshot at (θ, η) — the ODE solve integrates under it, and
+    // `init()` reads it (baseline covariate snapshot; a time-varying covariate on the
+    // generator is rejected at fit setup). Every dose-record quantity — absorption kernel,
+    // pathway fraction, route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`,
+    // the SS run-in — is read at its own dose record instead (#1575), always, as the
+    // ODE hazard reads it (`survival::ode_cumhaz_hazard`).
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let mut pk_at_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
 
     // One sub-grid per gap: `n_sub + 1` uniform nodes spanning [t_m, t_{m+1}] (gap m
     // occupies a contiguous block, so gaps sharing a boundary time keep independent
@@ -338,7 +344,13 @@ fn ctmm_endpoint_nll_inhomogeneous(
             grid.push(t0 + (t1 - t0) * (i as f64) / (n_sub as f64));
         }
     }
-    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, &grid);
+    let states = crate::ode::predictions::ode_dense_solve_states_reading(
+        ode,
+        &pk.values,
+        crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
+        subject,
+        &grid,
+    );
     debug_assert_eq!(states.len(), grid.len());
 
     let cov = &subject.covariates;
@@ -748,6 +760,110 @@ mod tests {
             "CTMM NLL under an infusion into the absorption compartment is {nll_infused}, \
              but the equivalent sub-dose train gives {nll_train} (rel {rel:.2e}) — the \
              generator is seeing the wrong exposure"
+        );
+    }
+
+    /// #1575 (M1). The drug-driven generator reads its concentration from a dense solve
+    /// under the **baseline** snapshot. Until #1575 that solve read every dose-record
+    /// quantity there too, so a covariate on an absorption parameter that differed between
+    /// baseline and the dose records — `KA = 0.6 − WT`, `−0.4` at a baseline `WT = 1`, `0.6`
+    /// at both doses — clamped the kernel and the generator saw **no drug**: the NLL equalled
+    /// the drug-free one (measured 2.2867 vs 4.9106, −5.25 OFV), with every dose in domain.
+    ///
+    /// Bad and control differ only in the baseline `WT`, which reaches nothing but `KA`, and
+    /// `KA` is a dose quantity — so their NLLs must be bit-identical. The straddle is
+    /// asserted through `pk_param_fn`, and the control is pinned away from the drug-free NLL,
+    /// so a solve that lost the dose in both arms cannot pass. Dies if
+    /// `ctmm_endpoint_nll_inhomogeneous` hands the dense solve `Shared` reads.
+    #[test]
+    fn one_snapshot_ctmm_reads_dose_quantities_at_the_dose_record() {
+        use crate::types::DoseEvent;
+
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(0.6, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.4, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA - WT
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let theta = &model.default_params.theta;
+        let eta = [0.0_f64];
+        let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+        let obs = [(0.0, 0), (2.0, 1), (5.0, 0), (9.0, 1), (14.0, 0)];
+        let subject = |wt_baseline: f64| {
+            let mut s = ctmm_subject(&obs);
+            // Two doses, the second on residual drug.
+            s.doses = vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+            ];
+            s.covariates = wt(wt_baseline);
+            s.dose_covariates = vec![wt(0.0), wt(0.0)];
+            s
+        };
+        let (bad, ctl) = (subject(1.0), subject(0.0));
+
+        // The straddle: KA differs at the baseline snapshot the solve integrates under, and
+        // is the control's in-domain value at both dose records.
+        let ka_slot = model.pk_indices[model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "KA")
+            .expect("KA")];
+        let ka = |cov: &HashMap<String, f64>, t: f64| {
+            (model.pk_param_fn)(theta, &eta, cov, t).values[ka_slot]
+        };
+        assert_eq!(ka(&bad.covariates, 0.0), 0.6 - 1.0, "bad baseline KA");
+        assert_eq!(ka(&ctl.covariates, 0.0), 0.6, "control baseline KA");
+        for (k, d) in bad.doses.iter().enumerate() {
+            assert_eq!(ka(&bad.dose_covariates[k], d.time), 0.6, "KA at dose {k}");
+        }
+
+        let (nll_bad, nll_ctl) = (
+            ctmm_subject_nll(&model, &bad, theta, &eta),
+            ctmm_subject_nll(&model, &ctl, theta, &eta),
+        );
+        let drug_free = ctmm_subject_nll(&model, &ctmm_subject(&obs), theta, &eta);
+        assert!(
+            nll_ctl.is_finite() && nll_ctl != SUBJECT_SENTINEL_NLL,
+            "control NLL {nll_ctl}"
+        );
+        assert!(
+            (nll_ctl - drug_free).abs() > 1e-1,
+            "control NLL {nll_ctl} sits at the drug-free {drug_free}: the generator does not \
+             see the dose, so the bit-identity below would be vacuous"
+        );
+        assert_eq!(
+            nll_bad.to_bits(),
+            nll_ctl.to_bits(),
+            "the CTMM solve read KA at the baseline snapshot instead of the dose record: \
+             {nll_bad} vs {nll_ctl} (drug-free {drug_free})"
         );
     }
 

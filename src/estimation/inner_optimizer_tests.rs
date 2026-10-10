@@ -4184,3 +4184,75 @@ mod frozen_ebe_variance {
         }
     }
 }
+
+/// #1575: a subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves
+/// its inner η-gradient to **FD** — `subject_has_survival_records` declines it, since the
+/// hazard term has no analytic η-channel. So `ode_cumhaz_hazard`'s per-dose reads have no
+/// `Dual2` twin to keep in parity, which is what `tests/one_snapshot_dose_reads_survival.rs`
+/// states. Pinned here because the fit's model-level `gradient_method_inner` label does not
+/// say so: on that file's model it reads `analytic (Dual2)` while the per-subject route (and
+/// the run banner) is FD.
+///
+/// The control is the same subject without its event record, which the analytic provider
+/// does serve — so the FD half is the survival record's doing, not the model's.
+#[cfg(feature = "survival")]
+#[test]
+fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
+    use crate::types::{DoseEvent, EventType, ObsRecord};
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("parse the drug-driven joint PK-TTE model");
+    let pk_only = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![8.0],
+        observations: vec![5.0],
+        obs_cmts: vec![2],
+        cens: vec![0],
+        ..Default::default()
+    };
+    let mut with_event = pk_only.clone();
+    with_event.obs_records = vec![ObsRecord::Event {
+        time: 20.0,
+        event_type: EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    assert_eq!(
+        resolve_gradient_method(&model, &pk_only),
+        InnerGradientMethod::Analytic,
+        "control: the PK-only subject is in the analytic provider's scope"
+    );
+    assert_eq!(
+        resolve_gradient_method(&model, &with_event),
+        InnerGradientMethod::Fd,
+        "a TTE record on a drug-driven hazard has no analytic η-channel"
+    );
+}
