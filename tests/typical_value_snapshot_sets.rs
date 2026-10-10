@@ -1463,3 +1463,273 @@ fn states_seed_a_lagged_steady_state_dose_on_its_own_record() {
         "F1",
     );
 }
+
+/// [`TV_COV_TRANSIT_MODEL`] with a `[derived]` grid integral of `central`, which the
+/// `[derived]` engine (`api::output_columns`) computes from its own dense solve over a grid,
+/// not from the per-observation states.
+///
+/// **No ω, deliberately.** With `ETA_CL ~ 0 FIX` the fit's inner solve lands on an EBE of
+/// ~2.94e-8 that differs between the bad and control arms by 1.3e-7 relative, and the
+/// integral, read at that η, then differs by 9 ULPs: the arms disagree upstream of the
+/// grid, in the fit's own IPRED (measured 7e-8 relative at `ipred[1]` even with no η, while
+/// `compute_predictions_with_states` is bit-identical on the same arms). That is a
+/// separate question from the grid read; without an η the grid read is isolated and the
+/// integral is bit-identical.
+const TV_COV_TRANSIT_AUC_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.1, 30.0)
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL
+  V   = TVV
+  KA  = TVKA
+  MTT = TVMTT - WT
+  NTR = TVN
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[derived]
+  AUC = integral(compartments[1], from=0, to=30, step=0.05)
+"#;
+
+/// S9 — the `[derived]` grid integral (#1575 review, finding 1). Its ODE arm runs its own
+/// dense solve under one snapshot, and until the review it read the transit kernel there
+/// too: `MTT = −9` at observation 1 clamped the kernel and the integral of `central` came
+/// back 0 against the control's 34.711 (measured on the review's probe), with IPRED and the
+/// per-observation states agreeing and no `E_` fired. Dies if `output_columns`' grid arm
+/// hands the dense solve `Shared` reads.
+#[test]
+fn a_derived_grid_integral_reads_the_transit_kernel_at_the_dose_record() {
+    use ferx_core::{fit, EstimationMethod, FitOptions};
+    let model = parse_full_model(TV_COV_TRANSIT_AUC_MODEL)
+        .expect("the TV-covariate transit [derived] model parses")
+        .model;
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.0; model.n_eta];
+    let mtt = |w: f64| {
+        let slot = model.pk_indices[model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "MTT")
+            .expect("MTT")];
+        (model.pk_param_fn)(&theta, &eta, &wt(w), 0.0).values[slot]
+    };
+    // The straddle: observation 1's snapshot is out of domain in the bad arm only; every
+    // dose record is at `WT = 0`, `MTT = 1`, in both.
+    assert_eq!((mtt(10.0), mtt(0.0)), (-9.0, 1.0));
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let auc = |wt_obs1: f64| -> Vec<f64> {
+        let pop = population(states_subject(two_bolus_doses(), 2, wt_obs1), &["WT"]);
+        let res = fit(&model, &pop, &model.default_params, &opts).expect("maxiter-0 fit runs");
+        res.subjects[0]
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "AUC")
+            .expect("AUC column")
+            .1
+            .clone()
+    };
+    let (bad, ctl) = (auc(10.0), auc(0.0));
+    assert!(
+        !ctl.is_empty() && ctl.iter().all(|a| a.is_finite() && *a > 1.0),
+        "the control's AUC must be a live, finite integral of the dosed drug: {ctl:?}"
+    );
+    assert_eq!(
+        bits(&bad),
+        bits(&ctl),
+        "the [derived] grid integral read MTT at observation 1 instead of the dose record: \
+         {bad:?} vs control {ctl:?}"
+    );
+}
+
+/// Parallel first-order absorption whose two fractions both ride `WT` and sum to 1 at every
+/// record (`FR1 = 0.6 + WT`, `FR2 = 0.4 − WT`), at S2's tolerance. Lets two dose records carry
+/// different, in-domain partitions.
+const TV_COV_PARALLEL_SPLIT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  FR1 = TVFR1 + WT
+  FR2 = 1 - TVFR1 - WT
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 1000000
+"#;
+
+/// S10 — the per-dose index itself (#1575 review, finding 2). Every arm above holds every
+/// dose record at one value, so a pass that read *some* dose record's snapshot for all of
+/// them — `per_dose[0]` — passed them all. Here the two doses carry **different** in-domain
+/// partitions (`WT = 0` at dose 1: 0.6 / 0.4; `WT = 0.3` at dose 2: 0.9 / 0.1), the
+/// disposition is static, and the central amount is checked against the Bateman sum outside
+/// both engines with each dose's own split. A pass reading dose 1's split for dose 2 gives
+/// central 95.376 at t = 14 against the correct 107.946 (and 26.454 vs 24.532 at t = 30).
+///
+/// Measured realised error (macOS arm64) at `ode_reltol 1e-12 / abstol 1e-14`: worst
+/// 2.060e-9 (t = 14). Bound 1e-8 as S2's — ~5× over the measurement, and 1.26e9× under the
+/// 12.57 a `per_dose[0]` read moves central by at t = 14.
+#[test]
+fn states_read_each_dose_at_its_own_record_not_the_first() {
+    let model = parse_full_model(TV_COV_PARALLEL_SPLIT_MODEL)
+        .expect("the split-fraction parallel model parses")
+        .model;
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.0; model.n_eta];
+    let mut s = states_subject(two_bolus_doses(), 1, 0.0);
+    s.dose_covariates = vec![wt(0.0), wt(0.3)];
+    // The two dose records really differ, and both are in domain.
+    let fr1 = |w: f64, t: f64| {
+        let slot = model.pk_indices[model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "FR1")
+            .expect("FR1")];
+        (model.pk_param_fn)(&theta, &eta, &wt(w), t).values[slot]
+    };
+    assert_eq!(fr1(0.0, 0.0), 0.6);
+    assert!((fr1(0.3, 12.0) - 0.9).abs() < 1e-15);
+    let pop = population(s, &["WT"]);
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        !diags.iter().any(|d| d.code.starts_with("E_")),
+        "both dose records are in domain, got {:?}",
+        codes(&diags)
+    );
+    let (_, states) =
+        ferx_core::pk::compute_predictions_with_states(&model, &pop.subjects[0], &theta, &eta);
+    // 40-digit decimal Bateman sum, two first-order pathways (KA 1.5, 0.3), k = 0.1,
+    // dose 1 at 0 split 0.6 / 0.4, dose 2 at 12 split 0.9 / 0.1.
+    let want = [
+        (1.0, 53.665189848309986),
+        (8.0, 50.401699072124362),
+        (14.0, 107.94567292657524),
+        (30.0, 24.531687024988530),
+    ];
+    let mut worst = 0.0f64;
+    for (state, &(t, a)) in states.iter().zip(&want) {
+        let got = state[0];
+        assert!(got.is_finite(), "S10: central at t = {t} is {got}");
+        let err = (got - a).abs();
+        eprintln!("S10 Bateman: t = {t:>4}: got {got:.15} want {a:.15} |err| {err:.3e}");
+        worst = worst.max(err);
+    }
+    assert!(
+        worst < 1e-8,
+        "S10: central departs from the per-dose Bateman sum by {worst:.3e} — a dose read \
+         another dose record's FR1"
+    );
+}
+
+/// [`TV_COV_F_MODEL`] at S2's tolerance, for a closed-form reference.
+const TV_COV_F_TIGHT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F1 = TVF - WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 1000000
+"#;
+
+/// S10b — the per-dose index on the **dose-attribute** reads (#1575 review, finding 2). S10's
+/// differing quantity is a pathway fraction, which the forcings read; this one is `F`, which
+/// `subject_dose_attrs` reads through the same per-dose snapshot as the compartment lag,
+/// `D{n}`, the zero-order window and the SS run-in. The doses carry `F1 = 0.8` and `0.5`
+/// (`WT = 0`, `0.3`), the disposition is static, and central is checked against the exact
+/// bolus sum `Σ F_k·100·exp(−0.1·(t − t_k))`. A pass reading dose 1's snapshot for dose 2
+/// gives central 85.226 at t = 14 against the correct 60.664.
+///
+/// Measured realised error (macOS arm64) at `ode_reltol 1e-12 / abstol 1e-14`: worst
+/// 7.113e-12 (t = 14). Bound 1e-8, S2's: no tighter, so one bound serves every closed-form
+/// arm, and still 2.5e9× under the 24.56 a `per_dose[0]` read moves central by at t = 14.
+#[test]
+fn states_read_each_dose_attribute_at_its_own_record_not_the_first() {
+    let model = parse_full_model(TV_COV_F_TIGHT_MODEL)
+        .expect("the TV-covariate F model parses")
+        .model;
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.0; model.n_eta];
+    let mut s = states_subject(two_bolus_doses(), 1, 0.0);
+    s.dose_covariates = vec![wt(0.0), wt(0.3)];
+    let f1 = |w: f64, t: f64| {
+        let slot = model.pk_indices[model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "F1")
+            .expect("F1")];
+        (model.pk_param_fn)(&theta, &eta, &wt(w), t).values[slot]
+    };
+    assert_eq!(f1(0.0, 0.0), 0.8);
+    assert!((f1(0.3, 12.0) - 0.5).abs() < 1e-15);
+    let pop = population(s, &["WT"]);
+    let (_, states) =
+        ferx_core::pk::compute_predictions_with_states(&model, &pop.subjects[0], &theta, &eta);
+    // 40-digit decimal: 0.8·100·e^(−0.1t) + 0.5·100·e^(−0.1(t−12)) for t ≥ 12.
+    let want = [
+        (1.0, 72.386993442876766),
+        (8.0, 35.946317129377727),
+        (14.0, 60.664294769227611),
+        (30.0, 12.247909880508442),
+    ];
+    let mut worst = 0.0f64;
+    for (state, &(t, a)) in states.iter().zip(&want) {
+        let got = state[0];
+        assert!(got.is_finite(), "S10b: central at t = {t} is {got}");
+        let err = (got - a).abs();
+        eprintln!("S10b bolus: t = {t:>4}: got {got:.15} want {a:.15} |err| {err:.3e}");
+        worst = worst.max(err);
+    }
+    assert!(
+        worst < 1e-8,
+        "S10b: central departs from the per-dose bolus sum by {worst:.3e} — a dose read \
+         another dose record's F1"
+    );
+}
