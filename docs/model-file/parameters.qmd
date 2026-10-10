@@ -406,6 +406,12 @@ reproduce the other: on `[STUDY, TIME]` with one subject per study, `ETA_E0` on
 `E0` and `ETA_EM` on `EMAX` are each fine alone, but not together. Drop one of
 the random effects, or remove the block.
 
+A **one-column** block that absorbs two random effects has neither rescue. It is
+a single group, so there is no within-group contrast, and each of its levels lies
+within one subject (one occasion, for kappas), so it absorbs each random effect
+on its own: dropping one leaves the other absorbed. The message says to remove
+the block or drop all of them (#1880).
+
 One case is named differently. When every subject has a single occasion and the
 kappa is read by the same parameters as the η, the kappa *is* the η by another
 name: the model is unidentified with or without the block, and the message says

@@ -7959,6 +7959,186 @@ mod absorption {
         assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 3)));
     }
 
+    /// #1880. Two random effects absorbed by a **one-column** block. With one
+    /// level per unit two absorbed random effects are each other's twin, which
+    /// the block is not to blame for; with several levels per unit they are
+    /// not, and the block absorbs each on its own. Neither the within contrast
+    /// (a one-column block is one group) nor dropping one of them rescues it —
+    /// only removing the block, or every one of them.
+    ///
+    /// Two pairs, on [`arms_pop`] with a one-column `CELL` key:
+    /// - η: `CELL` = study × occasion, `E0 = S + ETA_EM * OCC`. Both are
+    ///   measured (the `OCC` term leaves no funnel), as two combinations of
+    ///   the subject's three levels; the oracle absorbs both.
+    /// - κ: `CELL` = one level per record, `KAPPA_E0` on `E0` with the block (a
+    ///   site) and `KAPPA_EM` on `EMAX` (measured): the occasion wording.
+    ///
+    /// Each sentence of the refusal is asserted on both. The straddle: the η
+    /// pair keyed on the nested `[STUDY, OCC]` keeps the within / "drop one"
+    /// advice and never the one-column sentences, so a refusal stuck on either
+    /// branch fails here.
+    ///
+    /// Mutations — the one-column branch removed (the one-column cells give the
+    /// within advice); taken for every block (the nested twin loses it); the
+    /// unit phrase fixed to "a single subject" (the kappa pair); each sentence
+    /// of the branch deleted in turn.
+    #[test]
+    fn a_one_column_block_absorbing_two_random_effects() {
+        let keyed = |cell: &dyn Fn(usize, f64, usize) -> f64| {
+            let mut p = arms_pop();
+            for (si, sub) in p.subjects.iter_mut().enumerate() {
+                for (j, m) in sub.obs_covariates.iter_mut().enumerate() {
+                    let occ = m["OCC"];
+                    m.insert("CELL".to_string(), cell(si, occ, j));
+                }
+            }
+            p
+        };
+        let by_occasion = keyed(&|si, occ, _| (10 * (si + 1)) as f64 + occ);
+        let by_record = keyed(&|si, _, j| (100 * (si + 1) + j) as f64);
+        let etas = |cols: &'static str| {
+            move |c: &str| {
+                cf_model(
+                    c,
+                    cols,
+                    &format!("{BASE}  E0 = {S} + ETA_EM * OCC"),
+                    &format!("E0 + {EMAXY}"),
+                )
+                .replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  omega ETA_EM ~ 0.1\n",
+                )
+            }
+        };
+        let eta_pair = etas("CELL");
+        let nested = etas("STUDY, OCC");
+        let kappa_pair = |c: &str| {
+            cf_model(
+                c,
+                "CELL",
+                "  EMAX = TVEMAX + KAPPA_EM\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + KAPPA_E0\n  \
+                 Z = TVE0 * exp(ETA_E0)",
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n  kappa KAPPA_EM ~ 0.1\n",
+            )
+        };
+        let sentences = |within: &str| {
+            [
+                format!(
+                    "theta PLACEBO[CELL]: each `CELL` level lies within {within}, and the levels \
+                     absorb "
+                ),
+                "so the model is not identified under any contrast.".to_string(),
+                " Dropping one random effect leaves the block absorbing the other: remove the \
+                 block, or drop all of them."
+                    .to_string(),
+            ]
+        };
+        let within_advice = [
+            "`contrast = sum_to_zero_within` leaves each",
+            "Drop one of the random effects",
+        ];
+        let mut wrong = Vec::new();
+        let one_col: [(&str, &dyn Fn(&str) -> String, &Population, &str, &str); 2] = [
+            (
+                "η pair",
+                &eta_pair,
+                &by_occasion,
+                "a single subject",
+                "absorb `ETA_E0` and `ETA_EM` (",
+            ),
+            (
+                "κ pair",
+                &kappa_pair,
+                &by_record,
+                "a single occasion of one subject",
+                "absorb `KAPPA_E0` and `KAPPA_EM` (",
+            ),
+        ];
+        for (tag, text, pop, within, extra) in one_col {
+            for c in ALL {
+                match try_bind(&text(c), pop) {
+                    Err(e) => {
+                        for m in sentences(within).iter().map(String::as_str).chain([extra]) {
+                            if !e.contains(m) {
+                                wrong.push(format!("{tag} {c:?}: lacks {m:?}: {e}"));
+                            }
+                        }
+                        for b in within_advice {
+                            if e.contains(b) {
+                                wrong.push(format!("{tag} {c:?}: says {b:?}: {e}"));
+                            }
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+        }
+        agrees_with_joint_oracle("η pair", &eta_pair, &by_occasion, &mut wrong);
+        // The nested twin keeps the within advice.
+        for c in ALL {
+            match try_bind(&nested(c), &by_occasion) {
+                Err(e) => {
+                    for m in within_advice {
+                        if !e.contains(m) {
+                            wrong.push(format!("nested {c:?}: lacks {m:?}: {e}"));
+                        }
+                    }
+                    if e.contains("Dropping one random effect") || e.contains("level lies within") {
+                        wrong.push(format!("nested {c:?}: one-column text: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("nested {c:?}: bound {b:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "one column, two absorbed:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// #1882. A `FIX` level has no direction for the data to estimate, so
+    /// neither level check measures it, and both read the one lookup
+    /// (`free_level_thetas`). On a block fixed whole: the `TIME = 0` levels of
+    /// `g_no_eta` are dead, and P16's η lies in the levels' span, yet both bind;
+    /// the unfixed controls are refused — the dead levels, and P16 with the
+    /// measured clause. Both callers of the lookup are on each side.
+    ///
+    /// Mutation — the lookup counting a fixed level as free (both fixed rows
+    /// are refused).
+    #[test]
+    fn a_fixed_level_is_not_measured() {
+        let fix = |text: String| {
+            let out = text.replace("(0.0, -10.0, 10.0)", "(0.0, -10.0, 10.0, FIX)");
+            assert_ne!(out, text, "the block is fixed");
+            out
+        };
+        let mut wrong = Vec::new();
+        let t6 = cf_pop(3, 1, &T6);
+        let dead = g_no_eta("STUDY, TIME", "none");
+        match try_bind(&dead, &t6) {
+            Err(e) if e.contains(DEAD_LEVELS) => {}
+            got => wrong.push(format!("dead, free: {got:?}")),
+        }
+        if let Err(e) = try_bind(&fix(dead), &t6) {
+            wrong.push(format!("dead, FIX: refused: {e}"));
+        }
+        let pop = arms_pop();
+        let p16 = row_text(&row_1836("P16", branches_p16(), false))("none");
+        match try_bind(&p16, &pop) {
+            Err(e) if e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("P16, free: {got:?}")),
+        }
+        if let Err(e) = try_bind(&fix(p16), &pop) {
+            wrong.push(format!("P16, FIX: refused: {e}"));
+        }
+        assert!(wrong.is_empty(), "FIX:\n{}", wrong.join("\n"));
+    }
+
     /// P16's `[individual_parameters]`: `E0` in proportional branches on `OCC > 1`.
     fn branches_p16() -> String {
         format!("  if (OCC > 1) {{\n    E0 = {S}\n  }} else {{\n    E0 = 2 * ({S})\n  }}")

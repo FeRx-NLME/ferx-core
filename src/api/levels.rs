@@ -1391,6 +1391,38 @@ fn structural_site<'a>(
     })
 }
 
+/// Where the structural walk leaves one random effect of a block on this data.
+enum Placement<'a> {
+    /// The block's levels do not nest in its units: the block cannot absorb it.
+    Unnested,
+    /// Nested, and the walk names the site ([`structural_site`]).
+    Site(How<'a>),
+    /// Nested, and the walk names no site: the span certificate measures it
+    /// ([`spanned`]) on this unit.
+    Silent(Unit),
+}
+
+/// Per random effect of `decl`, parallel to `eta_couplings`: its
+/// [`Placement`]. The one source of both gates on the walk's verdict — which
+/// random effects [`measure_levels`] measures, and where [`absorbed`] takes a
+/// site from the walk and where from the measurement — so the two cannot
+/// disagree on which random effects are silent (#1874 review, F12).
+fn placements<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Placement<'a>> {
+    let units = nesting_units(decl, population);
+    let resolving = resolves_observations(decl, population);
+    decl.eta_couplings
+        .iter()
+        .zip(units)
+        .map(|(c, unit)| match unit {
+            None => Placement::Unnested,
+            Some(unit) => match structural_site(c, population, unit, resolving) {
+                Some(how) => Placement::Site(how),
+                None => Placement::Silent(unit),
+            },
+        })
+        .collect()
+}
+
 /// Every random effect the block absorbs (#1649, #1678, #1696, #1834): the
 /// block's levels nest in the random effect's units ([`levels_nest_in_units`]),
 /// and either the walk names a site ([`structural_site`]) or, where it names
@@ -1402,18 +1434,18 @@ fn absorbed<'a>(
     population: &Population,
     spanned: &[Option<Span>],
 ) -> Vec<Absorbed<'a>> {
-    let units = nesting_units(decl, population);
-    let resolving = resolves_observations(decl, population);
-    decl.eta_couplings
-        .iter()
+    placements(decl, population)
+        .into_iter()
         .enumerate()
-        .filter_map(|(k, c)| {
-            let unit = units[k]?;
-            let how = structural_site(c, population, unit, resolving)
-                .or_else(|| spanned.get(k).copied().flatten().map(How::Measured))?;
+        .filter_map(|(k, placement)| {
+            let how = match placement {
+                Placement::Unnested => return None,
+                Placement::Site(how) => how,
+                Placement::Silent(_) => How::Measured(spanned.get(k).copied().flatten()?),
+            };
             let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
             Some(Absorbed {
-                coupling: c,
+                coupling: &decl.eta_couplings[k],
                 readers,
                 how,
             })
@@ -1631,6 +1663,27 @@ fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
     (0..n_eta).map(|j| re * (1.0 + 0.3 * j as f64)).collect()
 }
 
+/// Per level of `decl` (in `levels` order): the index of its θ in `model` —
+/// the model bound with every block under `contrast = none` — or `None` when
+/// that θ is `FIX` or absent. A fixed level is never measured: it has no
+/// direction for the data to estimate. Shared by [`dead_levels`] and
+/// [`spanned`], so the two checks read the same levels (#1874 review, F12).
+fn free_level_thetas(
+    model: &CompiledModel,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+) -> Vec<Option<usize>> {
+    let p = &model.default_params;
+    levels
+        .iter()
+        .map(|level| {
+            let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
+            let k = model.theta_names.iter().position(|n| *n == name)?;
+            (!p.theta_fixed.get(k).copied().unwrap_or(false)).then_some(k)
+        })
+        .collect()
+}
+
 /// Rule 1 (#1679): the non-`FIX` levels of `decl` whose θ the likelihood never
 /// reads, and which random effects read their records.
 ///
@@ -1674,14 +1727,13 @@ fn dead_levels(
         .collect();
 
     let mut out = DeadLevels::default();
-    for (i, level) in levels.iter().enumerate() {
-        let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
-        let Some(k) = model.theta_names.iter().position(|n| *n == name) else {
+    for (i, theta_k) in free_level_thetas(model, decl, levels)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(k) = theta_k else {
             continue;
         };
-        if p.theta_fixed.get(k).copied().unwrap_or(false) {
-            continue;
-        }
         let index = (i + 1) as f64;
         let unchanged_at = |(point, (th, re)): (usize, &(Vec<f64>, f64))| {
             let mut stepped = th.clone();
@@ -1829,20 +1881,14 @@ fn spanned(
     if silent.is_empty() {
         return out;
     }
-    let p = &model.default_params;
     let column = level_index_column(decl.name());
     // Per level index (1-based, as written to the data): its free θ and its
     // within-group.
     let groups = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
-    let level_theta: HashMap<u64, (usize, usize)> = levels
-        .iter()
+    let level_theta: HashMap<u64, (usize, usize)> = free_level_thetas(model, decl, levels)
+        .into_iter()
         .enumerate()
-        .filter_map(|(i, level)| {
-            let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
-            let k = model.theta_names.iter().position(|n| *n == name)?;
-            let fixed = p.theta_fixed.get(k).copied().unwrap_or(false);
-            (!fixed).then_some((((i + 1) as f64).to_bits(), (k, groups[i])))
-        })
+        .filter_map(|(i, k)| Some((((i + 1) as f64).to_bits(), (k?, groups[i]))))
         .collect();
     let nested = decl.columns().len() >= 2;
     // Per silent random effect: in the levels' span, and in the within span.
@@ -2051,16 +2097,12 @@ fn measure_levels(
         .iter()
         .zip(discovered)
         .map(|(decl, levels)| {
-            let resolving = resolves_observations(decl, population);
-            let silent: Vec<(usize, Unit)> = nesting_units(decl, population)
+            let silent: Vec<(usize, Unit)> = placements(decl, population)
                 .into_iter()
-                .zip(&decl.eta_couplings)
                 .enumerate()
-                .filter_map(|(k, (unit, c))| {
-                    let unit = unit?;
-                    structural_site(c, population, unit, resolving)
-                        .is_none()
-                        .then_some((k, unit))
+                .filter_map(|(k, placement)| match placement {
+                    Placement::Silent(unit) => Some((k, unit)),
+                    _ => None,
                 })
                 .collect();
             Measured {
@@ -2500,6 +2542,24 @@ fn jointly_absorbed_message(
     } else {
         "subject"
     };
+    // A one-column block has no within rescue and dropping one random effect
+    // does not help: each level lies within one unit, so the block absorbs
+    // every one of them on its own (#1880).
+    if decl.columns().len() == 1 {
+        let within = if unit == "occasion" {
+            "a single occasion of one subject"
+        } else {
+            "a single subject"
+        };
+        return format!(
+            "{block}: each `{}` level lies within {within}, and the levels absorb {} and {last} \
+             ({}), so the model is not identified under any contrast. Dropping one random effect \
+             leaves the block absorbing the other: remove the block, or drop all of them.",
+            decl.columns()[0],
+            rest.join(", "),
+            sites.join("; "),
+        );
+    }
     format!(
         "{block}: the levels absorb {} and {last} together ({}). `contrast = sum_to_zero_within` \
          leaves each {unit}'s mean to one of them, and the levels reproduce the other, so the \
