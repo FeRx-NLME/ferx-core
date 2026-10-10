@@ -309,8 +309,7 @@ that another parameter reads first is a route of its own: with `C2 = E0` written
 before `E0` is reassigned, and `y` reading `C2`, the reassigned `E0` alone is
 not the shared expression. When every branch of an `if` assigns the parameter,
 the branch assignments are also judged together, and a branch condition that
-varies within a subject keeps them from counting, even when the branches happen
-to be proportional (#1834).
+varies within a subject keeps them from counting as one shared expression.
 
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in
@@ -326,6 +325,33 @@ refused, with the advice to remove the block or drop the random effect. Fitted
 anyway, ω collapses to 0. With two or more subjects per study the same model
 binds, since the random effect is then identified from the spread within each
 study.
+
+##### When no single expression reads both
+
+Where no single expression collects the two, the binder **measures** instead
+(#1834). Proportional branches on a condition that varies within a subject
+(`if (OCC > 1) { E0 = S } else { E0 = 2 * (S) }`, with
+`S = TVE0 + PLACEBO + ETA_E0`), or a factor distributed over a sum
+(`(TVE0 + PLACEBO) * F + ETA_E0 * F`), still make the two effects on `y`
+proportional within each subject, but no rule on how the model is written can
+see every such case. So for each random effect the walk above does not settle,
+the binder computes, subject by subject (occasion by occasion, for a kappa), how
+much of the random effect's effect on the predictions lies outside the block's,
+by central differences at the initial estimates (random effects 0) and at a
+nearby point (each θ moved inside its bounds, random effects 0.05). The random
+effect counts when that relative residual is below `1e-6` in every subject at
+both points; on the models in the test suite, absorbed ones come out below
+`1e-10` and identified ones above `5e-3`. Both points are needed: with
+`E0 = S + ETA_E0 * ETA_E0 * OCC` the random effect's derivative is 1 at 0, and
+proportional there by accident. A subject observed once is the plainest case:
+with each level within one subject, a random effect that moves its single
+record is proportional to the level there, whatever the model, and is refused.
+The refusal says the absorption was measured, not where it sits. Like the shared-expression rule, it judges the predictions:
+a block that also scales the residual error is refused when its effect on the
+predictions absorbs the random effect. And like the
+[dead-level check](#levels-with-no-effect), it is skipped for a
+model with a hazard, Markov or binary endpoint, a mixture, or an EKF diffusion
+term: there such an absorption still binds.
 
 #### Kappas
 
