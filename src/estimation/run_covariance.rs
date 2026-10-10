@@ -24,8 +24,10 @@
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
-use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
-use crate::estimation::uncertainty_samples::fitted_params_from_result;
+use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
+use crate::estimation::uncertainty_samples::{
+    fit_packed_estimate, fitted_params_from_result, PackedEstimate,
+};
 use crate::types::*;
 
 /// Run the covariance step against an existing fit. Returns a new `FitResult`
@@ -41,18 +43,22 @@ use crate::types::*;
 /// single fit produced with `covariance = true`.
 ///
 /// When the fit carries the optimizer's exact packed vector
-/// ([`FitResult::packed_estimate`] — the in-memory FOCE/FOCEI path), the match is
-/// **bit-for-bit**: the parameters are rebuilt by *unpacking* that vector, so the
-/// `OmegaMatrix`'s `Ω⁻¹` / `log|Ω|` come from the same Cholesky factor `L` the
-/// inline step used. Reconstructing them from `fit.omega` instead re-decomposes
-/// `chol(L·Lᵀ) ≠ L` to machine-ε; that tiny `Ω⁻¹` difference feeds the inner NLL
-/// penalty, shifts the reconverged EBEs, and the FD Hessian amplifies it — up to
-/// ~1e-1 on an ill-conditioned ω direction (the divergence #816's review surfaced).
-/// A fit reloaded from `.fitrx` (no packed vector), or from SAEM /
-/// importance-sampling / Bayes (whose inline step re-packs `omega` the same way
-/// and so already agrees), takes that re-decomposition fallback. Every in-memory
-/// packed-Cholesky-space fit — NLopt, BFGS, trust region, Gauss-Newton — carries
-/// the vector and reproduces bit-for-bit.
+/// ([`FitResult::packed_estimate`] — a FOCE / FOCEI / Laplace fit, in memory or
+/// reloaded from a `.fitrx` bundle [`save_fit`](crate::io::fitrx::save_fit) wrote,
+/// #1815), the match is **bit-for-bit**: the parameters are rebuilt by *unpacking*
+/// that vector, so the `OmegaMatrix`'s `Ω⁻¹` / `log|Ω|` come from the same Cholesky
+/// factor `L` the inline step used. Reconstructing them from `fit.omega` instead
+/// re-decomposes `chol(L·Lᵀ) ≠ L` to machine-ε; that tiny `Ω⁻¹` difference feeds the
+/// inner NLL penalty, shifts the reconverged EBEs, and the FD Hessian amplifies it —
+/// up to ~1e-1 on an ill-conditioned ω direction (the divergence #816's review
+/// surfaced). The vector is reused only when it unpacks bit-for-bit to the fit's
+/// reported θ / Ω / σ / Ω_IOV / ρ under `model`; a fit whose estimates were edited
+/// after the fit, or a model of the same packed length with a different layout, is
+/// evaluated at the reported estimates instead. A fit with no vector — SAEM /
+/// importance-sampling / Bayes, a fit built in R, a bundle saved before #1815 or
+/// written by ferx-r — takes that re-decomposition fallback too. Pure Gauss-Newton,
+/// SAEM, importance sampling and VI are not bit-for-bit with their inline step even
+/// in memory (#1847).
 ///
 /// # Failure semantics
 ///
@@ -216,29 +222,20 @@ fn run_covariance_scoped(
     // amplifies it — badly on ill-conditioned ω directions (the #816-review
     // divergence: ~0.1 on a warfarin ω²(KA) with ~115% RSE).
     //
-    // So when the fit carries the optimizer's exact packed vector (`packed_estimate`,
-    // the in-memory packed-Cholesky-space path), **unpack it** to rebuild the
-    // parameters — the `OmegaMatrix` is then built from that same `L`
-    // (`from_chol_factor`), bit-for-bit identical to the inline path, and the
-    // covariance reproduces exactly. The fallback re-decomposes from `omega`
-    // (reloaded `.fitrx` fits, or SAEM/importance-sampling/Bayes, whose inline step
-    // re-packs `omega` the same way and so already agrees). The length guard falls
-    // back on any model/dimension mismatch.
-    //
-    // Note: on the reuse arm `packed_estimate` is the source of truth for the
-    // numeric center — `base_params` supplies only the structural template
-    // (names/masks/bounds/diagonal), and `compute_covariance` reads all θ/Ω/σ
-    // values from `x_hat`. A `FitResult` whose `theta`/`omega`/`sigma` were mutated
-    // in-process *after* the fit is therefore evaluated at the original packed
-    // point; recompute the fit rather than editing its estimates in place.
+    // So when the fit carries the optimizer's exact packed vector (`packed_estimate`:
+    // a packed-Cholesky-space fit, in memory or reloaded from a `.fitrx` bundle
+    // `save_fit` wrote, #1815), **unpack it** to rebuild the parameters — the
+    // `OmegaMatrix` is then built from that same `L` (`from_chol_factor`),
+    // bit-for-bit identical to the inline path, and the covariance reproduces
+    // exactly. The vector is reused only when `fit_packed_estimate` finds it
+    // `Usable`: this model's length, and an unpack bit-equal to the fit's reported
+    // θ/Ω/σ/Ω_IOV/ρ. Anything else — no vector (SAEM/importance-sampling/Bayes, an
+    // older or R-written bundle), a different layout, or estimates edited after the
+    // fit — re-decomposes from the reported estimates, at the point they say.
     // (`base_params` is built above, ahead of the EBE check, as the shape gate.)
-    let (params, x_hat) = match &fit.packed_estimate {
-        // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
-        // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.
-        Some(v) if v.len() == packed_len(&base_params) => {
-            (unpack_params(v, &base_params), v.clone())
-        }
-        _ => {
+    let (params, x_hat) = match fit_packed_estimate(fit, &base_params) {
+        PackedEstimate::Usable(v) => (unpack_params(v, &base_params), v.to_vec()),
+        PackedEstimate::Absent | PackedEstimate::WrongLength(_) | PackedEstimate::Stale => {
             let repacked = pack_params(&base_params);
             (base_params, repacked)
         }
@@ -1666,5 +1663,80 @@ mod from_fit_bindings {
         let got = run_covariance(&c.fit, Some(model), None, &c.opts)
             .expect("a fit with recorded reader settings needs no model file");
         assert_same_covariance(&got, &want, "recorded settings, Some/None");
+    }
+}
+
+/// #1815 T5: every packed-space engine's own vector passes the bit-equality guard,
+/// so none of them is silently dropped onto the re-decomposition fallback. Warfarin
+/// at `outer_maxiter = 3` (the guard is a property of pack/unpack at whatever point
+/// the engine stopped, not of convergence). The plan's §0d sweep: 337/337 hold over
+/// 31 examples × 11 engines; VI fails every one (its stored Ω is 1 ULP off its own
+/// unpack — warfarin `0.3360326090905553` vs `…554`), pinned here as `Stale` so a
+/// VI fix flips the row and prompts the docs (`foce.qmd`, #1847).
+///
+/// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
+/// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:
+/// the VI row dies.
+#[cfg(test)]
+mod packed_estimate_guard_per_engine {
+    use super::*;
+    use crate::estimation::uncertainty_samples::{fit_packed_estimate, PackedEstimate};
+    use crate::types::{EstimationMethod as M, Optimizer as O};
+
+    #[test]
+    fn every_packed_space_engine_is_usable_and_vi_is_stale() {
+        let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+            "examples/warfarin.ferx",
+        ))
+        .expect("model");
+        let cases: [(&str, M, O, bool); 11] = [
+            ("auto", M::FoceI, O::Auto, true),
+            ("bfgs", M::FoceI, O::Bfgs, true),
+            ("slsqp", M::FoceI, O::Slsqp, true),
+            ("mma", M::FoceI, O::Mma, true),
+            ("bobyqa", M::FoceI, O::Bobyqa, true),
+            ("trust_region", M::FoceI, O::TrustRegion, true),
+            ("foce", M::Foce, O::Auto, true),
+            ("laplace", M::Laplace, O::Auto, true),
+            ("gn", M::FoceGn, O::Auto, true),
+            ("gn_hybrid", M::FoceGnHybrid, O::Auto, true),
+            ("vi", M::Vi, O::Auto, false),
+        ];
+        let mut wrong = Vec::new();
+        for (name, method, optimizer, usable) in cases {
+            let opts = FitOptions {
+                method,
+                optimizer,
+                interaction: method != M::Foce,
+                outer_maxiter: 3,
+                // VI ignores `outer_maxiter`; its default run is ~25 s in debug.
+                vi_iters: 20,
+                run_covariance_step: false,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let fit = crate::api::fit_from_files(
+                "examples/warfarin.ferx",
+                Some("data/warfarin.csv"),
+                None,
+                Some(opts),
+            )
+            .unwrap_or_else(|e| panic!("{name}: fit failed: {e}"));
+            assert!(
+                fit.packed_estimate.is_some(),
+                "{name}: a packed-space engine must carry packed_estimate"
+            );
+            let base = fitted_params_from_result(&fit, &model).expect("base");
+            let got = fit_packed_estimate(&fit, &base);
+            let ok = if usable {
+                matches!(got, PackedEstimate::Usable(_))
+            } else {
+                got == PackedEstimate::Stale
+            };
+            if !ok {
+                wrong.push(format!("{name}: {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "guard misclassified: {wrong:?}");
     }
 }
