@@ -5290,7 +5290,20 @@ mod absorption {
         pop: &Population,
         wrong: &mut Vec<String>,
     ) {
-        let jac = jacobian(&text("none"), pop);
+        agrees_with_joint_oracle_at(tag, text, pop, Point::ZERO, wrong)
+    }
+
+    /// [`agrees_with_joint_oracle`] with the oracle's Jacobian at `at`: for a
+    /// row whose derivative depends on the random effects, where η = 0 alone can
+    /// look proportional (#1834, Q1).
+    pub(super) fn agrees_with_joint_oracle_at(
+        tag: &str,
+        text: &dyn Fn(&str) -> String,
+        pop: &Population,
+        at: Point,
+        wrong: &mut Vec<String>,
+    ) {
+        let jac = jacobian_at(&text("none"), pop, at);
         let mut absorbs = HashMap::new();
         for (c, token) in EXPLICIT {
             let (absorbed, free) = joint_oracle(&jac, c);
@@ -7331,6 +7344,804 @@ mod absorption {
             "per-definition taint:\n{}",
             wrong.join("\n")
         );
+    }
+
+    // ── #1834: an absorption the walk cannot name, measured ─────────────────
+    //
+    // Proportional branches on a varying condition, `S + S` against `2 * S`,
+    // and a factor distributed over a sum absorb the η with no expression that
+    // reads both. Where the walk names no site, the binder measures the span,
+    // unit by unit, at two points. Binder-only fixtures: FD of the f64
+    // predictor, no fit, no dual engine.
+
+    /// The measured clause on random effect `re` over `unit`, up to its caveat.
+    fn measured(re: &str, unit: &str) -> String {
+        format!(
+            "the random effect `{re}` moves `y`, at every record of each {unit}, exactly as some \
+             combination of this block's levels does"
+        )
+    }
+    /// What the clause adds when the combination sums to zero within each group.
+    const WITHIN: &str = ", one that sums to zero within each group";
+    /// The measured clause's caveat: the claim that it was measured, and where.
+    const MEASURED_AT: &str = "(measured at the initial estimates and at a point near them)";
+
+    /// Refused under every contrast and auto, each refusal carrying the measured
+    /// clause over subjects, and none naming a site the walk would name.
+    fn refused_measured(r: &Row, pop: &Population, wrong: &mut Vec<String>) {
+        refused_measured_text(r.0, &row_text(r), pop, wrong)
+    }
+
+    /// [`refused_measured`] on any model text.
+    fn refused_measured_text(
+        tag: &str,
+        text: &dyn Fn(&str) -> String,
+        pop: &Population,
+        wrong: &mut Vec<String>,
+    ) {
+        for c in ALL {
+            match try_bind(&text(c), pop) {
+                Err(e) => {
+                    for must in [&measured("ETA_E0", "subject"), MEASURED_AT] {
+                        if !e.contains(must) {
+                            wrong.push(format!("{tag} {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                    for bad in ["reads this block", "reaches `y`"] {
+                        if e.contains(bad) {
+                            wrong.push(format!("{tag} {c:?}: says {bad:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+            }
+        }
+    }
+
+    /// B1 (#1834: P16, P16b, P16c, P16d, R5). On one study per subject with
+    /// `OCC` varying within each subject, `E0`'s two branches on `OCC > 1` are
+    /// proportional: `S` and `2 * (S)` (P16, and P16b written inline), `S` and
+    /// `(S) + (S)` (P16c), `S` and `S` distributed by 2 (P16d). R5 distributes
+    /// the factor `(1 + 0.1 * OCC)` over `TVE0 + PLACEBO` and `ETA_E0`. In each
+    /// the η moves `y` in proportion to the block at every record of each
+    /// subject — a combination of the subject's one level — the block absorbs it, and no single expression reads both: the
+    /// walk names no site, and the certificate measures it. Each is refused
+    /// under every contrast with the measured clause, and agrees with the joint
+    /// oracle. P16 again with the block also scaling the residual error
+    /// (`additive(ADD * exp(PLACEBO))`), which the η does not: the mean still
+    /// absorbs the η, the certificate and the oracle judge the mean, and it is
+    /// refused too.
+    ///
+    /// Mutations — the certificate always false (`spanned` returns all
+    /// `false`): every row binds; the residual multipliers stacked onto the
+    /// predictions (the residual row binds).
+    #[test]
+    fn proportional_branches_are_measured() {
+        let pop = arms_pop();
+        let branches = |a: &str, b: &str| {
+            format!("  if (OCC > 1) {{\n    E0 = {a}\n  }} else {{\n    E0 = {b}\n  }}")
+        };
+        let rows = [
+            row_1836(
+                "P16 proportional branches",
+                branches(S, &format!("2 * ({S})")),
+                false,
+            ),
+            row_1836(
+                "P16b inline",
+                format!("  E0 = if (OCC > 1) {S} else 2 * ({S})"),
+                false,
+            ),
+            row_1836("P16c a sum", branches(S, &format!("({S}) + ({S})")), false),
+            row_1836(
+                "P16d distributed constant",
+                branches(S, "2 * TVE0 + 2 * PLACEBO + 2 * ETA_E0"),
+                false,
+            ),
+            row_1836(
+                "R5 distributed factor",
+                format!("  E0 = (TVE0 + PLACEBO) * {FAC} + ETA_E0 * {FAC}"),
+                false,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for r in &rows {
+            refused_measured(r, &pop, &mut wrong);
+            agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
+        }
+        // The block also scales the residual error, which the η does not: the
+        // mean still absorbs the η, and the certificate judges the mean.
+        let scaled = |c: &str| {
+            let text = row_text(&rows[0])(c);
+            let out = text.replace("DV ~ additive(ADD)", "DV ~ additive(ADD * exp(PLACEBO))");
+            assert_ne!(out, text, "the error model reads the block");
+            out
+        };
+        refused_measured_text("P16, block in the residual", &scaled, &pop, &mut wrong);
+        agrees_with_joint_oracle("P16, block in the residual", &scaled, &pop, &mut wrong);
+        assert!(wrong.is_empty(), "measured:\n{}", wrong.join("\n"));
+    }
+
+    /// B2 (#1834: P16k). A kappa's funnel in proportional branches on `W > 5`,
+    /// which varies within each occasion, on `[STUDY, OCC]`: the block absorbs
+    /// the kappa occasion by occasion. Refused under `sum_to_zero`, `ref` and
+    /// `none`, the clause naming the occasion and not the subject; auto goes
+    /// within; agrees with the joint oracle. `ETA_E0` is declared but read only
+    /// by an unread `Z`, so its unit columns are zero and it measures nothing —
+    /// a random effect with no measured unit is not absorbed.
+    ///
+    /// The twin is proportional on occasion 1 only, and identified on the
+    /// other two: it binds global, and agrees.
+    ///
+    /// Mutations — the certificate always false (auto stays global, and the
+    /// three explicit contrasts bind); a kappa measured over the whole subject
+    /// as one unit, its first occasion's (the twin is refused). Equivalent on
+    /// this closed form, so not killed: the kappa bumped on every occasion at
+    /// once, and a unit's columns taken from every level of the subject —
+    /// a kappa and a level move only their own occasion's records here.
+    #[test]
+    fn a_measured_kappa_absorption() {
+        let pop = arms_pop();
+        let k = "TVE0 + PLACEBO + KAPPA_E0";
+        let r: Row = (
+            "P16k kappa branches",
+            "STUDY, OCC",
+            format!(
+                "  if (W > 5) {{\n    E0 = {k}\n  }} else {{\n    E0 = 2 * ({k})\n  }}\n  \
+                 Z = TVE0 * exp(ETA_E0)"
+            ),
+            format!("E0 + {EMAXY}"),
+            true,
+        );
+        let text = row_text(&r);
+        let mut wrong = Vec::new();
+        let clause = measured("KAPPA_E0", "occasion");
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&text(c), &pop) {
+                Err(e) => {
+                    for must in [
+                        clause.as_str(),
+                        MEASURED_AT,
+                        "reproduce `KAPPA_E0` at every occasion",
+                    ] {
+                        if !e.contains(must) {
+                            wrong.push(format!("{c}: lacks {must:?}: {e}"));
+                        }
+                    }
+                    if e.contains("subject") {
+                        wrong.push(format!("{c}: says \"subject\": {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("{c}: bound {b:?}")),
+            }
+        }
+        match try_bind(&text(""), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("auto: {got:?}, want within")),
+        }
+        agrees_with_joint_oracle(r.0, &text, &pop, &mut wrong);
+        // The twin: proportional on occasion 1 only. On occasions 2 and 3 the
+        // kappa is scaled by `W`, which varies within the occasion while the
+        // occasion's level does not, so it is identified there: every unit must
+        // be measured, not the first.
+        let twin: Row = (
+            "P16k twin, occasion 1 only",
+            "STUDY, OCC",
+            format!(
+                "  if (OCC > 1) {{\n    E0 = TVE0 + PLACEBO + KAPPA_E0 * (1 + 0.1 * W)\n  }} \
+                 else {{\n    E0 = if (W > 5) {k} else 2 * ({k})\n  }}\n  \
+                 Z = TVE0 * exp(ETA_E0)"
+            ),
+            format!("E0 + {EMAXY}"),
+            true,
+        );
+        match try_bind(&row_text(&twin)(""), &pop) {
+            Ok((LevelContrast::SumToZero, _)) => {}
+            got => wrong.push(format!("{} auto: {got:?}, want global", twin.0)),
+        }
+        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
+        assert!(wrong.is_empty(), "kappa:\n{}", wrong.join("\n"));
+    }
+
+    /// #1874 review F1. On `[STUDY, OCC]`, `ETA_E0 * (OCC - 2)` moves `y` as
+    /// `−level₁ + level₃` of each subject's occasions: a combination that sums
+    /// to zero within the subject's `STUDY` group, which `sum_to_zero_within`
+    /// leaves free. So the block absorbs the η under every contrast, within
+    /// included, and the refusal says so — under all five, with the within
+    /// clause, agreeing with the oracle. The twin `ETA_E0 * (OCC + 1)` is
+    /// `2·level₁ + 3·level₂ + 4·level₃`, with a common shift that within removes:
+    /// refused under the global contrasts with the plain clause, auto goes to
+    /// within, and it agrees. The pair straddles the within test.
+    ///
+    /// Mutations — the within residual never taken (F1 binds `within`); always
+    /// within (the twin is refused under within); the within-clause suffix
+    /// deleted; the "under every contrast" sentence deleted.
+    #[test]
+    fn a_within_group_combination_is_absorbed_under_every_contrast() {
+        let pop = arms_pop();
+        let row = |tag, factor: &str| -> Row {
+            (
+                tag,
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * {factor}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            )
+        };
+        let f1 = row("F1 sums to zero", "(OCC - 2)");
+        let twin = row("F1 twin, a shift", "(OCC + 1)");
+        let within = format!("{}{WITHIN} {MEASURED_AT}", measured("ETA_E0", "subject"));
+        let every = "so the levels reproduce it under every contrast, `sum_to_zero_within` \
+                     included: the model is not identified";
+        let mut wrong = Vec::new();
+        for c in ALL {
+            match try_bind(&row_text(&f1)(c), &pop) {
+                Err(e) => {
+                    for must in [within.as_str(), every] {
+                        if !e.contains(must) {
+                            wrong.push(format!("F1 {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("F1 {c:?}: bound {b:?}")),
+            }
+        }
+        agrees_with_joint_oracle(f1.0, &row_text(&f1), &pop, &mut wrong);
+        let plain = format!("{} {MEASURED_AT}", measured("ETA_E0", "subject"));
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&row_text(&twin)(c), &pop) {
+                Err(e) if e.contains(&plain) && !e.contains(WITHIN) && !e.contains(every) => {}
+                got => wrong.push(format!("twin {c:?}: {got:?}")),
+            }
+        }
+        match try_bind(&row_text(&twin)(""), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("twin auto: {got:?}, want within")),
+        }
+        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
+        assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
+    /// B3 (#1834: P17, P18, R5t, R9, R11, Q1). What is identified is not
+    /// measured as absorbed: P17's branches load the η differently, P18's
+    /// factor reads the η, R5t leaves `ETA_E0` out of the distributed factor,
+    /// and R9 / R11 put the varying factor on the block or on a second η term.
+    /// Each binds and agrees with the joint oracle.
+    ///
+    /// Q1, `E0 = S + ETA_E0 * ETA_E0 * OCC`, is why the certificate measures at
+    /// two points: at η = 0 the η's derivative is `1 + 2·η·OCC` = 1, which is
+    /// proportional by accident, and the joint oracle at η = 0 absorbs it — the
+    /// straddle, asserted. At the moved point the derivative varies with `OCC`:
+    /// Q1 is identified, binds, and agrees with the oracle evaluated there.
+    ///
+    /// F3 (#1874 review) is Q1 with the square of `ETA_E0 - ETA_X`, `ETA_X`
+    /// also on `EMAX`: probed with every random effect at one value the
+    /// difference is 0 at both points and the η reads as absorbed; spread per
+    /// random effect (`probe_res`) it is identified, binds under every contrast,
+    /// and agrees with the oracle at the moved point. Its kappa twin, on
+    /// `[STUDY, OCC]` with `(KAPPA_E0 - ETA_E0)²·W`, needs each κ probed
+    /// apart from the ηs: it binds global and agrees.
+    ///
+    /// Mutations — the certificate always true (P17 and every other row is
+    /// refused); the certificate at the first point only (Q1 is refused); every
+    /// random effect at the probe's level, not spread (F3 is refused); each κ
+    /// at the first η's value (the kappa twin is refused).
+    #[test]
+    fn what_the_certificate_does_not_refuse() {
+        let pop = arms_pop();
+        let rows = [
+            row_1836(
+                "P17 condition",
+                format!(
+                    "  if (OCC > 1) {{\n    E0 = {S}\n  }} else {{\n    \
+                     E0 = TVE0 + PLACEBO + 2 * ETA_E0\n  }}"
+                ),
+                false,
+            ),
+            row_1836(
+                "P18 factor reads the η",
+                "  E0 = (TVE0 + PLACEBO) * (1 + 0.1 * OCC * ETA_E0)".into(),
+                false,
+            ),
+            row_1836(
+                "R5t twin",
+                format!("  E0 = (TVE0 + PLACEBO) * {FAC} + ETA_E0"),
+                false,
+            ),
+            row_1836(
+                "R9 twin",
+                format!("  E0 = TVE0 + ETA_E0\n  E0 = E0 + PLACEBO * {FAC}"),
+                false,
+            ),
+            row_1836(
+                "R11 twin",
+                format!("  E0 = {S}\n  E0 = E0 + ETA_E0 * {FAC}"),
+                false,
+            ),
+        ];
+        // #1874 review F3: a term in `ETA_E0 - ETA_X` cancels where the two
+        // random effects sit at one value; the moved point spreads them.
+        let f3 = |c: &str| {
+            let r = row_1836(
+                "F3",
+                format!(
+                    "  EMAX = TVEMAX * exp(ETA_X)\n  \
+                     E0 = {S} + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC"
+                ),
+                false,
+            );
+            let text = row_text(&r)(c);
+            let out = text.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n",
+            );
+            assert_ne!(out, text, "ETA_X is declared");
+            out
+        };
+        let q1 = row_1836(
+            "Q1 a derivative 1 at η = 0",
+            format!("  E0 = {S} + ETA_E0 * ETA_E0 * OCC"),
+            false,
+        );
+        let mut wrong = Vec::new();
+        for r in &rows {
+            binds(r, &pop, &mut wrong);
+            agrees_with_joint_oracle(r.0, &row_text(r), &pop, &mut wrong);
+        }
+        binds(&q1, &pop, &mut wrong);
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        agrees_with_joint_oracle_at(q1.0, &row_text(&q1), &pop, moved, &mut wrong);
+        for c in ALL {
+            if let Err(e) = try_bind(&f3(c), &pop) {
+                wrong.push(format!("F3 {c:?}: refused: {e}"));
+            }
+        }
+        agrees_with_joint_oracle_at("F3", &f3, &pop, moved, &mut wrong);
+        // Its kappa twin: the kappa's funnel plus the square of
+        // `KAPPA_E0 - ETA_E0` scaled by `W`, `ETA_E0` also on `EMAX`. A kappa
+        // probed at the η's value cancels the term; spread, it is identified,
+        // and the block binds global.
+        let f3k: Row = (
+            "F3 kappa",
+            "STUDY, OCC",
+            "  EMAX = TVEMAX * exp(ETA_E0)\n  \
+             E0 = TVE0 + PLACEBO + KAPPA_E0 + (KAPPA_E0 - ETA_E0) * (KAPPA_E0 - ETA_E0) * W"
+                .into(),
+            format!("E0 + {EMAXY}"),
+            true,
+        );
+        match try_bind(&row_text(&f3k)(""), &pop) {
+            Ok((LevelContrast::SumToZero, _)) => {}
+            got => wrong.push(format!("F3 kappa auto: {got:?}, want global")),
+        }
+        agrees_with_joint_oracle_at(f3k.0, &row_text(&f3k), &pop, moved, &mut wrong);
+        // The straddle: at η = 0 alone Q1 reads as absorbed.
+        let (at_zero, _) = joint_oracle(
+            &jacobian(&row_text(&q1)("none"), &pop),
+            LevelContrast::SumToZero,
+        );
+        if at_zero != ["ETA_E0"] {
+            wrong.push(format!(
+                "Q1 at η = 0: the oracle absorbs {at_zero:?}, want ETA_E0"
+            ));
+        }
+        assert!(wrong.is_empty(), "not refused:\n{}", wrong.join("\n"));
+    }
+
+    /// B4. The span residual on synthetic columns: a multiple of a column is in
+    /// its span, to rounding; an orthogonal part shows as its relative size; a
+    /// zero column measures nothing; a repeated column adds no direction; and a
+    /// non-finite entry comes back as `NaN`, which [`SPAN_TOL`] refuses, so an
+    /// inconclusive unit never counts as absorbed.
+    ///
+    /// Mutations — the residual returned without the second Gram–Schmidt pass
+    /// is not observable here (exact columns); the zero test dropped (`None`
+    /// becomes `NaN`); the dependent-column test dropped (the repeated column
+    /// divides by ~0 and the residual is `NaN`).
+    #[test]
+    fn the_span_residual_on_synthetic_columns() {
+        let a = vec![1.0, 2.0, 0.5, -1.0];
+        let b = vec![0.0, 1.0, 0.0, 2.0];
+        let two_a: Vec<f64> = a.iter().map(|x| 2.0 * x).collect();
+        let r = span_residual(&two_a, &[a.clone()]).unwrap();
+        assert!(r.is_finite() && r < 1e-15, "2a against a: {r:e}");
+        // b is orthogonal to a: a + 1e-3·b leaves 1e-3·‖b‖ / ‖a + 1e-3·b‖.
+        let mixed: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x + 1e-3 * y).collect();
+        let r = span_residual(&mixed, &[a.clone()]).unwrap();
+        let want = 1e-3 * 5f64.sqrt() / (6.25f64 + 5e-6).sqrt();
+        assert!(
+            r.is_finite() && (r - want).abs() < 1e-12,
+            "{r:e} vs {want:e}"
+        );
+        assert!(r > SPAN_TOL, "a 1e-3 part is not absorbed");
+        // In the span of both, with a repeated column.
+        let r = span_residual(&mixed, &[a.clone(), a.clone(), b.clone()]).unwrap();
+        assert!(
+            r.is_finite() && r < 1e-15,
+            "a + 1e-3·b against a, a, b: {r:e}"
+        );
+        assert_eq!(span_residual(&[0.0; 4], &[a.clone()]), None);
+        let r = span_residual(&[1.0, f64::NAN, 0.0, 0.0], &[a]).unwrap();
+        assert!(r.is_nan() && !(r < SPAN_TOL), "NaN: {r}");
+    }
+
+    /// The message cells of the measured clause (#1834 plan §3). Each sentence
+    /// of the clause is asserted: the random effect's name, the proportion,
+    /// the unit, and the caveat that it was measured.
+    ///
+    /// | Cell | Row |
+    /// |---|---|
+    /// | η, one column | P16 on `STUDY` (`refused_measured` in B1, plus the template here) |
+    /// | η, nested, global | P16 on `[STUDY, OCC]` under `sum_to_zero` |
+    /// | κ, nested | B2 |
+    /// | free = 0, nested | P16 on `[STUDY, S2]`, `S2` a copy of `STUDY`, auto |
+    /// | two absorbed, one measured and one a site | `KAPPA_E0`'s funnel and `ETA_E0 * F` |
+    /// | `ferx check` | the code `E_THETA_LEVEL_BINDING` on P16 |
+    ///
+    /// Mutations — the nested `why` back to `"{clause} at that grouping"` for a
+    /// measured absorption (the nested cell says it); the unit word swapped.
+    #[test]
+    fn the_measured_clause_in_every_message() {
+        let pop = arms_pop();
+        let p16 = branches_p16();
+        let mut wrong = Vec::new();
+        fn check(
+            wrong: &mut Vec<String>,
+            tag: &str,
+            got: Result<(LevelContrast, usize), String>,
+            must: &[&str],
+            bad: &[&str],
+        ) {
+            match got {
+                Err(e) => {
+                    for m in must.iter().filter(|m| !e.contains(*m)) {
+                        wrong.push(format!("{tag}: lacks {m:?}: {e}"));
+                    }
+                    for b in bad.iter().filter(|b| e.contains(*b)) {
+                        wrong.push(format!("{tag}: says {b:?}: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("{tag}: bound {b:?}")),
+            }
+        }
+        let subject_clause = format!("{} {MEASURED_AT}", measured("ETA_E0", "subject"));
+
+        let one = row_1836("P16", p16.clone(), false);
+        check(
+            &mut wrong,
+            "η, one column",
+            try_bind(&row_text(&one)("sum_to_zero"), &pop),
+            &[&format!(
+                "each `STUDY` level belongs to a single subject, and {subject_clause}, so a level \
+                 and that subject's random effect are the same quantity"
+            )],
+            &["directly", "through", "reads this block"],
+        );
+
+        let nested: Row = (
+            "P16 nested",
+            "STUDY, OCC",
+            p16.clone(),
+            format!("E0 + {EMAXY}"),
+            false,
+        );
+        check(
+            &mut wrong,
+            "η, nested, global",
+            try_bind(&row_text(&nested)("sum_to_zero"), &pop),
+            &[
+                &format!(
+                    "leaves each STUDY group's mean free, but {subject_clause} — the two are the \
+                     same quantity"
+                ),
+                "Use `contrast = sum_to_zero_within`",
+            ],
+            &["at that grouping"],
+        );
+        match try_bind(&row_text(&nested)(""), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("η, nested, auto: {got:?}, want within")),
+        }
+
+        let mut single = pop.clone();
+        for s in single.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            s.covariates.insert("S2".into(), study);
+        }
+        let free0: Row = (
+            "P16 one level per group",
+            "STUDY, S2",
+            p16,
+            format!("E0 + {EMAXY}"),
+            false,
+        );
+        check(
+            &mut wrong,
+            "free = 0, nested",
+            try_bind(&row_text(&free0)(""), &single),
+            &[
+                &format!("every STUDY group has a single level, and {subject_clause}"),
+                "Remove the block.",
+            ],
+            &["sum_to_zero_within` (the default"],
+        );
+
+        let joint: Row = (
+            "a site and a measurement",
+            "STUDY, OCC",
+            "  F = if (OCC > 1) 1 else 2\n  E0 = TVE0 + PLACEBO + KAPPA_E0 + ETA_E0 * F".into(),
+            format!("E0 + {EMAXY}"),
+            true,
+        );
+        let got = try_bind(&row_text(&joint)("sum_to_zero_within"), &pop);
+        check(
+            &mut wrong,
+            "two absorbed",
+            got.clone(),
+            &[
+                "the levels absorb `ETA_E0` and `KAPPA_E0` together (",
+                &subject_clause,
+                "`E0` reads this block and carries a random effect",
+            ],
+            &[],
+        );
+        if let Err(e) = &got {
+            if e.matches(MEASURED_AT).count() != 1 {
+                wrong.push(format!("two absorbed: the measured clause not once: {e}"));
+            }
+        }
+
+        let text = row_text(&one)("sum_to_zero");
+        let mut parsed = parse_full_model(&text).unwrap();
+        let mut p = pop.clone();
+        match bind_theta_levels_diag(&mut parsed, &text, &mut p) {
+            Err(d) if d.code == "E_THETA_LEVEL_BINDING" && d.message.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("ferx check: {got:?}")),
+        }
+        assert!(wrong.is_empty(), "messages:\n{}", wrong.join("\n"));
+    }
+
+    /// B6 (#1834). The certificate reads the predictions and residual
+    /// multipliers only, so a model with a likelihood channel it does not
+    /// compare is not measured — the dead-level check's limit, shared. P16's
+    /// proportional branches on `CL` of an ODE model, one study per subject:
+    /// with the event model removed the block absorbs `ETA_CL` and is refused
+    /// with the measured clause; with a hazard on the model the certificate is
+    /// skipped and the block binds. Both sides of the gate in one test; the
+    /// joint model's absorption is real and goes unrefused, which is the limit
+    /// `docs/model-file/parameters.qmd` states.
+    ///
+    /// Mutation — the skip removed from `measure_levels` (the joint model is
+    /// refused).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_certificate_is_skipped_off_gaussian() {
+        let joint = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta PLACEBO[STUDY, contrast = sum_to_zero](0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  if (OCC > 1) {
+    CL = TVCL * exp(PLACEBO + ETA_CL)
+  } else {
+    CL = 2 * TVCL * exp(PLACEBO + ETA_CL)
+  }
+  V    = TVV
+  H0   = TVH0
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let mut pop = arms_pop();
+        for s in pop.subjects.iter_mut() {
+            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        }
+        let pk_only = joint.replace("[event_model]\n  cmt    = 3\n  hazard = H0\n", "");
+        assert_ne!(pk_only, joint, "the event model is removed");
+        let err = try_bind(&pk_only, &pop).expect_err("Gaussian only: measured");
+        assert!(
+            err.contains(&measured("ETA_CL", "subject")) && err.contains(MEASURED_AT),
+            "{err}"
+        );
+        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 3)));
+    }
+
+    /// #1880. Two random effects absorbed by a **one-column** block. With one
+    /// level per unit two absorbed random effects are each other's twin, which
+    /// the block is not to blame for; with several levels per unit they are
+    /// not, and the block absorbs each on its own. Neither the within contrast
+    /// (a one-column block is one group) nor dropping one of them rescues it —
+    /// only removing the block, or every one of them.
+    ///
+    /// Two pairs, on [`arms_pop`] with a one-column `CELL` key:
+    /// - η: `CELL` = study × occasion, `E0 = S + ETA_EM * OCC`. Both are
+    ///   measured (the `OCC` term leaves no funnel), as two combinations of
+    ///   the subject's three levels; the oracle absorbs both.
+    /// - κ: `CELL` = one level per record, `KAPPA_E0` on `E0` with the block (a
+    ///   site) and `KAPPA_EM` on `EMAX` (measured): the occasion wording.
+    ///
+    /// Each sentence of the refusal is asserted on both. The straddle: the η
+    /// pair keyed on the nested `[STUDY, OCC]` keeps the within / "drop one"
+    /// advice and never the one-column sentences, so a refusal stuck on either
+    /// branch fails here.
+    ///
+    /// Mutations — the one-column branch removed (the one-column cells give the
+    /// within advice); taken for every block (the nested twin loses it); the
+    /// unit phrase fixed to "a single subject" (the kappa pair); each sentence
+    /// of the branch deleted in turn.
+    #[test]
+    fn a_one_column_block_absorbing_two_random_effects() {
+        let keyed = |cell: &dyn Fn(usize, f64, usize) -> f64| {
+            let mut p = arms_pop();
+            for (si, sub) in p.subjects.iter_mut().enumerate() {
+                for (j, m) in sub.obs_covariates.iter_mut().enumerate() {
+                    let occ = m["OCC"];
+                    m.insert("CELL".to_string(), cell(si, occ, j));
+                }
+            }
+            p
+        };
+        let by_occasion = keyed(&|si, occ, _| (10 * (si + 1)) as f64 + occ);
+        let by_record = keyed(&|si, _, j| (100 * (si + 1) + j) as f64);
+        let etas = |cols: &'static str| {
+            move |c: &str| {
+                cf_model(
+                    c,
+                    cols,
+                    &format!("{BASE}  E0 = {S} + ETA_EM * OCC"),
+                    &format!("E0 + {EMAXY}"),
+                )
+                .replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  omega ETA_EM ~ 0.1\n",
+                )
+            }
+        };
+        let eta_pair = etas("CELL");
+        let nested = etas("STUDY, OCC");
+        let kappa_pair = |c: &str| {
+            cf_model(
+                c,
+                "CELL",
+                "  EMAX = TVEMAX + KAPPA_EM\n  ET50 = TVET50\n  E0 = TVE0 + PLACEBO + KAPPA_E0\n  \
+                 Z = TVE0 * exp(ETA_E0)",
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n  kappa KAPPA_EM ~ 0.1\n",
+            )
+        };
+        let sentences = |within: &str| {
+            [
+                format!(
+                    "theta PLACEBO[CELL]: each `CELL` level lies within {within}, and the levels \
+                     absorb "
+                ),
+                "so the model is not identified under any contrast.".to_string(),
+                " Dropping one random effect leaves the block absorbing the other: remove the \
+                 block, or drop all of them."
+                    .to_string(),
+            ]
+        };
+        let within_advice = [
+            "`contrast = sum_to_zero_within` leaves each",
+            "Drop one of the random effects",
+        ];
+        let mut wrong = Vec::new();
+        let one_col: [(&str, &dyn Fn(&str) -> String, &Population, &str, &str); 2] = [
+            (
+                "η pair",
+                &eta_pair,
+                &by_occasion,
+                "a single subject",
+                "absorb `ETA_E0` and `ETA_EM` (",
+            ),
+            (
+                "κ pair",
+                &kappa_pair,
+                &by_record,
+                "a single occasion of one subject",
+                "absorb `KAPPA_E0` and `KAPPA_EM` (",
+            ),
+        ];
+        for (tag, text, pop, within, extra) in one_col {
+            for c in ALL {
+                match try_bind(&text(c), pop) {
+                    Err(e) => {
+                        for m in sentences(within).iter().map(String::as_str).chain([extra]) {
+                            if !e.contains(m) {
+                                wrong.push(format!("{tag} {c:?}: lacks {m:?}: {e}"));
+                            }
+                        }
+                        for b in within_advice {
+                            if e.contains(b) {
+                                wrong.push(format!("{tag} {c:?}: says {b:?}: {e}"));
+                            }
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+        }
+        agrees_with_joint_oracle("η pair", &eta_pair, &by_occasion, &mut wrong);
+        // The nested twin keeps the within advice.
+        for c in ALL {
+            match try_bind(&nested(c), &by_occasion) {
+                Err(e) => {
+                    for m in within_advice {
+                        if !e.contains(m) {
+                            wrong.push(format!("nested {c:?}: lacks {m:?}: {e}"));
+                        }
+                    }
+                    if e.contains("Dropping one random effect") || e.contains("level lies within") {
+                        wrong.push(format!("nested {c:?}: one-column text: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("nested {c:?}: bound {b:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "one column, two absorbed:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// #1882. A `FIX` level has no direction for the data to estimate, so
+    /// neither level check measures it, and both read the one lookup
+    /// (`free_level_thetas`). On a block fixed whole: the `TIME = 0` levels of
+    /// `g_no_eta` are dead, and P16's η lies in the levels' span, yet both bind;
+    /// the unfixed controls are refused — the dead levels, and P16 with the
+    /// measured clause. Both callers of the lookup are on each side.
+    ///
+    /// Mutation — the lookup counting a fixed level as free (both fixed rows
+    /// are refused).
+    #[test]
+    fn a_fixed_level_is_not_measured() {
+        let fix = |text: String| {
+            let out = text.replace("(0.0, -10.0, 10.0)", "(0.0, -10.0, 10.0, FIX)");
+            assert_ne!(out, text, "the block is fixed");
+            out
+        };
+        let mut wrong = Vec::new();
+        let t6 = cf_pop(3, 1, &T6);
+        let dead = g_no_eta("STUDY, TIME", "none");
+        match try_bind(&dead, &t6) {
+            Err(e) if e.contains(DEAD_LEVELS) => {}
+            got => wrong.push(format!("dead, free: {got:?}")),
+        }
+        if let Err(e) = try_bind(&fix(dead), &t6) {
+            wrong.push(format!("dead, FIX: refused: {e}"));
+        }
+        let pop = arms_pop();
+        let p16 = row_text(&row_1836("P16", branches_p16(), false))("none");
+        match try_bind(&p16, &pop) {
+            Err(e) if e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("P16, free: {got:?}")),
+        }
+        if let Err(e) = try_bind(&fix(p16), &pop) {
+            wrong.push(format!("P16, FIX: refused: {e}"));
+        }
+        assert!(wrong.is_empty(), "FIX:\n{}", wrong.join("\n"));
+    }
+
+    /// P16's `[individual_parameters]`: `E0` in proportional branches on `OCC > 1`.
+    fn branches_p16() -> String {
+        format!("  if (OCC > 1) {{\n    E0 = {S}\n  }} else {{\n    E0 = 2 * ({S})\n  }}")
     }
 }
 

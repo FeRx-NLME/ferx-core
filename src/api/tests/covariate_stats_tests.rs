@@ -847,6 +847,13 @@ fn binding_preserves_a_level_block_binding_made_first() {
         subject
             .covariates
             .insert("STUDY".to_string(), (i + 1) as f64);
+        // Two times per subject: with one study per subject and a single
+        // record, `ETA_CL` and the subject's level are one number each on one
+        // record, which the binder measures as absorbed and refuses (#1834).
+        subject.obs_times = vec![1.0, 4.0];
+        subject.observations = vec![1.0, 0.5];
+        subject.obs_cmts = vec![1, 1];
+        subject.cens = vec![0, 0];
     }
 
     let mut parsed = parse_full_model(text).expect("model should parse");
