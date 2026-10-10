@@ -565,6 +565,9 @@ keeps the finite-difference covariance, subject to its numerical convergence and
   occasions. The assembly uses the full joint mode and quadrature grid and ties
   the shared covariance derivatives across occasions. IOV with modeled lag,
   LTBS, or observation scaling remains outside this covariance scope.
+- The exact conditional Hessian must be positive-definite at the subject's **mode** only.
+  At a quadrature node it may be indefinite, which is common in the tails of a wide-Ω grid,
+  because the assembly contracts it there and never inverts it (#1844).
 - The subject's anchor is well conditioned. A flat or unidentifiable random-effect
   direction is declined rather than reported: the assembly would otherwise invert a
   near-singular matrix and return standard errors inflated by orders of magnitude.

@@ -669,9 +669,19 @@ pub(crate) struct NodeJet {
 /// `theta_block`, not here"* — and `theta_block` is exactly what this path does **not** call:
 /// [`subject_cov_hessian_parts`] reads `prep.et`, `prep.omega_inv` and `z = Ω⁻¹·b`, all of which
 /// are ordinary functions of the evaluation point. `node_jet_at_the_mode_reproduces_the_focei_parts`
-/// pins the mode case against #436 so a future mode-only assumption in `prepare` fails loudly.
+/// pins the mode case against #436, so a drift between this path's
+/// `prepare_covariance_point` → `prepare_point_stacked` and the mode's `prepare` fails loudly
+/// there.
+///
+/// **A node factors nothing** (#1844). The preparation here is the [`PointPrep`] half, not the
+/// full `Prep`: the mode's `Prep` Cholesky-factors the exact `H`, which is the mode's
+/// precondition (`b̂_ζ = −H⁻¹M_ζ`) and not a node's. Away from the mode `H_j` may be indefinite —
+/// on `two_cpt_oral_cov` at `n_agq = 3` one tail node per subject was, for 14 of 30 subjects —
+/// and term (C) only contracts it, as `β_lᵀH_jβ_k`. Holding a `PointPrep` makes a node-side read
+/// of `h_inner_inv` a compile error rather than a silent mode-only assumption.
 ///
 /// [`subject_cov_hessian_parts`]: super::sens_cov_hessian::subject_cov_hessian_parts
+/// [`PointPrep`]: crate::estimation::sens_outer_gradient::PointPrep
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn node_jet(
     model: &CompiledModel,
@@ -684,12 +694,12 @@ pub(crate) fn node_jet(
 ) -> Option<NodeJet> {
     use crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule;
     use crate::estimation::sens_cov_hessian::{
-        covariance_sensitivities, prepare_covariance, subject_cov_hessian_parts,
+        covariance_sensitivities, prepare_covariance_point, subject_cov_hessian_parts,
     };
     use crate::estimation::sens_outer_gradient::score_core;
 
     let sens = covariance_sensitivities(model, subject, &params.theta, b)?;
-    let prep = prepare_covariance(model, subject, params, &sens, b)?;
+    let prep = prepare_covariance_point(model, subject, params, &sens, b)?;
     let core = score_core(
         model,
         subject,
@@ -700,6 +710,14 @@ pub(crate) fn node_jet(
         b,
         model.residual_error_eta,
     )?;
+    // The one half of the mode's Cholesky a node does need: an `H_j` the provider could not
+    // evaluate (a far tail overflowing to NaN) is out of scope, not merely indefinite. Before
+    // #1844 the factorisation refused it as a side effect. Only `H_j` is guarded here; a
+    // non-finite `s`, `g` or `parts` with a finite `H_j` is declined by the population
+    // assembly's `is_finite` backstop in `covariance::analytic_cov_assembly`.
+    if !core.h_inner.iter().all(|v| v.is_finite()) {
+        return None;
+    }
     let g = if model.n_kappa > 0 {
         let mut g = &prep.omega_inv * DVector::from_column_slice(b);
         for (obs, e) in sens.obs.iter().zip(&core.et) {
@@ -1004,7 +1022,7 @@ pub(crate) fn fixed_b_natural_score(
     subject: &Subject,
     params: &ModelParameters,
     sens: &crate::sens::provider::SubjectSens,
-    prep: &crate::estimation::sens_outer_gradient::Prep,
+    prep: &crate::estimation::sens_outer_gradient::PointPrep,
     core: &crate::estimation::sens_outer_gradient::ScoreCore,
     b: &[f64],
 ) -> Vec<f64> {

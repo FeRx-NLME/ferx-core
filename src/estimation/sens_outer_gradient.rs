@@ -376,26 +376,21 @@ pub(crate) struct CovariancePrior {
     pub(crate) basis: Vec<DMatrix<f64>>,
 }
 
-/// Shared per-subject quantities the theta/omega/sigma gradient blocks consume.
-pub(crate) struct Prep {
+/// The per-subject quantities of [`Prep`] that are **values at the evaluation point** —
+/// everything `prepare_stacked` builds before it factors anything.
+///
+/// Split from [`Prep`] (#1844) because an AGQ quadrature node needs exactly these and never an
+/// inverse: its exact `H_j` is contracted directly by term (C) and may be indefinite away from
+/// the mode, where the Cholesky inside `invert_inner_hessian` would refuse it. Holding a
+/// `PointPrep` and not a `Prep` is what makes a node-side read of `h_inner_inv` a compile error
+/// instead of a silent mode-only assumption.
+pub(crate) struct PointPrep {
     pub(crate) covariance_prior: Option<CovariancePrior>,
     pub(crate) n_eta: usize,
     pub(crate) n_obs: usize,
     pub(crate) et: Vec<ErrTerms>,
     /// `Ω⁻¹` (copied so blocks don't borrow `params`).
     pub(crate) omega_inv: DMatrix<f64>,
-    /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
-    pub(crate) htilde_inv: DMatrix<f64>,
-    /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
-    /// Built by `invert_inner_hessian`, whose Cholesky is a **precondition** gate and
-    /// not merely a matrix-shape one — see there before widening it.
-    pub(crate) h_inner_inv: DMatrix<f64>,
-    /// `wⱼ = H̃⁻¹aⱼ`.
-    pub(crate) w: Vec<DVector<f64>>,
-    /// `qⱼ = aⱼᵀ H̃⁻¹ aⱼ`.
-    pub(crate) q: Vec<f64>,
-    /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
-    pub(crate) g_eta: Vec<f64>,
     // Per-observation M3-censored flag lives on `et[j].censored` (single source).
     // Censored rows enter `H` (true inner Hessian), the data gradient, AND `H̃`/`log|H̃|`
     // at FOCEI order (`p = g2`, `β = dg2/df`; residual-eta `C·z`/`C·m`) — consistently with
@@ -430,6 +425,35 @@ pub(crate) struct Prep {
     /// (which re-walks every magnitude expression per observation) a second time
     /// for the same subject/θ (#486 review).
     pub(crate) mult: Option<Vec<Vec<f64>>>,
+}
+
+/// Shared per-subject quantities the theta/omega/sigma gradient blocks consume: the
+/// [`PointPrep`] values plus the two factored inverses and what is built from them.
+///
+/// Building one requires `H̃` **and** the exact `H` to be positive-definite — the mode's
+/// precondition (`b̂_ζ = −H⁻¹M_ζ`), not a property of an arbitrary evaluation point. Point
+/// fields are reached through `Deref`, so `prep.et` reads unchanged.
+pub(crate) struct Prep {
+    pub(crate) point: PointPrep,
+    /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
+    pub(crate) htilde_inv: DMatrix<f64>,
+    /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
+    /// Built by `invert_inner_hessian`, whose Cholesky is a **precondition** gate and
+    /// not merely a matrix-shape one — see there before widening it.
+    pub(crate) h_inner_inv: DMatrix<f64>,
+    /// `wⱼ = H̃⁻¹aⱼ`.
+    pub(crate) w: Vec<DVector<f64>>,
+    /// `qⱼ = aⱼᵀ H̃⁻¹ aⱼ`.
+    pub(crate) q: Vec<f64>,
+    /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
+    pub(crate) g_eta: Vec<f64>,
+}
+
+impl std::ops::Deref for Prep {
+    type Target = PointPrep;
+    fn deref(&self) -> &PointPrep {
+        &self.point
+    }
 }
 
 /// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
@@ -587,6 +611,27 @@ pub(crate) fn prepare(
     eta_hat: &[f64],
 ) -> Option<Prep> {
     prepare_stacked(
+        model,
+        subject,
+        params,
+        sens,
+        model.n_eta,
+        params.omega.inv.clone(),
+        eta_hat,
+        model.residual_error_eta,
+    )
+}
+
+/// [`prepare`]'s point half: the same arguments into [`prepare_point_stacked`], so the mode and
+/// node preparations of a no-IOV model cannot drift apart (#1844).
+pub(crate) fn prepare_point(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    eta_hat: &[f64],
+) -> Option<PointPrep> {
+    prepare_point_stacked(
         model,
         subject,
         params,
@@ -1183,8 +1228,10 @@ fn invert_inner_hessian(h_inner: DMatrix<f64>) -> Option<DMatrix<f64>> {
     Some(h_inner.cholesky()?.inverse())
 }
 
+/// [`PointPrep`] plus the two unfactored Hessians `(H̃, H)` it was built alongside — the shared
+/// first half of [`prepare_stacked`] and [`prepare_point_stacked`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_stacked(
+fn prepare_point_and_hessians(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -1193,10 +1240,7 @@ pub(crate) fn prepare_stacked(
     omega_inv: DMatrix<f64>,
     eta_hat: &[f64],
     ruv: Option<usize>,
-) -> Option<Prep> {
-    let n_obs = subject.observations.len();
-    let err_keys = model.error_spec.obs_keys(subject);
-    let sigma = &params.sigma.values;
+) -> Option<(PointPrep, DMatrix<f64>, DMatrix<f64>)> {
     let ScoreCore {
         et,
         htilde,
@@ -1211,9 +1255,73 @@ pub(crate) fn prepare_stacked(
     } = score_core(
         model, subject, params, sens, n_eta, &omega_inv, eta_hat, ruv,
     )?;
+    let point = PointPrep {
+        covariance_prior: None,
+        n_eta,
+        n_obs: subject.observations.len(),
+        et,
+        omega_inv,
+        ruv,
+        g_ruv,
+        gp_ruv,
+        ruv_scale,
+        cens_dcz_df,
+        cens_dcm_df,
+        mult,
+    };
+    Some((point, htilde, h_inner))
+}
+
+/// The point half of [`prepare_stacked`]: every [`PointPrep`] value at `eta_hat`, with **no**
+/// factorisation, so it succeeds where `H` is indefinite.
+///
+/// For evaluation points that are not the mode — an AGQ quadrature node (#1844), whose exact
+/// `H_j` term (C) contracts directly. A caller that needs `H⁻¹` or `H̃⁻¹` must use
+/// [`prepare_stacked`], which keeps the positive-definiteness gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_point_stacked(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    n_eta: usize,
+    omega_inv: DMatrix<f64>,
+    eta_hat: &[f64],
+    ruv: Option<usize>,
+) -> Option<PointPrep> {
+    prepare_point_and_hessians(model, subject, params, sens, n_eta, omega_inv, eta_hat, ruv)
+        .map(|(point, _, _)| point)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_stacked(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    n_eta: usize,
+    omega_inv: DMatrix<f64>,
+    eta_hat: &[f64],
+    ruv: Option<usize>,
+) -> Option<Prep> {
+    let n_obs = subject.observations.len();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let sigma = &params.sigma.values;
+    let (point, htilde, h_inner) =
+        prepare_point_and_hessians(model, subject, params, sens, n_eta, omega_inv, eta_hat, ruv)?;
 
     let htilde_inv = htilde.cholesky()?.inverse();
     let h_inner_inv = invert_inner_hessian(h_inner)?;
+    let PointPrep {
+        et,
+        g_ruv,
+        gp_ruv,
+        ruv_scale,
+        cens_dcz_df,
+        cens_dcm_df,
+        ..
+    } = &point;
+    let ruv_scale = *ruv_scale;
 
     let mut w: Vec<DVector<f64>> = Vec::with_capacity(n_obs);
     let mut q = vec![0.0f64; n_obs];
@@ -1320,23 +1428,12 @@ pub(crate) fn prepare_stacked(
     }
 
     Some(Prep {
-        covariance_prior: None,
-        n_eta,
-        n_obs,
-        et,
-        omega_inv,
+        point,
         htilde_inv,
         h_inner_inv,
         w,
         q,
         g_eta,
-        ruv,
-        g_ruv,
-        gp_ruv,
-        ruv_scale,
-        cens_dcz_df,
-        cens_dcm_df,
-        mult,
     })
 }
 
