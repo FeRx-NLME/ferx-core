@@ -9,12 +9,14 @@
 //! re-decomposition's last bits go through the OS math library): measured at `160cc9a3`,
 //! warfarin FOCE diverges by 9.7e-7 on macOS arm64 and 6.9e-5 on Linux/aarch64, and
 //! two_cpt_oral_cov FOCEI by 1.5e-6 / 2.8e-7, so both rows discriminate on both
-//! platforms. warfarin_iov FOCEI (the issue's own fixture) reloads bit-identically on
-//! macOS even without the vector and diverges by 2.6e-8 on Linux, so its row asserts the
-//! claim only.
+//! platforms. warfarin Laplace (review r1 #3, the docs' Laplace claim) discriminates on
+//! both too: its premise held on macOS arm64 and Linux/aarch64 in that round. warfarin_iov
+//! FOCEI (the issue's own fixture) reloads bit-identically on macOS even without the
+//! vector and diverges by 2.6e-8 on Linux, so its row asserts the claim only.
 //!
 //! Mutations — `load_fit` reads `packed_estimate: None`: every claim dies; route
-//! `PackedEstimate::Usable` to the fallback arm in `run_covariance`: every claim dies.
+//! `PackedEstimate::Usable` to the fallback arm in `run_covariance`: every discriminating
+//! row dies (warfarin_iov survives on macOS, as above).
 //!
 //! Engines: every fixture runs analytic (`Dual2`) inner gradients, asserted per fit
 //! through `gradient_method_inner`; the outer optimizer is the `auto` default.
