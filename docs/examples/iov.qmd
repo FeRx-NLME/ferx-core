@@ -122,7 +122,7 @@ The console summary gains a `KAPPA (IOV) Estimates` block, and the fit YAML gain
 Console output (Option A, single kappa on CL):
 ```
 --- KAPPA (IOV) Estimates ---
-  KAPPA_CL = 0.041200  (CV% = 20.3)  SE = 0.008000
+  KAPPA_CL = 0.041200  (CV% = 20.5)  SE = 0.008000
 ```
 
 For Option B with off-diagonal correlations a `--- Correlations ---` block follows the diagonal entries.

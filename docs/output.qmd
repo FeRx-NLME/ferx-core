@@ -202,11 +202,11 @@ theta:
 omega:
   omega_11:
     variance: 0.028584
-    cv_pct: 16.9
+    cv_pct: 17.03
     se: 0.006394
   omega_22:
     variance: 0.009613
-    cv_pct: 9.8
+    cv_pct: 9.83
     se: 0.002165
 sigma:
   sigma_1:
@@ -265,7 +265,8 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
 - **cv_pct** / **sd**: how an `omega` / `omega_iov` variance reads on the scale
   its random effect enters (#1643). A log-normal effect (`TVCL * exp(ETA)`) gets
-  `cv_pct` = sqrt(variance) * 100, the usual small-variance approximation. An
+  `cv_pct` = sqrt(exp(variance) - 1) * 100, the exact CV (#1858; formerly the
+  first-order sqrt(variance) * 100: 44.7 for 47.1 at 0.2; `.inf` past ~709.8). So does an untyped one. An
   additive (`TVV + ETA`) or logit (`inv_logit(THETA + ETA)`) effect gets `sd` =
   sqrt(variance) instead, since a CV% of an effect that does not multiply its
   parameter means nothing. An effect in any other expression gets neither key.
@@ -283,18 +284,19 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   (#1683, #1697). That line's figure is printed exactly when the row's note is
   (#1698): a custom kappa, or a covariance step that failed or fell back to SIR,
   leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
-- **weight** / **weight_typical** / **sd_at_typical_weight**: present only on the
-  `omega_iov` entry of a sample-size-weighted kappa (`kappa K ~ γ² weight = W`,
-  #1660). `weight` is the source text of `W` (quoted), `weight_typical` the median
-  weight over the dataset's subject-occasions, and `sd_at_typical_weight` =
+- **weight** / **weight_typical** / **sd_at_typical_weight** /
+  **cv_pct_at_typical_weight**: present only on the `omega_iov` entry of a
+  sample-size-weighted kappa (`kappa K ~ γ² weight = W`, #1660). `weight` is the
+  source text of `W` (quoted), `weight_typical` the median weight over the
+  dataset's subject-occasions, and `sd_at_typical_weight` =
   sqrt(variance / weight_typical), the between-arm SD at that typical arm — the
-  number the console's weight line prints. `variance` and its `cv_pct` / `sd` line
-  keep their meaning (the weight-1 γ² and its CV% or square root): a weighted
-  log-normal kappa's `cv_pct` is the CV% of a one-subject arm, and no separate
-  typical-arm CV% key is written, since with `cv_pct` = sqrt(variance) * 100 it
-  would be exactly `100 * sd_at_typical_weight` (#1666). Without a
-  positive typical weight, or when the variance is negative, only `weight` is
-  written. An unweighted kappa's entry carries none of the three.
+  number the console's weight line prints for an additive or logit kappa. A
+  log-normal (or untyped) kappa also gets `cv_pct_at_typical_weight` =
+  sqrt(exp(variance / weight_typical) - 1) * 100, its weight line's CV% (#1858),
+  which is not `100 * sd_at_typical_weight`. `variance` and its `cv_pct` / `sd`
+  line stay the weight-1 γ² and its CV% or square root (#1666). Without a positive
+  typical weight, or when the variance is negative, only `weight` is written. An
+  unweighted kappa's entry carries none of these.
 - **covariance_method**: which estimator produced the standard errors — `r`, `s`
   or `rsr`. Present only when a covariance matrix was produced; see below.
 
