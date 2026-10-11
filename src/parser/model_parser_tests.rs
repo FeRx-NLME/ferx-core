@@ -29640,6 +29640,193 @@ fn conditional_name_read_by_a_markov_model_is_refused() {
     assert_conditional_read(&err, "Q01", "named in `[markov_model]`");
 }
 
+// ── #1902: an assignment target is not a read ────────────────────────────────
+
+/// A helper `h` assigned and read only inside the arm that computes `CL`, which
+/// every path assigns: nothing outside the block reads `h`.
+fn arm_local_helper(h: &str) -> String {
+    format!(
+        "  if (WT > 70) {{\n    {h} = 2\n    CL = TVCL * {h} * exp(ETA_CL)\n  }} else {{\n    \
+         CL = TVCL * exp(ETA_CL)\n  }}"
+    )
+}
+
+/// `h` assigned on one path only, after an unconditional `CL`.
+fn partial_helper(h: &str) -> String {
+    format!("  CL = TVCL * exp(ETA_CL)\n  if (WT > 70) {{\n    {h} = 2\n  }}")
+}
+
+/// For each `(helper, block that names it only as a target or literal, the
+/// same block reading it on a right-hand side, label)`: the arm-local helper
+/// parses, and the reading twin refuses it under the block's label — so each
+/// pair straddles the gate, and the refusal still sees the block.
+fn assert_target_is_not_a_read(cases: &[(&str, String, String, String)], ode: bool) {
+    let rhs = "-(CL/V) * central";
+    for (h, quiet, reads, label) in cases {
+        let build = |ip: &str, extra: &str| {
+            if ode {
+                cond_ode_model(ip, rhs, extra)
+            } else {
+                cond_pk_model(ip, "", extra)
+            }
+        };
+        parse_model_string(&build(&arm_local_helper(h), quiet))
+            .unwrap_or_else(|e| panic!("`{h}` is read by nothing outside the block: {e}"));
+        let err = refused_with_valid_twin(&build(&partial_helper(h), reads), h);
+        assert_conditional_read(&err, h, &format!("named in `{label}`"));
+    }
+}
+
+/// The issue's rows: a helper named like an `[event_model]` key (`RATE`,
+/// `SHAPE`) or a word value (`WEIBULL`, `TTE`, `RESET`) parses, unnamed and
+/// named; `RENAMED` is the control that parsed before #1857 too.
+#[cfg(feature = "survival")]
+#[test]
+fn event_model_keys_and_words_are_not_reads_of_a_helper() {
+    let weibull = "  cmt    = 3\n  family = weibull\n  shape  = 1.0\n";
+    let bodies = [
+        ("RATE", format!("{weibull}  rate   = 20\n")),
+        ("SHAPE", format!("{weibull}  scale  = 20\n")),
+        ("WEIBULL", format!("{weibull}  scale  = 20\n")),
+        ("RENAMED", format!("{weibull}  rate   = 20\n")),
+        (
+            "TTE",
+            "  cmt = 3\n  family = exponential\n  type = tte\n  scale = 20\n".to_string(),
+        ),
+        (
+            "RESET",
+            "  cmt = 3\n  family = exponential\n  type = rtte\n  clock = reset\n  scale = 20\n"
+                .to_string(),
+        ),
+    ];
+    let mut cases = Vec::new();
+    for header in ["[event_model]", "[event_model DEATH]"] {
+        for (h, body) in &bodies {
+            let reads = body
+                .replace("rate   = 20", &format!("rate   = 20 * {h}"))
+                .replace("scale = 20", &format!("scale = 20 * {h}"))
+                .replace("scale  = 20", &format!("scale  = 20 * {h}"));
+            assert_ne!(&reads, body, "the reading twin of `{h}` must read it");
+            cases.push((
+                *h,
+                format!("{header}\n{body}"),
+                format!("{header}\n{reads}"),
+                header.to_string(),
+            ));
+        }
+    }
+    assert_target_is_not_a_read(&cases, false);
+}
+
+/// `[binary_model]`: the `logit` key and the `link = logit` word.
+#[cfg(feature = "survival")]
+#[test]
+fn binary_model_key_and_link_word_are_not_reads_of_a_helper() {
+    let body = "[binary_model]\n  cmt   = 3\n  link  = logit\n  logit = 0.5\n";
+    let cases = [(
+        "LOGIT",
+        body.to_string(),
+        body.replace("logit = 0.5", "logit = 0.5 * LOGIT"),
+        "[binary_model]".to_string(),
+    )];
+    assert_target_is_not_a_read(&cases, true);
+}
+
+/// `[markov_model]`: the state labels, in `states = [...]` and on a
+/// `transition` target.
+#[cfg(feature = "markov")]
+#[test]
+fn markov_model_state_labels_are_not_reads_of_a_helper() {
+    let body = "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+                states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
+                transition asleep -> awake  = 0.3\n";
+    let cases = [(
+        "AWAKE",
+        body.to_string(),
+        body.replace("asleep = 0.5", "asleep = 0.5 * AWAKE"),
+        "[markov_model]".to_string(),
+    )];
+    assert_target_is_not_a_read(&cases, true);
+}
+
+/// `[odes]`' `d/dt(...)` (`D`, `DT`) and `[initial_conditions]`' `init(...)`
+/// targets.
+#[test]
+fn ode_and_initial_condition_targets_are_not_reads_of_a_helper() {
+    let rhs = "-(CL/V) * central";
+    for h in ["D", "DT"] {
+        parse_model_string(&cond_ode_model(&arm_local_helper(h), rhs, ""))
+            .unwrap_or_else(|e| panic!("`{h}` is read by nothing outside the block: {e}"));
+        let reads = format!("{rhs} * {h}");
+        let err = refused_with_valid_twin(&cond_ode_model(&partial_helper(h), &reads, ""), h);
+        assert_conditional_read(&err, h, "named in `[odes]`");
+    }
+    let ic = "[initial_conditions]\n  init(central) = 1\n";
+    let cases = [(
+        "INIT",
+        ic.to_string(),
+        ic.replace("= 1", "= INIT"),
+        "[initial_conditions]".to_string(),
+    )];
+    assert_target_is_not_a_read(&cases, false);
+}
+
+/// The docs' limit: a line that is not `target = expr` counts whole, so an
+/// arm-local helper named like the `pk` call's own words is still refused.
+#[test]
+fn a_line_that_is_not_an_assignment_counts_whole() {
+    for h in ["PK", "ONE_CPT_ORAL"] {
+        let err = parse_err(&cond_pk_model(&arm_local_helper(h), "", ""));
+        assert_conditional_read(&err, h, "named in `[structural_model]`");
+    }
+}
+
+/// What counts as an assignment target: a first `=` (not `==`) after an
+/// identifier, `name(arg)`, `d/dt(x)` or `transition A -> B`. Every other line
+/// is tokenized whole, which keeps the refusal scan a superset of the reads.
+#[test]
+fn split_assignment_target_recognises_only_write_forms() {
+    for (line, target, rhs) in [
+        ("  rate = 20 * X", "rate", " 20 * X"),
+        ("init(central) = S", "init(central)", " S"),
+        ("logit(1) = MIXL", "logit(1)", " MIXL"),
+        ("d / dt(central) = -K", "d / dt(central)", " -K"),
+        ("d/dt ( central ) = -K", "d/dt ( central )", " -K"),
+        ("transition a -> b = Q", "transition a -> b", " Q"),
+        ("transition 0 -> 1 = Q", "transition 0 -> 1", " Q"),
+        ("CL = if (M == 1) A else B", "CL", " if (M == 1) A else B"),
+    ] {
+        assert_eq!(
+            split_assignment_target(line),
+            Some((target, rhs)),
+            "{line:?}"
+        );
+    }
+    for line in [
+        "pk one_cpt_oral(cl=CL, v=V)",
+        "y[CMT=2] = effect",
+        "if (A == B) {",
+        "A >= B",
+        "A <= B",
+        "A != B",
+        "X == 1",
+        "DV ~ additive(ADD)",
+        "X + Y = Z",
+        "f(a, b) = Z",
+        "f() = Z",
+        "transition a b = Q",
+        "transitionx -> b = Q",
+        "pk f(x) = Z",
+        "f(x) * Y = Z",
+        "d/dt(c) * RATE = Z",
+        "d/dt(c + RATE) = Z",
+        "transition a + K -> b = Q",
+        "transition a -> b * K = Q",
+    ] {
+        assert_eq!(split_assignment_target(line), None, "{line:?}");
+    }
+}
+
 /// Row 9: the inner `if` has no `else`, inside an outer `if`/`else` that
 /// assigns `E0` on its other arm.
 #[test]

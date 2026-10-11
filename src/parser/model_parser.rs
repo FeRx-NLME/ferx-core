@@ -22249,6 +22249,78 @@ const NON_READING_BLOCKS: &[&str] = &[
     "priors",
 ];
 
+/// Keys of the endpoint blocks whose value is a word or a list of words (a
+/// family, link, recurrence or clock name, the state labels), never an
+/// expression, so the line reads no name (#1902). `cmt` is absent: its integer
+/// value holds no identifier to drop.
+const LITERAL_VALUED_ENDPOINT_KEYS: &[&str] = &["family", "type", "clock", "states", "link"];
+
+/// The identifiers a reading block's `lines` can read, for the #1857 refusal:
+/// [`collect_referenced_identifiers`] over each line minus its assignment target
+/// (#1902). On a `key = expr` line the target — `key`, `init(x)`, `d/dt(x)`,
+/// `transition A -> B` — is a key, a state or a slot being written, never a read,
+/// and counting it refused a valid model whose helper was named `RATE` or `SHAPE`
+/// because `[event_model]` has keys of those names. In an endpoint block a
+/// [`LITERAL_VALUED_ENDPOINT_KEYS`] line reads nothing at all.
+///
+/// A line of any other shape — `pk f(cl=CL)`, `DV ~ …`, `if (A == B) {`, or a
+/// target of another form — is tokenized whole, so
+/// the scan stays a superset of the real reads and can still only over-refuse.
+fn collect_read_identifiers(
+    block: &str,
+    lines: &[String],
+    out: &mut std::collections::HashSet<String>,
+) {
+    let endpoint = matches!(block, "event_model" | "markov_model" | "binary_model");
+    for line in lines {
+        let rhs = match split_assignment_target(line) {
+            Some((target, _)) if endpoint && LITERAL_VALUED_ENDPOINT_KEYS.contains(&target) => {
+                continue
+            }
+            Some((_, rhs)) => rhs,
+            None => line.as_str(),
+        };
+        collect_referenced_identifiers(&[rhs.to_string()], out);
+    }
+}
+
+/// `(target, rhs)` when the line's first `=` is not `==` and what precedes it is,
+/// in full, a target that writes rather than reads: an identifier, `name(arg)`,
+/// `d/dt(x)`, or `transition A -> B`, where `arg`, `x`, `A` and `B` are each one
+/// identifier or integer. `target` is trimmed; `None` for every other line, so
+/// anything more (`pk f(x)`, `f(x) * Y`, `d/dt(c + K)`) is tokenized whole. An `=`
+/// inside a call or after `<`, `>` or `!` leaves a target that ends mid-token and
+/// matches no form.
+fn split_assignment_target(line: &str) -> Option<(&str, &str)> {
+    let eq = line.find('=')?;
+    if line[eq + 1..].starts_with('=') {
+        return None;
+    }
+    let target = line[..eq].trim();
+    let word = |s: &str| {
+        let s = s.trim();
+        is_plain_identifier(s) || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    // `name(arg)`, `d/dt(x)` (spacing-insensitive, as `diffeq_state`) and
+    // `transition A -> B`.
+    let call_form = || {
+        let Some((name, rest)) = target.split_once('(') else {
+            return false;
+        };
+        let compact: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+        let call = is_plain_identifier(name.trim()) || compact == "d/dt";
+        call && rest.strip_suffix(')').is_some_and(word)
+    };
+    let transition = || {
+        target
+            .strip_prefix("transition")
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .and_then(|r| r.split_once("->"))
+            .is_some_and(|(a, b)| word(a) && word(b))
+    };
+    (is_plain_identifier(target) || call_form() || transition()).then(|| (target, &line[eq + 1..]))
+}
+
 /// The `[individual_parameters]` names some `if` arm assigns but not every path
 /// does, each with what reads it from outside the block (#1857).
 ///
@@ -22261,9 +22333,11 @@ const NON_READING_BLOCKS: &[&str] = &[
 ///
 /// The scan is lexical over the blocks as written (before any desugaring, so a
 /// `$PRED` readout is reported under `[structural_model]`) and case-folded like
-/// the #357 promotion scan: a superset of the real reads, so a missed consumer
-/// cannot reopen the silent path — which is why a hit is reported as "named in",
-/// not "read by": a helper that shares its name with a keyword is a hit too. A
+/// the #357 promotion scan, but over each line's right-hand side only
+/// ([`collect_read_identifiers`], #1902): still a superset of the real reads, so
+/// a missed consumer cannot reopen the silent path — which is why a hit is
+/// reported as "named in", not "read by": a helper sharing its name with a token
+/// on the right, such as a function name, is a hit too. A
 /// name the engine applies to the dose with no textual reader
 /// ([`engine_dose_attr`]) is reported as well.
 fn conditionally_assigned_downstream_reads(
@@ -22289,7 +22363,7 @@ fn conditionally_assigned_downstream_reads(
         }
         if let Some(lines) = raw.unnamed.get(*ty) {
             let mut ids = std::collections::HashSet::new();
-            collect_referenced_identifiers(lines, &mut ids);
+            collect_read_identifiers(ty, lines, &mut ids);
             readers.push((format!("[{ty}]"), ids));
         }
         if let Some(instances) = raw.named.get(*ty) {
@@ -22297,7 +22371,7 @@ fn conditionally_assigned_downstream_reads(
             names.sort();
             for inst in names {
                 let mut ids = std::collections::HashSet::new();
-                collect_referenced_identifiers(&instances[inst], &mut ids);
+                collect_read_identifiers(ty, &instances[inst], &mut ids);
                 readers.push((format!("[{ty} {inst}]"), ids));
             }
         }
