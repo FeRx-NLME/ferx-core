@@ -3494,8 +3494,8 @@ pub fn parse_full_model_with(
     // such a name correctly without a slot, so they are not listed (nor is
     // `[markov_model]`, which parses but was not measured); `[initial_conditions]`
     // is not either: an analytical init reads a non-`pk(...)` individual
-    // parameter through its placeholder PK slot (CL's, #1356 / #1379's deferred
-    // consumers), so promotion would turn today's missing-covariate refusal of an
+    // parameter through its placeholder PK slot (CL's, #1898),
+    // so promotion would turn today's missing-covariate refusal of an
     // all-arm name into a silent wrong amount.
     for lines in blocks.get("event_model").into_iter().chain(
         extracted

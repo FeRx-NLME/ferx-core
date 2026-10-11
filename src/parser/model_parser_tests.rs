@@ -29363,6 +29363,7 @@ fn the_inliner_matches_the_eager_one() {
 
 /// An ODE joint PK-TTE model whose `[individual_parameters]` tail is `ip` and
 /// whose endpoint block is `endpoint`.
+#[cfg(feature = "survival")]
 fn all_arm_endpoint_model(ip: &str, endpoint: &str) -> String {
     format!(
         "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
@@ -29375,6 +29376,7 @@ fn all_arm_endpoint_model(ip: &str, endpoint: &str) -> String {
     )
 }
 
+#[cfg(feature = "survival")]
 const ALL_ARM_H0: &str = "  if (WT > 70) {\n    H0 = 0.01\n  } else {\n    H0 = 0.02\n  }";
 
 /// An all-arm `H0` read only by an ODE `hazard =` — unnamed or named — earns an
@@ -29400,7 +29402,7 @@ fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
 /// The deliberate exclusion: an all-arm name read only by an analytical
 /// `[initial_conditions]` is not promoted, so it stays the loud missing-column
 /// refusal it was. An analytical init reads a non-`pk(...)` individual parameter
-/// through its placeholder PK slot (CL's), so promoting it would make that
+/// through its placeholder PK slot (CL's, #1898), so promoting it would make that
 /// refusal a silent wrong amount.
 #[test]
 fn all_arm_name_read_only_by_an_analytical_init_is_not_promoted() {
