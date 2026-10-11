@@ -216,3 +216,73 @@ fn unused_branch_f_does_not_hijack_bioavailability() {
         );
     }
 }
+
+/// #1857: the issue's level-block model, where `E0` — which carries the
+/// `PLACEBO[STUDY]` effect — is assigned only when `STUDY > 1`, with no `else`.
+/// On `main` it parsed, bound its levels against the data, and the level binder
+/// then refused the fit with "no level of the block affects the likelihood",
+/// because `y` never saw the branch value. The run must stop at the parse, naming
+/// `E0` and the readout, before the dataset is bound at all.
+const LEVEL_BLOCK_NO_ELSE: &str = r"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[STUDY, contrast = none](0.0, -10.0, 10.0)
+  theta TVEMAX(3.0, 0.1, 20.0)
+  theta TVET50(1.5, 0.1, 20.0)
+  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  EMAX = TVEMAX
+  ET50 = TVET50
+  if (STUDY > 1) {
+    E0 = TVE0 + PLACEBO + ETA_E0
+  }
+
+[structural_model]
+  y = E0 + EMAX * TIME / (TIME + ET50)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  maxiter = 2
+  covariance = false
+";
+
+#[test]
+fn level_block_read_through_an_if_without_else_is_refused_at_parse() {
+    use std::io::Write;
+    let mut data = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n");
+    for id in 1..=4 {
+        for t in [0.0, 1.0, 2.0, 4.0] {
+            data.push_str(&format!("{id},{t},{},0,.,1,0,{id}\n", 1.0 + t / 4.0));
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_path = dir.path().join("m.ferx");
+    let data_path = dir.path().join("d.csv");
+    write!(
+        std::fs::File::create(&model_path).unwrap(),
+        "{LEVEL_BLOCK_NO_ELSE}"
+    )
+    .unwrap();
+    write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
+
+    let err = match ferx_core::run_model_with_data(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    ) {
+        Ok(_) => panic!("the model must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("not on every path through it")
+            && err.contains("`E0` (read by `[structural_model]`)"),
+        "expected the #1857 refusal naming E0 and its reader, got: {err}"
+    );
+    assert!(
+        !err.contains("no level of the block"),
+        "the refusal must come before the level binder: {err}"
+    );
+}
