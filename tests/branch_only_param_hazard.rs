@@ -117,7 +117,8 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin_on_the_analytic_
         )
     };
     // Eight subjects alternating WT 60 / 80, two PK observations each and one
-    // TTE record (events on the even IDs), so both arms carry data.
+    // TTE record (an event on the odd IDs, WT 60; censored on the even IDs,
+    // WT 80), so both arms carry data.
     let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,WT\n");
     for id in 1..=8 {
         let wt = if id % 2 == 0 { 80 } else { 60 };
