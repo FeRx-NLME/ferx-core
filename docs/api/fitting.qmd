@@ -565,5 +565,8 @@ CLI's post-fit θ list and the JSON result list every θ. The rule is public as
 returns each such block's name and θ index range; the threshold is
 `THETA_BLOCK_COMPACT_MIN`. It counts free coefficients, not levels: a 21-level
 `sum_to_zero` block (20 free) is compacted and a 20-level one (19 free) is not.
+Here "free" means "not a dependent level": a `FIX` coefficient still has a θ, so
+it counts toward the threshold, though the report itself lists it as `FIX`
+rather than free.
 Call the function rather than comparing against the constant, so a wrapper
 cannot drift from the writers.
