@@ -152,8 +152,9 @@ fn level_standard_errors_match_nonmem_under_both_parameterisations() {
     assert!(worst_dep < BOUND, "dependent levels: {worst_dep:e}");
 }
 
-/// Measured on macOS arm64 at the #1890 commit: worst relative SE gap 3.44e-3 over the
-/// 18 free levels and 4.22e-3 over the 6 dependent ones. The two are the same size, so
+/// Measured on Linux aarch64 (`tools/linux-test.sh`, glibc 2.41) and on macOS arm64,
+/// identical in every printed digit: worst relative SE gap 3.44e-3 over the 18 free
+/// levels and 4.22e-3 over the 6 dependent ones. The two are the same size, so
 /// the dependent-level rule adds nothing measurable to the gap the covariance step
 /// itself has against NONMEM (its FD R matrix against NONMEM's, at a point printed to
 /// six digits). The bound is 2.4× the worst. Reading the diagonal only — dropping the

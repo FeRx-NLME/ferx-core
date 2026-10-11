@@ -9918,7 +9918,8 @@ mod level_uncertainty {
     ///
     /// The value is linear in θ and `exp` is smooth, so the realised error is
     /// rounding: measured worst relative error 1.4e-10 (identity-packed), 1.1e-11
-    /// (log-packed) and 8.9e-12 (global) at `h = 1e-6` on macOS arm64; the bound is
+    /// (log-packed) and 8.9e-12 (global) at `h = 1e-6`, identical on Linux aarch64
+    /// and macOS arm64; the bound is
     /// 1e-8, 70× the worst. A dropped or misapplied Jacobian scales each term by a
     /// level θ (0.47–0.98 here) and lands far outside it.
     ///

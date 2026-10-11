@@ -1113,4 +1113,4 @@ throughout. The log-packed path (`d = θ`) is pinned only inside ferx (U3's
 log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 `tests/level_se_nonmem_anchor.rs` evaluates ferx at NONMEM (a)'s optimum
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
-gaps at 1e-2, 2.4× the worst (measured on macOS arm64).
+gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digit).
