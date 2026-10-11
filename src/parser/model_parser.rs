@@ -22594,9 +22594,8 @@ struct ReadoutExtraSlots {
 /// `[initial_conditions]` amount (#1898). Without a slot of its own, such a name
 /// read the placeholder `0` — CL's slot — so `init(central) = S` deposited CL and
 /// `obs_scale = S` divided by it. Their names join the `y` names here and draw from
-/// the same pool. A modeled-dose `D{n}`/`R{n}` keeps its own value slot and is not
-/// re-slotted (its `pk_indices` entry is deliberately `0`, see the `pk_indices`
-/// builder).
+/// the same pool. A modeled-dose `D{n}`/`R{n}` read here gets a read slot the
+/// same way, as it already did for `y`; its modeled-dose value slot is untouched.
 ///
 /// ODE models get no entries here (their individual parameters already receive
 /// slots via `ode_param_slots`), and a model with none of those readers returns
@@ -22624,8 +22623,6 @@ fn allocate_readout_extra_slots(
     }
     let indiv_set: std::collections::HashSet<&str> =
         indiv_var_names.iter().map(|s| s.as_str()).collect();
-    let modeled: std::collections::HashSet<&str> =
-        modeled_slots.iter().map(|(n, _)| n.as_str()).collect();
     let mut referenced: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // The readers whose names took a slot, for the overflow message.
@@ -22636,7 +22633,6 @@ fn allocate_readout_extra_slots(
             if let Expression::Variable(name) = e {
                 if indiv_set.contains(name.as_str())
                     && !structural_vars.contains(name)
-                    && (reader == "[scaling] y" || !modeled.contains(name.as_str()))
                     && seen.insert(name.clone())
                 {
                     referenced.push(name.clone());

@@ -29474,18 +29474,34 @@ fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
     }
 }
 
-/// A modeled-dose `D{n}` keeps its own value slot and its deliberate `pk_indices`
-/// entry `0` (the FD routing keys on it): reading it in `obs_scale` must not
-/// re-slot it.
+/// A modeled-dose `D{n}` / `R{n}` read by `init` or `obs_scale` reads its own
+/// value, like any other parameter no `pk(...)` role binds (#1901 review r1).
+/// It keeps its modeled-dose value slot too; this only adds the read slot, as a
+/// Form C `y` already did. Four cells: D and R × init and obs_scale, each via
+/// the name against the same read written inline.
 #[test]
-fn a_modeled_dose_duration_read_by_obs_scale_is_not_reslotted() {
-    let plain = parse_model_string(&unbound_reader_model("  D1 = 2", "")).unwrap();
-    let read = parse_model_string(&unbound_reader_model(
-        "  D1 = 2",
-        "[scaling]\n  obs_scale = D1\n",
-    ))
-    .unwrap();
-    assert_eq!(read.pk_indices, plain.pk_indices);
+fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
+    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
+    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
+    for name in ["D1", "R1"] {
+        for (label, block) in [
+            ("init", &init as &dyn Fn(&str) -> String),
+            ("obs_scale", &scale),
+        ] {
+            let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
+            let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
+            assert_eq!(via_name, inline, "{name} read by {label}");
+            let m = parse_model_string(&unbound_reader_model(
+                &format!("  {name} = 2"),
+                &block(name),
+            ))
+            .unwrap();
+            assert!(
+                crate::sens::provider::analytical_supported(&m),
+                "{name} read by {label}: the read slot keeps the analytic path"
+            );
+        }
+    }
 }
 
 /// More unbound names than free differentiable slots is a loud refusal naming
