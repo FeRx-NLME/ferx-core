@@ -516,11 +516,11 @@ free parameter, so it is absent from `FitResult::theta_names`.
 included, keyed by block name. Each label is the combination without the
 block name (`STUDY=7,TIME=4`), in index order.
 
-`theta_level_values(&parsed.model, &result.theta)` adds each level's value at
-that θ, in the same order. Each `ThetaLevelValue` carries the `label`, the
-`value`, and a `theta_index`. A free level's `theta_index` is `Some(k)`, its
-position in `theta`, `theta_names` and the θ standard errors, so SEs can be
-joined to it. A dependent level's is `None`. Its value is what the model
+`theta_level_values(&parsed.model, &result.theta, None, None)` adds each
+level's value at that θ, in the same order. Each `ThetaLevelValue` carries the
+`label`, the `value`, a `theta_index`, an `se` and a `sir_ci`. A free level's
+`theta_index` is `Some(k)`, its position in `theta`, `theta_names` and the θ
+standard errors. A dependent level's is `None`. Its value is what the model
 applies: the negated sum of its group's free θ under `sum_to_zero` and
 `sum_to_zero_within`, and `0` for a `ref` reference level. The value is read
 through the same evaluator the predictions use, never re-derived. The θ must be
@@ -528,6 +528,34 @@ laid out for that bound model, so pass the fit's own θ with the model it was
 fitted with (or one rebound with `bind_from_fit`). A θ of the wrong
 length is refused. Unbound blocks and counted `theta NAME[N]` blocks are left
 out.
+
+The last two arguments give each level its uncertainty
+([#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890)). Pass
+`result.covariance_matrix.as_ref()` for standard errors and
+`result.sir_resamples_packed.as_deref()` for SIR intervals:
+
+- A free level's `se` is its `se_theta` entry, and its `sir_ci` its
+  `sir_ci_theta` entry, to the bit.
+- A dependent level's `se` is the delta-method standard error of the negated
+  sum, `sqrt(dᵀ C_g d)`. `C_g` is the block of the covariance for the group's
+  free θ. The covariance is on the packed scale the optimizer works in, so `d`
+  is the packing Jacobian: θ for a level θ with a lower bound of 0 or more
+  (log-packed), 1 otherwise. Its `sir_ci` is the 2.5th and 97.5th percentile of
+  the negated sum over the draws, computed draw by draw.
+- A level with an empty range (a `ref` reference level, or a group with no θ
+  at all) is a constant: `se` and `sir_ci` are `None`.
+- A `FIX` block reports `se` 0 for its free and its dependent levels, as
+  `se_theta` does.
+- A free level keeps `se_theta`'s conventions, including `0.0` for a
+  non-positive packed variance
+  ([#1895](https://github.com/FeRx-NLME/ferx-core/issues/1895)).
+- With no covariance (the step failed, was not requested, or fell back to SIR)
+  every `se` is `None`. Without kept draws (`sir_keep_samples = false`, the
+  default) every `sir_ci` is `None`. A dependent level whose quadratic form is
+  negative or not finite gets `None`, never 0.
+
+A covariance that is not square or has fewer rows than θ, and a draw shorter
+than θ, are refused.
 
 A block of 20 or more free coefficients is reported in its own compact section
 instead of one entry per θ in the main table, by the console report,

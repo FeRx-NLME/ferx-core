@@ -2777,6 +2777,16 @@ pub(crate) fn ode_solver_diagnostics_warning(
     Some((msg, entry))
 }
 
+/// A θ's standard error on its own scale from its packed-scale variance `var`: the
+/// packed SE (`0.0` for a non-positive variance, as every `se_*` vector reports it)
+/// times the packing Jacobian. The one rule behind `se_theta` and a free level's
+/// standard error in `theta_level_values` (#1890), so the two are equal by
+/// construction rather than by a second formula.
+pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
+    let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+    crate::estimation::parameterization::theta_packing_jacobian(theta, theta_lower) * se_packed
+}
+
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
@@ -2823,10 +2833,8 @@ pub(crate) fn extract_standard_errors(
             // panicking away an otherwise-converged fit.
             if i >= n {
                 0.0
-            } else if theta_packs_log(template.theta_lower[i]) {
-                template.theta[i] * se_packed[i]
             } else {
-                se_packed[i]
+                theta_se_from_packed(cov[(i, i)], template.theta[i], template.theta_lower[i])
             }
         })
         .collect();

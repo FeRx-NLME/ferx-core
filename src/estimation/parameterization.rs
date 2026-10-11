@@ -32,6 +32,30 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
+/// A θ from its packed coordinate: `exp(x)` when log-packed, `x` otherwise. The one
+/// θ back-transform, shared by [`unpack_params`] and the per-level SIR intervals of
+/// `theta_level_values` (#1890), so a level's draw is the θ `sir_ci_theta` reads.
+#[inline]
+pub(crate) fn theta_from_packed(x: f64, theta_lower: f64) -> f64 {
+    if theta_packs_log(theta_lower) {
+        x.exp()
+    } else {
+        x
+    }
+}
+
+/// `∂θ/∂x` of the θ packing at `theta`: `theta` when log-packed (`θ = exp(x)`), `1`
+/// otherwise. The delta-method Jacobian taking a packed-scale covariance to θ's own
+/// scale, shared by `se_theta` and the per-level standard errors (#1890).
+#[inline]
+pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
+    if theta_packs_log(theta_lower) {
+        theta
+    } else {
+        1.0
+    }
+}
+
 /// Smallest value the **log packing** represents: [`pack_params`] floors at it
 /// and `compute_bounds` floors a declared θ *lower* bound at it, so a
 /// declaration reaching below it arrives at the optimizer as this number.
@@ -628,11 +652,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
     // Theta — back-transform mirrors `pack_params`.
     let theta: Vec<f64> = (0..n_theta)
         .map(|i| {
-            let val = if theta_packs_log(template.theta_lower[i]) {
-                v[idx].exp()
-            } else {
-                v[idx]
-            };
+            let val = theta_from_packed(v[idx], template.theta_lower[i]);
             idx += 1;
             val
         })

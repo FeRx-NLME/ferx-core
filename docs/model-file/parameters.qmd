@@ -486,8 +486,8 @@ coefficient, fixed or not, because a fixed level is still the value the model
 predicts with. A block is usually fixed as a whole by its `FIX`, but a single θ
 can be fixed too (from the Rust API, through `ModelParameters::theta_fixed`, or
 when ferx freezes a θ with no effect on the objective), so a block can also be partly fixed (#1891).
-To read a dependent level's value, use `theta_level_values`
-([Level labels and values](../api/fitting.qmd#level-labels-values)).
+To read a dependent level's value, standard error or SIR interval, use
+`theta_level_values` ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
 Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
 the dual-number path — so a *small* level block keeps the analytic gradient.

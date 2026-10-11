@@ -29758,6 +29758,73 @@ fn conditional_name_read_by_adaptive_observe_is_refused() {
     assert_conditional_read(&err, "S", "named in `[adaptive_dosing]`");
 }
 
+// ── #357 for endpoints: an all-arm name read by an ODE hazard is promoted ─────
+
+/// An ODE joint PK-TTE model whose `[individual_parameters]` tail is `ip` and
+/// whose endpoint block is `endpoint`.
+#[cfg(feature = "survival")]
+fn all_arm_endpoint_model(ip: &str, endpoint: &str) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
+         omega ETA_CL ~ 0.1\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  V = TVV\n  CL = TVCL * exp(ETA_CL)\n{ip}\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = -(CL/V) * central\n\
+         [scaling]\n  obs_scale = V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{endpoint}"
+    )
+}
+
+#[cfg(feature = "survival")]
+const ALL_ARM_H0: &str = "  if (WT > 70) {\n    H0 = 0.01\n  } else {\n    H0 = 0.02\n  }";
+
+/// An all-arm `H0` read only by an ODE `hazard =` — unnamed or named — earns an
+/// individual-parameter slot, so the cumulative-hazard state's RHS resolves it.
+/// Before, the model was refused: "[odes]: RHS references undefined name(s): H0".
+#[cfg(feature = "survival")]
+#[test]
+fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
+    for header in ["[event_model]", "[event_model DEATH]"] {
+        let src = all_arm_endpoint_model(
+            ALL_ARM_H0,
+            &format!("{header}\n  cmt    = 2\n  hazard = H0\n"),
+        );
+        let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{header}: {e}"));
+        assert!(
+            m.indiv_param_names.iter().any(|n| n == "H0"),
+            "{header}: H0 must be an individual parameter, got {:?}",
+            m.indiv_param_names
+        );
+    }
+}
+
+/// The deliberate exclusion: an all-arm name read only by an analytical
+/// `[initial_conditions]` is not promoted, so it stays the loud missing-column
+/// refusal it was. An analytical init reads a non-`pk(...)` individual parameter
+/// through its placeholder PK slot (CL's, #1898), so promoting it would make that
+/// refusal a silent wrong amount.
+#[test]
+fn all_arm_name_read_only_by_an_analytical_init_is_not_promoted() {
+    let src = "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
+               theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.1\n  sigma PROP_ERR ~ 0.04\n\
+               [individual_parameters]\n  V = TVV\n  KA = TVKA\n  CL = TVCL * exp(ETA_CL)\n  \
+               if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }\n\
+               [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+               [error_model]\n  DV ~ proportional(PROP_ERR)\n\
+               [initial_conditions]\n  init(central) = S\n";
+    let m = parse_model_string(src).expect("parses");
+    assert!(
+        !m.indiv_param_names.iter().any(|n| n == "S"),
+        "{:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        m.referenced_covariates.iter().any(|c| c == "S"),
+        "S stays a required data column: {:?}",
+        m.referenced_covariates
+    );
+}
+
 // ── #1898: obs_scale / init read an unbound parameter through its own slot ────
 
 /// A 1-cpt oral model (TVCL 3, TVV 20, TVKA 1.5) with `ip` appended to
