@@ -191,7 +191,10 @@ does not count, because it is written, not read: a key (`rate`, `shape`,
 `obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The word
 values of the endpoint blocks (`family = weibull`, `type`, `clock`, `link`, the
 `states` labels) do not count either, so a helper named `RATE`, `SHAPE` or
-`WEIBULL` is fine (#1902).
+`WEIBULL` is fine (#1902). A line that is not of that `target = expr` shape,
+such as a `pk one_cpt_oral(cl=CL, …)` call or `DV ~ …`, counts whole, its keys
+and function names included, so a helper named `PK` or `ONE_CPT_ORAL` is still
+refused.
 
 **Translating from NONMEM.** NM-TRAN accepts `IF (...) E0 = ...` without an
 `ELSE`, but what the variable holds when the condition fails depends on the

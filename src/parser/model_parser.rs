@@ -22261,40 +22261,41 @@ fn collect_read_identifiers(
     }
 }
 
-/// `(target, rhs)` when the line's first `=` is not `==` and what precedes it is
-/// a target that writes rather than reads: an identifier, `name(arg)` with a
-/// bare identifier or integer argument, `d/dt(x)`, or `transition A -> B`.
-/// `target` is trimmed; `None` for every other line. An `=` inside a call or
-/// after `<`, `>` or `!` leaves a target that ends mid-token and matches no form.
+/// `(target, rhs)` when the line's first `=` is not `==` and what precedes it is,
+/// in full, a target that writes rather than reads: an identifier, `name(arg)`,
+/// `d/dt(x)`, or `transition A -> B`, where `arg`, `x`, `A` and `B` are each one
+/// identifier or integer. `target` is trimmed; `None` for every other line, so
+/// anything more (`pk f(x)`, `f(x) * Y`, `d/dt(c + K)`) is tokenized whole. An `=`
+/// inside a call or after `<`, `>` or `!` leaves a target that ends mid-token and
+/// matches no form.
 fn split_assignment_target(line: &str) -> Option<(&str, &str)> {
     let eq = line.find('=')?;
     if line[eq + 1..].starts_with('=') {
         return None;
     }
     let target = line[..eq].trim();
-    let is_ident = |s: &str| {
-        let mut c = s.bytes();
-        matches!(c.next(), Some(b) if b == b'_' || b.is_ascii_alphabetic())
-            && c.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+    let word = |s: &str| {
+        let s = s.trim();
+        is_plain_identifier(s) || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
     };
+    // `name(arg)`, `d/dt(x)` (spacing-insensitive, as `diffeq_state`) and
+    // `transition A -> B`.
     let call_form = || {
-        let compact: String = target.chars().filter(|c| !c.is_whitespace()).collect();
-        let Some((name, rest)) = compact.split_once('(') else {
+        let Some((name, rest)) = target.split_once('(') else {
             return false;
         };
-        let Some(arg) = rest.strip_suffix(')') else {
-            return false;
-        };
-        is_ident(name)
-            && (is_ident(arg) || (!arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit())))
+        let compact: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+        let call = is_plain_identifier(name.trim()) || compact == "d/dt";
+        call && rest.strip_suffix(')').is_some_and(word)
     };
     let transition = || {
         target
             .strip_prefix("transition")
-            .is_some_and(|r| r.starts_with(char::is_whitespace) && r.contains("->"))
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .and_then(|r| r.split_once("->"))
+            .is_some_and(|(a, b)| word(a) && word(b))
     };
-    (is_ident(target) || call_form() || diffeq_state(target).is_some() || transition())
-        .then(|| (target, &line[eq + 1..]))
+    (is_plain_identifier(target) || call_form() || transition()).then(|| (target, &line[eq + 1..]))
 }
 
 /// The `[individual_parameters]` names some `if` arm assigns but not every path

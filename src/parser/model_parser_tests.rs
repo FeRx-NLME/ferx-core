@@ -29771,6 +29771,16 @@ fn ode_and_initial_condition_targets_are_not_reads_of_a_helper() {
     assert_target_is_not_a_read(&cases, false);
 }
 
+/// The docs' limit: a line that is not `target = expr` counts whole, so an
+/// arm-local helper named like the `pk` call's own words is still refused.
+#[test]
+fn a_line_that_is_not_an_assignment_counts_whole() {
+    for h in ["PK", "ONE_CPT_ORAL"] {
+        let err = parse_err(&cond_pk_model(&arm_local_helper(h), "", ""));
+        assert_conditional_read(&err, h, "named in `[structural_model]`");
+    }
+}
+
 /// What counts as an assignment target: a first `=` (not `==`) after an
 /// identifier, `name(arg)`, `d/dt(x)` or `transition A -> B`. Every other line
 /// is tokenized whole, which keeps the refusal scan a superset of the reads.
@@ -29781,7 +29791,9 @@ fn split_assignment_target_recognises_only_write_forms() {
         ("init(central) = S", "init(central)", " S"),
         ("logit(1) = MIXL", "logit(1)", " MIXL"),
         ("d / dt(central) = -K", "d / dt(central)", " -K"),
+        ("d/dt ( central ) = -K", "d/dt ( central )", " -K"),
         ("transition a -> b = Q", "transition a -> b", " Q"),
+        ("transition 0 -> 1 = Q", "transition 0 -> 1", " Q"),
         ("CL = if (M == 1) A else B", "CL", " if (M == 1) A else B"),
     ] {
         assert_eq!(
@@ -29803,6 +29815,13 @@ fn split_assignment_target_recognises_only_write_forms() {
         "f(a, b) = Z",
         "f() = Z",
         "transition a b = Q",
+        "transitionx -> b = Q",
+        "pk f(x) = Z",
+        "f(x) * Y = Z",
+        "d/dt(c) * RATE = Z",
+        "d/dt(c + RATE) = Z",
+        "transition a + K -> b = Q",
+        "transition a -> b * K = Q",
     ] {
         assert_eq!(split_assignment_target(line), None, "{line:?}");
     }
