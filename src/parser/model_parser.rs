@@ -3490,10 +3490,12 @@ pub fn parse_full_model_with(
     // state, whose name resolver sees individual parameters only: an all-arm
     // name it reads must earn its slot like one `[odes]` reads, or it is refused
     // there as undefined. Named endpoints (`[event_model DEATH]`) included.
-    // A `[binary_model]` logit and a parametric `scale =` were measured to read
-    // such a name correctly without a slot, so they are not listed (nor is
-    // `[markov_model]`, which parses but was not measured); `[initial_conditions]`
-    // is not either: an analytical init reads a non-`pk(...)` individual
+    // The whole block is scanned, so a parametric `scale =` (and any key token,
+    // `rate`, `shape`, …) promotes too; it did not need the slot, and promoting
+    // it was measured value-neutral on both engines. A `[binary_model]` logit and
+    // a `[markov_model]` transition were measured to read such a name correctly
+    // (bit-identical to the ternary twin) without a slot, so they are not listed.
+    // `[initial_conditions]` is not either: an analytical init reads a non-`pk(...)` individual
     // parameter through its placeholder PK slot (CL's, #1898),
     // so promotion would turn today's missing-covariate refusal of an
     // all-arm name into a silent wrong amount.
