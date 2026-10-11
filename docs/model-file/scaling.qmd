@@ -88,7 +88,12 @@ Expressions may reference:
   uses the per-subject V (typical value times the EBE eta). On a
   built-in `pk <model>(...)` block, referencing the same name bound to
   its `v`/`v1` role divides by that volume a second time — see the note
-  above.
+  above. On a `pk <model>(...)` block, a parameter **no** `pk(...)` role
+  binds (a scale factor `SCF = WT / 70`, say) takes a free differentiable
+  PK slot of its own, as a Form C readout parameter does. Before #1898 it
+  had none and silently read `CL`'s value. These slots are shared with
+  `y = …` and `[initial_conditions]`; more distinct such parameters than
+  the model leaves free is a parse error (inline the expression instead).
 
 The scale is evaluated **once per subject** with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for
