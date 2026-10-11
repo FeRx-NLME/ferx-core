@@ -29824,3 +29824,178 @@ fn all_arm_name_read_only_by_an_analytical_init_is_not_promoted() {
         m.referenced_covariates
     );
 }
+
+// ── #1898: obs_scale / init read an unbound parameter through its own slot ────
+
+/// A 1-cpt oral model (TVCL 3, TVV 20, TVKA 1.5) with `ip` appended to
+/// `[individual_parameters]` and `extra` blocks appended.
+fn unbound_reader_model(ip: &str, extra: &str) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.1\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  V = TVV\n  KA = TVKA\n  CL = TVCL * exp(ETA_CL)\n{ip}\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{extra}"
+    )
+}
+
+/// Two subjects, WT 60 and 80, one 100 mg dose into the depot at t = 0 and one
+/// observation on central at t = 1.
+fn unbound_reader_pop() -> crate::types::Population {
+    use crate::types::{DoseEvent, Population, Subject};
+    Population {
+        subjects: [60.0, 80.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &wt)| Subject {
+                id: (i + 1).to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0],
+                observations: vec![1.0],
+                obs_cmts: vec![2],
+                cens: vec![0],
+                covariates: HashMap::from([("WT".to_string(), wt)]),
+                ..Default::default()
+            })
+            .collect(),
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+fn unbound_reader_preds(ip: &str, extra: &str) -> Vec<f64> {
+    let m = parse_model_string(&unbound_reader_model(ip, extra)).unwrap_or_else(|e| panic!("{e}"));
+    crate::api::predict(&m, &unbound_reader_pop(), &m.default_params)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .iter()
+        .map(|r| r.pred)
+        .collect()
+}
+
+/// `init(central) = S` and `obs_scale = S` with `S` bound by no `pk(...)` role
+/// predict exactly as the same value written inline. On `main` both read the
+/// placeholder slot 0, CL's (3.0): the init deposited 3 instead of 1000 (pred
+/// 3.6712 against 46.5775) and the scale divided by 3 instead of 2.
+///
+/// `S = WT` is the differential half: the two subjects must differ, and each
+/// must match its own inline literal, so the read is live per subject — a
+/// constant `S` would also pass if the reader picked up any slot holding it.
+#[test]
+fn an_unbound_parameter_read_by_init_or_obs_scale_predicts_like_its_value() {
+    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
+    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
+    for (label, block) in [
+        ("init", &init as &dyn Fn(&str) -> String),
+        ("obs_scale", &scale),
+    ] {
+        let via_name = unbound_reader_preds("  S = 2", &block("S"));
+        let inline = unbound_reader_preds("", &block("2"));
+        assert_eq!(via_name, inline, "{label}: S = 2 must read 2");
+
+        let via_wt = unbound_reader_preds("  S = WT", &block("S"));
+        let inline_wt = unbound_reader_preds("", &block("WT"));
+        assert_eq!(
+            via_wt, inline_wt,
+            "{label}: S = WT must read WT per subject"
+        );
+        assert!(
+            (via_wt[0] - via_wt[1]).abs() > 1e-3,
+            "{label}: the two subjects must differ (WT 60 vs 80): {via_wt:?}"
+        );
+    }
+    // The init case at the plan's measured values: S = 1000 deposits 1000.
+    let got = unbound_reader_preds("  S = 1000", &init("S"));
+    assert!((got[0] - 46.577_497_800_567_49).abs() < 1e-9, "{got:?}");
+}
+
+/// The slot itself: `S` gets a free differentiable slot of its own — not CL's
+/// placeholder `0`, and not a slot the closed form consumes — so the analytic
+/// provider keeps serving the model.
+#[test]
+fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
+    for extra in [
+        "[initial_conditions]\n  init(central) = S\n",
+        "[scaling]\n  obs_scale = S\n",
+    ] {
+        let m = parse_model_string(&unbound_reader_model("  S = 2", extra)).unwrap();
+        let i = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
+        let slot = m.pk_indices[i];
+        assert_ne!(
+            slot,
+            crate::types::PK_IDX_CL,
+            "{extra}: S must not alias CL"
+        );
+        assert!(
+            slot <= crate::types::PK_IDX_MTT,
+            "{extra}: slot {slot} differentiable"
+        );
+        assert!(
+            !m.pk_model.consumes_pk_slot(slot),
+            "{extra}: slot {slot} is read by the closed form"
+        );
+        assert!(crate::sens::provider::analytical_supported(&m), "{extra}");
+    }
+}
+
+/// A modeled-dose `D{n}` / `R{n}` read by `init` or `obs_scale` reads its own
+/// value, like any other parameter no `pk(...)` role binds (#1901 review r1).
+/// It keeps its modeled-dose value slot too; this only adds the read slot, as a
+/// Form C `y` already did. Four cells: D and R × init and obs_scale, each via
+/// the name against the same read written inline.
+#[test]
+fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
+    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
+    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
+    for name in ["D1", "R1"] {
+        for (label, block) in [
+            ("init", &init as &dyn Fn(&str) -> String),
+            ("obs_scale", &scale),
+        ] {
+            let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
+            let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
+            assert_eq!(via_name, inline, "{name} read by {label}");
+            let m = parse_model_string(&unbound_reader_model(
+                &format!("  {name} = 2"),
+                &block(name),
+            ))
+            .unwrap();
+            assert!(
+                crate::sens::provider::analytical_supported(&m),
+                "{name} read by {label}: the read slot keeps the analytic path"
+            );
+        }
+    }
+}
+
+/// More unbound names than free differentiable slots is a loud refusal naming
+/// every reader, not a silent alias.
+#[test]
+fn too_many_unbound_parameters_for_the_free_slots_is_refused() {
+    let names: Vec<String> = (1..=12).map(|i| format!("S{i}")).collect();
+    let ip: String = names.iter().map(|n| format!("  {n} = 2\n")).collect();
+    // S1..S11 through obs_scale, S12 through the init: both readers take a slot.
+    let sum = names[..11].join(" + ");
+    let err = parse_err(&unbound_reader_model(
+        &ip,
+        &format!("[scaling]\n  obs_scale = {sum}\n[initial_conditions]\n  init(central) = S12\n"),
+    ));
+    for want in [
+        "[scaling] obs_scale, [initial_conditions]: together these reference 12 individual",
+        "free differentiable PK slot(s) are available",
+        "S12",
+    ] {
+        assert!(err.contains(want), "missing {want:?}: {err}");
+    }
+    // A Form C readout alone names only itself.
+    let err = parse_err(&unbound_reader_model(
+        &ip,
+        &format!("[scaling]\n  y = central / V + {sum} + S12\n"),
+    ));
+    assert!(
+        err.contains("[scaling] y: together these reference 12 individual"),
+        "{err}"
+    );
+}

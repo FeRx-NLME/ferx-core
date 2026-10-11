@@ -4228,6 +4228,7 @@ pub fn parse_full_model_with(
         pk_param_map.values().cloned().collect();
     let readout_alloc = allocate_readout_extra_slots(
         blocks.get("scaling"),
+        blocks.get("initial_conditions"),
         &theta_names,
         &eta_names,
         &indiv_var_names,
@@ -22798,12 +22799,21 @@ struct ReadoutExtraSlots {
 /// reference order, or an error if the readout references more distinct
 /// non-structural parameters than the free differentiable slots can hold.
 ///
+/// The same holds for the two other subject-level readers that look an individual
+/// parameter up through `pk_indices`: a Form B `obs_scale` and an
+/// `[initial_conditions]` amount (#1898). Without a slot of its own, such a name
+/// read the placeholder `0` — CL's slot — so `init(central) = S` deposited CL and
+/// `obs_scale = S` divided by it. Their names join the `y` names here and draw from
+/// the same pool. A modeled-dose `D{n}`/`R{n}` read here gets a read slot the
+/// same way, as it already did for `y`; its modeled-dose value slot is untouched.
+///
 /// ODE models get no entries here (their individual parameters already receive
-/// slots via `ode_param_slots`), and a model with no `[scaling] y` readout returns
+/// slots via `ode_param_slots`), and a model with none of those readers returns
 /// empty.
 #[allow(clippy::too_many_arguments)]
 fn allocate_readout_extra_slots(
     scaling_lines: Option<&Vec<String>>,
+    init_lines: Option<&Vec<String>>,
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
@@ -22821,42 +22831,76 @@ fn allocate_readout_extra_slots(
     if uses_ode_param_layout {
         return Ok(ReadoutExtraSlots::default());
     }
-    let Some(lines) = scaling_lines else {
-        return Ok(ReadoutExtraSlots::default());
-    };
     let indiv_set: std::collections::HashSet<&str> =
         indiv_var_names.iter().map(|s| s.as_str()).collect();
     let mut referenced: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // An individual parameter can be referenced only from a named intermediate the
-    // readout uses (#1030); it still needs a slot, so inline before scanning.
-    let intermediates = scaling_intermediates(lines)?;
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (key, value) = split_scaling_entry(trimmed)?;
-        let (base, _cmt) = parse_scaling_key(key)?;
-        if base != "y" {
-            continue;
-        }
-        // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
-        // references resolve elsewhere and are ignored here.
-        let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-        let mut expr =
-            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
-        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
-        visit_expr_nodes(&expr, &mut |e: &Expression| {
+    // The readers whose names took a slot, for the overflow message.
+    let mut readers: Vec<&str> = Vec::new();
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let mut note = |expr: &Expression, reader: &'static str, readers: &mut Vec<&str>| {
+        visit_expr_nodes(expr, &mut |e: &Expression| {
             if let Expression::Variable(name) = e {
                 if indiv_set.contains(name.as_str())
                     && !structural_vars.contains(name)
                     && seen.insert(name.clone())
                 {
                     referenced.push(name.clone());
+                    if !readers.contains(&reader) {
+                        readers.push(reader);
+                    }
                 }
             }
         });
+    };
+    if let Some(lines) = scaling_lines {
+        // An individual parameter can be referenced only from a named intermediate the
+        // readout uses (#1030); it still needs a slot, so inline before scanning.
+        let intermediates = scaling_intermediates(lines)?;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (key, value) = split_scaling_entry(trimmed)?;
+            let (base, _cmt) = parse_scaling_key(key)?;
+            let reader = match base {
+                "y" => "[scaling] y",
+                "obs_scale" => "[scaling] obs_scale",
+                _ => continue,
+            };
+            // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
+            // references resolve elsewhere and are ignored here.
+            let parsed = parse_scalar_expression(value, ctx)
+                .map_err(|e| format!("{reader}: {e}"))
+                .and_then(|mut expr| {
+                    inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
+                    Ok(expr)
+                });
+            let expr = match parsed {
+                Ok(expr) => expr,
+                // An `obs_scale` that does not parse is reported by
+                // `parse_scaling_block`, with the diagnostic written for it (an
+                // unreachable intermediate, say); it reads no name here. `y` keeps
+                // reporting from here, as it did before #1898.
+                Err(_) if reader == "[scaling] obs_scale" => continue,
+                Err(e) => return Err(e),
+            };
+            note(&expr, reader, &mut readers);
+        }
+    }
+    for line in init_lines.into_iter().flatten() {
+        // A malformed line is reported by `parse_initial_conditions_block`, with
+        // its own message; it reads no name here.
+        let Some((_, value)) = parse_init_line(line) else {
+            continue;
+        };
+        // Likewise an init expression that does not parse is reported by
+        // `parse_initial_conditions_block`.
+        let Ok(expr) = parse_scalar_expression(&value, ctx) else {
+            continue;
+        };
+        note(&expr, "[initial_conditions]", &mut readers);
     }
     if referenced.is_empty() && synth_params.is_empty() {
         return Ok(ReadoutExtraSlots::default());
@@ -22873,10 +22917,12 @@ fn allocate_readout_extra_slots(
     // named them, so silently dropping the readout's analytic path would be the wrong answer.
     if referenced.len() > free.len() {
         return Err(format!(
-            "[scaling] y: the analytic readout references {} non-structural individual \
-             parameter(s) ({}), but only {} free differentiable PK slot(s) are available for \
-             this model. Reduce the number of distinct non-PK parameters referenced in the \
-             readout, or use an ODE model.",
+            "{}: together these reference {} individual parameter(s) that no `pk(...)` role \
+             binds ({}), but only {} free differentiable PK slot(s) are available for this \
+             model, and each such parameter needs one. Reduce the number of distinct non-PK \
+             parameters these blocks reference (inline the expression instead), or use an \
+             ODE model.",
+            readers.join(", "),
             referenced.len(),
             referenced.join(", "),
             free.len(),

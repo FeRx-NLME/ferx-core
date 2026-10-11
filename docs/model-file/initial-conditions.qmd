@@ -38,7 +38,10 @@ Each line is `init(NAME) = <expr>`, where:
   thetas, etas, covariates, and individual parameters declared in
   `[individual_parameters]` — exactly the symbols a Form-B `[scaling]`
   expression sees. So `init(central) = CONC0 * V` reads the data column `CONC0`
-  and the per-subject `V`. Unlike `[scaling]`, that includes a parameter the
+  and the per-subject `V`. A parameter **no** `pk(...)` role binds
+  (`BASEAMT = CONC0 * V`, then `init(central) = BASEAMT`) takes a free
+  differentiable PK slot of its own, shared with `[scaling]`; before #1898 it
+  had none and silently read `CL`'s value. Unlike `[scaling]`, that includes a parameter the
   `pk(...)` call maps as a dose attribute (`f=`, `lagtime=`/`alag=`): an initial
   condition is **not** an absorbed dose, so the engine deposits the amount with
   `F = 1` and no lag. `init(depot) = F * 500` — the bioavailable residue of a

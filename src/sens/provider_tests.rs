@@ -14264,3 +14264,49 @@ fn lognormal_chain_gate_uses_the_measured_flag_or_the_labels() {
         "measured inexact beats LogNormal labels"
     );
 }
+
+/// #1898: an η-dependent individual parameter that no `pk(...)` role binds,
+/// read by `init(central)` and by a Form B `obs_scale`, now has a slot of its
+/// own, so the analytic provider differentiates through it. Full jet vs central
+/// FD of the production predictor, with `ETA_S` live on the read name only.
+///
+/// This pins the derivative against the value path (AGENTS.md: the parity cannot
+/// see a value-path defect both share); the value itself is pinned against the
+/// inline spelling in `an_unbound_parameter_read_by_init_or_obs_scale_predicts_like_its_value`.
+#[test]
+fn unbound_parameter_read_by_init_and_obs_scale_matches_fd() {
+    let base = |ip: &str, extra: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  theta TVS(5.0, 0.01, 1000.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_S ~ 0.1\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA\n{ip}\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n{extra}"
+        )
+    };
+    let cases = [
+        (
+            "init",
+            base(
+                "  S = TVS * V * exp(ETA_S)",
+                "[initial_conditions]\n  init(central) = S\n",
+            ),
+        ),
+        (
+            "obs_scale",
+            base("  S = TVS / 5 * exp(ETA_S)", "[scaling]\n  obs_scale = S\n"),
+        ),
+    ];
+    for (label, src) in cases {
+        let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(
+            analytical_supported(&m),
+            "{label}: must stay on the analytic provider"
+        );
+        let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 1.5, 5.0], &[0.1, -0.05, 0.2]);
+    }
+}
