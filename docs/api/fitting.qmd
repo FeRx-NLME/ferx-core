@@ -542,9 +542,13 @@ The last two arguments give each level its uncertainty
   is the packing Jacobian: θ for a level θ with a lower bound of 0 or more
   (log-packed), 1 otherwise. Its `sir_ci` is the 2.5th and 97.5th percentile of
   the negated sum over the draws, computed draw by draw.
-- A `ref` reference level, and a level whose group has no free θ, is a
-  constant: `se` and `sir_ci` are `None`.
-- A `FIX` block reports `se` 0, as `se_theta` does.
+- A level with an empty range (a `ref` reference level, or a group with no θ
+  at all) is a constant: `se` and `sir_ci` are `None`.
+- A `FIX` block reports `se` 0 for its free and its dependent levels, as
+  `se_theta` does.
+- A free level keeps `se_theta`'s conventions, including `0.0` for a
+  non-positive packed variance
+  ([#1895](https://github.com/FeRx-NLME/ferx-core/issues/1895)).
 - With no covariance (the step failed, was not requested, or fell back to SIR)
   every `se` is `None`. Without kept draws (`sir_keep_samples = false`, the
   default) every `sir_ci` is `None`. A dependent level whose quadratic form is

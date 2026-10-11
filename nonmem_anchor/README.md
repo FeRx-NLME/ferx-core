@@ -1107,7 +1107,10 @@ image. All three configurations agree to |ΔOFV| < 1e-6.
 | the same, with the dependent rule reading the diagonal only (mutation) | | 0.70 |
 
 The dependent-level gap is the size of the free-level one. So the rule adds nothing
-measurable on top of the covariance step's own distance from NONMEM.
+measurable on top of the covariance step's own distance from NONMEM. The level θ are
+bounded below by −50, so they are identity-packed and the packing Jacobian is 1
+throughout. The log-packed path (`d = θ`) is pinned only inside ferx (U3's
+log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 `tests/level_se_nonmem_anchor.rs` evaluates ferx at NONMEM (a)'s optimum
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
 gaps at 1e-2, 2.4× the worst (measured on macOS arm64).

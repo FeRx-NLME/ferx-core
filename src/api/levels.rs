@@ -3070,13 +3070,16 @@ pub struct ThetaLevelValue {
     pub theta_index: Option<usize>,
     /// The level's standard error on θ's own scale (#1890), from the covariance
     /// handed to [`theta_level_values`]. A free level's is exactly its `se_theta`
-    /// entry (`0.0` for a `FIX` block, as `se_theta` reports it). A sum-to-zero
+    /// entry, conventions included: `0.0` for a `FIX` block, and also `0.0` for a
+    /// non-positive packed variance, as `se_theta` reports it. A sum-to-zero
     /// dependent level's is the delta-method `sqrt(dᵀ C_g d)` over its group's free
     /// θ, `C_g` being their block of the packed covariance and `d` the packing
-    /// Jacobian (`θ` for a log-packed θ, `1` otherwise). `None` for a `ref` reference
-    /// level or a level whose group has no free θ (a constant, not an estimate), for
-    /// every level when no covariance is given, and for a dependent level whose
-    /// quadratic form is negative or not finite.
+    /// Jacobian (`θ` for a log-packed θ, `1` otherwise); a dependent level of a `FIX`
+    /// block is therefore `Some(0.0)`. `None` for a level with an empty range — a
+    /// `ref` reference level, or a group with no θ at all — which is a constant, not
+    /// an estimate; for every level when no covariance is given; and for a dependent
+    /// level whose quadratic form is negative or not finite. That last rule is
+    /// deliberately stricter than the free levels' `se_theta` convention.
     pub se: Option<f64>,
     /// The level's 95% SIR interval (2.5th and 97.5th percentiles) over the retained
     /// SIR draws handed to [`theta_level_values`] (#1890): the level's value
@@ -3106,7 +3109,10 @@ pub struct ThetaLevelValue {
 /// model rebound with [`bind_from_fit`]. A θ whose length is not the model's is
 /// refused, as is a covariance that is not square or has fewer rows than θ, and a
 /// SIR draw shorter than θ. Ones of the right size but from a different binding
-/// cannot be detected, and are read at the wrong positions.
+/// cannot be detected, and are read at the wrong positions. The packing — which θ
+/// are log-packed, and so the Jacobian and the draws' back-transform — is read from
+/// `model`'s declared bounds (`default_params.theta_lower`), which are the fit's
+/// unless the fit was given other bounds by hand.
 ///
 /// Unbound level blocks and counted `theta NAME[N]` blocks are omitted, as in
 /// [`theta_level_map`](crate::theta_level_map); a model with neither gives an empty map.
@@ -3223,9 +3229,12 @@ pub fn theta_level_values(
 }
 
 /// One level's standard error from the packed covariance `c` (#1890). A free level
-/// goes through `se_theta`'s own rule; a dependent level is the delta-method
-/// `sqrt(dᵀ C_g d)` over its range, `None` when that form is negative or not finite —
-/// never clamped to `0`, which would report a certainty the matrix does not carry.
+/// goes through `se_theta`'s own rule, so it keeps that rule's conventions — a
+/// non-positive variance reports `0.0` — and agrees with `se_theta` to the bit. A
+/// dependent level is the delta-method `sqrt(dᵀ C_g d)` over its range, `None` when
+/// that form is negative or not finite: it has no `se_theta` entry to agree with, so
+/// it is not clamped to `0`, which would report a certainty the matrix does not
+/// carry. Whether `se_theta`'s own `0.0` convention should change is #1895.
 fn level_se(
     rule: LevelRule,
     c: &nalgebra::DMatrix<f64>,

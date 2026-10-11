@@ -24,6 +24,12 @@
 //! three free θ with a nonzero covariance block, the six dependent values differ
 //! (−2.48 … −0.01), and the free-level comparison runs on the same matrix, so a gap
 //! in the dependent levels can be told from a gap in the covariance step itself.
+//!
+//! What it does not see: the level θ here are bounded below by −50, so they are
+//! identity-packed and the packing Jacobian `d` is 1 throughout. The log-packed
+//! dependent path (`d = θ`) is pinned only inside ferx — by U3's log-packed arm (an FD
+//! of the gather's value in packed coordinates) and U2's bit-parity with `se_theta`
+//! in `src/api/tests/theta_levels_tests.rs` — not by NONMEM.
 
 use ferx_core::types::{FitOptions, OmegaMatrix};
 use std::collections::HashMap;
