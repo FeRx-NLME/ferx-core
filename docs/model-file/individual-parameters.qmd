@@ -184,8 +184,14 @@ For a dose attribute, use the engine's own default: `F = 1` (or `F1 = 1`),
 
 A name used only inside the branch that assigns it (a helper for another
 assignment in that branch) is still fine. The check is lexical: a branch-only
-helper that happens to share its name with any identifier in another block
-(case-insensitively) is refused too. Rename the helper in that case.
+helper that shares its name (case-insensitively) with an identifier on the
+right-hand side of `=` in another block is refused too, even if that identifier
+means something else there. Rename the helper in that case. What is left of `=`
+does not count, because it is written, not read: a key (`rate`, `shape`,
+`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The word
+values of the endpoint blocks (`family = weibull`, `type`, `clock`, `link`, the
+`states` labels) do not count either, so a helper named `RATE`, `SHAPE` or
+`WEIBULL` is fine (#1902).
 
 **Translating from NONMEM.** NM-TRAN accepts `IF (...) E0 = ...` without an
 `ELSE`, but what the variable holds when the condition fails depends on the
