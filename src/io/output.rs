@@ -148,13 +148,7 @@ fn note_suffix(note: Option<String>, show_cv: bool) -> String {
 }
 
 /// Whether the console shows a CV%/SD parenthetical: not when the covariance
-/// step failed or fell back to SIR.
-fn shows_cv(result: &FitResult) -> bool {
-    status_shows_cv(&result.covariance_status)
-}
-
-/// [`shows_cv`] on the status alone, for [`format_kappa_rows_from`], whose
-/// input is not a `FitResult`.
+/// step failed or fell back to SIR (the SEs are then meaningless).
 fn status_shows_cv(status: &CovarianceStatus) -> bool {
     !matches!(
         status,
@@ -162,16 +156,216 @@ fn status_shows_cv(status: &CovarianceStatus) -> bool {
     )
 }
 
+/// The typical-value θ an ETA is linked to (`EtaParamInfo::linked_theta`): the
+/// θ the ETA is added to directly, as in `THETA + ETA` or
+/// `inv_logit(THETA + ETA)`. [`OmegaRowsOptions::typical_value_spread`] reads it
+/// to put an additive ETA's SD and a logit ETA's ±1 SD on the scale of that θ.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EtaLinkedTheta {
+    /// The θ's name, as printed in the `at NAME = …` clause.
+    pub name: String,
+    /// The θ's estimate as the fit reports it (`FitResult::theta`), untransformed.
+    pub value: f64,
+    /// The θ's transform (`FitResult::theta_transform`); `None` when unknown.
+    /// Decides whether a logit ETA's θ is already a probability
+    /// (`LogitProbability`) or on the logit scale; unknown falls back to the
+    /// ETA's own type.
+    pub transform: Option<ThetaTransform>,
+}
+
+/// The facts an `--- OMEGA Estimates ---` row reads, borrowed from wherever
+/// they live: a [`FitResult`] ([`OmegaRowsInput::from_result`]), or a wrapper's
+/// own copy of the fit at print time (ferx-r's `print.ferx_fit()`, #1859). Both
+/// then print through [`format_omega_rows_from`], so the rows cannot drift
+/// between the CLI, [`format_summary`] and a wrapper. The OMEGA twin of
+/// [`KappaRowsInput`].
+///
+/// Every slice is indexed by ETA; a short or empty slice reads as the field's
+/// default for the missing ETAs (named `ETA`, not fixed, no SE, unknown type,
+/// not initialised as an SD, no linked θ).
+#[derive(Debug, Clone)]
+pub struct OmegaRowsInput<'a> {
+    /// The between-subject covariance matrix; one row per ETA, its diagonal
+    /// printed.
+    pub omega: &'a nalgebra::DMatrix<f64>,
+    /// ETA names; a missing name prints as `ETA`.
+    pub eta_names: &'a [String],
+    /// Per-ETA FIX flag: a fixed ETA is labelled `[FIX]` with `SE = ---`.
+    pub omega_fixed: &'a [bool],
+    /// The SEs as `run_covariance` writes `FitResult::se_omega`: one per ETA
+    /// (diagonal Ω) or the packed lower triangle (block Ω), read through
+    /// [`crate::types::omega_se_at`]. `None` (or a missing entry) prints
+    /// `SE = N/A`.
+    pub se_omega: Option<&'a [f64]>,
+    /// Per-ETA scale, already resolved **by name** from
+    /// `FitResult::eta_param_info` (whose order is statement order, not ETA
+    /// order): the one type every use of the ETA agrees on, `Custom` when they
+    /// disagree, `None` when it has none (a `.fitrx` saved before #1643, an ETA
+    /// no parameter classifies), which prints the log-normal CV%.
+    pub eta_param_types: Vec<Option<EtaParamType>>,
+    /// Per-ETA SD-init flag (`FitResult::omega_init_as_sd`), for
+    /// [`OmegaRowsOptions::init_as_sd`].
+    pub omega_init_as_sd: &'a [bool],
+    /// Per-ETA linked θ, resolved by name like `eta_param_types`: the one θ
+    /// every use of the ETA links to, `None` when they disagree or none does.
+    /// For [`OmegaRowsOptions::typical_value_spread`].
+    pub eta_linked_thetas: Vec<Option<EtaLinkedTheta>>,
+    /// The covariance step's status: a failed or SIR-fallback step suppresses
+    /// every CV%/SD (#1698).
+    pub covariance_status: CovarianceStatus,
+}
+
+impl<'a> OmegaRowsInput<'a> {
+    /// The input view of `r`, its ETA types and linked θs resolved by name from
+    /// `eta_param_info`. A fixed-effects-only fit (`n_eta = 0`) gives a view
+    /// that prints no rows.
+    pub fn from_result(r: &'a FitResult) -> Self {
+        let n_eta = r.omega.nrows();
+        Self {
+            omega: &r.omega,
+            eta_names: &r.eta_names,
+            omega_fixed: &r.omega_fixed,
+            se_omega: r.se_omega.as_deref(),
+            eta_param_types: (0..n_eta).map(|i| eta_type(r, eta_name(r, i))).collect(),
+            omega_init_as_sd: &r.omega_init_as_sd,
+            eta_linked_thetas: (0..n_eta)
+                .map(|i| eta_linked_theta(r, eta_name(r, i)))
+                .collect(),
+            covariance_status: r.covariance_status.clone(),
+        }
+    }
+}
+
+/// The θ the ETA called `name` is linked to, by the same by-name rule as
+/// [`eta_type`]: every `eta_param_info` entry for the ETA names the same θ →
+/// that θ, with its estimate and transform; disagreement, no link, or a name
+/// not in `theta_names` → `None`.
+fn eta_linked_theta(result: &FitResult, name: &str) -> Option<EtaLinkedTheta> {
+    let mut links = result
+        .eta_param_info
+        .iter()
+        .filter(|i| i.eta_name == name)
+        .map(|i| i.linked_theta.as_deref());
+    let first = links.next()??;
+    if !links.all(|l| l == Some(first)) {
+        return None;
+    }
+    let k = result.theta_names.iter().position(|t| t == first)?;
+    Some(EtaLinkedTheta {
+        name: first.to_string(),
+        value: *result.theta.get(k)?,
+        transform: result.theta_transform.get(k).copied(),
+    })
+}
+
+/// How [`format_omega_rows_from`] renders its rows. `Default` (everything off)
+/// is what the CLI and [`format_summary`] print. Each flag adds one thing a
+/// wrapper's print may want; build with `..Default::default()` so a flag added
+/// later does not break the caller. The rows carry no glyph above ASCII of
+/// their own either way (names are printed as given).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OmegaRowsOptions {
+    /// A scale tag after the label, in a 12-wide column: `[log-normal]`,
+    /// `[additive]`, `[logit]` (both logit types) or `[custom]`; blank for an
+    /// unknown type.
+    pub type_tag: bool,
+    /// Extend the note with the ETA's spread at its linked θ: an additive ETA's
+    /// `CV% = SD/|θ|·100 at NAME = θ` (when `|θ| > 1e-12`), a logit ETA's
+    /// `+/-1 SD = [lo, hi]` on the probability scale. Part of the note, so
+    /// absent with it (custom ETA, failed or SIR-fallback covariance) and for
+    /// an ETA with no linked θ.
+    pub typical_value_spread: bool,
+    /// `  [initial specified as SD]` after the SE of an ETA whose initial value
+    /// was written `omega NAME ~ X (sd)`.
+    pub init_as_sd: bool,
+}
+
 /// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
 fn format_omega_rows(result: &FitResult) -> String {
+    format_omega_rows_from(
+        &OmegaRowsInput::from_result(result),
+        OmegaRowsOptions::default(),
+    )
+}
+
+/// The row tag [`OmegaRowsOptions::type_tag`] prints for type `t`.
+fn eta_type_tag(t: Option<EtaParamType>) -> &'static str {
+    match t {
+        Some(EtaParamType::LogNormal) => "[log-normal]",
+        Some(EtaParamType::Additive) => "[additive]",
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => "[logit]",
+        Some(EtaParamType::Custom) => "[custom]",
+        None => "",
+    }
+}
+
+/// The clause [`OmegaRowsOptions::typical_value_spread`] appends to the note
+/// of an ETA of type `t` and variance `var` linked to `theta`, or `None` when
+/// there is nothing to add: additive `, CV% = … at NAME = …` (`|θ| ≤ 1e-12`
+/// adds nothing — a CV% about zero is meaningless), logit
+/// `, +/-1 SD = [lo, hi]` around the θ on the logit scale — `logit(θ)` when
+/// the θ is a probability (its transform, else the ETA's type, says
+/// `LogitProbability`), skipped when that is not finite (a θ outside (0, 1)).
+fn typical_value_clause(
+    t: Option<EtaParamType>,
+    var: f64,
+    theta: &EtaLinkedTheta,
+) -> Option<String> {
+    use crate::sens::num::PkNum;
+    let sd = sd_from_var(var);
+    match t {
+        Some(EtaParamType::Additive) if theta.value.abs() > 1e-12 => Some(format!(
+            ", CV% = {:.1} at {} = {:.4}",
+            sd / theta.value.abs() * 100.0,
+            theta.name,
+            theta.value
+        )),
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
+            let on_probability_scale = match theta.transform {
+                Some(tf) => tf == ThetaTransform::LogitProbability,
+                None => t == Some(EtaParamType::LogitProbability),
+            };
+            let centre = if on_probability_scale {
+                PkNum::logit(theta.value)
+            } else {
+                theta.value
+            };
+            centre.is_finite().then(|| {
+                format!(
+                    ", +/-1 SD = [{:.3}, {:.3}]",
+                    PkNum::inv_logit(centre - sd),
+                    PkNum::inv_logit(centre + sd)
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The OMEGA rows the CLI's `--- OMEGA Estimates ---` section and
+/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
+/// ETA. The note is the exact log-normal CV% (#1858) or the SD on the ETA's
+/// scale (#1643); it is absent for a custom ETA, and on every row when the
+/// covariance step failed or fell back to SIR. A fixed ETA reads
+/// `name [FIX] = …  SE = ---`. `opts` adds the extras a wrapper's print shows
+/// (see [`OmegaRowsOptions`]); with the default it prints exactly the CLI's
+/// rows. One line per `\n`; empty for a zero-row `omega`. Off-diagonal
+/// block-Ω correlations are not part of the rows.
+pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
     use std::fmt::Write;
-    let n_eta = result.omega.nrows();
-    let show_cv = shows_cv(result);
+    // Destructured so a flag added later fails to compile here until honoured.
+    let OmegaRowsOptions {
+        type_tag,
+        typical_value_spread,
+        init_as_sd,
+    } = opts;
+    let n_eta = input.omega.nrows();
+    let show_cv = status_shows_cv(&input.covariance_status);
     let mut out = String::new();
     for i in 0..n_eta {
-        let var = result.omega[(i, i)];
-        let name = eta_name(result, i);
-        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
+        let var = input.omega[(i, i)];
+        let name = input.eta_names.get(i).map_or("ETA", |s| s.as_str());
+        let is_fixed = input.omega_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
             fixed_label(name)
         } else {
@@ -180,13 +374,85 @@ fn format_omega_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+            match input
+                .se_omega
+                .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i))
+            {
                 Some(s) => format!("{:.6}", s),
                 None => "N/A".to_string(),
             }
         };
-        let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
-        let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
+        let eta_type = input.eta_param_types.get(i).copied().flatten();
+        let mut note = variance_note(eta_type, var, false);
+        if typical_value_spread {
+            let clause = input
+                .eta_linked_thetas
+                .get(i)
+                .and_then(Option::as_ref)
+                .and_then(|theta| typical_value_clause(eta_type, var, theta));
+            if let (Some(n), Some(c)) = (note.as_mut(), clause) {
+                n.push_str(&c);
+            }
+        }
+        let note = note_suffix(note, show_cv);
+        let tag = if type_tag {
+            format!(" {:<12}", eta_type_tag(eta_type))
+        } else {
+            String::new()
+        };
+        let sd_init = if init_as_sd && input.omega_init_as_sd.get(i).copied().unwrap_or(false) {
+            "  [initial specified as SD]"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  {:<20}{} = {:.6}{}  SE = {}{}",
+            label, tag, var, note, se_str, sd_init
+        );
+    }
+    out
+}
+
+/// The `--- SIGMA Estimates ---` rows of [`print_results`] and
+/// [`format_summary`]: `name = σ  (CV% = σ·100)  SE = …` for a proportional σ
+/// (stored on the SD scale, so its CV% is direct), `name = σ  SE = …` for an
+/// additive one (observation units, no CV%), `[FIX]` with `SE = ---` for a
+/// fixed one. `sigma_types` is parallel to `sigma`.
+fn format_sigma_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (i, &s) in result.sigma.iter().enumerate() {
+        let name = result
+            .sigma_names
+            .get(i)
+            .map(|n| n.as_str())
+            .unwrap_or("EPS");
+        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
+        let label = if is_fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se_str = if is_fixed {
+            "---".to_string()
+        } else {
+            match &result.se_sigma {
+                Some(se) if i < se.len() => format!("{:.6}", se[i]),
+                _ => "N/A".to_string(),
+            }
+        };
+        let _ = match result.sigma_types.get(i).copied() {
+            Some(SigmaType::Proportional) => writeln!(
+                out,
+                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
+                label,
+                s,
+                s * 100.0,
+                se_str,
+            ),
+            _ => writeln!(out, "  {:<20} = {:.6}  SE = {}", label, s, se_str),
+        };
     }
     out
 }
@@ -826,42 +1092,7 @@ pub fn print_results(result: &FitResult) {
         ErrorModel::Combined => "combined",
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
-    // Sigma is stored on the SD scale for both proportional and additive
-    // components (see src/stats/residual_error.rs). For the proportional
-    // component CV% = sigma * 100 directly; for the additive component the
-    // value is in observation units and no CV% applies. `result.sigma_types`
-    // is already parallel to `result.sigma`.
-    for (i, &s) in result.sigma.iter().enumerate() {
-        let sig_name = result
-            .sigma_names
-            .get(i)
-            .map(|n| n.as_str())
-            .unwrap_or("EPS");
-        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(sig_name)
-        } else {
-            sig_name.to_string()
-        };
-        let se_str = if is_fixed {
-            "---".to_string()
-        } else {
-            match &result.se_sigma {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
-        };
-        match result.sigma_types.get(i).copied() {
-            Some(SigmaType::Proportional) => eprintln!(
-                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
-                label,
-                s,
-                s * 100.0,
-                se_str,
-            ),
-            _ => eprintln!("  {:<20} = {:.6}  SE = {}", label, s, se_str),
-        }
-    }
+    eprint!("{}", format_sigma_rows(result));
 
     // IOV (KAPPA) estimates
     if result.omega_iov.is_some() {
@@ -1105,13 +1336,6 @@ pub fn format_summary(result: &FitResult) -> String {
     let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
     write_prior_summary(&mut out, result);
 
-    // Failed / SIR-fallback covariance make the SE columns meaningless, so we
-    // suppress the derived CV% (mirrors `print_results`).
-    let show_cv = !matches!(
-        result.covariance_status,
-        CovarianceStatus::Failed | CovarianceStatus::SirFallback
-    );
-
     // NN weight thetas are excluded from the per-parameter table (they can
     // number in the hundreds); `print_results` skips them the same way.
     #[cfg(feature = "nn")]
@@ -1187,26 +1411,9 @@ pub fn format_summary(result: &FitResult) -> String {
     let n_eta = result.omega.nrows();
     if n_eta > 0 {
         let _ = writeln!(out, "\n--- OMEGA ---");
-        for i in 0..n_eta {
-            let var = result.omega[(i, i)];
-            let name = eta_name(result, i);
-            let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-            let label = if is_fixed {
-                fixed_label(name)
-            } else {
-                name.to_string()
-            };
-            let se_str = if is_fixed {
-                "---".to_string()
-            } else {
-                match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
-                    Some(s) => format!("{:.6}", s),
-                    None => "N/A".to_string(),
-                }
-            };
-            let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
-            let _ = writeln!(out, "  {:<16} = {:.6}{}  SE = {}", label, var, note, se_str);
-        }
+        // The console's rows verbatim (#1859), as the KAPPA section below
+        // (#1657), so the two cannot drift.
+        out.push_str(&format_omega_rows(result));
         // Off-diagonal correlations (block omega).
         for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
             eta_name(result, k)
@@ -1236,42 +1443,8 @@ pub fn format_summary(result: &FitResult) -> String {
         ErrorModel::Combined => "combined",
     };
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
-    for (i, &s) in result.sigma.iter().enumerate() {
-        let name = result
-            .sigma_names
-            .get(i)
-            .map(|n| n.as_str())
-            .unwrap_or("EPS");
-        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.to_string()
-        };
-        let se_str = if is_fixed {
-            "---".to_string()
-        } else {
-            match &result.se_sigma {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
-        };
-        match result.sigma_types.get(i).copied() {
-            Some(SigmaType::Proportional) => {
-                let _ = writeln!(
-                    out,
-                    "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
-                    label,
-                    s,
-                    s * 100.0,
-                    se_str
-                );
-            }
-            _ => {
-                let _ = writeln!(out, "  {:<16} = {:.6}  SE = {}", label, s, se_str);
-            }
-        }
-    }
+    // The console's rows verbatim, as OMEGA and KAPPA above.
+    out.push_str(&format_sigma_rows(result));
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
@@ -5849,7 +6022,7 @@ mod tests {
             ] {
                 let mut r = mk(true, typed);
                 r.covariance_status = status.clone();
-                assert_eq!(shows_cv(&r), show, "{status:?}");
+                assert_eq!(status_shows_cv(&r.covariance_status), show, "{status:?}");
                 for (surface, text) in [
                     ("console", format_kappa_rows(&r)),
                     ("summary", format_summary(&r)),
@@ -6507,6 +6680,537 @@ mod tests {
             assert_eq!(format_omega_corr_rows(r), "", "{tag}");
             assert_eq!(format_kappa_corr_rows(r), "", "{tag}");
             assert_eq!(summary_corr(&format_summary(r)), "", "{tag}");
+        }
+    }
+
+    /// #1859: an OMEGA fixture spanning every input the rows read — one ETA of
+    /// each `EtaParamType` plus one with no `eta_param_info` entry *and* no
+    /// name (prints `ETA`, unknown type → log-normal CV%), a diagonal or block
+    /// Ω (block → SEs packed lower-triangle, read through `omega_se_at`'s
+    /// `chol_lt_idx` branch; diagonal → one SE per ETA), an optional FIX on the
+    /// additive ETA, SEs present or absent, and the covariance status. The
+    /// variances put each note in a regime the old first-order CV% gets wrong
+    /// (0.2: 47.1 exact against 44.7; 2.37: 311 against 154, #1858).
+    fn omega_rows_result(block: bool, fix: bool, se: bool, status: CovarianceStatus) -> FitResult {
+        use EtaParamType::*;
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        let vars = [0.2, 156.036966, 0.5, 0.3, 0.4, 2.37];
+        let n = vars.len();
+        r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_row_slice(&vars));
+        if block {
+            for (i, j, c) in [(1, 0, 0.03), (2, 0, -0.04), (5, 3, 0.05), (4, 2, 0.06)] {
+                r.omega[(i, j)] = c;
+                r.omega[(j, i)] = c;
+            }
+        }
+        r.eta_names = ["eta_LN", "eta_ADD", "eta_LGT", "eta_LP", "eta_C"]
+            .map(String::from)
+            .to_vec();
+        r.omega_fixed = vec![false, fix, false, false, false, false];
+        let info = |n: &str, t, th: Option<&str>| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: t,
+            linked_theta: th.map(String::from),
+            individual_param_name: n.to_uppercase(),
+        };
+        // Statement order, not `eta_names` order: the type is found by name.
+        // Linked θs (#1884 extras) for the additive and both logit ETAs; the
+        // log-normal one is mu-referenced (no link).
+        r.eta_param_info = vec![
+            info("eta_C", Custom, None),
+            info("eta_LP", LogitProbability, Some("TH_LP")),
+            info("eta_LGT", Logit, Some("TH_LGT")),
+            info("eta_ADD", Additive, Some("TVV")),
+            info("eta_LN", LogNormal, None),
+        ];
+        r.theta_names = ["TVCL", "TVV", "TH_LGT", "TH_LP"]
+            .map(String::from)
+            .to_vec();
+        r.theta = vec![5.0, 62.5, 0.4, 0.7];
+        // Parallel to `theta` (the summary's θ table indexes it by θ).
+        r.se_theta = Some(vec![0.5, 6.0, 0.05, 0.07]);
+        r.theta_fixed = vec![false; 4];
+        r.theta_transform = vec![
+            ThetaTransform::Log,
+            ThetaTransform::Identity,
+            ThetaTransform::Logit,
+            ThetaTransform::LogitProbability,
+        ];
+        r.omega_init_as_sd = vec![true, false, false, false, false, false];
+        let n_se = if block { n * (n + 1) / 2 } else { n };
+        r.se_omega = se.then(|| (1..=n_se).map(|k| k as f64 / 1000.0).collect());
+        r.covariance_status = status;
+        r
+    }
+
+    /// #1859: the console's OMEGA rows, frozen byte for byte as the private
+    /// `format_omega_rows` printed them **before** it became a call to
+    /// `format_omega_rows_from` (captured at `14cca400`), on five cells of
+    /// `omega_rows_result` that between them take every axis value: diagonal
+    /// and block Ω (the block SEs are the packed `(i,i)` entries 0.012, 0.016,
+    /// … where a diagonal read would give 0.003, 0.004), FIX, every ETA type
+    /// plus an unnamed untyped one, SEs absent, and the four covariance
+    /// statuses (Failed and SirFallback: no note on any row). Asserted on the
+    /// console, on `from_result` through the public fn, and on
+    /// `format_summary`, which now prints the same rows verbatim (its OMEGA
+    /// label column was 16 wide; it is the console's 20, as KAPPA's has been
+    /// since #1657).
+    #[test]
+    fn omega_rows_match_frozen_console_rows() {
+        use CovarianceStatus::*;
+        let typed_rows = |se: [&str; 6], fix: bool| -> String {
+            let add = if fix {
+                "  eta_ADD [FIX]        = 156.036966  (SD = 12.4915)  SE = ---\n".to_string()
+            } else {
+                format!(
+                    "  eta_ADD              = 156.036966  (SD = 12.4915)  SE = {}\n",
+                    se[1]
+                )
+            };
+            format!(
+                "  eta_LN               = 0.200000  (CV% = 47.1)  SE = {}\n{add}\
+                 \x20 eta_LGT              = 0.500000  (SD = 0.7071, logit scale)  SE = {}\n  \
+                 eta_LP               = 0.300000  (SD = 0.5477, logit scale)  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  (CV% = 311.4)  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let diag_se = [
+            "0.001000", "0.002000", "0.003000", "0.004000", "0.005000", "0.006000",
+        ];
+        let block_se = [
+            "0.001000", "", "0.012000", "0.016000", "0.019000", "0.021000",
+        ];
+        let bare_rows = |se: [&str; 6]| -> String {
+            format!(
+                "  eta_LN               = 0.200000  SE = {}\n  \
+                 eta_ADD [FIX]        = 156.036966  SE = ---\n  \
+                 eta_LGT              = 0.500000  SE = {}\n  \
+                 eta_LP               = 0.300000  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let cells = [
+            ((false, false, true, Computed), typed_rows(diag_se, false)),
+            ((true, true, true, Computed), typed_rows(block_se, true)),
+            (
+                (true, false, false, NotRequested),
+                typed_rows(["N/A"; 6], false),
+            ),
+            ((false, true, true, Failed), bare_rows(diag_se)),
+            ((true, true, true, SirFallback), bare_rows(block_se)),
+        ];
+        let mut wrong = Vec::new();
+        for ((block, fix, se, status), want) in cells {
+            let cell = format!("block={block} fix={fix} se={se} {status:?}");
+            let r = omega_rows_result(block, fix, se, status);
+            let summary = format_summary(&r);
+            let summary_rows = summary
+                .split_once("--- OMEGA ---\n")
+                .map(|(_, rest)| {
+                    rest.lines()
+                        .take_while(|l| !l.is_empty() && !l.starts_with("  corr("))
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let via_result = format_omega_rows_from(
+                &OmegaRowsInput::from_result(&r),
+                OmegaRowsOptions::default(),
+            );
+            for (surface, got) in [
+                ("console", format_omega_rows(&r)),
+                ("from_result", via_result),
+                ("summary", summary_rows),
+            ] {
+                if got != want {
+                    wrong.push(format!("{surface} {cell}:\n got: {got:?}\nwant: {want:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// #1859: an `OmegaRowsInput` built field by field the way ferx-r builds
+    /// it — its own copies of the fields, the ETA types and linked θs resolved
+    /// by name from tables rather than through `eta_type` /
+    /// `eta_linked_theta` — prints exactly what `from_result` prints, across
+    /// all 32 cells of `omega_rows_result` (Ω shape × FIX × SEs × covariance
+    /// status) and all 8 `OmegaRowsOptions` combinations; with the default
+    /// options both equal the console. A field `from_result` drops or
+    /// mis-wires reddens the equality, as does one the fn ignores; the frozen
+    /// strings in `omega_rows_match_frozen_console_rows` and
+    /// `omega_rows_extras_render_as_frozen` pin what the shared answer is.
+    #[test]
+    fn omega_rows_from_input_built_field_by_field() {
+        use EtaParamType::*;
+        let by_name = |n: &str| match n {
+            "eta_LN" => Some(LogNormal),
+            "eta_ADD" => Some(Additive),
+            "eta_LGT" => Some(Logit),
+            "eta_LP" => Some(LogitProbability),
+            "eta_C" => Some(Custom),
+            _ => None,
+        };
+        let linked = |n: &str| {
+            let (name, value, transform) = match n {
+                "eta_ADD" => ("TVV", 62.5, ThetaTransform::Identity),
+                "eta_LGT" => ("TH_LGT", 0.4, ThetaTransform::Logit),
+                "eta_LP" => ("TH_LP", 0.7, ThetaTransform::LogitProbability),
+                _ => return None,
+            };
+            Some(EtaLinkedTheta {
+                name: name.into(),
+                value,
+                transform: Some(transform),
+            })
+        };
+        let mut options = Vec::new();
+        for type_tag in [false, true] {
+            for typical_value_spread in [false, true] {
+                for init_as_sd in [false, true] {
+                    options.push(OmegaRowsOptions {
+                        type_tag,
+                        typical_value_spread,
+                        init_as_sd,
+                    });
+                }
+            }
+        }
+        let mut cells = 0;
+        for block in [false, true] {
+            for fix in [false, true] {
+                for se in [false, true] {
+                    for status in [
+                        CovarianceStatus::Computed,
+                        CovarianceStatus::NotRequested,
+                        CovarianceStatus::Failed,
+                        CovarianceStatus::SirFallback,
+                    ] {
+                        let cell = format!("block={block} fix={fix} se={se} {status:?}");
+                        let r = omega_rows_result(block, fix, se, status.clone());
+                        let omega = r.omega.clone();
+                        let names = r.eta_names.clone();
+                        let fixed = r.omega_fixed.clone();
+                        let se_omega = r.se_omega.clone();
+                        let init_sd = r.omega_init_as_sd.clone();
+                        let input = OmegaRowsInput {
+                            omega: &omega,
+                            eta_names: &names,
+                            omega_fixed: &fixed,
+                            se_omega: se_omega.as_deref(),
+                            eta_param_types: (0..omega.nrows())
+                                .map(|i| names.get(i).and_then(|n| by_name(n)))
+                                .collect(),
+                            omega_init_as_sd: &init_sd,
+                            eta_linked_thetas: (0..omega.nrows())
+                                .map(|i| names.get(i).and_then(|n| linked(n)))
+                                .collect(),
+                            covariance_status: status,
+                        };
+                        let via_result = OmegaRowsInput::from_result(&r);
+                        assert_eq!(via_result.eta_param_types, input.eta_param_types, "{cell}");
+                        assert_eq!(
+                            via_result.eta_linked_thetas, input.eta_linked_thetas,
+                            "{cell}"
+                        );
+                        for &opts in &options {
+                            let by_hand = format_omega_rows_from(&input, opts);
+                            assert_eq!(
+                                format_omega_rows_from(&via_result, opts),
+                                by_hand,
+                                "from_result {cell} {opts:?}"
+                            );
+                            assert_eq!(by_hand.lines().count(), 6, "{cell}:\n{by_hand}");
+                            if opts == OmegaRowsOptions::default() {
+                                assert_eq!(by_hand, format_omega_rows(&r), "console {cell}");
+                            }
+                        }
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 32);
+    }
+
+    /// #1884 review finding 1: ferx-r's OMEGA-row extras, each behind its own
+    /// `OmegaRowsOptions` flag, frozen against values computed outside the
+    /// engine (Python: additive `√156.036966 / 62.5 · 100 = 20.0`; logit
+    /// `inv_logit(0.4 ∓ √0.5) = [0.424, 0.752]`; probability-scale θ
+    /// `inv_logit(logit(0.7) ∓ √0.3) = [0.574, 0.801]`). All three flags on a
+    /// computed block-Ω fit, then on a failed one — the spread clause is part
+    /// of the note and goes with it (#1698), while the tag and the SD-init
+    /// mark stay. Each flag alone changes only its own part of a row, so
+    /// deleting one flag's code reddens the cell naming it.
+    #[test]
+    fn omega_rows_extras_render_as_frozen() {
+        let all = OmegaRowsOptions {
+            type_tag: true,
+            typical_value_spread: true,
+            init_as_sd: true,
+        };
+        let rows = |r: &FitResult, o| format_omega_rows_from(&OmegaRowsInput::from_result(r), o);
+
+        let computed = omega_rows_result(true, false, true, CovarianceStatus::Computed);
+        assert_eq!(
+            rows(&computed, all),
+            "  eta_LN               [log-normal] = 0.200000  (CV% = 47.1)  SE = 0.001000  \
+             [initial specified as SD]\n  \
+             eta_ADD              [additive]   = 156.036966  \
+             (SD = 12.4915, CV% = 20.0 at TVV = 62.5000)  SE = 0.007000\n  \
+             eta_LGT              [logit]      = 0.500000  \
+             (SD = 0.7071, logit scale, +/-1 SD = [0.424, 0.752])  SE = 0.012000\n  \
+             eta_LP               [logit]      = 0.300000  \
+             (SD = 0.5477, logit scale, +/-1 SD = [0.574, 0.801])  SE = 0.016000\n  \
+             eta_C                [custom]     = 0.400000  SE = 0.019000\n  \
+             ETA                               = 2.370000  (CV% = 311.4)  SE = 0.021000\n"
+        );
+
+        let failed = omega_rows_result(false, true, true, CovarianceStatus::Failed);
+        assert_eq!(
+            rows(&failed, all),
+            "  eta_LN               [log-normal] = 0.200000  SE = 0.001000  \
+             [initial specified as SD]\n  \
+             eta_ADD [FIX]        [additive]   = 156.036966  SE = ---\n  \
+             eta_LGT              [logit]      = 0.500000  SE = 0.003000\n  \
+             eta_LP               [logit]      = 0.300000  SE = 0.004000\n  \
+             eta_C                [custom]     = 0.400000  SE = 0.005000\n  \
+             ETA                               = 2.370000  SE = 0.006000\n"
+        );
+
+        // One flag at a time, against the default rows.
+        let default = rows(&computed, OmegaRowsOptions::default());
+        let only = |o: OmegaRowsOptions| rows(&computed, o);
+        assert_eq!(
+            only(OmegaRowsOptions {
+                init_as_sd: true,
+                ..Default::default()
+            }),
+            default.replacen(
+                "SE = 0.001000\n",
+                "SE = 0.001000  [initial specified as SD]\n",
+                1
+            ),
+            "init_as_sd alone"
+        );
+        assert_eq!(
+            only(OmegaRowsOptions {
+                typical_value_spread: true,
+                ..Default::default()
+            }),
+            default
+                .replace(
+                    "(SD = 12.4915)",
+                    "(SD = 12.4915, CV% = 20.0 at TVV = 62.5000)"
+                )
+                .replace(
+                    "(SD = 0.7071, logit scale)",
+                    "(SD = 0.7071, logit scale, +/-1 SD = [0.424, 0.752])"
+                )
+                .replace(
+                    "(SD = 0.5477, logit scale)",
+                    "(SD = 0.5477, logit scale, +/-1 SD = [0.574, 0.801])"
+                ),
+            "typical_value_spread alone"
+        );
+        let tagged = only(OmegaRowsOptions {
+            type_tag: true,
+            ..Default::default()
+        });
+        // The tag is a 13-character insertion (" " + 12-wide column) after the
+        // 22-character label column; cutting it out must give the default.
+        let untag = |s: &str| -> String {
+            s.lines()
+                .map(|l| format!("{}{}\n", &l[..22], &l[35..]))
+                .collect()
+        };
+        assert_eq!(untag(&tagged), default, "type_tag alone:\n{tagged}");
+        assert!(
+            tagged.contains("eta_ADD              [additive]   = "),
+            "{tagged}"
+        );
+    }
+
+    /// #1884 extras: the spread clause's edge cases on `typical_value_clause`
+    /// directly, and `eta_linked_theta`'s by-name rule. Additive: a θ of 0
+    /// adds nothing, a negative θ uses `|θ|`. Logit: the θ's transform decides
+    /// the scale and wins over the ETA's type; an unknown transform falls back
+    /// to the ETA's type, both ways (the pair straddles that gate); a
+    /// probability-scale θ outside (0, 1) adds nothing. Log-normal and custom
+    /// add nothing.
+    #[test]
+    fn omega_rows_typical_value_clause_edges() {
+        use EtaParamType::*;
+        let th = |value, transform| EtaLinkedTheta {
+            name: "TH".into(),
+            value,
+            transform,
+        };
+        let id = Some(ThetaTransform::Identity);
+        assert_eq!(
+            typical_value_clause(Some(Additive), 0.25, &th(0.0, id)),
+            None
+        );
+        assert_eq!(
+            typical_value_clause(Some(Additive), 0.25, &th(-2.0, id)).as_deref(),
+            Some(", CV% = 25.0 at TH = -2.0000")
+        );
+        let as_logit = Some(", +/-1 SD = [0.538, 0.777]");
+        let as_prob = Some(", +/-1 SD = [0.574, 0.801]");
+        for (t, tf, want) in [
+            (LogitProbability, None, as_prob),
+            (Logit, None, as_logit),
+            (LogitProbability, Some(ThetaTransform::Logit), as_logit),
+            (Logit, Some(ThetaTransform::LogitProbability), as_prob),
+        ] {
+            assert_eq!(
+                typical_value_clause(Some(t), 0.3, &th(0.7, tf)).as_deref(),
+                want,
+                "{t:?} {tf:?}"
+            );
+        }
+        assert_eq!(
+            typical_value_clause(
+                Some(LogitProbability),
+                0.3,
+                &th(1.5, Some(ThetaTransform::LogitProbability))
+            ),
+            None
+        );
+        for t in [Some(LogNormal), Some(Custom), None] {
+            assert_eq!(typical_value_clause(t, 0.3, &th(0.7, id)), None, "{t:?}");
+        }
+
+        // By name: the fixture's links resolve with value and transform; an ETA
+        // whose two uses link different θs, or that links a θ not in
+        // `theta_names`, or has no entry, gets none.
+        let mut r = omega_rows_result(false, false, false, CovarianceStatus::Computed);
+        assert_eq!(
+            eta_linked_theta(&r, "eta_LP"),
+            Some(EtaLinkedTheta {
+                name: "TH_LP".into(),
+                value: 0.7,
+                transform: Some(ThetaTransform::LogitProbability)
+            })
+        );
+        let info = |n: &str, th: &str| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: Additive,
+            linked_theta: Some(th.into()),
+            individual_param_name: "Q".into(),
+        };
+        r.eta_param_info.push(info("eta_ADD", "TVV"));
+        assert_eq!(eta_linked_theta(&r, "eta_ADD").map(|t| t.value), Some(62.5));
+        r.eta_param_info.push(info("eta_ADD", "TVCL"));
+        assert_eq!(eta_linked_theta(&r, "eta_ADD"), None);
+        r.eta_param_info.push(info("eta_C", "NOT_A_THETA"));
+        assert_eq!(eta_linked_theta(&r, "eta_C"), None);
+        assert_eq!(eta_linked_theta(&r, "ETA"), None);
+        assert_eq!(eta_linked_theta(&r, "eta_LN"), None);
+    }
+
+    /// #1859: a short or empty slice reads as the field's default for the
+    /// missing ETAs — `ETA`, not fixed, `SE = N/A`, unknown type (log-normal
+    /// CV%), no SD-init mark, no linked θ — and a zero-row Ω prints nothing, on
+    /// the console and in a fixed-effects-only (`n_eta = 0`) summary, which has
+    /// no OMEGA section.
+    #[test]
+    fn omega_rows_from_short_slices_and_no_omega() {
+        let omega = DMatrix::from_row_slice(2, 2, &[0.2, 0.0, 0.0, 0.5]);
+        let input = OmegaRowsInput {
+            omega: &omega,
+            eta_names: &[],
+            omega_fixed: &[],
+            se_omega: Some(&[0.01]),
+            eta_param_types: vec![Some(EtaParamType::Additive)],
+            omega_init_as_sd: &[],
+            eta_linked_thetas: Vec::new(),
+            covariance_status: CovarianceStatus::Computed,
+        };
+        let want = "  ETA                  = 0.200000  (SD = 0.4472)  SE = 0.010000\n  \
+                    ETA                  = 0.500000  (CV% = 80.5)  SE = N/A\n";
+        assert_eq!(
+            format_omega_rows_from(&input, OmegaRowsOptions::default()),
+            want
+        );
+        let spread_and_sd = OmegaRowsOptions {
+            typical_value_spread: true,
+            init_as_sd: true,
+            ..Default::default()
+        };
+        assert_eq!(format_omega_rows_from(&input, spread_and_sd), want);
+
+        let mut none = crate::types::test_helpers::minimal_fit_result();
+        none.omega = DMatrix::zeros(0, 0);
+        none.eta_names.clear();
+        none.omega_fixed.clear();
+        none.se_omega = None;
+        assert_eq!(format_omega_rows(&none), "");
+        let view = OmegaRowsInput::from_result(&none);
+        assert!(view.eta_param_types.is_empty() && view.eta_linked_thetas.is_empty());
+        assert!(!format_summary(&none).contains("--- OMEGA ---"));
+    }
+
+    /// #1884 review finding 2: a SIGMA fixture spanning every input the rows
+    /// read — proportional (CV% = σ·100) and additive, a FIX entry, a fourth σ
+    /// with no name (prints `EPS`) and no type, and `se_sigma` absent, short
+    /// (the last σ reads `N/A`) or full.
+    fn sigma_rows_result(fix: bool, se: Option<usize>) -> FitResult {
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        r.sigma = vec![0.15, 0.8, 0.05, 1.2];
+        r.sigma_names = ["EPS_PROP", "EPS_ADD", "EPS_P2"].map(String::from).to_vec();
+        r.sigma_types = vec![
+            SigmaType::Proportional,
+            SigmaType::Additive,
+            SigmaType::Proportional,
+        ];
+        r.sigma_fixed = vec![false, false, fix, false];
+        r.se_sigma = se.map(|n| (1..=n).map(|k| k as f64 / 100.0).collect());
+        r
+    }
+
+    /// #1884 review finding 2: the SIGMA rows, frozen from what
+    /// `format_summary` printed **before** its loop became a call to the shared
+    /// `format_sigma_rows` (captured at `bb1f72f0`, 16-wide), re-padded to the
+    /// console's 20 — the one difference between the two old copies. Asserted
+    /// on the shared rows and on the summary, which now prints them verbatim
+    /// (the console's `eprint!` cannot be captured; it prints the same string).
+    #[test]
+    fn sigma_rows_match_frozen_rows() {
+        let row = |label: &str, rest: &str| format!("  {label:<20} = {rest}\n");
+        let cells = [
+            (
+                (false, Some(4)),
+                ["0.010000", "0.020000", "0.030000", "0.040000"],
+            ),
+            ((true, Some(3)), ["0.010000", "0.020000", "---", "N/A"]),
+            ((false, None), ["N/A"; 4]),
+        ];
+        for ((fix, se), s) in cells {
+            let want = [
+                row(
+                    "EPS_PROP",
+                    &format!("0.150000  (CV% = 15.0)  SE = {}", s[0]),
+                ),
+                row("EPS_ADD", &format!("0.800000  SE = {}", s[1])),
+                row(
+                    if fix { "EPS_P2 [FIX]" } else { "EPS_P2" },
+                    &format!("0.050000  (CV% = 5.0)  SE = {}", s[2]),
+                ),
+                row("EPS", &format!("1.200000  SE = {}", s[3])),
+            ]
+            .concat();
+            let r = sigma_rows_result(fix, se);
+            assert_eq!(format_sigma_rows(&r), want, "fix={fix} se={se:?}");
+            let summary = format_summary(&r);
+            assert!(
+                summary.contains(&format!("--- SIGMA (proportional) ---\n{want}")),
+                "summary fix={fix} se={se:?}:\n{summary}"
+            );
         }
     }
 }

@@ -510,6 +510,35 @@ in force where it sits: a line before the assignment, a line after a
 reassignment that replaces it, or one in the other branch of an `if` does not
 change the label.
 
+### Printing the OMEGA rows from a wrapper
+
+A wrapper prints the same OMEGA rows through the engine's own formatter, at
+print time (#1859), as it does the KAPPA rows. It builds a
+`ferx_core::io::output::OmegaRowsInput` from the fit's `omega`, ETA names, FIX
+flags, `se_omega` (one SE per ETA, or the packed lower triangle of a block Ω),
+each ETA's type resolved by name from `eta_param_info`, and the covariance
+status (`OmegaRowsInput::from_result` does this for a `FitResult`), then calls
+`format_omega_rows_from`. With `OmegaRowsOptions::default()` the rows are the
+console's: a fixed ETA reads `[FIX]` with `SE = ---`, and a covariance step that
+failed or fell back to SIR prints no `CV%` or `SD` on any row. Block-Ω
+correlations are not part of the rows.
+
+Three options add what a wrapper's print may want. They are off by default, so
+the CLI and `format_summary()` never print them:
+
+| Option | Adds |
+|---|---|
+| `type_tag` | `[log-normal]`, `[additive]`, `[logit]` or `[custom]` after the name |
+| `typical_value_spread` | inside the note, for an ETA linked to a θ (`TVV + ETA_V`, `inv_logit(TH + ETA)`): an additive ETA's `CV% = … at TVV = …` (its SD over the θ), and a logit ETA's `+/-1 SD = [lo, hi]` on the probability scale |
+| `init_as_sd` | `[initial specified as SD]` after an ETA declared `omega NAME ~ X (sd)` |
+
+The ±1 SD range is centred on the θ on the logit scale: the θ itself, or
+`logit(θ)` when the θ's transform is `LogitProbability` (it is a probability).
+The spread goes wherever the note goes, so a failed covariance step drops it
+too. The view's `eta_linked_thetas` carries each ETA's θ name, estimate and
+transform, resolved by name like the types. An ETA whose uses link different θs
+has none.
+
 ## Covariate Detection
 
 Any uppercase identifier in the expression that does not match a theta name,
