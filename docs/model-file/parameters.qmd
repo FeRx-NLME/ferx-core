@@ -476,6 +476,14 @@ A block of 20 or more free coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console. The
 fit YAML writes every independently estimated coefficient under
 `theta_blocks:`; constrained dependent levels are derived values, not estimates.
+A `FIX` coefficient is never counted as free: a fixed block reports
+`PLACEBO  0 free, 18 FIX coefficients`, and the YAML's `n_free_coefficients` and
+`n_fixed_coefficients` split the count the same way, with each fixed coefficient
+listed as `fixed: true` and no SE. The min, median and max cover every
+coefficient, fixed or not, because a fixed level is still the value the model
+predicts with. A block is usually fixed as a whole by its `FIX`, but a single θ
+can be fixed too (through `theta_fixed`, or when ferx freezes a θ with no effect
+on the objective), so a block can also be partly fixed (#1891).
 To read a dependent level's value, use `theta_level_values`
 ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
