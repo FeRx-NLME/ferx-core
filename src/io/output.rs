@@ -778,13 +778,14 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
     (mn, mx, mean, var.sqrt())
 }
 
-/// Number of **free** coefficients at or above which a θ vector or level block
-/// (#1064) is reported as its own compact section instead of one entry per θ in
-/// the θ table.
+/// Number of coefficients at or above which a θ vector or level block (#1064) is
+/// reported as its own compact section instead of one entry per θ in the θ table.
 ///
-/// The count is of the block's entries in `theta_names` — its estimated θ — not of
-/// its levels: a `sum_to_zero` block's dependent level has no θ, so a 21-level
-/// block (20 free coefficients) is compacted and a 20-level one (19) is not.
+/// The count is of the block's entries in `theta_names` — its θ, `FIX` or not —
+/// not of its levels: a `sum_to_zero` block's dependent level has no θ, so a
+/// 21-level block (20 coefficients) is compacted and a 20-level one (19) is not.
+/// A `FIX` coefficient counts here, since it still takes a row, although the
+/// report lists it as `FIX` rather than free (#1891).
 /// [`compact_theta_blocks`] applies the rule; call it rather than comparing against
 /// this constant, so a caller cannot drift from the writers (#1623).
 ///
@@ -834,6 +835,81 @@ fn block_summary(values: &[f64]) -> (f64, f64, f64) {
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
+}
+
+/// One compact θ block as the console, `format_summary` and the fit YAML report
+/// it — the single place its count and summary are computed, so the three cannot
+/// drift (#1891).
+struct ThetaBlockSummary {
+    /// Coefficients the fit estimated.
+    n_free: usize,
+    /// Coefficients held `FIX` — the whole block by its declaration's `FIX`, or
+    /// single θs fixed through `theta_fixed` (an API caller, or the outer
+    /// optimizer freezing a θ with no effect on the objective).
+    n_fixed: usize,
+    /// `(min, median, max)` over **every** coefficient, FIX or not: a fixed level
+    /// is still the value the model predicts with, so leaving it out would
+    /// misdescribe what the block absorbs, and a fully `FIX` block would have
+    /// nothing to summarise.
+    min: f64,
+    median: f64,
+    max: f64,
+}
+
+impl ThetaBlockSummary {
+    /// `"21 free coefficients"`, or `"3 free, 18 FIX coefficients"` once any
+    /// coefficient is fixed — a FIX θ is not free, so it is never counted as one.
+    fn count_label(&self) -> String {
+        if self.n_fixed == 0 {
+            format!("{} free coefficients", self.n_free)
+        } else {
+            format!("{} free, {} FIX coefficients", self.n_free, self.n_fixed)
+        }
+    }
+}
+
+/// The whole THETA BLOCKS section — header and one line per block — or `""` when
+/// no block is compact. `print_results` prints it to stderr verbatim and
+/// `format_summary` appends it with each block line indented by `indent`, so the
+/// console and the saved report are one writer and a test of either covers both.
+fn format_theta_blocks_section(
+    result: &FitResult,
+    theta_blocks: &[(String, std::ops::Range<usize>)],
+    indent: &str,
+) -> String {
+    use std::fmt::Write;
+    if theta_blocks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n--- THETA BLOCKS ---\n");
+    for (block, range) in theta_blocks {
+        let s = theta_block_summary(result, range.clone());
+        let _ = writeln!(
+            out,
+            "{indent}{}  {}   min {:.4}  median {:.4}  max {:.4}",
+            block,
+            s.count_label(),
+            s.min,
+            s.median,
+            s.max
+        );
+    }
+    out
+}
+
+fn theta_block_summary(result: &FitResult, range: std::ops::Range<usize>) -> ThetaBlockSummary {
+    let n_fixed = range
+        .clone()
+        .filter(|&i| result.theta_fixed.get(i).copied().unwrap_or(false))
+        .count();
+    let (min, median, max) = block_summary(&result.theta[range.clone()]);
+    ThetaBlockSummary {
+        n_free: range.len() - n_fixed,
+        n_fixed,
+        min,
+        median,
+        max,
+    }
 }
 
 /// Render the per-parameter prior report (#254), or nothing when no prior is in
@@ -1028,20 +1104,7 @@ pub fn print_results(result: &FitResult) {
 
     // Compact θ level block summary (#1064). Only independently estimated
     // contrast coefficients live in `FitResult`; dependent levels are derived.
-    if !theta_blocks.is_empty() {
-        eprintln!("\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
-            eprintln!(
-                "{}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
-                block,
-                range.len(),
-                mn,
-                med,
-                mx
-            );
-        }
-    }
+    eprint!("{}", format_theta_blocks_section(result, &theta_blocks, ""));
 
     // Compact NN-weight summary block (Option E). Skipped when no
     // `[covariate_nn]` blocks were declared.
@@ -1391,21 +1454,7 @@ pub fn format_summary(result: &FitResult) -> String {
             label, est, se_str, rse_str
         );
     }
-    if !theta_blocks.is_empty() {
-        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
-            let _ = writeln!(
-                out,
-                "  {}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
-                block,
-                range.len(),
-                mn,
-                med,
-                mx
-            );
-        }
-    }
+    out.push_str(&format_theta_blocks_section(result, &theta_blocks, "  "));
 
     // --- OMEGA ---
     let n_eta = result.omega.nrows();
@@ -2589,20 +2638,29 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !theta_blocks.is_empty() {
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            let s = theta_block_summary(result, range.clone());
             writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
-            writeln!(f, "    n_free_coefficients: {}", range.len()).map_err(|e| e.to_string())?;
-            writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
-            writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
-            writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
+            writeln!(f, "    min: {:.6}", s.min).map_err(|e| e.to_string())?;
+            writeln!(f, "    median: {:.6}", s.median).map_err(|e| e.to_string())?;
+            writeln!(f, "    max: {:.6}", s.max).map_err(|e| e.to_string())?;
             writeln!(f, "    coefficients:").map_err(|e| e.to_string())?;
             for i in range.clone() {
                 let label = result.theta_names[i]
                     .strip_prefix(&format!("{block}["))
                     .and_then(|r| r.strip_suffix(']'))
                     .unwrap_or(&result.theta_names[i]);
+                // A FIX coefficient reads as a fixed scalar θ does above (#1891):
+                // flagged, with no SE — it was not estimated.
+                let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
                 let se = result.se_theta.as_ref().map(|v| v[i]);
                 match se {
+                    _ if is_fixed => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
                     Some(se) => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
@@ -3722,6 +3780,100 @@ mod tests {
         assert!(yaml.contains("n_free_coefficients: 21"));
         assert!(yaml.contains("coefficients:"));
         assert!(!yaml.contains("n_levels:"));
+    }
+
+    #[test]
+    fn compact_theta_block_never_counts_a_fix_coefficient_as_free() {
+        // #1891: a FIX θ is not free. A level block's `FIX` fixes every level; a
+        // single θ can be fixed through `theta_fixed`, so a block may be partly
+        // fixed. min/median/max cover every coefficient — the FIX values are the
+        // ones the model predicts with — so fixing the three smallest leaves
+        // `min 1.0000`; a summary over free levels only would read `min 4.0000`.
+        //
+        // Two scalar θs sit before the block, as they do in a real model, so the
+        // block does not start at θ index 0: `V` is FIX and both are far outside
+        // the block's values, so reading the block by relative index (`0..n`)
+        // miscounts the FIX levels and moves min/max.
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        let cases: [(&str, Vec<bool>, &str, usize, usize); 3] = [
+            (
+                "free",
+                vec![false; n],
+                "PLACEBO  21 free coefficients   min 1.0000  median 11.0000  max 21.0000",
+                21,
+                0,
+            ),
+            (
+                "fully FIX",
+                vec![true; n],
+                "PLACEBO  0 free, 21 FIX coefficients   min 1.0000  median 11.0000  max 21.0000",
+                0,
+                21,
+            ),
+            (
+                "partly FIX",
+                (0..n).map(|i| i < 3).collect(),
+                "PLACEBO  18 free, 3 FIX coefficients   min 1.0000  median 11.0000  max 21.0000",
+                18,
+                3,
+            ),
+        ];
+        for (case, fixed, line, n_free, n_fixed) in cases {
+            let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+            r.theta = [100.0, 200.0]
+                .into_iter()
+                .chain((1..=n).map(|i| i as f64))
+                .collect();
+            r.theta_names = ["CL".to_string(), "V".to_string()]
+                .into_iter()
+                .chain((1..=n).map(|i| format!("PLACEBO[L={i}]")))
+                .collect();
+            r.theta_fixed = [false, true].into_iter().chain(fixed.clone()).collect();
+            r.se_theta = Some(vec![0.5; n + 2]);
+            let blocks = compact_theta_blocks(&r.theta_names);
+            assert_eq!(blocks, vec![("PLACEBO".to_string(), 2..n + 2)]);
+
+            // Console: `print_results` prints this section verbatim to stderr.
+            assert_eq!(
+                format_theta_blocks_section(&r, &blocks, ""),
+                format!("\n--- THETA BLOCKS ---\n{line}\n"),
+                "{case}: console"
+            );
+
+            let summary = format_summary(&r);
+            assert!(
+                summary.contains(&format!("  {line}\n")),
+                "{case}: summary\n{summary}"
+            );
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            assert!(
+                yaml.contains(&format!(
+                    "    n_free_coefficients: {n_free}\n    n_fixed_coefficients: {n_fixed}\n    min: 1.000000\n"
+                )),
+                "{case}: yaml counts\n{yaml}"
+            );
+            // Each coefficient says whether it was estimated: a FIX one carries
+            // `fixed: true` and no SE, a free one its SE.
+            for (i, &is_fixed) in fixed.iter().enumerate() {
+                let entry = if is_fixed {
+                    format!(
+                        "label: \"L={}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        i + 1,
+                        (i + 1) as f64
+                    )
+                } else {
+                    format!(
+                        "label: \"L={}\", estimate: {:.6}, se: 0.500000,",
+                        i + 1,
+                        (i + 1) as f64
+                    )
+                };
+                assert!(yaml.contains(&entry), "{case}: yaml entry {i}\n{yaml}");
+            }
+        }
     }
 
     #[test]
