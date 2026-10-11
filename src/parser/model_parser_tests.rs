@@ -29816,6 +29816,11 @@ fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
         "{:?}",
         m.indiv_param_names
     );
+    assert!(
+        !m.referenced_covariates.iter().any(|c| c == "S"),
+        "S is no longer a required data column: {:?}",
+        m.referenced_covariates
+    );
     assert!(crate::sens::provider::analytical_supported(&m));
     let got = unbound_reader_preds(all_arm, init);
     assert_eq!(
