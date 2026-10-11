@@ -1426,7 +1426,7 @@ fn lgamma(x: f64) -> f64 {
 }
 
 /// Compute 2.5th and 97.5th percentiles from a sample.
-fn percentile_ci(values: &[f64]) -> (f64, f64) {
+pub(crate) fn percentile_ci(values: &[f64]) -> (f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN);
     }

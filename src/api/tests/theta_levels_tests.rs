@@ -2385,7 +2385,8 @@ mod level_values {
     /// The values of `PLACEBO`, after checking the labels are `theta_level_map`'s
     /// and every free level's θ name is `PLACEBO[label]` at its index.
     fn placebo_values(model: &CompiledModel, theta: &[f64]) -> Vec<ThetaLevelValue> {
-        let map = theta_level_values(model, theta).expect("a bound model and its own theta");
+        let map =
+            theta_level_values(model, theta, None, None).expect("a bound model and its own theta");
         assert_eq!(map.len(), 1, "only PLACEBO is a level block: {map:?}");
         let values = map["PLACEBO"].clone();
         let labels: Vec<String> = values.iter().map(|v| v.label.clone()).collect();
@@ -2543,19 +2544,19 @@ mod level_values {
         let mut pop = population(2, 3);
         let model = bind(&no_eta_model(), &mut pop).unwrap();
         let t = distinct_theta(model.n_theta);
-        let err = theta_level_values(&model, &t[..6]).unwrap_err();
+        let err = theta_level_values(&model, &t[..6], None, None).unwrap_err();
         assert!(
             err.contains("the supplied theta has 6 values but this model has 7"),
             "{err}"
         );
         let mut long = t.clone();
         long.push(1.0);
-        let err = theta_level_values(&model, &long).unwrap_err();
+        let err = theta_level_values(&model, &long, None, None).unwrap_err();
         assert!(
             err.contains("the supplied theta has 8 values but this model has 7"),
             "{err}"
         );
-        assert!(theta_level_values(&model, &t).is_ok());
+        assert!(theta_level_values(&model, &t, None, None).is_ok());
     }
 
     /// T4. Only bound level blocks are reported: an unbound one and a counted
@@ -2568,7 +2569,10 @@ mod level_values {
     fn unbound_and_counted_blocks_are_not_reported() {
         let unbound = parse_full_model(&no_eta_model()).unwrap().model;
         let t = distinct_theta(unbound.n_theta);
-        assert_eq!(theta_level_values(&unbound, &t), Ok(HashMap::new()));
+        assert_eq!(
+            theta_level_values(&unbound, &t, None, None),
+            Ok(HashMap::new())
+        );
 
         let counted = parse_full_model(
             &no_eta_model()
@@ -2579,7 +2583,10 @@ mod level_values {
         .model;
         assert_eq!(counted.n_theta, 6, "TVCL, TVV and four counted levels");
         let t = distinct_theta(counted.n_theta);
-        assert_eq!(theta_level_values(&counted, &t), Ok(HashMap::new()));
+        assert_eq!(
+            theta_level_values(&counted, &t, None, None),
+            Ok(HashMap::new())
+        );
     }
 
     /// T5. The compact rule counts **free** coefficients, on a real binding: a
@@ -2796,8 +2803,8 @@ mod readout_share {
         let theta: Vec<f64> = (0..auto.model.n_theta)
             .map(|k| 0.1 * k as f64 + 0.013 * (k * k) as f64)
             .collect();
-        let va = theta_level_values(&auto.model, &theta).unwrap();
-        let vw = theta_level_values(&within.model, &theta).unwrap();
+        let va = theta_level_values(&auto.model, &theta, None, None).unwrap();
+        let vw = theta_level_values(&within.model, &theta, None, None).unwrap();
         let bits = |v: &ThetaLevelValue| (v.label.clone(), v.value.to_bits(), v.theta_index);
         assert_eq!(
             va["PLACEBO"].iter().map(bits).collect::<Vec<_>>(),
@@ -3266,7 +3273,7 @@ mod contrast_refusals {
         let model = bind(&mbma_model(""), &mut pop).unwrap();
         assert_eq!(model.n_theta, 4, "TVCL, TVV, study 1's two free levels");
         let theta = [2.0, 0.3, -0.7, 10.0];
-        let values = theta_level_values(&model, &theta).unwrap();
+        let values = theta_level_values(&model, &theta, None, None).unwrap();
         assert_eq!(values["PLACEBO"][3].label, "STUDY=2,TIME=1");
         assert_eq!(values["PLACEBO"][3].value.to_bits(), 0.0f64.to_bits());
     }
@@ -3303,7 +3310,7 @@ mod contrast_refusals {
             "TVE0, TVEMAX, TVET50 and 17 free levels"
         );
         let theta: Vec<f64> = (0..20).map(|k| 0.05 * k as f64 + 0.01).collect();
-        let values = theta_level_values(&parsed.model, &theta).unwrap();
+        let values = theta_level_values(&parsed.model, &theta, None, None).unwrap();
         let v = &values["PLACEBO"];
         for (k, level) in v.iter().take(17).enumerate() {
             assert_eq!(level.value.to_bits(), theta[k + 1].to_bits(), "level {k}");
@@ -5212,7 +5219,7 @@ mod absorption {
             "TVE0, TVEMAX, TVET50 and 17 free levels"
         );
         let theta: Vec<f64> = (0..20).map(|k| 0.05 * k as f64 + 0.01).collect();
-        let values = theta_level_values(&parsed.model, &theta).unwrap();
+        let values = theta_level_values(&parsed.model, &theta, None, None).unwrap();
         let v = &values["PLACEBO"];
         for (k, level) in v.iter().take(17).enumerate() {
             assert_eq!(level.value.to_bits(), theta[k + 1].to_bits(), "level {k}");
@@ -9770,5 +9777,434 @@ mod no_gaussian_cells {
                     and its index says 1.";
         assert!(d[0].message.contains(want), "{}", d[0].message);
         assert!(!d[0].message.contains("at time"), "{}", d[0].message);
+    }
+}
+
+/// `ThetaLevelValue::se` and `::sir_ci` (#1890): each level's standard error from the
+/// fit's packed covariance, and its SIR interval from the retained packed draws.
+///
+/// Fixtures are the #1623 ones: `mbma_model("")` binds a 2 study × 3 time design under
+/// `sum_to_zero_within` (θ = `[TVCL, L1, L2, L4, L5, TVV]`, levels L3 and L6
+/// dependent), `no_eta_model()` the same design under global `sum_to_zero` (L6 reads
+/// all five free θ). Every covariance carries two trailing rows (one Ω, one σ), as a
+/// fit's does, so the "at least θ rows" contract is exercised and not the square
+/// `n_theta` case only.
+mod level_uncertainty {
+    use super::*;
+    use crate::api::postfit::extract_standard_errors;
+    use crate::api::{theta_level_values, ThetaLevelValue};
+    use crate::estimation::parameterization::unpack_params;
+    use crate::estimation::sir::percentile_ci;
+    use nalgebra::DMatrix;
+
+    /// Rows past θ in every covariance below: the model's one Ω and one σ.
+    const EXTRA: usize = 2;
+
+    fn within(lower: &str) -> CompiledModel {
+        let mut pop = population(2, 3);
+        let text = mbma_model("").replace("(0.0, -10.0, 10.0)", &format!("(0.0, {lower}, 10.0)"));
+        bind(&text, &mut pop).unwrap()
+    }
+
+    fn global() -> CompiledModel {
+        let mut pop = population(2, 3);
+        bind(&no_eta_model(), &mut pop).unwrap()
+    }
+
+    fn reference() -> CompiledModel {
+        let mut pop = population(2, 3);
+        let text = no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = ref]");
+        bind(&text, &mut pop).unwrap()
+    }
+
+    /// Positive, distinct, none equal to 1 — so a log-packing Jacobian `d = θ` is
+    /// never the identity and a dropped or misapplied Jacobian shows.
+    fn theta(model: &CompiledModel) -> Vec<f64> {
+        (0..model.n_theta).map(|k| 0.3 + 0.17 * k as f64).collect()
+    }
+
+    /// A dense symmetric positive-definite covariance, `A Aᵀ + 0.05 I`, with large
+    /// off-diagonals of both signs: a rule that reads only the diagonal, or the
+    /// wrong rows, gets a different number.
+    fn spd(n: usize) -> DMatrix<f64> {
+        let a = DMatrix::from_fn(n, n, |i, j| ((3 * i + 7 * j) % 11) as f64 / 11.0 - 0.45);
+        &a * a.transpose() + DMatrix::identity(n, n) * 0.05
+    }
+
+    fn placebo(
+        model: &CompiledModel,
+        t: &[f64],
+        cov: Option<&DMatrix<f64>>,
+        draws: Option<&[Vec<f64>]>,
+    ) -> Vec<ThetaLevelValue> {
+        theta_level_values(model, t, cov, draws).unwrap()["PLACEBO"].clone()
+    }
+
+    fn ses(values: &[ThetaLevelValue]) -> Vec<Option<f64>> {
+        values.iter().map(|v| v.se).collect()
+    }
+
+    /// U1. A dependent level's SE is `sqrt(1ᵀ C_g 1)` over its own group's free θ
+    /// (identity-packed here), written out by hand: group 1 `0.04 + 0.09 − 2·0.03`,
+    /// group 2 `0.25 + 0.16 + 2·0.10`. Every other entry of the matrix is set too, so
+    /// the off-group cells and the TVCL/TVV rows are read only if the range is wrong.
+    ///
+    /// Mutations — sum the diagonal only (group 1 gives `sqrt(0.13)`); read the range
+    /// inclusively (`a..=b`, which drags in the next group's first θ); give L6 group
+    /// 1's range. Each moves one of the two numbers.
+    #[test]
+    fn a_dependent_level_is_the_hand_computed_quadratic_form_of_its_group() {
+        let model = within("-10.0");
+        let t = theta(&model);
+        let mut c = DMatrix::from_element(model.n_theta + EXTRA, model.n_theta + EXTRA, 0.007);
+        for (i, j, v) in [
+            (1, 1, 0.04),
+            (2, 2, 0.09),
+            (1, 2, -0.03),
+            (3, 3, 0.25),
+            (4, 4, 0.16),
+            (3, 4, 0.10),
+        ] {
+            c[(i, j)] = v;
+            c[(j, i)] = v;
+        }
+        let values = placebo(&model, &t, Some(&c), None);
+        // Summed in the rule's own row-major order, so `==` is exact.
+        let g1 = (((0.04 + -0.03) + -0.03) + 0.09f64).sqrt();
+        let g2 = (((0.25 + 0.10) + 0.10) + 0.16f64).sqrt();
+        assert_eq!(values[2].se, Some(g1), "L3 = −(L1 + L2)");
+        assert_eq!(values[5].se, Some(g2), "L6 = −(L4 + L5)");
+        assert!((g1 - 0.07f64.sqrt()).abs() < 1e-15 && (g2 - 0.61f64.sqrt()).abs() < 1e-15);
+    }
+
+    /// U2. A free level's SE is bit-for-bit the `se_theta` the covariance step
+    /// reports from the same matrix, under both packings.
+    ///
+    /// Mutations — compute a free level by a second formula (`sqrt(dᵀ C d)` over the
+    /// singleton differs by rounding); read row `k + 1`; drop the Jacobian for a
+    /// log-packed θ (the `lower = 0` arm).
+    #[test]
+    fn a_free_level_is_bit_identical_to_se_theta() {
+        for lower in ["-10.0", "0.0"] {
+            let model = within(lower);
+            let t = theta(&model);
+            let c = spd(model.n_theta + EXTRA);
+            let mut template = model.default_params.clone();
+            template.theta = t.clone();
+            let se_theta = extract_standard_errors(&Some(c.clone()), &template)
+                .0
+                .unwrap();
+            let values = placebo(&model, &t, Some(&c), None);
+            let mut free = 0;
+            for v in &values {
+                if let Some(k) = v.theta_index {
+                    assert_eq!(
+                        v.se.map(f64::to_bits),
+                        Some(se_theta[k].to_bits()),
+                        "lower {lower}, level {}",
+                        v.label
+                    );
+                    free += 1;
+                }
+            }
+            assert_eq!(free, 4, "lower {lower}");
+        }
+    }
+
+    /// U3. A dependent level's SE matches the delta method computed a second way: a
+    /// central finite difference, in the packed coordinates the covariance is on, of
+    /// the level's **value** as the engine's gather reports it, `sqrt(gᵀ C g)`. Run on
+    /// both packings of the within-study contrast and on global `sum_to_zero`.
+    ///
+    /// The value is linear in θ and `exp` is smooth, so the realised error is
+    /// rounding: measured worst relative error 1.4e-10 (identity-packed), 1.1e-11
+    /// (log-packed) and 8.9e-12 (global) at `h = 1e-6`, identical on Linux aarch64
+    /// and macOS arm64; the bound is
+    /// 1e-8, 70× the worst. A dropped or misapplied Jacobian scales each term by a
+    /// level θ (0.47–0.98 here) and lands far outside it.
+    ///
+    /// Mutations — drop `d` for log-packed θ (the `lower = 0` arm); apply `d = θ` to
+    /// identity-packed θ (the `-10` and global arms); diagonal only.
+    #[test]
+    fn a_dependent_level_matches_a_finite_difference_of_its_value_in_packed_space() {
+        let cases = [
+            ("within, identity-packed", within("-10.0")),
+            ("within, log-packed", within("0.0")),
+            ("global sum_to_zero", global()),
+        ];
+        let mut checked = 0;
+        for (what, model) in &cases {
+            let t = theta(model);
+            let lower = &model.default_params.theta_lower;
+            let c = spd(model.n_theta + EXTRA);
+            let values = placebo(model, &t, Some(&c), None);
+            let x: Vec<f64> = (0..t.len())
+                .map(|k| if lower[k] >= 0.0 { t[k].ln() } else { t[k] })
+                .collect();
+            let at = |x: &[f64], level: usize| {
+                let th: Vec<f64> = (0..x.len())
+                    .map(|k| if lower[k] >= 0.0 { x[k].exp() } else { x[k] })
+                    .collect();
+                placebo(model, &th, None, None)[level].value
+            };
+            let h = 1e-6;
+            let mut worst = 0.0f64;
+            for (level, v) in values.iter().enumerate() {
+                if v.theta_index.is_some() {
+                    continue;
+                }
+                let g: Vec<f64> = (0..x.len())
+                    .map(|k| {
+                        let (mut up, mut dn) = (x.clone(), x.clone());
+                        up[k] += h;
+                        dn[k] -= h;
+                        (at(&up, level) - at(&dn, level)) / (2.0 * h)
+                    })
+                    .collect();
+                let n = g.len();
+                let q: f64 = (0..n)
+                    .flat_map(|i| (0..n).map(move |j| (i, j)))
+                    .map(|(i, j)| g[i] * c[(i, j)] * g[j])
+                    .sum();
+                let want = q.sqrt();
+                let got =
+                    v.se.unwrap_or_else(|| panic!("{what}: level {level} has no SE"));
+                assert!(
+                    got.is_finite() && want.is_finite(),
+                    "{what}: {got} vs {want}"
+                );
+                let rel = (got - want).abs() / want;
+                worst = worst.max(rel);
+                assert!(
+                    rel < 1e-8,
+                    "{what}: level {level}: se {got} vs FD {want} (rel {rel:e})"
+                );
+                checked += 1;
+            }
+            eprintln!("{what}: worst relative error {worst:e}");
+        }
+        assert_eq!(
+            checked,
+            2 + 2 + 1,
+            "every dependent level of every case was checked"
+        );
+    }
+
+    /// U4. A reference level and a group with no free θ are constants: `se` and
+    /// `sir_ci` are `None` though the matrix and draws are there, and though the
+    /// reference level's group has five free θ of its own — which `Some` neighbours
+    /// prove are read.
+    ///
+    /// Mutations — key a dependent level's θ on its group rather than its range (the
+    /// reference level then reports the SE of the group's sum); return `Some(0.0)` /
+    /// `Some((0, 0))` for a constant.
+    #[test]
+    fn a_constant_level_has_no_standard_error_or_interval() {
+        let model = reference();
+        let t = theta(&model);
+        let c = spd(model.n_theta + EXTRA);
+        let draws = draws_around(&model, &t);
+        let values = placebo(&model, &t, Some(&c), Some(&draws));
+        assert_eq!(values[0].value, 0.0);
+        assert_eq!(
+            (values[0].se, values[0].sir_ci),
+            (None, None),
+            "the reference level"
+        );
+        for v in &values[1..] {
+            assert!(v.se.is_some() && v.sir_ci.is_some(), "{}: {v:?}", v.label);
+        }
+
+        // Study 2 observed once: its one level is `NegSum(a, a)` under the within
+        // contrast, while study 1's dependent level still has an SE.
+        let mut pop = population(2, 3);
+        let s2 = &mut pop.subjects[1];
+        s2.obs_times.truncate(1);
+        s2.observations.truncate(1);
+        s2.obs_cmts.truncate(1);
+        s2.cens.truncate(1);
+        let model = bind(&mbma_model(""), &mut pop).unwrap();
+        let t = theta(&model);
+        let c = spd(model.n_theta + EXTRA);
+        let values = placebo(&model, &t, Some(&c), None);
+        assert_eq!(values[3].label, "STUDY=2,TIME=1");
+        assert_eq!(values[3].se, None);
+        assert!(values[2].se.is_some(), "study 1's dependent level");
+    }
+
+    /// U5. No covariance and no draws: every `se` and `sir_ci` is `None`, and the
+    /// values are bit-identical to a call that has both — uncertainty never moves a
+    /// value.
+    ///
+    /// Mutations — compute from a default (zero) matrix when none is given (`se`
+    /// becomes `Some(0.0)`); let the covariance path feed `value`.
+    #[test]
+    fn without_uncertainty_every_level_has_none_and_the_same_value() {
+        let model = within("0.0");
+        let t = theta(&model);
+        let c = spd(model.n_theta + EXTRA);
+        let draws = draws_around(&model, &t);
+        let bare = placebo(&model, &t, None, None);
+        let full = placebo(&model, &t, Some(&c), Some(&draws));
+        assert!(
+            bare.iter().all(|v| v.se.is_none() && v.sir_ci.is_none()),
+            "{bare:?}"
+        );
+        assert!(
+            full.iter().all(|v| v.se.is_some() && v.sir_ci.is_some()),
+            "{full:?}"
+        );
+        let bits =
+            |vs: &[ThetaLevelValue]| -> Vec<u64> { vs.iter().map(|v| v.value.to_bits()).collect() };
+        assert_eq!(bits(&bare), bits(&full));
+        // An empty draw set is no draws: `percentile_ci(&[])` would be `(NaN, NaN)`.
+        let empty = placebo(&model, &t, None, Some(&[]));
+        assert!(empty.iter().all(|v| v.sir_ci.is_none()), "{empty:?}");
+    }
+
+    /// U6. A dependent level whose quadratic form is negative (an indefinite group
+    /// block) or not finite (a `NaN` or an infinite entry) has no SE; the other
+    /// group's level, read from the same matrix, still has one. The infinite case is
+    /// the one only `is_finite` rejects (`inf >= 0` holds; `NaN >= 0` does not).
+    ///
+    /// Mutations — clamp a negative form to 0 (`Some(0.0)`); drop `is_finite`
+    /// (`Some(inf)`); return `Some(NaN)`.
+    #[test]
+    fn an_unusable_quadratic_form_gives_no_standard_error() {
+        let model = within("-10.0");
+        let t = theta(&model);
+        let mut c = DMatrix::identity(model.n_theta + EXTRA, model.n_theta + EXTRA) * 0.01;
+        c[(1, 2)] = -0.5;
+        c[(2, 1)] = -0.5;
+        let values = placebo(&model, &t, Some(&c), None);
+        assert_eq!(values[2].se, None, "group 1: 0.01 + 0.01 − 1.0 < 0");
+        assert_eq!(values[5].se, Some(0.02f64.sqrt()), "group 2 is untouched");
+
+        let mut c = DMatrix::identity(model.n_theta + EXTRA, model.n_theta + EXTRA) * 0.01;
+        c[(3, 4)] = f64::NAN;
+        c[(4, 3)] = f64::NAN;
+        let values = placebo(&model, &t, Some(&c), None);
+        assert_eq!(values[5].se, None, "group 2 reads a NaN");
+        assert_eq!(values[2].se, Some(0.02f64.sqrt()), "group 1 is untouched");
+
+        let mut c = DMatrix::identity(model.n_theta + EXTRA, model.n_theta + EXTRA) * 0.01;
+        c[(4, 4)] = f64::INFINITY;
+        let values = placebo(&model, &t, Some(&c), None);
+        assert_eq!(values[5].se, None, "group 2 reads an infinite variance");
+        assert_eq!(values[2].se, Some(0.02f64.sqrt()), "group 1 is untouched");
+    }
+
+    /// U7. A covariance that is not square, or has fewer rows than θ, and a SIR draw
+    /// shorter than θ are refused, naming the sizes — never read at the wrong
+    /// positions. A matrix with exactly θ's rows is accepted.
+    ///
+    /// Mutation — drop either shape check: the call returns `Ok` (or panics out of
+    /// bounds) and the `unwrap_err` dies.
+    #[test]
+    fn a_misshapen_covariance_or_draw_is_refused() {
+        let model = within("-10.0");
+        let t = theta(&model);
+        let n = model.n_theta;
+        let err =
+            theta_level_values(&model, &t, Some(&DMatrix::zeros(n, n + 1)), None).unwrap_err();
+        assert!(err.contains(&format!("{n}x{}", n + 1)), "{err}");
+        let err =
+            theta_level_values(&model, &t, Some(&DMatrix::zeros(n - 1, n - 1)), None).unwrap_err();
+        assert!(
+            err.contains(&format!("{}x{}", n - 1, n - 1)) && err.contains(&format!("{n} theta")),
+            "{err}"
+        );
+        assert!(theta_level_values(&model, &t, Some(&spd(n)), None).is_ok());
+        let short = vec![vec![0.0; n - 1]];
+        let err = theta_level_values(&model, &t, None, Some(&short)).unwrap_err();
+        assert!(err.contains(&format!("has {} values", n - 1)), "{err}");
+    }
+
+    /// U8. A `FIX` block: the covariance step leaves every level θ row and column at
+    /// exactly 0 (measured on `mbma_placebo`, #1890 plan M6), so a free level's SE is
+    /// `se_theta`'s `0.0` and a dependent level's is exactly 0 too.
+    ///
+    /// Mutation — treat a zero form as unusable (`None`), which would make a `FIX`
+    /// block's dependent level disagree with its free ones.
+    #[test]
+    fn a_fixed_block_has_zero_standard_errors() {
+        let model = within("-10.0");
+        let t = theta(&model);
+        let mut c = spd(model.n_theta + EXTRA);
+        for k in 1..=4 {
+            for j in 0..c.ncols() {
+                c[(k, j)] = 0.0;
+                c[(j, k)] = 0.0;
+            }
+        }
+        let values = placebo(&model, &t, Some(&c), None);
+        assert_eq!(ses(&values), vec![Some(0.0); 6]);
+    }
+
+    /// Forty-one packed draws around `t`, each coordinate moved by a different,
+    /// non-monotone pattern, so per-draw sums and per-coordinate percentiles do not
+    /// commute. Two trailing coordinates stand in for Ω and σ.
+    fn draws_around(model: &CompiledModel, t: &[f64]) -> Vec<Vec<f64>> {
+        let lower = &model.default_params.theta_lower;
+        (0..41)
+            .map(|d| {
+                (0..t.len() + EXTRA)
+                    .map(|k| {
+                        let x = if k >= t.len() {
+                            0.0
+                        } else if lower[k] >= 0.0 {
+                            t[k].ln()
+                        } else {
+                            t[k]
+                        };
+                        x + 0.2 * ((7 * d + 3 * k * k + 1) as f64).sin()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// U9. SIR intervals per level: a free level's is the percentile interval of its
+    /// θ as `unpack_params` — the SIR step's own unpacking — maps each draw; a
+    /// dependent level's is the percentile interval of `−Σ` its group's θ **per
+    /// draw**. Both packings.
+    ///
+    /// Mutations — interval of the sum as the sum of the free levels' interval ends
+    /// (the draws are built so that differs); skip `exp` for a log-packed draw; read
+    /// the other group.
+    #[test]
+    fn a_level_sir_interval_is_the_percentile_of_its_value_over_the_draws() {
+        for lower in ["-10.0", "0.0"] {
+            let model = within(lower);
+            let t = theta(&model);
+            let draws = draws_around(&model, &t);
+            let mut template = model.default_params.clone();
+            template.theta = t.clone();
+            let th: Vec<Vec<f64>> = draws
+                .iter()
+                .map(|d| unpack_params(d, &template).theta)
+                .collect();
+            let col = |f: &dyn Fn(&[f64]) -> f64| -> (f64, f64) {
+                percentile_ci(&th.iter().map(|x| f(x)).collect::<Vec<_>>())
+            };
+            let values = placebo(&model, &t, None, Some(&draws));
+            let want = [
+                col(&|x| x[1]),
+                col(&|x| x[2]),
+                col(&|x| -(x[1] + x[2])),
+                col(&|x| x[3]),
+                col(&|x| x[4]),
+                col(&|x| -(x[3] + x[4])),
+            ];
+            for (v, w) in values.iter().zip(want) {
+                assert_eq!(v.sir_ci, Some(w), "lower {lower}, level {}", v.label);
+            }
+            // The shortcut the per-draw rule replaces is genuinely different here.
+            let (l1, l2) = (want[0], want[1]);
+            assert!(
+                (want[2].0 - (-(l1.1 + l2.1))).abs() > 1e-3,
+                "lower {lower}: draws too regular"
+            );
+        }
     }
 }

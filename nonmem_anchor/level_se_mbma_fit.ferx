@@ -1,0 +1,40 @@
+# #1890 NONMEM anchor: per-level standard errors of a sum_to_zero_within level block.
+#
+# `tests/data/mbma_placebo/mbma_placebo.ferx` without the between-arm kappa (and so
+# without `iov_column`), which keeps the NONMEM twin a plain $PRED with one ETA:
+#   level_se_a.ctl  the last visit of each study dependent, as ferx lays it out;
+#   level_se_b.ctl  the first visit dependent, so each level ferx derives is a
+#                   NONMEM THETA with its own $COV standard error.
+# Data: tests/data/mbma_placebo/mbma_placebo.csv (NONMEM reads level_se_mbma.csv,
+# the same rows with an `@` header). See nonmem_anchor/README.md, #1890.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta ED50(20.0, 0.1, 1000.0)
+  theta ET50(2.0, 0.01, 100.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)
+
+  omega ETA_E0 ~ 4.0 (sd)
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  STUDY categorical
+  NARM  continuous
+  SE    continuous
+  DOSE  continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLACEBO + ETA_E0
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = focei
+  covariance = true
