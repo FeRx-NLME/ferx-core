@@ -128,6 +128,7 @@ jobs:
           cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-cov \
             --lib \
             --test agq \
+            --test branch_only_param_hazard \
             --test categorical_convergence \
             --test categorical_smoke \
             --test cmt_data_selection_scope \
