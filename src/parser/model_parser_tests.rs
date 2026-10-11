@@ -29400,7 +29400,8 @@ fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
 /// The deliberate exclusion: an all-arm name read only by an analytical
 /// `[initial_conditions]` is not promoted, so it stays the loud missing-column
 /// refusal it was. An analytical init reads a non-`pk(...)` individual parameter
-/// as 0, so promoting it would make that refusal silent.
+/// through its placeholder PK slot (CL's), so promoting it would make that
+/// refusal a silent wrong amount.
 #[test]
 fn all_arm_name_read_only_by_an_analytical_init_is_not_promoted() {
     let src = "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
