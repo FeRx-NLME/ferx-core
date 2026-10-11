@@ -3526,19 +3526,17 @@ pub fn parse_full_model_with(
             forward.join(", "),
         ));
     }
+    let is_algebraic =
+        is_algebraic_structural(blocks.get("structural_model").map_or(&[], |v| v.as_slice()));
     if !conditional.is_empty() {
-        return Err(conditional_assignment_error(&conditional));
+        return Err(conditional_assignment_error(&conditional, is_algebraic));
     }
     // The same read from outside the block (#1857): a name not assigned on every
     // path must not reach any other block, nor the engine as a dose attribute.
-    let downstream = conditionally_assigned_downstream_reads(
-        content,
-        &pre_stmts,
-        &all_assigned,
-        is_algebraic_structural(blocks.get("structural_model").map_or(&[], |v| v.as_slice())),
-    )?;
+    let downstream =
+        conditionally_assigned_downstream_reads(content, &pre_stmts, &all_assigned, is_algebraic)?;
     if !downstream.is_empty() {
-        return Err(conditional_assignment_error(&downstream));
+        return Err(conditional_assignment_error(&downstream, is_algebraic));
     }
 
     // ── Sample-size-weighted IOV (#1031) ────────────────────────────────────
@@ -22241,9 +22239,10 @@ const NON_READING_BLOCKS: &[&str] = &[
 /// The scan is lexical over the blocks as written (before any desugaring, so a
 /// `$PRED` readout is reported under `[structural_model]`) and case-folded like
 /// the #357 promotion scan: a superset of the real reads, so a missed consumer
-/// cannot reopen the silent path. A name the engine applies to the dose with no
-/// textual reader — bare `F`/`ALAG`/`LAGTIME`, and `F{n}`/`ALAG{n}`/`D{n}`/`R{n}`
-/// outside a compartment-free model, where nothing is dosed — is reported too.
+/// cannot reopen the silent path — which is why a hit is reported as "named in",
+/// not "read by": a helper that shares its name with a keyword is a hit too. A
+/// name the engine applies to the dose with no textual reader
+/// ([`engine_dose_attr`]) is reported as well.
 fn conditionally_assigned_downstream_reads(
     content: &str,
     pre_stmts: &[Statement],
@@ -22288,16 +22287,11 @@ fn conditionally_assigned_downstream_reads(
             .filter(|(_, ids)| ids.contains(&upper))
             .map(|(label, _)| format!("`{label}`"))
             .collect();
-        let engine = matches!(
-            PkParams::name_to_index(&name.to_ascii_lowercase()),
-            Some(crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)
-        ) || (!is_algebraic
-            && crate::types::DoseAttr::from_indexed_name(name).is_some());
         let mut parts = Vec::new();
         if !blocks.is_empty() {
-            parts.push(format!("read by {}", blocks.join(", ")));
+            parts.push(format!("named in {}", blocks.join(", ")));
         }
-        if engine {
+        if engine_dose_attr(name, is_algebraic).is_some() {
             parts.push("applied to the dose by the engine".to_string());
         }
         if !parts.is_empty() {
@@ -22307,17 +22301,52 @@ fn conditionally_assigned_downstream_reads(
     Ok(out)
 }
 
+/// The dose attribute the engine applies under `name` with no textual reader:
+/// bare `F`/`ALAG`/`LAGTIME`, or `F{n}`/`ALAG{n}`/`D{n}`/`R{n}`. `None` in a
+/// compartment-free model, where nothing is dosed (#1857).
+fn engine_dose_attr(name: &str, is_algebraic: bool) -> Option<crate::types::DoseAttr> {
+    use crate::types::{DoseAttr, PK_IDX_F, PK_IDX_LAGTIME};
+    if is_algebraic {
+        return None;
+    }
+    match PkParams::name_to_index(&name.to_ascii_lowercase()) {
+        Some(PK_IDX_F) => Some(DoseAttr::F),
+        Some(PK_IDX_LAGTIME) => Some(DoseAttr::Lag),
+        _ => DoseAttr::from_indexed_name(name).map(|(attr, _)| attr),
+    }
+}
+
+/// The default the refusal suggests for `name`. A dose attribute gets the
+/// engine's own (bioavailability 1, lag 0): `F = 0` would zero the dose on the
+/// skipped path, the very defect being refused. A modeled duration or rate has
+/// none — it acts only where the data codes a `RATE`, so no value is neutral.
+/// Anything else gets 0, NONMEM's WARNING 3 value for an η-dependent variable.
+fn suggested_default(name: &str, is_algebraic: bool) -> Option<&'static str> {
+    use crate::types::DoseAttr;
+    match engine_dose_attr(name, is_algebraic) {
+        Some(DoseAttr::F) => Some("1"),
+        Some(DoseAttr::Duration | DoseAttr::Rate) => None,
+        Some(DoseAttr::Lag) | None => Some("0"),
+    }
+}
+
 /// The refusal for a read of a name not assigned on every path (#1857), given
 /// `(name, reader)` pairs — `reader` is "used in `E1`" for a read inside the
-/// block, "read by `[structural_model]`" for one outside it.
-fn conditional_assignment_error(reads: &[(String, String)]) -> String {
+/// block, "named in `[structural_model]`" for one outside it. The example
+/// default is the first listed name's [`suggested_default`], if any has one.
+fn conditional_assignment_error(reads: &[(String, String)], is_algebraic: bool) -> String {
     let list: Vec<String> = reads.iter().map(|(n, r)| format!("`{n}` ({r})")).collect();
-    let first = reads.first().map_or("X", |(n, _)| n.as_str());
+    let example = reads
+        .iter()
+        .find_map(|(n, _)| {
+            suggested_default(n, is_algebraic).map(|v| format!(" (e.g. `{n} = {v}`)"))
+        })
+        .unwrap_or_default();
     format!(
         "[individual_parameters]: a name assigned inside an `if`, but not on every path \
          through it, is read: {}. On a record where no branch assigns it, it has no value: \
          ferx does not default it to 0 or carry over an earlier value. Assign it before the \
-         `if` (e.g. `{first} = 0`), or in every branch, including an `else`.",
+         `if`{example}, or in every branch, including an `else`.",
         list.join(", "),
     )
 }

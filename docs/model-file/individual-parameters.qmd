@@ -179,6 +179,9 @@ an `else`:
   }
 ```
 
+For a dose attribute, use the engine's own default: `F = 1` (or `F1 = 1`),
+`ALAG = 0`. A default of `F = 0` would give the skipped records no dose at all.
+
 A name used only inside the branch that assigns it (a helper for another
 assignment in that branch) is still fine. The check is lexical: a branch-only
 helper that happens to share its name with any identifier in another block
@@ -195,6 +198,23 @@ variable:
   `PRED` and `IPRED` passes of the same record. ferx evaluates subjects
   independently, so there is no equivalent. Write the value you intend
   explicitly.
+
+The common NONMEM pattern of one `IF` per category with no `ELSE` is refused
+too, even when the categories cover every subject in the data:
+
+```
+[individual_parameters]
+  if (SEX == 0) {
+    TVCLS = TVCL
+  }
+  if (SEX == 1) {
+    TVCLS = TVCL * THETA_SEX
+  }
+  CL = TVCLS * exp(ETA_CL)    # error: TVCLS is unassigned when SEX is neither 0 nor 1
+```
+
+The check cannot know which values `SEX` takes, so rewrite the pattern as one
+`if`/`else if`/`else` chain, or assign a default before the first `if`.
 
 ### Inline (ternary) form
 

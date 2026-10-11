@@ -29440,8 +29440,8 @@ fn assert_conditional_read(err: &str, name: &str, reader: &str) {
         "On a record where no branch assigns it, it has no value: ferx does not default \
          it to 0 or carry over an earlier value."
             .to_string(),
-        "Assign it before the `if` (e.g. `".to_string(),
-        " = 0`), or in every branch, including an `else`.".to_string(),
+        "Assign it before the `if`".to_string(),
+        ", or in every branch, including an `else`.".to_string(),
     ];
     for want in &wants {
         assert!(err.contains(want.as_str()), "missing {want:?} in: {err}");
@@ -29467,7 +29467,7 @@ fn conditional_name_read_by_the_structural_readout_is_refused() {
         &cond_model(COND_E0, "E0 + EMAX * TIME / (TIME + ET50)", ""),
         "E0",
     );
-    assert_conditional_read(&err, "E0", "read by `[structural_model]`");
+    assert_conditional_read(&err, "E0", "named in `[structural_model]`");
     assert!(err.contains("(e.g. `E0 = 0`)"), "{err}");
 }
 
@@ -29477,7 +29477,7 @@ fn conditional_name_read_by_the_structural_readout_is_refused() {
 fn conditional_name_bound_to_a_pk_role_is_refused() {
     let ip = "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  }";
     let err = refused_with_valid_twin(&cond_pk_model(ip, "", ""), "CL");
-    assert_conditional_read(&err, "CL", "read by `[structural_model]`");
+    assert_conditional_read(&err, "CL", "named in `[structural_model]`");
 }
 
 /// Row 3: dose attributes — analytical `f=F` and `lagtime=ALAG` (#1026's two
@@ -29486,20 +29486,40 @@ fn conditional_name_bound_to_a_pk_role_is_refused() {
 #[test]
 fn conditional_dose_attribute_is_refused_on_both_engines() {
     let top = "  CL = TVCL * exp(ETA_CL)\n";
-    for (attr, name, theta) in [(", f=F", "F", "TVF"), (", lagtime=ALAG", "ALAG", "TVLAG")] {
+    // Each suggests the engine's own default: `F = 0` would zero the dose on
+    // the skipped path, the defect being refused.
+    for (attr, name, theta, dflt) in [
+        (", f=F", "F", "TVF", "1"),
+        (", lagtime=ALAG", "ALAG", "TVLAG", "0"),
+    ] {
         let ip = format!("{top}  if (WT > 70) {{\n    {name} = {theta}\n  }}");
         let err = refused_with_valid_twin(&cond_pk_model(&ip, attr, ""), name);
         assert_conditional_read(
             &err,
             name,
-            "read by `[structural_model]`; applied to the dose by the engine",
+            "named in `[structural_model]`; applied to the dose by the engine",
         );
+        assert!(err.contains(&format!("(e.g. `{name} = {dflt}`)")), "{err}");
     }
-    for name in ["F", "F1", "ALAG1"] {
+    for (name, dflt) in [("F", "1"), ("F1", "1"), ("ALAG1", "0")] {
         let ip = format!("{top}  if (WT > 70) {{\n    {name} = TVF\n  }}");
         let err = refused_with_valid_twin(&cond_ode_model(&ip, "-(CL/V) * central", ""), name);
         assert_conditional_read(&err, name, "applied to the dose by the engine");
+        assert!(err.contains(&format!("(e.g. `{name} = {dflt}`)")), "{err}");
     }
+    // A modeled duration has no neutral value, so no example is offered.
+    let ip = format!("{top}  if (WT > 70) {{\n    D1 = 2\n  }}");
+    let err = refused_with_valid_twin(&cond_ode_model(&ip, "-(CL/V) * central", ""), "D1");
+    assert_conditional_read(&err, "D1", "applied to the dose by the engine");
+    assert!(!err.contains("(e.g."), "{err}");
+    // With a second name that has a default, the example skips `D1` for it.
+    let ip = format!("{top}  if (WT > 70) {{\n    D1 = 2\n    S = 1\n  }}");
+    let err = parse_err(&cond_ode_model(&ip, "-(CL/V) * central * S", ""));
+    assert!(
+        err.contains("`D1` (applied to the dose by the engine), `S` (named in `[odes]`)")
+            && err.contains("(e.g. `S = 0`)"),
+        "{err}"
+    );
     // #1026 D: the same `F` bound at the dose and read again in `[scaling]`.
     // Its `else` twin is #1026 E, refused by #1004's double-use check, so the
     // two spellings of that defect now both refuse, each with its own cause.
@@ -29511,7 +29531,7 @@ fn conditional_dose_attribute_is_refused_on_both_engines() {
     assert_conditional_read(
         &err,
         "F",
-        "read by `[scaling]`, `[structural_model]`; applied to the dose by the engine",
+        "named in `[scaling]`, `[structural_model]`; applied to the dose by the engine",
     );
 }
 
@@ -29571,7 +29591,7 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
     ];
     for (block, name, src) in cases {
         let err = refused_with_valid_twin(&src, name);
-        assert_conditional_read(&err, name, &format!("read by `{block}`"));
+        assert_conditional_read(&err, name, &format!("named in `{block}`"));
     }
     // `[error_model]` reads no individual parameter even when it is assigned on
     // every path (its twin is refused as an undeclared covariate), so only the
@@ -29580,7 +29600,7 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
         cond_ode_model(&s, rhs, "").replace("proportional(PROP_ERR)", "proportional(PROP_ERR * S)");
     let twin_err = parse_err(&else_twin(&src, "S"));
     assert!(twin_err.contains("undeclared covariate `S`"), "{twin_err}");
-    assert_conditional_read(&parse_err(&src), "S", "read by `[error_model]`");
+    assert_conditional_read(&parse_err(&src), "S", "named in `[error_model]`");
 }
 
 /// Row 7: a TTE endpoint, unnamed and named (`[event_model NAME]`). A parametric
@@ -29594,7 +29614,7 @@ fn conditional_name_read_by_an_event_model_is_refused() {
     for header in ["[event_model]", "[event_model DEATH]"] {
         let extra = format!("{header}\n  cmt    = 2\n  family = exponential\n  scale  = H0\n");
         let err = refused_with_valid_twin(&cond_pk_model(ip, "", &extra), "H0");
-        assert_conditional_read(&err, "H0", &format!("read by `{header}`"));
+        assert_conditional_read(&err, "H0", &format!("named in `{header}`"));
     }
 }
 
@@ -29605,7 +29625,7 @@ fn conditional_name_read_by_a_binary_model_is_refused() {
     let ip = "  CL = TVCL * exp(ETA_CL)\n  if (WT > 70) {\n    B0 = 0.5\n  }";
     let extra = "[binary_model]\n  cmt   = 3\n  logit = B0\n";
     let err = refused_with_valid_twin(&cond_ode_model(ip, "-(CL/V) * central", extra), "B0");
-    assert_conditional_read(&err, "B0", "read by `[binary_model]`");
+    assert_conditional_read(&err, "B0", "named in `[binary_model]`");
 }
 
 /// Row 8: a CTMM transition rate.
@@ -29617,7 +29637,7 @@ fn conditional_name_read_by_a_markov_model_is_refused() {
                  states = [awake=0, asleep=1]\n  transition awake  -> asleep = Q01\n  \
                  transition asleep -> awake  = 0.3\n";
     let err = refused_with_valid_twin(&cond_ode_model(ip, "-(CL/V) * central", extra), "Q01");
-    assert_conditional_read(&err, "Q01", "read by `[markov_model]`");
+    assert_conditional_read(&err, "Q01", "named in `[markov_model]`");
 }
 
 /// Row 9: the inner `if` has no `else`, inside an outer `if`/`else` that
@@ -29627,7 +29647,7 @@ fn conditional_name_nested_without_else_is_refused() {
     let ip = "  if (STUDY > 2) {\n    if (STUDY > 3) {\n      E0 = TVE0\n    }\n  } else {\n    \
               E0 = 0.25\n  }";
     let err = parse_err(&cond_model(ip, "E0 + EMAX", ""));
-    assert_conditional_read(&err, "E0", "read by `[structural_model]`");
+    assert_conditional_read(&err, "E0", "named in `[structural_model]`");
 }
 
 /// Row 10: an `else if` chain with no final `else`; and a full `if`/`else`
@@ -29636,11 +29656,11 @@ fn conditional_name_nested_without_else_is_refused() {
 fn conditional_name_requires_every_arm_not_merely_an_else() {
     let ip = "  if (STUDY < 2) {\n    E0 = 1\n  } else if (STUDY < 3) {\n    E0 = 2\n  }";
     let err = refused_with_valid_twin(&cond_model(ip, "E0 + EMAX", ""), "E0");
-    assert_conditional_read(&err, "E0", "read by `[structural_model]`");
+    assert_conditional_read(&err, "E0", "named in `[structural_model]`");
 
     let ip = "  if (STUDY < 2) {\n    A = 1\n    B = 2\n  } else {\n    A = 3\n  }";
     let err = parse_err(&cond_model(ip, "A + B + EMAX", ""));
-    assert_conditional_read(&err, "B", "read by `[structural_model]`");
+    assert_conditional_read(&err, "B", "named in `[structural_model]`");
     assert!(!err.contains("`A` ("), "A is assigned on every arm: {err}");
 }
 
@@ -29693,4 +29713,47 @@ fn definitely_assigned_names_still_parse_and_agree() {
         (a[0] - 1.45).abs() < 1e-12 && (a[1] - 2.7).abs() < 1e-12,
         "{a:?}"
     );
+}
+
+/// Two conditional names in one refusal: each is listed with its own reader,
+/// and the example names the first.
+#[test]
+fn conditional_names_are_listed_together() {
+    let ip = "  if (STUDY > 1) {\n    E0 = TVE0 + ETA_E0\n    E1 = 1\n  }";
+    let err = parse_err(&cond_model(ip, "E0 + E1 + EMAX", ""));
+    assert_conditional_read(&err, "E0", "named in `[structural_model]`");
+    assert!(
+        err.contains("`E0` (named in `[structural_model]`), `E1` (named in `[structural_model]`)")
+            && err.contains("(e.g. `E0 = 0`)"),
+        "{err}"
+    );
+}
+
+/// A compartment-free model doses nothing, so `F` / `LAGTIME` there are plain
+/// names: a branch-only one read nowhere parses, and one that is read is
+/// refused as a read — with the plain `0` example, not as a dose attribute.
+#[test]
+fn compartment_free_dose_attribute_names_are_plain_names() {
+    for name in ["F", "LAGTIME", "F1"] {
+        let ip = format!("  E0 = TVE0 + ETA_E0\n  if (STUDY > 1) {{\n    {name} = 1\n  }}");
+        parse_full_model(&cond_model(&ip, "E0 + EMAX", ""))
+            .unwrap_or_else(|e| panic!("unread `{name}` must parse: {e}"));
+        let err = refused_with_valid_twin(&cond_model(&ip, &format!("E0 + {name}"), ""), name);
+        assert_conditional_read(&err, name, "named in `[structural_model]`");
+        assert!(
+            !err.contains("applied to the dose") && err.contains(&format!("(e.g. `{name} = 0`)")),
+            "{err}"
+        );
+    }
+}
+
+/// #1026's third consumer: a controller's `observe` signal.
+#[test]
+fn conditional_name_read_by_adaptive_observe_is_refused() {
+    let src = adaptive_observe_model("KEL", "central / (V * S)").replace(
+        "  KEL = TVX\n",
+        "  KEL = TVX\n  if (WT > 70) {\n    S = TVX\n  }\n",
+    );
+    let err = refused_with_valid_twin(&src, "S");
+    assert_conditional_read(&err, "S", "named in `[adaptive_dosing]`");
 }

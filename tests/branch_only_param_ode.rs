@@ -278,7 +278,7 @@ fn level_block_read_through_an_if_without_else_is_refused_at_parse() {
     };
     assert!(
         err.contains("not on every path through it")
-            && err.contains("`E0` (read by `[structural_model]`)"),
+            && err.contains("`E0` (named in `[structural_model]`)"),
         "expected the #1857 refusal naming E0 and its reader, got: {err}"
     );
     assert!(
