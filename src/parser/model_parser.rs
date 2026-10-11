@@ -3521,24 +3521,44 @@ pub fn parse_full_model_with(
 
     // Reject a forward reference — a name read before it is assigned in file
     // order — rather than let it silently resolve to 0.0 at eval time (#710).
+    // A read of a name only some `if` arm assigns is the same defect on the path
+    // that skips the arm, and gets its own message (#1857).
     let in_block: HashSet<String> = all_assigned.iter().cloned().collect();
-    let forward_refs = collect_forward_refs(&indiv_stmts, &in_block);
-    if !forward_refs.is_empty() {
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut msgs: Vec<String> = Vec::new();
-        for (used, defining) in &forward_refs {
-            if seen.insert((used.clone(), defining.clone())) {
-                msgs.push(format!("`{used}` (used in `{defining}`)"));
+    let unassigned_reads = collect_forward_refs(&indiv_stmts, &in_block);
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut forward: Vec<String> = Vec::new();
+    let mut conditional: Vec<(String, String)> = Vec::new();
+    for (used, defining, kind) in &unassigned_reads {
+        if seen.insert((used.clone(), defining.clone())) {
+            match kind {
+                UnassignedRead::Forward => forward.push(format!("`{used}` (used in `{defining}`)")),
+                UnassignedRead::Conditional => {
+                    conditional.push((used.clone(), format!("used in `{defining}`")))
+                }
             }
         }
+    }
+    if !forward.is_empty() {
         return Err(format!(
             "[individual_parameters]: forward reference(s) to name(s) declared later \
              in the block: {}. Statements are evaluated in file order, so a name must \
              be assigned before it is used; a forward reference would otherwise \
              silently read 0.0. Reorder the block so each name is declared before it \
              is referenced.",
-            msgs.join(", "),
+            forward.join(", "),
         ));
+    }
+    let is_algebraic =
+        is_algebraic_structural(blocks.get("structural_model").map_or(&[], |v| v.as_slice()));
+    if !conditional.is_empty() {
+        return Err(conditional_assignment_error(&conditional, is_algebraic));
+    }
+    // The same read from outside the block (#1857): a name not assigned on every
+    // path must not reach any other block, nor the engine as a dose attribute.
+    let downstream =
+        conditionally_assigned_downstream_reads(content, &pre_stmts, &all_assigned, is_algebraic)?;
+    if !downstream.is_empty() {
+        return Err(conditional_assignment_error(&downstream, is_algebraic));
     }
 
     // ── Sample-size-weighted IOV (#1031) ────────────────────────────────────
@@ -22101,6 +22121,16 @@ fn collect_undefined_vars_in_stmts(
     });
 }
 
+/// How a read flagged by [`collect_forward_refs`] fails to be definitely
+/// assigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnassignedRead {
+    /// No path assigns the name before the read (#710).
+    Forward,
+    /// Some path does — an `if` arm — but not every one (#1857).
+    Conditional,
+}
+
 /// Detect a `[individual_parameters]` expression that reads an in-block name
 /// *before* that name is assigned in file order (issue #710). Because the block
 /// registers every assigned name as a defined variable — so a forward reference
@@ -22115,74 +22145,232 @@ fn collect_undefined_vars_in_stmts(
 /// (`assigned_vars_in_order`); only reads of those names are order-checked. A
 /// `Variable(name)` whose name is outside `in_block` cannot occur in this parse
 /// context, and covariate / theta / eta references are distinct node kinds that
-/// are never flagged. Returns each `(used_name, defining_name)` violation in
-/// encounter order (a read of a not-yet-assigned name inside the RHS of
+/// are never flagged. Returns each `(used_name, defining_name, kind)` violation
+/// in encounter order (a read of a not-yet-assigned name inside the RHS of
 /// `defining_name = …`). Statements execute top-to-bottom; each `if` arm is
-/// checked against the names assigned before the `if`, and a name assigned in
-/// any arm is treated as available afterwards (conservative — avoids
-/// false-positive order errors on a name defined across branches).
-fn collect_forward_refs(stmts: &[Statement], in_block: &HashSet<String>) -> Vec<(String, String)> {
+/// checked against the names assigned before the `if`, and afterwards only the
+/// names assigned on **every** arm (`unconditional_names_in`, which needs an
+/// `else`) count as assigned (#1857). A name some arm assigns but not all is
+/// reported as [`UnassignedRead::Conditional`] — on the path that skips it the
+/// read would see the same silent `0.0`.
+fn collect_forward_refs(
+    stmts: &[Statement],
+    in_block: &HashSet<String>,
+) -> Vec<(String, String, UnassignedRead)> {
+    /// `assigned`: definitely assigned on every path so far. `maybe`: assigned
+    /// on at least one path so far.
+    struct Scope {
+        assigned: HashSet<String>,
+        maybe: HashSet<String>,
+    }
     fn check_reads(
-        assigned: &HashSet<String>,
+        scope: &Scope,
         in_block: &HashSet<String>,
         defining: &str,
-        out: &mut Vec<(String, String)>,
+        out: &mut Vec<(String, String, UnassignedRead)>,
         visit: impl FnOnce(&mut dyn FnMut(&Expression)),
     ) {
         visit(&mut |e: &Expression| {
             if let Expression::Variable(name) = e {
-                if in_block.contains(name) && !assigned.contains(name) {
-                    out.push((name.clone(), defining.to_string()));
+                if in_block.contains(name) && !scope.assigned.contains(name) {
+                    let kind = if scope.maybe.contains(name) {
+                        UnassignedRead::Conditional
+                    } else {
+                        UnassignedRead::Forward
+                    };
+                    out.push((name.clone(), defining.to_string(), kind));
                 }
             }
         });
     }
     fn walk(
         stmts: &[Statement],
-        assigned: &mut HashSet<String>,
+        scope: &mut Scope,
         in_block: &HashSet<String>,
-        out: &mut Vec<(String, String)>,
+        out: &mut Vec<(String, String, UnassignedRead)>,
     ) {
         for s in stmts {
             match s {
                 Statement::Assign(name, expr) => {
-                    check_reads(assigned, in_block, name, out, |f| visit_expr_nodes(expr, f));
-                    assigned.insert(name.clone());
+                    check_reads(scope, in_block, name, out, |f| visit_expr_nodes(expr, f));
+                    scope.assigned.insert(name.clone());
+                    scope.maybe.insert(name.clone());
                 }
                 Statement::If {
                     branches,
                     else_body,
                 } => {
                     // Each arm sees only names assigned before the `if`.
+                    let arm = |scope: &Scope| Scope {
+                        assigned: scope.assigned.clone(),
+                        maybe: scope.maybe.clone(),
+                    };
                     for (cond, body) in branches {
-                        check_reads(assigned, in_block, "if-condition", out, |f| {
+                        check_reads(scope, in_block, "if-condition", out, |f| {
                             visit_condition_nodes(cond, f)
                         });
-                        let mut branch_assigned = assigned.clone();
-                        walk(body, &mut branch_assigned, in_block, out);
+                        walk(body, &mut arm(scope), in_block, out);
                     }
                     if let Some(eb) = else_body {
-                        let mut branch_assigned = assigned.clone();
-                        walk(eb, &mut branch_assigned, in_block, out);
+                        walk(eb, &mut arm(scope), in_block, out);
                     }
-                    // A name assigned in any arm is available afterwards.
-                    let mut branch_names: Vec<String> = Vec::new();
-                    for (_, body) in branches {
-                        branch_names.extend(assigned_vars_in_order(body));
-                    }
-                    if let Some(eb) = else_body {
-                        branch_names.extend(assigned_vars_in_order(eb));
-                    }
-                    assigned.extend(branch_names);
+                    // Afterwards a name is assigned only if every arm assigns it;
+                    // one some arm assigns is only possibly assigned.
+                    let one = std::slice::from_ref(s);
+                    scope.assigned.extend(unconditional_names_in(one));
+                    scope.maybe.extend(assigned_vars_in_order(one));
                 }
                 _ => {}
             }
         }
     }
-    let mut assigned: HashSet<String> = HashSet::new();
-    let mut out: Vec<(String, String)> = Vec::new();
-    walk(stmts, &mut assigned, in_block, &mut out);
+    let mut scope = Scope {
+        assigned: HashSet::new(),
+        maybe: HashSet::new(),
+    };
+    let mut out: Vec<(String, String, UnassignedRead)> = Vec::new();
+    walk(stmts, &mut scope, in_block, &mut out);
     out
+}
+
+/// Blocks that declare — parameters, columns, options, priors — and so never
+/// read an `[individual_parameters]` name's value. Every other block, named or
+/// not, is scanned by [`conditionally_assigned_downstream_reads`]: a block left
+/// off this list is scanned by default, which can only over-refuse.
+const NON_READING_BLOCKS: &[&str] = &[
+    "individual_parameters",
+    "covariate_model",
+    "parameters",
+    "covariates",
+    "data",
+    "data_selection",
+    "fit_options",
+    "priors",
+];
+
+/// The `[individual_parameters]` names some `if` arm assigns but not every path
+/// does, each with what reads it from outside the block (#1857).
+///
+/// Such a name stays branch-local (#357), so each downstream resolver handled it
+/// its own way on `main` — a data column in a `$PRED` readout, `0.0` in a `pk`
+/// role or a later statement, dropped as an ODE dose attribute — and none said
+/// so. NONMEM has no single rule to follow instead (an η-dependent variable is
+/// zeroed with WARNING 3, an η-free one keeps the previous record's value, even
+/// another subject's), so the name is refused wherever it is read.
+///
+/// The scan is lexical over the blocks as written (before any desugaring, so a
+/// `$PRED` readout is reported under `[structural_model]`) and case-folded like
+/// the #357 promotion scan: a superset of the real reads, so a missed consumer
+/// cannot reopen the silent path — which is why a hit is reported as "named in",
+/// not "read by": a helper that shares its name with a keyword is a hit too. A
+/// name the engine applies to the dose with no textual reader
+/// ([`engine_dose_attr`]) is reported as well.
+fn conditionally_assigned_downstream_reads(
+    content: &str,
+    pre_stmts: &[Statement],
+    all_assigned: &[String],
+    is_algebraic: bool,
+) -> Result<Vec<(String, String)>, String> {
+    let definite = unconditionally_assigned_vars(pre_stmts);
+    let partial: Vec<&String> = all_assigned
+        .iter()
+        .filter(|n| !definite.contains(n))
+        .collect();
+    if partial.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw = extract_blocks(content)?;
+    // `(label, identifiers)` per reading block, in registry (alphabetical) order.
+    let mut readers: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
+    for (ty, _, _) in BLOCK_REGISTRY {
+        if NON_READING_BLOCKS.contains(ty) {
+            continue;
+        }
+        if let Some(lines) = raw.unnamed.get(*ty) {
+            let mut ids = std::collections::HashSet::new();
+            collect_referenced_identifiers(lines, &mut ids);
+            readers.push((format!("[{ty}]"), ids));
+        }
+        if let Some(instances) = raw.named.get(*ty) {
+            let mut names: Vec<&String> = instances.keys().collect();
+            names.sort();
+            for inst in names {
+                let mut ids = std::collections::HashSet::new();
+                collect_referenced_identifiers(&instances[inst], &mut ids);
+                readers.push((format!("[{ty} {inst}]"), ids));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for name in partial {
+        let upper = name.to_ascii_uppercase();
+        let blocks: Vec<String> = readers
+            .iter()
+            .filter(|(_, ids)| ids.contains(&upper))
+            .map(|(label, _)| format!("`{label}`"))
+            .collect();
+        let mut parts = Vec::new();
+        if !blocks.is_empty() {
+            parts.push(format!("named in {}", blocks.join(", ")));
+        }
+        if engine_dose_attr(name, is_algebraic).is_some() {
+            parts.push("applied to the dose by the engine".to_string());
+        }
+        if !parts.is_empty() {
+            out.push((name.clone(), parts.join("; ")));
+        }
+    }
+    Ok(out)
+}
+
+/// The dose attribute the engine applies under `name` with no textual reader:
+/// bare `F`/`ALAG`/`LAGTIME`, or `F{n}`/`ALAG{n}`/`D{n}`/`R{n}`. `None` in a
+/// compartment-free model, where nothing is dosed (#1857).
+fn engine_dose_attr(name: &str, is_algebraic: bool) -> Option<crate::types::DoseAttr> {
+    use crate::types::{DoseAttr, PK_IDX_F, PK_IDX_LAGTIME};
+    if is_algebraic {
+        return None;
+    }
+    match PkParams::name_to_index(&name.to_ascii_lowercase()) {
+        Some(PK_IDX_F) => Some(DoseAttr::F),
+        Some(PK_IDX_LAGTIME) => Some(DoseAttr::Lag),
+        _ => DoseAttr::from_indexed_name(name).map(|(attr, _)| attr),
+    }
+}
+
+/// The default the refusal suggests for `name`. A dose attribute gets the
+/// engine's own (bioavailability 1, lag 0): `F = 0` would zero the dose on the
+/// skipped path, the very defect being refused. A modeled duration or rate has
+/// none — it acts only where the data codes a `RATE`, so no value is neutral.
+/// Anything else gets 0, NONMEM's WARNING 3 value for an η-dependent variable.
+fn suggested_default(name: &str, is_algebraic: bool) -> Option<&'static str> {
+    use crate::types::DoseAttr;
+    match engine_dose_attr(name, is_algebraic) {
+        Some(DoseAttr::F) => Some("1"),
+        Some(DoseAttr::Duration | DoseAttr::Rate) => None,
+        Some(DoseAttr::Lag) | None => Some("0"),
+    }
+}
+
+/// The refusal for a read of a name not assigned on every path (#1857), given
+/// `(name, reader)` pairs — `reader` is "used in `E1`" for a read inside the
+/// block, "named in `[structural_model]`" for one outside it. The example
+/// default is the first listed name's [`suggested_default`], if any has one.
+fn conditional_assignment_error(reads: &[(String, String)], is_algebraic: bool) -> String {
+    let list: Vec<String> = reads.iter().map(|(n, r)| format!("`{n}` ({r})")).collect();
+    let example = reads
+        .iter()
+        .find_map(|(n, _)| {
+            suggested_default(n, is_algebraic).map(|v| format!(" (e.g. `{n} = {v}`)"))
+        })
+        .unwrap_or_default();
+    format!(
+        "[individual_parameters]: a name assigned inside an `if`, but not on every path \
+         through it, is read: {}. On a record where no branch assigns it, it has no value: \
+         ferx does not default it to 0 or carry over an earlier value. Assign it before the \
+         `if`{example}, or in every branch, including an `else`.",
+        list.join(", "),
+    )
 }
 
 /// The θ/η indices one expression node reads, for the two collectors below.

@@ -151,6 +151,71 @@ when several alternative branches are needed. Conditions support comparison
 operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`,
 `||`, `!`); parentheses group sub-conditions.
 
+#### A name must be assigned on every path before it is read
+
+A name assigned inside an `if` that has no `else`, or in only some of its
+branches, has no value on a record where no branch assigning it runs. Reading
+such a name is a parse error (#1857). This covers a read by a later statement or
+`if` condition in the block, a read by any other block (`pk(...)`, `[odes]`,
+`[scaling]`, a `[structural_model]` readout, `[error_model]`, `[derived]`, an
+endpoint block, and so on), and the dose attributes the engine applies without a
+textual reference (`F`, `ALAG`/`LAGTIME`, `F1`, `ALAG1`, `D1`, `R1`):
+
+```
+[individual_parameters]
+  if (STUDY > 1) {
+    E0 = TVE0 + ETA_E0        # error if anything reads E0: STUDY = 1 has no E0
+  }
+```
+
+Give it a value on every path. Either assign a default before the `if`, or add
+an `else`:
+
+```
+[individual_parameters]
+  E0 = 0                      # the default when the branch is not taken
+  if (STUDY > 1) {
+    E0 = TVE0 + ETA_E0
+  }
+```
+
+For a dose attribute, use the engine's own default: `F = 1` (or `F1 = 1`),
+`ALAG = 0`. A default of `F = 0` would give the skipped records no dose at all.
+
+A name used only inside the branch that assigns it (a helper for another
+assignment in that branch) is still fine. The check is lexical: a branch-only
+helper that happens to share its name with any identifier in another block
+(case-insensitively) is refused too. Rename the helper in that case.
+
+**Translating from NONMEM.** NM-TRAN accepts `IF (...) E0 = ...` without an
+`ELSE`, but what the variable holds when the condition fails depends on the
+variable:
+
+- If it depends on an `ETA`, NONMEM sets it to 0 and prints WARNING 3.
+  `E0 = 0` before the `if` reproduces that.
+- If it does not depend on an `ETA`, NONMEM keeps the value from the previous
+  evaluation. That can come from another subject, and it can differ between the
+  `PRED` and `IPRED` passes of the same record. ferx evaluates subjects
+  independently, so there is no equivalent. Write the value you intend
+  explicitly.
+
+The common NONMEM pattern of one `IF` per category with no `ELSE` is refused
+too, even when the categories cover every subject in the data:
+
+```
+[individual_parameters]
+  if (SEX == 0) {
+    TVCLS = TVCL
+  }
+  if (SEX == 1) {
+    TVCLS = TVCL * THETA_SEX
+  }
+  CL = TVCLS * exp(ETA_CL)    # error: TVCLS is unassigned when SEX is neither 0 nor 1
+```
+
+The check cannot know which values `SEX` takes, so rewrite the pattern as one
+`if`/`else if`/`else` chain, or assign a default before the first `if`.
+
 ### Inline (ternary) form
 
 ```
