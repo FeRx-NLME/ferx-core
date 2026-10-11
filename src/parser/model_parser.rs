@@ -3447,8 +3447,8 @@ pub fn parse_full_model_with(
     //   1. Every top-level assignment is always an individual parameter.
     //   2. A name assigned on *all* branches of an if/else is promoted ONLY
     //      when a downstream block ([odes], [structural_model], [scaling],
-    //      [derived], [event_model]) actually references it — i.e. it is
-    //      consumed as a PK parameter. This is what makes the NONMEM-style `IF (cond) CL = ...`
+    //      [derived], [event_model], [initial_conditions]) actually references
+    //      it — i.e. it is consumed as a PK parameter. This is what makes the NONMEM-style `IF (cond) CL = ...`
     //      / `IF (!cond) CL = ...` construction work: CL appears in [odes], so
     //      it earns a slot, is written back by pk_param_fn, and resolves in the
     //      ODE RHS.
@@ -3495,17 +3495,22 @@ pub fn parse_full_model_with(
     // it was measured value-neutral on both engines. A `[binary_model]` logit and
     // a `[markov_model]` transition were measured to read such a name correctly
     // (bit-identical to the ternary twin) without a slot, so they are not listed.
-    // `[initial_conditions]` is not either: an analytical init reads a non-`pk(...)` individual
-    // parameter through its placeholder PK slot (CL's, #1898),
-    // so promotion would turn today's missing-covariate refusal of an
-    // all-arm name into a silent wrong amount.
-    for lines in blocks.get("event_model").into_iter().chain(
-        extracted
-            .named
-            .get("event_model")
-            .into_iter()
-            .flat_map(HashMap::values),
-    ) {
+    // `[initial_conditions]` is listed: an analytical init reads an individual
+    // parameter through its PK slot, so an unpromoted all-arm name it read was a
+    // data column ("not found in data"). A promoted one that no `pk(...)` role
+    // binds draws a free differentiable slot like any other init-read name (#1898).
+    for lines in blocks
+        .get("event_model")
+        .into_iter()
+        .chain(blocks.get("initial_conditions"))
+        .chain(
+            extracted
+                .named
+                .get("event_model")
+                .into_iter()
+                .flat_map(HashMap::values),
+        )
+    {
         collect_referenced_identifiers(lines, &mut downstream_refs);
     }
     let mut indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
