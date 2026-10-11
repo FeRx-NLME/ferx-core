@@ -1044,6 +1044,8 @@ fn a_subset_design_simulates_the_closed_form_with_the_fits_theta() {
 /// `api::ThetaLevelValue`, and `io::output::{compact_theta_blocks,
 /// THETA_BLOCK_COMPACT_MIN}`. On the file path's own binding of the 2 × 3 design
 /// (global sum-to-zero, so the last level is dependent), at the model's inits.
+/// Since #1890 also the uncertainty half: the covariance and SIR-draw arguments,
+/// and the `se` / `sir_ci` fields, as the R glue will pass and read them.
 ///
 /// Mutation — make any of them `pub(crate)`: this file stops compiling.
 #[test]
@@ -1056,7 +1058,7 @@ fn the_level_reporting_surface_is_reachable_from_outside_the_crate() {
     let model = &parsed.model;
     let theta: Vec<f64> = (0..model.n_theta).map(|k| 0.1 * (k + 1) as f64).collect();
 
-    let map = ferx_core::theta_level_values(model, &theta).expect("level values");
+    let map = ferx_core::theta_level_values(model, &theta, None, None).expect("level values");
     let levels: &Vec<ThetaLevelValue> = &map["PLACEBO"];
     let labels: Vec<&str> = levels.iter().map(|l| l.label.as_str()).collect();
     assert_eq!(
@@ -1075,6 +1077,28 @@ fn the_level_reporting_surface_is_reachable_from_outside_the_crate() {
     }
     let free: f64 = theta[1..6].iter().sum();
     assert_eq!((levels[5].value, levels[5].theta_index), (-free, None));
+    assert!(levels.iter().all(|l| l.se.is_none() && l.sir_ci.is_none()));
+
+    // #1890: a packed covariance and packed SIR draws in, `se` and `sir_ci` out. The
+    // level θ are identity-packed (lower -5), so a draw's level entry is its θ.
+    let cov = nalgebra::DMatrix::<f64>::identity(model.n_theta, model.n_theta) * 0.04;
+    let shifted: Vec<f64> = theta.iter().map(|x| x + 0.5).collect();
+    let draws = vec![theta.clone(), shifted];
+    let map = ferx_core::theta_level_values(model, &theta, Some(&cov), Some(&draws))
+        .expect("level uncertainty");
+    let levels = &map["PLACEBO"];
+    assert_eq!(levels[0].se, Some(0.04f64.sqrt()));
+    assert_eq!(levels[0].sir_ci, Some((theta[1], theta[1] + 0.5)));
+    let derived = levels[5].se.expect("the dependent level's SE");
+    assert!(
+        (derived - 0.2f64.sqrt()).abs() < 1e-15,
+        "sqrt(5 × 0.04): {derived}"
+    );
+    let (lo, hi) = levels[5].sir_ci.expect("the dependent level's interval");
+    assert!(
+        (lo - (-free - 2.5)).abs() < 1e-12 && hi == -free,
+        "({lo}, {hi})"
+    );
 
     assert_eq!(THETA_BLOCK_COMPACT_MIN, 20);
     assert!(
@@ -1856,4 +1880,127 @@ fn mbma_placebo_stays_within() {
         assert_eq!(free, 18, "{tag}: free levels");
         assert_eq!(binding.labels.len(), 24, "{tag}: 6 studies × 4 visits");
     }
+}
+
+/// #1890 end to end: `mbma_placebo` as shipped (`sum_to_zero_within`, 6 studies × 4
+/// visits, 18 free levels, 6 dependent), fitted with the covariance step and SIR with
+/// the draws kept, and its own `covariance_matrix` / `sir_resamples_packed` handed to
+/// `theta_level_values` — the join the R glue makes.
+///
+/// (a) Each free level's `se` and `sir_ci` are bit-for-bit the fit's `se_theta` and
+/// `sir_ci_theta`. (b) Each dependent level's `se` agrees with the delta method done a
+/// second way: a central FD, in packed coordinates, of the level's value as the gather
+/// reports it, `sqrt(gᵀ C g)` on the fit's matrix. The #1890 planning probe measured
+/// that agreement at 1.4e-10 relative on this fixture (macOS arm64, outside the
+/// engine, from a JSON dump); the bound is 1e-8. (c) Each dependent interval brackets
+/// its value.
+///
+/// Mutations — any join that reads a different matrix or scale than the fit's own
+/// (a); the Tier-1 rule mutations (b).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn mbma_placebo_level_uncertainty_joins_the_fits_own() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let prep = ferx_core::prepare_run(
+        root.join("tests/data/mbma_placebo/mbma_placebo.ferx")
+            .to_str()
+            .unwrap(),
+        Some(
+            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .expect("prepare");
+    let opts = ferx_core::types::FitOptions {
+        verbose: false,
+        run_covariance_step: true,
+        sir: true,
+        sir_samples: 1000,
+        sir_resamples: 250,
+        sir_seed: Some(1890),
+        sir_keep_samples: true,
+        ..prep.parsed.fit_options.clone()
+    };
+    let model = &prep.parsed.model;
+    let f = ferx_core::fit(model, &prep.population, &prep.init_params, &opts).expect("fit");
+    let cov = f.covariance_matrix.as_ref().expect("covariance step");
+    let draws = f.sir_resamples_packed.as_deref().expect("kept SIR draws");
+    let se_theta = f.se_theta.as_ref().expect("se_theta");
+    let sir_ci_theta = f.sir_ci_theta.as_ref().expect("sir_ci_theta");
+    let map = ferx_core::theta_level_values(model, &f.theta, Some(cov), Some(draws))
+        .expect("level uncertainty");
+    let levels = &map["PLACEBO"];
+    assert_eq!(levels.len(), 24);
+
+    let lower = &model.default_params.theta_lower;
+    let x: Vec<f64> = (0..f.theta.len())
+        .map(|k| {
+            if lower[k] >= 0.0 {
+                f.theta[k].ln()
+            } else {
+                f.theta[k]
+            }
+        })
+        .collect();
+    let value_at = |x: &[f64], level: usize| {
+        let th: Vec<f64> = (0..x.len())
+            .map(|k| if lower[k] >= 0.0 { x[k].exp() } else { x[k] })
+            .collect();
+        ferx_core::theta_level_values(model, &th, None, None).unwrap()["PLACEBO"][level].value
+    };
+    let (mut free, mut dependent, mut worst) = (0, 0, 0.0f64);
+    for (level, l) in levels.iter().enumerate() {
+        if let Some(k) = l.theta_index {
+            assert_eq!(
+                l.se.map(f64::to_bits),
+                Some(se_theta[k].to_bits()),
+                "{}",
+                l.label
+            );
+            assert_eq!(l.sir_ci, Some(sir_ci_theta[k]), "{}", l.label);
+            free += 1;
+            continue;
+        }
+        let h = 1e-6;
+        let g: Vec<f64> = (0..x.len())
+            .map(|k| {
+                let (mut up, mut dn) = (x.clone(), x.clone());
+                up[k] += h;
+                dn[k] -= h;
+                (value_at(&up, level) - value_at(&dn, level)) / (2.0 * h)
+            })
+            .collect();
+        let q: f64 = (0..g.len())
+            .flat_map(|i| (0..g.len()).map(move |j| (i, j)))
+            .map(|(i, j)| g[i] * cov[(i, j)] * g[j])
+            .sum();
+        let want = q.sqrt();
+        let got = l.se.expect("a dependent level's SE");
+        assert!(
+            got.is_finite() && want.is_finite(),
+            "{}: {got} vs {want}",
+            l.label
+        );
+        let rel = (got - want).abs() / want;
+        worst = worst.max(rel);
+        assert!(
+            rel < 1e-8,
+            "{}: se {got} vs FD {want} (rel {rel:e})",
+            l.label
+        );
+        let (lo, hi) = l.sir_ci.expect("a dependent level's interval");
+        assert!(
+            lo <= l.value && l.value <= hi,
+            "{}: {} outside ({lo}, {hi})",
+            l.label,
+            l.value
+        );
+        dependent += 1;
+    }
+    eprintln!("mbma_placebo dependent-level SE vs FD: worst relative error {worst:e}");
+    assert_eq!((free, dependent), (18, 6));
 }

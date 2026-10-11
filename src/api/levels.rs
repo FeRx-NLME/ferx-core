@@ -22,7 +22,10 @@
 use std::collections::HashMap;
 
 use crate::api::apply_iov_occasion_rule;
+use crate::api::postfit::theta_se_from_packed;
 use crate::diagnostics::{Diagnostic, EngineError};
+use crate::estimation::parameterization::{theta_from_packed, theta_packing_jacobian};
+use crate::estimation::sir::percentile_ci;
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
@@ -3065,26 +3068,53 @@ pub struct ThetaLevelValue {
     /// θ vector (and in `theta_names` and the θ standard errors); `None` for a
     /// dependent level, which has no θ of its own.
     pub theta_index: Option<usize>,
+    /// The level's standard error on θ's own scale (#1890), from the covariance
+    /// handed to [`theta_level_values`]. A free level's is exactly its `se_theta`
+    /// entry (`0.0` for a `FIX` block, as `se_theta` reports it). A sum-to-zero
+    /// dependent level's is the delta-method `sqrt(dᵀ C_g d)` over its group's free
+    /// θ, `C_g` being their block of the packed covariance and `d` the packing
+    /// Jacobian (`θ` for a log-packed θ, `1` otherwise). `None` for a `ref` reference
+    /// level or a level whose group has no free θ (a constant, not an estimate), for
+    /// every level when no covariance is given, and for a dependent level whose
+    /// quadratic form is negative or not finite.
+    pub se: Option<f64>,
+    /// The level's 95% SIR interval (2.5th and 97.5th percentiles) over the retained
+    /// SIR draws handed to [`theta_level_values`] (#1890): the level's value
+    /// evaluated on each draw. A free level's is exactly its `sir_ci_theta` entry.
+    /// `None` for a reference level, and for every level when no draws (or an empty
+    /// set) are given.
+    pub sir_ci: Option<(f64, f64)>,
 }
 
 /// Every level's value, free and dependent, of each bound level block, keyed by
-/// block name and in [`theta_level_map`](crate::theta_level_map) order (#1623).
+/// block name and in [`theta_level_map`](crate::theta_level_map) order (#1623), with
+/// its standard error and SIR interval when the fit's uncertainty is supplied (#1890).
 ///
 /// The value is what the model's own evaluator reads for that level at `theta` — the
 /// one every prediction and objective uses — so a dependent level is reported exactly
 /// as the model applies it, never re-derived here. `theta_index` places each free
-/// level in the θ vector, so standard errors can be joined to it.
+/// level in the θ vector.
+///
+/// `covariance` is the fit's `covariance_matrix`, on the **packed** scale the
+/// covariance step works in (log for a θ with a lower bound `>= 0`, identity
+/// otherwise). Pass `None` when the fit has none (a failed or not-requested step,
+/// or a SIR fallback), and every `se` is `None`. `sir_resamples_packed` is the fit's
+/// `sir_resamples_packed`, kept only under `sir_keep_samples = true`; `None` leaves
+/// every `sir_ci` `None`. See [`ThetaLevelValue`] for each level's rule.
 ///
 /// `theta` must be laid out for this bound model: the θ of a fit of `model`, or of a
-/// model rebound with [`bind_from_fit`]. A θ whose length is not the
-/// model's is refused; one of the right length but from a different binding cannot be
-/// detected, and is read at the wrong positions.
+/// model rebound with [`bind_from_fit`]. A θ whose length is not the model's is
+/// refused, as is a covariance that is not square or has fewer rows than θ, and a
+/// SIR draw shorter than θ. Ones of the right size but from a different binding
+/// cannot be detected, and are read at the wrong positions.
 ///
 /// Unbound level blocks and counted `theta NAME[N]` blocks are omitted, as in
 /// [`theta_level_map`](crate::theta_level_map); a model with neither gives an empty map.
 pub fn theta_level_values(
     model: &crate::types::CompiledModel,
     theta: &[f64],
+    covariance: Option<&nalgebra::DMatrix<f64>>,
+    sir_resamples_packed: Option<&[Vec<f64>]>,
 ) -> Result<HashMap<String, Vec<ThetaLevelValue>>, String> {
     let expected = model.default_params.theta.len();
     if theta.len() != expected {
@@ -3094,6 +3124,44 @@ pub fn theta_level_values(
             theta.len()
         ));
     }
+    if let Some(c) = covariance {
+        if c.nrows() != c.ncols() || c.nrows() < expected {
+            return Err(format!(
+                "the supplied covariance is {}x{} but must be square with at least the \
+                 model's {expected} theta rows; level standard errors are read from it by \
+                 position",
+                c.nrows(),
+                c.ncols()
+            ));
+        }
+    }
+    if let Some(short) = sir_resamples_packed
+        .into_iter()
+        .flatten()
+        .find(|d| d.len() < expected)
+    {
+        return Err(format!(
+            "a supplied SIR draw has {} values but must hold at least the model's \
+             {expected} theta; level intervals are read from it by position",
+            short.len()
+        ));
+    }
+    let lower = &model.default_params.theta_lower;
+    // Each draw's θ, through the one back-transform `unpack_params` uses, so a free
+    // level's interval is the `sir_ci_theta` the SIR step reports. No draws is no
+    // interval: `percentile_ci` of an empty set is `(NaN, NaN)`, not an answer.
+    let draw_thetas: Option<Vec<Vec<f64>>> = sir_resamples_packed
+        .filter(|draws| !draws.is_empty())
+        .map(|draws| {
+            draws
+                .iter()
+                .map(|d| {
+                    (0..expected)
+                        .map(|k| theta_from_packed(d[k], lower[k]))
+                        .collect()
+                })
+                .collect()
+        });
     let blocks = model.theta_blocks();
     let mut out = HashMap::new();
     for decl in blocks.level_blocks() {
@@ -3119,18 +3187,67 @@ pub fn theta_level_values(
             .iter()
             .zip(&gather.spec.levels)
             .enumerate()
-            .map(|(i, (label, rule))| ThetaLevelValue {
-                label: label.clone(),
-                value: eval_gather(&gather.spec, theta, (i + 1) as f64),
-                theta_index: match *rule {
-                    LevelRule::Free(k) => Some(k as usize),
-                    LevelRule::NegSum(..) => None,
-                },
+            .map(|(i, (label, &rule))| {
+                let index = (i + 1) as f64;
+                // A reference level, or a group with no free θ, is the empty range: a
+                // constant with no uncertainty. Keyed on the range, never on the
+                // level's group, whose free θ a reference level does not read.
+                let constant = matches!(rule, LevelRule::NegSum(a, b) if a == b);
+                ThetaLevelValue {
+                    label: label.clone(),
+                    value: eval_gather(&gather.spec, theta, index),
+                    theta_index: match rule {
+                        LevelRule::Free(k) => Some(k as usize),
+                        LevelRule::NegSum(..) => None,
+                    },
+                    se: match covariance {
+                        Some(c) if !constant => level_se(rule, c, theta, lower),
+                        _ => None,
+                    },
+                    sir_ci: match &draw_thetas {
+                        Some(draws) if !constant => {
+                            let v: Vec<f64> = draws
+                                .iter()
+                                .map(|t| eval_gather(&gather.spec, t, index))
+                                .collect();
+                            Some(percentile_ci(&v))
+                        }
+                        _ => None,
+                    },
+                }
             })
             .collect();
         out.insert(decl.name().to_string(), values);
     }
     Ok(out)
+}
+
+/// One level's standard error from the packed covariance `c` (#1890). A free level
+/// goes through `se_theta`'s own rule; a dependent level is the delta-method
+/// `sqrt(dᵀ C_g d)` over its range, `None` when that form is negative or not finite —
+/// never clamped to `0`, which would report a certainty the matrix does not carry.
+fn level_se(
+    rule: LevelRule,
+    c: &nalgebra::DMatrix<f64>,
+    theta: &[f64],
+    lower: &[f64],
+) -> Option<f64> {
+    match rule {
+        LevelRule::Free(k) => {
+            let k = k as usize;
+            Some(theta_se_from_packed(c[(k, k)], theta[k], lower[k]))
+        }
+        LevelRule::NegSum(a, b) => {
+            let range = a as usize..b as usize;
+            let d = |k: usize| theta_packing_jacobian(theta[k], lower[k]);
+            let q: f64 = range
+                .clone()
+                .flat_map(|i| range.clone().map(move |j| (i, j)))
+                .map(|(i, j)| d(i) * c[(i, j)] * d(j))
+                .sum();
+            (q.is_finite() && q >= 0.0).then(|| q.sqrt())
+        }
+    }
 }
 
 #[cfg(test)]

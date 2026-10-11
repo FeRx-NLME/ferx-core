@@ -476,8 +476,8 @@ A block of 20 or more free coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console. The
 fit YAML writes every independently estimated coefficient under
 `theta_blocks:`; constrained dependent levels are derived values, not estimates.
-To read a dependent level's value, use `theta_level_values`
-([Level labels and values](../api/fitting.qmd#level-labels-values)).
+To read a dependent level's value, standard error or SIR interval, use
+`theta_level_values` ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
 Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
 the dual-number path — so a *small* level block keeps the analytic gradient.
