@@ -778,13 +778,14 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
     (mn, mx, mean, var.sqrt())
 }
 
-/// Number of **free** coefficients at or above which a θ vector or level block
-/// (#1064) is reported as its own compact section instead of one entry per θ in
-/// the θ table.
+/// Number of coefficients at or above which a θ vector or level block (#1064) is
+/// reported as its own compact section instead of one entry per θ in the θ table.
 ///
-/// The count is of the block's entries in `theta_names` — its estimated θ — not of
-/// its levels: a `sum_to_zero` block's dependent level has no θ, so a 21-level
-/// block (20 free coefficients) is compacted and a 20-level one (19) is not.
+/// The count is of the block's entries in `theta_names` — its θ, `FIX` or not —
+/// not of its levels: a `sum_to_zero` block's dependent level has no θ, so a
+/// 21-level block (20 coefficients) is compacted and a 20-level one (19) is not.
+/// A `FIX` coefficient counts here, since it still takes a row, although the
+/// report lists it as `FIX` rather than free (#1891).
 /// [`compact_theta_blocks`] applies the rule; call it rather than comparing against
 /// this constant, so a caller cannot drift from the writers (#1623).
 ///
@@ -839,7 +840,6 @@ fn block_summary(values: &[f64]) -> (f64, f64, f64) {
 /// One compact θ block as the console, `format_summary` and the fit YAML report
 /// it — the single place its count and summary are computed, so the three cannot
 /// drift (#1891).
-#[derive(Debug, Clone, Copy, PartialEq)]
 struct ThetaBlockSummary {
     /// Coefficients the fit estimated.
     n_free: usize,
@@ -868,19 +868,33 @@ impl ThetaBlockSummary {
     }
 }
 
-/// The THETA BLOCKS line of one block, shared by `print_results` and
-/// `format_summary` (which indents it) so the console and the saved report print
-/// the same words.
-fn theta_block_line(result: &FitResult, block: &str, range: std::ops::Range<usize>) -> String {
-    let s = theta_block_summary(result, range);
-    format!(
-        "{}  {}   min {:.4}  median {:.4}  max {:.4}",
-        block,
-        s.count_label(),
-        s.min,
-        s.median,
-        s.max
-    )
+/// The whole THETA BLOCKS section — header and one line per block — or `""` when
+/// no block is compact. `print_results` prints it to stderr verbatim and
+/// `format_summary` appends it with each block line indented by `indent`, so the
+/// console and the saved report are one writer and a test of either covers both.
+fn format_theta_blocks_section(
+    result: &FitResult,
+    theta_blocks: &[(String, std::ops::Range<usize>)],
+    indent: &str,
+) -> String {
+    use std::fmt::Write;
+    if theta_blocks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n--- THETA BLOCKS ---\n");
+    for (block, range) in theta_blocks {
+        let s = theta_block_summary(result, range.clone());
+        let _ = writeln!(
+            out,
+            "{indent}{}  {}   min {:.4}  median {:.4}  max {:.4}",
+            block,
+            s.count_label(),
+            s.min,
+            s.median,
+            s.max
+        );
+    }
+    out
 }
 
 fn theta_block_summary(result: &FitResult, range: std::ops::Range<usize>) -> ThetaBlockSummary {
@@ -1090,12 +1104,7 @@ pub fn print_results(result: &FitResult) {
 
     // Compact θ level block summary (#1064). Only independently estimated
     // contrast coefficients live in `FitResult`; dependent levels are derived.
-    if !theta_blocks.is_empty() {
-        eprintln!("\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            eprintln!("{}", theta_block_line(result, block, range.clone()));
-        }
-    }
+    eprint!("{}", format_theta_blocks_section(result, &theta_blocks, ""));
 
     // Compact NN-weight summary block (Option E). Skipped when no
     // `[covariate_nn]` blocks were declared.
@@ -1445,12 +1454,7 @@ pub fn format_summary(result: &FitResult) -> String {
             label, est, se_str, rse_str
         );
     }
-    if !theta_blocks.is_empty() {
-        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            let _ = writeln!(out, "  {}", theta_block_line(result, block, range.clone()));
-        }
-    }
+    out.push_str(&format_theta_blocks_section(result, &theta_blocks, "  "));
 
     // --- OMEGA ---
     let n_eta = result.omega.nrows();
@@ -3785,6 +3789,11 @@ mod tests {
         // fixed. min/median/max cover every coefficient — the FIX values are the
         // ones the model predicts with — so fixing the three smallest leaves
         // `min 1.0000`; a summary over free levels only would read `min 4.0000`.
+        //
+        // Two scalar θs sit before the block, as they do in a real model, so the
+        // block does not start at θ index 0: `V` is FIX and both are far outside
+        // the block's values, so reading the block by relative index (`0..n`)
+        // miscounts the FIX levels and moves min/max.
         let n = THETA_BLOCK_COMPACT_MIN + 1;
         let cases: [(&str, Vec<bool>, &str, usize, usize); 3] = [
             (
@@ -3811,15 +3820,23 @@ mod tests {
         ];
         for (case, fixed, line, n_free, n_fixed) in cases {
             let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
-            r.theta = (1..=n).map(|i| i as f64).collect();
-            r.theta_names = (1..=n).map(|i| format!("PLACEBO[L={i}]")).collect();
-            r.theta_fixed = fixed.clone();
-            r.se_theta = Some(vec![0.5; n]);
+            r.theta = [100.0, 200.0]
+                .into_iter()
+                .chain((1..=n).map(|i| i as f64))
+                .collect();
+            r.theta_names = ["CL".to_string(), "V".to_string()]
+                .into_iter()
+                .chain((1..=n).map(|i| format!("PLACEBO[L={i}]")))
+                .collect();
+            r.theta_fixed = [false, true].into_iter().chain(fixed.clone()).collect();
+            r.se_theta = Some(vec![0.5; n + 2]);
+            let blocks = compact_theta_blocks(&r.theta_names);
+            assert_eq!(blocks, vec![("PLACEBO".to_string(), 2..n + 2)]);
 
-            // Console: `print_results` prints exactly this line.
+            // Console: `print_results` prints this section verbatim to stderr.
             assert_eq!(
-                theta_block_line(&r, "PLACEBO", 0..n),
-                line,
+                format_theta_blocks_section(&r, &blocks, ""),
+                format!("\n--- THETA BLOCKS ---\n{line}\n"),
                 "{case}: console"
             );
 
