@@ -7522,7 +7522,12 @@ impl FitResult {
 /// `se_omega` is `None`, the index is out of bounds, or the format is
 /// diagonal and an off-diagonal element is requested.
 pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
-    let se = se_omega.as_ref()?;
+    omega_se_at_in(se_omega.as_deref()?, n_eta, i, j)
+}
+
+/// [`omega_se_at`] over a borrowed SE slice, for a caller holding the packed
+/// vector without its `Option<Vec<_>>` (`OmegaRowsInput`, #1859).
+pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Option<f64> {
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
     if se.len() == n_lt && n_lt != n_eta {

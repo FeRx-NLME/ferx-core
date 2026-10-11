@@ -510,6 +510,17 @@ in force where it sits: a line before the assignment, a line after a
 reassignment that replaces it, or one in the other branch of an `if` does not
 change the label.
 
+A wrapper prints the same OMEGA rows through the engine's own formatter, at
+print time (#1859), as it does the KAPPA rows. It builds a
+`ferx_core::io::output::OmegaRowsInput` from the fit's `omega`, ETA names, FIX
+flags, `se_omega` (one SE per ETA, or the packed lower triangle of a block Ω),
+each ETA's type resolved by name from `eta_param_info`, and the covariance
+status (`OmegaRowsInput::from_result` does this for a `FitResult`), then calls
+`format_omega_rows_from` with `OmegaRowsOptions::default()`. The rows are the
+console's: a fixed ETA reads `[FIX]` with `SE = ---`, and a covariance step that
+failed or fell back to SIR prints no `CV%` or `SD` on any row. Block-Ω
+correlations are not part of the rows.
+
 ## Covariate Detection
 
 Any uppercase identifier in the expression that does not match a theta name,

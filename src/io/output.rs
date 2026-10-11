@@ -148,13 +148,7 @@ fn note_suffix(note: Option<String>, show_cv: bool) -> String {
 }
 
 /// Whether the console shows a CV%/SD parenthetical: not when the covariance
-/// step failed or fell back to SIR.
-fn shows_cv(result: &FitResult) -> bool {
-    status_shows_cv(&result.covariance_status)
-}
-
-/// [`shows_cv`] on the status alone, for [`format_kappa_rows_from`], whose
-/// input is not a `FitResult`.
+/// step failed or fell back to SIR (the SEs are then meaningless).
 fn status_shows_cv(status: &CovarianceStatus) -> bool {
     !matches!(
         status,
@@ -162,16 +156,94 @@ fn status_shows_cv(status: &CovarianceStatus) -> bool {
     )
 }
 
+/// The facts an `--- OMEGA Estimates ---` row reads, borrowed from wherever
+/// they live: a [`FitResult`] ([`OmegaRowsInput::from_result`]), or a wrapper's
+/// own copy of the fit at print time (ferx-r's `print.ferx_fit()`, #1859). Both
+/// then print through [`format_omega_rows_from`], so the rows cannot drift
+/// between the CLI, [`format_summary`] and a wrapper. The OMEGA twin of
+/// [`KappaRowsInput`].
+///
+/// Every slice is indexed by ETA; a short or empty slice reads as the field's
+/// default for the missing ETAs (named `ETA`, not fixed, no SE, unknown type).
+#[derive(Debug, Clone)]
+pub struct OmegaRowsInput<'a> {
+    /// The between-subject covariance matrix; one row per ETA, its diagonal
+    /// printed.
+    pub omega: &'a nalgebra::DMatrix<f64>,
+    /// ETA names; a missing name prints as `ETA`.
+    pub eta_names: &'a [String],
+    /// Per-ETA FIX flag: a fixed ETA is labelled `[FIX]` with `SE = ---`.
+    pub omega_fixed: &'a [bool],
+    /// The SEs as `run_covariance` writes `FitResult::se_omega`: one per ETA
+    /// (diagonal Ω) or the packed lower triangle (block Ω), read through
+    /// [`crate::types::omega_se_at`]. `None` (or a missing entry) prints
+    /// `SE = N/A`.
+    pub se_omega: Option<&'a [f64]>,
+    /// Per-ETA scale, already resolved **by name** from
+    /// `FitResult::eta_param_info` (whose order is statement order, not ETA
+    /// order): the one type every use of the ETA agrees on, `Custom` when they
+    /// disagree, `None` when it has none (a `.fitrx` saved before #1643, an ETA
+    /// no parameter classifies), which prints the log-normal CV%.
+    pub eta_param_types: Vec<Option<EtaParamType>>,
+    /// The covariance step's status: a failed or SIR-fallback step suppresses
+    /// every CV%/SD (#1698).
+    pub covariance_status: CovarianceStatus,
+}
+
+impl<'a> OmegaRowsInput<'a> {
+    /// The input view of `r`, its ETA types resolved by name from
+    /// `eta_param_info`. A fixed-effects-only fit (`n_eta = 0`) gives a view
+    /// that prints no rows.
+    pub fn from_result(r: &'a FitResult) -> Self {
+        Self {
+            omega: &r.omega,
+            eta_names: &r.eta_names,
+            omega_fixed: &r.omega_fixed,
+            se_omega: r.se_omega.as_deref(),
+            eta_param_types: (0..r.omega.nrows())
+                .map(|i| eta_type(r, eta_name(r, i)))
+                .collect(),
+            covariance_status: r.covariance_status.clone(),
+        }
+    }
+}
+
+/// How [`format_omega_rows_from`] renders its rows. `Default` is what the CLI
+/// and [`format_summary`] print, and today the only rendering: unlike the
+/// KAPPA rows, the OMEGA rows carry no glyph of their own above ASCII (names
+/// are printed as given). `#[non_exhaustive]` so a rendering choice can be
+/// added without breaking a caller, who builds this with `Default::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OmegaRowsOptions {}
+
 /// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
 fn format_omega_rows(result: &FitResult) -> String {
+    format_omega_rows_from(
+        &OmegaRowsInput::from_result(result),
+        OmegaRowsOptions::default(),
+    )
+}
+
+/// The OMEGA rows the CLI's `--- OMEGA Estimates ---` section and
+/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
+/// ETA. The note is the exact log-normal CV% (#1858) or the SD on the ETA's
+/// scale (#1643); it is absent for a custom ETA, and on every row when the
+/// covariance step failed or fell back to SIR. A fixed ETA reads
+/// `name [FIX] = …  SE = ---`. One line per `\n`; empty for a zero-row
+/// `omega`. Off-diagonal block-Ω correlations are not part of the rows.
+pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
     use std::fmt::Write;
-    let n_eta = result.omega.nrows();
-    let show_cv = shows_cv(result);
+    // No rendering choices yet; destructured so adding one fails to compile
+    // here until it is honoured.
+    let OmegaRowsOptions {} = opts;
+    let n_eta = input.omega.nrows();
+    let show_cv = status_shows_cv(&input.covariance_status);
     let mut out = String::new();
     for i in 0..n_eta {
-        let var = result.omega[(i, i)];
-        let name = eta_name(result, i);
-        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
+        let var = input.omega[(i, i)];
+        let name = input.eta_names.get(i).map_or("ETA", |s| s.as_str());
+        let is_fixed = input.omega_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
             fixed_label(name)
         } else {
@@ -180,12 +252,16 @@ fn format_omega_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+            match input
+                .se_omega
+                .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i))
+            {
                 Some(s) => format!("{:.6}", s),
                 None => "N/A".to_string(),
             }
         };
-        let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
+        let eta_type = input.eta_param_types.get(i).copied().flatten();
+        let note = note_suffix(variance_note(eta_type, var, false), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
     }
     out
@@ -1105,13 +1181,6 @@ pub fn format_summary(result: &FitResult) -> String {
     let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
     write_prior_summary(&mut out, result);
 
-    // Failed / SIR-fallback covariance make the SE columns meaningless, so we
-    // suppress the derived CV% (mirrors `print_results`).
-    let show_cv = !matches!(
-        result.covariance_status,
-        CovarianceStatus::Failed | CovarianceStatus::SirFallback
-    );
-
     // NN weight thetas are excluded from the per-parameter table (they can
     // number in the hundreds); `print_results` skips them the same way.
     #[cfg(feature = "nn")]
@@ -1187,26 +1256,9 @@ pub fn format_summary(result: &FitResult) -> String {
     let n_eta = result.omega.nrows();
     if n_eta > 0 {
         let _ = writeln!(out, "\n--- OMEGA ---");
-        for i in 0..n_eta {
-            let var = result.omega[(i, i)];
-            let name = eta_name(result, i);
-            let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-            let label = if is_fixed {
-                fixed_label(name)
-            } else {
-                name.to_string()
-            };
-            let se_str = if is_fixed {
-                "---".to_string()
-            } else {
-                match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
-                    Some(s) => format!("{:.6}", s),
-                    None => "N/A".to_string(),
-                }
-            };
-            let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
-            let _ = writeln!(out, "  {:<16} = {:.6}{}  SE = {}", label, var, note, se_str);
-        }
+        // The console's rows verbatim (#1859), as the KAPPA section below
+        // (#1657), so the two cannot drift.
+        out.push_str(&format_omega_rows(result));
         // Off-diagonal correlations (block omega).
         for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
             eta_name(result, k)
@@ -5849,7 +5901,7 @@ mod tests {
             ] {
                 let mut r = mk(true, typed);
                 r.covariance_status = status.clone();
-                assert_eq!(shows_cv(&r), show, "{status:?}");
+                assert_eq!(status_shows_cv(&r.covariance_status), show, "{status:?}");
                 for (surface, text) in [
                     ("console", format_kappa_rows(&r)),
                     ("summary", format_summary(&r)),
@@ -6508,5 +6560,236 @@ mod tests {
             assert_eq!(format_kappa_corr_rows(r), "", "{tag}");
             assert_eq!(summary_corr(&format_summary(r)), "", "{tag}");
         }
+    }
+
+    /// #1859: an OMEGA fixture spanning every input the rows read — one ETA of
+    /// each `EtaParamType` plus one with no `eta_param_info` entry *and* no
+    /// name (prints `ETA`, unknown type → log-normal CV%), a diagonal or block
+    /// Ω (block → SEs packed lower-triangle, read through `omega_se_at`'s
+    /// `chol_lt_idx` branch; diagonal → one SE per ETA), an optional FIX on the
+    /// additive ETA, SEs present or absent, and the covariance status. The
+    /// variances put each note in a regime the old first-order CV% gets wrong
+    /// (0.2: 47.1 exact against 44.7; 2.37: 311 against 154, #1858).
+    fn omega_rows_result(block: bool, fix: bool, se: bool, status: CovarianceStatus) -> FitResult {
+        use EtaParamType::*;
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        let vars = [0.2, 156.036966, 0.5, 0.3, 0.4, 2.37];
+        let n = vars.len();
+        r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_row_slice(&vars));
+        if block {
+            for (i, j, c) in [(1, 0, 0.03), (2, 0, -0.04), (5, 3, 0.05), (4, 2, 0.06)] {
+                r.omega[(i, j)] = c;
+                r.omega[(j, i)] = c;
+            }
+        }
+        r.eta_names = ["eta_LN", "eta_ADD", "eta_LGT", "eta_LP", "eta_C"]
+            .map(String::from)
+            .to_vec();
+        r.omega_fixed = vec![false, fix, false, false, false, false];
+        let info = |n: &str, t| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: t,
+            linked_theta: None,
+            individual_param_name: n.to_uppercase(),
+        };
+        // Statement order, not `eta_names` order: the type is found by name.
+        r.eta_param_info = vec![
+            info("eta_C", Custom),
+            info("eta_LP", LogitProbability),
+            info("eta_LGT", Logit),
+            info("eta_ADD", Additive),
+            info("eta_LN", LogNormal),
+        ];
+        let n_se = if block { n * (n + 1) / 2 } else { n };
+        r.se_omega = se.then(|| (1..=n_se).map(|k| k as f64 / 1000.0).collect());
+        r.covariance_status = status;
+        r
+    }
+
+    /// #1859: the console's OMEGA rows, frozen byte for byte as the private
+    /// `format_omega_rows` printed them **before** it became a call to
+    /// `format_omega_rows_from` (captured at `14cca400`), on five cells of
+    /// `omega_rows_result` that between them take every axis value: diagonal
+    /// and block Ω (the block SEs are the packed `(i,i)` entries 0.012, 0.016,
+    /// … where a diagonal read would give 0.003, 0.004), FIX, every ETA type
+    /// plus an unnamed untyped one, SEs absent, and the four covariance
+    /// statuses (Failed and SirFallback: no note on any row). Asserted on the
+    /// console, on `from_result` through the public fn, and on
+    /// `format_summary`, which now prints the same rows verbatim (its OMEGA
+    /// label column was 16 wide; it is the console's 20, as KAPPA's has been
+    /// since #1657).
+    #[test]
+    fn omega_rows_match_frozen_console_rows() {
+        use CovarianceStatus::*;
+        let typed_rows = |se: [&str; 6], fix: bool| -> String {
+            let add = if fix {
+                "  eta_ADD [FIX]        = 156.036966  (SD = 12.4915)  SE = ---\n".to_string()
+            } else {
+                format!(
+                    "  eta_ADD              = 156.036966  (SD = 12.4915)  SE = {}\n",
+                    se[1]
+                )
+            };
+            format!(
+                "  eta_LN               = 0.200000  (CV% = 47.1)  SE = {}\n{add}\
+                 \x20 eta_LGT              = 0.500000  (SD = 0.7071, logit scale)  SE = {}\n  \
+                 eta_LP               = 0.300000  (SD = 0.5477, logit scale)  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  (CV% = 311.4)  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let diag_se = [
+            "0.001000", "0.002000", "0.003000", "0.004000", "0.005000", "0.006000",
+        ];
+        let block_se = [
+            "0.001000", "", "0.012000", "0.016000", "0.019000", "0.021000",
+        ];
+        let bare_rows = |se: [&str; 6]| -> String {
+            format!(
+                "  eta_LN               = 0.200000  SE = {}\n  \
+                 eta_ADD [FIX]        = 156.036966  SE = ---\n  \
+                 eta_LGT              = 0.500000  SE = {}\n  \
+                 eta_LP               = 0.300000  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let cells = [
+            ((false, false, true, Computed), typed_rows(diag_se, false)),
+            ((true, true, true, Computed), typed_rows(block_se, true)),
+            (
+                (true, false, false, NotRequested),
+                typed_rows(["N/A"; 6], false),
+            ),
+            ((false, true, true, Failed), bare_rows(diag_se)),
+            ((true, true, true, SirFallback), bare_rows(block_se)),
+        ];
+        let mut wrong = Vec::new();
+        for ((block, fix, se, status), want) in cells {
+            let cell = format!("block={block} fix={fix} se={se} {status:?}");
+            let r = omega_rows_result(block, fix, se, status);
+            let summary = format_summary(&r);
+            let summary_rows = summary
+                .split_once("--- OMEGA ---\n")
+                .map(|(_, rest)| {
+                    rest.lines()
+                        .take_while(|l| !l.is_empty() && !l.starts_with("  corr("))
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let via_result = format_omega_rows_from(
+                &OmegaRowsInput::from_result(&r),
+                OmegaRowsOptions::default(),
+            );
+            for (surface, got) in [
+                ("console", format_omega_rows(&r)),
+                ("from_result", via_result),
+                ("summary", summary_rows),
+            ] {
+                if got != want {
+                    wrong.push(format!("{surface} {cell}:\n got: {got:?}\nwant: {want:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// #1859: an `OmegaRowsInput` built field by field the way ferx-r builds
+    /// it — its own copies of the fields, the ETA types resolved by name from a
+    /// table rather than through `eta_type` — prints exactly what `from_result`
+    /// and the console print, across all 32 cells of `omega_rows_result`
+    /// (Ω shape × FIX × SEs × covariance status). A field `from_result` drops
+    /// or mis-wires reddens the equality, as does one the fn ignores; the
+    /// frozen strings in `omega_rows_match_frozen_console_rows` pin what the
+    /// shared answer is.
+    #[test]
+    fn omega_rows_from_input_built_field_by_field() {
+        use EtaParamType::*;
+        let by_name = |n: &str| match n {
+            "eta_LN" => Some(LogNormal),
+            "eta_ADD" => Some(Additive),
+            "eta_LGT" => Some(Logit),
+            "eta_LP" => Some(LogitProbability),
+            "eta_C" => Some(Custom),
+            _ => None,
+        };
+        let mut cells = 0;
+        for block in [false, true] {
+            for fix in [false, true] {
+                for se in [false, true] {
+                    for status in [
+                        CovarianceStatus::Computed,
+                        CovarianceStatus::NotRequested,
+                        CovarianceStatus::Failed,
+                        CovarianceStatus::SirFallback,
+                    ] {
+                        let cell = format!("block={block} fix={fix} se={se} {status:?}");
+                        let r = omega_rows_result(block, fix, se, status.clone());
+                        let omega = r.omega.clone();
+                        let names = r.eta_names.clone();
+                        let fixed = r.omega_fixed.clone();
+                        let se_omega = r.se_omega.clone();
+                        let input = OmegaRowsInput {
+                            omega: &omega,
+                            eta_names: &names,
+                            omega_fixed: &fixed,
+                            se_omega: se_omega.as_deref(),
+                            eta_param_types: (0..omega.nrows())
+                                .map(|i| names.get(i).and_then(|n| by_name(n)))
+                                .collect(),
+                            covariance_status: status,
+                        };
+                        let by_hand = format_omega_rows_from(&input, OmegaRowsOptions::default());
+                        assert_eq!(by_hand, format_omega_rows(&r), "console {cell}");
+                        let via_result = OmegaRowsInput::from_result(&r);
+                        assert_eq!(via_result.eta_param_types, input.eta_param_types, "{cell}");
+                        assert_eq!(
+                            format_omega_rows_from(&via_result, OmegaRowsOptions::default()),
+                            by_hand,
+                            "from_result {cell}"
+                        );
+                        assert_eq!(by_hand.lines().count(), 6, "{cell}:\n{by_hand}");
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 32);
+    }
+
+    /// #1859: a short or empty slice reads as the field's default for the
+    /// missing ETAs — `ETA`, not fixed, `SE = N/A`, unknown type (log-normal
+    /// CV%) — and a zero-row Ω prints nothing, on the console and in a
+    /// fixed-effects-only (`n_eta = 0`) summary, which has no OMEGA section.
+    #[test]
+    fn omega_rows_from_short_slices_and_no_omega() {
+        let omega = DMatrix::from_row_slice(2, 2, &[0.2, 0.0, 0.0, 0.5]);
+        let input = OmegaRowsInput {
+            omega: &omega,
+            eta_names: &[],
+            omega_fixed: &[],
+            se_omega: Some(&[0.01]),
+            eta_param_types: vec![Some(EtaParamType::Additive)],
+            covariance_status: CovarianceStatus::Computed,
+        };
+        assert_eq!(
+            format_omega_rows_from(&input, OmegaRowsOptions::default()),
+            "  ETA                  = 0.200000  (SD = 0.4472)  SE = 0.010000\n  \
+             ETA                  = 0.500000  (CV% = 80.5)  SE = N/A\n"
+        );
+
+        let mut none = crate::types::test_helpers::minimal_fit_result();
+        none.omega = DMatrix::zeros(0, 0);
+        none.eta_names.clear();
+        none.omega_fixed.clear();
+        none.se_omega = None;
+        assert_eq!(format_omega_rows(&none), "");
+        assert!(OmegaRowsInput::from_result(&none)
+            .eta_param_types
+            .is_empty());
+        assert!(!format_summary(&none).contains("--- OMEGA ---"));
     }
 }
