@@ -1882,6 +1882,7 @@ fn test_reset_occasions_skipped_without_an_iov_column() {
     let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
                    1,0,.,1,1,100,1\n\
                    1,4,.,3,1,0,2\n\
+                   1,6,.,2,1,.,4\n\
                    1,10,5.0,0,0,.,3\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
@@ -1891,6 +1892,52 @@ fn test_reset_occasions_skipped_without_an_iov_column() {
     assert!(subj.reset_occasions.is_empty());
     assert!(subj.occasions.is_empty());
     assert!(subj.dose_occasions.is_empty());
+    // A pk-only row is gated the same way (#1876): `pk::pk_only_row_occasion` also reads
+    // emptiness as "no label stored".
+    assert_eq!(subj.pk_only_times, vec![6.0]);
+    assert!(subj.pk_only_occasions.is_empty());
+}
+
+#[test]
+fn test_pk_only_rows_capture_their_own_occasion() {
+    // #1876: NONMEM runs `$PK` at an EVID=2 or EVID=0/MDV=1 row under that row's `OCC`,
+    // measured in `nonmem_anchor/iov_pk_only_*_X.ctl`. Each pk-only label differs from
+    // the records on both sides, so a label taken one row early or late shows here.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,4,.,2,1,.,2\n\
+                   1,6,.,0,1,.,3\n\
+                   1,8,5.0,0,0,.,4\n";
+    let f = write_csv(csv);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    assert_eq!(subj.pk_only_times, vec![4.0, 6.0]);
+    assert_eq!(subj.pk_only_occasions, vec![2, 3]);
+    assert_eq!(subj.occasions, vec![1, 4]);
+}
+
+#[test]
+fn test_a_nudged_pk_only_row_keeps_its_own_occasion() {
+    // The #1810 tie pass moves an EVID=2 row listed before a co-timed dose one ULP down,
+    // in place. Its label must stay with it, not take the dose's, and the labels after it
+    // must stay aligned.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,4,.,2,1,.,2\n\
+                   1,4,.,1,1,50,3\n\
+                   1,6,.,2,1,.,4\n\
+                   1,8,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    assert_eq!(subj.pk_only_times, vec![4.0_f64.next_down(), 6.0]);
+    assert_eq!(subj.pk_only_occasions, vec![2, 4]);
+    assert_eq!(subj.dose_occasions, vec![1, 3]);
 }
 
 #[test]

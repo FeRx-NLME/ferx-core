@@ -152,6 +152,7 @@ fn subject() -> Subject {
         obs_l2: vec![],
         dose_occasions: DOSES.iter().map(|&(_, o, _)| o).collect(),
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
     }

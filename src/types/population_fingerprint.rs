@@ -38,7 +38,8 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   subject (`pk_only_times`). A scheme-1 fingerprint is treated as absent, with a
 ///   warning. The same scheme covers #1810, which landed with it: the reader moves the
 ///   first record of a co-timed tie with a pk-only row one ULP down (`obs_times`,
-///   `pk_only_times`).
+///   `pk_only_times`). It also covers #1876, which landed with both: the reader
+///   keeps each pk-only row's `OCC` (`pk_only_occasions`).
 pub(crate) const SCHEME: u32 = 2;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
@@ -51,7 +52,7 @@ pub(crate) const SCHEME: u32 = 2;
 pub struct PopulationFingerprint {
     scheme: u32,
     /// The fit derived its occasion labels from a model-side `iov_occasion` rule,
-    /// so `occasions` and `dose_occasions` are left out of the records and doses
+    /// so `occasions`, `pk_only_occasions` and `dose_occasions` are left out of the records and doses
     /// digests, here and in every population compared against this fingerprint.
     #[serde(default)]
     occasions_derived: bool,
@@ -378,6 +379,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         obs_l2,
         dose_occasions,
         reset_occasions,
+        pk_only_occasions,
         fremtype,
         obs_records,
     } = s;
@@ -406,6 +408,12 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     r.f64s(pk_only_times);
     r.f64s(reset_times);
     r.u32s(reset_occasions);
+    // A derived rule overwrites these too (`apply_iov_occasion_rule`, #1876).
+    r.u32s(if occasions_derived {
+        derived_out
+    } else {
+        pk_only_occasions
+    });
 
     let mut d = Encoder::default();
     d.len(doses.len());

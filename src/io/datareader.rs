@@ -2502,6 +2502,7 @@ fn parse_subject(
     // the snapshot only when there are TV covariates.
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    let mut pk_only_occasions: Vec<u32> = Vec::new();
     // EVID=3 (reset) and EVID=4 (reset + dose) rows. Both zero every
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
@@ -3319,6 +3320,13 @@ fn parse_subject(
             if any_tv {
                 pk_only_covariates.push(locf_state.clone());
             }
+            // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
+            // snapshot governs the interval ending at this row. Gated like
+            // `reset_occasions`. The #1810 pass below only moves a time in place, so the
+            // labels stay parallel to `pk_only_times`.
+            if occ_col.is_some() {
+                pk_only_occasions.push(occ);
+            }
         }
     }
 
@@ -3503,6 +3511,7 @@ fn parse_subject(
             reset_times,
             reset_covariates,
             reset_occasions,
+            pk_only_occasions,
             cens,
             occasions,
             obs_l2,

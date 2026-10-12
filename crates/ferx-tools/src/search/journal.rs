@@ -649,6 +649,7 @@ fn data_fingerprint(data: &Population) -> String {
             obs_l2,
             dose_occasions,
             reset_occasions,
+            pk_only_occasions,
             fremtype,
             obs_records,
         } = subject;
@@ -666,6 +667,12 @@ fn data_fingerprint(data: &Population) -> String {
         let _ = writeln!(buf, "obs_l2={obs_l2:?}");
         let _ = writeln!(buf, "dose_occasions={dose_occasions:?}");
         let _ = writeln!(buf, "reset_occasions={reset_occasions:?}");
+        // Only when present (#1876): a journal written before the field existed, or
+        // for data with no IOV column or no pk-only row, keeps its digest. The digest
+        // moves only for data whose fits #1876 can change.
+        if !pk_only_occasions.is_empty() {
+            let _ = writeln!(buf, "pk_only_occasions={pk_only_occasions:?}");
+        }
         let _ = writeln!(buf, "fremtype={fremtype:?}");
         let _ = writeln!(buf, "obs_records={obs_records:?}");
 

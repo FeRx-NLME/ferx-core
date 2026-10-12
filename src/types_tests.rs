@@ -207,6 +207,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
         obs_records: vec![],
@@ -260,6 +261,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: vec![0],
         obs_records: vec![],
     };
@@ -2193,6 +2195,7 @@ fn bare_subject(id: &str) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     }

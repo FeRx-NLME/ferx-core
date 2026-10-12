@@ -182,7 +182,7 @@ zero-dose) fit:
 When using Inter-Occasion Variability (IOV), add an occasion-index column to the dataset and specify its name with `iov_column` in `[fit_options]`. The column:
 
 - Contains **integer occasion indices** (e.g. 1, 2, 3…) — one per row
-- Applies to both dose rows and observation rows
+- Applies to both dose rows and observation rows, and also to `EVID=2` rows, `EVID=0` rows with `MDV=1` and resets: such a row governs the interval that ends at it, so it runs under its own occasion (see [Occasions](model-file/iov.qmd#occasions))
 - Is **excluded from covariate auto-detection**
 
 Example dataset with `OCC` column:

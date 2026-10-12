@@ -2889,9 +2889,9 @@ pub fn ode_subject_eta_grad_iov(
 /// `(θ, η_bsv, κ)` axes from its [`CombinedDerivs`] — the IOV analogue of
 /// [`seed_pk_dual2`]. The combined column `c` of the program maps to a stacked dual
 /// axis: η_bsv (`c < n_eta`) → shared `n_theta + c`; κ (`c ≥ n_eta`) → group `g`'s
-/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. For EVID=2 pk-only events
-/// `group` is `None`, matching production's zero-κ `combined_for(u32::MAX)`; κ columns
-/// are then dropped. Non-individual-parameter slots are seeded as constants
+/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. For a pk-only event whose
+/// occasion has no group (#1876) `group` is `None`, matching production's zero-κ
+/// `combined_for(u32::MAX)` miss; κ columns are then dropped. Non-individual-parameter slots are seeded as constants
 /// (`pk.values`), exactly as the non-IOV seeder does. `cd` rows are parallel to
 /// `model.pk_indices` (the program-eval row order shared with [`pd_from_program`]).
 fn seed_pk_dual2_iov<const M: usize>(
@@ -3051,10 +3051,10 @@ fn run_subject_iov<const M: usize>(
             n_theta,
         ))
     };
-    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
-    // closed-form provider, #598 review). Built lazily inside the closure so the common
-    // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
-    // when `seed_iov_events` actually has pk-only records to seed, or (#1133) when a reset
+    // The κ = 0 seed: a pk-only row with no κ group (`pk::pk_only_row_group` is `None`,
+    // #1876), held at κ = 0 as the closed-form provider does (#598 review). Built lazily
+    // inside the closure so the common IOV subject pays no allocation — the closure is only
+    // invoked when `seed_iov_events` has such a pk-only row to seed, or (#1133) when a reset
     // row's occasion cannot be resolved from any record, which is a record-free subject.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
@@ -3225,6 +3225,7 @@ fn seed_iov_events<T: Clone>(
     // EVID=2 covariate breakpoints, OR a `TIME`-built-in structural parameter (the
     // switch fires per event even with static covariates, #486). Each event's time is
     // threaded to `seed_group_cov`/`seed_pk_only_cov` so `TIME` resolves per event.
+    let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, occ_to_k);
     if per_event {
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
@@ -3238,8 +3239,17 @@ fn seed_iov_events<T: Clone>(
                 seed_group_cov(g, subject.obs_cov(j), subject.obs_times[j])
             })
             .collect::<Option<_>>()?;
+        // A pk-only row under its own occasion's group (#1876), as production's
+        // `fill_iov_record_params` evaluates it; one whose occasion has no group falls to
+        // the κ = 0 seeder, which is production's `combined_for(u32::MAX)` there too.
         let pk_at_pk_only = (0..subject.pk_only_times.len())
-            .map(|m| seed_pk_only_cov(subject.pk_only_cov(m), subject.pk_only_times[m]))
+            .map(|m| {
+                let t = subject.pk_only_times[m];
+                match pk_only_group(m) {
+                    Some(g) => seed_group_cov(g, subject.pk_only_cov(m), t),
+                    None => seed_pk_only_cov(subject.pk_only_cov(m), t),
+                }
+            })
             .collect::<Option<_>>()?;
         // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
         // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
@@ -3282,12 +3292,19 @@ fn seed_iov_events<T: Clone>(
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
             .collect::<Option<_>>()?;
-        let pk_at_pk_only = if subject.pk_only_times.is_empty() {
-            Vec::new()
-        } else {
-            let seeded = seed_pk_only_cov(static_cov, 0.0)?;
-            vec![seeded; subject.pk_only_times.len()]
-        };
+        // A pk-only row reads its group's seeding (#1876); one κ = 0 seeding, built on
+        // first use, serves every row whose occasion has no group.
+        let mut ungrouped: Option<Vec<T>> = None;
+        let mut pk_at_pk_only = Vec::with_capacity(subject.pk_only_times.len());
+        for m in 0..subject.pk_only_times.len() {
+            pk_at_pk_only.push(match pk_only_group(m) {
+                Some(g) => group_dual[g].clone(),
+                None => match &ungrouped {
+                    Some(seeded) => seeded.clone(),
+                    None => ungrouped.insert(seed_pk_only_cov(static_cov, 0.0)?).clone(),
+                },
+            });
+        }
         // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
         // the reset row's own snapshot and the covariate question is vacuous — but κ is
         // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
@@ -3309,8 +3326,8 @@ fn seed_iov_events<T: Clone>(
 /// First-order (`Dual1<N>`, `N = n_stacked`) IOV seeder — the light counterpart of
 /// [`seed_pk_dual2_iov`]. Seeds only `∂p/∂(stacked-η)` (no θ axes, no Hessian): the
 /// combined column `c` maps to stacked axis `c` (η_bsv, `c < n_eta`) or
-/// `n_eta + group·n_kappa + (c − n_eta)` (κ). For EVID=2 pk-only events
-/// `group = None`, so κ columns are dropped. Reuses [`CombinedDerivs::deta`].
+/// `n_eta + group·n_kappa + (c − n_eta)` (κ). For a pk-only event whose occasion
+/// has no group (#1876) `group = None`, so κ columns are dropped. Reuses [`CombinedDerivs::deta`].
 fn seed_pk_dual1_iov<const N: usize>(
     model: &CompiledModel,
     pk: &crate::types::PkParams,
@@ -3392,9 +3409,8 @@ fn run_subject_iov_eta<const N: usize>(
             n_kappa,
         ))
     };
-    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
-    // closed-form provider, #598 review). Built lazily inside the closure so the common
-    // IOV subject with no EVID=2 records pays no allocation.
+    // The inner κ = 0 seed, for the same rows as the outer one above (#1876). Built lazily
+    // inside the closure so the common IOV subject pays no allocation.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
      -> Option<Vec<Dual1<N>>> {
