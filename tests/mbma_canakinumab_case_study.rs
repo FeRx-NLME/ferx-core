@@ -24,8 +24,9 @@
 //!
 //! or the path in `FERX_CANAKINUMAB_CSV`. Without it each data-reading test prints
 //! `SKIPPED: …` and returns — **a green skip is not a passing anchor**. With
-//! `FERX_REQUIRE_EXTERNAL_DATA=1` a missing file panics instead, which is what a job
-//! that provisions the data must set. `no_external_data_is_tracked` runs everywhere
+//! `FERX_REQUIRE_EXTERNAL_DATA=1` a missing file panics instead. The nightly
+//! `slow-tests.yml` core leg fetches the data and sets that flag, so that is where
+//! this anchor actually runs; in per-PR CI it skips. `no_external_data_is_tracked` runs everywhere
 //! and fails if anything under `data/external/` is ever committed.
 //!
 //! ## Three references, three claims

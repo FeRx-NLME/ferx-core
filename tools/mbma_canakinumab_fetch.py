@@ -3,6 +3,7 @@
 Usage:
     python3 tools/mbma_canakinumab_fetch.py [--from <zip|csv>] [--out <path>] \\
         [--allow-new-hash]
+    python3 tools/mbma_canakinumab_fetch.py --check [--out <path>]
 
 Source: Case Study 2 of
 
@@ -33,6 +34,13 @@ hash-pinned. The endpoint is slow (minutes for ~10 MB) and has returned HTTP 500
 hence the retries. `--from` takes a local copy of the outer zip, of
 `PSP4-15-e70158-s002.zip`, or of the bare `data_9studies.csv`, and skips the
 download.
+
+The nightly `slow-tests.yml` core leg runs this script, then `--check`, and sets
+FERX_REQUIRE_EXTERNAL_DATA=1, so a failed fetch is a red job rather than a skipped
+anchor. Downloading at test time redistributes nothing. The file is deliberately
+NOT put in the Actions cache or uploaded as an artifact: a cache entry written on
+`main` can be restored by any branch's workflow, a fork PR's included, so caching
+it would hand the data to anyone who opens a PR.
 
 Transformations, all mechanical:
     ID      <- STUDY   (study is the unit of between-study variability)
@@ -155,7 +163,21 @@ def main():
     ap.add_argument("--from", dest="src", help="local outer zip, inner zip, or data_9studies.csv")
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--allow-new-hash", action="store_true")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="only verify that --out already holds the pinned derived file; exit 1 if not",
+    )
     a = ap.parse_args()
+    if a.check:
+        try:
+            got = hashlib.sha256(open(a.out, "rb").read()).hexdigest()
+        except OSError as e:
+            sys.exit(f"--check: cannot read {a.out}: {e}")
+        if got != DERIVED_SHA256:
+            sys.exit(f"--check: {a.out} sha256 {got} != pinned {DERIVED_SHA256}")
+        print(f"ok: {a.out} is the pinned derived file")
+        return
     if not URL.startswith("https://"):
         sys.exit(f"refusing a non-https download URL: {URL}")
 
