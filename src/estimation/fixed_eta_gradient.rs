@@ -534,8 +534,7 @@ fn obs_nll_subject_grad_impl(
     want_fisher: bool,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
-    let fd_all =
-        matches!(model.bloq_in_force(), BloqMethod::M3) || !model.residual_correlations.is_empty();
+    let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
     // Fall back to the full-FD path when TTE endpoints are present: the analytic
     // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
@@ -554,7 +553,7 @@ fn obs_nll_subject_grad_impl(
             &preds_base,
             theta,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov(),
             eta,
         );
         let mut grad = vec![0.0f64; n];
@@ -569,7 +568,7 @@ fn obs_nll_subject_grad_impl(
                 subject,
                 &theta_p,
                 sigma_values,
-                &model.residual_correlations,
+                model.residual_cov(),
                 eta,
                 pk_scratch,
             );
@@ -601,7 +600,7 @@ fn obs_nll_subject_grad_impl(
                     &preds_base,
                     theta,
                     &sigma_p,
-                    &model.residual_correlations,
+                    model.residual_cov(),
                     eta,
                 );
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)

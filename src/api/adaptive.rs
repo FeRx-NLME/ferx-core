@@ -1001,7 +1001,7 @@ pub(crate) fn assay_resid_var(
     Some(
         model
             .error_spec
-            .variance_at_with_correlations(cmt, ipred, sigma, correlations)
+            .variance_at_with_correlations(cmt, ipred, sigma, correlations.pairs)
             * ruv_scale,
     )
 }

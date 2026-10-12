@@ -848,6 +848,43 @@ pub(crate) fn gaussian_obs_nll_scaled(
     nll
 }
 
+/// The structure a subject's residual covariance `R` is built from (#1081).
+///
+/// Every consumer that asks "can `R` couple two observation rows?" asks
+/// [`is_dense`](Self::is_dense) on one of these — directly, or through
+/// `ModelParameters::residual_is_dense` / `CompiledModel::residual_is_dense` — and
+/// every dense-`R` builder takes one, so a second source of off-diagonal terms is
+/// one field here and one clause in `is_dense`, not ~45 call sites that each test
+/// `residual_correlations.is_empty()` and would each silently score a correlated
+/// model with independent residuals if missed. `tests/residual_is_dense_is_the_one_predicate.rs`
+/// keeps it that way.
+///
+/// The per-observation *diagonal* helpers ([`ErrorSpec::variance_at_with_correlations`],
+/// [`compute_r_diag_with_correlations`], [`compute_iwres_with_correlations`]) keep
+/// taking the `block_sigma` pairs directly: those carry the within-observation
+/// `combined(...)` term, which is a property of the pairs, not of `R`'s shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResidualCov<'a> {
+    /// The `block_sigma` off-diagonal correlations (#847) — the live ones from the
+    /// parameter set being scored, or the model's declaration.
+    pub(crate) pairs: &'a [ResidualCorrelation],
+}
+
+impl<'a> ResidualCov<'a> {
+    /// The structure carried by a bare `block_sigma` correlation list — the shape every
+    /// `pub` builder taking `&[ResidualCorrelation]` describes.
+    pub(crate) fn block_sigma(pairs: &'a [ResidualCorrelation]) -> Self {
+        Self { pairs }
+    }
+
+    /// Can `R` hold an off-diagonal term? The one predicate for "take the dense-`R`
+    /// path" (#1081). Whether a given subject's `R` actually couples two rows is
+    /// [`has_cross_observation_residual`]'s question; this is the model-level one.
+    pub(crate) fn is_dense(&self) -> bool {
+        !self.pairs.is_empty()
+    }
+}
+
 /// Compute residual variances including fixed residual correlations from
 /// `block_sigma`.
 pub fn compute_r_diag_with_correlations(
@@ -1090,9 +1127,9 @@ pub(crate) fn has_cross_observation_residual(
     error_spec: &ErrorSpec,
     subject: &Subject,
     sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    cov: ResidualCov<'_>,
 ) -> bool {
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         return false;
     }
     let loadings: Vec<Vec<(usize, f64)>> = error_spec
@@ -1107,7 +1144,7 @@ pub(crate) fn has_cross_observation_residual(
         &subject.occasions,
         &subject.obs_l2,
         sigma_values,
-        correlations,
+        cov.pairs,
     )
     .is_empty()
 }
@@ -1132,6 +1169,34 @@ pub fn compute_r_matrix_with_correlations(
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+    )
+}
+
+/// [`compute_r_matrix_with_correlations`] over a resolved [`ResidualCov`] — the
+/// form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     // NOTE: deliberately NOT delegated to `_scaled` with an empty multiplier.
     // The diagonal here goes through `compute_r_diag` → `residual_variance`,
     // which forms the proportional variance as `(f·σ)·(f·σ)`; `variance_at_scaled`
@@ -1148,7 +1213,7 @@ pub fn compute_r_matrix_with_correlations(
     // and copying it in — this runs once per subject per FOCE inner/outer
     // iteration. The empty-correlation case delegates to `variance_at`, the
     // legacy `(f·σ)·(f·σ)` association the comment above relies on.
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         for (j, (&f, &cmt)) in ipreds.iter().zip(obs_cmts.iter()).enumerate() {
             r[(j, j)] = error_spec.variance_at(cmt, f, sigma_values);
         }
@@ -1200,6 +1265,36 @@ pub fn compute_r_matrix_with_correlations_scaled(
     correlations: &[ResidualCorrelation],
     mult: &[Vec<f64>],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_scaled_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_r_matrix_with_correlations_scaled`] over a resolved [`ResidualCov`] —
+/// the form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_scaled_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: &[Vec<f64>],
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let mut r = DMatrix::<f64>::zeros(n, n);
     let ones: Vec<f64> = Vec::new();
@@ -1209,7 +1304,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
         let cmt = obs_cmts.get(j).copied().unwrap_or(0);
         r[(j, j)] = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, row(j));
     }
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         return r;
     }
     // Scale each observation's loadings by its multiplier row before computing
@@ -1251,11 +1346,11 @@ pub(crate) fn r_matrix_maybe_scaled(
     err_keys: &[usize],
     subject: &Subject,
     sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    cov: ResidualCov<'_>,
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> DMatrix<f64> {
     match ruv_mult {
-        Some(mult) => compute_r_matrix_with_correlations_scaled(
+        Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             error_spec,
             preds,
             err_keys,
@@ -1264,10 +1359,10 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.occasions,
             &subject.obs_l2,
             sigma_values,
-            correlations,
+            cov,
             mult,
         ),
-        None => compute_r_matrix_with_correlations(
+        None => compute_r_matrix_with_correlations_cov(
             error_spec,
             preds,
             err_keys,
@@ -1276,7 +1371,7 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.occasions,
             &subject.obs_l2,
             sigma_values,
-            correlations,
+            cov,
         ),
     }
 }
@@ -1316,6 +1411,36 @@ pub fn compute_dr_df_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
+    compute_dr_df_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_dr_df_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_dr_df_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<DMatrix<f64>> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
@@ -1452,6 +1577,36 @@ pub fn compute_d2r_df2_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
+    compute_d2r_df2_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_d2r_df2_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_d2r_df2_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<Vec<DMatrix<f64>>> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {

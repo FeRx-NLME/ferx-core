@@ -4339,7 +4339,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         for &m in &chain {
             if !matches!(
                 m,

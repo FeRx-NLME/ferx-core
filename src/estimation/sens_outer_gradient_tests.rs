@@ -3,6 +3,7 @@ use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
 use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_interaction};
+use crate::stats::residual_error::ResidualCov;
 use crate::types::{DoseEvent, ErrorSpec, OmegaMatrix, Subject};
 use std::collections::HashMap;
 
@@ -918,7 +919,7 @@ fn precise_ebe_corr_with(
             subject,
             &sens0,
             &params.sigma.values,
-            &params.residual_correlations,
+            params.residual_cov(),
         )
         .unwrap()
         .0
@@ -937,8 +938,9 @@ fn precise_ebe_corr_with(
         // reference would silently omit the ρ coordinate's EBE-response term.
         let (rv, dv, d2v) = match &frozen_rv {
             Some(r0) => (r0.clone(), vec![0.0; r0.len()], vec![0.0; r0.len()]),
-            None => corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
-                .unwrap(),
+            None => {
+                corr_residual_diag(model, subject, &sens, sigma, params.residual_cov()).unwrap()
+            }
         };
         let mut grad = DVector::<f64>::from_column_slice(
             &(omega_inv * DVector::from_column_slice(&eta))
@@ -1276,13 +1278,18 @@ fn cross_observation_residual_gate_follows_pairing_not_values() {
         ("one endpoint", &one_endpoint, &corr, false),
     ] {
         assert_eq!(
-            has_cross_observation_residual(&model.error_spec, s, sigma, c),
+            has_cross_observation_residual(
+                &model.error_spec,
+                s,
+                sigma,
+                ResidualCov::block_sigma(c)
+            ),
             cross,
             "{name}: predicate"
         );
         let sens = sens_of(s);
         assert_eq!(
-            corr_residual_diag(&model, s, &sens, sigma, c).is_some(),
+            corr_residual_diag(&model, s, &sens, sigma, ResidualCov::block_sigma(c)).is_some(),
             !cross,
             "{name}: corr_residual_diag must decline exactly the cross-observation subjects"
         );
@@ -1299,7 +1306,7 @@ fn cross_observation_residual_gate_follows_pairing_not_values() {
         &model.error_spec,
         &paired,
         sigma,
-        &[]
+        ResidualCov::block_sigma(&[])
     ));
 }
 

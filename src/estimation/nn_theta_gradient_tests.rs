@@ -152,7 +152,7 @@ fn central_fd_theta_grad(
             subject,
             &tp,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov(),
             eta,
             &mut scratch,
         );
@@ -162,7 +162,7 @@ fn central_fd_theta_grad(
             subject,
             &tp,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov(),
             eta,
             &mut scratch,
         );
@@ -338,7 +338,7 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
         &subject,
         &theta,
         &sigma_values,
-        &model.residual_correlations,
+        model.residual_cov(),
         &eta,
         &mut scratch,
     );
@@ -351,7 +351,7 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
             &subject,
             &tp,
             &sigma_values,
-            &model.residual_correlations,
+            model.residual_cov(),
             &eta,
             &mut scratch,
         );

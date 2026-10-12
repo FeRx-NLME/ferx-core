@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::{residual_rd, residual_rd2};
+use crate::stats::residual_error::{residual_rd, residual_rd2, ResidualCov};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -81,7 +81,7 @@ pub fn individual_nll_into(
     sigma_values: &[f64],
     scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    individual_nll_into_with_schedule(
+    individual_nll_into_with_schedule_cov(
         model,
         subject,
         theta,
@@ -92,7 +92,7 @@ pub fn individual_nll_into(
         // wrapper (SAEM, HMC, VI, AGQ) holds ρ fixed at the declaration, so that
         // *is* their live value; FOCE/FOCEI, which estimate it (#847), call
         // `individual_nll_into_with_schedule` directly with the optimizer's ρ.
-        &model.residual_correlations,
+        model.residual_cov(),
         scratch,
         None,
     )
@@ -503,6 +503,32 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    individual_nll_into_with_schedule_cov(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        scratch,
+        schedule,
+    )
+}
+
+/// [`individual_nll_into_with_schedule`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+pub(crate) fn individual_nll_into_with_schedule_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     let err_keys = model.error_spec.obs_keys(subject);
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut pred_recycle = Vec::new();
@@ -515,7 +541,7 @@ pub fn individual_nll_into_with_schedule(
         eta,
         omega,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         scratch,
         schedule,
         err_keys.as_ref(),
@@ -658,7 +684,7 @@ pub(crate) fn individual_nll_prepared(
         eta,
         omega,
         sigma_values,
-        &model.residual_correlations,
+        model.residual_cov(),
         pk,
         schedule,
         &prep.err_keys,
@@ -680,7 +706,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     err_keys: &[usize],
@@ -696,7 +722,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
         eta,
         omega,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         scratch,
         schedule,
         err_keys,
@@ -776,7 +802,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     err_keys: &[usize],
@@ -852,14 +878,14 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+    if residual_cov.is_dense() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
             model,
             subject,
             &preds,
             frozen_var_preds.unwrap_or(&preds[..]),
             sigma_values,
-            residual_correlations,
+            residual_cov,
             ruv_scale,
             &p_obs,
             ruv_mult,
@@ -970,7 +996,7 @@ fn dense_residual_data_term(
     // frozen `f(η = 0)` of a non-interaction FOCE EBE search (#1722).
     var_preds: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     ruv_scale: f64,
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
@@ -983,7 +1009,7 @@ fn dense_residual_data_term(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     if ruv_scale != 1.0 {
@@ -1026,7 +1052,7 @@ pub(crate) fn obs_nll_subject_into(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
@@ -1035,7 +1061,7 @@ pub(crate) fn obs_nll_subject_into(
         subject,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         pk_scratch,
         None,
@@ -1058,7 +1084,7 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -1072,7 +1098,7 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
         &preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
     )
 }
@@ -1091,7 +1117,7 @@ pub(crate) fn obs_nll_subject_from_preds(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
 ) -> f64 {
     obs_nll_subject_from_preds_with_semantics(
@@ -1100,7 +1126,7 @@ pub(crate) fn obs_nll_subject_from_preds(
         preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         PredNllSemantics::Marginal,
     )
@@ -1121,7 +1147,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     semantics: PredNllSemantics,
 ) -> f64 {
@@ -1139,7 +1165,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if semantics != PredNllSemantics::ConditionalIov
-        && !residual_correlations.is_empty()
+        && residual_cov.is_dense()
         && !m3
         && !has_frem_rows
     {
@@ -1151,7 +1177,7 @@ fn obs_nll_subject_from_preds_with_semantics(
             preds,
             preds,
             sigma_values,
-            residual_correlations,
+            residual_cov,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -1256,7 +1282,7 @@ pub(crate) fn conditional_obs_nll_from_preds(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     iov: bool,
 ) -> f64 {
@@ -1271,7 +1297,7 @@ pub(crate) fn conditional_obs_nll_from_preds(
         preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         semantics,
     )
@@ -1387,6 +1413,33 @@ pub fn foce_subject_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     residual_correlations: &[ResidualCorrelation],
+    interaction: bool,
+) -> f64 {
+    foce_subject_nll_cov(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        interaction,
+    )
+}
+
+/// [`foce_subject_nll`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1569,7 +1622,7 @@ pub fn foce_subject_nll(
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
     if interaction {
-        if residual_correlations.is_empty() {
+        if !residual_cov.is_dense() {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -1585,7 +1638,7 @@ pub fn foce_subject_nll(
                 ruv_mult.as_deref(),
             )
         } else {
-            foce_subject_nll_interaction_dense(
+            foce_subject_nll_interaction_dense_cov(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1593,7 +1646,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                residual_correlations,
+                residual_cov,
                 &p_obs,
                 ruv_mult.as_deref(),
             )
@@ -1608,7 +1661,7 @@ pub fn foce_subject_nll(
         // (always ≥0). Skipped for additive error (variance is f-independent,
         // so f0 and f(η=0) give the same R) to keep that path bit-identical.
         let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
-        foce_subject_nll_standard(
+        foce_subject_nll_standard_cov(
             subject,
             &ipreds,
             eta_hat,
@@ -1616,7 +1669,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            residual_correlations,
+            residual_cov,
             model.bloq_in_force(),
             &p_obs,
             frem_r_override.as_deref(),
@@ -1701,6 +1754,46 @@ pub fn foce_subject_nll_standard(
     // path. Scales each observation's sigma loadings in R.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_standard_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(residual_correlations),
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        r_pred_override,
+        ruv_mult,
+    )
+}
+
+/// [`foce_subject_nll_standard`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+pub(crate) fn foce_subject_nll_standard_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    // When `Some`, evaluate the residual variance R at these predictions
+    // instead of the SB-linearized f0. Used to evaluate R at the population
+    // prediction f(η=0) — NONMEM's no-interaction semantics — which is always
+    // ≥0, avoiding the f0 zero-crossing pathology on oral proportional models.
+    r_pred_override: Option<&[f64]>,
+    // Per-observation custom residual magnitude (#484); `None` on the legacy
+    // path. Scales each observation's sigma loadings in R.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
@@ -1724,7 +1817,7 @@ pub fn foce_subject_nll_standard(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     for (j, v) in p_obs.iter().enumerate() {
@@ -1952,6 +2045,36 @@ pub fn foce_subject_nll_interaction_dense(
     // Per-observation custom residual magnitude (#484); `None` on the legacy path.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_interaction_dense_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(correlations),
+        p_obs,
+        ruv_mult,
+    )
+}
+
+/// [`foce_subject_nll_interaction_dense`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_interaction_dense_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    p_obs: &[f64],
+    // Per-observation custom residual magnitude (#484); `None` on the legacy path.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -1965,7 +2088,7 @@ pub fn foce_subject_nll_interaction_dense(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        correlations,
+        residual_cov,
         ruv_mult,
     );
     for (j, v) in p_obs.iter().enumerate() {
@@ -1998,7 +2121,7 @@ pub fn foce_subject_nll_interaction_dense(
 
     // B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l). Build M_k = R⁻¹ ∂R/∂η_k once per η,
     // then B_{kl} = tr(M_k M_l) = Σ_{p,q} M_k[p,q]·M_l[q,p].
-    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+    let dr = crate::stats::residual_error::compute_dr_df_matrices_cov(
         error_spec,
         ipreds,
         err_keys.as_ref(),
@@ -2007,7 +2130,7 @@ pub fn foce_subject_nll_interaction_dense(
         &subject.occasions,
         &subject.obs_l2,
         sigma_values,
-        correlations,
+        residual_cov,
         ruv_mult,
     );
     let mut m_mats: Vec<DMatrix<f64>> = Vec::with_capacity(n_eta);
@@ -2385,7 +2508,7 @@ pub fn foce_subject_nll_iov(
     omega_iov: &OmegaMatrix,
 ) -> f64 {
     if kappas.is_empty() {
-        return foce_subject_nll(
+        return foce_subject_nll_cov(
             model,
             subject,
             theta,
@@ -2395,7 +2518,7 @@ pub fn foce_subject_nll_iov(
             sigma_values,
             // `block_sigma` + IOV is rejected up front, so an IOV model's
             // correlations are always the (empty) declaration (#847).
-            &model.residual_correlations,
+            model.residual_cov(),
             interaction,
         );
     }
@@ -2522,7 +2645,7 @@ pub fn foce_subject_nll_iov(
         // Additive error keeps f0 (bit-identical).
         // `kappas` has one length-`n_iov` vector per occasion (checked above).
         let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
-        foce_subject_nll_standard(
+        foce_subject_nll_standard_cov(
             subject,
             &ipreds,
             &b_hat,
@@ -2533,7 +2656,7 @@ pub fn foce_subject_nll_iov(
             // `block_sigma` + IOV is rejected up front
             // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
             // practice and the estimated-ρ threading (#847) never reaches here.
-            &model.residual_correlations,
+            model.residual_cov(),
             model.bloq_in_force(),
             &p_obs_iov,
             None,
@@ -2605,6 +2728,33 @@ pub fn foce_population_nll(
     residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
+    foce_population_nll_cov(
+        model,
+        population,
+        theta,
+        eta_hats,
+        h_matrices,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        interaction,
+    )
+}
+
+/// [`foce_population_nll`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_population_nll_cov(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
     // sum serially. A parallel `.sum()` would make the OFV depend on the
     // thread count (f64 addition is non-associative; rayon splits by worker
@@ -2614,7 +2764,7 @@ pub fn foce_population_nll(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            foce_subject_nll(
+            foce_subject_nll_cov(
                 model,
                 subject,
                 theta,
@@ -2622,7 +2772,7 @@ pub fn foce_population_nll(
                 &h_matrices[i],
                 omega,
                 sigma_values,
-                residual_correlations,
+                residual_cov,
                 interaction,
             )
         })
@@ -2686,6 +2836,53 @@ pub fn compute_cwres(
     // this (#1499).
     bloq_method: BloqMethod,
 ) -> Vec<f64> {
+    compute_cwres_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(residual_correlations),
+        frem_r_override,
+        residual_error_eta,
+        ruv_mult,
+        r_preds,
+        bloq_method,
+    )
+}
+
+/// [`compute_cwres`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_cwres_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    frem_r_override: Option<&[Option<f64>]>,
+    // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
+    // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
+    residual_error_eta: Option<usize>,
+    // Per-observation custom residual magnitude (#484) matrix, or `None` on the
+    // legacy path. Scales each row's residual variance so sdtab CWRES matches
+    // the magnitude-aware OFV (the multiplier is f-independent, so the matrix
+    // built at `ipred` applies unchanged at the SB-linearized `f0`).
+    ruv_mult: Option<&[Vec<f64>]>,
+    // The predictions at which `R` is evaluated — `IPRED` under an interaction
+    // fit, `f(η = 0)` under FOCE — NONMEM's `CWRES`. `None` evaluates `R` at
+    // the linearized `f0`.
+    r_preds: Option<&[f64]>,
+    // How the fit scored `CENS` rows. Only `M3` makes a flagged row censored;
+    // under `Drop` the likelihood kept it as an ordinary observation and so does
+    // this (#1499).
+    bloq_method: BloqMethod,
+) -> Vec<f64> {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
@@ -2706,7 +2903,7 @@ pub fn compute_cwres(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     if let Some(overrides) = frem_r_override {
@@ -3263,9 +3460,25 @@ mod tests {
         let mut scratch = pk::EventPkParams::default();
 
         let corr = model.residual_correlations.clone();
-        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &corr, &eta, &mut scratch);
+        let dense = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&corr),
+            &eta,
+            &mut scratch,
+        );
         model.residual_correlations.clear();
-        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let diagonal = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
 
         assert!(dense.is_finite());
         assert!(diagonal.is_finite());
@@ -3439,7 +3652,7 @@ mod tests {
             &eta,
             &omega,
             &sigma,
-            &[],
+            ResidualCov::block_sigma(&[]),
             &mut event_scratch,
             None,
             err_keys.as_ref(),
@@ -3548,15 +3761,22 @@ mod tests {
         let sigma = [0.8];
         let eta = [0.0];
 
-        let nll_weighted =
-            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &[], &eta);
+        let nll_weighted = obs_nll_subject_from_preds(
+            &weighted,
+            &natural,
+            &f,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+        );
         let nll_hand = obs_nll_subject_from_preds(
             &plain,
             &prescaled,
             &scaled_preds,
             &theta,
             &sigma,
-            &[],
+            ResidualCov::block_sigma(&[]),
             &eta,
         );
         let jacobian: f64 = w.iter().map(|wi| wi.ln()).sum();
@@ -4536,9 +4756,25 @@ mod tests {
         let eta = vec![0.4];
         let mut scratch = pk::EventPkParams::with_capacity_for(&subj);
 
-        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let base = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
         model.residual_error_eta = Some(0);
-        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let scaled = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
 
         let s = (2.0_f64 * 0.4).exp();
         let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
@@ -4703,7 +4939,7 @@ mod tests {
             &preds,
             &p.theta,
             &p.sigma.values,
-            &p.residual_correlations,
+            p.residual_cov(),
             &eta,
         );
         assert!(

@@ -498,7 +498,7 @@ impl Stack {
                 &params.sigma.values,
                 // AGQ holds the `block_sigma` off-diagonals at their declared
                 // value (#847); `params` carries exactly that.
-                &params.residual_correlations,
+                params.residual_cov(),
                 scratch,
                 schedule,
                 err_keys.expect("non-IOV error keys"),
@@ -1928,7 +1928,7 @@ fn fused_node_nll_and_score(
         preds,
         &params.theta,
         &params.sigma.values,
-        &params.residual_correlations,
+        params.residual_cov(),
         eta,
         stack.is_iov(),
     );
@@ -2655,7 +2655,7 @@ fn node_nll_gradient(
             &params.omega,
             &params.sigma.values,
             // AGQ holds ρ at the declaration; `params` carries it (#847).
-            &params.residual_correlations,
+            params.residual_cov(),
             schedule,
             mult,
             err_keys,

@@ -725,7 +725,7 @@ fn numerical_mstep_scope_gap(
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Some("the model has a correlated residual (`block_sigma`)");
     }
     #[cfg(feature = "survival")]
@@ -1430,7 +1430,7 @@ fn scalar_residual_mstep_model(
         && !is_mixture
         && n_kappa == 0
         && model.residual_error_eta.is_none()
-        && model.residual_correlations.is_empty()
+        && !model.residual_is_dense()
         && model.frem_config.is_none()
         && !model.has_custom_ruv_magnitude()
         && !model.log_transform
@@ -2370,7 +2370,7 @@ pub(crate) fn obs_nll_sum(
                 subject,
                 theta,
                 sigma_values,
-                &model.residual_correlations,
+                model.residual_cov(),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -2444,7 +2444,7 @@ fn obs_nll_sum_mix(
                 subject,
                 theta,
                 sg_i,
-                &model.residual_correlations,
+                model.residual_cov(),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -5747,7 +5747,7 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    crate::stats::likelihood::individual_nll_into_with_schedule(
+                    crate::stats::likelihood::individual_nll_into_with_schedule_cov(
                         model,
                         &population.subjects[i],
                         &state.theta,
@@ -5756,7 +5756,7 @@ pub fn run_saem(
                         sigma_i,
                         // Same ρ `individual_nll_into` passes — SAEM holds
                         // `block_sigma` at its declaration.
-                        &model.residual_correlations,
+                        model.residual_cov(),
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )

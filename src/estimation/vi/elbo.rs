@@ -400,7 +400,7 @@ fn fd_eta_data_grad(
                 subject,
                 theta,
                 sigma,
-                &model.residual_correlations,
+                model.residual_cov(),
                 zz,
                 scratch,
             )
@@ -1119,7 +1119,7 @@ pub fn closed_form_sigma_support(
     if template.sigma_fixed.first().copied().unwrap_or(false) {
         return Err("σ is declared FIX".to_string());
     }
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Err("correlated residuals put σ inside a non-diagonal R".to_string());
     }
     if model.frem_config.is_some() {
@@ -1314,7 +1314,7 @@ pub(crate) fn elbo_tightness(
                 subject,
                 &params.theta,
                 &params.sigma.values,
-                &params.residual_correlations,
+                params.residual_cov(),
                 eta,
                 &mut scratch,
             )
