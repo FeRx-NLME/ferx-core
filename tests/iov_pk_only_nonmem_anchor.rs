@@ -3,7 +3,8 @@
 //! record. Under the end-of-interval rule that row's κ governs the interval ending at it.
 //!
 //! Model and data: `warfarin_iov` at its initial estimates, `ADVAN2 TRANS2`, `MAXEVAL=0`,
-//! NONMEM 7.6.0 (`nonmem:7.6.0-anchor`), run by @TeunP on PR #1875. The files are theirs,
+//! NONMEM 7.6.0 (`nonmem:7.6.0-anchor`), run by @TeunP on PR #1875, except X3 / XM3 / AT
+//! (below). The A–X files are theirs,
 //! verbatim, except that each control stream's `$DATA data.csv` names its committed CSV, and
 //! the `focei_*` streams other than `focei_E` are generated from `foce_*` by their stated rule
 //! (`METHOD=1 INTER`); the rule reproduces the posted `focei_E` byte for byte.
@@ -17,6 +18,19 @@
 //! * **XM** is X with the row written as `EVID=0, MDV=1`. TeunP ran it and reports it equals
 //!   X "to every digit" for both methods, but posted no `.ext`; the test therefore compares
 //!   XM against X's.
+//! * **X3** / **XM3** are X / XM with the row labelled **OCC 3**, which no other record of the
+//!   subject carries. NONMEM gives that occasion an `ETA(6)` of its own; ferx gave it no κ
+//!   group, so the row ran under κ = 0 (`X3_k0`: X's two-κ stream on X3 data). The `X3`
+//!   streams add `IF(OCC.EQ.3) KAPPA = ETA(6)` and a third `$OMEGA BLOCK(1) SAME`. These
+//!   and AT are generated from the X / A files by `make_iov_pk_only_slot_fixtures.py`, and
+//!   their `.ext` files come from NONMEM 7.5.1 under PsN `execute`, 2026-10-12, not from
+//!   TeunP. The same run re-did A and X as controls: both reproduce the 7.6.0 OBJs above to
+//!   within 3.3e-8, and X3_k0 reproduces X_k0 to within 1.1e-8, as it must (the row's OCC
+//!   is irrelevant once its κ is 0).
+//! * **AT** is A plus one `EVID=2` row per subject, 24 h after its last record, under OCC 3.
+//!   It governs no observation, so κ₃ is uninformed and the objective must be A's, on both
+//!   engines: the degenerate oracle for the extra κ group, which every site that counts the
+//!   groups now sees. It passes with or without that group, so it pins the count, not the fix.
 //!
 //! The `_k0` streams add `IF(EVID.EQ.2) KAPPA = 0` (ferx before #1876); `X_prev` adds
 //! `IF(EVID.EQ.2) KAPPA = ETA(4)`, i.e. the occasion of the record before the row — what a
@@ -63,6 +77,8 @@ fn expected_pk_only(data: &str) -> Vec<(f64, u32)> {
         "A" => vec![],
         "E" => vec![(30.0, 1), (150.0, 2)],
         "X" | "XM" => vec![(110.0, 2)],
+        "X3" | "XM3" => vec![(110.0, 3)],
+        "AT" => vec![(264.0, 3)],
         _ => unreachable!(),
     }
 }
@@ -74,11 +90,20 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
         let nm = |run: &str| nonmem_obj(&format!("iov_pk_only_{method}_{run}"));
         let (a, e, e_k0) = (nm("A"), nm("E"), nm("E_k0"));
         let (x, x_k0, x_prev) = (nm("X"), nm("X_k0"), nm("X_prev"));
+        let (x3, xm3, x3_k0, at) = (nm("X3"), nm("XM3"), nm("X3_k0"), nm("AT"));
+        // AT's oracle holds on the NONMEM side too: an uninformed ETA(6) adds nothing.
+        assert!(
+            (at - a).abs() < OFV_TOL,
+            "{method}: NONMEM AT {at} differs from A {a}; AT is no longer a degenerate case"
+        );
         // The fixture's own straddles: each wrong convention sits far outside the bound.
         for (what, gap) in [
             ("E − E_k0", e - e_k0),
             ("X − X_k0", x - x_k0),
             ("X − X_prev", x - x_prev),
+            ("X3 − X3_k0", x3 - x3_k0),
+            ("X3 − X_prev", x3 - x_prev),
+            ("X3 − X", x3 - x),
         ] {
             assert!(
                 gap.abs() > 1e3 * OFV_TOL,
@@ -89,7 +114,15 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
         let mut by_engine: Vec<Vec<f64>> = Vec::new();
         for engine in ["an", "ode"] {
             let mut ofvs = Vec::new();
-            for (data, want) in [("A", a), ("E", e), ("X", x), ("XM", x)] {
+            for (data, want) in [
+                ("A", a),
+                ("E", e),
+                ("X", x),
+                ("XM", x),
+                ("X3", x3),
+                ("XM3", xm3),
+                ("AT", at),
+            ] {
                 let (fit, pop) = ferx(engine, method, data);
                 let tag = format!("{engine}_{method} on {data}");
                 // The rows must reach the engine, labelled: a reader that drops them, or
@@ -142,6 +175,18 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
                                 x_prev,
                             ),
                         ],
+                        "X3" | "XM3" => &[
+                            (
+                                "X3_k0: the occasion only the pk-only row carries got no κ \
+                                 group (iov_occasion_groups), so the row ran under κ = 0",
+                                x3_k0,
+                            ),
+                            (
+                                "X_prev: the row took the previous record's occasion, so \
+                                 its own label (pk_only_occasions) was not used",
+                                x_prev,
+                            ),
+                        ],
                         _ => &[],
                     };
                     let why = wrong
@@ -181,8 +226,9 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-// Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |OFV − NONMEM| 5.03e-8
-// (an_focei on X), so 20× headroom. The nearest wrong convention is 0.788 away (X_k0, FOCEI).
+// Measured on Linux x86_64 (the reference platform) at 6b53ca9c: worst |OFV − NONMEM| 5.03e-8
+// (an_focei on X), so 20× headroom; on X3 / XM3 / AT, 4.04e-8 (ode_focei on AT). The nearest
+// wrong convention is 0.095 away (X3_k0, FOCEI).
 // When ferx is reverted to a wrong convention on both sides, its OFV equals that convention's
 // NONMEM OBJ to within 1.85e-7 (macOS, mutations B2/B3), which is inside the bound, so the
 // diagnosis names it.
