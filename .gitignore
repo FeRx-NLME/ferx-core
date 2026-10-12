@@ -20,5 +20,9 @@ rustc-ice-*.txt
 docs/_site/
 bench_*.csv
 
+# Externally provisioned data that may not be redistributed (#1913): written by
+# tools/mbma_canakinumab_fetch.py, read by the test of the same name. Never commit.
+data/external/
+
 # Python bytecode from the nonmem_anchor reference scripts
 __pycache__/
