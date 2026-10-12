@@ -1,4 +1,5 @@
 use super::*;
+use crate::stats::likelihood::iov_occasion_groups;
 use crate::types::{
     BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
 };

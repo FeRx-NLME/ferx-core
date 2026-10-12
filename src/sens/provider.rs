@@ -1811,9 +1811,9 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
 /// * time-varying covariates: the closed-form TV-walk scope ([`tvcov_analytical_supported`]).
 pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
     if model.n_kappa > 0 {
-        let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
         iov_analytical_supported_core(model, true)
-            && model.n_eta + k * model.n_kappa < MAX_TVCOV_AXES
+            && crate::stats::stacked_layout::StackedLayout::of(model, subject).n_stacked()
+                < MAX_TVCOV_AXES
     } else {
         tvcov_analytical_supported(model)
     }
@@ -2133,28 +2133,25 @@ fn build_iov_sources(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
 
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let k_groups = occ_groups.len();
+    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_kappa, subject);
+    let k_groups = layout.n_groups();
     if k_groups == 0 {
         return None;
     }
-    let n_stacked = n_eta + k_groups * n_kappa;
+    let n_stacked = layout.n_stacked();
     if stacked_eta.len() != n_stacked {
         return None;
     }
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
-    let combined_for =
-        |k: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, k);
+    let combined_for = |k: usize| layout.combined_effect(stacked_eta, k);
     // A pk-only row runs under its own occasion's group (`crate::pk::pk_only_row_occasion`,
     // #1876), like production `predict_iov`. One whose occasion has no group gets the
     // BSV-only effect `[η_bsv, κ = 0]` with its κ derivatives dropped from the stacked
     // axes (group `None` below), so the prediction holds κ fixed at 0 there. That κ = 0
     // vector is single-sourced with the ODE IOV provider via the shared helper (#598
     // review).
-    let combined_pk_only: Vec<f64> =
-        crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
-    let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, &occ_to_k);
+    let combined_pk_only: Vec<f64> = layout.combined_pk_only(stacked_eta);
+    let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, layout.occ_to_group());
 
     let prog = model
         .indiv_param_partials
@@ -2227,7 +2224,7 @@ fn build_iov_sources(
     if per_event {
         for d in 0..subject.doses.len() {
             let occ = subject.dose_occasions.get(d).copied()?;
-            let g = *occ_to_k.get(&occ)?;
+            let g = layout.group_of(occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
             let t = subject.doses[d].time;
@@ -2238,7 +2235,7 @@ fn build_iov_sources(
         }
         for j in 0..subject.obs_times.len() {
             let occ = subject.occasions.get(j).copied()?;
-            let g = *occ_to_k.get(&occ)?;
+            let g = layout.group_of(occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
             let t = subject.obs_times[j];
@@ -2279,11 +2276,11 @@ fn build_iov_sources(
         }
         for d in 0..subject.doses.len() {
             let occ = subject.dose_occasions.get(d).copied()?;
-            dose_src[d] = group_source[*occ_to_k.get(&occ)?];
+            dose_src[d] = group_source[layout.group_of(occ)?];
         }
         for j in 0..subject.obs_times.len() {
             let occ = subject.occasions.get(j).copied()?;
-            obs_src[j] = group_source[*occ_to_k.get(&occ)?];
+            obs_src[j] = group_source[layout.group_of(occ)?];
         }
         // A pk-only row shares its group's source; one κ = 0 source, built on first
         // use, serves every row whose occasion has no group.
@@ -2481,7 +2478,8 @@ fn run_obs_iov<const M: usize>(
     // `group` is `None` (an ungrouped pk-only event, κ fixed at 0). The θ-θ Hessian block is
     // unused downstream (left zero).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual2<M> {
-        let kappa_base = group.map(|g| nc + n_eta + g * n_kappa);
+        let kappa_base =
+            group.map(|g| nc + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
         let stacked_axis = |c: usize| -> Option<usize> {
             if c < n_eta {
                 Some(nc + c)
@@ -2867,7 +2865,8 @@ fn run_obs_iov_eta<const N: usize>(
     // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
     // (an ungrouped pk-only event, κ fixed at 0).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual1<N> {
-        let kappa_base = group.map(|g| n_eta + g * n_kappa);
+        let kappa_base =
+            group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
         let stacked_axis = |c: usize| -> Option<usize> {
             if c < n_eta {
                 Some(c)
@@ -5393,7 +5392,7 @@ fn dose_pk_snapshots(
     }
     let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
     let eta_bsv = &b[..n_eta.min(b.len())];
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
     subject
         .doses
         .iter()
@@ -5402,10 +5401,9 @@ fn dose_pk_snapshots(
             let occ = subject.dose_occasions.get(k).copied().unwrap_or(0);
             let mut combined = Vec::with_capacity(n_eta + n_kappa);
             combined.extend_from_slice(eta_bsv);
-            let slot = occ_groups.iter().position(|(o, _)| *o == occ);
-            match slot {
-                Some(g) if n_eta + (g + 1) * n_kappa <= b.len() => {
-                    combined.extend_from_slice(&b[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa]);
+            match layout.group_of(occ) {
+                Some(g) if layout.kappa_range(g).end <= b.len() => {
+                    combined.extend_from_slice(layout.kappa(b, g));
                 }
                 _ => combined.extend(std::iter::repeat_n(0.0, n_kappa)),
             }

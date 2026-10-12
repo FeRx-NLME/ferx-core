@@ -2400,20 +2400,20 @@ pub fn foce_subject_nll_iov(
         );
     }
 
-    let occ_groups = iov_occasion_groups(subject);
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
+    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_iov, subject);
     // Defensive: the EBE pipeline always yields exactly one κ vector per
     // occasion group, each of width n_iov. A mismatch would silently leave the
     // unmatched occasions' ipreds (and H columns) at 0.0 and score the
     // augmented marginal against wrong predictions, so bail with the large
     // finite sentinel — mirroring the guards in `individual_nll_iov`.
-    if kappas.len() != occ_groups.len() || kappas.iter().any(|k| k.len() != n_iov) {
+    if kappas.len() != layout.n_groups() || kappas.iter().any(|k| k.len() != n_iov) {
         return 1e20;
     }
-    let k_occ = occ_groups.len();
-    let n_b = n_eta + k_occ * n_iov;
+    let k_occ = layout.n_groups();
+    let n_b = layout.n_stacked();
 
     // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
     // (proper cross-occasion carryover; issue #104), plus the augmented
@@ -2437,7 +2437,7 @@ pub fn foce_subject_nll_iov(
     let mut kpert = kappa_slices.clone();
     const EPS: f64 = 1e-6;
     for k in 0..k_occ {
-        let col_base = n_eta + k * n_iov;
+        let col_base = layout.kappa_offset(k);
         for ki in 0..n_iov {
             let orig = kpert[k][ki];
             let step = EPS * (1.0 + orig.abs());
@@ -2460,7 +2460,7 @@ pub fn foce_subject_nll_iov(
     }
     for (k, kap) in kappas.iter().enumerate() {
         for ki in 0..n_iov {
-            b_hat[n_eta + k * n_iov + ki] = kap[ki];
+            b_hat[layout.kappa_offset(k) + ki] = kap[ki];
         }
     }
 
@@ -2468,7 +2468,7 @@ pub fn foce_subject_nll_iov(
     // `from_matrix` regularises if a sub-block is not PD, matching the
     // robustness of the non-IOV OmegaMatrix path; the standard/interaction
     // FOCE routines below read only `Σ_b.matrix`.
-    let sigma_b_mat = build_block_diag_omega(&omega_bsv.matrix, &omega_iov.matrix, k_occ);
+    let sigma_b_mat = layout.prior(&omega_bsv.matrix, &omega_iov.matrix);
     let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
 
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
@@ -2833,7 +2833,7 @@ pub fn iov_combined_effect(
 ) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
-    let base = n_eta + g * n_kappa;
+    let base = crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g);
     c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
     c
 }
@@ -2859,26 +2859,7 @@ pub fn build_block_diag_omega(
     omega_iov: &DMatrix<f64>,
     n_occasions: usize,
 ) -> DMatrix<f64> {
-    let n_bsv = omega_bsv.nrows();
-    let n_iov = omega_iov.nrows();
-    let n_total = n_bsv + n_occasions * n_iov;
-    let mut m = DMatrix::zeros(n_total, n_total);
-    // BSV block
-    for i in 0..n_bsv {
-        for j in 0..n_bsv {
-            m[(i, j)] = omega_bsv[(i, j)];
-        }
-    }
-    // K copies of IOV block
-    for k in 0..n_occasions {
-        let offset = n_bsv + k * n_iov;
-        for i in 0..n_iov {
-            for j in 0..n_iov {
-                m[(offset + i, offset + j)] = omega_iov[(i, j)];
-            }
-        }
-    }
-    m
+    crate::stats::stacked_layout::block_diag_stack(omega_bsv, omega_iov, n_occasions)
 }
 
 /// IOV-aware individual NLL: uses per-occasion kappas.

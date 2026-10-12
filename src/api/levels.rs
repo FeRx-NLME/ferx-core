@@ -1506,9 +1506,7 @@ fn record_values(
     }
     let groups = match model.n_kappa {
         0 => 1,
-        _ => crate::stats::likelihood::iov_occasion_groups(subject)
-            .len()
-            .max(1),
+        _ => crate::stats::stacked_layout::group_count(subject).max(1),
     };
     values_at(model, subject, theta, &eta, &vec![kappa; groups])
 }

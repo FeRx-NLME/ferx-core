@@ -187,11 +187,11 @@ pub fn compute_npde_npd(
                 // Empty when the subject carries no occasion labels, in which case
                 // `predict_iov` falls back to κ = 0 (matching the fit-time
                 // no-occasion diagnostic).
-                let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
+                let iov: Option<(&crate::types::OmegaMatrix, usize)> = params
                     .omega_iov
                     .as_ref()
                     .filter(|_| model.n_kappa > 0)
-                    .map(|om| (om, crate::stats::likelihood::iov_occasion_groups(subject)));
+                    .map(|om| (om, crate::stats::stacked_layout::group_count(subject)));
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
@@ -210,8 +210,8 @@ pub fn compute_npde_npd(
                     // baseline-only `pk_param_fn(subject.covariates)` — and draw no
                     // extra randoms, so their sims are byte-identical.
                     let ipreds = match &iov {
-                        Some((omega_iov, occ_groups)) => {
-                            let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+                        Some((omega_iov, n_groups)) => {
+                            let kappas: Vec<Vec<f64>> = (0..*n_groups)
                                 .map(|_| {
                                     let z: Vec<f64> = (0..model.n_kappa)
                                         .map(|_| normal.sample(&mut rng))

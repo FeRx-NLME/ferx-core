@@ -8539,6 +8539,7 @@ fn ode_iov_bucketed_dispatch_body() {
         24,
         "fixture must have 24 κ occasion groups"
     );
+    let layout = crate::stats::stacked_layout::StackedLayout::of(&model, &subj);
 
     let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
     let m_dim = model.n_theta + n_stacked;
@@ -8562,10 +8563,10 @@ fn ode_iov_bucketed_dispatch_body() {
 
     // Outer (`Dual2`): exact width 27 (what the pre-#971 ladder ran) vs the padded width 28
     // the bucketed ladder picks.
-    let exact = run_subject_iov::<27>(&model, &subj, &theta, &stacked, &occ_groups)
+    let exact = run_subject_iov::<27>(&model, &subj, &theta, &stacked, &layout)
         .expect("exact-width IOV walk");
-    let padded = run_subject_iov::<28>(&model, &subj, &theta, &stacked, &occ_groups)
-        .expect("bucketed IOV walk");
+    let padded =
+        run_subject_iov::<28>(&model, &subj, &theta, &stacked, &layout).expect("bucketed IOV walk");
     assert_subject_sens_bit_identical(&exact, &padded, "outer 27 vs 28");
     // …and the public entry point, which is what actually goes through the ladder.
     let dispatched = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked)
@@ -8573,9 +8574,9 @@ fn ode_iov_bucketed_dispatch_body() {
     assert_subject_sens_bit_identical(&exact, &dispatched, "outer 27 vs dispatched");
 
     // Inner (`Dual1`): exact width 25 vs the padded width 28.
-    let exact_g = run_subject_iov_eta::<25>(&model, &subj, &theta, &stacked, &occ_groups)
+    let exact_g = run_subject_iov_eta::<25>(&model, &subj, &theta, &stacked, &layout)
         .expect("exact-width IOV η-gradient");
-    let padded_g = run_subject_iov_eta::<28>(&model, &subj, &theta, &stacked, &occ_groups)
+    let padded_g = run_subject_iov_eta::<28>(&model, &subj, &theta, &stacked, &layout)
         .expect("bucketed IOV η-gradient");
     let dispatched_g = ode_subject_eta_grad_iov(&model, &subj, &theta, &stacked)
         .expect("in-scope IOV subject must stay analytic");

@@ -73,6 +73,7 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
+use crate::stats::stacked_layout::stacked_width;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -376,7 +377,7 @@ impl Stack {
     fn new(model: &CompiledModel, params: &ModelParameters, n_occ: usize) -> Self {
         let n_eta = model.n_eta;
         let n_kappa = if n_occ == 0 { 0 } else { model.n_kappa };
-        let d = n_eta + n_occ * n_kappa;
+        let d = stacked_width(n_eta, n_kappa, n_occ);
 
         let (omega_joint_inv, prior_sd) = match (&params.omega_iov, n_kappa) {
             (Some(iov), k) if k > 0 => {
@@ -1135,7 +1136,7 @@ pub(crate) fn subject_grid_and_weights(
     weights: &[f64],
 ) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
     let n_occ = if model.n_kappa > 0 {
-        crate::stats::likelihood::iov_occasion_groups(subject).len()
+        crate::stats::stacked_layout::group_count(subject)
     } else {
         0
     };

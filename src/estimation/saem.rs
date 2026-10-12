@@ -15,7 +15,7 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
-    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
+    individual_nll_prepared, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -3703,7 +3703,7 @@ pub fn run_saem(
             .subjects
             .iter()
             .map(|s| {
-                let n_occ = iov_occasion_groups(s).len();
+                let n_occ = crate::stats::stacked_layout::group_count(s);
                 vec![vec![0.0f64; n_kappa]; n_occ]
             })
             .collect();

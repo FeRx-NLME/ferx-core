@@ -90,6 +90,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::agq::analytic_score_supported;
@@ -598,8 +599,8 @@ pub(crate) fn subject_htilde_dx_iov(
     if n_eta_bsv == 0 || n_iov == 0 {
         return None;
     }
-    let k_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    let n_st = n_eta_bsv + k_occ * n_iov;
+    let k_occ = crate::stats::stacked_layout::group_count(subject);
+    let n_st = stacked_width(n_eta_bsv, n_iov, k_occ);
     let omega_iov = params.omega_iov.as_ref()?;
 
     let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
@@ -767,8 +768,8 @@ pub(crate) fn subject_htilde_dx_iov(
             let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
             let mut acc = DMatrix::<f64>::zeros(n_st, n_st);
             for occ in 0..k_occ {
-                let row = n_eta_bsv + occ * n_iov + i;
-                let col = n_eta_bsv + occ * n_iov + j;
+                let row = kappa_offset(n_eta_bsv, n_iov, occ) + i;
+                let col = kappa_offset(n_eta_bsv, n_iov, occ) + j;
                 let v = l_full.column(col).into_owned();
                 let u: DVector<f64> = omega_inv.column(row).into_owned();
                 acc += omega_inv_deriv(omega_inv, &u, &v);

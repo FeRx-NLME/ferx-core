@@ -1,3 +1,4 @@
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::types::{
     CompiledModel, ModelParameters, MuTransform, OmegaMatrix, ResidualCorrelation, SigmaVector,
 };
@@ -2040,7 +2041,7 @@ pub(crate) fn block_chol_full(
     n_eta: usize,
     n_iov: usize,
 ) -> DMatrix<f64> {
-    let n = n_eta + k * n_iov;
+    let n = stacked_width(n_eta, n_iov, k);
     let mut l = DMatrix::zeros(n, n);
     for r in 0..n_eta {
         for c in 0..n_eta {
@@ -2048,7 +2049,7 @@ pub(crate) fn block_chol_full(
         }
     }
     for kk in 0..k {
-        let off = n_eta + kk * n_iov;
+        let off = kappa_offset(n_eta, n_iov, kk);
         for r in 0..n_iov {
             for c in 0..n_iov {
                 l[(off + r, off + c)] = l_iov[(r, c)];
