@@ -89,7 +89,8 @@ def download(attempts=4, timeout=600):
     for i in range(attempts):
         try:
             print(f"downloading {URL} (attempt {i + 1}/{attempts}) ...", file=sys.stderr)
-            with urllib.request.urlopen(URL, timeout=timeout) as r:
+            # URL is the https constant above, never user input (asserted in main).
+            with urllib.request.urlopen(URL, timeout=timeout) as r:  # nosec B310
                 return r.read()
         except Exception as e:  # noqa: BLE001 — any failure is retried, then reported
             last = e
@@ -155,6 +156,8 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--allow-new-hash", action="store_true")
     a = ap.parse_args()
+    if not URL.startswith("https://"):
+        sys.exit(f"refusing a non-https download URL: {URL}")
 
     blob = open(a.src, "rb").read() if a.src else download()
     raw = upstream_csv(blob)
