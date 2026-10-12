@@ -857,6 +857,32 @@ fn test_iov_occasion_degenerate_single_occasion_errors() {
     );
 }
 
+// #1876: a pk-only row past the breakpoint lands in a second occasion of its own, and
+// `iov_occasion_groups` gives that occasion a κ. But it lies after every observation and
+// dose, so its κ informs nothing, and the observations still share one occasion: the
+// single-occasion check must count observations and doses only, and still error.
+#[test]
+fn test_iov_occasion_single_occasion_errors_despite_a_later_pk_only_row() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for s in &mut pop.subjects {
+        s.pk_only_times = vec![150.0];
+        s.pk_only_covariates = vec![HashMap::new()];
+    }
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+    // The straddle: the rule does put the row in an occasion of its own, which gets a group.
+    let mut derived = pop.clone();
+    super::apply_iov_occasion_rule(&mut derived, &opts.iov_occasion, false, &mut Vec::new());
+    for s in &derived.subjects {
+        assert_eq!(s.pk_only_occasions, vec![1u32]);
+        assert_eq!(crate::stats::likelihood::iov_occasion_groups(s).len(), 2);
+    }
+    let msg = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("a pk-only row after every observation must not make kappa identifiable");
+    assert!(msg.contains("single occasion"), "unexpected error: {msg}");
+}
+
 // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
 // (so the user knows it had no effect) and skip the derivation entirely.
 #[test]

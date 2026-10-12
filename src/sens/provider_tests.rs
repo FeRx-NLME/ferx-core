@@ -11931,14 +11931,17 @@ fn iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
 /// then depends on occasion 2's κ through that row alone, and only when the row runs
 /// under its own `OCC = 2`:
 ///
-/// | labelling | `∂pred(12)/∂κ₂` |
-/// |---|---|
-/// | own `OCC = 2` | live |
-/// | none (in-memory; the scan picks the t = 6 record, occasion 1) | exactly 0 |
-/// | `OCC = 9`, no κ group (κ = 0) | exactly 0 |
+/// | labelling | groups | `∂pred(12)/∂κ₂` | `∂pred(12)/∂κ₉` |
+/// |---|---|---|---|
+/// | own `OCC = 2` | 2 | live | — |
+/// | none (in-memory; the scan picks the t = 6 record, occasion 1) | 2 | exactly 0 | — |
+/// | `OCC = 9`, which only the row carries | 3 | exactly 0 | live |
+///
+/// Occasion 9 gets the third κ group, since `iov_occasion_groups` appends the occasions
+/// only pk-only rows carry. Before that it had none, and the row ran under κ = 0.
 ///
 /// Each side is asserted on its own, so a reverted site names itself: production
-/// (`predict_iov` under a κ₂ step), the outer `Dual2` jet and the inner `Dual1` gradient.
+/// (`predict_iov` under a κ step), the outer `Dual2` jet and the inner `Dual1` gradient.
 /// Then the whole jet is checked against FD of `predict_iov`. `cov` is the row's WT
 /// snapshot; `None` leaves `pk_only_covariates` empty, which is the static-source branch.
 fn check_pk_only_row_takes_its_own_kappa(
@@ -11959,62 +11962,74 @@ fn check_pk_only_row_takes_its_own_kappa(
         .iter()
         .position(|n| n == "KAPPA_CL")
         .expect("KAPPA_CL declared");
-    let axis = n_eta + n_kappa + kappa_cl;
-    let kappas_of = |st: &[f64]| -> Vec<Vec<f64>> {
-        (0..2)
-            .map(|g| st[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa].to_vec())
-            .collect()
-    };
-    for (label, occ, live) in [
-        ("own OCC 2", Some(2u32), true),
-        ("unlabelled", None, false),
-        ("OCC 9, no group", Some(9), false),
+    let axis_of = |g: usize| n_eta + g * n_kappa + kappa_cl;
+    for (label, occ, n_groups, live) in [
+        ("own OCC 2", Some(2u32), 2, Some(1)),
+        ("unlabelled", None, 2, None),
+        ("OCC 9, only the row carries it", Some(9), 3, Some(2)),
     ] {
         let mut s = subject.clone();
         s.pk_only_occasions = occ.into_iter().collect();
-        assert_eq!(crate::stats::likelihood::iov_occasion_groups(&s).len(), 2);
-        // Production.
-        let mut stepped = stacked.to_vec();
-        stepped[axis] += 0.1;
+        assert_eq!(
+            crate::stats::likelihood::iov_occasion_groups(&s).len(),
+            n_groups,
+            "{label}: κ groups"
+        );
+        // A third group's κ is nonzero, like the other two.
+        let mut st0 = stacked.to_vec();
+        st0.extend(std::iter::repeat_n(0.07, (n_groups - 2) * n_kappa));
+        let kappas_of = |st: &[f64]| -> Vec<Vec<f64>> {
+            (0..n_groups)
+                .map(|g| st[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa].to_vec())
+                .collect()
+        };
         let pred =
             |st: &[f64]| crate::pk::predict_iov(model, &s, theta, &st[..n_eta], &kappas_of(st))[2];
-        let (p0, p1) = (pred(stacked), pred(&stepped));
-        assert!(
-            p0.is_finite() && p1.is_finite(),
-            "{label}: production {p0}, {p1}"
-        );
-        if live {
+        let outer = subject_sensitivities_iov(model, &s, theta, &st0).expect("outer supported");
+        let inner = subject_eta_grad_iov(model, &s, theta, &st0).expect("inner supported");
+        // Every group after occasion 1's is live only if the row runs under it.
+        for g in 1..n_groups {
+            let is_live = live == Some(g);
+            // Production.
+            let mut stepped = st0.clone();
+            stepped[axis_of(g)] += 0.1;
+            let (p0, p1) = (pred(&st0), pred(&stepped));
             assert!(
-                (p1 - p0).abs() > 1e-4 * p0.abs(),
-                "{label}: production predict_iov ignores occasion 2's κ at t = 12 ({p0} → {p1})"
+                p0.is_finite() && p1.is_finite(),
+                "{label}: production {p0}, {p1}"
             );
-        } else {
-            assert_eq!(
-                p0.to_bits(),
-                p1.to_bits(),
-                "{label}: production predict_iov let occasion 2's κ reach t = 12"
-            );
-        }
-        // The two dual providers, each on its own.
-        let outer = subject_sensitivities_iov(model, &s, theta, stacked).expect("outer supported");
-        let inner = subject_eta_grad_iov(model, &s, theta, stacked).expect("inner supported");
-        for (side, d) in [
-            ("outer Dual2", outer.obs[2].df_deta[axis]),
-            ("inner Dual1", inner[2].df_deta[axis]),
-        ] {
-            assert!(d.is_finite(), "{label}: {side} {d}");
-            if live {
+            if is_live {
                 assert!(
-                    d.abs() > 1e-4 * p0.abs(),
-                    "{label}: {side} ∂pred(12)/∂κ₂ = {d}, the pk-only row did not seed κ₂"
+                    (p1 - p0).abs() > 1e-4 * p0.abs(),
+                    "{label}: production predict_iov ignores group {g}'s κ at t = 12 ({p0} → {p1})"
                 );
             } else {
-                assert_eq!(d, 0.0, "{label}: {side} let occasion 2's κ reach t = 12");
+                assert_eq!(
+                    p0.to_bits(),
+                    p1.to_bits(),
+                    "{label}: production predict_iov let group {g}'s κ reach t = 12"
+                );
+            }
+            // The two dual providers, each on its own.
+            for (side, d) in [
+                ("outer Dual2", outer.obs[2].df_deta[axis_of(g)]),
+                ("inner Dual1", inner[2].df_deta[axis_of(g)]),
+            ] {
+                assert!(d.is_finite(), "{label}: {side} {d}");
+                if is_live {
+                    assert!(
+                        d.abs() > 1e-4 * p0.abs(),
+                        "{label}: {side} ∂pred(12)/∂κ of group {g} = {d}, the pk-only row did \
+                         not seed it"
+                    );
+                } else {
+                    assert_eq!(d, 0.0, "{label}: {side} let group {g}'s κ reach t = 12");
+                }
             }
         }
         eprintln!("pk-only labelling: {label}");
-        check_iov_provider_vs_fd(model, &s, theta, stacked);
-        check_iov_inner_matches_outer(model, &s, theta, stacked);
+        check_iov_provider_vs_fd(model, &s, theta, &st0);
+        check_iov_inner_matches_outer(model, &s, theta, &st0);
     }
 }
 

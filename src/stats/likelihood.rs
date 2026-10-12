@@ -2797,10 +2797,20 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// empty observation-index list. This preserves existing stacked-kappa ordering for the
 /// common case while assigning dose-only occasions their own axes, so dose carryover into
 /// later observations can be differentiated analytically.
+///
+/// Occasions carried only by pk-only rows (`EVID=2` / `EVID=0, MDV=1`,
+/// `Subject::pk_only_occasions`) come last, in file order, also with an empty list. Such a
+/// row runs `$PK` under its own occasion (#1876) and governs the interval ending at it, so
+/// its κ moves every later prediction; NONMEM gives that occasion an `ETA` like any other.
+/// Without a group here the row would fall back to κ = 0.
 pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut groups = split_obs_by_occasion(subject);
     let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
-    for &occ in &subject.dose_occasions {
+    for &occ in subject
+        .dose_occasions
+        .iter()
+        .chain(&subject.pk_only_occasions)
+    {
         if seen.insert(occ) {
             groups.push((occ, Vec::new()));
         }
@@ -2841,7 +2851,8 @@ pub fn iov_combined_effect(
 /// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
 /// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
 /// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
-/// for one whose occasion has none (matching production `predict_iov`'s
+/// for one whose occasion has none, which only an unlabelled in-memory row's fallback can
+/// reach (matching production `predict_iov`'s
 /// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
 /// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
 /// review).
@@ -3581,6 +3592,21 @@ mod tests {
         assert_eq!(groups[1], (2, vec![3, 4, 5]));
         assert_eq!(groups[2], (3, Vec::new()));
         assert_eq!(groups[3], (4, Vec::new()));
+    }
+
+    /// An occasion only pk-only rows carry gets a group too, after the dose-only ones and
+    /// in file order; one an observation or a dose already carries does not get a second.
+    #[test]
+    fn test_iov_occasion_groups_appends_pk_only_occ() {
+        let mut subj = make_simple_subject();
+        subj.dose_occasions = vec![1, 3];
+        subj.pk_only_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        subj.pk_only_occasions = vec![6, 2, 5, 3, 6, 1];
+        let groups = iov_occasion_groups(&subj);
+        let ids: Vec<u32> = groups.iter().map(|(occ, _)| *occ).collect();
+        assert_eq!(ids, vec![1, 2, 3, 6, 5]);
+        assert_eq!(groups[3], (6, Vec::new()));
+        assert_eq!(groups[4], (5, Vec::new()));
     }
 
     #[test]

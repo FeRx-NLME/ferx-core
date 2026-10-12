@@ -967,9 +967,10 @@ pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
 /// scan [`reset_row_occasion`] uses, so such a row runs under its neighbour's occasion
 /// rather than κ = 0. `None` only for a subject with no labelled record at all.
 ///
-/// A label is not a guarantee of a κ slot: an occasion carried by no dose and no scored
-/// observation has no group in `iov_occasion_groups`, and every caller maps that miss,
-/// like `None`, to κ = 0.
+/// The row's own label always has a κ slot: `iov_occasion_groups` gives an occasion that
+/// only pk-only rows carry a group of its own. A miss is left only to the fallback scan,
+/// which can land on a reset-only occasion, and every caller maps it, like `None`, to
+/// κ = 0.
 pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
     if let Some(&occ) = subject.pk_only_occasions.get(m) {
         return Some(occ);
@@ -978,8 +979,9 @@ pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
 }
 
 /// The κ group of pk-only row `m` ([`pk_only_row_occasion`] through `occ_to_k`), as the
-/// `sens/` providers seed it. `None` is the κ = 0 row: no resolvable occasion, or one
-/// with no group, which is where production's `combined_for` lands on a miss.
+/// `sens/` providers seed it. `None` is the κ = 0 row: no resolvable occasion, or a
+/// fallback occasion with no group, which is where production's `combined_for` lands on
+/// a miss.
 pub(crate) fn pk_only_row_group(
     subject: &Subject,
     m: usize,
@@ -1373,9 +1375,9 @@ pub(crate) fn compute_event_pk_params_iov(
 ///
 /// `eta_bsv` is the BSV eta (length `n_eta`); `kappas[k]` is the kappa vector
 /// for the k-th occasion group in `iov_occasion_groups` order, including dose-only
-/// occasions. A pk-only row (`EVID=2`, or `EVID=0` with `MDV=1`) runs under its own
-/// occasion, or the record before it when unlabelled; zero kappa only when that
-/// occasion has no group (#1876, `pk_only_row_occasion`).
+/// and pk-only-only occasions. A pk-only row (`EVID=2`, or `EVID=0` with `MDV=1`) runs
+/// under its own occasion, or the record before it when unlabelled; zero kappa only
+/// when that fallback occasion has no group (#1876, `pk_only_row_occasion`).
 ///
 /// Every `PkModel` variant has event-driven analytical support and every ODE
 /// model takes the ODE path, so the dispatch below is total; an unsupported
@@ -3705,8 +3707,8 @@ mod tests {
     ///
     /// | pk-only row under | `(0, 2]` rate | pred(5) |
     /// |---|---|---|
-    /// | its own occasion 2 | 0.3 | 20·e^−1.2 |
-    /// | κ = 0 (ferx before #1876; a label with no group) | 0.1 | 20·e^−0.8 |
+    /// | its own occasion: 2, or 9 that only it carries (κ₉ = ln 3) | 0.3 | 20·e^−1.2 |
+    /// | κ = 0 (ferx before #1876) | 0.1 | 20·e^−0.8 |
     /// | the record before it (occasion 1) | 0.2 | 20·e^−1.0 |
     ///
     /// Run on the closed form and on an `[odes]` twin, which share
@@ -3753,10 +3755,13 @@ mod tests {
             let pred = |labels: Vec<u32>| {
                 let s = pk_only_occasion_subject(labels);
                 let groups = crate::stats::likelihood::iov_occasion_groups(&s);
-                let k_of = |occ: u32| groups.iter().position(|(id, _)| *id == occ).unwrap();
                 let mut kappas = vec![vec![0.0]; groups.len()];
-                kappas[k_of(1)] = vec![2.0f64.ln()];
-                kappas[k_of(2)] = vec![3.0f64.ln()];
+                // Occasion 9 is carried by the pk-only row alone, when it is so labelled.
+                for (occ, kappa) in [(1, 2.0f64.ln()), (2, 3.0f64.ln()), (9, 3.0f64.ln())] {
+                    if let Some(k) = groups.iter().position(|(id, _)| *id == occ) {
+                        kappas[k] = vec![kappa];
+                    }
+                }
                 predict_iov(model, &s, &theta, &[0.0], &kappas)[0]
             };
             let got = pred(vec![2]);
@@ -3776,11 +3781,13 @@ mod tests {
                     "{name}: indistinguishable from the {what} convention"
                 );
             }
-            // A label with no κ group runs under κ = 0, as the providers seed it.
-            let unknown = pred(vec![9]);
+            // A label no dose or observation carries gets a κ group of its own, so the
+            // row runs under κ₉ = ln 3, not κ = 0.
+            let only_pk_only = pred(vec![9]);
             assert!(
-                (unknown - kappa0).abs() / kappa0 < tol,
-                "{name}: label without a group gave {unknown}, kappa = 0 is {kappa0}"
+                (only_pk_only - own).abs() / own < tol,
+                "{name}: an occasion only the pk-only row carries gave {only_pk_only}, \
+                 its own kappa gives {own} (kappa = 0 is {kappa0})"
             );
             // No label (an in-memory subject): the record before it, the occasion-1 dose.
             let unlabelled = pred(Vec::new());

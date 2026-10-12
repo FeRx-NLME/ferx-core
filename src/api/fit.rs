@@ -898,6 +898,10 @@ fn fit_unstamped(
     //     problem balloons; warn so the multiplication isn't silent.
     if derive_occ {
         // Distinct occasion labels seen across observations and doses, per subject.
+        // Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
+        // (#1876): a derived rule is monotone in time, so on a subject whose observations
+        // and doses share one occasion such a row lies before or after all of them, its κ
+        // informs nothing, and counting it would let the unidentifiable case below through.
         let distinct_occ = |s: &Subject| -> usize {
             let mut occs: Vec<u32> = s.occasions.clone();
             occs.extend_from_slice(&s.dose_occasions);
