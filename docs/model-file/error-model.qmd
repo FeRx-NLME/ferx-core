@@ -433,7 +433,10 @@ That stays your call, because both conventions are real:
   `DV = logit(p)` with `weight = 1/sqrt(N)`): **estimate** it. The
   $p(1-p)$ factor was never divided out, and sigma absorbs it —
   $1/\sqrt{p(1-p)} \approx 2.04$ at $p \approx 0.4$, which is most of a published
-  σ of 2.466.
+  σ of 2.466. That analysis (Bracis et al. 2026, Case Study 2) is an anchor:
+  `tests/mbma_canakinumab_case_study.rs` reproduces its published objective and
+  NONMEM's FOCE-I fit of the same model. Its data may not be redistributed, so
+  provision them locally with `python3 tools/mbma_canakinumab_fetch.py`.
 
 `weight =` does not silently fix or free sigma; it just makes the weighting
 explicit so the two cases are distinguishable in the model file.
