@@ -19,6 +19,11 @@
 //! must-stay-green side: they guard against a nudge that moves too much (an `EVID=2` listed
 //! first must not move the observation, a dose listed first must not move anything, two
 //! observations keep file order).
+//!
+//! Five more cases come from the PR #1875 review (`review_cases`): two doses or two pk-only
+//! rows in one tie, which pin *which* record of a kind the tie pass compares, and
+//! `EVID=0, MDV=1` twins of cases 1 and 6. They have no NONMEM print of their own; the
+//! closed form they are checked against is the one pinned to NONMEM above.
 
 use super::predict;
 use crate::io::datareader::read_nonmem_csv;
@@ -118,6 +123,59 @@ fn cases(t0: f64) -> Vec<(&'static str, Vec<Rec>)> {
     ]
 }
 
+/// `EVID=0` with `MDV=1` in a [`Rec`]: a pk-only record like `EVID=2`, written as a
+/// missing observation.
+const MDV1: u32 = 100;
+
+/// Ties beyond #1810's seven, from the PR #1875 review (rows 2 and 3). Each pins one choice
+/// of the tie pass that the seven cannot see, and carries the record order the engines would
+/// use if that choice were wrong, so the test can assert the case straddles it.
+fn review_cases(t0: f64) -> Vec<(&'static str, Vec<Rec>, Vec<Rec>)> {
+    let c = |v: Vec<Rec>| -> Vec<Rec> {
+        v.into_iter()
+            .map(|(t, e, x, a)| (t + t0, e, x, a))
+            .collect()
+    };
+    let (d0, end) = ((0.0, 1, 1.0, 100.0), (8.0, 0, 3.0, 0.0));
+    let (d1, p, d2) = ((4.0, 1, 3.0, 50.0), (4.0, 2, 2.0, 0.0), (4.0, 1, 4.0, 30.0));
+    let (p1, o, p2) = ((4.0, 2, 2.0, 0.0), (4.0, 0, 1.0, 0.0), (4.0, 2, 3.0, 0.0));
+    let (o_m, m) = ((4.0, 0, 1.0, 0.0), (4.0, MDV1, 2.0, 0.0));
+    vec![
+        // The first dose at the tie decides whether the pk-only row is ahead of the doses:
+        // taking the last one (`.max()`) moves P below D1.
+        (
+            "8 dose1, EVID=2, dose2",
+            c(vec![d0, d1, p, d2, end]),
+            c(vec![d0, p, d1, d2, end]),
+        ),
+        // The first pk-only row at the tie is the one compared: taking the last one
+        // (`rposition`) finds the observation ahead of it and moves the observation.
+        (
+            "9 EVID=2, obs, EVID=2",
+            c(vec![d0, p1, o, p2, end]),
+            c(vec![d0, o, p1, p2, end]),
+        ),
+        // ...and is the one moved below a dose: the last one would govern instead.
+        (
+            "10 EVID=2, EVID=2, dose",
+            c(vec![d0, p1, p2, d1, end]),
+            c(vec![d0, p2, p1, d1, end]),
+        ),
+        // `EVID=0, MDV=1` twins of cases 1 and 6: the same pk-only record, spelled as a
+        // missing observation.
+        (
+            "11 obs, MDV=1",
+            c(vec![d0, o_m, m, end]),
+            c(vec![d0, m, o_m, end]),
+        ),
+        (
+            "12 MDV=1, dose",
+            c(vec![d0, m, (4.0, 1, 3.0, 50.0), end]),
+            c(vec![d0, (4.0, 1, 3.0, 50.0), m, end]),
+        ),
+    ]
+}
+
 /// The NONMEM convention in closed form, at the typical values: walk the records in file
 /// order; the interval ending at a record runs on that record's `X`; a dose adds its
 /// amount; an observation reads the state. `advance(a, x, dt)` is the model's exact
@@ -164,7 +222,11 @@ fn csv_of(cases: &[(&str, Vec<Rec>)]) -> String {
             } else {
                 ".".to_string()
             };
-            let mdv = u32::from(evid != 0);
+            let (evid, mdv) = if evid == MDV1 {
+                (0, 1)
+            } else {
+                (evid, u32::from(evid != 0))
+            };
             s.push_str(&format!("{},{t:?},0,{evid},{mdv},{amt},1,{x:?}\n", i + 1));
         }
     }
@@ -251,9 +313,18 @@ fn the_closed_form_reference_is_nonmems() {
 
 /// The seven cases on one model, at time offset `t0`, against the closed form.
 fn check_all_cases(model_src: &str, reference: fn(&[Rec]) -> Vec<f64>, t0: f64, tol: f64) {
+    check_cases(model_src, reference, &cases(t0), t0, tol);
+}
+
+fn check_cases(
+    model_src: &str,
+    reference: fn(&[Rec]) -> Vec<f64>,
+    cs: &[(&str, Vec<Rec>)],
+    t0: f64,
+    tol: f64,
+) {
     let model = parse_model_string(model_src).expect("parse");
-    let cs = cases(t0);
-    let pop = population(&cs);
+    let pop = population(cs);
     for (s, ((label, recs), got)) in pop
         .subjects
         .iter()
@@ -292,13 +363,53 @@ fn ties_follow_file_order_at_large_time() {
     check_all_cases(PK_MODEL, pk_reference, 17520.0, 1e-9);
 }
 
+/// The review cases as `(label, file-order records)`.
+fn review_file_order(t0: f64) -> Vec<(&'static str, Vec<Rec>)> {
+    review_cases(t0)
+        .into_iter()
+        .map(|(label, file, _)| (label, file))
+        .collect()
+}
+
+#[test]
+fn review_ties_follow_file_order() {
+    // Each case must straddle its wrong order on both models, or it cannot see the choice
+    // it pins: the closed form in file order and in the wrong order differ by at least 0.1.
+    for (label, file, wrong) in review_cases(0.0) {
+        for (model, reference) in [
+            ("ODE", ode_reference as fn(&[Rec]) -> Vec<f64>),
+            ("ADVAN1", pk_reference),
+        ] {
+            let (want, other) = (reference(&file), reference(&wrong));
+            let gap = want
+                .iter()
+                .zip(&other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                want.iter().chain(&other).all(|v| v.is_finite()) && gap > 0.1,
+                "{model} {label}: file order {want:?} and wrong order {other:?} differ by \
+                 {gap:.3e}, so the case cannot tell them apart"
+            );
+        }
+    }
+    // Bounds as for the seven cases above.
+    for t0 in [0.0, 17520.0] {
+        let cs = review_file_order(t0);
+        check_cases(ODE_MODEL, ode_reference, &cs, t0, 1e-9);
+        let pk_tol = if t0 == 0.0 { 1e-12 } else { 1e-9 };
+        check_cases(PK_MODEL, pk_reference, &cs, t0, pk_tol);
+    }
+}
+
 #[test]
 fn the_analytic_providers_value_follows_file_order() {
     // The `Dual2` walks carry their own copy of the kind order (`sens/propagate`,
     // `sens/ode_provider`'s `K_PKONLY < K_OBS`). The reader fix reaches them through the
     // same `Subject`, and their *value* must match the closed form. A Dual2-vs-FD parity
     // test cannot see the order, since the FD reference reads the same Subject.
-    let cs = cases(0.0);
+    let mut cs = cases(0.0);
+    cs.extend(review_file_order(0.0));
     let pop = population(&cs);
     let ode = parse_model_string(ODE_MODEL).unwrap();
     let pk = parse_model_string(PK_MODEL).unwrap();

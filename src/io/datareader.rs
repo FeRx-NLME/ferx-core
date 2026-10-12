@@ -1212,8 +1212,11 @@ fn read_nonmem_csv_impl(
         population_warnings.push(match routing.missing_dv {
             MissingDvPolicy::Skip => format!(
                 "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
-                 but were not marked MDV=1; they were skipped (not scored as DV=0). Set MDV=1 \
-                 on intentionally-missing observations to silence this, or check for data errors.",
+                 but were not marked MDV=1; they were skipped (not scored as DV=0). Setting \
+                 MDV=1 on intentionally-missing observations silences this, but is not the same \
+                 as the skip: an MDV=1 row is kept as a record, so it starts the integration \
+                 clock and its covariates and occasion govern the interval ending at it, as in \
+                 NONMEM. Otherwise, check for data errors.",
                 total_missing_dv
             ),
             MissingDvPolicy::KeepAsDesign => format!(

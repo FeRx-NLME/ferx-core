@@ -1969,6 +1969,78 @@ fn test_missing_dv_obs_skipped_and_warned() {
 }
 
 #[test]
+fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
+    // PR #1875 review, row 4: since #1809 the advice's MDV=1 row is not the skipped row.
+    // One dataset, two spellings of the leading t = 0 row, so both sides of the claim are
+    // asserted here: skipped, it starts nothing; as MDV=1, it is a record that starts the
+    // clock and carries its own covariate and occasion. Each clause of the message is
+    // asserted next to the fact it states, so deleting either a clause or the behaviour
+    // behind it reddens this test.
+    let csv = |mdv: u32| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,WT,OCC\n\
+             1,0,.,0,{mdv},.,1,70,1\n\
+             1,1,.,1,1,100,1,80,2\n\
+             1,2,5.0,0,0,.,1,80,2\n"
+        )
+    };
+    let read = |mdv| {
+        let f = write_csv(&csv(mdv));
+        read_nonmem_csv(f.path(), Some(&["WT"][..]), Some("OCC")).unwrap()
+    };
+    let skipped = read(0);
+    let s = &skipped.subjects[0];
+    assert!(s.pk_only_times.is_empty() && s.obs_times == vec![2.0]);
+    let warn = skipped
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_MISSING_DV"))
+        .expect("the skipped row warns");
+    assert!(
+        warn.contains("they were skipped (not scored as DV=0)"),
+        "{warn}"
+    );
+    assert!(warn.contains("Otherwise, check for data errors."), "{warn}");
+
+    let kept = read(1);
+    assert!(
+        !kept.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+        "the message says MDV=1 silences it"
+    );
+    assert!(
+        warn.contains("Setting MDV=1 on intentionally-missing observations silences this"),
+        "{warn}"
+    );
+    let s = &kept.subjects[0];
+    assert!(
+        warn.contains("is not the same as the skip: an MDV=1 row is kept as a record"),
+        "{warn}"
+    );
+    assert_eq!(s.pk_only_times, vec![0.0]);
+    assert!(
+        warn.contains("so it starts the integration clock"),
+        "{warn}"
+    );
+    let first_record = s
+        .pk_only_times
+        .iter()
+        .chain(&s.obs_times)
+        .chain(s.doses.iter().map(|d| &d.time))
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    assert_eq!(
+        first_record, 0.0,
+        "the kept row is the subject's first record"
+    );
+    assert!(
+        warn.contains("its covariates and occasion govern the interval ending at it, as in NONMEM"),
+        "{warn}"
+    );
+    assert_eq!(s.pk_only_cov(0)["WT"], 70.0);
+    assert_eq!(s.pk_only_occasions, vec![1]);
+}
+
+#[test]
 fn test_missing_dv_with_mdv1_no_warning() {
     // The same missing-DV row marked MDV=1 is the documented convention and
     // must NOT trigger the W_MISSING_DV warning (it's already handled).
