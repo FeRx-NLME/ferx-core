@@ -29985,31 +29985,37 @@ fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
     }
 }
 
-/// The deliberate exclusion: an all-arm name read only by an analytical
-/// `[initial_conditions]` is not promoted, so it stays the loud missing-column
-/// refusal it was. An analytical init reads a non-`pk(...)` individual parameter
-/// through its placeholder PK slot (CL's, #1898), so promoting it would make that
-/// refusal a silent wrong amount.
+/// An all-arm name read only by an analytical `[initial_conditions]` is
+/// promoted, and predicts like its top-level ternary twin. Before, it was read
+/// as a data column ("S not found in data"); it was held back from #1900 because
+/// an init then read a non-`pk(...)` parameter through CL's placeholder slot,
+/// which #1898 fixed. Two subjects straddle the condition (WT 60 / 80), so both
+/// arms are live; the promoted name takes a free differentiable slot, so the
+/// model stays analytic.
 #[test]
-fn all_arm_name_read_only_by_an_analytical_init_is_not_promoted() {
-    let src = "[parameters]\n  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
-               theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.1\n  sigma PROP_ERR ~ 0.04\n\
-               [individual_parameters]\n  V = TVV\n  KA = TVKA\n  CL = TVCL * exp(ETA_CL)\n  \
-               if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }\n\
-               [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
-               [error_model]\n  DV ~ proportional(PROP_ERR)\n\
-               [initial_conditions]\n  init(central) = S\n";
-    let m = parse_model_string(src).expect("parses");
+fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
+    let all_arm = "  if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }";
+    let ternary = "  S = if (WT > 70) 50 else 100";
+    let init = "[initial_conditions]\n  init(central) = S\n";
+    let m = parse_model_string(&unbound_reader_model(all_arm, init)).expect("parses");
     assert!(
-        !m.indiv_param_names.iter().any(|n| n == "S"),
+        m.indiv_param_names.iter().any(|n| n == "S"),
         "{:?}",
         m.indiv_param_names
     );
     assert!(
-        m.referenced_covariates.iter().any(|c| c == "S"),
-        "S stays a required data column: {:?}",
+        !m.referenced_covariates.iter().any(|c| c == "S"),
+        "S is no longer a required data column: {:?}",
         m.referenced_covariates
     );
+    assert!(crate::sens::provider::analytical_supported(&m));
+    let got = unbound_reader_preds(all_arm, init);
+    assert_eq!(
+        got,
+        unbound_reader_preds(ternary, init),
+        "all-arm == ternary"
+    );
+    assert!((got[0] - got[1]).abs() > 1e-3, "both arms live: {got:?}");
 }
 
 // ── #1898: obs_scale / init read an unbound parameter through its own slot ────

@@ -14299,6 +14299,16 @@ fn unbound_parameter_read_by_init_and_obs_scale_matches_fd() {
             "obs_scale",
             base("  S = TVS / 5 * exp(ETA_S)", "[scaling]\n  obs_scale = S\n"),
         ),
+        // #1904: `S` assigned on every arm of an `if`/`else`, read only by the
+        // init, is promoted (#357) and reaches the same slot; η live on both arms.
+        (
+            "init, all-arm",
+            base(
+                "  if (WT > 70) {\n    S = TVS * V * exp(ETA_S)\n  } else {\n    \
+                 S = 2 * TVS * V * exp(ETA_S)\n  }",
+                "[initial_conditions]\n  init(central) = S\n",
+            ),
+        ),
     ];
     for (label, src) in cases {
         let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -14306,7 +14316,26 @@ fn unbound_parameter_read_by_init_and_obs_scale_matches_fd() {
             analytical_supported(&m),
             "{label}: must stay on the analytic provider"
         );
-        let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 1.5, 5.0], &[0.1, -0.05, 0.2]);
+        // The parity alone cannot see a lost read: an unpromoted `S` is a
+        // missing covariate, and value path and FD then agree on the same wrong
+        // number. So pin that `S` is read: promoted, and `ETA_S` (only on `S`)
+        // moves the prediction.
+        assert!(
+            m.indiv_param_names.iter().any(|n| n == "S"),
+            "{label}: S must be an individual parameter"
+        );
+        // Both sides of the all-arm condition (the other cases ignore WT).
+        for wt in [60.0, 80.0] {
+            let mut s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+            s.covariates.insert("WT".to_string(), wt);
+            let theta = [0.2, 10.0, 1.5, 5.0];
+            let eta = [0.1, -0.05, 0.2];
+            check_full_provider_vs_fd(&m, &s, &theta, &eta);
+            let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+            assert!(
+                sens.obs.iter().any(|o| o.df_deta[2].abs() > 1e-6),
+                "{label}, WT {wt}: ETA_S must move the prediction"
+            );
+        }
     }
 }
