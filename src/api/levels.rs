@@ -2050,13 +2050,349 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
     (eta, kappa)
 }
 
+/// An orthonormal basis of the span of `cols` by modified Gram–Schmidt with one
+/// re-orthogonalisation pass: the population-wide columns [`carried`] stacks are
+/// far from orthogonal (a θ read on every record against the levels'), where
+/// one pass loses the orthogonality the residual relies on. A zero or
+/// non-finite column, or one already in the span, adds no direction.
+fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let mut basis: Vec<Vec<f64>> = Vec::new();
+    for c in cols {
+        let c_norm = dot(c, c).sqrt();
+        if c_norm == 0.0 || !c_norm.is_finite() {
+            continue;
+        }
+        let mut v = c.clone();
+        for _ in 0..2 {
+            for b in &basis {
+                let d = dot(&v, b);
+                v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            }
+        }
+        let n = dot(&v, &v).sqrt();
+        if n > 1e-12 * c_norm {
+            basis.push(v.into_iter().map(|x| x / n).collect());
+        }
+    }
+    basis
+}
+
+/// `‖g − P g‖ / ‖g‖` against an orthonormal `basis` ([`orthonormal_basis`]),
+/// projected twice for the same reason; `None` when `g` is zero.
+fn residual_against(g: &[f64], basis: &[Vec<f64>]) -> Option<f64> {
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let g_norm = dot(g, g).sqrt();
+    if g_norm == 0.0 {
+        return None;
+    }
+    let mut r = g.to_vec();
+    for _ in 0..2 {
+        for b in basis {
+            let d = dot(&r, b);
+            r.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+        }
+    }
+    Some(dot(&r, &r).sqrt() / g_norm)
+}
+
+/// Whether a contrast's coded block, with the rest of the model, reproduces an
+/// absorbed random effect entirely (#1840).
+///
+/// The structural walk and the span certificate say that a random effect's
+/// effect on `y` lies, unit by unit, in the span of the block's levels: under
+/// `contrast = none` the levels are then that random effect. A contrast that
+/// codes the levels with one direction fewer per group — the common mean under
+/// sum-to-zero, the reference level under `ref` — leaves the random effect that
+/// direction, unless something else in the model carries it: an intercept, or
+/// any θ whose effect is some combination of the levels'. That is the joint
+/// oracle's test: the random effect is absorbed under `c` when every one of its
+/// unit columns lies in the span of the other free θ, the block coded by `c`,
+/// and the random effects at a coarser-or-equal unit (the other η for an η;
+/// every η and the other κ for a κ). Nothing in the model is constant across
+/// all records when the only θ that would be is read through a factor varying
+/// within each subject (`TVE0 * (1 + 0.1 * OCC) + PLACEBO + ETA_E0`): no θ
+/// carries the levels' mean, and sum-to-zero identifies the random effect.
+///
+/// Measured on the model bound under `contrast = none`, by central differences
+/// of the predictions over the whole population, at both [`probe_points`] with
+/// the random effects spread by [`probe_res`]. The verdict is
+/// [`Carried::Identified`] only when, at **both** points, every column is
+/// finite and some unit's residual is at least [`SPAN_TOL`]; anything else —
+/// a non-finite value, a point where no unit measures anything, a direction
+/// carried at either point — is [`Carried::Held`], and the block stays refused.
+/// That is the opposite of [`spanned`]'s convention, and on purpose: here the
+/// measurement removes a refusal, so an inconclusive point must fall to it. A θ
+/// initialised at 0 that switches the intercept off at the initial estimates
+/// is seen at the moved point.
+///
+/// Measured over every call the `api::levels` tests make, macOS arm64 debug:
+/// a unit set the verdict holds on reaches at most 2.1e-10 (its largest unit
+/// residual; `a_common_factor_does_not_count_in_a_parameter_funnel` under
+/// `ref`), an identified one at least 1.4e-2 (the kappa twin of
+/// `a_coarser_random_effect_can_carry_the_mean` without `ETA_B`). [`SPAN_TOL`]
+/// sits 3.7 decades above the one and 4.2 below the other.
+///
+/// Only branches that refuse without it ask for it, so a model that binds
+/// without the certificate never pays for the population-wide basis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carried {
+    /// Every unit column of the random effect lies in the span: the contrast
+    /// absorbs it.
+    Held,
+    /// Some unit column keeps a direction outside the span at both points.
+    Identified,
+}
+
+/// The certificate behind [`Carried`], for random effect `name` (`kappa`
+/// when it is one) of `decl` under `contrast`.
+fn carried(
+    model: &CompiledModel,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    population: &Population,
+    name: &str,
+    kappa: bool,
+    contrast: LevelContrast,
+) -> Carried {
+    let index = match kappa {
+        false => model.eta_names.iter().position(|n| n == name),
+        true => model.kappa_names.iter().position(|n| n == name),
+    };
+    let Some(index) = index else {
+        return Carried::Held;
+    };
+    if contrast == LevelContrast::Unconstrained {
+        return Carried::Held;
+    }
+    let level_thetas = free_level_thetas(model, decl, levels);
+    let in_block: Vec<usize> = level_thetas.iter().flatten().copied().collect();
+    let p = &model.default_params;
+    let other_thetas: Vec<usize> = (0..model.n_theta)
+        .filter(|k| !p.theta_fixed.get(*k).copied().unwrap_or(false) && !in_block.contains(k))
+        .collect();
+    let groups = assign_groups(decl, levels, contrast);
+    let column = level_index_column(decl.name());
+    let lens: Vec<usize> = population
+        .subjects
+        .iter()
+        .map(|s| s.obs_times.len())
+        .collect();
+    let n_rows: usize = lens.iter().sum();
+    let offsets: Vec<usize> = lens
+        .iter()
+        .scan(0, |at, n| {
+            let o = *at;
+            *at += n;
+            Some(o)
+        })
+        .collect();
+
+    for (theta, re) in probe_points(model) {
+        let layouts: Vec<_> = population
+            .subjects
+            .iter()
+            .map(|s| crate::stats::stacked_layout::StackedLayout::of(model, s))
+            .collect();
+        let res: Vec<(Vec<f64>, Vec<Vec<f64>>)> = layouts
+            .iter()
+            .map(|l| probe_res(re, model, l.n_groups().max(1)))
+            .collect();
+        // One population-wide column: per subject, the central difference of
+        // its predictions under `perturb`, which moves θ or that subject's
+        // random effects by ±h; `None` when anything is non-finite.
+        let diff_col = |subjects: &[usize],
+                        h: f64,
+                        perturb: &dyn Fn(f64, &mut Vec<f64>, &mut Vec<f64>, &mut Vec<Vec<f64>>)|
+         -> Option<Vec<f64>> {
+            let mut col = vec![0.0; n_rows];
+            for &s in subjects {
+                let subject = &population.subjects[s];
+                let (eta, kappa) = &res[s];
+                let side = |sign: f64| {
+                    let (mut th, mut et, mut ka) = (theta.clone(), eta.clone(), kappa.clone());
+                    perturb(sign * h, &mut th, &mut et, &mut ka);
+                    predictions_at(model, subject, &th, &et, &ka)
+                };
+                let d = record_diffs(&side(1.0), &side(-1.0), h)?;
+                if d.len() != lens[s] || d.iter().any(|v| !v.is_finite()) {
+                    return None;
+                }
+                col[offsets[s]..offsets[s] + lens[s]].copy_from_slice(&d);
+            }
+            Some(col)
+        };
+        let all: Vec<usize> = (0..population.subjects.len()).collect();
+        let theta_col = |k: usize| {
+            let h = SPAN_STEP * theta[k].abs().max(1.0);
+            diff_col(&all, h, &|d, th, _, _| th[k] += d)
+        };
+
+        let mut cols: Vec<Vec<f64>> = Vec::new();
+        for &k in &other_thetas {
+            let Some(c) = theta_col(k) else {
+                return Carried::Held;
+            };
+            cols.push(c);
+        }
+        // The block's level columns (a `FIX` level moves nothing), coded by
+        // `contrast` over `groups`: under `ref` the first level of each group
+        // is dropped, under sum-to-zero each level but its group's last is
+        // taken against that last one.
+        let mut level_cols: Vec<Vec<f64>> = Vec::with_capacity(levels.len());
+        for (i, k) in level_thetas.iter().enumerate() {
+            let readers: Vec<usize> = all
+                .iter()
+                .copied()
+                .filter(|&s| {
+                    indices_read(&population.subjects[s], &column).contains(&((i + 1) as f64))
+                })
+                .collect();
+            let col = match k {
+                Some(k) => {
+                    let h = SPAN_STEP * theta[*k].abs().max(1.0);
+                    let k = *k;
+                    match diff_col(&readers, h, &|d, th, _, _| th[k] += d) {
+                        Some(c) => c,
+                        None => return Carried::Held,
+                    }
+                }
+                None => vec![0.0; n_rows],
+            };
+            level_cols.push(col);
+        }
+        let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
+        let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
+        for i in 0..level_cols.len() {
+            match contrast {
+                LevelContrast::Ref if !first(i) => cols.push(level_cols[i].clone()),
+                LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
+                    let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
+                    cols.push(
+                        level_cols[i]
+                            .iter()
+                            .zip(&level_cols[j])
+                            .map(|(a, b)| a - b)
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Per unit of each random effect: its column. A unit is a subject for
+        // an η, an occasion group of a subject for a κ.
+        let unit_cols = |r: usize, is_kappa: bool| -> Option<Vec<Vec<f64>>> {
+            let mut out = Vec::new();
+            for s in 0..population.subjects.len() {
+                let units = if is_kappa {
+                    layouts[s].n_groups().max(1)
+                } else {
+                    1
+                };
+                for g in 0..units {
+                    let col = diff_col(&[s], SPAN_STEP, &|d, _, et, ka| match is_kappa {
+                        false => et[r] += d,
+                        true => {
+                            if let Some(row) = ka.get_mut(g) {
+                                row[r] += d;
+                            }
+                        }
+                    })?;
+                    out.push(col);
+                }
+            }
+            Some(out)
+        };
+        // The random effects at a coarser-or-equal unit: the other η for an η,
+        // every η and the other κ for a κ.
+        let coarser: Vec<(usize, bool)> = (0..model.n_eta)
+            .filter(|&e| kappa || e != index)
+            .map(|e| (e, false))
+            .chain(
+                (0..model.n_kappa)
+                    .filter(|&q| kappa && q != index)
+                    .map(|q| (q, true)),
+            )
+            .collect();
+        for (r, is_kappa) in coarser {
+            let Some(c) = unit_cols(r, is_kappa) else {
+                return Carried::Held;
+            };
+            cols.extend(c);
+        }
+        let Some(own) = unit_cols(index, kappa) else {
+            return Carried::Held;
+        };
+        let basis = orthonormal_basis(&cols);
+        let mut measured = false;
+        let mut outside = false;
+        for z in &own {
+            match residual_against(z, &basis) {
+                None => {}
+                Some(r) if !r.is_finite() => return Carried::Held,
+                Some(r) => {
+                    measured = true;
+                    outside |= r >= SPAN_TOL;
+                }
+            }
+        }
+        if !(measured && outside) {
+            return Carried::Held;
+        }
+    }
+    Carried::Identified
+}
+
+/// [`carried`] for one block's absorbed random effect, each contrast measured
+/// at most once (#1840). `None` model: the likelihood reads a channel the
+/// certificate does not compare, so nothing is measured and every contrast is
+/// [`Carried::Held`] — the refusal stands.
+struct Certificate<'a> {
+    model: Option<&'a CompiledModel>,
+    decl: &'a LevelBlockDecl,
+    levels: &'a [Level],
+    population: &'a Population,
+    name: &'a str,
+    kappa: bool,
+    seen: std::cell::RefCell<Vec<(LevelContrast, Carried)>>,
+}
+
+impl Certificate<'_> {
+    fn under(&self, contrast: LevelContrast) -> Carried {
+        if let Some(&(_, c)) = self.seen.borrow().iter().find(|(k, _)| *k == contrast) {
+            return c;
+        }
+        let verdict = match self.model {
+            None => Carried::Held,
+            Some(m) => carried(
+                m,
+                self.decl,
+                self.levels,
+                self.population,
+                self.name,
+                self.kappa,
+                contrast,
+            ),
+        };
+        self.seen.borrow_mut().push((contrast, verdict));
+        verdict
+    }
+
+    fn identified(&self, contrast: LevelContrast) -> bool {
+        self.under(contrast) == Carried::Identified
+    }
+}
+
 /// What the binder measures on one block, on the model with every block under
 /// `contrast = none`: its dead levels (rule 1, #1679), and per random effect,
 /// parallel to `eta_couplings`, whether the span certificate measured it
-/// absorbed (#1834).
+/// absorbed (#1834). `model` is that model, kept for [`carried`], which only a
+/// refusing branch asks for; `None` when the checks do not read every channel.
 struct Measured {
     dead: DeadLevels,
     spanned: Vec<Option<Span>>,
+    model: Option<std::rc::Rc<CompiledModel>>,
 }
 
 /// Run [`dead_levels`] and [`spanned`] on every block, on the model re-parsed
@@ -2091,9 +2427,11 @@ fn measure_levels(
             .map(|decl| Measured {
                 dead: DeadLevels::default(),
                 spanned: vec![None; decl.eta_couplings.len()],
+                model: None,
             })
             .collect());
     }
+    let model = std::rc::Rc::new(model);
     Ok(decls
         .iter()
         .zip(discovered)
@@ -2109,6 +2447,7 @@ fn measure_levels(
             Measured {
                 dead: dead_levels(&model, decl, levels, population),
                 spanned: spanned(&model, decl, levels, population, &silent),
+                model: Some(model.clone()),
             }
         })
         .collect())
@@ -2307,8 +2646,24 @@ fn resolve_contrast(
             found.clause(),
         ));
     }
+    // Whether a contrast leaves the absorbed random effect a direction no other
+    // θ carries (#1840): measured only when a branch below would refuse.
+    let certificate = absorbed.as_ref().map(|found| Certificate {
+        model: measured.model.as_deref(),
+        decl,
+        levels,
+        population,
+        name: found.name(),
+        kappa: found.kappa(),
+        seen: Default::default(),
+    });
+    let identified = |c: LevelContrast| certificate.as_ref().is_some_and(|k| k.identified(c));
     // A contrast the block can take: one the absorbed random effect allows,
-    // that leaves a free θ, and that carries the dead levels.
+    // that leaves a free θ, and that carries the dead levels. The certificate
+    // does not enter: a contrast carries a dead level only by coding it through
+    // the others (the reference, or its group's last level), which hands that
+    // level's slack — exactly the direction the contrast removes — to the live
+    // levels, so the absorbed random effect is reproduced entirely there anyway.
     let admissible = |c: LevelContrast| {
         let allowed = match &absorbed {
             None => true,
@@ -2319,8 +2674,27 @@ fn resolve_contrast(
             && free_count(&groups, c) > 0
             && dead_failure(&groups, c, dead, absorbed.as_ref()).is_none()
     };
+    // A contrast that binds a one-column block next to its absorbed random
+    // effect: the random effect keeps a direction there, the contrast leaves a
+    // free θ, and it carries the dead levels (#1840).
+    let rescues = |c: LevelContrast| {
+        let groups = assign_groups(decl, levels, c);
+        identified(c)
+            && free_count(&groups, c) > 0
+            && dead_failure(&groups, c, dead, absorbed.as_ref()).is_none()
+    };
     let resolved = match decl.contrast() {
         LevelContrast::Auto if nested && absorbed.is_some() => LevelContrast::SumToZeroWithin,
+        // A one-column block whose absorbed random effect keeps the levels'
+        // mean only under `ref`: something else carries the mean (#1840).
+        LevelContrast::Auto
+            if !nested
+                && absorbed.is_some()
+                && !identified(LevelContrast::SumToZero)
+                && rescues(LevelContrast::Ref) =>
+        {
+            LevelContrast::Ref
+        }
         // Global sum-to-zero unless it cannot carry the dead levels and the
         // within-group contrast can (#1702 review, F1).
         LevelContrast::Auto
@@ -2345,28 +2719,18 @@ fn resolve_contrast(
     if let Some(found) = absorbed.as_ref() {
         // A one-column block with no free θ is the plain single-level case
         // below: there is no level left for the random effect to be confused with.
-        if !nested && free > 0 {
-            let (unit, whose) = if found.kappa() {
-                (
-                    "lies within a single occasion of one subject",
-                    "that occasion's",
-                )
-            } else {
-                ("belongs to a single subject", "that subject's")
-            };
-            return Err(format!(
-                "{block}: each `{}` level {unit}, and {}, so a level and {whose} random effect \
-                 are the same quantity: the model is not identified under any contrast. Remove \
-                 the block, or drop the random effect.",
-                decl.columns()[0],
-                found.clause(),
-            ));
+        if !nested && free > 0 && !identified(resolved) {
+            let alt = [LevelContrast::SumToZero, LevelContrast::Ref]
+                .into_iter()
+                .find(|&c| rescues(c));
+            return Err(one_column_message(&block, decl, found, resolved, alt));
         }
         if nested
             && matches!(
                 resolved,
                 LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
             )
+            && !identified(resolved)
         {
             let leading = subject_key_columns(decl).join(", ");
             // When every group is a single level the within-group contrast
@@ -2475,6 +2839,64 @@ fn resolve_contrast(
     }
 
     Ok((resolved, groups))
+}
+
+/// The refusal for a one-column block whose levels each lie within one unit of
+/// the absorbed random effect `found`, under `resolved`. With `alt` `None` no
+/// contrast leaves the random effect a direction of its own — something else
+/// in the model carries the levels' mean and their reference level alike (an
+/// intercept) — and the refusal says so for every contrast. With `alt` a
+/// contrast that does (#1840), the refusal names what `resolved` loses and
+/// that contrast.
+fn one_column_message(
+    block: &str,
+    decl: &LevelBlockDecl,
+    found: &Absorbed,
+    resolved: LevelContrast,
+    alt: Option<LevelContrast>,
+) -> String {
+    let (unit, whose) = if found.kappa() {
+        (
+            "lies within a single occasion of one subject",
+            "that occasion's",
+        )
+    } else {
+        ("belongs to a single subject", "that subject's")
+    };
+    let column = &decl.columns()[0];
+    let Some(alt) = alt else {
+        return format!(
+            "{block}: each `{column}` level {unit}, and {}, so a level and {whose} random effect \
+             are the same quantity: the model is not identified under any contrast. Remove \
+             the block, or drop the random effect.",
+            found.clause(),
+        );
+    };
+    let lost = |c: LevelContrast| match c {
+        LevelContrast::Ref => "the reference level",
+        _ => "the levels' common mean",
+    };
+    let how = match resolved {
+        LevelContrast::Unconstrained => format!(
+            "Under `contrast = none` every level has a θ of its own, so the levels reproduce \
+             {whose} random effect entirely."
+        ),
+        c => format!(
+            "Under `contrast = {}` the levels reproduce {whose} random effect up to {}, and \
+             another θ of the model carries that direction, so together they reproduce it \
+             entirely.",
+            contrast_token(c),
+            lost(c),
+        ),
+    };
+    format!(
+        "{block}: each `{column}` level {unit}, and {}. {how} The two are the same quantity, so \
+         the model is not identified under this contrast. Use `contrast = {}`: no other θ \
+         carries {}, so the random effect keeps that direction.",
+        found.clause(),
+        contrast_token(alt),
+        lost(alt),
+    )
 }
 
 /// The refusal for a block that absorbs two or more random effects (#1696).
