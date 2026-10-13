@@ -303,9 +303,10 @@ volume estimate instead of the clearance one, and `TVV` is never written at all
 name that does not collide.
 
 The η-name match is also not checked for **uniqueness**: if two η names qualify for
-one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — which
-one is used is unspecified and varies between runs, so the resulting start values are
-not reproducible (#1930). Keep one qualifying η name per parameter.
+one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — one of
+them is used and which one is unspecified. In the current implementation it depends on
+hash iteration order, so the resulting start values can differ between runs of the
+same model on the same data (#1930). Keep one qualifying η name per parameter.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.

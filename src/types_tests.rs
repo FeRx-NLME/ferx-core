@@ -3932,8 +3932,13 @@ fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
 ///
 /// `pk two_cpt_iv(cl=D1, …)` alongside `D1 = …` parses because the modeled-dose
 /// mapping is not a `pk(...)` role and the #1359 one-variable-two-roles reject does
-/// not see it. The derivative that depends on both rows is asserted against FD in
-/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`.
+/// not see it.
+///
+/// This is the **only** check on the slot-9 row (review r4 #2): the companion
+/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
+/// asserts FD parity for the `cl` row, but on the plain bolus it runs that row is
+/// the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would leave its parity unchanged.
 #[test]
 fn pk_slot_rows_give_one_name_both_of_its_slots() {
     let m = crate::parser::model_parser::parse_model_string(

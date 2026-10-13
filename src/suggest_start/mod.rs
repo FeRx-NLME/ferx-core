@@ -1205,6 +1205,95 @@ mod tests {
         }
     }
 
+    /// Review r4 #3: the reverse lookup over **every** structural slot
+    /// `find_theta_for_slot` supports, on a model whose θ names are deliberately
+    /// non-canonical (`TH_A`, `TLAG`, `THBIO` — not `TVCL`, `LAGTIME`, `F`).
+    ///
+    /// The non-canonical names are the point. The earlier fixtures let layer 3's
+    /// canonical-name search mask a loss in layer 1: a minimal edit
+    /// `if pk_slot == PK_IDX_LAGTIME { return None; }` inside
+    /// `indiv_param_for_pk_slot` was caught by no test, because a model whose lag θ
+    /// is called `TVLAGTIME` resolves through layer 3 anyway. Here `TLAG` contains
+    /// no canonical slot name, so skipping the owner route loses the θ outright and
+    /// a detected NCA lag would be silently left at its default.
+    ///
+    /// Asserted per slot so a failure names which one drifted, and the owner side is
+    /// asserted for all nine — that is the #1899 lookup itself, over its whole
+    /// contract rather than the one slot the issue was reported on.
+    #[test]
+    fn reverse_lookup_covers_every_structural_slot_with_noncanonical_theta_names() {
+        let src = "[parameters]\n  theta TH_A(5.0, 0.1, 100.0)\n  \
+             theta TH_B(50.0, 1.0, 500.0)\n  theta TH_C(10.0, 0.1, 200.0)\n  \
+             theta TH_D(100.0, 1.0, 1000.0)\n  theta TH_E(2.0, 0.1, 50.0)\n  \
+             theta TH_F(200.0, 1.0, 2000.0)\n  theta TH_G(1.5, 0.01, 50.0)\n  \
+             theta TLAG(0.5, 0.0, 5.0)\n  theta THBIO(0.8, 0.01, 1.0)\n  \
+             omega ETA_CLR ~ 0.09\n  omega ETA_VC ~ 0.04\n  omega ETA_ALAG ~ 0.01\n  \
+             omega ETA_FBIO ~ 0.02\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CLR = TH_A * exp(ETA_CLR)\n  \
+             VC = TH_B * exp(ETA_VC)\n  QQ = TH_C\n  VP = TH_D\n  QQ3 = TH_E\n  \
+             VP3 = TH_F\n  KABS = TH_G\n  ALAG = TLAG * exp(ETA_ALAG)\n  \
+             FBIO = THBIO * exp(ETA_FBIO)\n\
+             [structural_model]\n  pk three_cpt_oral(cl=CLR, v1=VC, q=QQ, v2=VP, \
+             q3=QQ3, v3=VP3, ka=KABS, lagtime=ALAG, f=FBIO)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // No theta name may contain a canonical slot name, or layer 3 can answer for
+        // layer 1 and the masking this test exists to remove is back.
+        for name in &m.default_params.theta_names {
+            let u = name.to_ascii_uppercase();
+            for canon in ["CL", "V2", "V3", "Q3", "KA", "LAGTIME"] {
+                assert!(
+                    !u.contains(canon),
+                    "theta `{name}` contains the canonical name `{canon}`, so layer 3 \
+                     could mask a layer-1 loss"
+                );
+            }
+        }
+        // Every structural slot resolves to the parameter the `pk(...)` line bound to
+        // it — the #1899 lookup over its whole contract.
+        let owners: [(&str, usize, &str); 9] = [
+            ("CL", PK_IDX_CL, "CLR"),
+            ("V", PK_IDX_V, "VC"),
+            ("Q", PK_IDX_Q, "QQ"),
+            ("V2", PK_IDX_V2, "VP"),
+            ("KA", PK_IDX_KA, "KABS"),
+            ("Q3", PK_IDX_Q3, "QQ3"),
+            ("V3", PK_IDX_V3, "VP3"),
+            ("LAGTIME", PK_IDX_LAGTIME, "ALAG"),
+            ("F", PK_IDX_F, "FBIO"),
+        ];
+        for (label, slot, name) in owners {
+            assert_eq!(
+                m.indiv_param_for_pk_slot(slot)
+                    .map(|i| m.indiv_param_names[i].as_str()),
+                Some(name),
+                "{label}: slot {slot} must resolve to {name}"
+            );
+        }
+        // The two slots whose parameter carries a matching eta reach their theta
+        // through layer 1 only — nothing in `theta_names` contains `LAGTIME` or a
+        // bare `F`-like canonical token, so losing the owner route loses the theta.
+        for (label, slot, theta) in [
+            ("LAGTIME", PK_IDX_LAGTIME, "TLAG"),
+            ("F", PK_IDX_F, "THBIO"),
+        ] {
+            assert_eq!(
+                find_theta_for_slot(&m, slot).map(|i| m.default_params.theta_names[i].as_str()),
+                Some(theta),
+                "{label}: must resolve to {theta} through the owning parameter"
+            );
+        }
+        // CL and V likewise, via their own etas.
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_CL).map(|i| m.default_params.theta_names[i].as_str()),
+            Some("TH_A")
+        );
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_V).map(|i| m.default_params.theta_names[i].as_str()),
+            Some("TH_B")
+        );
+    }
+
     /// Characterization of #1930 (review r3 #2), the first of the two shapes
     /// `docs/model-file/fit-options.qmd` now names as *not* covered by step 1: a
     /// PK role bound to a **literal**. No individual parameter owns the slot, so
@@ -1245,19 +1334,48 @@ mod tests {
         // The slots that do have owners are unaffected.
         let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
         assert_eq!(m.default_params.theta_names[v], "TVV");
+
+        // The user-visible half (review r4 #1): the lookup's answer is not the
+        // documented claim — `build_params` actually *writing* the pooled clearance
+        // onto the readout coefficient is. An ownerless-write guard added for #1930
+        // would leave the assertion above green while making the docs stale, so run
+        // it end to end. `NcaInit::Nca`, so no sweep can move a theta instead.
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+        let i = out
+            .params
+            .theta_names
+            .iter()
+            .position(|n| n == "THCL_A")
+            .expect("THCL_A");
+        assert_ne!(
+            out.params.theta[i], m.default_params.theta[i],
+            "#1930: THCL_A receives the pooled clearance although `cl` is a literal. \
+             When this starts failing, #1930 has been fixed — drop the paragraph from \
+             docs/model-file/fit-options.qmd."
+        );
+        // And it is pinned at its upper bound, since a clearance is not a readout
+        // coefficient: measured 5.0 against the model default 0.5.
+        assert_eq!(out.params.theta[i], m.default_params.theta_upper[i]);
     }
 
     /// Characterization of #1930 (review r3 #2), second shape: the mu-reference
     /// match is **not checked for uniqueness**. Layer 1 iterates `model.mu_refs`,
     /// a `HashMap`, and takes the first η whose name qualifies, so when two η names
-    /// both end in `_CL` the winner depends on hash-seed order and **changes
-    /// between processes** — measured 10/10 over 20 launches, alternating between
-    /// `TVCL` (the real clearance θ) and `THS` (an unbound intermediate's).
+    /// both end in `_CL` the winner is whichever the iteration yields first — and
+    /// with `HashMap`'s per-process seed that was measured as a 10/10 split over 20
+    /// launches, alternating between `TVCL` (the real clearance θ) and `THS` (an
+    /// unbound intermediate's).
     ///
-    /// Asserted as set membership, not as a value: pinning either outcome would be
-    /// a flaky test, and that it *has* two outcomes is the defect. What is asserted
-    /// firmly is the premise — that two η names qualify — so a fix that makes the
-    /// lookup deterministic will have to come back here.
+    /// **What this asserts, precisely** (review r4 #1): the *structural* ambiguity —
+    /// that two η names qualify, that they carry different θ, and that the lookup
+    /// returns one of them rather than declining. It does **not** assert the
+    /// run-to-run variability: that is a property of `mu_refs` being a `HashMap`,
+    /// measured and recorded in #1930, and a fix that only made the iteration order
+    /// deterministic would leave this test green while removing the variability. It
+    /// would also still be returning an arbitrary one of two answers, which is why
+    /// the assertion is on the ambiguity and not on the ordering.
     #[test]
     fn nca_mu_ref_match_is_ambiguous_when_two_eta_names_qualify() {
         let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
@@ -1289,14 +1407,26 @@ mod tests {
             "both ETA_CL and IIV_CL must qualify, or the ambiguity is not present: \
              {qualifying:?}"
         );
-        // #1930: which one wins is hash-seed order, so only membership is asserted.
+        // The two qualifying etas must carry DIFFERENT thetas, or there is no
+        // ambiguity to characterize.
+        let mut qualifying_thetas: Vec<&str> = qualifying
+            .iter()
+            .map(|e| m.mu_refs[*e].theta_name.as_str())
+            .collect();
+        qualifying_thetas.sort_unstable();
+        assert_eq!(
+            qualifying_thetas,
+            vec!["THS", "TVCL"],
+            "the two qualifying etas must point at different thetas"
+        );
+        // #1930: the lookup returns one of them rather than declining, and which one
+        // is not determined by the model.
         let got = find_theta_for_slot(&m, PK_IDX_CL)
             .map(|i| m.default_params.theta_names[i].clone())
             .expect("a theta");
         assert!(
             got == "TVCL" || got == "THS",
-            "#1930: layer 1 returns one of the two qualifying etas' thetas, \
-             non-reproducibly; got {got}"
+            "#1930: layer 1 returns one of the two qualifying etas' thetas; got {got}"
         );
     }
 

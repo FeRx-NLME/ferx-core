@@ -14736,11 +14736,20 @@ fn a_spare_slot_reader_matches_fd_on_the_fallback_path() {
 /// simply absent) and `rows = [(0,0), (1,1), (3,2), (9,0)]` — four rows for three
 /// names, `D1` appearing twice with different slots and the same `tv`/`sel` entry.
 ///
-/// This is the fixture that kills a `pk_slot_rows` deduplicated by name: that
-/// mutation keeps one row per `var_slot` and so drops either `∂CL/∂η_D1` or
-/// `∂D1/∂η_D1`, which no other fixture can see because every other one gives `D1`
-/// a single slot. The invariant test in `types_tests.rs` pins the row list; this
-/// pins the derivative that depends on it.
+/// **What each half of this test kills** (review r4 #2 — the earlier comment
+/// overstated the FD side). On a plain bolus `D1`'s modeled-duration slot is
+/// *unread*, so `η_D1` reaches the prediction only through the live `cl` row:
+///
+/// * the **FD parity** kills a mutation that drops or corrupts the `cl` row — a
+///   `pk_slot_rows` deduplicated by name keeping the *last* row per `var_slot`
+///   does exactly that, and nothing else in the suite catches it;
+/// * the **row assertions** kill the mirror mutation, keeping the *first* row per
+///   `var_slot`, which drops slot 9. No derivative here depends on slot 9, so that
+///   side is structural-only — by necessity, since a modeled dose would route this
+///   subject to the walk and the literal `q` denies the walk its program path.
+///
+/// `pk_slot_rows_give_one_name_both_of_its_slots` pins the same row list from the
+/// map's side.
 #[test]
 fn a_parameter_owning_two_pk_slots_gets_both_gradient_rows() {
     const TWOCPT_CL_IS_D1: &str = r#"
@@ -14783,9 +14792,9 @@ fn a_parameter_owning_two_pk_slots_gets_both_gradient_rows() {
     let theta = [2.0, 50.0, 100.0];
     let eta = [0.1, -0.05];
 
-    // `D1` must contribute TWO rows — its `cl` role and its modeled-duration slot —
-    // and `η_D1` moves both, which is what makes a name-deduplicating mutation
-    // observable below.
+    // `D1` must contribute TWO rows — its `cl` role and its modeled-duration slot.
+    // This assertion is what observes the slot-9 side; the FD parity below observes
+    // the `cl` side.
     let rows = m.pk_slot_rows();
     let d1_rows: Vec<usize> = rows
         .iter()

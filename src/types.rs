@@ -5186,15 +5186,34 @@ impl CompiledModel {
     /// every entry is a real slot by construction. Every parsed model has a program.
     pub(crate) fn pk_slot_rows(&self) -> Vec<(usize, usize)> {
         match self.indiv_param_partials.indiv_param_program.as_ref() {
-            Some(prog) => prog
-                .pk_var_slots()
-                .iter()
-                .copied()
-                // A top-level name's var slot is its `indiv_param_names` index; the
-                // `tv` / `sel_flat` vectors a consumer pairs these with are that
-                // long, so a pair pointing past them is dropped rather than indexed.
-                .filter(|&(_, i)| i < self.indiv_param_names.len())
-                .collect(),
+            Some(prog) => {
+                // A top-level name's var slot is its `indiv_param_names` index, and
+                // the `tv` / `sel_flat` vectors a consumer pairs a row with are that
+                // long, so a pair pointing past them must not be indexed.
+                //
+                // No in-tree model reaches it: every PK role, modeled-dose and
+                // readout-spare mapping resolves to a top-level name (an `if`/`else`
+                // assignment that one of those blocks reads is promoted to one,
+                // #357/#1900/#1904). Measured — deleting the filter leaves the whole
+                // `--lib` suite green — so this is a guard, not a behaviour. The
+                // `debug_assert` is the point of it: a future mapping that broke the
+                // invariant would otherwise lose a gradient row silently, which is
+                // the #1899 failure mode again, so it fails the test suite loudly
+                // and only release builds fall back to dropping the row.
+                debug_assert!(
+                    prog.pk_var_slots()
+                        .iter()
+                        .all(|&(_, i)| i < self.indiv_param_names.len()),
+                    "pk_var_slots must point at top-level names: {:?} vs {} names",
+                    prog.pk_var_slots(),
+                    self.indiv_param_names.len()
+                );
+                prog.pk_var_slots()
+                    .iter()
+                    .copied()
+                    .filter(|&(_, i)| i < self.indiv_param_names.len())
+                    .collect()
+            }
             None => self
                 .pk_indices
                 .iter()
