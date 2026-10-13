@@ -2738,7 +2738,7 @@ fn run_subject_tvcov<const M: usize>(
 fn ode_iov_subject_supported(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<(crate::stats::stacked_layout::StackedLayout, usize, usize)> {
+) -> Option<(crate::stats::stacked_layout::StackedLayout, usize)> {
     if !ode_iov_supported(model) {
         return None;
     }
@@ -2823,7 +2823,7 @@ fn ode_iov_subject_supported(
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
-    Some((layout, n_stacked, m_dim))
+    Some((layout, m_dim))
 }
 
 /// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
@@ -2842,8 +2842,8 @@ pub fn ode_subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let (layout, n_stacked, m_dim) = ode_iov_subject_supported(model, subject)?;
-    if stacked_eta.len() != n_stacked {
+    let (layout, m_dim) = ode_iov_subject_supported(model, subject)?;
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     dispatch_ode_iov_axes!(
@@ -2869,7 +2869,8 @@ pub fn ode_subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let (layout, n_stacked, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let n_stacked = layout.n_stacked();
     if stacked_eta.len() != n_stacked {
         return None;
     }

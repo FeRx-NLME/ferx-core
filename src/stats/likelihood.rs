@@ -2821,10 +2821,10 @@ pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashM
 }
 
 /// The combined effect vector `[η_bsv, κ_g]` for occasion group `g`, sliced from a
-/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The **single source** of the κ-axis offset
-/// (`base = n_eta + g·n_kappa`) so the closed-form and ODE IOV providers cannot seed κ onto
-/// different axes — a change to the stacked layout now touches one place (#466 review
-/// round 2).
+/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The κ-axis offset itself is owned by
+/// `stats::stacked_layout` (`kappa_offset`, #1082); this keeps its public signature and
+/// delegates there, so the closed-form and ODE IOV providers cannot seed κ onto different
+/// axes (#466 review round 2).
 pub fn iov_combined_effect(
     stacked_eta: &[f64],
     n_eta: usize,

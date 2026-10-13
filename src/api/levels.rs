@@ -1904,9 +1904,8 @@ fn spanned(
             if holds.iter().all(|h| !h) {
                 break;
             }
-            let occasion_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-            let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occasion_groups);
-            let (eta, kappa) = probe_res(re, model, occasion_groups.len().max(1));
+            let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+            let (eta, kappa) = probe_res(re, model, layout.n_groups().max(1));
             let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| {
                 predictions_at(model, subject, th, et, ka)
             };
@@ -1957,7 +1956,7 @@ fn spanned(
                         eta_down[k] -= SPAN_STEP;
                     } else {
                         // A kappa moves its own occasion only.
-                        let Some(&g) = occ_to_k.get(&u) else {
+                        let Some(g) = layout.group_of(u) else {
                             holds[s] = false;
                             break;
                         };

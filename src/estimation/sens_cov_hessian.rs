@@ -481,15 +481,11 @@ fn iov_stack(
     if b.len() != d || iov.dim() != nk || params.omega.dim() != ne {
         return None;
     }
-    let mut matrix = DMatrix::zeros(d, d);
-    matrix
-        .view_mut((0, 0), (ne, ne))
-        .copy_from(&params.omega.matrix);
-    for k in 0..occasions {
-        matrix
-            .view_mut((kappa_offset(ne, nk, k), kappa_offset(ne, nk, k)), (nk, nk))
-            .copy_from(&iov.matrix);
-    }
+    let matrix = crate::stats::stacked_layout::block_diag_stack(
+        &params.omega.matrix,
+        &iov.matrix,
+        occasions,
+    );
     let inv = crate::estimation::importance_sampling::build_joint_omega_inv(
         &params.omega.inv,
         &iov.inv,

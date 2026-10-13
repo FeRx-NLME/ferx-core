@@ -1812,8 +1812,11 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
 pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
     if model.n_kappa > 0 {
         iov_analytical_supported_core(model, true)
-            && crate::stats::stacked_layout::StackedLayout::of(model, subject).n_stacked()
-                < MAX_TVCOV_AXES
+            && crate::stats::stacked_layout::stacked_width(
+                model.n_eta,
+                model.n_kappa,
+                crate::stats::stacked_layout::group_count(subject),
+            ) < MAX_TVCOV_AXES
     } else {
         tvcov_analytical_supported(model)
     }
