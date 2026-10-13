@@ -810,11 +810,7 @@ fn simulate_inner<R: rand::Rng>(
 /// which may be the shifted clock for stacked reset occasions. Shared by every
 /// simulation row emitter so the static and reactive paths cannot drift.
 pub(crate) fn obs_row_time(subject: &Subject, j: usize) -> f64 {
-    subject
-        .obs_raw_times
-        .get(j)
-        .copied()
-        .unwrap_or(subject.obs_times[j])
+    subject.readout_time(j)
 }
 
 fn emit_subject_rows<R: rand::Rng>(

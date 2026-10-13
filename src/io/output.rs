@@ -1895,12 +1895,7 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             // to covtab, which is also raw); `obs_times` may be the internal
             // shifted timeline for stacked reset occasions. Falls back to
             // `obs_times` when no raw vector was recorded (in-memory subjects).
-            times.push(
-                subj.obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subj.obs_times[j]),
-            );
+            times.push(subj.readout_time(j));
             dvs.push(subj.observations[j]);
             cens_col.push(sr.cens.get(j).copied().unwrap_or(0) as f64);
             occ_col.push(subj.occasions.get(j).copied().unwrap_or(0) as f64);

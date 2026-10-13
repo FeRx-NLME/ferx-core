@@ -1196,12 +1196,7 @@ fn write_predictions_csv<W: Write>(
             // to the input CSV and to the sdtab, which is also raw); `obs_times`
             // may be the internal shifted timeline for stacked reset occasions.
             // Falls back to `obs_times` when no raw vector was recorded.
-            row.push_str(&fmt_f64(
-                subj.obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subj.obs_times[j]),
-            ));
+            row.push_str(&fmt_f64(subj.readout_time(j)));
             row.push(',');
             row.push_str(&fmt_f64(subj.observations[j]));
             row.push(',');
