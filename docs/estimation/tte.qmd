@@ -380,6 +380,11 @@ genuinely disagree:
   lands in it. On a competing-risks model the error names the endpoint whose own hazard is
   affected.
 
+One case is still refused that need not be: a `TIME`-dependent definition that a later
+line overwrites before anything reads it is followed anyway
+([#1931](https://github.com/FeRx-NLME/ferx-core/issues/1931)) — delete the dead line, which
+is what the model already means.
+
 Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for
 now; a per-record disposition for the hazard pass is tracked in
 [#1920](https://github.com/FeRx-NLME/ferx-core/issues/1920).

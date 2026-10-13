@@ -3611,6 +3611,15 @@ pub(crate) fn check_survival_tv_covariates(
 /// lives; `tests/one_snapshot_dose_reads_survival.rs` is the #1575 fixture that must stay
 /// fittable.
 ///
+/// **One documented over-refusal remains (#1931):** both analyses are flow-insensitive
+/// with respect to *kills*, so a `TIME`-dependent definition that a later unconditional
+/// assignment discards is still followed, and a model carrying such a dead store is
+/// refused although its effective `$PK` is time-free. The direction is the safe one — a
+/// loud error whose remedy, deleting the dead line, is right for the model anyway — and a
+/// kill-aware pass can produce a false *accept* if it mistakes a conditional write for a
+/// kill, which is the silent class this check exists to stop. Pinned, with its live twin,
+/// by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
+///
 /// Returns `None` for every model with no `OdeAccumulated` hazard, and for every model
 /// none of whose `TIME`-dependent individual parameters can reach one. `fit()` and every
 /// predict / simulate entry point surface the message as an `Err`, as they do for #741.
@@ -3643,26 +3652,11 @@ pub(crate) fn check_survival_tv_covariates(
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
     use crate::types::{EndpointLikelihood, HazardSpec};
-    // Neither `?` here is a silent bail-out on a reachable model: an `OdeAccumulated`
-    // hazard is parsed out of an `[odes]` block, which always yields both an `ode_spec`
-    // and a compiled `rhs_program`, and a model with no `[individual_parameters]`
-    // program has no parameter that could read `TIME`. A hand-assembled
-    // `CompiledModel` missing either is the only `None`, and for it the engine returns
-    // NaN curves rather than a frozen answer.
-    let rhs = model.ode_spec.as_ref()?.rhs_program.as_ref()?;
-    let reads_time = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()?
-        .params_reading_time();
-    // No `TIME`-dependent parameter ⇒ nothing is frozen, and no slice has to be built.
-    if !reads_time.iter().any(|&t| t) {
-        return None;
-    }
     // Every `OdeAccumulated` endpoint with its own accumulator slot, in CMT order: the
     // message must name the endpoint whose hazard actually depends on the parameter, not
     // merely the lowest-numbered one (round-1 review of PR #1924). Deterministic in both
-    // loops — CMT order outside, declaration order inside.
+    // loops — CMT order outside, declaration order inside. No such endpoint is the cheap
+    // exit for every other model.
     let mut ode_hazards: Vec<(usize, usize)> = model
         .endpoints
         .iter()
@@ -3675,6 +3669,36 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
         })
         .collect();
     ode_hazards.sort_unstable();
+    let first_cmt = ode_hazards.first().map(|&(cmt, _)| cmt)?;
+    // **Fail closed from here.** Both analyses below need metadata the parser always
+    // attaches, and "this model cannot be analysed" must not read as "nothing is frozen"
+    // (round-3 review of PR #1924): `CompiledModel::indiv_param_partials` is a `pub`
+    // field and `IndivParamPartials::empty()` is public API, and `OdeSpec`'s fields are
+    // `pub` too, so a hand-assembled or hand-edited model can present a working
+    // `pk_param_fn` and `[odes]` RHS with the metadata stripped — and would have kept the
+    // silent freeze this check exists to stop. A `.ferx` file cannot reach either arm.
+    let unanalysable = |what: &str, how: &str| -> Option<String> {
+        Some(format!(
+            "[event_model] on CMT={first_cmt}: this model carries an ODE-accumulated              (joint PK-TTE) hazard, whose pass integrates the individual parameters frozen              at their TIME=0 values, but it has no {what}, so whether that freeze applies              cannot be determined (#1853). Every model parsed from a `.ferx` file carries              one; a `CompiledModel` assembled or edited by hand may not. Build it through              `parse_model_string` / `parse_model_file`{how}."
+        ))
+    };
+    let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
+        return unanalysable(
+            "compiled `[odes]` program (`OdeSpec::rhs_program`)",
+            ", or drop the ODE-accumulated hazard",
+        );
+    };
+    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+        return unanalysable(
+            "compiled `[individual_parameters]` program              (`CompiledModel::indiv_param_partials`)",
+            " rather than replacing that field with `IndivParamPartials::empty()`",
+        );
+    };
+    let reads_time = program.params_reading_time();
+    // No `TIME`-dependent parameter ⇒ nothing is frozen, and no slice has to be built.
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
     for (cmt, chz_state) in ode_hazards {
         // What this accumulator's value depends on. Built per endpoint, because two
         // hazards on one model can read different states.

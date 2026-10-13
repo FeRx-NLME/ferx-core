@@ -510,6 +510,142 @@ fn the_message_names_the_endpoint_whose_hazard_depends_on_the_parameter() {
     );
 }
 
+/// **Missing analysis metadata fails closed** (round-3 review of PR #1924). Both halves
+/// of the predicate read metadata the parser always attaches, but
+/// `CompiledModel::indiv_param_partials` is a `pub` field with a public
+/// `IndivParamPartials::empty()`, and `OdeSpec`'s fields are `pub` too — so a
+/// hand-assembled or hand-edited model can present a working `pk_param_fn` and `[odes]`
+/// RHS with the metadata gone. Returning `None` there would hand exactly that model the
+/// silent freeze this check exists to stop.
+///
+/// Each component is removed independently, from a model that is otherwise **accepted**
+/// (time-free `$PK`), so the refusal is the missing metadata and nothing else — and each
+/// message names which component is missing, since the repair differs.
+#[test]
+fn missing_analysis_metadata_is_refused_rather_than_passed() {
+    use crate::parser::model_parser::IndivParamPartials;
+
+    // The straddle: intact, this model is accepted.
+    let base = joint_model(TIME_FREE_IP, PLAIN_ODES);
+    assert_eq!(
+        check_survival_time_dependent_pk(&base),
+        None,
+        "straddle: the intact model must be accepted, or these arms prove nothing"
+    );
+
+    let mut no_ip = joint_model(TIME_FREE_IP, PLAIN_ODES);
+    no_ip.indiv_param_partials = IndivParamPartials::empty();
+    let msg = check_survival_time_dependent_pk(&no_ip)
+        .expect("a model with no [individual_parameters] program must not be passed");
+    for want in [
+        "CMT=3",
+        "no compiled `[individual_parameters]` program",
+        "IndivParamPartials::empty()",
+        "#1853",
+    ] {
+        assert!(msg.contains(want), "missing {want:?} in: {msg}");
+    }
+
+    let mut no_rhs = joint_model(TIME_FREE_IP, PLAIN_ODES);
+    no_rhs.ode_spec.as_mut().expect("ODE model").rhs_program = None;
+    let msg = check_survival_time_dependent_pk(&no_rhs)
+        .expect("a model with no compiled [odes] program must not be passed");
+    for want in [
+        "CMT=3",
+        "no compiled `[odes]` program",
+        "drop the ODE-accumulated hazard",
+        "#1853",
+    ] {
+        assert!(msg.contains(want), "missing {want:?} in: {msg}");
+    }
+
+    // And a model with **no** ODE-accumulated hazard still exits before the metadata is
+    // asked for: stripping it there must stay silent, or every analytic-hazard model with
+    // a hand-built `CompiledModel` would start erroring.
+    let mut analytic = joint_model(TIME_FREE_IP, PLAIN_ODES);
+    analytic.endpoints.clear();
+    analytic.indiv_param_partials = IndivParamPartials::empty();
+    assert_eq!(
+        check_survival_time_dependent_pk(&analytic),
+        None,
+        "no ODE-accumulated endpoint: there is no freeze to be undecided about"
+    );
+}
+
+/// **A pinned limitation, not a desired property** (round-3 review of PR #1924, tracked as
+/// #1931). Both analyses are flow-insensitive with respect to *kills*: they union over
+/// every write to a slot and never notice that a later unconditional write discards an
+/// earlier one. So a model whose `TIME`-dependent definition is dead — overwritten before
+/// anything reads it — is refused although its effective `$PK` is time-free.
+///
+/// Two shapes, one per analysis: a dead store in `[individual_parameters]` (the taint
+/// mask) and one among the `[odes]` intermediates (the dependency slice). Each is paired
+/// with its **live twin**, differing only in the dead line's absence, which must be
+/// accepted or refused for the real reason — that is what keeps this from being a test
+/// that passes because everything is refused.
+///
+/// The error direction is the safe one: a loud over-refusal whose remedy (delete the dead
+/// line) is right for the model anyway, rather than a silent freeze. When #1931 lands,
+/// the two `assert!(… .is_some())` below become `assert_eq!(…, None)`.
+#[test]
+fn the_time_mask_and_the_slice_ignore_a_killed_definition() {
+    // `[individual_parameters]`: `CL`'s TIME-dependent definition is overwritten.
+    let dead_indiv = joint_model(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  \
+         CL   = TVCL * exp(ETA_CL)\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        PLAIN_ODES,
+    );
+    assert!(
+        check_survival_time_dependent_pk(&dead_indiv).is_some(),
+        "#1931: the dead TIME-dependent definition of CL is still followed"
+    );
+    // Its live twin: the dead line gone, nothing else changed — accepted.
+    assert_eq!(
+        check_survival_time_dependent_pk(&joint_model(TIME_FREE_IP, PLAIN_ODES)),
+        None,
+        "the same model without the dead line must be accepted, or the arm above is \
+         refusing for some other reason"
+    );
+
+    // `[odes]`: `KEFF`'s read of the TIME-dependent `CL` is overwritten before use.
+    let dead_odes = joint_model(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        "  KEFF = CL / V\n  KEFF = 0.1\n  \
+         d/dt(depot)   = -KA * depot\n  \
+         d/dt(central) =  KA * depot - KEFF * central\n",
+    );
+    assert!(
+        check_survival_time_dependent_pk(&dead_odes).is_some(),
+        "#1931: the dead read of CL in the [odes] intermediate is still followed"
+    );
+    // Its live twin: the same block with the kill removed, so `CL` genuinely reaches the
+    // accumulator — refused, and for the right reason, which the message states.
+    let live_odes = joint_model(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        "  KEFF = CL / V\n  \
+         d/dt(depot)   = -KA * depot\n  \
+         d/dt(central) =  KA * depot - KEFF * central\n",
+    );
+    let msg = check_survival_time_dependent_pk(&live_odes)
+        .expect("the live twin's CL does reach the accumulator");
+    assert!(
+        msg.contains("`CL` reads the `TIME` built-in and the [odes] RHS reads it"),
+        "the live twin must be refused for CL: {msg}"
+    );
+}
+
 /// Scope: the freeze this refuses is the **ODE-accumulated** hazard's single `$PK`
 /// snapshot, so a model with no such endpoint is not this check's business however its
 /// `$PK` reads `TIME`. (An analytic hazard has its own frozen-snapshot question — its
