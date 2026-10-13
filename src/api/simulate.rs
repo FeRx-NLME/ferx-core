@@ -548,9 +548,9 @@ pub fn simulate_with_options(
 ///
 /// Four sources feed `warnings`, in this order: per-subject simulation diagnostics (a
 /// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
-/// `W_SIMULATED_FLIP_FLOP` count of the dosed simulated individuals whose sampled η
-/// entered a twin-less transit / IG closed form's flip-flop regime, so their entire
-/// dose-driven concentration was clamped to zero (#1823), capped
+/// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their
+/// observations whose sampled η entered a twin-less transit / IG closed form's flip-flop
+/// regime, so their entire dose-driven concentration was clamped to zero (#1823), capped
 /// steady-state equilibrations (#867), and — new in #1280 / #1304 — the shared non-fit
 /// diagnostics bundle (parse warnings, data-reader warnings, the model/data checks,
 /// experimental-feature notices, and this pass's ODE-solver diagnostics). Before it, a model
@@ -1338,9 +1338,9 @@ pub fn simulate_with_uncertainty(
 /// order: the per-subject simulation diagnostics (a degenerate hazard draw, #763 / #762), one
 /// `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every draw skipped because it landed in the
 /// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), one
-/// `W_SIMULATED_FLIP_FLOP` count of the dosed individuals *inside* the draws that ran whose
-/// own sampled η landed there (#1823 — the skip is decided at each draw's η = 0 θ, so both
-/// can fire on one run), capped steady-state
+/// `W_SIMULATED_FLIP_FLOP` count of the eligible individuals *inside* the draws that ran
+/// whose own sampled η landed there (#1823 — the skip is decided at each draw's η = 0 θ, so
+/// both can fire on one run), capped steady-state
 /// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
 /// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
 /// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
@@ -1569,8 +1569,9 @@ pub struct SimulationResult {
 ///
 /// Since #1823 both `_diag` forms also carry one `W_SIMULATED_FLIP_FLOP` count of the dosed
 /// simulated individuals whose *sampled* η entered a twin-less transit / IG closed form's
-/// flip-flop regime, where it clamps: the drug contributes nothing to any of that
-/// individual's rows. Those rows are returned either way — the count is the only thing that
+/// flip-flop regime, where it clamps: none of that individual's rows carries any
+/// contribution from the doses its subject was given. (*Undosed*, not drug-free — an
+/// `[initial_conditions]` baseline is itself drug and survives the clamp.) Those rows are returned either way — the count is the only thing that
 /// says they are degenerate, which is why the row-only entry points cannot report it.
 /// **Searching the rows for `ipred == 0.0` is not an alternative**: four things run on the
 /// closed form's output after the clamp (an `[initial_conditions]` baseline, a Form-C

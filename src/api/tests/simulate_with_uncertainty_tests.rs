@@ -1229,11 +1229,17 @@ fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, 
 /// reddens here until the page is updated, in either direction.
 #[test]
 fn the_documented_warning_example_is_the_message_the_code_emits() {
-    let page = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/docs/api/simulation.qmd"
-    ))
-    .expect("the simulation docs page is in the repo");
+    // `docs/*` is excluded from the published crate (`Cargo.toml`), and `src/` unit tests
+    // *are* shipped, so a `cargo test --lib` from an unpacked tarball has no `docs/` to
+    // read. Skip only when the whole directory is absent — that is the packaged case and
+    // there are no docs there to protect. In any repo checkout, where this gate is the
+    // point, a missing page or a missing quote is still a failure.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !root.join("docs").is_dir() {
+        return;
+    }
+    let page = std::fs::read_to_string(root.join("docs/api/simulation.qmd"))
+        .expect("docs/ is present, so the simulation page must be too");
     // The one fenced block that quotes this warning.
     let start = page
         .find("W_SIMULATED_FLIP_FLOP: 27 of 600")
@@ -1243,21 +1249,19 @@ fn the_documented_warning_example_is_the_message_the_code_emits() {
             .find("\n```")
             .expect("the quote sits in a fenced block");
     let quoted = normalize_ws(&page[start..end]);
-    assert!(
-        quoted.len() > 200,
-        "the quoted example is the whole message, not a fragment: {quoted}"
-    );
 
     // The real thing, at the fixture and seed the page names.
     let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
     let (msg, clamped, total) = clamped_run(&model, 0.09, 300, 7);
     assert_eq!((clamped, total), (27, 600), "the page's 27 of 600");
     let emitted = normalize_ws(&msg.expect("the fixture reports"));
-    assert!(
-        emitted.contains(&quoted),
-        "the documented example has drifted from the emitted message.\n\
-         page:    {quoted}\n\
-         emitted: {emitted}"
+    // **Equality**, not containment (#1823 review r5): a `contains` check with a length
+    // floor passes on a truncated quote — dropping the last three sentences still leaves a
+    // 200-character prefix — so it would not notice the page quoting half the message. This
+    // fixture carries no twin-decline clause, so the page's block is the whole thing.
+    assert_eq!(
+        emitted, quoted,
+        "the documented example has drifted from the emitted message"
     );
 }
 
@@ -1514,24 +1518,35 @@ fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
         // The four claims the message makes, all of them true on every fixture above.
         assert!(
             msg.contains(&format!(
-                "{clamped} of {total} simulated individuals that received a dose"
+                "{clamped} of {total} simulated individuals dosed before one of their \
+                 observations"
             )),
             "{name}: {msg}"
         );
         assert!(
             msg.contains(
-                "their entire dose-driven concentration was clamped to zero — the drug \
-                 contributes nothing to any of their rows"
+                "their entire dose-driven concentration was clamped to zero — none of their \
+                 rows carries any contribution from the doses the subject was given"
             ),
             "{name}: {msg}"
         );
         assert!(
             msg.contains(
-                "every VPC band, prediction interval or mean computed over them describes a \
-                 subject with no drug in it"
+                "every VPC band, prediction interval or mean computed over them describes an \
+                 undosed subject"
             ),
             "{name}: {msg}"
         );
+        // …and it must not call those rows drug-free: on the `[initial_conditions]`
+        // fixture the baseline `init(central) = BASE` *is* drug, and it survives the
+        // clamp. "Undosed" is the claim the dose-free oracle actually supports
+        // (#1823 review r5).
+        for drug_free in ["no drug in it", "drug-free", "contributes nothing to any"] {
+            assert!(
+                !msg.contains(drug_free),
+                "{name}: the rows are undosed, not drug-free ({drug_free:?}): {msg}"
+            );
+        }
         assert!(
             msg.contains("searching the output for a zero row will not reliably find them"),
             "{name}: {msg}"
@@ -1591,7 +1606,7 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
     mixed.observe(&model, &placebo.subjects[0], &theta, &crosser);
     let msg = mixed.warning(&model).expect("the dosed crosser is counted");
     assert!(
-        msg.contains("1 of 1 simulated individuals that received a dose"),
+        msg.contains("1 of 1 simulated individuals dosed before one of their observations"),
         "the placebo individual counts on neither side: {msg}"
     );
 
@@ -1619,7 +1634,7 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
     // subject's own 900 rows are all zero whether or not it crossed, which is exactly why
     // counting it would have been meaningless.
     assert!(
-        reported.contains("of 300 simulated individuals that received a dose"),
+        reported.contains("of 300 simulated individuals dosed before one of their observations"),
         "{reported}"
     );
     assert_eq!(
@@ -1776,7 +1791,8 @@ fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
         let msg = msg.expect("a crossing individual must be reported");
         assert!(
             msg.contains(&format!(
-                "{zeroed} of {total} simulated individuals that received a dose"
+                "{zeroed} of {total} simulated individuals dosed before one of their \
+                 observations"
             )),
             "count must equal the zeroed individuals: {msg}"
         );
@@ -1818,7 +1834,7 @@ fn simulated_flip_flop_count_covers_the_propensity_matched_branch() {
     let msg = msg.expect("a matched run reports its crossers too");
     assert!(
         msg.contains(&format!(
-            "{zeroed} of {total} simulated individuals that received a dose"
+            "{zeroed} of {total} simulated individuals dosed before one of their observations"
         )),
         "{msg}"
     );
@@ -1860,7 +1876,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
         // Sentence 1 — the count, the cause, and the consequence for `ipred`.
         assert!(
             msg.contains(&format!(
-                "{zeroed} of 600 simulated individuals that received a dose"
+                "{zeroed} of 600 simulated individuals dosed before one of their observations"
             )),
             "{name}: {msg}"
         );
@@ -1879,7 +1895,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("describes a subject with no drug in it"),
+            msg.contains("describes an undosed subject"),
             "{name}: {msg}"
         );
         // Sentence 3 — why a zero row is not the way to find them
@@ -2017,7 +2033,7 @@ fn simulated_flip_flop_tally_skips_a_wrong_length_eta() {
         .warning(&model)
         .expect("the well-shaped crosser is counted");
     assert!(
-        msg.contains("1 of 1 simulated individuals"),
+        msg.contains("1 of 1 simulated individuals dosed before"),
         "the two mis-shaped etas count on neither side: {msg}"
     );
 }

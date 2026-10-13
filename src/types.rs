@@ -6386,8 +6386,8 @@ pub enum WarningCode {
     /// identically-zero *dose-driven* profile. One cause, three phases: auto-rerouted to the
     /// ODE twin (an informational heads-up, #776); or, on a twin-less model, a silently
     /// degenerate likelihood contribution at a subject's fitted EBE (#785), or a dosed
-    /// simulated individual whose drawn η crossed the abscissa, so the drug contributes
-    /// nothing to any of its rows (`W_SIMULATED_FLIP_FLOP`, #1823) — neither of which the
+    /// simulated individual whose drawn η crossed the abscissa, so none of its rows carries
+    /// any contribution from the doses it was given (`W_SIMULATED_FLIP_FLOP`, #1823) — neither of which the
     /// η = 0 entry-point reject can catch. Note that such a row is not necessarily
     /// `ipred == 0.0`: a baseline, a Form-C readout, a log transform or the FREM override
     /// runs after the clamp, so the count is the only reliable way to find these

@@ -3783,16 +3783,22 @@ pub(crate) fn uncertainty_draws_skipped_warning(
 /// `simulate()` draws from N(0, Ω) whose own η pushes `ke` to or past the tilting
 /// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
 /// reroute to and returns the closed form, which clamps — so the individual contributes
-/// finite, plottable rows carrying none of the drug, and every summary computed over them
-/// (a VPC band, a prediction interval, a mean) describes a subject with no drug in it.
-/// Counting them is the only channel that says so.
+/// finite, plottable rows carrying nothing from the doses the subject was given, and every
+/// summary computed over them (a VPC band, a prediction interval, a mean) describes an
+/// **undosed** subject. Counting them is the only channel that says so.
+///
+/// "Undosed", not "drug-free": an `[initial_conditions] init(central) = BASE` baseline is
+/// itself drug, and it survives the clamp (it is layered on afterwards), so such a subject's
+/// rows carry its decay. What is zero is the **dose-driven** contribution, which is exactly
+/// what the dose-free twin in the tests measures (#1823 review r5).
 ///
 /// The message says that and stops. It does **not** say the clamp *moved* anything, because
 /// for a few degenerate designs it did not — an absorption `lagtime` past the last
 /// observation, or `f = 0`, leaves the rows where they already were. Those are
 /// individual-parameter expressions, so excluding them needs the predictor; the two
-/// structural halves that can be excluded — no positive dose, and no dose at or before an
-/// observation — are ([`observe`](Self::observe), #1823 review r2 / r3).
+/// structural halves that can be excluded — no positive dose, and no dose strictly before
+/// an observation — are ([`observe`](Self::observe), #1823 review r2 / r3 / r4), and the
+/// message names that eligibility rather than claiming every dosed individual is counted.
 ///
 /// **The count says nothing about what those rows contain**, deliberately. Four things run
 /// on the closed form's output *after* the clamp (`pk/mod.rs`, in order):
@@ -3844,10 +3850,9 @@ impl SimulatedFlipFlopTally {
         if !twinless_absorption_closed_form(model) {
             return;
         }
-        // A subject with no drug on board has no dose-driven term for the clamp to take
-        // away, so nothing was lost and there is nothing to report about it — its profile
-        // is drug-free with the clamp and without it, and an ODE rewrite would produce the
-        // same rows. Counting it would inflate *both* sides of the ratio and attach a
+        // A subject with no dose has no dose-driven term for the clamp to take away, so
+        // nothing was lost and there is nothing to report about it — its rows are the same
+        // with the clamp and without it, and an ODE rewrite would produce the same rows. Counting it would inflate *both* sides of the ratio and attach a
         // message about a lost drug contribution to a placebo arm (#1823 review r2).
         // Measured there: an `AMT = 0` second subject contributed its crossers to a count
         // of 27 while all 900 of its rows were already zero.
@@ -3879,9 +3884,9 @@ impl SimulatedFlipFlopTally {
         // the last observation, or `f = 0`. Those are individual-parameter *expressions*,
         // η-dependent and evaluated per individual, so excluding them needs the predictor —
         // which is exactly the mistake `clamp_shows_as_literal_zero` was (review r2). Such
-        // an individual is still counted, and the message stays true for it: the drug does
-        // contribute nothing to its rows. The claim that was *not* safe there — that the
-        // clamp moved anything — was removed from the message in the same round.
+        // an individual is still counted, and the message stays true for it: nothing from
+        // its doses reaches its rows. The claim that was *not* safe there — that the clamp
+        // moved anything — was removed from the message in the same round.
         let last_obs = subject
             .obs_times
             .iter()
@@ -3916,14 +3921,14 @@ impl SimulatedFlipFlopTally {
         let (domain, ode_fn) = absorption_flip_flop_wording(model);
         let confluent = absorption_confluent_clause(model);
         Some(format!(
-            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals that received a dose \
-             were evaluated at an η inside the flip-flop regime (disposition rate ≥ \
-             {domain}){confluent}, where the twin-less {model_name} closed form has no \
-             solution, so their entire dose-driven concentration was clamped to zero — the \
-             drug contributes nothing to any of their rows. \
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
+             their observations were evaluated at an η inside the flip-flop regime \
+             (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
+             closed form has no solution, so their entire dose-driven concentration was \
+             clamped to zero — none of their rows carries any contribution from the doses \
+             the subject was given. \
              Those rows are still returned and still summarised, so every VPC band, \
-             prediction interval or mean computed over them describes a subject with no \
-             drug in it. \
+             prediction interval or mean computed over them describes an undosed subject. \
              Whether they read as a literal `ipred = 0` depends on what this model layers \
              on the closed form's output afterwards, so searching the output for a zero row \
              will not reliably find them. \
