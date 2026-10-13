@@ -1310,6 +1310,91 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// #1823 review r7: an individual whose parameters overflow to non-finite is **not** counted.
+///
+/// `absorption_flip_flop_at` guards its inputs with positivity only (`cl > 0.0 && v1 > 0.0`),
+/// and `f64::INFINITY > 0.0` is `true`, so an overflowed draw reaches the domain comparison
+/// and `!(x < KTR)` is `true` for both `x = inf` and `x = NaN`. The individual was therefore
+/// reported as a domain crossing, with the message attributing it to "disposition rate ≥ the
+/// tilting abscissa" and recommending an ODE "valid in both regimes" — which would receive
+/// the same non-finite parameters. That is the predicate's own stated contract being broken
+/// ("invalid parameters … a deliberate optimiser penalty, not a flip-flop"), so the tally
+/// enforces it.
+///
+/// Measured at η = 710, where `exp(η)` overflows:
+///
+/// | fixture | `cl` | `v` | `cl / v` | pre-fix |
+/// |---|---|---|---|---|
+/// | η on `CL` only | `inf` | 4 | `inf` | counted |
+/// | η on `CL` and `V` | `inf` | `inf` | `NaN` | counted |
+///
+/// Both sides of the gate in one test: the same two fixtures at a *finite* crossing η are
+/// still counted, and the η-on-both fixture at η = 0.6 is correctly in-domain (`CL/V` is
+/// unchanged at 0.125 because both scale together), which is what makes it a real
+/// discriminator rather than a second copy of the first.
+#[test]
+fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
+    let cl_only = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    // Same fixture with η on V as well, so a huge draw overflows both and the ratio is NaN.
+    let cl_and_v = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  V = TVV\n", "  V = TVV * exp(ETA_CL)\n"),
+    );
+    let pop = tiny_population();
+    let subject = &pop.subjects[0];
+
+    for (name, model, crossing_eta) in [
+        ("η on CL only", &cl_only, 0.6_f64),
+        // With η on both, CL/V is η-independent, so no finite η crosses — the overflow is
+        // the only way in, which is exactly the case under test.
+        ("η on CL and V", &cl_and_v, f64::NAN),
+    ] {
+        let theta = model.default_params.theta.clone();
+        for eta in [710.0_f64, 1e4] {
+            let pk = (model.pk_param_fn)(&theta, &[eta], &subject.covariates, 0.0);
+            assert!(
+                !pk.values.iter().all(|v| v.is_finite()),
+                "{name}: η = {eta} must overflow for this test to mean anything (cl = {}, v = {})",
+                pk.cl(),
+                pk.v()
+            );
+            // The predicate still says "crossing" — that is the pre-existing behaviour this
+            // guard compensates for, asserted so the guard's reason cannot go stale.
+            assert!(
+                crate::pk::absorption_flip_flop_at(model, subject, &theta, &[eta]),
+                "{name}: the predicate flags a non-finite individual"
+            );
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(model, subject, &theta, &[eta]);
+            assert_eq!(
+                tally.warning(model),
+                None,
+                "{name}: η = {eta} overflows, so it is not a domain crossing"
+            );
+        }
+        // The other side: a finite crossing η is still counted (where one exists).
+        if crossing_eta.is_finite() {
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(model, subject, &theta, &[crossing_eta]);
+            assert!(
+                tally.warning(model).is_some(),
+                "{name}: a finite crossing η must still be counted"
+            );
+        }
+    }
+
+    // And the η-on-both fixture is genuinely in-domain at a finite η, which is why it is a
+    // different fixture and not a restatement of the first.
+    let theta = cl_and_v.default_params.theta.clone();
+    let pk = (cl_and_v.pk_param_fn)(&theta, &[0.6], &subject.covariates, 0.0);
+    assert!(
+        (pk.cl() / pk.v() - 0.125).abs() < 1e-12,
+        "CL/V is η-independent here"
+    );
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&cl_and_v, subject, &theta, &[0.6]);
+    assert_eq!(tally.warning(&cl_and_v), None);
+}
+
 /// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
 /// file is degenerate, so nothing else can reach it — and a guard whose job is to reject a
 /// *future* fixture is worth nothing if it cannot be shown to fire at all.

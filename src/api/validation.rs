@@ -3639,8 +3639,10 @@ pub(crate) fn check_analytic_readout_support(
 }
 
 /// Whether `model` is a transit / inverse-Gaussian **closed form carrying no ODE twin** —
-/// the one family whose flip-flop regime has nothing to reroute to, and so the only one
-/// that can silently return an identically-zero profile.
+/// the one family whose flip-flop regime has nothing to reroute to, and so the only one that
+/// can silently return an identically-zero **dose-driven contribution** (not necessarily an
+/// identically-zero profile: a baseline, readout or log transform layered on afterwards
+/// survives the clamp — see [`SimulatedFlipFlopTally`]).
 ///
 /// A twin-*carrying* model is rerouted per evaluation by
 /// [`crate::pk::effective_model_for_eval`] and is correct in both regimes (it is only
@@ -3904,6 +3906,29 @@ impl SimulatedFlipFlopTally {
         // prediction uses. Guard the length anyway so an unexpected shape is skipped
         // rather than read past the end inside `pk_param_fn`.
         if eta.len() != model.n_eta + model.n_kappa {
+            return;
+        }
+        // An individual whose parameters are not finite is not a measurement of the closed
+        // form's domain at all, and must not be reported as one (#1823 review r7).
+        //
+        // [`crate::pk::absorption_flip_flop_at`]'s own contract already says so — it returns
+        // `false` "for invalid parameters — there the closed form's `0` is a deliberate
+        // optimiser penalty, not a flip-flop to reroute to the ODE twin" — but it enforces
+        // that with positivity tests only (`cl > 0.0 && v1 > 0.0`), and `f64::INFINITY > 0.0`
+        // is `true`. So an overflowed draw reaches the comparison. Measured: at η = 710 a
+        // lognormal `CL` is `inf`, so `!(inf < KTR)` is `true`; with η on `V` as well
+        // `cl / v1` is `NaN` and `!(NaN < KTR)` is `true` too. Either way the individual was
+        // counted, and the message then attributed it to "disposition rate ≥ {the abscissa}"
+        // and recommended an ODE "valid in both regimes" — which would receive the same
+        // non-finite parameters.
+        //
+        // Enforced here rather than in the predicate: that predicate also decides **routing**
+        // for twin-*carrying* models ([`crate::pk::effective_model_for_eval`]), where sending
+        // a non-finite subject to the ODE twin is existing behaviour and a separate question.
+        // This is about what the tally claims. The extra `pk_param_fn` call lands only on a
+        // twin-less transit / IG model with an eligible dose, next to the predicate's own.
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        if !pk.values.iter().all(|v| v.is_finite()) {
             return;
         }
         self.total += 1;

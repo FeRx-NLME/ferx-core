@@ -406,8 +406,9 @@ output for a zero row will not reliably find them**. The count is the reliable c
 `[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero
 row between them.
 
-An individual is not counted at all unless its subject carries a dose of positive
-amount **strictly before one of its observations**: without that, no returned row
+The count is of **timing-eligible crossers**: an individual is not counted unless
+its subject carries a dose of positive amount **strictly before one of its
+observations**: without that, no returned row
 could have carried the dose either way, so nothing was lost and an ODE rewrite
 would produce the same rows. The count's denominator is those eligible individuals,
 and the warning says so rather than claiming every dosed individual is counted.
@@ -426,10 +427,17 @@ expressions, evaluated per individual. The warning stays accurate for them — i
 says nothing from their doses reaches those rows, which is true — and it
 deliberately does not claim the clamp *moved* anything.
 
-### Why it biases a VPC
+### What it does to a VPC
 
 Those rows are **not** dropped, so every summary taken over them — a VPC band, a
-prediction interval, a mean — describes an undosed subject. Measured on
+prediction interval, a mean — describes an undosed subject.
+
+How much that biases the result is **fixture-dependent**, and in the degenerate
+cases above (a `lagtime` past the last observation, `f = 0`) it does not bias it
+at all: those rows were already undosed, and an ODE rewrite would reproduce them.
+The count tells you how many individuals are in that state; whether it matters is
+a question about your model. On the fixture measured here it matters a great deal.
+Measured on
 the #1823 fixture (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`,
 ω²~CL~ = 0.09), 260 of 4000 simulated individuals were clamped — 6.5%, against
 the 5.9% that P(η ≥ ln 1.6) predicts for this boundary. On the matching

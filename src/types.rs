@@ -6572,7 +6572,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         )
     } else if lower.contains("w_simulated_flip_flop") {
         // #1823: simulated individuals whose drawn η crossed into a twin-less transit / IG
-        // closed form's flip-flop regime and came back as an identically-zero profile. Shares
+        // closed form's flip-flop regime, so their dose-driven contribution came back
+        // identically zero (the whole *profile* need not be zero — a baseline or readout
+        // layered on after the clamp survives it). Shares
         // `FlipFlop` with the η = 0 reroute note (#776) and the fitted-EBE crossing (#785) —
         // one cause, three phases, told apart by the message. A token arm rather than the
         // `flip-flop regime` prose arm below, because the message interpolates the twin
