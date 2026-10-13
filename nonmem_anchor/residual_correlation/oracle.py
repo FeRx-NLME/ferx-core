@@ -5,7 +5,8 @@ marginal: y ~ N(f0, G Om G' + R).  Pure python (no numpy)."""
 import csv, math, sys, collections
 
 def chol(A):
-    n = len(A); L = [[0.0]*n for _ in range(n)]
+    n = len(A)
+    L = [[0.0]*n for _ in range(n)]
     for i in range(n):
         for j in range(i+1):
             s = A[i][j] - sum(L[i][k]*L[j][k] for k in range(j))
@@ -35,13 +36,22 @@ def m2ll(struct, rho, th, om_var, path='napx1081.csv'):
     for r in rows: by_id.setdefault(r['ID'], []).append(r)
     tot = 0.0
     for sid, rs in by_id.items():
-        n = len(rs); res = []; G = []; W = []
+        n = len(rs)
+        res = []
+        G = []
+        W = []
         for r in rs:
-            t = float(r['TIME']); trt = float(r['TRT']); fl = float(r['FLARE'])
-            e0 = E0 + BE0F*fl; emax = EMAX + BEMF*fl + BEMT*trt; et50 = ET50*math.exp(BLET*trt)
+            t = float(r['TIME'])
+            trt = float(r['TRT'])
+            fl = float(r['FLARE'])
+            e0 = E0 + BE0F*fl
+            emax = EMAX + BEMF*fl + BEMT*trt
+            et50 = ET50*math.exp(BLET*trt)
             g2 = t/(t+et50)
             f = e0 - emax*g2
-            res.append(float(r['DV']) - f); G.append((1.0, -g2)); W.append(float(r['WPSE']))
+            res.append(float(r['DV']) - f)
+            G.append((1.0, -g2))
+            W.append(float(r['WPSE']))
         V = [[G[i][0]*G[j][0]*om_var[0] + G[i][1]*G[j][1]*om_var[1] for j in range(n)] for i in range(n)]
         # arm blocks
         blocks = collections.OrderedDict()

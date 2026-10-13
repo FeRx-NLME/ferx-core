@@ -2,6 +2,7 @@
 Each arm is one L2 record (EPS shared across its rows). SIGMA = diag(1) FIX over
 5 EPS; row VIS=j carries RES = sum_k L[j,k](rho) EPS(k), L = Cholesky of the arm
 correlation C(rho); Y = F + WPSE*RES  =>  R_arm = W C W.  rho = THETA(8)."""
+import shutil
 import sys, os
 TH = [5.1972, 1.1580, 0.6901, 0.9629, 0.8197, 0.7930, -1.1747]
 OM = [0.6215**2, 0.7387**2]
@@ -150,5 +151,5 @@ RUNS = [('cs', 0.0, False, 'cs_r0'), ('cs', 0.5, False, 'cs_p05'), ('cs', -0.2, 
 for struct, rho, est, name in RUNS:
     os.makedirs(name, exist_ok=True)
     open(f'{name}/{name}.ctl', 'w').write(ctl(struct, rho, est))
-    os.system(f'cp napx1081.csv {name}/')
+    shutil.copy('napx1081.csv', f'{name}/')
 print('ok')
