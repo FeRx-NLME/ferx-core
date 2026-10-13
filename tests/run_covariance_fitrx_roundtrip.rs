@@ -71,8 +71,10 @@ struct Fitted {
     fit: FitResult,
 }
 
-fn fit_inline(model_path: &str, data_path: &str, method: EstimationMethod) -> Fitted {
-    let prep = prepare_run(model_path, Some(data_path)).expect("prepare");
+/// `row` labels every panic: two rows share `model_path` (warfarin FOCE and Laplace).
+fn fit_inline(row: &str, model_path: &str, data_path: &str, method: EstimationMethod) -> Fitted {
+    let prep =
+        prepare_run(model_path, Some(data_path)).unwrap_or_else(|e| panic!("{row}: prepare: {e}"));
     let (model, population, init) = (prep.parsed.model, prep.population, prep.init_params);
     let options = FitOptions {
         verbose: false,
@@ -82,16 +84,16 @@ fn fit_inline(model_path: &str, data_path: &str, method: EstimationMethod) -> Fi
         sir: false,
         ..FitOptions::default()
     };
-    let fit = fit(&model, &population, &init, &options)
-        .unwrap_or_else(|e| panic!("{model_path}: fit: {e}"));
+    let fit =
+        fit(&model, &population, &init, &options).unwrap_or_else(|e| panic!("{row}: fit: {e}"));
     assert!(
         fit.gradient_method_inner.starts_with("analytic"),
-        "{model_path}: the engine this file names moved: {}",
+        "{row}: the engine this file names moved: {}",
         fit.gradient_method_inner
     );
     assert!(
         fit.packed_estimate.is_some(),
-        "{model_path}: a packed-space fit must carry packed_estimate"
+        "{row}: a packed-space fit must carry packed_estimate"
     );
     Fitted {
         model,
@@ -162,8 +164,8 @@ fn roundtrip_row(
     data_path: &str,
     method: EstimationMethod,
 ) -> Option<f64> {
-    let f = fit_inline(model_path, data_path, method);
-    let inline = bits_of(&f.fit, "inline");
+    let f = fit_inline(row, model_path, data_path, method);
+    let inline = bits_of(&f.fit, &format!("{row} inline"));
     let reloaded = reload(&f);
     assert_eq!(
         reloaded
@@ -177,12 +179,12 @@ fn roundtrip_row(
         "{row}: the bundle must carry the packed vector bit for bit"
     );
     assert!(
-        covariance_bits(&f, &reloaded, "reloaded") == inline,
+        covariance_bits(&f, &reloaded, &format!("{row} reloaded")) == inline,
         "{row}: claim — run_covariance on the reloaded fit must repeat the inline step"
     );
     let mut legacy = reloaded;
     legacy.packed_estimate = None;
-    let legacy = covariance_bits(&f, &legacy, "legacy");
+    let legacy = covariance_bits(&f, &legacy, &format!("{row} legacy"));
     (legacy != inline).then(|| max_gap(&legacy.0, &inline.0).max(max_gap(&legacy.1, &inline.1)))
 }
 
