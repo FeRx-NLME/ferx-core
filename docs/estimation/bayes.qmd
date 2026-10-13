@@ -76,8 +76,10 @@ Every θ draw stays inside its declared `(lower, upper)` bounds. A random-walk
 proposal or a conjugate draw that lands outside is rejected, and the chain
 keeps its current value. The posterior density is zero outside the bounds, so
 this is an exact Metropolis–Hastings step, and the prior stays the documented
-one truncated to the bounds. The alternative, sampling on a transform of
-`(lower, upper)`, would add a Jacobian that changes the implied prior. Until
+one truncated to the bounds. Sampling on a transform of `(lower, upper)` would
+also be exact, provided the change-of-variables Jacobian is included. It is
+not used because rejection needs no transform at all, and it leaves the
+proposal scales and the prior on the scale they are documented on. Until
 issue #1626 the random-walk block ignored the bounds. A covariate exponent declared
 `(0.75, 0.01, 5.0)` could then drift to 5e-9, where `(WT/70)^θ ≈ 1` leaves the
 likelihood flat.
@@ -109,8 +111,25 @@ holds:
 - a covariate it reads changes within a subject;
 - the θ is read elsewhere in the model;
 - the η is read by a second parameter;
-- the typical value is not linear on any scale, e.g.
-  `(TVCL + (CRCL - 90)*TH_CRCL) * exp(ETA_CL)`.
+- the typical value is not one of the recognised linear forms, e.g.
+  `(TVCL + (CRCL - 90)*TH_CRCL) * exp(ETA_CL)`;
+- the data cannot identify the coefficient through the individual parameters.
+  This happens when every subject is at the covariate's reference value, or
+  when the covariate is constant across subjects and so duplicates the
+  typical value.
+
+Linearity is established from the written form of the typical value, not by
+probing it numerically. The recognised forms are products and quotients of
+θ, constants, powers with a constant base or a constant exponent, `exp()` of
+a linear term, and `sqrt()`. Under the logit and identity links they are sums
+of constant multiples of θ. A numerical probe cannot prove linearity: an odd
+term such as `(θ - θ₀)^3` passes every symmetric check about θ₀.
+
+**Prior.** Moving a coefficient onto this move changes its prior. On the
+random walk it has the default N(init, sd = 10) on log θ, truncated to its
+bounds. On the conjugate move it has a flat prior on θ itself, truncated to
+its bounds. The posteriors are comparable whenever the data dominate. A
+coefficient the data barely inform will show the difference.
 
 Mixture models draw only the plain typical values.
 
@@ -118,12 +137,26 @@ Mixture models draw only the plain typical values.
 
 On `two_cpt_oral_base`, one subject's posterior has a second mode: the KA ↔
 distribution flip-flop, $e^{-19.6}$ times less probable than the main mode.
-Started from η = 0, a chain could fall into it in warmup. No random-walk
+The ratio comes from a Laplace approximation at the posterior means. Started
+from η = 0, a chain could fall into the second mode in warmup. No random-walk
 kernel climbs back out, so the run reported max R̂ ≈ 1.2 at 1,000, 6,000 and
-20,000 draws per chain alike. Starting at the EBE (the main mode) removes the
-trap. Like the shared initial θ, the start does not change the target
-distribution, only where the chains begin. Mixture models keep η = 0, because
-their EBE is per class.
+20,000 draws per chain alike. On this example, starting at the EBE (here the
+main mode) removed the trap: R̂ ≤ 1.012 across four seeds. Like the shared
+initial θ, the start does not change the target distribution, only where the
+chains begin. Mixture models keep η = 0, because their EBE is per class.
+
+The start has a diagnostic cost:
+
+- **An EBE is a local optimum.** It is not guaranteed to be the dominant
+  mode.
+- **The chains all start in the same place.** Every chain begins at the same
+  EBEs and the same initial θ. If they all stay in one mode, R̂ and ESS can
+  look reassuring while every chain misses another mode.
+
+A max R̂ near 1 from common starts therefore shows the chains agree. It does
+not show they have explored the whole posterior. For a model where a second
+mode is plausible, refit from different initial estimates and compare the
+posteriors.
 
 ## Options
 

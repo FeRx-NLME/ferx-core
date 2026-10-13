@@ -3231,9 +3231,11 @@ mod tests {
         assert_eq!(d(5), WorstRhatDriver::Other);
     }
 
-    /// Every sentence of the warning, and both sides of the n_leapfrog gate.
+    /// Every sentence of the warning, and both sides of the n_leapfrog gate
+    /// in one test (AGENTS.md: a gate stuck on either branch must redden it).
     #[test]
     fn rhat_warning_names_the_parameter_and_its_kernel() {
+        hmc_gate_closed_side();
         let w = rhat_warning(1.2, "OMEGA(2,2)", WorstRhatDriver::EtaDriven, true);
         assert!(
             w.starts_with(
@@ -3259,16 +3261,18 @@ mod tests {
         assert!(!w.contains("random-walk (theta, sigma) block"), "{w}");
     }
 
-    #[test]
-    fn rhat_warning_does_not_suggest_hmc_when_it_ran_or_cannot() {
+    /// The closed side of the HMC-advice gate (HMC ran, or cannot serve).
+    fn hmc_gate_closed_side() {
         let w = rhat_warning(1.2, "OMEGA(2,2)", WorstRhatDriver::EtaDriven, false);
         assert!(!w.contains("n_leapfrog"), "{w}");
         assert!(!w.contains("Metropolis-Hastings"), "{w}");
         assert!(w.ends_with(" Increase bayes_warmup / bayes_iters."), "{w}");
     }
 
+    /// Both sides of the `mu_referenced` gate in one test.
     #[test]
     fn rhat_warning_says_when_a_random_walk_theta_is_worst() {
+        mu_referenced_gate_open_side();
         let w = rhat_warning(
             2.4,
             "THETA_CRCL",
@@ -3306,8 +3310,7 @@ mod tests {
 
     /// The other side of the `mu_referenced` gate: a θ that already anchors an
     /// η is not told to become one.
-    #[test]
-    fn rhat_warning_for_a_mu_referenced_random_walk_theta_points_at_the_other_etas() {
+    fn mu_referenced_gate_open_side() {
         let w = rhat_warning(
             1.9,
             "TVCL",
