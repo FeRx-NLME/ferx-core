@@ -19,9 +19,7 @@ use crate::sim::adaptive::{
     AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
     DoseLedgerEntry, MonitorSpec,
 };
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
+use crate::stats::likelihood::{build_frem_r_override, foce_subject_nll_iov};
 use crate::stats::residual_error::{
     compute_iwres_with_correlations, compute_r_matrix_with_correlations_cov,
     compute_r_matrix_with_correlations_scaled_cov, iwres_autocorrelation,

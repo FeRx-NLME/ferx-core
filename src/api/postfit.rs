@@ -23,10 +23,7 @@ use crate::sim::adaptive::{
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
 };
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};

@@ -23,7 +23,8 @@
 //! Scope: production code under `src/` — `*_tests.rs` siblings, `tests/` folders,
 //! `test_helpers` files and the bodies of inline `#[cfg(test)] mod … { }` modules
 //! are skipped. The remaining gap is an alias: `let c = &p.residual_correlations;
-//! if c.is_empty()` is not seen. None exists today.
+//! if c.is_empty()` is not seen. None exists today. A rustfmt-wrapped chain
+//! (`p\n    .residual_correlations\n    .is_empty()`) *is* seen.
 //!
 //! Not feature-gated: runs in the base `--features ci` job.
 
@@ -69,17 +70,25 @@ fn production_part(src: &str) -> String {
     out
 }
 
-/// Every `<ident ending in "correlations">.is_empty()` in `src` as `(line, trimmed line)`.
+/// Every `<ident ending in "correlations">.is_empty()` in `src` as `(line, trimmed line)`,
+/// including the rustfmt-wrapped chain form (`…correlations` ending one line and
+/// `.is_empty()` starting the next), reported at the `.is_empty()` line with the two
+/// trimmed lines joined.
 fn emptiness_tests(src: &str) -> Vec<(usize, String)> {
     const NEEDLE: &str = "correlations.is_empty()";
     let mut out = Vec::new();
+    let mut prev = "";
     for (i, line) in src.lines().enumerate() {
-        if line.trim_start().starts_with("//") {
+        let t = line.trim();
+        if t.starts_with("//") {
             continue;
         }
         if line.contains(NEEDLE) {
-            out.push((i + 1, line.trim().to_string()));
+            out.push((i + 1, t.to_string()));
+        } else if t.starts_with(".is_empty()") && prev.ends_with("correlations") {
+            out.push((i + 1, format!("{prev}{t}")));
         }
+        prev = t;
     }
     out
 }
@@ -130,50 +139,50 @@ fn wrapper_calls(src: &str) -> Vec<(usize, String)> {
 const ALLOWED: &[(&str, &str, &str)] = &[
     // Reporting: the `block_sigma` ρ is reported as its own block (a serial ρ is a θ).
     (
-        "io/output.rs",
+        "src/io/output.rs",
         "if !result.residual_correlations.is_empty() {",
         "reports the block_sigma rows",
     ),
     (
-        "io/fitrx.rs",
+        "src/io/fitrx.rs",
         "let residual_correlation_fixed_resolved = if w.sigma.residual_correlations.is_empty() {",
         "round-trips the block_sigma FIX flags",
     ),
     (
-        "estimation/uncertainty_samples.rs",
+        "src/estimation/uncertainty_samples.rs",
         "residual_correlations: if fit_result.residual_correlations.is_empty() {",
         "carries the block_sigma ρ into an uncertainty draw",
     ),
     (
-        "api/postfit.rs",
+        "src/api/postfit.rs",
         "if template.residual_correlations.is_empty() {",
         "SE of the packed block_sigma ρ coordinates; None (not Some([])) without any",
     ),
     // The declaration's own validation.
     (
-        "parser/model_parser.rs",
+        "src/parser/model_parser.rs",
         "if correlations.is_empty() {",
         "validate_residual_correlations: checks the declared block_sigma pairs",
     ),
     (
-        "api/validation.rs",
+        "src/api/validation.rs",
         "|| (rho_fixed.is_empty() && !model.residual_correlations.is_empty());",
         "is a block_sigma ρ free to estimate (E_BLOCK_SIGMA_CHAIN_UNSUPPORTED)",
     ),
     (
-        "api/validation.rs",
+        "src/api/validation.rs",
         "if model.residual_correlations.is_empty()",
         "W_L2_UNUSED: an L2 column pairs block_sigma rows only",
     ),
     (
-        "api/validation.rs",
+        "src/api/validation.rs",
         "if !model.residual_correlations.is_empty() {",
         "row-order-dependent (time, occasion) pairing of block_sigma rows",
     ),
     // Per-observation diagonal: the within-observation `combined(...)` term is a
     // property of the block_sigma pairs, never of R's off-diagonal shape.
     (
-        "stats/residual_error.rs",
+        "src/stats/residual_error.rs",
         "if correlations.is_empty() {",
         "variance_at_with_correlations / compute_r_diag_with_correlations / \
          compute_iwres_with_correlations: diagonal only",
@@ -183,7 +192,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 /// How many times each allowed `(file, line)` may occur.
 fn allowed_count(file: &str, line: &str) -> usize {
     match (file, line) {
-        ("stats/residual_error.rs", "if correlations.is_empty() {") => 3,
+        ("src/stats/residual_error.rs", "if correlations.is_empty() {") => 3,
         _ => 1,
     }
 }
@@ -192,9 +201,12 @@ fn scan<F>(find: F) -> Vec<(String, usize, String)>
 where
     F: Fn(&str) -> Vec<(usize, String)>,
 {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Keys are repo-relative (`src/api/…`), never `src`-relative: a string literal
+    // `api/…` in `tests/` reads as a fixture under the tracked top-level `api/`
+    // directory to `tests/slow_test_path_filter.rs`.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    rust_sources(&root, &mut sources);
+    rust_sources(&root.join("src"), &mut sources);
     assert!(
         sources.len() > 50,
         "found only {} sources under src/",
@@ -205,7 +217,7 @@ where
         let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
         let rel = path
             .strip_prefix(&root)
-            .expect("under src/")
+            .expect("under the manifest dir")
             .to_string_lossy()
             .replace('\\', "/");
         for (n, line) in find(&production_part(&src)) {
@@ -228,10 +240,17 @@ fn the_scanners_see_gates_and_calls_and_skip_test_modules() {
                fn e() { x.my_compute_cwres(1); crate::stats::likelihood::compute_cwres(1) }\n\
                #[cfg(test)]\nmod tests {\n  fn f(p: &P) -> bool { p.residual_correlations.is_empty() }\n  \
                fn g() { foce_subject_nll(a) }\n}\n\
-               fn h(p: &P) -> bool { p.residual_correlations.is_empty() }\n";
+               fn h(p: &P) -> bool { p.residual_correlations.is_empty() }\n\
+               fn k(p: &P) -> bool {\n    p.residual_correlations\n        .is_empty()\n}\n\
+               fn m(p: &P) -> bool {\n    p.omega_corrs\n        .is_empty()\n}\n";
     let prod = production_part(src);
     let gates: Vec<usize> = emptiness_tests(&prod).into_iter().map(|(n, _)| n).collect();
-    assert_eq!(gates, vec![1, 4, 13], "gates on lines 1, 4 and 13 only");
+    // 16: a rustfmt-wrapped chain; 20 is the same shape on a non-correlation field.
+    assert_eq!(
+        gates,
+        vec![1, 4, 13, 16],
+        "gates on lines 1, 4, 13 and 16 only"
+    );
     let calls: Vec<usize> = wrapper_calls(&prod).into_iter().map(|(n, _)| n).collect();
     assert_eq!(calls, vec![5, 7], "wrapper calls on lines 5 and 7 only");
 }
@@ -244,7 +263,7 @@ fn no_production_code_tests_residual_correlations_for_emptiness() {
         if ALLOWED.iter().any(|(f, l, _)| *f == file && *l == line) {
             seen.push((file, line));
         } else {
-            offenders.push(format!("src/{file}:{n}: {line}"));
+            offenders.push(format!("{file}:{n}: {line}"));
         }
     }
     assert!(
@@ -265,7 +284,7 @@ fn no_production_code_tests_residual_correlations_for_emptiness() {
         assert_eq!(
             got,
             allowed_count(f, l),
-            "allow-list entry src/{f}: `{l}` ({why}) occurs {got} time(s)"
+            "allow-list entry {f}: `{l}` ({why}) occurs {got} time(s)"
         );
     }
 }
@@ -274,7 +293,7 @@ fn no_production_code_tests_residual_correlations_for_emptiness() {
 fn no_production_code_calls_a_block_sigma_only_dense_builder() {
     let offenders: Vec<String> = scan(wrapper_calls)
         .into_iter()
-        .map(|(f, n, l)| format!("src/{f}:{n}: {l}"))
+        .map(|(f, n, l)| format!("{f}:{n}: {l}"))
         .collect();
     assert!(
         offenders.is_empty(),
