@@ -262,22 +262,6 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
     ))
 }
 
-/// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
-/// `None` when `dw` is non-finite or inside the `[1.5, 2.5]` band.
-///
-/// A free function rather than an inline block so the exact text is reachable
-/// from a unit test without running a fit (the suffix dropped below outlived
-/// #1285 precisely because nothing tested it), and deliberately independent of
-/// the model: it used to append " For ODE models, SDE process noise may also
-/// help." whenever `model.ode_spec` was present. `[diffusion]` is not that
-/// remedy. The EKF propagates the state covariance and never corrects the state
-/// mean with the observed data (#1285), so the fitted object is the
-/// deterministic ODE mean with an inflated residual variance: it re-weights the
-/// fit rather than supplying the missing dynamics the statistic is reporting.
-/// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
-/// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
-/// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
-/// against a truth of 1.0. The hint returns with the mean update.
 /// [`dw_autocorrelation_warning`] for a model with a `correlation` line (#1081),
 /// where `dw` is taken on the residuals decorrelated by the fitted `R`
 /// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
@@ -320,6 +304,22 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     }
 }
 
+/// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
+/// `None` when `dw` is non-finite or inside the `[1.5, 2.5]` band.
+///
+/// A free function rather than an inline block so the exact text is reachable
+/// from a unit test without running a fit (the suffix dropped below outlived
+/// #1285 precisely because nothing tested it), and deliberately independent of
+/// the model: it used to append " For ODE models, SDE process noise may also
+/// help." whenever `model.ode_spec` was present. `[diffusion]` is not that
+/// remedy. The EKF propagates the state covariance and never corrects the state
+/// mean with the observed data (#1285), so the fitted object is the
+/// deterministic ODE mean with an inflated residual variance: it re-weights the
+/// fit rather than supplying the missing dynamics the statistic is reporting.
+/// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
+/// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
+/// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
+/// against a truth of 1.0. The hint returns with the mean update.
 pub(crate) fn dw_autocorrelation_warning(dw: f64) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -870,10 +870,11 @@ fn fit_unstamped(
     // see the data. `ferx check` runs the same `check_model_data` to report
     // every finding; here we stop at the first error to preserve fit()'s
     // historical fail-fast behavior and exact error strings.
-    first_error(&check_model_data_rule(
+    first_error(&crate::api::validation::check_model_data_rule_at(
         model,
         population,
         &options.iov_occasion,
+        init_params,
     ))
     .map_err(|e| e.to_string())?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the

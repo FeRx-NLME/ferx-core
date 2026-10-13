@@ -1022,17 +1022,9 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     rng: &mut R,
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
-    // `simulate()` takes the caller's population as given, so a `correlation`
-    // line's blocks are read here when nothing assigned them (#1081); a fitted
-    // population carries them already.
-    let assigned: Vec<u32>;
-    let obs_rgroup: &[u32] =
-        if residual_cov.serial.is_some() && subject.obs_rgroup.len() != subject.obs_times.len() {
-            assigned = crate::stats::residual_error::residual_groups(model, subject);
-            &assigned
-        } else {
-            &subject.obs_rgroup
-        };
+    // A `correlation` line's blocks are the subject's `obs_rgroup`: assigned once per
+    // call by `simulate_inner_with_draw`, and by `fitted_population` for NPDE (#1081).
+    let obs_rgroup: &[u32] = &subject.obs_rgroup;
     let mut r = match ruv_mult {
         Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
@@ -1167,6 +1159,23 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // Every precondition below is an `Err`, never a panic (#898), and every
     // `simulate*` entry point returns it as is.
     check_simulate_preconditions(model, population, params)?;
+    // `simulate()` takes the caller's population as given, so a `correlation` line's
+    // residual blocks are read off its `by` columns here, once per call rather than
+    // once per replicate (#1081). A fitted population carries them already.
+    let with_blocks;
+    let population = if model.residual_serial.is_some()
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.obs_rgroup.len() != s.obs_times.len())
+    {
+        let mut p = population.clone();
+        crate::stats::residual_error::assign_residual_groups(model, &mut p);
+        with_blocks = p;
+        &with_blocks
+    } else {
+        population
+    };
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()

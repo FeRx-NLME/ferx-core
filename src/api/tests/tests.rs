@@ -339,6 +339,34 @@ fn adaptive_rejects_sde_model() {
     );
 }
 
+/// #1081 review r1 #1: a `correlation` line is refused, naming the line and why;
+/// the same model without it is accepted.
+#[test]
+fn adaptive_rejects_a_residual_correlation_line() {
+    use crate::parser::model_parser::parse_model_string;
+    let with_line = PLAIN_ADAPTIVE_MODEL
+        .replace(
+            "  sigma PROP ~ 0.05 (sd)",
+            "  theta RHO(0.3, -0.4, 0.9)\n  sigma PROP ~ 0.05 (sd)",
+        )
+        .replace(
+            "  DV ~ proportional(PROP)",
+            "  DV ~ proportional(PROP)\n  correlation ar1(RHO) by ARM",
+        );
+    let model = parse_model_string(&with_line).expect("parses");
+    assert!(model.residual_serial.is_some());
+    let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
+        .expect_err("a correlation line is refused");
+    assert_eq!(
+        err,
+        "adaptive-dosing simulation does not support `correlation ar1(RHO) by ARM`: the \
+         controller draws its assay noise one reading at a time, so readings in one block \
+         would be independent. Drop the line for the adaptive simulation."
+    );
+    let plain = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("parses");
+    assert!(reject_unsupported_adaptive(&plain, &adaptive_pop(adaptive_base_subject())).is_ok());
+}
+
 #[test]
 fn adaptive_accepts_time_varying_covariate_subject() {
     use crate::parser::model_parser::parse_model_string;

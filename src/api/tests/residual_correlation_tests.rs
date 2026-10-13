@@ -436,3 +436,51 @@ fn scope_refuses_a_non_gaussian_endpoint() {
     )
     .contains("is not supported with a time-to-event, binary, categorical or Markov endpoint."));
 }
+
+/// #1081 review r1 #3: ρ's range is checked at the parameter set the fit starts
+/// from, not the model's declaration. Widening the bound in the caller's
+/// `init_params` (ferx-r, `--inits-from-nca`) past the CS floor is refused by `fit()`,
+/// while the same model at its declared bounds passes the same check.
+#[test]
+fn rho_range_is_checked_at_the_fits_init_params() {
+    let pop = population(&[&[(1.0, 0.0), (1.0, 1.0), (1.0, 2.0)]]);
+    let m = model("cs", "(0.3, -0.4, 0.95)");
+    let rule = crate::types::IovOccasionRule::Column;
+    assert!(with_code(
+        &super::check_model_data_rule_at(&m, &pop, &rule, &m.default_params),
+        "E_RESIDUAL_CORRELATION_RANGE"
+    )
+    .is_empty());
+    let mut init = m.default_params.clone();
+    init.theta_lower[2] = -0.6;
+    let at_init = super::check_model_data_rule_at(&m, &pop, &rule, &init);
+    assert!(
+        one(&at_init, "E_RESIDUAL_CORRELATION_RANGE").contains("lower bound of theta RHO is -0.6")
+    );
+    let err = crate::api::fit(&m, &pop, &init, &focei()).expect_err("refused");
+    assert!(err.contains("lower bound of theta RHO is -0.6"), "{err}");
+}
+
+/// #1081 review r1 #7: `fitted_population` assigns the blocks even when no other
+/// preparation step applies — here the `by` column is a baseline covariate, so the
+/// subject carries no per-row snapshots and nothing else would copy the population.
+/// The fixture's precondition (no snapshots) is asserted, since every other test's
+/// fixture has them and so reaches the copy through the pruning step.
+#[test]
+fn fitted_population_assigns_blocks_for_a_baseline_by_column() {
+    let m = model("cs", "(0.3, -0.4, 0.95)");
+    let mut pop = population(&[&[(4.0, 0.0), (4.0, 1.0), (4.0, 2.0)]]);
+    pop.subjects[0].obs_covariates.clear();
+    assert!(pop.subjects[0].obs_covariates.is_empty() && pop.subjects[0].obs_rgroup.is_empty());
+    let mut warnings = Vec::new();
+    let out = crate::api::fitted_population(
+        &m,
+        &crate::types::IovOccasionRule::Column,
+        false,
+        std::borrow::Cow::Borrowed(&pop),
+        &mut warnings,
+    );
+    assert_eq!(out.subjects[0].obs_rgroup, vec![1, 1, 1]);
+    // the caller's population is untouched
+    assert!(pop.subjects[0].obs_rgroup.is_empty());
+}

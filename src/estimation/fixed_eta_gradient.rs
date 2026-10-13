@@ -568,7 +568,8 @@ fn obs_nll_subject_grad_impl(
                 subject,
                 &theta_p,
                 sigma_values,
-                model.residual_cov_theta(theta),
+                // At the perturbed θ: a `correlation` line's ρ is a θ (#1081).
+                model.residual_cov_theta(&theta_p),
                 eta,
                 pk_scratch,
             );

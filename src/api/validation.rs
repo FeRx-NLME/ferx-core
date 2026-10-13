@@ -1667,6 +1667,20 @@ pub fn check_model_data_rule(
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
+    check_model_data_rule_at(model, population, iov_rule, &model.default_params)
+}
+
+/// [`check_model_data_rule`] at the parameter set a fit starts from. The one check
+/// that reads parameters, a `correlation` line's admissible ρ (#1081), reads
+/// `params`' θ bounds and `FIX` flags: `fit()` passes its `init_params`, which a
+/// caller (ferx-r, `--inits-from-nca`) may have replaced — the reason
+/// `check_variance_init_rails` reads them too (#1229).
+pub(crate) fn check_model_data_rule_at(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
@@ -1682,7 +1696,7 @@ pub fn check_model_data_rule(
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));
-    diags.extend(check_residual_correlation(model, population));
+    diags.extend(check_residual_correlation(model, population, params));
     // Errors only; the within-occasion-variation *warning* is a separate walk,
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
@@ -4814,12 +4828,16 @@ fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> S
 ///   on its value when it is `FIX`ed.
 /// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
 ///   of one block at the same time have no order.
-fn check_residual_correlation(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+fn check_residual_correlation(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
         return Vec::new();
     };
-    let p = &model.default_params;
+    let p = params;
     let i = serial.rho_theta;
     let rho = model.theta_names.get(i).cloned().unwrap_or_default();
     let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);

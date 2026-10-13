@@ -1403,6 +1403,11 @@ const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
 /// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
 /// to be scored at the optimizer's current value, not the model's declaration.
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
     model: &CompiledModel,
@@ -2717,6 +2722,11 @@ pub fn foce_population_nll_iov(
 }
 
 /// Population FOCE objective: sum over all subjects
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
     model: &CompiledModel,
@@ -2809,6 +2819,11 @@ pub(crate) fn foce_population_nll_cov(
 /// ordinary observation the likelihood scored at its `DV`, so it stays in the
 /// system: gating on the raw flag instead blanked it *and* shifted every other
 /// CWRES of that subject, because the decorrelation mixes rows (#1499).
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
