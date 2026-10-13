@@ -1205,6 +1205,71 @@ mod tests {
         }
     }
 
+    /// `docs/model-file/fit-options.qmd` offers two workarounds for the #1922
+    /// collision and names a second η spelling that resolves. Each is a claim a
+    /// reader will act on, so each gets an assertion:
+    ///
+    /// * **`IIV_V` resolves `V`** — the docs say the η must be the parameter's name
+    ///   or end in `_<PARAM>`, and quote `IIV_V` as well as `ETA_V`. Only `ETA_V`
+    ///   was covered, so half of that sentence was unchecked.
+    /// * **a non-colliding θ name resolves** — "give the θ a name that does not
+    ///   collide" was untested: with `TVCL` renamed `THCL`, which does not contain
+    ///   `V`, a `V = TVV` carrying no η must reach `TVV` through layer 2.
+    ///
+    /// Delete either sentence from the docs and this is the test that says it was
+    /// load-bearing.
+    #[test]
+    fn nca_theta_lookup_honours_both_documented_workarounds() {
+        // Workaround 1: name the eta after its parameter, using the `_<PARAM>`
+        // suffix form rather than the `ETA_` prefix the other fixtures use.
+        let iiv = allometric_cl_intermediate_first()
+            .replace("  omega ETA_V ~ 0.04\n", "  omega IIV_V ~ 0.04\n")
+            .replace("  V = TVV * exp(ETA_V)\n", "  V = TVV * exp(IIV_V)\n");
+        let m = crate::parser::model_parser::parse_model_string(&iiv).expect("parses");
+        assert!(
+            m.mu_refs.iter().any(|(e, _)| e == "IIV_V"),
+            "the eta must be named IIV_V, or this tests a different spelling"
+        );
+        let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+        assert_eq!(
+            m.default_params.theta_names[v], "TVV",
+            "an eta named IIV_V must resolve V through layer 1"
+        );
+
+        // Workaround 2: rename the colliding theta. `THCL` does not contain `V`, so
+        // layer 2's search reaches `TVV` even with no eta on V at all.
+        let renamed = allometric_cl_intermediate_first()
+            .replace("  omega ETA_V ~ 0.04\n", "")
+            .replace("  V = TVV * exp(ETA_V)\n", "  V = TVV\n")
+            .replace("theta TVCL(", "theta THCL(")
+            .replace("TVCL * CLWT", "THCL * CLWT");
+        let m = crate::parser::model_parser::parse_model_string(&renamed).expect("parses");
+        // Layer 2 takes the FIRST theta whose name contains `V`, so the premise is
+        // that none before `TVV` does. (`TVKA` also contains `V`, but it is later.)
+        assert_eq!(
+            m.default_params
+                .theta_names
+                .iter()
+                .find(|n| n.contains('V'))
+                .map(String::as_str),
+            Some("TVV"),
+            "TVV must be the first theta whose name contains `V`, or the workaround \
+             is not what is being tested: {:?}",
+            m.default_params.theta_names
+        );
+        let cl = find_theta_for_slot(&m, PK_IDX_CL).expect("CL theta");
+        let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+        assert_eq!(
+            m.default_params.theta_names[cl], "THCL",
+            "CL still resolves"
+        );
+        assert_eq!(
+            m.default_params.theta_names[v], "TVV",
+            "a non-colliding theta name must let layer 2 reach TVV"
+        );
+        assert_ne!(cl, v, "the two slots must no longer share a theta");
+    }
+
     /// The user-visible half of #1922's characterization (review r2 #1): asserting
     /// that two slots share a θ *index* does not assert what the docs claim, namely
     /// that the volume estimate lands on `TVCL` and `TVV` is never written. A later
