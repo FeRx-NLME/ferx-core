@@ -181,9 +181,15 @@ fn scope_refuses_kappa_and_says_it_is_the_same_covariance() {
 #[test]
 fn scope_refuses_m3_and_sde() {
     let m3 = src("cs", "(0.3, -0.4, 0.95)", "", "  bloq_method = m3\n");
+    let d = scope_for(&m3, &focei());
     assert!(
-        one(&scope_for(&m3, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
-            .contains("is not supported with bloq_method = m3.")
+        one(&d, "E_RESIDUAL_CORRELATION_SCOPE").contains("is not supported with bloq_method = m3.")
+    );
+    // `block_sigma` refuses M3 too (`E_BLOCK_SIGMA_M3_UNSUPPORTED`); that refusal is
+    // about a different object and must not be reported for a `correlation` line.
+    assert!(
+        d.iter().all(|x| !x.code.starts_with("E_BLOCK_SIGMA")),
+        "{d:#?}"
     );
     let sde = src("cs", "(0.3, -0.4, 0.95)", "", "")
         .replace("pk one_cpt_iv(cl=CL, v=V)", "ode(obs_cmt=central, states=[central])")
@@ -226,6 +232,9 @@ fn cs_range_names_the_largest_block_and_its_interval() {
         "{msg}"
     );
     assert!(msg.contains("Keep ρ above -0.5000."), "{msg}");
+    // The floor itself is not admissible: at ρ = −1/2 the 3-row block's `C` is singular.
+    let at_floor = check_model_data(&model("cs", "(0.3, -0.5, 0.95)"), &pop);
+    assert!(one(&at_floor, "E_RESIDUAL_CORRELATION_RANGE").contains("is -0.5, but"));
     let accepted = check_model_data(&model("cs", "(0.3, -0.4, 0.95)"), &pop);
     assert!(
         with_code(&accepted, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
