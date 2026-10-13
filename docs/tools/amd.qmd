@@ -271,10 +271,13 @@ column the rest of the table compares.
   their standard errors**: one row per θ, Ω variance and block covariance
   (`ETA_V × ETA_CL`), Σ, and IOV κ variance and block covariance, each named
   by the model's θ, ETA, sigma or kappa name. A covariance row is listed by the
-  model's layout, not by its size: a diagonal Ω has none, while a `block_omega`
-  covariance is listed even when it is estimated at zero. (A block-κ
-  covariance estimated at exactly zero is the one omission: the fit keeps no
-  initial κ matrix to tell it from a structural zero.) The `Type` column gives
+  model's layout, not by its size: a diagonal Ω has none, and the cross-block
+  zeros of a `block_omega` beside a standalone `omega` are not listed, while a
+  block covariance is listed even at zero when the fit shows it is estimated
+  (a non-zero estimate, initial value or SE). Two zero covariances carry no
+  such evidence and are omitted: a `block_omega` covariance initialised and
+  estimated at zero in a fit without a covariance step, and a block-κ
+  covariance estimated at exactly zero. The `Type` column gives
   the scale (`OMEGA var`, `OMEGA cov`, `SIGMA SD`, `KAPPA var`, `KAPPA cov`);
   Σ is a standard deviation, so a proportional σ of 0.28 is a 28% CV. An SE
   reads `---` when the covariance step produced none (a block-κ covariance

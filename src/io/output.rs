@@ -3401,20 +3401,31 @@ fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind:
 /// `m` that are model parameters rather than structural zeros, in row-major
 /// lower-triangle order.
 ///
-/// Selected by **layout**, not by size: a diagonal layout (`diagonal =
-/// Some(true)`) has none; otherwise an entry is a parameter when its estimate
-/// is non-zero or its initial value `init` was (a `block_omega` entry that
-/// came to rest at exactly 0 is still an estimate). A structural zero — the
-/// cross-block entry of a mixed block + diagonal Ω — is exactly 0 in both,
-/// since its Cholesky coordinate is packed and held at exactly 0 (#1018). The
-/// same rule serves an unrecorded layout (`None`: a `.fitrx` saved before
-/// #1177, a hand-built result). `FitResult` records no initial κ matrix, so a
-/// block-κ covariance that is exactly 0 is indistinguishable from a structural
-/// one and is omitted; any non-zero one is listed, however small.
+/// `FitResult` records the layout (`diagonal`) but not which entries a
+/// `block_omega` declared, so this reads the evidence it does carry:
+///
+/// * a diagonal layout (`Some(true)`) has no off-diagonal parameters;
+/// * otherwise an entry is listed when its estimate is non-zero, its initial
+///   value `init` was, or its SE (`se_at`) is positive. A structural zero —
+///   the cross-block entry of a mixed block + diagonal Ω — is exactly 0 in all
+///   three: its Cholesky coordinate is packed and held at exactly 0 (#1018),
+///   and the covariance step leaves a held coordinate's covariance at 0, so
+///   its delta-method SE is exactly 0 (measured on `warfarin_block_omega` with
+///   the block covariance initialised at 0: SEs 541.05 for the declared entry,
+///   0.0 for both cross-block ones). The SE is what keeps a block entry
+///   initialised *and* estimated at 0.
+///
+/// What stays unresolvable is an entry that is 0 in all three for want of
+/// evidence: a block Ω entry initialised and estimated at 0 with no
+/// covariance step, and any block-κ covariance estimated at exactly 0
+/// (`FitResult` has no initial κ matrix, and no block-κ covariance SE). Those
+/// are omitted. The same rule serves an unrecorded layout (`None`: a `.fitrx`
+/// saved before #1177, a hand-built result).
 fn estimated_offdiag_pairs(
     m: &nalgebra::DMatrix<f64>,
     diagonal: Option<bool>,
     init: Option<&nalgebra::DMatrix<f64>>,
+    se_at: impl Fn(usize, usize) -> Option<f64>,
 ) -> Vec<(usize, usize)> {
     if diagonal == Some(true) {
         return Vec::new();
@@ -3422,10 +3433,11 @@ fn estimated_offdiag_pairs(
     let mut out = Vec::new();
     for i in 0..m.nrows() {
         for j in 0..i {
-            let declared = init
+            let initial = init
                 .and_then(|m0| m0.get((i, j)))
                 .is_some_and(|&v| v != 0.0);
-            if m[(i, j)] != 0.0 || declared {
+            let free = se_at(i, j).is_some_and(|s| s > 0.0);
+            if m[(i, j)] != 0.0 || initial || free {
                 out.push((i, j));
             }
         }
@@ -3441,8 +3453,9 @@ fn estimated_offdiag_pairs(
 /// it is a model parameter, by the fit's recorded layout
 /// (`omega_is_diagonal` / `kappa_is_diagonal`) and not by its size: a diagonal
 /// Ω's structural zeros are not estimates, while a block covariance is listed
-/// even at (or near) zero. See `estimated_offdiag_pairs` for the rule and its
-/// one gap. The `Type` column states the scale: `OMEGA var`,
+/// even at (or near) zero when the fit carries the evidence for it. See
+/// `estimated_offdiag_pairs` for the rule and the two cases it cannot
+/// resolve. The `Type` column states the scale: `OMEGA var`,
 /// `OMEGA cov`, `SIGMA SD` (σ is stored as a standard deviation, as the fit
 /// YAML's `estimate` is), `KAPPA var`, `KAPPA cov`. The SEs are the ones
 /// `run_covariance` writes (`se_theta`, `se_omega` through
@@ -3482,6 +3495,7 @@ pub fn parameter_table(result: &FitResult) -> String {
         &result.omega,
         result.omega_is_diagonal,
         Some(&result.omega_init),
+        |i, j| crate::types::omega_se_at(&result.se_omega, n_eta, i, j),
     ) {
         lines.push(parameter_table_row(
             &format!("{} × {}", eta_name(result, i), eta_name(result, j)),
@@ -3514,7 +3528,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             ));
         }
         // `run_covariance` reports no SE for a block-κ covariance.
-        for (i, j) in estimated_offdiag_pairs(iov, result.kappa_is_diagonal, None) {
+        for (i, j) in estimated_offdiag_pairs(iov, result.kappa_is_diagonal, None, |_, _| None) {
             lines.push(parameter_table_row(
                 &format!("{} × {}", kappa_name(result, i), kappa_name(result, j)),
                 iov[(i, j)],
@@ -5282,6 +5296,16 @@ mod tests {
         let t = parameter_table(&diagonal);
         assert!(!t.contains("OMEGA cov") && !t.contains('×'), "{t}");
 
+        // With no covariance step the declared initial value alone keeps the
+        // row. Catches: the initial value ignored (the SE above would hide it).
+        let mut no_cov = block.clone();
+        no_cov.se_omega = None;
+        let t = parameter_table(&no_cov);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "---", "---", "OMEGA cov"]
+        );
+
         // An unrecorded layout (a `.fitrx` saved before #1177) falls back to
         // the same estimate-or-initial rule.
         block.omega_is_diagonal = None;
@@ -5321,6 +5345,89 @@ mod tests {
         zero.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.0, 0.0, 0.03]));
         let t = parameter_table(&zero);
         assert!(!t.contains("KAPPA cov"), "{t}");
+    }
+
+    /// A 3-ETA mixed Ω, `block_omega (ETA_CL, ETA_V)` + `omega ETA_KA`, with
+    /// the within-block covariance `cov` initialised at `init_cov`. The packed
+    /// SEs follow `run_covariance` on such a fit: the cross-block slots (2,0)
+    /// and (2,1) are exactly 0, the held coordinates' SE.
+    fn mixed_block_omega_result(cov: f64, init_cov: f64) -> FitResult {
+        let mut r = param_table_result_with_ses();
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()];
+        let m =
+            |c: f64| DMatrix::from_row_slice(3, 3, &[0.09, c, 0.0, c, 0.04, 0.0, 0.0, 0.0, 0.3]);
+        r.omega = m(cov);
+        r.omega_init = m(init_cov);
+        r.omega_fixed = vec![false; 3];
+        r.omega_is_diagonal = Some(false);
+        // Column-major packed lower triangle: (0,0) (1,0) (2,0) (1,1) (2,1) (2,2).
+        r.se_omega = Some(vec![0.011, 0.003, 0.0, 0.004, 0.0, 0.05]);
+        r
+    }
+
+    /// #1748 review round 2: `block_omega (ETA_CL, ETA_V) = [0.09, 0.0, 0.04]`
+    /// declares a covariance initialised at 0, and a fit (or an evaluation at
+    /// the initial estimates) can leave it there. Its SE is positive, so it is
+    /// an estimate and keeps its row. The cross-block entries of the same
+    /// matrix are equally 0 in estimate and initial value, but their SE is
+    /// exactly 0: they stay out.
+    #[test]
+    fn parameter_table_keeps_a_zero_initialised_block_covariance_by_its_se() {
+        let t = parameter_table(&mixed_block_omega_result(0.0, 0.0));
+        // Catches: selection by estimate / initial value alone (round 1).
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "0.003000", "---", "OMEGA cov"]
+        );
+        // Catches: every off-diagonal of a non-diagonal layout listed, or a
+        // zero SE counted as evidence (`>= 0`).
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+        assert_eq!(t.matches("OMEGA cov").count(), 1, "{t}");
+        // With no covariance step the zero-initialised entry has no evidence
+        // left and is omitted — the documented gap, pinned.
+        let mut no_cov = mixed_block_omega_result(0.0, 0.0);
+        no_cov.se_omega = None;
+        let t = parameter_table(&no_cov);
+        assert!(!t.contains("OMEGA cov"), "{t}");
+    }
+
+    /// #1748 review round 2: a mixed block + diagonal Ω and κ list the
+    /// within-block covariance and neither cross-block structural zero, with
+    /// SEs (Ω) and without (Ω with no covariance step, and κ, which has none).
+    #[test]
+    fn parameter_table_omits_the_cross_block_zeros_of_a_mixed_layout() {
+        let mut r = mixed_block_omega_result(0.01, 0.01);
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.010000", "0.003000", "30.0", "OMEGA cov"]
+        );
+        // Catches: the whole lower triangle of a non-diagonal layout listed.
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+        r.se_omega = None;
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.010000", "---", "---", "OMEGA cov"]
+        );
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+
+        // κ: `block_kappa (KAPPA_CL, KAPPA_V)` + `kappa KAPPA_KA`.
+        r.omega_iov = Some(DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.05, 0.002, 0.0, 0.002, 0.03, 0.0, 0.0, 0.0, 0.02],
+        ));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into(), "KAPPA_KA".into()];
+        r.kappa_is_diagonal = Some(false);
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "KAPPA_V × KAPPA_CL"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
+        // Catches: the cross-block κ zeros listed.
+        assert!(!t.contains("KAPPA_KA ×"), "{t}");
+        assert_eq!(t.matches("KAPPA cov").count(), 1, "{t}");
     }
 
     // ── format_comparison: multi-run Markdown table ──────────────────────────
