@@ -1763,7 +1763,44 @@ fn fit_inner(
                     && cp.stage_idx < n_stages
                     && cp.packed.len()
                         == crate::estimation::parameterization::packed_len(init_params);
-                if hashes_ok && layout_ok {
+                // #1617 review round 8: and the recorded objective has to be one. A file
+                // written by a build predating #1617 can hold the EBE guard's *rejection
+                // penalty* instead of an objective — those writes are gated on a feasible
+                // evaluation now, but the gate cannot reach a file that already exists, and
+                // nothing else here would refuse it: `SCHEMA_VERSION` is unchanged (the
+                // layout is compatible) and `ferx_version` is recorded but not compared. Its
+                // `packed` is then the scaled midpoint of the declared bounds, so a resume
+                // would adopt that as its own start and report it — #1617's point defect,
+                // surviving an upgrade.
+                //
+                // Identified **structurally**, by where the point sits, and only then by
+                // its magnitude. Round 9 of review killed the magnitude-only version,
+                // rightly: `Checkpoint::ofv` means different things per method — for SAEM it
+                // is an arbitrary iteration's conditional NLL, not an objective at a minimum
+                // — and `ofv_is_valid` admits finite values up to `1e14`, so a threshold
+                // alone would refuse (and the first version *deleted*) a legitimate
+                // large-objective or early-SAEM checkpoint, throwing away hours of progress.
+                //
+                // The fingerprint is exact instead: `guard_penalty_value` is minimised at the
+                // centre of the box, and that centre is scale-free — `c_s · scale =
+                // (lower + upper) / 2` — so a penalty checkpoint's `packed` is the midpoint
+                // of the *packed* bounds in every coordinate. Measured on the unfixed code:
+                // `[-1.956011463563535, 1.9560115078359035, -2.4e-8, -1.5]` against exact
+                // midpoints `[-1.956011502714073, 1.956011502714073, 0.0, -1.5]`, agreeing to
+                // 4e-8, which is where the 1e-6 relative tolerance comes from. Requiring the
+                // magnitude *as well* makes a false positive need a `>= GUARD_PENALTY_BASE`
+                // objective **and** the box centre in every coordinate at once; `>=` rather
+                // than `<` so a `NaN` ofv does not satisfy it.
+                let packed_bounds =
+                    crate::estimation::parameterization::pack_with_bounds(init_params).bounds;
+                let at_box_centre = cp.packed.len() == packed_bounds.lower.len()
+                    && cp.packed.iter().enumerate().all(|(i, &x)| {
+                        let c = (packed_bounds.lower[i] + packed_bounds.upper[i]) / 2.0;
+                        (x - c).abs() <= 1e-6 * (1.0 + c.abs())
+                    });
+                let objective_ok = !(at_box_centre
+                    && cp.ofv >= crate::estimation::outer_optimizer::GUARD_PENALTY_BASE);
+                if hashes_ok && layout_ok && objective_ok {
                     stage_params =
                         crate::estimation::parameterization::unpack_params(&cp.packed, init_params);
                     start_stage = cp.stage_idx;
@@ -1787,11 +1824,23 @@ fn fit_inner(
                     // are simply unavailable we can't prove staleness, so we start
                     // fresh but keep the checkpoint (a later run that does supply
                     // hashes may still use it; a successful fit removes it anyway).
+                    // Deliberately **not** `|| !objective_ok` (#1617 review round 9). This
+                    // block's own rule is that deletion requires *proof* of staleness — "when
+                    // hashes are simply unavailable we can't prove staleness, so we start
+                    // fresh but keep the checkpoint" — and a fingerprint, however tight, is an
+                    // inference. Refusing to resume already closes the defect; deleting is the
+                    // half that cannot be undone if the inference is ever wrong, and it buys
+                    // nothing, because a successful fit removes the file through
+                    // `finish_success` anyway. The cost of keeping it is one warning per run.
                     let stale = (hashes_present && !hashes_match) || !layout_ok;
                     let reason = if hashes_present && !hashes_match {
                         "model or data changed since it was written"
                     } else if !layout_ok {
                         "its parameter layout does not match this model"
+                    } else if !objective_ok {
+                        "it holds the EBE guard's rejection penalty at the midpoint of \
+                         the parameter bounds, so the run that wrote it had no feasible \
+                         evaluation; the file is kept but not resumed from"
                     } else {
                         "its model/data integrity hashes are unavailable"
                     };

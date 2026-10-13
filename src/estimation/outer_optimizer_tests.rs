@@ -2957,13 +2957,23 @@ fn test_stall_retry_rejects_a_non_finite_retry() {
 fn test_mid_descent_restart_skips_a_non_finite_objective() {
     use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
 
-    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
-    assert!(worth_restarting_mid_descent(true, -676.7746, true));
-    assert!(!worth_restarting_mid_descent(true, f64::NAN, true));
-    assert!(!worth_restarting_mid_descent(true, f64::INFINITY, true));
-    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY, true));
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    assert!(worth_restarting_mid_descent(true, -676.7746, true, false));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, true, false));
+    assert!(!worth_restarting_mid_descent(
+        true,
+        f64::INFINITY,
+        true,
+        false
+    ));
+    assert!(!worth_restarting_mid_descent(
+        true,
+        f64::NEG_INFINITY,
+        true,
+        false
+    ));
     // A finite objective is not on its own a reason to restart.
-    assert!(!worth_restarting_mid_descent(false, 3209.8087, true));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, true, false));
 }
 
 /// A stall on the last permitted evaluation is not restarted (#1428): the
@@ -2976,10 +2986,42 @@ fn test_mid_descent_restart_skips_a_non_finite_objective() {
 fn test_mid_descent_restart_needs_budget_left() {
     use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
 
-    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
-    assert!(!worth_restarting_mid_descent(true, 3209.8087, false));
-    assert!(!worth_restarting_mid_descent(false, 3209.8087, false));
-    assert!(!worth_restarting_mid_descent(true, f64::NAN, false));
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    assert!(!worth_restarting_mid_descent(true, 3209.8087, false, false));
+    assert!(!worth_restarting_mid_descent(
+        false, 3209.8087, false, false
+    ));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, false, false));
+}
+
+/// A leg with **no feasible evaluation** is not restarted (#1617 review round 1 #1).
+///
+/// After the #1617 restore such a leg reports the point it was handed, so the restart
+/// would begin exactly where this leg began, with the same `hold_cap_at_init = false` and
+/// the same empty `(s, y)` memory — a deterministic replay of a prefix of the leg that
+/// just failed, which cannot find a feasible evaluation the first leg missed.
+///
+/// The verdict's *position* in `optimize_nlopt_once` does not provide this. The first
+/// version of #1617 claimed it did — the demotion sits after `stalled_mid_descent` is
+/// read — but `stalled_mid_descent` is already `true` for an all-infeasible leg that ends
+/// in a bare NLopt `Failure` rather than `Success`: `stationarity_check_pending` is set,
+/// and `failure_is_converged_plateau` cannot promote a run whose `last_sig_feasible_eval`
+/// is 0. The issue's own reproduction ends in `Success`, so no test reached the other
+/// branch. The `no_feasible_eval = true` rows below are the ones that fail if the fourth
+/// argument is dropped or OR-ed instead of AND-ed.
+#[test]
+fn test_mid_descent_restart_skips_a_run_with_no_feasible_evaluation() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    // The #1277 case: a real stall, on a real objective, with budget left.
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    // The same run, except nothing it evaluated was feasible.
+    assert!(!worth_restarting_mid_descent(true, 3209.8087, true, true));
+    // And it stays off whatever the other three say — the finite-objective row is the
+    // one an OR would let through.
+    assert!(!worth_restarting_mid_descent(true, -676.7746, true, true));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, true, true));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, true, true));
 }
 
 /// The restart leg's evaluation budget is the fit's budget less what the

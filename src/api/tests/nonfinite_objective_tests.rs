@@ -57,7 +57,12 @@ fn one_cpt_model() -> CompiledModel {
 }
 
 /// The #1296 model: a rapid-equilibrium two-state ODE, benign at `KFAST = 1`.
-fn two_state_model() -> CompiledModel {
+///
+/// `pub(super)` so #1617's sibling test module can reuse it rather than copy it: the same
+/// population is the only end-to-end input that makes *every* objective non-finite, which
+/// is the entry condition for `no_feasible_eval_warning`'s non-finite arm. One fixture, two
+/// properties — see `api::no_feasible_eval_tests::an_all_non_finite_run_reports_the_non_finite_arm_end_to_end`.
+pub(super) fn two_state_model() -> CompiledModel {
     parse_model_string(
         r#"
 [parameters]
@@ -82,7 +87,8 @@ fn two_state_model() -> CompiledModel {
     .expect("parse")
 }
 
-fn subject_with_dose_time(id: &str, dose_time: f64, scale: f64) -> Subject {
+/// `pub(super)` for the same reason as [`two_state_model`].
+pub(super) fn subject_with_dose_time(id: &str, dose_time: f64, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 50.0 / (1.0 + t)).collect();
     Subject {

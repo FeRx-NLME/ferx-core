@@ -340,6 +340,12 @@ mod stalled_at_init_warning_tests;
 #[path = "tests/nonfinite_objective_tests.rs"]
 mod nonfinite_objective_tests;
 
+// #1617: a run whose every outer trial was rejected is not a converged fit at the
+// midpoint of its bounds.
+#[cfg(test)]
+#[path = "tests/no_feasible_eval_tests.rs"]
+mod no_feasible_eval_tests;
+
 #[cfg(test)]
 #[path = "tests/ode_solver_options_tests.rs"]
 mod ode_solver_options_tests;

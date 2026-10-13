@@ -1231,8 +1231,21 @@ fn ebe_guard_rejects(
 /// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
 /// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
 /// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+/// The floor of [`guard_penalty_value`] — the wall a guard-rejected gradient evaluation
+/// returns before the quadratic term is added, so every value that function can produce is
+/// `>= GUARD_PENALTY_BASE`.
+///
+/// Named and `pub(crate)` because `api::fit`'s resume check reads it (#1617 review round 8):
+/// a checkpoint whose recorded objective is at or above this floor was written from a
+/// guard-rejected point, which violates [`crate::io::checkpoint::Checkpoint::ofv`]'s own
+/// contract ("the unpenalized −2LL at that point") and means the file came from a run with
+/// no feasible evaluation. Far above any legitimate population objective — real −2 log L
+/// reaches ~10⁶–10⁷ even for very large cohorts, five orders below this — and below the
+/// `1e20` wall the derivative-free arm returns, so it catches both shapes.
+pub(crate) const GUARD_PENALTY_BASE: f64 = 1e12;
+
 fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
-    const BASE: f64 = 1e12;
+    const BASE: f64 = GUARD_PENALTY_BASE;
     let pen: f64 = xs
         .iter()
         .enumerate()
@@ -1889,6 +1902,184 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
          variance driven to zero — and fix the data or the model rather than the optimizer \
          settings.",
         nonfinite_objective_reason(ofv)
+    ))
+}
+
+/// The `W_` token a run that never scored the real objective carries (#1617), so
+/// [`crate::types::classify_warning`] routes it on the token rather than on prose a
+/// later edit could change out from under it.
+pub(crate) const NO_FEASIBLE_EVAL_TOKEN: &str = "W_NO_FEASIBLE_EVAL";
+
+/// What an outer run's evaluation trace says about whether it ever stood on
+/// feasible ground — the input to [`no_feasible_eval_warning`].
+pub(crate) struct RunFeasibility {
+    /// Unguarded evaluations, read off the feasible-eval plateau tracker. `0` means
+    /// the optimizer never once scored the real objective.
+    pub(crate) feasible_evals: usize,
+    /// Evaluations [`ebe_guard_rejects`] rejected.
+    pub(crate) n_guard_rejected: usize,
+    /// Evaluations the `guarded` branch absorbed for the *other* reason — the objective
+    /// was not a finite number — counted at the source rather than inferred as
+    /// "callbacks minus guard rejections" (#1617 review round 3 #2). The objective
+    /// closure has two fast paths that increment the callback counter without producing
+    /// an objective at all: cancellation (which returns before the increment) and the
+    /// latched stagnation guard, which increments it and returns the incumbent
+    /// `state.best_ofv`. A subtraction would file every post-latch callback under
+    /// "returned a non-finite objective", which is false, and no arithmetic check on the
+    /// message could notice.
+    pub(crate) n_nonfinite: usize,
+    /// Worst per-evaluation unconverged-subject count seen (the fraction trigger).
+    pub(crate) max_unconverged: usize,
+    /// Subjects in the population — the denominator the guard's fraction is taken over.
+    pub(crate) n_subj: usize,
+    /// `FitOptions::max_unconverged_frac`, quoted back in the remedy.
+    pub(crate) max_unconverged_frac: f64,
+    /// `FitOptions::inner_maxiter`, quoted back in the remedy.
+    pub(crate) inner_maxiter: usize,
+    /// The user cancelled. Cancelled evaluations short-circuit at the top of the
+    /// objective, *before* the feasible counter advances, so `feasible_evals == 0`
+    /// then says nothing about the model and must not be reported as a defect.
+    pub(crate) cancelled: bool,
+}
+
+impl RunFeasibility {
+    /// Evaluations that actually produced an objective for the optimizer to reject —
+    /// the number the message calls the run's *trials*. Deliberately the sum of the two
+    /// causes rather than the raw callback count, so the two cannot disagree: see
+    /// [`RunFeasibility::n_nonfinite`].
+    pub(crate) fn n_trials(&self) -> usize {
+        self.n_guard_rejected + self.n_nonfinite
+    }
+
+    /// Whether the run never scored the real objective. Spelled **once**, on the type,
+    /// because two consumers key on it 250 lines apart — the best-seen restore, which
+    /// decides *which point* the fit reports, and [`no_feasible_eval_warning`], which
+    /// decides *what it says about it*. Written out at both sites they would be
+    /// complementary boolean expressions that have to stay complementary; a fit whose
+    /// estimates and whose explanation disagreed about this is exactly the shape of the
+    /// defect being fixed.
+    pub(crate) fn no_feasible(&self) -> bool {
+        self.feasible_evals == 0 && !self.cancelled
+    }
+}
+
+/// Lower-case the first character, for a sentence fragment spliced after "For those, ".
+/// Spelled out rather than inlined so the shared remedy text exists exactly once — it is
+/// the arm's whole advice in one place and the mixed clause's in the other.
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+    }
+}
+
+/// Demote `converged` and name the reason when **no** outer evaluation was feasible
+/// (#1617): every trial was rejected by the EBE convergence guard, or returned a
+/// non-finite objective, so nothing the optimizer ranked is an estimate of anything.
+///
+/// Why this is not caught by any of the existing gates. A guard-rejected trial is
+/// scored by [`guard_penalty_value`] — `1e12 + 50·Σ(xs − c)²`, a quadratic bowl
+/// centred on the **scaled midpoint of the declared bounds** — so a gradient
+/// optimizer handed nothing else minimises *that*, walks to the box centre, and NLopt
+/// returns `Success` because the penalty really is stationary there. The best-seen
+/// tracker then ranks only penalties, its minimum is the centre, and the final inner
+/// loop re-scores that point into an ordinary-looking finite OFV. Every downstream
+/// check reads a plausible number: [`gate_converged_on_objective`] sees a finite
+/// objective, [`cold_solve_verdict`] compares the re-score against `1e12` and calls it
+/// a reproduction, and the plateau check never runs because the status was `Success`.
+/// Measured on the issue's report: warfarin at `inner_maxiter = 5` reported
+/// `converged = true` with θ at `sqrt(lower·upper)` in every coordinate to 3e-9.
+///
+/// The share of unconverged subjects is reported from the **worst** trial rather than
+/// the last, because the last trial of a centre-seeking walk is the least informative
+/// one and "how bad did it get" is what sizes `inner_maxiter`.
+///
+/// Two cause arms, because the remedies are not the same thing:
+///
+/// * the **guard** rejected the trials, which is the case `inner_maxiter` and
+///   `max_unconverged_frac` move;
+/// * a trace of **non-finite** objectives never involved the guard at all, so naming the
+///   guard there would be false, and the remedy is the data/model one
+///   [`gate_converged_on_objective`] gives.
+///
+/// [`ebe_guard_rejects`] has a *second*, unconditional trigger — a subject rejected at its
+/// inner start — and this message deliberately does **not** branch on it (#1617 review
+/// rounds 1 #4 / 2 #4). That trigger fires only through `has_informative_warm_start` in
+/// `inner_optimizer::find_ebe_iov`, i.e. some |η| > 1e-8 carried in from a previous trial,
+/// and [`adopt_warm_start`] withholds the EBE cache update on every guarded evaluation
+/// (#1290) — so a run whose evaluations were *all* guarded still holds the
+/// `new_nlopt_state` zeros and no subject can be start-rejected. An arm for it would be
+/// advice no run can produce, which is prose nobody has checked; the earlier version
+/// shipped one and it is gone. The guard arm's sentence is therefore worded to stay *true*
+/// rather than merely useful if that cell is ever reached — "at worst N of M … failed to
+/// converge, **against** `max_unconverged_frac`", not "above" it, so a rejection that was
+/// not the fraction trigger's is not misdescribed. The invariant the unreachability rests
+/// on is pinned by `adopt_warm_start_takes_only_feasible_improvements`.
+///
+/// `cancelled` short-circuits the whole thing: a cancelled run returns `1e20` from the
+/// top of the objective before the feasible counter advances, so its trace is
+/// infeasible by construction.
+pub(crate) fn no_feasible_eval_warning(
+    converged: &mut bool,
+    run: &RunFeasibility,
+) -> Option<String> {
+    if !run.no_feasible() {
+        return None;
+    }
+    *converged = false;
+
+    let n_subj = run.n_subj.max(1);
+    let poisoned_objective_remedy = "Look for the parameter value or record that poisons \
+         the objective at and around the starting estimates — a non-finite dose time, \
+         lagtime, bioavailability or infusion duration, a covariate model that overflows, \
+         or a residual variance driven to zero.";
+    let (cause, remedy) = if run.n_guard_rejected > 0 {
+        (
+            format!(
+                "the EBE convergence guard rejected {} of them; at worst {} of {} subjects' \
+                 inner loops failed to converge, against `max_unconverged_frac` = {}.",
+                run.n_guard_rejected, run.max_unconverged, n_subj, run.max_unconverged_frac,
+            ),
+            format!(
+                "Raise `inner_maxiter` (currently {}) so the inner loop can reach the EBEs \
+                 within its budget, or raise `max_unconverged_frac` (`1.0` disables the guard) \
+                 to let the fit proceed with the unconverged subjects.",
+                run.inner_maxiter,
+            ),
+        )
+    } else {
+        (
+            "every trial returned a non-finite objective, so the EBE convergence guard never \
+             came into it."
+                .to_string(),
+            format!("{poisoned_objective_remedy} This is not an optimizer setting."),
+        )
+    };
+    // A trace with both causes gets both remedies (#1617 review round 3 #1). The guard
+    // remedy alone would be advice that cannot reach the trials whose objective was not a
+    // number — `inner_maxiter` does not make a `NaN` finite — and the reader has no way to
+    // know the sentence only covers part of what the sentence before it just reported.
+    let mixed = if run.n_guard_rejected > 0 && run.n_nonfinite > 0 {
+        (
+            format!(
+                " The remaining {} returned a non-finite objective.",
+                run.n_nonfinite,
+            ),
+            format!(" For those, {}", lower_first(poisoned_objective_remedy)),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
+    Some(format!(
+        "{NO_FEASIBLE_EVAL_TOKEN}: the outer optimizer finished without a single feasible \
+         objective evaluation — all {} of its trials were rejected before they could be \
+         ranked, so no OFV was ever minimised and the estimates reported are the ones the \
+         fit started from. Specifically, {cause}{} {remedy}{}",
+        run.n_trials(),
+        mixed.0,
+        mixed.1,
     ))
 }
 
@@ -2714,6 +2905,15 @@ fn optimize_nlopt_once(
         }
     }
 
+    // The iterate NLopt is actually handed, snapshotted after the optional global
+    // pre-search has had its say. Deliberately *not* `x0_start_s`: that snapshot
+    // predates the pre-search, and `global_search = true` moves `x0` to a point the
+    // pre-search already scored feasibly — which is the point a run that then scores
+    // nothing feasible should fall back to (#1617), not the start the pre-search was
+    // run to improve on. Identical to `x0_start_s` whenever the pre-search is off,
+    // which is the default.
+    let optimizer_start_s: Vec<f64> = x0.clone();
+
     let state = new_nlopt_state(
         n_subj,
         n_eta,
@@ -2788,6 +2988,11 @@ fn optimize_nlopt_once(
         max_unconverged: usize,
         total_fallback: usize,
         n_convergence_warnings: usize,
+        /// Evaluations rejected because the objective was not a finite number rather than
+        /// by the EBE guard (#1617 review round 3 #2). Counted here, not inferred from the
+        /// callback count, because the latched-stagnation fast path increments that counter
+        /// and returns the incumbent objective without producing a trial at all.
+        n_nonfinite: usize,
     }
     let ebe_accum: Arc<Mutex<EbeAccum>> = Arc::new(Mutex::new(EbeAccum::default()));
     let ebe_accum_cl = Arc::clone(&ebe_accum);
@@ -2972,6 +3177,8 @@ fn optimize_nlopt_once(
             acc.total_fallback += ebe_stats.n_fallback;
             if ebe_guard_triggered {
                 acc.n_convergence_warnings += 1;
+            } else if !raw_ofv.is_finite() {
+                acc.n_nonfinite += 1;
             }
         }
 
@@ -3256,7 +3463,19 @@ fn optimize_nlopt_once(
         // probe that happens to land on the due window from being recorded as
         // where the fit is (#1317) — `best_seen` is updated just above, so it is
         // never empty here, and it is the same tracker the #59 restore reads.
-        if crate::io::checkpoint::is_due() {
+        //
+        // #1617 review round 7: and only once something feasible has been *seen*. Until
+        // then `best_seen` ranks `guard_penalty_value`s, so its minimum is the scaled
+        // midpoint of the declared bounds — and a checkpoint is a *starting point* for the
+        // next run, which is the one place the exit-time fallback below cannot help: resume
+        // from such a file and the midpoint becomes the resumed fit's own start, so the
+        // fallback faithfully restores it and #1617's point defect survives the interrupt.
+        // Writing nothing is the right answer rather than writing the optimizer start,
+        // because an absent file means "resume from the model's initial estimates", which is
+        // exactly where a run that has found nothing should begin. `is_due()` is tested
+        // first: it is `false` whenever no sink is active, so the default path does not take
+        // the plateau lock.
+        if crate::io::checkpoint::is_due() && plateau_tracker_cl.lock().unwrap().2 > 0 {
             best_seen_cl
                 .lock()
                 .unwrap()
@@ -3403,11 +3622,55 @@ fn optimize_nlopt_once(
 
     drop(opt);
 
+    // #1617: what this run's evaluation trace says about whether it ever stood on
+    // feasible ground. Read here, as soon as `opt` is dropped and the counters are final,
+    // because three separate decisions below key on it: whether the budget advice makes
+    // any sense (immediately below), which point the best-seen restore reports, and the
+    // verdict plus its warning. The cancellation field is not belt-and-braces — a
+    // cancelled run returns `1e20` from the top of the objective *before* the feasible
+    // counter advances, so its trace is infeasible by construction and says nothing about
+    // the model (see [`RunFeasibility::no_feasible`]).
+    let feasibility = {
+        let feasible_evals = plateau_tracker.lock().unwrap().2;
+        let ebe_now = ebe_accum.lock().unwrap();
+        RunFeasibility {
+            feasible_evals,
+            n_guard_rejected: ebe_now.n_convergence_warnings,
+            n_nonfinite: ebe_now.n_nonfinite,
+            max_unconverged: ebe_now.max_unconverged,
+            n_subj,
+            max_unconverged_frac: options.max_unconverged_frac,
+            inner_maxiter: options.inner_maxiter,
+            cancelled: crate::cancel::is_cancelled(&options.cancel),
+        }
+    };
+
+    // Whether "increase `maxiter`" is advice this run can act on (#1617 review). A run
+    // with no feasible evaluation cannot: there is no fit to tighten, and a longer *outer*
+    // budget buys only more rejected trials. `W_NO_FEASIBLE_EVAL` names the budget that
+    // actually binds — `inner_maxiter`, or `max_unconverged_frac` — so offering the outer
+    // knob beside it sends the reader at the wrong one. Only the *advice* is withheld:
+    // `max_eval_reached` itself still reads true, so `latched_stop_needs_plateau_check`
+    // above and the second arm's own conditions are unchanged.
+    //
+    // One binding read by **both** budget warnings rather than the same condition written
+    // twice (#1617 review round 2 #2). The `MaxEvalReached` arm just below is reachable and
+    // pinned by `a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter`; the bare
+    // `Failure`-with-spent-budget arm further down is not, and for a structural reason —
+    // that arm needs NLopt to return a bare `Failure`, and the guard penalty is an exact
+    // quadratic whose value and gradient agree by construction (#486), so no line search
+    // fails on it. Measured with this gate removed, across `slsqp` / `nlopt_lbfgs` / `mma`
+    // at three outer budgets on an all-rejected trace: every run came back in a *success*
+    // state with its budget exactly spent, so `!max_eval_reached` excluded the arm in all
+    // nine cases. Written twice, the unreachable copy would be an independently-breakable
+    // gate no test can reach; collapsed, the mutation that reddens E4 covers both sites.
+    let budget_advice_applies = !feasibility.no_feasible();
+
     // A spent evaluation budget gets a targeted "increase maxiter" warning; every
     // other non-convergence falls through to the generic "did not converge"
     // warning below. There is no automatic second optimization — a user who wants
     // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
-    if max_eval_reached {
+    if max_eval_reached && budget_advice_applies {
         warnings.push(format!(
             "Outer optimization hit the evaluation budget (maxiter = {}) before \
              converging; increase maxiter for a tighter fit.",
@@ -3432,8 +3695,28 @@ fn optimize_nlopt_once(
     // against the equally clean `final_ofv` in the plateau self-consistency
     // check below, and mixing a penalized best with a clean final would loosen
     // that check by exactly the penalty magnitude.
+    //
+    // #1617: unless there was nothing feasible to rank (`feasibility`, read above). Every
+    // evaluation of such a run was scored by `guard_penalty_value`, whose minimum is the
+    // scaled midpoint of the declared bounds, so the best-seen point is the box centre — a
+    // place the optimizer reached because the *penalty* is stationary there, not the
+    // objective. Restoring it dresses a failed run as a fit at a specific wrong estimate
+    // (the issue's warfarin run matched `sqrt(lower·upper)` in every θ to 3e-9, with
+    // `converged = true`). Fall back to the point this leg started from, and say so in
+    // `warnings` below. Leaving `best_seen_ofv` at `None` matters too: the #833 candidate
+    // check would otherwise compare the finite re-score against a `1e12` penalty and call
+    // that a reproduction.
     let mut best_seen_ofv: Option<f64> = None;
-    if let Some(best) = best_seen.lock().unwrap().get() {
+    if feasibility.no_feasible() {
+        x0.copy_from_slice(&optimizer_start_s);
+        if options.verbose {
+            eprintln!(
+                "No feasible evaluation in {} outer trials — reporting the starting \
+                 estimates rather than the guard penalty's minimum.",
+                n_evals_outer.load(Ordering::Relaxed),
+            );
+        }
+    } else if let Some(best) = best_seen.lock().unwrap().get() {
         if best.x.len() == n {
             x0.copy_from_slice(&best.x);
             best_seen_ofv = Some(best.ofv_clean);
@@ -3666,6 +3949,19 @@ fn optimize_nlopt_once(
     // `converged` for an entirely different reason — see
     // [`worth_restarting_mid_descent`], which is handed this and the objective.
     let stalled_mid_descent = stationarity_check_pending && !converged;
+    // #1617: no feasible evaluation at all. Placed *after* `stalled_mid_descent` is read,
+    // for the same reason `gate_converged_on_objective` is: that boolean must mean "NLopt
+    // returned a bare `Failure` and the plateau check rejected it", not "`converged` is
+    // false for any reason at all". The infeasibility is kept out of the #1277 restart by
+    // [`worth_restarting_mid_descent`], which is handed it as a separate argument —
+    // *not* by this statement's position (#1617 review round 1 #1: the first version
+    // claimed the position did it, and an all-infeasible leg that ended in `Failure`
+    // rather than `Success` was restarted anyway). Placed *before* the covariance step and
+    // the generic "did not converge" line, so the specific reason reaches the user
+    // alongside both (the same ordering #1303 uses).
+    if let Some(w) = no_feasible_eval_warning(&mut converged, &feasibility) {
+        warnings.push(w);
+    }
     // Whether any of the fit's budget is left for a restart to run on (#1428).
     // `n_evals_outer` counts objective calls, the same thing NLopt's `maxeval`
     // counts — but `maxeval` is a *soft* bound for L-BFGS: `luksan/plis.c` checks
@@ -3736,7 +4032,9 @@ fn optimize_nlopt_once(
     // budget, not the stall — a line search that fails after crossing `maxeval`
     // is a bare `Failure`, so the `max_eval_reached` branch above never saw it.
     // Same advice as that branch, not pushed twice.
-    if stalled_mid_descent && !budget_left && !max_eval_reached {
+    // `budget_advice_applies` for the same reason as the `max_eval_reached` arm above, and
+    // from the same binding — see the comment there for why it is one binding and not two.
+    if stalled_mid_descent && !budget_left && !max_eval_reached && budget_advice_applies {
         warnings.push(format!(
             "Outer optimization stopped mid-descent with its evaluation budget (maxiter = {}) \
              spent, so it was not restarted; increase maxiter for a tighter fit.",
@@ -3824,6 +4122,7 @@ fn optimize_nlopt_once(
                 stalled_mid_descent,
                 final_ofv,
                 budget_left,
+                feasibility.no_feasible(),
             ),
             stagnation_latched: latched,
             plateau_checked: stationarity_check_pending,
@@ -3852,12 +4151,31 @@ fn optimize_nlopt_once(
 /// one. Such a run is reported as it stands, with an "increase maxiter" warning
 /// of its own: the ordinary budget warning is keyed on `MaxEvalReached`, which a
 /// line search that fails after crossing `maxeval` never returns.
+///
+/// `no_feasible_eval` is [`RunFeasibility::no_feasible`] — not one evaluation scored the
+/// real objective (#1617). Such a leg has nothing to descend *from*: after the restore it
+/// reports the point it was handed, so the restart would begin exactly where this leg
+/// began, with `hold_cap_at_init = false` as this leg had it and a fresh `(s, y)` memory
+/// that this leg also started with. That makes it a deterministic replay of a prefix of
+/// the leg that just failed — the trajectory is a function of the start point and the cap
+/// state, and both are identical — so it cannot find a feasible evaluation the first leg
+/// missed, and the strictly-lower adoption rule then discards it. A fourth argument rather
+/// than a term folded into `stalled_mid_descent` at the call site, for the reason the
+/// objective is a third: the call site has to read `stalled_mid_descent` *before* the
+/// verdict is demoted, so the two facts cannot be combined there without re-introducing
+/// exactly the ordering bug the paragraph above describes.
+///
+/// This is **not** the same trade as the #751 `left_init` retry, which *is* run on an
+/// infeasible leg: that retry passes `hold_cap_at_init = true`, so its opening step is
+/// genuinely different, and a smaller first step is one of the ways a starved inner loop
+/// converges. One replay is waste; one different configuration is a chance.
 fn worth_restarting_mid_descent(
     stalled_mid_descent: bool,
     final_ofv: f64,
     budget_left: bool,
+    no_feasible_eval: bool,
 ) -> bool {
-    stalled_mid_descent && ofv_is_valid(final_ofv) && budget_left
+    stalled_mid_descent && ofv_is_valid(final_ofv) && budget_left && !no_feasible_eval
 }
 
 /// The `FitResult` warning a fit carries when it was restarted mid-descent and
