@@ -14722,7 +14722,49 @@ fn a_spare_slot_reader_matches_fd_on_the_fallback_path() {
             "{label}: S must own a row: {rows:?}"
         );
         let subj = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        check_full_provider_vs_fd(&m, &subj, &[0.2, 10.0, 5.0], &[0.1, -0.05, 0.2]);
+        let theta = [0.2, 10.0, 5.0];
+        let eta = [0.1, -0.05, 0.2];
+        check_full_provider_vs_fd(&m, &subj, &theta, &eta);
+
+        // The **light** η-only provider is a second consumer of the same fallback
+        // rows and had no spare-slot parity (review r5 #1): every other light-path
+        // fixture carries only structural rows, so a mutation dropping the spare
+        // row from `lognormal_eta_derivatives_only` would lose `ETA_S`'s inner
+        // gradient silently. `ETA_S` is on the read name only, so its column is
+        // exactly the spare row's contribution.
+        let s_eta = m.eta_names.iter().position(|n| n == "ETA_S").unwrap();
+        let light = subject_eta_grad(&m, &subj, &theta, &eta).expect("light supported");
+        let he = 1e-6;
+        let pred =
+            |e: &[f64], j: usize| -> f64 { compute_predictions_with_tv(&m, &subj, &theta, e)[j] };
+        let mut worst_s: f64 = 0.0;
+        for (j, g) in light.iter().enumerate() {
+            for k in 0..m.n_eta {
+                let mut ep = eta.to_vec();
+                ep[k] += he;
+                let mut em = eta.to_vec();
+                em[k] -= he;
+                let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+                assert!(
+                    g.df_deta[k].is_finite() && fd.is_finite(),
+                    "{label}: light obs {j} eta {k}: non-finite ({} vs {fd})",
+                    g.df_deta[k]
+                );
+                approx::assert_relative_eq!(g.df_deta[k], fd, max_relative = 2e-4, epsilon = 1e-7);
+            }
+            // Premise: the spare row actually moves the prediction, or the parity
+            // above is a comparison of two zeros.
+            assert!(
+                g.df_deta[s_eta].is_finite(),
+                "{label}: obs {j} dERR/dETA_S must be finite"
+            );
+            worst_s = worst_s.max(g.df_deta[s_eta].abs());
+        }
+        assert!(
+            worst_s > 1e-6,
+            "{label}: ETA_S must move the prediction through the spare slot, \
+             worst |df/dETA_S| = {worst_s}"
+        );
     }
 }
 
