@@ -2146,12 +2146,15 @@ fn build_iov_sources(
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
     let combined_for =
         |k: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, k);
-    // EVID=2 (`pk_only`) rows carry no occasion label → BSV η with zero κ (matches
-    // production `predict_iov`). Their κ derivatives are dropped from the stacked
-    // axes (group `None` below), so the prediction holds κ fixed at 0. Single-sourced
-    // with the ODE IOV provider via the shared helper (#598 review).
+    // A pk-only row runs under its own occasion's group (`crate::pk::pk_only_row_occasion`,
+    // #1876), like production `predict_iov`. One whose occasion has no group gets the
+    // BSV-only effect `[η_bsv, κ = 0]` with its κ derivatives dropped from the stacked
+    // axes (group `None` below), so the prediction holds κ fixed at 0 there. That κ = 0
+    // vector is single-sourced with the ODE IOV provider via the shared helper (#598
+    // review).
     let combined_pk_only: Vec<f64> =
         crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+    let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, &occ_to_k);
 
     let prog = model
         .indiv_param_partials
@@ -2245,12 +2248,14 @@ fn build_iov_sources(
             sources.push((pk, cd, Some(g)));
         }
         for m in 0..subject.pk_only_times.len() {
+            let g = pk_only_group(m);
+            let combined = g.map_or_else(|| combined_pk_only.clone(), combined_for);
             let cov = subject.pk_only_cov(m);
             let t = subject.pk_only_times[m];
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
-            let cd = cd_at(t, &combined_pk_only, cov)?;
+            let pk = (model.pk_param_fn)(theta, &combined, cov, t);
+            let cd = cd_at(t, &combined, cov)?;
             pkonly_src[m] = sources.len();
-            sources.push((pk, cd, None));
+            sources.push((pk, cd, g));
         }
         if want_scale {
             let mut groups = Vec::with_capacity(k_groups);
@@ -2280,14 +2285,22 @@ fn build_iov_sources(
             let occ = subject.occasions.get(j).copied()?;
             obs_src[j] = group_source[*occ_to_k.get(&occ)?];
         }
-        if !subject.pk_only_times.is_empty() {
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
-            let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
-            let idx = sources.len();
-            sources.push((pk, cd, None));
-            for m in 0..subject.pk_only_times.len() {
-                pkonly_src[m] = idx;
-            }
+        // A pk-only row shares its group's source; one κ = 0 source, built on first
+        // use, serves every row whose occasion has no group.
+        let mut ungrouped: Option<usize> = None;
+        for m in 0..subject.pk_only_times.len() {
+            pkonly_src[m] = match (pk_only_group(m), ungrouped) {
+                (Some(g), _) => group_source[g],
+                (None, Some(idx)) => idx,
+                (None, None) => {
+                    let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
+                    let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
+                    let idx = sources.len();
+                    sources.push((pk, cd, None));
+                    ungrouped = Some(idx);
+                    idx
+                }
+            };
         }
         if want_scale {
             // Reuse the per-group static sources (identical `(pk, cd)` at `t = 0`) —
@@ -2425,8 +2438,9 @@ fn subject_eta_grad_iov_analytical(
 ///
 /// `sources[src] = (pk, cd, group)`; `dose_src`/`obs_src`/`pkonly_src` map each
 /// event to its source index. `group = Some(g)` scatters the κ columns to occasion
-/// group `g`'s stacked block; `None` (a pk_only / EVID=2 event) drops them, so the
-/// prediction holds κ fixed at 0. One dual is built per *source* and cached, so a
+/// group `g`'s stacked block; `None` (a pk-only event whose occasion has no group,
+/// #1876) drops them, so the prediction holds κ fixed at 0. One dual is built per
+/// *source* and cached, so a
 /// subject-static-covariate subject still pays one build per occasion group.
 #[allow(clippy::too_many_arguments)]
 fn run_obs_iov<const M: usize>(
@@ -2464,7 +2478,7 @@ fn run_obs_iov<const M: usize>(
     // carrying `val` and `∂/∂(θ_chunk, stacked-η)`. The combined column `c` maps to a
     // stacked axis: η_bsv (`c < n_eta`) → shared `nc + c`; κ (`c ≥ n_eta`) →
     // group g's block `nc + n_eta + g·n_kappa + (c−n_eta)`, or is dropped when
-    // `group` is `None` (pk_only event, κ fixed at 0). The θ-θ Hessian block is
+    // `group` is `None` (an ungrouped pk-only event, κ fixed at 0). The θ-θ Hessian block is
     // unused downstream (left zero).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual2<M> {
         let kappa_base = group.map(|g| nc + n_eta + g * n_kappa);
@@ -2851,7 +2865,7 @@ fn run_obs_iov_eta<const N: usize>(
 
     // First-order stacked-η seed (no θ axes): η_bsv column `c` → axis `c`; κ column
     // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
-    // (pk_only, κ fixed at 0).
+    // (an ungrouped pk-only event, κ fixed at 0).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual1<N> {
         let kappa_base = group.map(|g| n_eta + g * n_kappa);
         let stacked_axis = |c: usize| -> Option<usize> {

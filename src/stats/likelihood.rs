@@ -2838,11 +2838,13 @@ pub fn iov_combined_effect(
     c
 }
 
-/// The combined effect vector `[η_bsv, 0…0]` for an **EVID=2 pk-only** event — the κ=0
-/// counterpart of [`iov_combined_effect`]. Pk-only breakpoints carry no occasion, so their
-/// IOV κ block is held at zero (matching production `predict_iov`'s `combined_for(u32::MAX)`
-/// branch). Shares the stacked-η layout with [`iov_combined_effect`] so the closed-form and
-/// ODE IOV providers cannot seed the κ=0 block differently (#598 review).
+/// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
+/// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
+/// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
+/// for one whose occasion has none (matching production `predict_iov`'s
+/// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
+/// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
+/// review).
 pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
@@ -3125,6 +3127,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -4258,6 +4261,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 100],
             obs_records: vec![],
         };
@@ -4447,6 +4451,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0],
             obs_records: vec![],
         };

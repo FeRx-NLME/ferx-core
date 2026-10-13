@@ -85,6 +85,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],
@@ -214,6 +215,7 @@ fn tvcov_ltbs_reports_analytic_inner() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -283,6 +285,7 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -309,6 +312,7 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_wide as u32).collect(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -357,6 +361,7 @@ fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -409,6 +414,7 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -454,6 +460,7 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -499,6 +506,7 @@ fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -590,6 +598,7 @@ fn iov_fd_reason_attributes_ss_input_rate() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -634,6 +643,7 @@ fn iov_fd_reason_attributes_infusion_into_absorption() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -682,6 +692,7 @@ fn transit_twin_ss_forcing_is_analytic_under_iov() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -810,6 +821,7 @@ fn make_iov_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -872,6 +884,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -963,6 +976,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1100,6 +1114,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1205,6 +1220,7 @@ fn repro555_subject22() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -1454,6 +1470,7 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1562,6 +1579,7 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1665,6 +1683,7 @@ fn iov_m3_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1780,6 +1799,7 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1899,6 +1919,7 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2014,6 +2035,7 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2128,6 +2150,7 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2351,6 +2374,7 @@ fn inner_optimizer_pin_reaches_same_ebe() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2425,6 +2449,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2464,6 +2489,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2549,6 +2575,7 @@ fn dense_residual_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2595,6 +2622,7 @@ fn dense_residual_ode_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2648,6 +2676,7 @@ fn dense_expression_scale_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2692,6 +2721,7 @@ fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2777,6 +2807,7 @@ fn ode_custom_magnitude_takes_analytic_inner_gradient() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2841,6 +2872,7 @@ fn magnitude_inner_eta_gradient_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2935,6 +2967,7 @@ fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -3013,6 +3046,7 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -3211,6 +3245,7 @@ fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -3367,6 +3402,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let params = model.default_params.clone();
@@ -3660,6 +3696,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
@@ -3834,6 +3871,7 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
