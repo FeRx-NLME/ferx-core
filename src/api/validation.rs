@@ -3667,6 +3667,28 @@ fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'stati
     }
 }
 
+/// Whether a clamped individual's rows come out as literal `0.0`, or carry a term the
+/// pipeline layers on *after* the closed form has already clamped.
+///
+/// The flip-flop clamp applies to the closed form's **dose-driven** concentration, and
+/// `compute_predictions_with_tv` then runs three things on that output
+/// (`pk/mod.rs`, in this order): an `[initial_conditions]` baseline impulse
+/// ([`crate::pk::add_analytical_init`]), a Form-C `[scaling] y = <expr>` readout
+/// ([`crate::pk::apply_analytic_readout`]) and the LTBS log transform
+/// ([`crate::pk::ltbs_log_g`], which maps `0` to `ln(LTBS_FLOOR)`, not to `0`). Any of the
+/// three lifts a clamped profile off zero, so the rows read as a *drug-free* profile
+/// rather than as zeros — the harder case to notice.
+///
+/// A Form-A/B `[scaling] obs_scale = <expr>` divisor is **not** one of them: it multiplies,
+/// so zero stays zero. Two of the three lifters (`[initial_conditions]`, a Form-C
+/// `[scaling]`) are themselves twin-decline causes that this family's refusal names, so on
+/// a twin-less model the literal-zero case is the special one, not the general one
+/// (#1823 review r1 — the warning claimed `ipred = 0` unconditionally, which was false on
+/// a measured fixture whose 27 clamped individuals had no zero row between them).
+fn clamp_shows_as_literal_zero(model: &CompiledModel) -> bool {
+    model.analytical_init.is_empty() && model.analytic_readout.is_none() && !model.log_transform
+}
+
 /// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
 /// 1-cpt model, which has a single disposition exponential and so no such edge.
 fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
@@ -3772,8 +3794,8 @@ pub(crate) fn uncertainty_draws_skipped_warning(
 }
 
 /// Per-run tally of simulated individuals whose **sampled η** entered the flip-flop regime
-/// of a twin-less transit / IG closed form, where the whole profile comes back as
-/// `ipred = 0` (#1823).
+/// of a twin-less transit / IG closed form, where the whole dose-driven concentration is
+/// clamped to zero (#1823).
 ///
 /// The three gates that existed before all sample a *fixed* η: the entry-point refusal
 /// ([`check_absorption_flip_flop_no_twin`]) evaluates η = 0 typical values, the fit-end
@@ -3783,15 +3805,20 @@ pub(crate) fn uncertainty_draws_skipped_warning(
 /// `simulate()` draws from N(0, Ω) whose own η pushes `ke` to or past the tilting
 /// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
 /// reroute to and returns the closed form, which clamps — so the individual contributes
-/// finite, plottable rows that are all zero, and every summary computed over them (a VPC
-/// band, a prediction interval, a mean) is pulled toward zero. Counting them is the only
-/// channel that says so.
+/// finite, plottable rows carrying none of the drug, and every summary computed over them
+/// (a VPC band, a prediction interval, a mean) is pulled toward the drug-free profile.
+/// Counting them is the only channel that says so: whether those rows read as literal
+/// zeros depends on [`clamp_shows_as_literal_zero`], so looking for a zero is not a
+/// reliable way to find them.
 ///
-/// [`observe`](Self::observe) is one `matches!` for every model outside this family, which
-/// is every model but a twin-less transit / IG closed form; the `total` denominator is
+/// [`observe`](Self::observe) is two cheap field tests for every model outside this family,
+/// which is every model but a twin-less transit / IG closed form; the `total` denominator is
 /// therefore counted only for that family, and a tally that never observed one reports
 /// nothing.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// Deliberately **not** `Copy` / `Clone`: it is an accumulator passed as `&mut` through the
+/// simulate chokepoint, and a copy taken by accident would drop every count written to it.
+#[derive(Debug, Default)]
 pub(crate) struct SimulatedFlipFlopTally {
     /// Individuals (subject × replicate × uncertainty draw) whose sampled η crossed.
     crossed: usize,
@@ -3804,9 +3831,11 @@ impl SimulatedFlipFlopTally {
     /// to predict with (`n_eta + n_kappa` long, the κ tail zeroed by the caller).
     ///
     /// The predicate is [`crate::pk::absorption_flip_flop_at`] — the same one
-    /// `effective_model_for_eval` routes on — not `ipred == 0.0`: a zero prediction has
-    /// other causes (a dose of 0, an observation before the first dose), and the question
-    /// here is specifically whether the closed form's domain was left.
+    /// `effective_model_for_eval` routes on — not `ipred == 0.0`, in both directions: a
+    /// zero prediction has other causes (a dose of 0, an observation before the first
+    /// dose), and a clamped individual is not necessarily zero at all
+    /// ([`clamp_shows_as_literal_zero`]). The question here is specifically whether the
+    /// closed form's domain was left.
     pub(crate) fn observe(
         &mut self,
         model: &CompiledModel,
@@ -3838,16 +3867,31 @@ impl SimulatedFlipFlopTally {
         }
         let (domain, ode_fn) = absorption_flip_flop_wording(model);
         let confluent = absorption_confluent_clause(model);
+        // What the clamp actually *shows as* depends on whether anything is layered on the
+        // closed form's output afterwards. Both halves say the rows are still returned and
+        // still summarised; they differ in whether a reader can spot them by looking for a
+        // zero.
+        let outcome = if clamp_shows_as_literal_zero(model) {
+            "Nothing in this model adds to or transforms that output afterwards, so those \
+             individuals' whole profiles are identically zero (`ipred = 0`). They are not \
+             missing from the output — they are zeros, so every summary taken over these \
+             rows (a VPC band, a prediction interval, a mean) is pulled toward zero; under \
+             a proportional error model their simulated DV is 0 as well."
+        } else {
+            "This model adds to or transforms that output afterwards — an \
+             `[initial_conditions]` baseline, a Form-C `[scaling] y = <expr>` readout, or a \
+             log transform — so those rows are not zero and cannot be found by looking for \
+             one: they carry only that term, with the drug's contribution gone. Every \
+             summary taken over these rows (a VPC band, a prediction interval, a mean) is \
+             pulled toward the drug-free profile."
+        };
         Some(format!(
             "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals were evaluated at an η \
              inside the flip-flop regime (disposition rate ≥ {domain}){confluent}, \
              where the twin-less \
-             {model_name} closed form has no solution, and were predicted as an \
-             identically-zero profile. \
-             Those individuals are not missing from the output — they are zeros, so every \
-             summary taken over these rows (a VPC band, a prediction interval, a mean) is \
-             pulled toward zero; under a proportional error model their simulated DV is 0 \
-             as well. \
+             {model_name} closed form has no solution, so their entire dose-driven \
+             concentration was clamped to zero. \
+             {outcome} \
              Rewrite the model as an explicit ODE `{ode_fn}` model, which reroutes per \
              individual and is valid in both regimes.{decline}",
             k = self.crossed,

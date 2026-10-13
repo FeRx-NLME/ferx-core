@@ -1164,13 +1164,57 @@ fn uncertainty_refuses_a_flip_flop_point_estimate() {
 // *sampled* η crosses the tilting abscissa, which on a twin-less closed form comes back as
 // `ipred = 0` for the whole profile with nothing said on any channel.
 
+/// `pop` with every dose amount set to zero: the **dose-free twin**, which is the oracle
+/// for "the entire dose-driven concentration was clamped".
+///
+/// A clamped individual's prediction must equal its dose-free twin's bit for bit — its dose
+/// contributed nothing — and a non-clamped one must not. Nothing else changes: the subject
+/// count and the observation grid are identical, so `simulate*` consumes the RNG in the
+/// same order and the two runs draw the same etas and epsilons at the same seed.
+///
+/// This is the oracle `ipred == 0.0` cannot be, because a clamped individual is only
+/// literally zero when nothing is layered on the closed form's output afterwards
+/// (`validation::clamp_shows_as_literal_zero`) — measured on `TWINLESS_TRANSIT_INIT_SRC`,
+/// where 27 individuals are clamped and not one row reads 0.
+fn dose_free(pop: &Population) -> Population {
+    let mut out = pop.clone();
+    for s in &mut out.subjects {
+        for d in &mut s.doses {
+            d.amt = 0.0;
+        }
+    }
+    out
+}
+
+/// Individuals whose prediction is bit-identical to the dose-free twin's, and how many were
+/// simulated in all, keyed by `(draw, sim, id)`. `a` and `b` must be two runs of the same
+/// model at the same seed, differing only in `dose_free`.
+fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, usize) {
+    assert_eq!(a.len(), b.len(), "the two runs must emit the same rows");
+    let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(
+            (x.draw, x.sim, &x.id, x.time),
+            (y.draw, y.sim, &y.id, y.time),
+            "the dose-free twin must emit the same grid in the same order"
+        );
+        let same = per_individual
+            .entry((x.draw, x.sim, x.id.clone()))
+            .or_insert(true);
+        *same &= x.ipred.to_bits() == y.ipred.to_bits();
+    }
+    (
+        per_individual.values().filter(|m| **m).count(),
+        per_individual.len(),
+    )
+}
+
 /// Simulated individuals whose whole profile came back identically zero, and how many were
 /// simulated in all, keyed by `(draw, sim, id)`.
 ///
 /// Read off the **rows**, never from `absorption_flip_flop_at` — the predicate the fix
-/// counts on. Two different things: that is what makes the equality asserted in
-/// `simulated_flip_flop_count_equals_the_zeroed_individuals` an oracle rather than a
-/// restatement of the implementation.
+/// counts on. Only a valid count of the *clamped* individuals on a model where the clamp
+/// shows as a literal zero; `dose_free_matches` is the oracle that holds on every model.
 fn zeroed_individuals(results: &[SimulationResult]) -> (usize, usize) {
     let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
     for r in results {
@@ -1230,6 +1274,222 @@ fn flip_flop_run(
     (flip_flop_warning(&out.warnings), zeroed, total)
 }
 
+/// `simulate_with_options_diag`'s rows at ω² = `var`, for an oracle that needs them twice.
+fn flip_flop_rows(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+) -> Vec<SimulationResult> {
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        ..Default::default()
+    };
+    simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates")
+        .results
+}
+
+/// The tally warning, the individuals the **dose-free twin** says were clamped, and the
+/// individuals simulated. Unlike [`flip_flop_run`] this oracle holds on a model that layers
+/// a baseline / readout / log transform on the closed form's output, where a clamped
+/// individual is not zero at all (#1823 review r1).
+fn clamped_run(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+) -> (Option<String>, usize, usize) {
+    assert_eq!(model.n_eta, 1, "every fixture here carries one η");
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        ..Default::default()
+    };
+    let dosed = simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates");
+    let undosed =
+        simulate_with_options_diag(model, &dose_free(&tiny_population()), &params, n_sim, &opts)
+            .expect("the dose-free twin simulates");
+    let (clamped, total) = dose_free_matches(&dosed.results, &undosed.results);
+    (flip_flop_warning(&dosed.warnings), clamped, total)
+}
+
+// A twin-less transit form declined by `[initial_conditions]` rather than by `[scaling]`,
+// in-domain at η = 0 (same ke = 0.125 < KTR = 0.2 as the M1 fixture). The init baseline
+// `BASE / V = 10` is layered on the closed form's output *after* the flip-flop clamp, so a
+// clamped individual's rows are the baseline's decay, not zeros (#1823 review r1).
+const TWINLESS_TRANSIT_INIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVBASE(40.0, 0.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  BASE = TVBASE
+
+[initial_conditions]
+  init(central) = BASE
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// The M1 fixture's `[scaling] obs_scale = 1` divisor replaced by a **Form-C** readout that
+/// adds a constant: `apply_analytic_readout` replaces the output after the clamp, so a
+/// clamped individual reads 2.5, not 0.
+fn twinless_transit_form_c_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
+        "[scaling]\n  obs_scale = 1\n",
+        "[scaling]\n  y = central/V + 2.5\n",
+    )
+}
+
+/// The M1 fixture under log-transform-both-sides: `apply_log_transform` maps the clamped
+/// `0` to `ln(LTBS_FLOOR)`, a large negative number, so again not a zero.
+fn twinless_transit_ltbs_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  DV ~ proportional(PROP)", "  log(DV) ~ additive(PROP)")
+}
+
+/// #1823 review r1: **both sides of the message's outcome gate**, and each of its three
+/// inputs, in one test — so forcing `clamp_shows_as_literal_zero` either way reddens it.
+///
+/// The clamp applies to the closed form's dose-driven term, and three things run after it
+/// (`pk/mod.rs`): `add_analytical_init`, `apply_analytic_readout`, `apply_log_transform`.
+/// Any of them lifts a clamped profile off zero. The first version of this warning claimed
+/// "predicted as an identically-zero profile" unconditionally, which was **false on two of
+/// the three twin-decline causes the same message names** — measured here: 27 clamped
+/// individuals and 0 zero rows on each of the three lifters.
+///
+/// The count itself is asserted against the **dose-free twin** on all four fixtures, which
+/// is what makes this a check on the claim and not on the wording: a clamped individual
+/// equals its dose-free twin bit for bit, a non-clamped one does not.
+#[test]
+fn simulated_flip_flop_warning_says_what_the_clamp_shows_as() {
+    let plain = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let init = parse_fixture(TWINLESS_TRANSIT_INIT_SRC);
+    let form_c = parse_fixture(&twinless_transit_form_c_src());
+    let ltbs = parse_fixture(&twinless_transit_ltbs_src());
+
+    // Each lifter fixture is twin-less, in-domain at η = 0, and carries exactly the one
+    // lifter it is here to exercise — so the gate is driven by a different input each time.
+    for (name, m) in [
+        ("init", &init),
+        ("form_c", &form_c),
+        ("ltbs", &ltbs),
+        ("plain", &plain),
+    ] {
+        assert!(m.absorption_ode_equivalent.is_none(), "{name}: twin-less");
+        assert!(
+            check_absorption_flip_flop_no_twin(m, &tiny_population(), &m.default_params.theta)
+                .is_none(),
+            "{name}: the point estimate is in-domain"
+        );
+    }
+    assert_eq!(
+        (
+            init.analytical_init.len(),
+            init.analytic_readout.is_some(),
+            init.log_transform
+        ),
+        (1, false, false)
+    );
+    assert_eq!(
+        (
+            form_c.analytical_init.len(),
+            form_c.analytic_readout.is_some(),
+            form_c.log_transform
+        ),
+        (0, true, false)
+    );
+    assert_eq!(
+        (
+            ltbs.analytical_init.len(),
+            ltbs.analytic_readout.is_some(),
+            ltbs.log_transform
+        ),
+        (0, false, true)
+    );
+    assert_eq!(
+        (
+            plain.analytical_init.len(),
+            plain.analytic_readout.is_some(),
+            plain.log_transform
+        ),
+        (0, false, false),
+        "the M1 fixture's `obs_scale` divisor is not a lifter: it multiplies, so 0 stays 0"
+    );
+
+    // Two phrases that appear in exactly one branch each. Not "adds to or transforms that
+    // output afterwards": both halves say that (one of them negated), so a test keying on it
+    // passes on either branch.
+    let zero_half = "whole profiles are identically zero (`ipred = 0`)";
+    let lifted_half = "cannot be found by looking for one";
+    for (name, model, lifted) in [
+        ("init", &init, true),
+        ("form_c", &form_c, true),
+        ("ltbs", &ltbs, true),
+        ("plain", &plain, false),
+    ] {
+        let (msg, clamped, total) = clamped_run(model, 0.09, 300, 7);
+        assert_eq!(total, 600, "{name}");
+        assert_eq!(clamped, 27, "{name}: measured at afe7f52b");
+        let msg = msg.expect("a clamped individual must be reported");
+        // The invariant half of the claim, true on every fixture.
+        assert!(
+            msg.contains(&format!(
+                "{clamped} of {total} simulated individuals were evaluated"
+            )),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains("their entire dose-driven concentration was clamped to zero"),
+            "{name}: {msg}"
+        );
+        // …and the gated half, both sides asserted on every fixture.
+        let (zeroed, _) = zeroed_individuals(&flip_flop_rows(model, 0.09, 300, 7));
+        if lifted {
+            assert!(msg.contains(lifted_half), "{name}: {msg}");
+            assert!(!msg.contains(zero_half), "{name}: {msg}");
+            // …and it names the three things that can lift the clamp off zero, so the
+            // reader can tell which one their model has.
+            assert!(
+                msg.contains("`[initial_conditions]` baseline")
+                    && msg.contains("Form-C `[scaling] y = <expr>` readout")
+                    && msg.contains("log transform"),
+                "{name}: {msg}"
+            );
+            assert!(
+                !msg.contains("their simulated DV is 0"),
+                "{name}: the proportional-DV claim belongs to the zero branch: {msg}"
+            );
+            assert_eq!(
+                zeroed, 0,
+                "{name}: not one of the {clamped} clamped individuals reads zero — \
+                 which is exactly why the message must not say they do"
+            );
+        } else {
+            assert!(msg.contains(zero_half), "{name}: {msg}");
+            assert!(!msg.contains(lifted_half), "{name}: {msg}");
+            assert_eq!(zeroed, clamped, "{name}: here the clamp IS a literal zero");
+        }
+    }
+}
+
 /// #1823: the count the warning reports is exactly the number of simulated individuals
 /// whose profile came back identically zero — on the measured fixture from the issue, and
 /// on its twin-carrying control, where both are zero.
@@ -1263,6 +1523,10 @@ fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
             )),
             "count must equal the zeroed individuals: {msg}"
         );
+        // …and the dose-free twin agrees, which is the oracle that also holds on a
+        // model where the clamp does not read as a zero (#1823 review r1).
+        let (_, clamped, clamped_total) = clamped_run(&model, 0.09, n_sim, seed);
+        assert_eq!((clamped, clamped_total), (zeroed, total));
     }
 
     // The twin-carrying control: the same model without the inert `[scaling]`, at ω² = 4 —
@@ -1347,10 +1611,16 @@ fn simulated_flip_flop_warning_wording_per_family() {
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("predicted as an identically-zero profile"),
+            msg.contains("their entire dose-driven concentration was clamped to zero"),
             "{name}: {msg}"
         );
-        // Sentence 2 — why zeros are worse than missing rows.
+        // Sentence 2 — the outcome, on its literal-zero branch (these three fixtures carry
+        // no `[initial_conditions]` / Form-C readout / log transform;
+        // `simulated_flip_flop_warning_says_what_the_clamp_shows_as` covers the other side).
+        assert!(
+            msg.contains("whole profiles are identically zero (`ipred = 0`)"),
+            "{name}: {msg}"
+        );
         assert!(
             msg.contains("not missing from the output — they are zeros"),
             "{name}: {msg}"

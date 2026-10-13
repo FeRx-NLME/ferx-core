@@ -354,9 +354,9 @@ whose **sampled η** pushes `ke` to or past the tilting abscissa — `KTR =
 
 A twin-*carrying* model reroutes such an individual to its exact ODE twin, which
 is valid in both regimes, and nothing is lost. A twin-less one has nothing to
-reroute to: the closed form clamps, and that individual's whole profile comes
-back as `ipred = 0` — finite, plottable rows that are all zero. Under a
-proportional error model its simulated DV is 0 too.
+reroute to: the closed form clamps, and that individual's **entire dose-driven
+concentration becomes zero** — the drug contributes nothing to any of its rows.
+The rows are still returned, still finite and still plotted.
 
 The `_diag` entry points report this as one per-run count
 ([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
@@ -364,18 +364,44 @@ The `_diag` entry points report this as one per-run count
 ```
 W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals were evaluated at an η
 inside the flip-flop regime (disposition rate ≥ transit rate KTR = (n+1)/mtt),
-where the twin-less one_cpt_transit closed form has no solution, and were
-predicted as an identically-zero profile. ...
+where the twin-less one_cpt_transit closed form has no solution, so their entire
+dose-driven concentration was clamped to zero. ...
 ```
 
-Those rows are **not** dropped, so they pull every summary taken over them — a
-VPC band, a prediction interval, a mean — toward zero. On the fixture measured
-in #1823 (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`, ω²~CL~ = 0.09),
-5.9% of simulated individuals crossed, and the 5th percentile of IPRED at t = 3
-read 0.0000 against 0.0331 on the same model with its twin.
+### What a clamped individual's rows look like
+
+Whether those rows read as literal zeros depends on what the model layers on the
+closed form's output *afterwards*. Three things can, all applied after the clamp:
+
+| Layer | Effect on a clamped individual |
+|---|---|
+| none (the plain case) | `ipred = 0` on every row |
+| `[initial_conditions] init(central) = ...` | the baseline's decay alone |
+| a Form-C `[scaling] y = <expr>` readout | whatever the readout evaluates to at a zero state |
+| log-transform-both-sides (`log(DV) ~ additive(...)`) | `ln` of the internal floor, a large negative number |
+
+A Form-A/B `[scaling] obs_scale = <expr>` divisor is **not** one of them — it
+multiplies, so zero stays zero.
+
+This matters because two of those three layers are themselves reasons the ODE
+twin was declined, so on a twin-less model the literal-zero case is the *special*
+one. The warning says which case the model is in, and **looking for a zero row is
+not a reliable way to find a clamped individual**. Measured on the #1823 fixture
+with an `[initial_conditions]` baseline: 27 of 600 individuals clamped, and not
+one zero row between them.
+
+### Why it biases a VPC
+
+Those rows are **not** dropped, so every summary taken over them — a VPC band, a
+prediction interval, a mean — is pulled toward the drug-free profile. Measured on
+the #1823 fixture (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`,
+ω²~CL~ = 0.09), 260 of 4000 simulated individuals were clamped — 6.5%, against
+the 5.9% that P(η ≥ ln 1.6) predicts for this boundary. On the matching
+`simulate_with_uncertainty()` run the 5th percentile of the first subject's
+IPRED at t = 3 read **0.0000**, against 0.0322 on the same model with its twin.
 
 Rewrite the model as an explicit ODE `transit()` / `igd()` model: that reroutes
-per individual, so no draw is clamped. `simulate()` and `simulate_with_seed()`
+per individual, so nothing is clamped. `simulate()` and `simulate_with_seed()`
 return rows only and so stay silent — use `simulate_with_options_diag()` or
 `simulate_with_uncertainty_diag()` when the count matters (a VPC, for example).
 
