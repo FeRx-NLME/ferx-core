@@ -1416,6 +1416,98 @@ fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
     );
 }
 
+/// #1823 review r9: the message stays true for a counted individual the clamp did **not**
+/// act on, and the docs do not claim its rows are finite.
+///
+/// Two cases, both measured, both reached through the same count:
+///
+/// 1. **A `lagtime` past every observation.** `[scaling]` declines the twin while a
+///    `lagtime=` binding is carried in the closed form (a bare `lagtime=` auto-routes since
+///    #735, so it takes both to build this), and the gate compares the *raw* dose time, so
+///    the individual is counted. But the absorption never arrives, the domain guard is never
+///    reached, and the rows are identical at a crossing η and at η = 0 — `[0, 0, 0]` either
+///    way. So "**so** their entire dose-driven concentration was clamped to zero" asserted a
+///    cause that did not occur. The message now states the clamp as a property of the closed
+///    form and the undosed rows as the observation, without linking them causally.
+///
+/// 2. **An η-dependent `obs_scale` that goes non-positive.** `apply_scaling` divides, and
+///    replaces the row with `NaN` when the evaluated scale is not finite and positive
+///    (`pk/mod.rs`). The tally's finiteness guard checks the **PK parameters**, not the
+///    evaluated scale, so a counted individual's rows can be `NaN`. Measured on
+///    `obs_scale = 1 - ETA_CL`: η = 0.6 gives `[0, 0, 0]`, η = 2 gives `[NaN, NaN, NaN]`,
+///    both counted. The docs no longer claim clamped rows stay finite; this pins the
+///    behaviour behind that wording.
+#[test]
+fn simulated_flip_flop_message_holds_where_the_clamp_was_not_the_cause() {
+    let pop = tiny_population();
+    let subject = &pop.subjects[0];
+
+    // ── 1. lagtime past every observation ───────────────────────────────────────────
+    let lagged = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC
+            .replace("  MTT = TVMTT\n", "  MTT = TVMTT\n  LAG = TVLAG\n")
+            .replace(
+                "  theta TVMTT(20.0, 0.05, 200.0)\n",
+                "  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVLAG(50.0, 0.0, 500.0)\n",
+            )
+            .replace(
+                "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)",
+                "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAG)",
+            ),
+    );
+    assert!(
+        lagged.absorption_ode_equivalent.is_none(),
+        "the `[scaling]` block declines the twin even with a `lagtime=` binding (#735)"
+    );
+    let theta = lagged.default_params.theta.clone();
+    let in_domain = crate::pk::compute_predictions_with_tv(&lagged, subject, &theta, &[0.0]);
+    let crossing = crate::pk::compute_predictions_with_tv(&lagged, subject, &theta, &[0.6]);
+    assert_eq!(
+        in_domain, crossing,
+        "the lag (50) is past every observation (1, 2, 3), so the crossing changes nothing"
+    );
+    assert_eq!(in_domain, vec![0.0, 0.0, 0.0]);
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&lagged, subject, &theta, &[0.6]);
+    let msg = tally
+        .warning(&lagged)
+        .expect("the gate reads the raw dose time, so this individual is counted");
+    // The row-level claim is true here — nothing from the dose reaches these rows — while
+    // the causal one would not be.
+    assert!(
+        msg.contains("None of their rows carries any contribution from the doses the subject"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("because the dose never arrived"),
+        "the message names this alternative cause: {msg}"
+    );
+    assert!(
+        !msg.contains("so their entire dose-driven concentration was clamped"),
+        "{msg}"
+    );
+
+    // ── 2. an η-dependent obs_scale going non-positive ──────────────────────────────
+    let scaled = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  obs_scale = 1\n", "  obs_scale = 1 - ETA_CL\n"),
+    );
+    let theta = scaled.default_params.theta.clone();
+    for (eta, want_finite) in [(0.0_f64, true), (0.6, true), (2.0, false)] {
+        let preds = crate::pk::compute_predictions_with_tv(&scaled, subject, &theta, &[eta]);
+        assert_eq!(
+            preds.iter().all(|p| p.is_finite()),
+            want_finite,
+            "η = {eta}: `apply_scaling` divides and writes NaN for a non-positive scale              (scale = {}), so a counted individual's rows are not guaranteed finite: {preds:?}",
+            1.0 - eta
+        );
+        let mut tally = SimulatedFlipFlopTally::default();
+        tally.observe(&scaled, subject, &theta, &[eta]);
+        // η = 0 is in-domain; both crossing draws are counted, including the NaN one — the
+        // PK parameters are finite, which is all the tally's guard asks.
+        assert_eq!(tally.warning(&scaled).is_some(), eta > 0.0, "η = {eta}");
+    }
+}
+
 /// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
 /// file is degenerate, so nothing else can reach it — and a guard whose job is to reject a
 /// *future* fixture is worth nothing if it cannot be shown to fire at all.
@@ -1670,10 +1762,23 @@ fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
         );
         assert!(
             msg.contains(
-                "their entire dose-driven concentration was clamped to zero — none of their \
-                 rows carries any contribution from the doses the subject was given"
+                "closed form has no solution and clamps its dose-driven concentration to zero"
             ),
             "{name}: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "None of their rows carries any contribution from the doses the subject was \
+                 given"
+            ),
+            "{name}: {msg}"
+        );
+        // …and it must not link the two with a causal "so": for an individual whose
+        // absorption never reaches an observation the rows are undosed because the dose
+        // never arrived, not because anything was clamped (#1823 review r9).
+        assert!(
+            !msg.contains("so their entire dose-driven concentration was clamped"),
+            "{name}: the clamp is not the cause for every counted individual: {msg}"
         );
         assert!(
             msg.contains(
@@ -2052,7 +2157,9 @@ fn simulated_flip_flop_warning_wording_per_family() {
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("their entire dose-driven concentration was clamped to zero"),
+            msg.contains(
+                "closed form has no solution and clamps its dose-driven concentration to zero"
+            ),
             "{name}: {msg}"
         );
         // Sentence 2 — the consequence for anything computed over those rows.

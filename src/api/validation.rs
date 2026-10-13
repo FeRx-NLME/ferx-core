@@ -3883,12 +3883,21 @@ impl SimulatedFlipFlopTally {
         // form before a simulation starts. So a counted subject has no stacked occasions.
         //
         // What it deliberately does **not** cover: a `lagtime` that pushes absorption past
-        // the last observation, or `f = 0`. Those are individual-parameter *expressions*,
-        // η-dependent and evaluated per individual, so excluding them needs the predictor —
-        // which is exactly the mistake `clamp_shows_as_literal_zero` was (review r2). Such
-        // an individual is still counted, and the message stays true for it: nothing from
-        // its doses reaches its rows. The claim that was *not* safe there — that the clamp
-        // moved anything — was removed from the message in the same round.
+        // the last observation, or `f = 0`. Such an individual is still counted, and the
+        // message stays true for it — nothing from its doses reaches its rows, and since
+        // review r9 the message names "because the dose never arrived" as the alternative
+        // cause rather than attributing those rows to the clamp (measured there: lag = 50
+        // against observations at t = 1, 2, 3 predicts `[0, 0, 0]` at a crossing η *and* at
+        // η = 0, so the domain guard is never even reached). The claim that was *not* safe —
+        // that the clamp moved anything — came out of the message in review r3.
+        //
+        // **Open option** (r9): the lag is reachable from the `pk` snapshot computed below,
+        // so comparing `dose.time + lag` here instead of `dose.time` would move the count's
+        // *scope* to match its claim and let the message drop that disclaimer. That is not
+        // the "needs the predictor" objection of review r2 — it reads an individual
+        // parameter, not an arbitrary expression's value — but a per-compartment `ALAGn` and
+        // the `dose_attr_map` layout make it more than a one-line change, and `f = 0` would
+        // want the same treatment. Deferred deliberately, not overlooked.
         let last_obs = subject
             .obs_times
             .iter()
@@ -3954,9 +3963,10 @@ impl SimulatedFlipFlopTally {
             "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
              their observations were evaluated at an η inside the flip-flop regime \
              (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
-             closed form has no solution, so their entire dose-driven concentration was \
-             clamped to zero — none of their rows carries any contribution from the doses \
-             the subject was given. \
+             closed form has no solution and clamps its dose-driven concentration to zero. \
+             None of their rows carries any contribution from the doses the subject was \
+             given — by that clamp, or, for an individual whose absorption never reaches an \
+             observation (a `lagtime` past it, or `f = 0`), because the dose never arrived. \
              Those rows are still returned and still summarised, so every VPC band, \
              prediction interval or mean computed over them describes an undosed subject. \
              Whether they read as a literal `ipred = 0` depends on what this model layers \
