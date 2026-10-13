@@ -5167,9 +5167,19 @@ impl CompiledModel {
     /// declared name. Order is the program's (analytical: alphabetical by PK name),
     /// so it matches `IndivParamProgram::pk_slots` row for row — which is what lets
     /// the sensitivity fallback hand its caller the same `(rows, slots)` shape the
-    /// program path does. Each slot appears at most once (one slot per variable is
-    /// guaranteed by the one-variable-two-roles reject, #1359), so a `find` over
-    /// these rows is unambiguous where a `position` over `pk_indices` was not.
+    /// program path does.
+    ///
+    /// **Each slot appears at most once, but a name may appear more than once.** The
+    /// one-variable-two-roles reject (#1359) is about two `pk(...)` *roles*, and the
+    /// modeled-dose mapping is not a role: `pk one_cpt_iv(cl=D1, v=V)` alongside
+    /// `D1 = …` parses, and its rows are `[(CL, D1), (V, V), (9, D1)]` — three rows
+    /// for two declared names, measured. So a `find` by slot is unambiguous where a
+    /// `position` over `pk_indices` was not, and that is the property the two
+    /// consumers rely on; `rows.len()` is **not** bounded by `pk_indices.len()`. What
+    /// bounds it for the sensitivity fallback is
+    /// `sens::provider::closed_form_slot_count_supported`, which caps the program's
+    /// own pair list — of which these rows are a subset — at the `const_dispatch!`
+    /// table width.
     ///
     /// Falls back to `pk_indices` — placeholder and all — for a hand-built
     /// `CompiledModel` carrying no program (test fixtures, `generate_data`), where

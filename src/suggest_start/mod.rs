@@ -1157,41 +1157,116 @@ mod tests {
     /// Characterization test for the **adjacent** defect #1922, which #1899's fix
     /// does not touch and which `docs/model-file/fit-options.qmd` now states as a
     /// caveat: layer 2 of `find_theta_for_slot` matches the first θ whose name
-    /// merely *contains* the parameter's name, and `TVCL` contains `V`. Layer 1
-    /// (mu-referencing) covers a parameter with an η, so only a PK parameter with
-    /// **no IIV** falls through to it.
+    /// merely *contains* the parameter's name, and `TVCL` contains `V`.
     ///
-    /// This pins today's wrong answer so the docs sentence describing it is backed
-    /// by a test that can die — delete the caveat from the docs and this is the
-    /// test that says the caveat was real. Invert it when #1922 is fixed.
+    /// Two ways in, both asserted, because the docs sentence claims both and review
+    /// r2 #1 found the single-case version too narrow:
     ///
-    /// Note what the collision costs: `build_params` resolves every slot's θ index
-    /// up front and writes each estimate in turn, so `PK_IDX_CL` and `PK_IDX_V`
-    /// landing on one index means the volume estimate overwrites the clearance one
-    /// and `TVV` is never written.
+    /// * **no η at all** — `V = TVV`;
+    /// * **an η whose name does not match the parameter** — `V = TVV * exp(ETA_VOL)`.
+    ///   Layer 1 matches a mu-reference by *η name* (`eta == PARAM` or
+    ///   `eta.ends_with("_PARAM")`), so `ETA_VOL` misses even though `mu_refs`
+    ///   already records `ETA_VOL -> TVV`. Without this case the docs' advice
+    ///   ("name the η after its parameter") is unsupported, and the earlier
+    ///   wording — "give such a parameter an η" — was simply wrong.
+    ///
+    /// This pins today's wrong answer so the docs sentences describing it are backed
+    /// by a test that can die — delete a caveat from the docs and this is the test
+    /// that says the caveat was real. Invert it when #1922 is fixed.
     #[test]
-    fn nca_layer_two_substring_match_can_still_mis_resolve_a_no_iiv_parameter() {
-        let src = allometric_cl_intermediate_first()
+    fn nca_layer_two_substring_match_can_still_mis_resolve_v() {
+        let no_eta = allometric_cl_intermediate_first()
             .replace("  omega ETA_V ~ 0.04\n", "")
             .replace("  V = TVV * exp(ETA_V)\n", "  V = TVV\n");
-        let m = crate::parser::model_parser::parse_model_string(&src).expect("model parses");
+        let wrong_eta_name = allometric_cl_intermediate_first()
+            .replace("  omega ETA_V ~ 0.04\n", "  omega ETA_VOL ~ 0.04\n")
+            .replace("  V = TVV * exp(ETA_V)\n", "  V = TVV * exp(ETA_VOL)\n");
+        for (label, src) in [("no eta", no_eta), ("eta name misses", wrong_eta_name)] {
+            let m = crate::parser::model_parser::parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(
+                !m.mu_refs.iter().any(|(e, _)| e == "ETA_V"),
+                "{label}: no eta may be named ETA_V, or layer 1 resolves V and this \
+                 tests nothing"
+            );
+            let cl = find_theta_for_slot(&m, PK_IDX_CL).expect("CL theta");
+            let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+            assert_eq!(
+                m.default_params.theta_names[cl], "TVCL",
+                "{label}: CL still resolves correctly — #1899's half is unaffected"
+            );
+            assert_eq!(
+                m.default_params.theta_names[v], "TVCL",
+                "{label}: #1922: V resolves to TVCL because `TVCL` contains `V`. When \
+                 this starts failing, #1922 has been fixed — invert the assertion and \
+                 drop the caveat from docs/model-file/fit-options.qmd."
+            );
+            assert_eq!(cl, v, "{label}: #1922: the two slots share one theta index");
+        }
+    }
+
+    /// The user-visible half of #1922's characterization (review r2 #1): asserting
+    /// that two slots share a θ *index* does not assert what the docs claim, namely
+    /// that the volume estimate lands on `TVCL` and `TVV` is never written. A later
+    /// duplicate-write guard in `build_params` would keep the index assertion green
+    /// while making that sentence false.
+    ///
+    /// Run against the η-named control, so the comparison is between two models that
+    /// differ in **one** thing — the η's name.
+    ///
+    /// Measured on `data/two_cpt_oral_cov.csv`: the control writes `TVV = 98.835…`
+    /// and `TVCL = 0.4387…`. The colliding model sends that volume to `TVCL`, whose
+    /// upper bound is `10.0`, so what actually lands is the **clamp** — `TVCL =
+    /// 10.0`, 23× the clearance estimate and pinned at its bound, with `TVV` left at
+    /// its default. The clamp is why this asserts the bound rather than the raw
+    /// volume: it is the same signature as #1899's `CLWT_EXP = 2.0`.
+    #[test]
+    fn nca_substring_collision_writes_the_volume_estimate_onto_tvcl() {
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        let run = |src: &str| {
+            let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+            let at = |name: &str| {
+                let i = out
+                    .params
+                    .theta_names
+                    .iter()
+                    .position(|n| n == name)
+                    .unwrap_or_else(|| panic!("no theta {name}"));
+                (
+                    out.params.theta[i],
+                    m.default_params.theta[i],
+                    m.default_params.theta_upper[i],
+                )
+            };
+            (at("TVCL"), at("TVV"))
+        };
+        // Control: `ETA_V` matches, so each slot reaches its own θ.
+        let ((ok_cl, _, cl_upper), (ok_v, ok_v_default, _)) =
+            run(&allometric_cl_intermediate_first());
         assert!(
-            !m.mu_refs.iter().any(|(e, _)| e == "ETA_V"),
-            "V must carry no IIV, or layer 1 resolves it and this tests nothing"
+            (ok_v - ok_v_default).abs() > 1e-6,
+            "control: TVV must receive the volume estimate, got {ok_v}"
         );
-        let cl = find_theta_for_slot(&m, PK_IDX_CL).expect("CL theta");
-        let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+        assert!(
+            ok_v > cl_upper,
+            "the fixture only shows the damage if the volume estimate ({ok_v})              overshoots TVCL's upper bound ({cl_upper})"
+        );
+        // #1922: rename the η and `PK_IDX_V` resolves to `TVCL`.
+        let collide = allometric_cl_intermediate_first()
+            .replace("  omega ETA_V ~ 0.04\n", "  omega ETA_VOL ~ 0.04\n")
+            .replace("  V = TVV * exp(ETA_V)\n", "  V = TVV * exp(ETA_VOL)\n");
+        let ((bad_cl, _, _), (bad_v, bad_v_default, _)) = run(&collide);
         assert_eq!(
-            m.default_params.theta_names[cl], "TVCL",
-            "CL still resolves correctly — #1899's half is unaffected"
+            bad_v, bad_v_default,
+            "#1922: TVV is never written when PK_IDX_V resolves elsewhere"
         );
-        assert_eq!(
-            m.default_params.theta_names[v], "TVCL",
-            "#1922: V resolves to TVCL because `TVCL` contains `V`. When this \
-             starts failing, #1922 has been fixed — invert the assertion and drop \
-             the caveat from docs/model-file/fit-options.qmd."
+        approx::assert_relative_eq!(bad_cl, cl_upper, max_relative = 1e-12);
+        assert!(
+            bad_cl > 1.5 * ok_cl,
+            "#1922: TVCL must hold the clamped volume, not the clearance ({bad_cl} vs {ok_cl})"
         );
-        assert_eq!(cl, v, "#1922: the two slots share one theta index");
     }
 
     /// #1899, end to end (review r1 #1): the user-visible outcome of

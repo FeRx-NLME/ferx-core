@@ -14530,3 +14530,166 @@ fn a_derived_intermediate_routes_the_subject_to_fd() {
     assert!(lognormal_chain_exact(&ok));
     assert!(subject_sensitivities(&ok, &s, &[0.2, 10.0, 3.0], &[0.1, -0.05, 0.2]).is_some());
 }
+
+/// A **modeled-duration** `D1` on an analytical model: its value slot lives above
+/// `PK_IDX_LAGTIME`, in the spare region, and `pk_indices` has never recorded it —
+/// the entry is the same placeholder `0` as an unbound intermediate's, i.e. `CL`'s
+/// slot. The `q=3.0` literal makes the program path decline, so this is the second
+/// live instance of #1899's defect, on a parameter that genuinely drives the
+/// infusion window rather than an inert one.
+///
+/// Measured: `pk_indices = [0, 1, 3, 0]`, so `seed_dim_from_slots` (last row per
+/// slot) gave `CL`'s slot `D1`'s row. The fix reports
+/// `rows = [(0,0), (1,1), (3,2), (9,3)]` — `D1` on its own slot `9`, which is what
+/// the program path has always done.
+///
+/// Asserted against central FD of the production predictor on both providers, with
+/// the subject carrying a `RATE = -2` dose so `D1` is actually read.
+#[test]
+fn a_modeled_duration_parameter_does_not_steal_cls_gradient_row() {
+    const TWOCPT_IV_MODELED_DUR_LITERAL_Q: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V)
+  V2 = TVV2
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=3.0, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(TWOCPT_IV_MODELED_DUR_LITERAL_Q).expect("parse");
+    assert!(
+        analytical_supported(&m),
+        "must stay on the analytic provider"
+    );
+    let prog = m
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("a parsed model carries a program");
+    assert!(
+        !prog_covers_required_pk_slots(&m, prog),
+        "the literal `q` must make the program path decline, or the fallback is untested"
+    );
+    assert!(lognormal_chain_exact(&m), "the fallback must be in scope");
+    let d1_pos = m.indiv_param_names.iter().position(|n| n == "D1").unwrap();
+    assert_eq!(
+        m.pk_indices[d1_pos], PK_IDX_CL,
+        "D1's pk_indices entry must still be the placeholder, or this tests nothing"
+    );
+
+    // A modeled-duration (`RATE = -2`) dose, so `D1` is read by the kernel.
+    let mut s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, -2.0, true, 0.0)];
+    let theta = [10.0, 50.0, 100.0, 2.0];
+    let eta = [0.1, -0.05, 0.2];
+
+    let pk = (m.pk_param_fn)(&theta, &eta, &s.covariates, 0.0);
+    let (_, slots) = resolve_param_derivs(&m, &s, &theta, &eta, &pk).expect("fallback resolves");
+    let mut sorted = slots.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![PK_IDX_CL, PK_IDX_V, PK_IDX_V2, 9],
+        "D1 must own slot 9, not share CL's: {slots:?}"
+    );
+
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+    let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+    let he = 1e-6;
+    let pred = |e: &[f64], j: usize| -> f64 { compute_predictions_with_tv(&m, &s, &theta, e)[j] };
+    for (j, g) in light.iter().enumerate() {
+        for k in 0..m.n_eta {
+            let mut ep = eta.to_vec();
+            ep[k] += he;
+            let mut em = eta.to_vec();
+            em[k] -= he;
+            let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+            assert!(
+                g.df_deta[k].is_finite() && fd.is_finite(),
+                "light obs {j} eta {k}: non-finite ({} vs {fd})",
+                g.df_deta[k]
+            );
+            approx::assert_relative_eq!(g.df_deta[k], fd, max_relative = 2e-4, epsilon = 1e-7);
+        }
+    }
+}
+
+/// Review r2 #3, second half: the #1898 spare-slot readers (`obs_scale`,
+/// `[initial_conditions]`) on a model whose program path **declines**, so their
+/// `∂p/∂(θ,η)` rows come from the closed-form fallback this PR rewrote. #1898's own
+/// parity test binds every `pk(...)` role to a variable, so it runs on the program
+/// path and never builds these rows; without this fixture the fallback × spare-slot
+/// combination is untested.
+///
+/// `pk_indices` already records the spare slot here (that is what #1898 fixed), so
+/// this is not a #1899 regression test — it is the non-degeneracy check that the
+/// rewritten fallback still differentiates a spare-slot reader exactly, and it
+/// kills a mutation that filtered the rows down to the structural PK slots.
+#[test]
+fn a_spare_slot_reader_matches_fd_on_the_fallback_path() {
+    let base = |ip: &str, extra: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVS(5.0, 0.01, 1000.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+             omega ETA_S ~ 0.1\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n{ip}\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=1.0)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n{extra}"
+        )
+    };
+    let cases = [
+        (
+            "init",
+            base(
+                "  S = TVS * exp(ETA_S)",
+                "[initial_conditions]\n  init(central) = S\n",
+            ),
+        ),
+        (
+            "obs_scale",
+            base("  S = TVS / 5 * exp(ETA_S)", "[scaling]\n  obs_scale = S\n"),
+        ),
+    ];
+    for (label, src) in cases {
+        let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(
+            analytical_supported(&m),
+            "{label}: must stay on the analytic provider"
+        );
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("a parsed model carries a program");
+        assert!(
+            !prog_covers_required_pk_slots(&m, prog),
+            "{label}: the literal `ka` must make the program path decline, or this \
+             duplicates #1898's program-path parity test"
+        );
+        assert!(
+            lognormal_chain_exact(&m),
+            "{label}: the fallback must be in scope, or the subject routes to FD"
+        );
+        // `S` owns a spare slot (#1898), so the fallback must carry a row for it.
+        let s_pos = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
+        let rows = m.pk_slot_rows();
+        assert!(
+            rows.iter().any(|&(_, i)| i == s_pos),
+            "{label}: S must own a row: {rows:?}"
+        );
+        let subj = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&m, &subj, &[0.2, 10.0, 5.0], &[0.1, -0.05, 0.2]);
+    }
+}

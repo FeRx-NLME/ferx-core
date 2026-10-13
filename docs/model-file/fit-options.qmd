@@ -271,8 +271,9 @@ a valid NCA estimate.
 
 Each pooled estimate is routed to a θ in two steps: find the individual parameter
 the `[structural_model]` line binds to that PK role, then find that parameter's θ
-— through its mu-reference when it carries an η, otherwise by searching
-`[parameters]` for a θ whose name contains the parameter's name.
+— through its mu-reference when the parameter carries an η **named after it**,
+otherwise by searching `[parameters]` for a θ whose name contains the parameter's
+name.
 
 The first step is exact. An intermediate the block declares on the way —
 `CLWT = exp(CLWT_EXP * log(WT/70))` above `CL = TVCL * CLWT * exp(ETA_CL)`, say —
@@ -283,12 +284,16 @@ declared *before* the bound parameter: the clearance estimate landed on
 is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
 model default (#1899).
 
-The second step is exact for a parameter **with** an η and a name search for one
-without. The search takes the first θ whose name *contains* the parameter's name,
-so a parameter with no IIV whose name is a substring of an earlier θ's name
-resolves to that θ — `V = TVV` declared alongside a `theta TVCL` resolves to
-`TVCL`, which then receives the volume estimate instead of the clearance one
-(#1922). Give such a parameter an η, or a θ name that does not collide.
+The second step is exact only through the mu-reference, and the mu-reference is
+matched **by η name**: the η must be called exactly the parameter's name or end in
+`_<PARAM>`, so `ETA_V` and `IIV_V` resolve `V` but `ETA_VOL` does not. Anything
+else falls through to the name search, which takes the first θ whose name
+*contains* the parameter's name — so a parameter whose name is a substring of an
+earlier θ's name resolves to that θ. `V = TVV` or `V = TVV * exp(ETA_VOL)`
+declared alongside a `theta TVCL` both resolve to `TVCL`, which then receives the
+volume estimate instead of the clearance one, and `TVV` is never written at all
+(#1922). Name the η after its parameter (`ETA_V`, not `ETA_VOL`), or give the θ a
+name that does not collide.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
