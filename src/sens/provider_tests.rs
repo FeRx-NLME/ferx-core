@@ -7158,6 +7158,105 @@ fn iov_subject() -> Subject {
     }
 }
 
+/// `dose_pk_snapshots` (the per-dose PK the IOV covariance sweep bounds its kinks with)
+/// must give every dose the κ of **its own** occasion group — including the **last**
+/// group, whose κ block ends exactly at `b.len()` (#1937: the `<=` boundary of the guard
+/// was untested, so `<` silently handed the last group's doses κ = 0). The κ sits on the
+/// lag, so a wrong κ moves a dose's arrival time, i.e. the kink the sweep must not cross.
+///
+/// Groups, in stacked order: obs occasions 1 and 2, then dose-only occasion 3 (the last).
+/// A fourth dose carries no occasion label and must read κ = 0, as must the last group
+/// when `b` is one entry short (no panic).
+#[test]
+fn dose_pk_snapshots_give_each_dose_its_own_groups_kappa_including_the_last() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_IOV).expect("parse IOV + lag");
+    let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
+    assert_eq!((n_eta, n_kappa), (2, 1));
+    let mut subject = iov_subject();
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(48.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(60.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    // Three labelled doses; the fourth has no entry, so it reads occasion "none".
+    subject.dose_occasions = vec![1, 2, 3];
+    let groups: Vec<u32> = crate::stats::likelihood::iov_occasion_groups(&subject)
+        .iter()
+        .map(|(occ, _)| *occ)
+        .collect();
+    assert_eq!(
+        groups,
+        vec![1, 2, 3],
+        "occasion 3 is the last, dose-only group"
+    );
+
+    let theta = model.default_params.theta.clone();
+    let eta = [0.1, -0.05];
+    // Distinct, non-zero κ per group, written at the literal pre-#1082 offsets.
+    let kappas = [0.3, -0.4, 0.7];
+    let mut b = eta.to_vec();
+    b.extend_from_slice(&kappas);
+    assert_eq!(b.len(), n_eta + groups.len() * n_kappa);
+
+    let at = |kappa: f64, k: usize| {
+        let combined = [eta[0], eta[1], kappa];
+        (model.pk_param_fn)(
+            &theta,
+            &combined,
+            subject.dose_cov(k),
+            subject.doses[k].time,
+        )
+        .values
+    };
+    let bits = |v: [f64; crate::types::MAX_PK_PARAMS]| v.map(f64::to_bits);
+
+    let snaps = dose_pk_snapshots(&model, &subject, &theta, &b, true);
+    assert_eq!(snaps.len(), 4);
+    for (k, (&kappa, name)) in kappas
+        .iter()
+        .zip(["occasion 1", "occasion 2", "occasion 3 (last group)"])
+        .enumerate()
+    {
+        assert_eq!(
+            bits(snaps[k].values),
+            bits(at(kappa, k)),
+            "dose {k}, {name}: own κ"
+        );
+    }
+    assert_eq!(
+        bits(snaps[3].values),
+        bits(at(0.0, 3)),
+        "unlabelled dose: κ = 0"
+    );
+    // Straddle: κ = 0 would give the last group's dose a different snapshot, so the
+    // assertion above can tell the two apart.
+    assert_ne!(
+        bits(at(kappas[2], 2)),
+        bits(at(0.0, 2)),
+        "the last group's κ must move its dose's PK, or the test cannot see a κ = 0 read"
+    );
+
+    // One entry short: the last group's block no longer fits → κ = 0, no panic; the
+    // earlier groups still read theirs.
+    let short = dose_pk_snapshots(&model, &subject, &theta, &b[..b.len() - 1], true);
+    assert_eq!(
+        bits(short[0].values),
+        bits(at(kappas[0], 0)),
+        "short b: occasion 1"
+    );
+    assert_eq!(
+        bits(short[1].values),
+        bits(at(kappas[1], 1)),
+        "short b: occasion 2"
+    );
+    assert_eq!(
+        bits(short[2].values),
+        bits(at(0.0, 2)),
+        "short b: last group → κ = 0"
+    );
+}
+
 /// Closed-form **IOV × lagtime** (#486). Before this the CF IOV walk declined *any*
 /// lagtime outright (`iov_analytical_supported` bailed on `has_lagtime()`), so every
 /// oral-with-lag IOV model — a completely standard popPK object — ran on FD. The lag here
