@@ -484,3 +484,42 @@ fn fitted_population_assigns_blocks_for_a_baseline_by_column() {
     // the caller's population is untouched
     assert!(pop.subjects[0].obs_rgroup.is_empty());
 }
+
+/// #1081 review r2 R2-1: the public `compute_npde_npd` on a population read in
+/// without residual blocks — what ferx-r hands it — assigns them itself. Every npde
+/// and npd is finite, and equal to the result on the same population with its blocks
+/// assigned beforehand (the `fit()` post-fit path), so the entry step changes nothing
+/// but the missing blocks.
+#[test]
+fn compute_npde_npd_assigns_blocks_on_a_caller_population() {
+    let m = model("cs", "(0.5, -0.4, 0.95)");
+    let mut pop = population(&[
+        &[(1.0, 0.5), (2.0, 1.0), (1.0, 2.0), (2.0, 4.0)],
+        &[(1.0, 0.5), (1.0, 1.0), (2.0, 2.0), (2.0, 4.0)],
+    ]);
+    for s in &mut pop.subjects {
+        s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        s.observations = vec![9.0, 8.5, 7.1, 5.2];
+    }
+    assert!(
+        pop.subjects.iter().all(|s| s.obs_rgroup.is_empty()),
+        "precondition"
+    );
+    let run = |p: &Population| {
+        crate::stats::npde::compute_npde_npd(&m, p, &m.default_params, 200, Some(7)).expect("runs")
+    };
+    let given = run(&pop);
+    let values: Vec<f64> = given
+        .iter()
+        .flat_map(|s| s.npde.iter().chain(s.npd.iter()).copied())
+        .collect();
+    assert_eq!(values.len(), 16);
+    assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
+    let mut prepared = pop.clone();
+    crate::stats::residual_error::assign_residual_groups(&m, &mut prepared);
+    let want: Vec<u64> = run(&prepared)
+        .iter()
+        .flat_map(|s| s.npde.iter().chain(s.npd.iter()).map(|v| v.to_bits()))
+        .collect();
+    assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want);
+}

@@ -1159,6 +1159,29 @@ pub(crate) fn residual_groups(model: &crate::types::CompiledModel, subject: &Sub
         .collect()
 }
 
+/// `population` with its residual blocks assigned — borrowed when the model has no
+/// `correlation` line or every subject already carries them, else a copy with
+/// [`assign_residual_groups`] applied (#1081). The one entry step for every public
+/// function that draws or scores a dense `R` on a population it was handed rather than
+/// one `fitted_population` prepared (`simulate()`, `compute_npde_npd`): such a caller has
+/// no way to assign blocks itself, and an unassigned population gets a NaN `R`.
+pub(crate) fn with_residual_blocks<'a>(
+    model: &crate::types::CompiledModel,
+    population: &'a crate::types::Population,
+) -> std::borrow::Cow<'a, crate::types::Population> {
+    let unassigned = model.residual_serial.is_some()
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.obs_rgroup.len() != s.obs_times.len());
+    if !unassigned {
+        return std::borrow::Cow::Borrowed(population);
+    }
+    let mut p = population.clone();
+    assign_residual_groups(model, &mut p);
+    std::borrow::Cow::Owned(p)
+}
+
 /// Give every subject of `population` its residual blocks ([`residual_groups`]),
 /// the step a population takes before a model with a `correlation` line scores
 /// it (#1081). A no-op for any other model.

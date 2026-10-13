@@ -1162,20 +1162,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // `simulate()` takes the caller's population as given, so a `correlation` line's
     // residual blocks are read off its `by` columns here, once per call rather than
     // once per replicate (#1081). A fitted population carries them already.
-    let with_blocks;
-    let population = if model.residual_serial.is_some()
-        && population
-            .subjects
-            .iter()
-            .any(|s| s.obs_rgroup.len() != s.obs_times.len())
-    {
-        let mut p = population.clone();
-        crate::stats::residual_error::assign_residual_groups(model, &mut p);
-        with_blocks = p;
-        &with_blocks
-    } else {
-        population
-    };
+    let with_blocks = crate::stats::residual_error::with_residual_blocks(model, population);
+    let population: &Population = &with_blocks;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
