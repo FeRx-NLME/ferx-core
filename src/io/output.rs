@@ -3412,14 +3412,17 @@ fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind:
 ///   and the covariance step leaves a held coordinate's covariance at 0, so
 ///   its delta-method SE is exactly 0 (measured on `warfarin_block_omega` with
 ///   the block covariance initialised at 0: SEs 541.05 for the declared entry,
-///   0.0 for both cross-block ones). The SE is what keeps a block entry
-///   initialised *and* estimated at 0.
+///   0.0 for both cross-block ones). A positive SE is sufficient evidence of
+///   an estimate; a zero SE is not evidence of a structural zero, since a
+///   fixed coordinate is held the same way. The SE is what keeps a free block
+///   entry initialised *and* estimated at 0.
 ///
 /// What stays unresolvable is an entry that is 0 in all three for want of
-/// evidence: a block Ω entry initialised and estimated at 0 with no
-/// covariance step, and any block-κ covariance estimated at exactly 0
-/// (`FitResult` has no initial κ matrix, and no block-κ covariance SE). Those
-/// are omitted. The same rule serves an unrecorded layout (`None`: a `.fitrx`
+/// evidence: a block Ω entry initialised and estimated at 0 with no positive
+/// SE — no covariance results, or a fixed block (`block_omega (…) = […] FIX`,
+/// whose held coordinates get SE exactly 0 even when the step ran) — and any
+/// block-κ covariance estimated at exactly 0 (`FitResult` has no initial κ
+/// matrix, and no block-κ covariance SE). Those are omitted. The same rule serves an unrecorded layout (`None`: a `.fitrx`
 /// saved before #1177, a hand-built result).
 fn estimated_offdiag_pairs(
     m: &nalgebra::DMatrix<f64>,
@@ -5389,6 +5392,19 @@ mod tests {
         no_cov.se_omega = None;
         let t = parameter_table(&no_cov);
         assert!(!t.contains("OMEGA cov"), "{t}");
+        // A present but zero SE is not evidence either: a `FIX` block's held
+        // coordinates get SE exactly 0 even when the covariance step ran, so
+        // `block_omega (ETA_CL, ETA_V) = [0.09, 0.0, 0.04] FIX` is omitted too —
+        // the same gap, pinned with SEs present.
+        let mut fixed = mixed_block_omega_result(0.0, 0.0);
+        fixed.omega_fixed = vec![true, true, false];
+        fixed.se_omega = Some(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.05]);
+        let t = parameter_table(&fixed);
+        assert!(!t.contains("OMEGA cov"), "{t}");
+        assert_eq!(
+            table_cells(&t, "ETA_KA"),
+            ["0.300000", "0.050000", "16.7", "OMEGA var"]
+        );
     }
 
     /// #1748 review round 2: a mixed block + diagonal Ω and κ list the

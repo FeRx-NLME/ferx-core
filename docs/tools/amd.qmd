@@ -276,8 +276,8 @@ column the rest of the table compares.
   block covariance is listed even at zero when the fit shows it is estimated
   (a non-zero estimate, initial value or SE). Two zero covariances carry no
   such evidence and are omitted: a `block_omega` covariance initialised and
-  estimated at zero in a fit without a covariance step, and a block-κ
-  covariance estimated at exactly zero. The `Type` column gives
+  estimated at zero with no positive SE (no covariance step, or a `FIX` block,
+  whose SEs are zero), and a block-κ covariance estimated at exactly zero. The `Type` column gives
   the scale (`OMEGA var`, `OMEGA cov`, `SIGMA SD`, `KAPPA var`, `KAPPA cov`);
   Σ is a standard deviation, so a proportional σ of 0.28 is a 28% CV. An SE
   reads `---` when the covariance step produced none (a block-κ covariance
