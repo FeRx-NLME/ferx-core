@@ -263,7 +263,7 @@ pub(crate) fn subject_htilde_dx(
     // mirrors `sens_outer_gradient::sigma_block`'s own `correlated` branch. Computed once per
     // σ slot (not per observation, unlike the FREM override lookup) since
     // `corr_residual_rd_at_sigma` already returns the whole per-subject array.
-    let correlated = !params.residual_correlations.is_empty();
+    let correlated = params.residual_is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     // `∂(R_jj, d_j)/∂ρ_k`, indexed `[k][j]` — [`rho_rd_terms`]'s own closed form
     // (`crate::stats::residual_error::dvar_drho`), not a central FD like the σ/magnitude
@@ -280,10 +280,10 @@ pub(crate) fn subject_htilde_dx(
         let frem_override_m =
             build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm);
         let corr_at_sp = correlated.then(|| {
-            corr_residual_rd_at_sigma(model, subject, &ipreds, &sp, &params.residual_correlations)
+            corr_residual_rd_at_sigma(model, subject, &ipreds, &sp, params.residual_cov())
         });
         let corr_at_sm = correlated.then(|| {
-            corr_residual_rd_at_sigma(model, subject, &ipreds, &sm, &params.residual_correlations)
+            corr_residual_rd_at_sigma(model, subject, &ipreds, &sm, params.residual_cov())
         });
         for (j, o) in sens.obs.iter().enumerate() {
             let cmt = err_keys[j];
@@ -615,7 +615,7 @@ pub(crate) fn subject_htilde_dx_iov(
         || db_dx.len() != x.len()
         || b_hat.len() != n_st
         || template.mixture.is_some()
-        || !params.residual_correlations.is_empty()
+        || params.residual_is_dense()
         || !analytic_score_supported(model)
     {
         return None;

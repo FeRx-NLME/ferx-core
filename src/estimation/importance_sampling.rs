@@ -848,7 +848,7 @@ fn subject_is_estimate(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             &eta_sample,
             scratch,
         );
@@ -1231,7 +1231,7 @@ pub(crate) fn subject_is_draws_frem_rb(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             &full_eta,
             scratch,
         );
@@ -1464,7 +1464,7 @@ pub(crate) fn subject_is_draws(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             &eta_sample,
             scratch,
         );
@@ -2229,7 +2229,7 @@ pub(crate) fn compute_posterior_hessian(
     // loadings, so the proposal precision is built from the same `R` the
     // importance weights score against.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         let r = crate::stats::residual_error::r_matrix_maybe_scaled(
             &model.error_spec,
             &ipreds,
@@ -2240,7 +2240,7 @@ pub(crate) fn compute_posterior_hessian(
             model.error_spec.obs_keys(subject).as_ref(),
             subject,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             ruv_mult.as_deref(),
         );
         if let Some(chol) = r.cholesky() {

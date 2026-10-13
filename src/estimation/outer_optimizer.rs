@@ -3,7 +3,7 @@ use crate::estimation::inner_optimizer::{
     InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -921,7 +921,7 @@ fn subject_nll(
             );
         }
     }
-    foce_subject_nll(
+    foce_subject_nll_cov(
         model,
         subject,
         &params.theta,
@@ -932,7 +932,7 @@ fn subject_nll(
         // Live `block_sigma` off-diagonals (#847): this is the objective the
         // outer optimizer minimises, so it has to be scored at the ρ the
         // optimizer is currently proposing.
-        &params.residual_correlations,
+        params.residual_cov(),
         interaction,
     )
 }
@@ -4664,7 +4664,7 @@ fn is_structural_decline(
         &model.error_spec,
         subject,
         &init_params.sigma.values,
-        &init_params.residual_correlations,
+        init_params.residual_cov(),
     )
 }
 
@@ -4703,7 +4703,7 @@ fn non_iov_declined_salvage(
     if structural {
         let subject = &population.subjects[subj_idx];
         let params = unpack_params(x, init_params);
-        let nll = crate::stats::likelihood::foce_subject_nll(
+        let nll = crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -4711,7 +4711,7 @@ fn non_iov_declined_salvage(
             h_matrix,
             &params.omega,
             &params.sigma.values,
-            &params.residual_correlations,
+            params.residual_cov(),
             options.interaction,
         );
         match structural_fill(nll) {
@@ -4874,7 +4874,7 @@ fn subject_reconverged_fd_gradient(
             0,
             options,
         );
-        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll(
+        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -4882,7 +4882,7 @@ fn subject_reconverged_fd_gradient(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
-            &params.residual_correlations,
+            params.residual_cov(),
             options.interaction,
         ))
     };

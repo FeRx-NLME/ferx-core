@@ -34,7 +34,7 @@ pub(crate) enum InnerGradientMethod {
 /// classifier (the live scope check is [`analytic_inner_grad_supported`]).
 #[allow(dead_code)]
 pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'static str> {
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Some("correlated residual error");
     }
     // Non-log-normal ETA: additive (`tv + eta`), logit (`inv_logit(... + eta)`),
@@ -550,7 +550,7 @@ fn analytic_inner_seed_hessian(
     // subject) declines here to the full provider, whose seed carries no gradient.
     #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
     let mut light_supported = model.residual_error_eta.is_none()
-        && params.residual_correlations.is_empty()
+        && !params.residual_is_dense()
         && model.frem_config.is_none()
         && !subject.obs_times.is_empty();
     // A CTMM subject's inner gradient carries the `ctmm_subject_eta_grad` block on top of
@@ -1646,7 +1646,7 @@ fn find_ebe_solve(
             // ρ, so the inner objective must see the optimizer's current value —
             // reading `model.residual_correlations` here would hold the EBE
             // search at the declared correlation while the outer loop moved it.
-            &params.residual_correlations,
+            params.residual_cov(),
             &mut scratch,
             schedule,
             err_keys.as_ref(),
@@ -1699,7 +1699,7 @@ fn find_ebe_solve(
             &params.sigma.values,
             // Live ρ (#847) — the same value `obj` above scores, so the BFGS
             // gradient and objective can never disagree about the residual R.
-            &params.residual_correlations,
+            params.residual_cov(),
             schedule,
             mult.as_deref(),
             err_keys.as_ref(),
@@ -2709,7 +2709,7 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         // `residual_inner_obs` threads the η-independent per-obs multiplier). Only the
         // *combination* with a correlated residual bails: the dense-R inner kernel does
         // not carry the magnitude's θ-dependence, so route it to FD (magnitude-aware).
-        || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
+        || (model.has_custom_ruv_magnitude() && model.residual_is_dense())
     // `iiv_on_ruv` needs no bail here: residual-η is served analytically on both loops for
     // every combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
     // (#474/#4b/#4c/#591/#623/#677); the scaling and the censored/quantified `η_ruv` terms
@@ -3120,7 +3120,7 @@ pub(crate) fn analytic_eta_nll_gradient(
         omega,
         sigma,
         // HMC and the one-off diagnostic callers hold ρ at the declaration (#847).
-        &model.residual_correlations,
+        model.residual_cov(),
         None,
         mult.as_deref(),
         err_keys.as_ref(),
@@ -3163,7 +3163,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
-    residual_correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
@@ -3236,14 +3236,14 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
-    if !residual_correlations.is_empty() {
+    if residual_cov.is_dense() {
         let result = dense_residual_inner_gradient(
             model,
             subject,
             eta,
             omega,
             sigma,
-            residual_correlations,
+            residual_cov,
             &sens,
             mult,
             err_keys,
@@ -3356,7 +3356,7 @@ fn dense_residual_inner_gradient(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
-    residual_correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     sens: &[crate::sens::provider::ObsGrad],
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
@@ -3376,9 +3376,9 @@ fn dense_residual_inner_gradient(
     // Non-interaction FOCE (#1722): `R` is built at the frozen `f(η = 0)` and is a
     // constant of the search, so `∂R/∂η = 0` and only the `−a_kᵀs` term survives.
     let var_preds: &[f64] = frozen_var_preds.unwrap_or(&ipreds);
-    let corr = residual_correlations;
+    let corr = residual_cov;
     let r = match mult {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
             var_preds,
             err_keys.as_ref(),
@@ -3390,7 +3390,7 @@ fn dense_residual_inner_gradient(
             corr,
             mult,
         ),
-        None => crate::stats::residual_error::compute_r_matrix_with_correlations(
+        None => crate::stats::residual_error::compute_r_matrix_with_correlations_cov(
             &model.error_spec,
             var_preds,
             err_keys.as_ref(),
@@ -3422,7 +3422,7 @@ fn dense_residual_inner_gradient(
             .collect();
         return Some(grad);
     }
-    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+    let dr = crate::stats::residual_error::compute_dr_df_matrices_cov(
         &model.error_spec,
         &ipreds,
         err_keys.as_ref(),

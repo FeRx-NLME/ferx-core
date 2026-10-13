@@ -24,7 +24,7 @@ use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
 use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
+use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
 use crate::types::{
     BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
     Subject,
@@ -219,7 +219,7 @@ fn subject_nll(
         for (c, slot) in nll.iter_mut().enumerate() {
             let _g = MixtureClassGuard::enter(c + 1);
             *slot = if kappas.is_empty() {
-                individual_nll_into_with_schedule(
+                individual_nll_into_with_schedule_cov(
                     model,
                     subject,
                     theta,
@@ -227,7 +227,7 @@ fn subject_nll(
                     omega,
                     sigma,
                     // Bayes holds the `block_sigma` off-diagonals fixed (#847).
-                    &model.residual_correlations,
+                    model.residual_cov(),
                     scratch,
                     schedule,
                 )
@@ -239,14 +239,14 @@ fn subject_nll(
         return 0.5 * combine_subject(&logp, &nll).0;
     }
     if kappas.is_empty() {
-        individual_nll_into_with_schedule(
+        individual_nll_into_with_schedule_cov(
             model,
             subject,
             theta,
             eta,
             omega,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             scratch,
             schedule,
         )
@@ -2438,7 +2438,7 @@ mod tests {
         let mut nll = [0.0f64; 2];
         for (c, slot) in nll.iter_mut().enumerate() {
             let _g = MixtureClassGuard::enter(c + 1);
-            *slot = individual_nll_into_with_schedule(
+            *slot = crate::stats::likelihood::individual_nll_into_with_schedule(
                 &model,
                 subject,
                 &params.theta,

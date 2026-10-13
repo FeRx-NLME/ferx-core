@@ -19,12 +19,10 @@ use crate::sim::adaptive::{
     AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
     DoseLedgerEntry, MonitorSpec,
 };
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
+use crate::stats::likelihood::{build_frem_r_override, foce_subject_nll_iov};
 use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
+    compute_iwres_with_correlations, compute_r_matrix_with_correlations_cov,
+    compute_r_matrix_with_correlations_scaled_cov, iwres_autocorrelation,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -899,7 +897,7 @@ fn emit_subject_rows<R: rand::Rng>(
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     // The **live** correlations (#847), resolved once in `draw_correlations`.
     let draw_correlations = draw_correlations(model, params);
-    if !draw_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+    if draw_correlations.is_dense() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
             model,
             subject,
@@ -924,7 +922,7 @@ fn emit_subject_rows<R: rand::Rng>(
                 j,
                 ipred,
                 &params.sigma.values,
-                draw_correlations,
+                draw_correlations.pairs,
                 ruv_scale,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
             );
@@ -978,8 +976,8 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
-/// The `block_sigma` correlations a residual draw under `params` must use
-/// (#847, #1733). `params` is the fitted (or drawn) vector, so reading
+/// The residual covariance structure — today the `block_sigma` correlations — a
+/// residual draw under `params` must use (#847, #1733, #1081). `params` is the fitted (or drawn) vector, so reading
 /// `model.residual_correlations` would draw residuals at the declared rho while
 /// using the fitted sigmas — exactly the mismatch that would make a VPC or an
 /// NPDE of an estimated `block_sigma` fail to reproduce it. Prefer the parameter
@@ -991,11 +989,11 @@ fn emit_subject_rows<R: rand::Rng>(
 pub(crate) fn draw_correlations<'a>(
     model: &'a CompiledModel,
     params: &'a ModelParameters,
-) -> &'a [crate::types::ResidualCorrelation] {
-    if params.residual_correlations.is_empty() {
-        &model.residual_correlations
+) -> crate::stats::residual_error::ResidualCov<'a> {
+    if params.residual_is_dense() {
+        params.residual_cov()
     } else {
-        &params.residual_correlations
+        model.residual_cov()
     }
 }
 
@@ -1016,7 +1014,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     subject: &Subject,
     sigma_values: &[f64],
     /* live correlations, resolved by the caller */
-    correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -1025,7 +1023,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
     let mut r = match ruv_mult {
-        Some(mult) => compute_r_matrix_with_correlations_scaled(
+        Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
             ipreds,
             err_keys.as_ref(),
@@ -1034,10 +1032,10 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             sigma_values,
-            correlations,
+            residual_cov,
             mult,
         ),
-        None => compute_r_matrix_with_correlations(
+        None => compute_r_matrix_with_correlations_cov(
             &model.error_spec,
             ipreds,
             err_keys.as_ref(),
@@ -1046,7 +1044,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             sigma_values,
-            correlations,
+            residual_cov,
         ),
     };
     if ruv_scale != 1.0 {
@@ -1092,7 +1090,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     subject: &Subject,
     params: &ModelParameters,
     /* live correlations, resolved by the caller */
-    correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -1106,7 +1104,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
         model,
         subject,
         &params.sigma.values,
-        correlations,
+        residual_cov,
         ipreds,
         ruv_scale,
         ruv_mult,

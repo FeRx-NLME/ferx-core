@@ -1875,7 +1875,7 @@ mod tests {
             &subj,
             &theta,
             &sigma,
-            &model.residual_correlations,
+            model.residual_cov(),
             &eta,
             &mut scratch,
         );

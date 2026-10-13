@@ -10,7 +10,7 @@
 //! ```
 //!
 //! `nll_ik` is the ordinary per-subject FOCE negative log-likelihood
-//! ([`foce_subject_nll`]) evaluated with class-`k` parameters and the class-`k`
+//! ([`crate::stats::likelihood::foce_subject_nll`]) evaluated with class-`k` parameters and the class-`k`
 //! empirical Bayes estimate. Because the class-specific typical values are
 //! selected by the reserved `MIXNUM` index inside `[individual_parameters]`, and
 //! `MIXNUM` resolves from a thread-local, each class's inner solve + NLL is run
@@ -27,7 +27,7 @@ use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{omega_packed_len, pack_params, theta_packs_log};
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{eval_mixing_log_probs, mixing_logp_grad, MixtureClassGuard};
-use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
 
 /// Result of one mixture-objective evaluation.
@@ -189,7 +189,7 @@ pub fn mixture_ofv(
                     omega_iov,
                 )
             } else {
-                foce_subject_nll(
+                foce_subject_nll_cov(
                     model,
                     subject,
                     &cp.theta,
@@ -197,7 +197,7 @@ pub fn mixture_ofv(
                     &ebe.h_matrix,
                     &cp.omega,
                     &cp.sigma.values,
-                    &cp.residual_correlations,
+                    cp.residual_cov(),
                     interaction,
                 )
             };

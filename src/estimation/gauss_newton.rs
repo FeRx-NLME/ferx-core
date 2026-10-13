@@ -1791,7 +1791,7 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && kappas.is_empty()
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()
-        && template.residual_correlations.is_empty()
+        && !template.residual_is_dense()
         && !model.has_non_gaussian()
 }
 
@@ -2184,7 +2184,7 @@ fn subject_nll_at(
         }
     }
 
-    crate::stats::likelihood::foce_subject_nll(
+    crate::stats::likelihood::foce_subject_nll_cov(
         model,
         subject,
         &params.theta,
@@ -2194,7 +2194,7 @@ fn subject_nll_at(
         // `block_sigma` + Gauss-Newton is rejected up front
         // (`E_BLOCK_SIGMA_METHOD_UNSUPPORTED`), so these are always empty (#847).
         &params.sigma.values,
-        &params.residual_correlations,
+        params.residual_cov(),
         options.interaction,
     )
 }

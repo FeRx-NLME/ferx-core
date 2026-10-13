@@ -1040,7 +1040,7 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
         // under the FOCEI magnitude path — `prepare_stacked` bails at runtime, not here.)
         && (!model.has_custom_ruv_magnitude()
             || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                && model.residual_correlations.is_empty()))
+                && !model.residual_is_dense()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
@@ -5755,7 +5755,7 @@ fn walk_covariance_scope(
         return;
     }
     if sink.hit(
-        !model.residual_correlations.is_empty(),
+        model.residual_is_dense(),
         CovScopeDecline::ResidualCorrelations,
     ) {
         return;

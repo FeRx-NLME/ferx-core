@@ -172,7 +172,7 @@ pub fn compute_npde_npd(
                 // reuse it across all replicates.
                 let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
                 let draw_correlations = crate::api::draw_correlations(model, params);
-                let correlated_draw = !draw_correlations.is_empty()
+                let correlated_draw = draw_correlations.is_dense()
                     && n_obs > 0
                     && !subject.fremtype.iter().any(|&ft| ft > 0);
                 // IOV (#734): the per-occasion κ draw needs the subject's occasion
@@ -271,7 +271,7 @@ pub fn compute_npde_npd(
                                 j,
                                 ip,
                                 &params.sigma.values,
-                                draw_correlations,
+                                draw_correlations.pairs,
                                 ruv_scale,
                                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
                             );

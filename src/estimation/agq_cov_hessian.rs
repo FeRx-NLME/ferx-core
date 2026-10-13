@@ -735,7 +735,7 @@ pub(crate) fn node_jet(
             b,
             &params.omega,
             &params.sigma.values,
-            &params.residual_correlations,
+            params.residual_cov(),
             // Event-walk subjects are excluded by subject_sensitivities_cov above.
             None,
             core.mult.as_deref(),

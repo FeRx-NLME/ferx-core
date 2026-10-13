@@ -490,7 +490,7 @@ fn data_term_quad(
             subject,
             &params.theta,
             &params.sigma.values,
-            &params.residual_correlations,
+            params.residual_cov(),
             eta.as_slice(),
             &mut scratch,
         );

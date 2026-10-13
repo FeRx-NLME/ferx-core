@@ -21,12 +21,9 @@ use crate::sim::adaptive::{
     DoseLedgerEntry, MonitorSpec,
 };
 use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
+    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
 };
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -795,7 +792,7 @@ pub(crate) fn compute_subject_results(
             } else {
                 Some(pred.as_slice())
             };
-            let cwres = compute_cwres(
+            let cwres = compute_cwres_cov(
                 subject,
                 &ipred,
                 eta,
@@ -803,7 +800,7 @@ pub(crate) fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
-                &params.residual_correlations,
+                params.residual_cov(),
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
@@ -830,7 +827,7 @@ pub(crate) fn compute_subject_results(
                     omega_iov,
                 )
             } else {
-                foce_subject_nll(
+                foce_subject_nll_cov(
                     model,
                     subject,
                     &params.theta,
@@ -838,7 +835,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
-                    &params.residual_correlations,
+                    params.residual_cov(),
                     interaction,
                 )
             };

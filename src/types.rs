@@ -2384,6 +2384,20 @@ impl ModelParameters {
             || self.residual_correlation_fixed.iter().any(|&b| b)
             || self.kappa_fixed.iter().any(|&b| b)
     }
+
+    /// The residual covariance structure of this parameter set — the live
+    /// `block_sigma` correlations (#847). What every dense-`R` builder is handed
+    /// when it scores these parameters (#1081).
+    pub(crate) fn residual_cov(&self) -> crate::stats::residual_error::ResidualCov<'_> {
+        crate::stats::residual_error::ResidualCov::block_sigma(&self.residual_correlations)
+    }
+
+    /// Can this parameter set's residual covariance `R` couple two observation rows?
+    /// The one "take the dense-`R` path" question for code holding the live
+    /// parameters (#1081); see `ResidualCov::is_dense`.
+    pub(crate) fn residual_is_dense(&self) -> bool {
+        self.residual_cov().is_dense()
+    }
 }
 
 /// One mixing-probability expression for a `$MIXTURE` class (#977).
@@ -5315,6 +5329,21 @@ impl CompiledModel {
     /// infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
         self.pk_indices.contains(&PK_IDX_F) || self.has_indexed_dose_attr(DoseAttr::F, None)
+    }
+
+    /// The residual covariance structure as **declared** — the model's own
+    /// `block_sigma` correlations. Code scoring a live parameter set uses
+    /// `ModelParameters::residual_cov` instead (#847); this is for the callers that
+    /// already read the declaration (#1081).
+    pub(crate) fn residual_cov(&self) -> crate::stats::residual_error::ResidualCov<'_> {
+        crate::stats::residual_error::ResidualCov::block_sigma(&self.residual_correlations)
+    }
+
+    /// Can this model's residual covariance `R` couple two observation rows? The
+    /// one "take the dense-`R` path" question for code holding the model (#1081);
+    /// see `ResidualCov::is_dense`.
+    pub(crate) fn residual_is_dense(&self) -> bool {
+        self.residual_cov().is_dense()
     }
 
     /// Residual variance for one observation, dispatching on its compartment.

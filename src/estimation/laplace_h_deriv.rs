@@ -182,7 +182,7 @@ pub(crate) fn subject_h_inner_dx(
         || params.omega_iov.is_some()
         || template.mixture.is_some()
         || model.residual_error_eta.is_some()
-        || !params.residual_correlations.is_empty()
+        || params.residual_is_dense()
     {
         return None;
     }

@@ -498,17 +498,23 @@ fn corr_residual_diag(
     subject: &Subject,
     sens: &SubjectSens,
     sigma: &[f64],
-    corr: &[ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
 ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     use crate::stats::residual_error::{
-        compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
+        compute_d2r_df2_matrices_cov, compute_dr_df_matrices_cov,
+        compute_r_matrix_with_correlations_cov,
     };
     let es = &model.error_spec;
     // Only diagonal R is served by the scalar reduction (see the doc above). Keyed on the
     // pairing itself rather than on `|R_jk| > 0`, so a paired row whose value covariance
     // is momentarily zero still declines: at `f = 0` on a proportional row its `∂R_jk/∂f`
     // is not zero, and at ρ = 0 its `∂R_jk/∂ρ` is not — both terms this path would drop.
-    if crate::stats::residual_error::has_cross_observation_residual(es, subject, sigma, corr) {
+    if crate::stats::residual_error::has_cross_observation_residual(
+        es,
+        subject,
+        sigma,
+        residual_cov,
+    ) {
         return None;
     }
     // #669: per-observation endpoint keys must come from the covariate selector
@@ -520,7 +526,7 @@ fn corr_residual_diag(
     let err_keys = es.obs_keys(subject);
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let n = ipreds.len();
-    let r = compute_r_matrix_with_correlations(
+    let r = compute_r_matrix_with_correlations_cov(
         es,
         &ipreds,
         err_keys.as_ref(),
@@ -529,9 +535,9 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_cov,
     );
-    let dr = compute_dr_df_matrices(
+    let dr = compute_dr_df_matrices_cov(
         es,
         &ipreds,
         err_keys.as_ref(),
@@ -540,10 +546,10 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_cov,
         None,
     );
-    let d2 = compute_d2r_df2_matrices(
+    let d2 = compute_d2r_df2_matrices_cov(
         es,
         &ipreds,
         err_keys.as_ref(),
@@ -552,7 +558,7 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_cov,
         None,
     );
     let mut rv = vec![0.0; n];
@@ -575,15 +581,15 @@ pub(crate) fn corr_residual_rd_at_sigma(
     subject: &Subject,
     ipreds: &[f64],
     sigma: &[f64],
-    corr: &[ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
 ) -> (Vec<f64>, Vec<f64>) {
-    use crate::stats::residual_error::compute_dr_df_matrices;
+    use crate::stats::residual_error::compute_dr_df_matrices_cov;
     let es = &model.error_spec;
     let n = ipreds.len();
     // #669: selector-resolved endpoint keys, not the raw CMT column (see
     // `corr_residual_diag`).
     let err_keys = es.obs_keys(subject);
-    let dr = compute_dr_df_matrices(
+    let dr = compute_dr_df_matrices_cov(
         es,
         ipreds,
         err_keys.as_ref(),
@@ -592,13 +598,13 @@ pub(crate) fn corr_residual_rd_at_sigma(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_cov,
         None,
     );
     let mut rv = vec![0.0; n];
     let mut dv = vec![0.0; n];
     for j in 0..n {
-        rv[j] = es.variance_at_with_correlations(err_keys[j], ipreds[j], sigma, corr);
+        rv[j] = es.variance_at_with_correlations(err_keys[j], ipreds[j], sigma, residual_cov.pairs);
         dv[j] = dr[j][(j, j)];
     }
     (rv, dv)
@@ -793,8 +799,8 @@ pub(crate) fn data_sigma_gradient(
     let err_keys = model.error_spec.obs_keys(subject);
     // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
     // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
-    let corrs = &params.residual_correlations;
-    let correlated = !corrs.is_empty();
+    let corrs = params.residual_cov();
+    let correlated = corrs.is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let mut out = vec![0.0f64; n_sigma];
 
@@ -967,13 +973,13 @@ pub(crate) fn score_core(
     // per-obs `(r, d, d2)` diagonals once (block_sigma excludes M3/ruv/IOV, so
     // `ruv_scale = 1`). `None` bails to FD (a rare off-diagonal R). Everything else in
     // the assembly is unchanged — see `corr_residual_diag`.
-    let corr_diag = if !params.residual_correlations.is_empty() {
+    let corr_diag = if params.residual_is_dense() {
         Some(corr_residual_diag(
             model,
             subject,
             sens,
             sigma,
-            &params.residual_correlations,
+            params.residual_cov(),
         )?)
     } else {
         None
@@ -1709,8 +1715,8 @@ fn sigma_block(
     // `corr_residual_diag`'s guard in `prepare_stacked`).
     // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
     // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
-    let corrs = &params.residual_correlations;
-    let correlated = !corrs.is_empty();
+    let corrs = params.residual_cov();
+    let correlated = corrs.is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     // Custom / time-varying residual-magnitude (#484/#576): `mult(θ)` is fixed
     // while perturbing σ (it doesn't depend on σ), so the σ±h FD below must hold
@@ -1952,7 +1958,7 @@ fn rho_block(
 ) -> Vec<f64> {
     let corrs = &params.residual_correlations;
     let mut grad = vec![0.0f64; corrs.len()];
-    if corrs.is_empty() || sens.obs.is_empty() {
+    if !params.residual_is_dense() || sens.obs.is_empty() {
         return grad;
     }
     let n_eta = prep.n_eta;
@@ -2571,10 +2577,16 @@ pub fn subject_packed_gradient_foce(
     // analytic FOCE scope, so `R̃ = JΩJᵀ + diag(R⁰)` is unchanged apart from the
     // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
     // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
-    let correlated = !params.residual_correlations.is_empty();
+    let correlated = params.residual_is_dense();
     let corr = &params.residual_correlations;
     let corr_rd0 = if correlated {
-        Some(corr_residual_diag(model, subject, &sens0, sigma, corr)?)
+        Some(corr_residual_diag(
+            model,
+            subject,
+            &sens0,
+            sigma,
+            params.residual_cov(),
+        )?)
     } else {
         None
     };
@@ -2719,7 +2731,7 @@ pub fn subject_packed_gradient_foce(
     // `½ ∂R⁰/∂ρ (R̃⁻¹ᵢᵢ − uᵢ²)` shape, with the Fisher-z chain. No censored
     // companion term: `block_sigma` + M3 is rejected up front, so `cg` carries no
     // ρ block to add.
-    if !params.residual_correlations.is_empty() {
+    if params.residual_is_dense() {
         let rho_start = rho_packed_start(template);
         let rho_terms = rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations);
         for (k, per_obs) in rho_terms.iter().enumerate() {
@@ -2768,7 +2780,8 @@ pub fn subject_packed_gradient_foce(
             &params.omega.inv,
             eta_hat,
         )?;
-        let rho_terms = (!params.residual_correlations.is_empty())
+        let rho_terms = params
+            .residual_is_dense()
             .then(|| rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations));
         frozen_eta_dx_assemble(
             &resp,
@@ -3120,9 +3133,15 @@ pub(crate) fn subject_eta_dx_foce(
         None => None,
     };
     let corr = &params.residual_correlations;
-    let corr_rd0 = match corr.is_empty() {
-        true => None,
-        false => Some(corr_residual_diag(model, subject, &sens0, sigma, corr)?),
+    let corr_rd0 = match params.residual_is_dense() {
+        false => None,
+        true => Some(corr_residual_diag(
+            model,
+            subject,
+            &sens0,
+            sigma,
+            params.residual_cov(),
+        )?),
     };
     let rows = foce_r0_rows(
         model,
@@ -3147,7 +3166,9 @@ pub(crate) fn subject_eta_dx_foce(
         &params.omega.inv,
         eta_hat,
     )?;
-    let rho_terms = (!corr.is_empty()).then(|| rho_rd_terms(model, subject, &sens0, sigma, corr));
+    let rho_terms = params
+        .residual_is_dense()
+        .then(|| rho_rd_terms(model, subject, &sens0, sigma, corr));
     Some(frozen_eta_dx_assemble(
         &resp,
         &sens,
@@ -3798,7 +3819,7 @@ pub(crate) fn subject_eta_dx_from_sens(
     // below come from `params`, so the predicate that gates them must too, or a
     // hand-built `ModelParameters` could disagree with the model about whether a
     // correlation exists at all.
-    let correlated = !params.residual_correlations.is_empty();
+    let correlated = params.residual_is_dense();
     let eta_dx_ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -3813,14 +3834,14 @@ pub(crate) fn subject_eta_dx_from_sens(
                     subject,
                     &eta_dx_ipreds,
                     &sp,
-                    &params.residual_correlations,
+                    params.residual_cov(),
                 )),
                 Some(corr_residual_rd_at_sigma(
                     model,
                     subject,
                     &eta_dx_ipreds,
                     &sm,
-                    &params.residual_correlations,
+                    params.residual_cov(),
                 )),
             )
         } else {
@@ -3921,7 +3942,7 @@ pub(crate) fn subject_eta_dx_from_sens(
     // so this one Jacobian serves both the FOCE and FOCEI callers — the same
     // reason the σ columns are shared. Every `sigma_block`-style branch is
     // inapplicable here (see `rho_block`), so the plain row is the only one.
-    if !params.residual_correlations.is_empty() {
+    if params.residual_is_dense() {
         let rho_start = rho_packed_start(template);
         let rho_terms = rho_rd_terms(model, subject, &sens, sigma, &params.residual_correlations);
         for (k, per_obs) in rho_terms.iter().enumerate() {
