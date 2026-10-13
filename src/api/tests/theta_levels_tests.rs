@@ -7825,12 +7825,14 @@ mod absorption {
     /// the refusal holds under every contrast and says so. M2: `none` on R8s,
     /// where sum-to-zero binds. M3/M4: the contrast that loses, and the one
     /// that binds, for `TVB * D2` (sum-to-zero refused, `ref` named) and its
-    /// mirror. M5: the kappa's `occasion` wording. "under any contrast" is
+    /// mirror. M5: the kappa's `occasion` wording. M6: a contrast the
+    /// certificate identifies but that leaves no free θ is not named. "under any contrast" is
     /// asserted present in M1 and absent from M2 in one test, so either branch
     /// forced reddens it.
     ///
     /// Mutations — delete each sentence of the new text in turn: each is
-    /// asserted below, by the cell that carries it.
+    /// asserted below, by the cell that carries it. `rescues` without its
+    /// free-θ gate: M6 advises `contrast = sum_to_zero`.
     #[test]
     fn the_one_column_refusal_says_which_contrast_binds() {
         let pop = arms_pop_d();
@@ -7914,6 +7916,22 @@ mod absorption {
             ],
         );
         lacks(&m5, &["that subject's", ANY_CONTRAST]);
+
+        // M6 (review r1, F2): one subject, one level. Sum-to-zero leaves the η
+        // its direction (the coded block has no column at all) but no free θ,
+        // so it is not named: that contrast is refused as a single level.
+        let one = occ_pop(1, 1, &T6, 3, true);
+        let m6 = refusal(NO_INTERCEPT, false, "none", &one);
+        has(&m6, &[ANY_CONTRAST]);
+        lacks(&m6, &["Use `contrast ="]);
+        let stz = try_bind(
+            &text(format!("  E0 = {NO_INTERCEPT}"), false, "sum_to_zero"),
+            &one,
+        );
+        assert!(
+            stz.as_ref().is_err_and(|e| e.contains("a single level")),
+            "M6 sum_to_zero: {stz:?}"
+        );
     }
 
     // ── #1834: an absorption the walk cannot name, measured ─────────────────

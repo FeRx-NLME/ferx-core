@@ -2325,19 +2325,17 @@ fn carried(
             return Carried::Held;
         };
         let basis = orthonormal_basis(&cols);
-        let mut measured = false;
+        // A unit whose column is zero measures nothing; one outside the span
+        // is the only way this point says `Identified`.
         let mut outside = false;
         for z in &own {
             match residual_against(z, &basis) {
                 None => {}
                 Some(r) if !r.is_finite() => return Carried::Held,
-                Some(r) => {
-                    measured = true;
-                    outside |= r >= SPAN_TOL;
-                }
+                Some(r) => outside |= r >= SPAN_TOL,
             }
         }
-        if !(measured && outside) {
+        if !outside {
             return Carried::Held;
         }
     }
@@ -2613,9 +2611,12 @@ fn dead_levels_message(
 /// A nested block (two or more columns) that absorbs one random effect resolves
 /// `auto` to the within-group contrast, which leaves each unit's mean to the
 /// random effect; an explicit global contrast is refused. A one-column block
-/// has no such rescue: each level *is* one unit's, so it is refused under every
-/// contrast. Two absorbed random effects have no rescue either: within leaves
-/// each unit's mean to one of them, and the levels reproduce the other.
+/// has no within-group rescue: each level *is* one unit's, so `none` is refused,
+/// and so is every other contrast whose removed direction — the levels' mean,
+/// the reference level — another θ of the model carries ([`carried`], #1840);
+/// the nested block's explicit global contrasts follow the same certificate.
+/// Two absorbed random effects have no rescue either: within leaves each unit's
+/// mean to one of them, and the levels reproduce the other.
 fn resolve_contrast(
     decl: &LevelBlockDecl,
     levels: &[Level],
@@ -2685,11 +2686,11 @@ fn resolve_contrast(
     };
     let resolved = match decl.contrast() {
         LevelContrast::Auto if nested && absorbed.is_some() => LevelContrast::SumToZeroWithin,
-        // A one-column block whose absorbed random effect keeps the levels'
-        // mean only under `ref`: something else carries the mean (#1840).
+        // A one-column block (the arm above took every nested one) whose
+        // absorbed random effect keeps the levels' mean only under `ref`:
+        // something else carries the mean (#1840).
         LevelContrast::Auto
-            if !nested
-                && absorbed.is_some()
+            if absorbed.is_some()
                 && !identified(LevelContrast::SumToZero)
                 && rescues(LevelContrast::Ref) =>
         {

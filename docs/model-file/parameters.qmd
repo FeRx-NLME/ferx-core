@@ -202,7 +202,7 @@ and it is chosen by looking at both the model and the data:
 | Situation | Default |
 |---|---|
 | The block's levels each lie within one subject (within one occasion of one subject, for a kappa) **and** the block absorbs one random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
-| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused, under every contrast when the model has an intercept; otherwise refused under `none` only (see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)) |
+| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused under `none`; under any other contrast only when another θ carries the direction that contrast removes (typically an intercept) (see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)) |
 | The block absorbs **two** random effects | refused, under every contrast (see [Two random effects](#two-random-effects)) |
 | A level has no effect on the likelihood | `auto` takes a contrast that carries it; an explicit contrast that cannot is refused (see [Levels with no effect](#levels-with-no-effect)) |
 | Otherwise | sum-to-zero over **all** levels |
@@ -317,11 +317,12 @@ that enters `y` only through a time-varying term, such as `EMAX` in
 observation: on `[STUDY, VISIT]` with several times per visit, it stays
 identified.
 
-A nested block that absorbs a random effect defaults to `sum_to_zero_within`, and
-an explicit `sum_to_zero`, `ref` or `none` is refused when the model has an
-intercept (see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)).
-A **one-column** block has no such rescue. `PLACEBO[STUDY]` with one subject per
-study, next to `E0 = TVE0 + PLACEBO + ETA_E0`, makes each level the same quantity
+A nested block that absorbs a random effect defaults to `sum_to_zero_within`. An
+explicit `none` is refused. So is an explicit `sum_to_zero` or `ref` when another
+θ carries the direction that contrast removes, which is typically an intercept
+(see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)).
+A **one-column** block has no within-group rescue. `PLACEBO[STUDY]` with one
+subject per study, next to `E0 = TVE0 + PLACEBO + ETA_E0`, makes each level the same quantity
 as that subject's random effect, under every contrast, so it is refused, with
 the advice to remove the block or drop the random effect. Fitted anyway, ω
 collapses to 0. With two or more subjects per study the same model binds, since
