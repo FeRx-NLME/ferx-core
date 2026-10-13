@@ -1487,9 +1487,11 @@ fn toward_interior(x: f64, lo: f64, hi: f64, step: f64) -> f64 {
 const RE_STEP: f64 = 0.1;
 
 /// The values the likelihood reads from one subject: per record, its
-/// prediction and its residual-magnitude multipliers. Every η and κ is at
-/// `re`, and random effect `bump` (an η index, or `n_eta` + a κ index) at
-/// `re + RE_STEP`.
+/// prediction and its residual-magnitude multipliers. The η and κ are spread
+/// around `re` by [`probe_res`], as the span certificate and the readership
+/// check spread them, so a read gated by a difference of random effects does
+/// not cancel at the moved point (#1852); random effect `bump` (an η index, or
+/// `n_eta` + a κ index, on every occasion group) is moved by `RE_STEP` more.
 fn record_values(
     model: &CompiledModel,
     subject: &Subject,
@@ -1497,18 +1499,17 @@ fn record_values(
     re: f64,
     bump: Option<usize>,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let mut eta = vec![re; model.n_eta];
-    let mut kappa = vec![re; model.n_kappa];
-    match bump {
-        Some(r) if r < model.n_eta => eta[r] += RE_STEP,
-        Some(r) => kappa[r - model.n_eta] += RE_STEP,
-        None => {}
-    }
     let groups = match model.n_kappa {
         0 => 1,
         _ => crate::stats::stacked_layout::group_count(subject).max(1),
     };
-    values_at(model, subject, theta, &eta, &vec![kappa; groups])
+    let (mut eta, mut kappa) = probe_res(re, model, groups);
+    match bump {
+        Some(r) if r < model.n_eta => eta[r] += RE_STEP,
+        Some(r) => kappa.iter_mut().for_each(|k| k[r - model.n_eta] += RE_STEP),
+        None => {}
+    }
+    values_at(model, subject, theta, &eta, &kappa)
 }
 
 /// [`record_values`] at explicit random effects: `eta`, and `kappa` per
@@ -1635,9 +1636,9 @@ impl DeadLevels {
 /// with the random effects at 0.05. One point is not enough — a θ initialised at 0,
 /// or a random effect at 0, can switch a block off there alone. `dead_levels` and
 /// `refuse_read_unindexed` share these θ points, so the two cannot drift apart
-/// (#1822); the second element is the random-effect level, which `dead_levels`
-/// applies to every η and κ alike and `refuse_read_unindexed` spreads per η
-/// (`probe_etas`).
+/// (#1822); the second element is the random-effect level, which every check
+/// spreads per random effect the same way ([`probe_res`], [`probe_etas`]), so a
+/// difference of random effects does not cancel at the moved point (#1852).
 fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
     let p = &model.default_params;
     let theta0 = p.theta.clone();
@@ -1692,8 +1693,8 @@ fn free_level_thetas(
 /// level has a θ of its own. A level is dead when a finite step in its θ leaves
 /// every value [`record_values`] returns bitwise unchanged, on every subject
 /// that carries it, at both of two points: the initial θ with η = κ = 0, and a
-/// deterministic jitter of every non-`FIX` θ inside its bounds with η = κ =
-/// 0.05. One point is not enough — a θ initialised at 0 can switch the block
+/// deterministic jitter of every non-`FIX` θ inside its bounds with the random
+/// effects spread around 0.05 by [`probe_res`]. One point is not enough — a θ initialised at 0 can switch the block
 /// off there alone. A point where anything is non-finite, or where the θ has
 /// no room to step, is inconclusive, and the level counts as live: only a
 /// measured "no change" counts. Whether a dead level costs the model anything

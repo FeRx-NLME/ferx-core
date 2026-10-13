@@ -6274,6 +6274,113 @@ mod absorption {
         has(&err, &[DEAD_LEVELS]);
     }
 
+    /// D7 (#1852). A block read through a difference of random effects is live:
+    /// closed at η = 0, and open at the moved point, where the check spreads the
+    /// random effects per index ([`probe_res`]) as the readership check does
+    /// (#1845). On a 1-cpt ODE model, `PLACEBO[STUDY]` with two subjects per
+    /// study, `CL = TVCL·exp(ETA_CL)·exp(PLACEBO·G)` binds under auto, `ref` and
+    /// `none` for the plain block, the single-η gate and the difference gate
+    /// `ETA_CL − ETA_V`; the gate `ETA_CL − ETA_CL` is 0 at every point, and
+    /// stays refused. A κ twin, `E0 = TVE0 + PLACEBO·(ETA_E0 − KAPPA_E0)` on a
+    /// compartment-free model with two occasions per subject, binds too. The
+    /// straddle is asserted on the random effects the check uses.
+    ///
+    /// Mutations — `record_values` back to `vec![re; n]` for η and κ: the
+    /// difference rows are refused (and #1822's
+    /// `a_gate_on_a_difference_of_random_effects_is_refused`, which measures the
+    /// readership probe, stays green); κ alone uniform at `re`: the κ row is
+    /// refused.
+    #[test]
+    fn a_dead_level_check_spreads_the_random_effects() {
+        let ode = |cl: &str, c: &str| {
+            let modifier = if c.is_empty() {
+                String::new()
+            } else {
+                format!(", contrast = {c}")
+            };
+            format!(
+                r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[STUDY{modifier}](0.0, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * exp({cl})
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL / V * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let mut pop = population(6, 4);
+        for (i, s) in pop.subjects.iter_mut().enumerate() {
+            s.covariates.insert("STUDY".to_string(), (i / 2 + 1) as f64);
+        }
+        let contrasts = [
+            ("", LevelContrast::SumToZero, 2),
+            ("ref", LevelContrast::Ref, 2),
+            ("none", LevelContrast::Unconstrained, 3),
+        ];
+        let mut wrong = Vec::new();
+        for gate in ["PLACEBO", "PLACEBO * ETA_CL", "PLACEBO * (ETA_CL - ETA_V)"] {
+            for (c, want, free) in contrasts {
+                let got = try_bind(&ode(gate, c), &pop);
+                if got != Ok((want, free)) {
+                    wrong.push(format!("{gate} {c:?}: {got:?}"));
+                }
+            }
+        }
+        for (c, ..) in contrasts {
+            match try_bind(&ode("PLACEBO * (ETA_CL - ETA_CL)", c), &pop) {
+                Err(e) if e.contains("the block estimates nothing") => {}
+                got => wrong.push(format!("ETA_CL - ETA_CL {c:?}: {got:?}")),
+            }
+        }
+
+        let kappa = |c: &str| {
+            cf_model(
+                c,
+                "STUDY",
+                &format!("{BASE}  E0 = TVE0 + PLACEBO * (ETA_E0 - KAPPA_E0)"),
+                &format!("E0 + {EMAXY}"),
+            )
+            .replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  kappa KAPPA_E0 ~ 0.1\n",
+            )
+        };
+        let occ = occ_pop(3, 2, &T6, 2, false);
+        for (c, want, free) in contrasts {
+            let got = try_bind(&kappa(c), &occ);
+            if got != Ok((want, free)) {
+                wrong.push(format!("κ {c:?}: {got:?}"));
+            }
+        }
+
+        // The straddle: uniform at 0, spread at the moved point.
+        let model = parse_full_model(&kappa("none")).unwrap().model;
+        let [(_, re0), (_, re1)] = probe_points(&model);
+        let (eta0, kappa0) = probe_res(re0, &model, 2);
+        assert!(eta0[0] == 0.0 && kappa0.iter().all(|k| k[0] == 0.0));
+        let (eta1, kappa1) = probe_res(re1, &model, 2);
+        assert!(
+            kappa1.iter().all(|k| k[0] != eta1[0]),
+            "η {eta1:?} κ {kappa1:?}"
+        );
+        assert_ne!(probe_etas(re1, 2)[0], probe_etas(re1, 2)[1]);
+        assert!(wrong.is_empty(), "dead-level spread:\n{}", wrong.join("\n"));
+    }
+
     /// D6 (#1679). The check skips a model with a likelihood channel it does not
     /// read: a block read only by a hazard parameter has no effect on any
     /// prediction, but the event model reads it, so the model binds. The same
