@@ -3517,4 +3517,301 @@ mod tests {
             focei.warnings
         );
     }
+
+    /// `(SE(λ), SE(ω²))` as the fit reports them, from a packed covariance.
+    #[cfg(feature = "survival")]
+    fn reported_lambda_omega(
+        cov: &DMatrix<f64>,
+        params: &crate::types::ModelParameters,
+    ) -> (f64, f64) {
+        let (th, om, _, _) =
+            crate::api::postfit::extract_standard_errors(&Some(cov.clone()), params);
+        (th.expect("se_theta")[0], om.expect("se_omega")[0])
+    }
+
+    /// #1781, the same-point external anchor (Codex review r1 §2). At each sampler's own
+    /// estimate, the covariance the routed step returns under `r`, `s` and `rsr` against the
+    /// **exact** marginal's at the *same* point, computed outside ferx by
+    /// `nonmem_anchor/tte_exponential_exact.py --at λ ω²` (composite Simpson over η, 4001
+    /// points; central-difference Hessian and per-subject scores). Comparing at one point
+    /// separates covariance error from estimator location, which a fit-vs-MLE band conflates.
+    ///
+    /// Measured (Linux x86_64), relative error against the oracle, worst over the 18 numbers:
+    /// 2.02e-3 (IMP `rsr`, SE(ω²)); `s` agrees to 6e-6, since `S` has no Hessian in it. The
+    /// `R` error is the FD stencil's truncation at the default `fd_hessian_step = 1e-2`, not the
+    /// quadrature: going from 7 to 15 nodes moves no SE by more than 3e-5, while the step moves
+    /// it as h² — worst `r` / `rsr` error 3.6e-3 / 8.2e-3 at h = 2e-2 and 2.3e-4 / 5.3e-4 at
+    /// h = 5e-3, at either node count. Three nodes, by contrast, is 11% low on SE(ω²), and the
+    /// FOCEI objective this replaced is off by three orders of magnitude.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_sampler_points_match_the_exact_marginal_covariance() {
+        use crate::types::EstimationMethod as M;
+        // (method, point, [R, S, RSR] as (SE(λ), SE(ω²))) — the oracle's output, verbatim.
+        let cases: [(M, (f64, f64), [(f64, f64); 3]); 3] = [
+            (
+                M::Saem,
+                SAEM_POINT,
+                [
+                    (0.0085912, 0.6132721),
+                    (0.0085592, 0.7800549),
+                    (0.0086290, 0.4840343),
+                ],
+            ),
+            (
+                M::Imp,
+                (0.033848, 0.081064),
+                [
+                    (0.0081875, 0.6417223),
+                    (0.0081655, 0.8941711),
+                    (0.0082157, 0.4629967),
+                ],
+            ),
+            (
+                M::Impmap,
+                (0.033591, 0.082876),
+                [
+                    (0.0081921, 0.6555724),
+                    (0.0081522, 0.9008471),
+                    (0.0082376, 0.4801825),
+                ],
+            ),
+        ];
+        let mut worst: f64 = 0.0;
+        for (method, (lambda, omega), oracle) in cases {
+            let (model, pop) = tte_exponential_at(lambda, omega);
+            for (cm, want) in [
+                CovarianceMethod::Hessian,
+                CovarianceMethod::CrossProduct,
+                CovarianceMethod::Sandwich,
+            ]
+            .into_iter()
+            .zip(oracle)
+            {
+                let out = step_at_init(&model, &pop, &opts_for(method, cm));
+                assert_eq!(
+                    out.method,
+                    Some(cm),
+                    "{method:?} {cm:?}: {:?}",
+                    out.warnings
+                );
+                let got = reported_lambda_omega(
+                    out.matrix.as_ref().expect("matrix"),
+                    &model.default_params,
+                );
+                assert!(
+                    got.0.is_finite() && got.1.is_finite(),
+                    "{method:?} {cm:?}: {got:?}"
+                );
+                let err = ((got.0 / want.0 - 1.0).abs()).max((got.1 / want.1 - 1.0).abs());
+                eprintln!(
+                    "{method:?} {:>3}: SE(λ) {:.7} vs {:.7}, SE(ω²) {:.7} vs {:.7}, rel {err:.2e}",
+                    cm.label(),
+                    got.0,
+                    want.0,
+                    got.1,
+                    want.1
+                );
+                worst = worst.max(err);
+            }
+        }
+        eprintln!("worst relative error: {worst:.2e}");
+        assert!(worst < SAME_POINT_TOL, "worst {worst:.3e}");
+    }
+
+    /// 2.5× the realised worst (2.02e-3) of `the_sampler_points_match_the_exact_marginal_covariance`.
+    #[cfg(feature = "survival")]
+    const SAME_POINT_TOL: f64 = 5e-3;
+
+    /// `examples/tte_exponential.ferx` with a `FIX`ed κ on the (unused) dummy clearance, and the
+    /// 30-subject dataset read with one occasion each — a reachable IOV model (`n_kappa = 1`)
+    /// whose likelihood is the 1-η TTE one, so its FOCEI `R` at `SAEM_POINT` is the same
+    /// indefinite matrix the plain model has there.
+    #[cfg(feature = "survival")]
+    fn tte_iov_at_saem_point() -> (crate::types::CompiledModel, crate::types::Population) {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+            .expect("model file")
+            .replace(
+                "theta TVLAMBDA(0.05, 0.001, 10.0)",
+                &format!("theta TVLAMBDA({:?}, 0.001, 10.0)", SAEM_POINT.0),
+            )
+            .replace(
+                "omega ETA_LAMBDA ~ 0.09",
+                &format!(
+                    "omega ETA_LAMBDA ~ {:?}\n  kappa KAPPA_CL ~ 0.04 FIX",
+                    SAEM_POINT.1
+                ),
+            )
+            .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert_eq!(model.n_kappa, 1, "fixture must carry a κ");
+        let csv = std::fs::read_to_string("data/tte_exponential.csv").expect("data");
+        let mut lines = csv.lines();
+        let mut out = format!("{},OCC\n", lines.next().expect("header"));
+        for l in lines.filter(|l| !l.trim().is_empty()) {
+            out.push_str(&format!("{l},1\n"));
+        }
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(out.as_bytes()).expect("write");
+        let (pop, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            f.path().to_str().expect("path"),
+            None,
+            Some("OCC"),
+            None,
+            &[],
+        )
+        .expect("data");
+        (model, pop)
+    }
+
+    /// #1781 (Codex review r1 §1, §4): a live IOV model declines the quadrature route through
+    /// `run_covariance_step_inner` — the production call site supplies `model.n_kappa > 0` — and
+    /// the step then runs on the objective it would have used without the route, bit for bit.
+    /// The declined warning must hold for every outcome of that step, so all three are driven
+    /// through the same declined route: `s` directly (S⁻¹), `r` with a clipped `R` (the
+    /// `S⁻¹` fallback), and `r` on one subject, where `S` is singular too (the step fails).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_live_iov_model_declines_the_quadrature_route_for_every_step_outcome() {
+        use crate::estimation::cov_diagnostics::{
+            NON_STATIONARY_TOKEN, QUADRATURE_DECLINED_TOKEN, QUADRATURE_OBJECTIVE_TOKEN,
+        };
+        use crate::types::EstimationMethod as M;
+        let (model, pop) = tte_iov_at_saem_point();
+        let declined = |w: &[String]| {
+            assert_eq!(count_token(w, QUADRATURE_OBJECTIVE_TOKEN), 0, "{w:?}");
+            assert_eq!(count_token(w, QUADRATURE_DECLINED_TOKEN), 1, "{w:?}");
+            let msg = w
+                .iter()
+                .find(|m| m.starts_with(QUADRATURE_DECLINED_TOKEN))
+                .unwrap();
+            assert!(msg.contains("inter-occasion variability"), "{msg}");
+        };
+        // Direct S: the same matrix the unrouted step produces.
+        let s_opts = opts_for(M::Saem, CovarianceMethod::CrossProduct);
+        let s = step_at_init(&model, &pop, &s_opts);
+        declined(&s.warnings);
+        assert_eq!(s.method, Some(CovarianceMethod::CrossProduct));
+        let direct = success(cov_at_init(&model, &pop, &s_opts), "unrouted s");
+        assert_eq!(
+            s.matrix.as_ref(),
+            Some(&direct.matrix),
+            "the unchanged objective"
+        );
+        // R clipped → S⁻¹ fallback, still on the unrouted objective.
+        let r = step_at_init(&model, &pop, &opts_for(M::Saem, CovarianceMethod::Hessian));
+        declined(&r.warnings);
+        assert_eq!(
+            count_token(&r.warnings, NON_STATIONARY_TOKEN),
+            1,
+            "{:?}",
+            r.warnings
+        );
+        assert_eq!(r.method, Some(CovarianceMethod::CrossProduct));
+        assert_eq!(r.matrix.as_ref(), Some(&direct.matrix));
+        // One subject: S singular as well → the step fails, and still says it was declined.
+        let one = crate::types::Population {
+            subjects: vec![pop.subjects[0].clone()],
+            ..pop.clone()
+        };
+        let failed = step_at_init(&model, &one, &opts_for(M::Saem, CovarianceMethod::Hessian));
+        declined(&failed.warnings);
+        assert!(failed.matrix.is_none() && failed.method.is_none());
+        assert!(
+            failed
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(&format!("{NON_STATIONARY_TOKEN}: Covariance step failed"))),
+            "{:?}",
+            failed.warnings
+        );
+    }
+
+    /// #1781 (Codex review r1 §1): a live mixture model declines the quadrature route through
+    /// `run_covariance_step_inner` — the call site supplies `template.mixture.is_some()` — and
+    /// the step runs on the K-fold mixture objective it would have used without the route,
+    /// bit for bit. Two identical classes with a `FIX`ed mixing probability, so the mixture
+    /// changes nothing but the gate.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_live_mixture_model_declines_the_quadrature_route() {
+        use crate::estimation::cov_diagnostics::{
+            QUADRATURE_DECLINED_TOKEN, QUADRATURE_OBJECTIVE_TOKEN,
+        };
+        use crate::types::EstimationMethod as M;
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+            .expect("model file")
+            .replace(
+                "theta TVLAMBDA(0.05, 0.001, 10.0)",
+                &format!(
+                    "theta TVLAMBDA({:?}, 0.001, 10.0)\n  theta P1(0.5, FIX)",
+                    FOCEI_POINT.0
+                ),
+            )
+            .replace(
+                "omega ETA_LAMBDA ~ 0.09",
+                &format!("omega ETA_LAMBDA ~ {:?}", FOCEI_POINT.1),
+            )
+            .replacen(
+                "\n[individual_parameters]\n",
+                "\n[mixture]\n  nsub = 2\n  p(1) = P1\n\n[individual_parameters]\n",
+                1,
+            )
+            .replace(
+                "CL     = DUMMY_CL",
+                "CL     = if (MIXNUM == 1) DUMMY_CL else DUMMY_CL",
+            );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert!(
+            model.default_params.mixture.is_some(),
+            "fixture must be a mixture"
+        );
+        let (pop, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            "data/tte_exponential.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("data");
+        let opts = opts_for(M::Saem, CovarianceMethod::Hessian);
+        let out = step_at_init(&model, &pop, &opts);
+        assert_eq!(
+            count_token(&out.warnings, QUADRATURE_OBJECTIVE_TOKEN),
+            0,
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(
+            count_token(&out.warnings, QUADRATURE_DECLINED_TOKEN),
+            1,
+            "{:?}",
+            out.warnings
+        );
+        let msg = out
+            .warnings
+            .iter()
+            .find(|m| m.starts_with(QUADRATURE_DECLINED_TOKEN))
+            .unwrap();
+        assert!(msg.contains("the model is a mixture"), "{msg}");
+        let unrouted = cov_at_init(&model, &pop, &opts);
+        match unrouted {
+            super::CovarianceStepResult::Success(o) => {
+                assert_eq!(
+                    out.matrix.as_ref(),
+                    Some(&o.matrix),
+                    "the mixture objective"
+                )
+            }
+            other => {
+                assert!(out.matrix.is_none(), "both routes must agree");
+                let _ = other;
+            }
+        }
+    }
 }

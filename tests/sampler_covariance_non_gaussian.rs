@@ -27,6 +27,12 @@
 //! Before the fix the FOCEI objective's curvature was inverted at the samplers' estimates,
 //! where it is indefinite: SE(λ) = 4.2–9.8 under `r` and 1.3e4–4.1e4 under `rsr`.
 //!
+//! This is the broad full-fit check. It compares each sampler's covariance at its *own* estimate
+//! with the oracle at the *MLE*, so its bands carry estimator location as well as covariance
+//! error. The precise check is the same-point anchor,
+//! `covariance::tests::the_sampler_points_match_the_exact_marginal_covariance`, which evaluates
+//! ferx and the oracle at one point (worst realised error 2.0e-3, bound 5e-3).
+//!
 //! Each estimator is banded against its own reference row. Bands are measured (release CLI,
 //! Linux x86_64, 2026-10-13) and printed by every run: the worst realised relative error is
 //! 5.2% on SE(λ) and 12.8% on SE(ω²), both SAEM, whose estimate is not the reference minimum

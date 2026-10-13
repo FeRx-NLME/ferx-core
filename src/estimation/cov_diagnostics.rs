@@ -1103,11 +1103,11 @@ pub(crate) fn format_quadrature_declined_warning(
         ),
     };
     format!(
-        "{QUADRATURE_DECLINED_TOKEN}: Covariance step: the standard errors are the {obj} \
-         objective's curvature at the {m} estimate. With a non-Gaussian endpoint that \
-         objective can have its minimum far from the {m} estimate, and the standard errors \
-         are then unreliable. The quadrature marginal that replaces it after {m} was not \
-         used because {reason}. For standard errors, {}.",
+        "{QUADRATURE_DECLINED_TOKEN}: Covariance step: R and S are evaluated on the {obj} \
+         objective at the {m} estimate. With a non-Gaussian endpoint that objective can have \
+         its minimum far from the {m} estimate, and standard errors taken from it are then \
+         unreliable. The quadrature marginal that replaces it after {m} was not used because \
+         {reason}. For standard errors, {}.",
         non_stationary_remedy(method, objective, None)
     )
 }
@@ -1198,17 +1198,25 @@ fn objective_name(objective: EstimationMethod, quadrature_nodes: Option<usize>) 
     }
 }
 
-/// The warning for an `R` matrix that is not positive definite at an estimate its objective
-/// never optimised (#1781). Two forms, keyed on `s_unavailable`: `S⁻¹` was returned instead
+/// The warning for an `R` matrix the eigenvalue floor had to clip at an estimate its objective
+/// never optimised (#1781) — not positive definite, or positive definite with an eigenvalue
+/// under the floor. Two forms, keyed on `s_unavailable`: `S⁻¹` was returned instead
 /// (a warning), or `S` was unavailable too and the step failed (no standard errors).
 ///
 /// Every sentence is pinned by `cov_diagnostics_tests.rs`, both forms in one test.
 pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
     let obj = objective_name(f.objective, f.quadrature_nodes);
     let method = f.method.label();
+    // The floor clips every eigenvalue under `max(1e-10·λ_max, 1e-12)`, positive ones included
+    // (Codex review r1 §3), so the clause says which of the two cells this is.
+    let state = if f.min_eigenvalue > 0.0 {
+        "positive definite but near-singular"
+    } else {
+        "not positive definite"
+    };
     let head = format!(
-        "the {obj} R matrix is not positive definite at the {method} estimate (min eigenvalue \
-         {:.3e}, max {:.3e})",
+        "the {obj} R matrix needed an eigenvalue floor at the {method} estimate (it is {state}: \
+         min eigenvalue {:.3e}, max {:.3e})",
         f.min_eigenvalue, f.max_eigenvalue
     );
     let why = format!(

@@ -1513,19 +1513,23 @@ fn the_declined_warning_names_the_objective_the_reason_and_the_remedy_sentence_b
     use EstimationMethod as M;
     let saem = |d| format_quadrature_declined_warning(M::Saem, M::FoceI, d);
     let w = saem(QuadratureDecline::Mixture);
-    // Sentence 1 — whose curvature the standard errors are.
+    // Sentence 1 — the objective R and S are evaluated on. It claims nothing about which
+    // matrix the step returns, or whether it returns one (Codex review r1 §4): the step that
+    // follows may give `S⁻¹`, fall back to it, or fail, all pinned through the live declined
+    // route in `covariance::tests::a_live_iov_model_declines_the_quadrature_route_for_every_step_outcome`.
     assert!(
         w.starts_with(
-            "W_COV_QUADRATURE_DECLINED: Covariance step: the standard errors are the FOCEI \
-             objective's curvature at the SAEM estimate."
+            "W_COV_QUADRATURE_DECLINED: Covariance step: R and S are evaluated on the FOCEI \
+             objective at the SAEM estimate."
         ),
         "{w}"
     );
+    assert!(!w.contains("curvature"), "{w}");
     // Sentence 2 — why that is unreliable.
     assert!(
         w.contains(
             " With a non-Gaussian endpoint that objective can have its minimum far from the \
-             SAEM estimate, and the standard errors are then unreliable."
+             SAEM estimate, and standard errors taken from it are then unreliable."
         ),
         "{w}"
     );
@@ -1592,8 +1596,8 @@ fn non_stationary_facts(s_unavailable: Option<&str>) -> NonStationaryFacts<'_> {
 
 #[test]
 fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
-    let head = "the FOCEI R matrix is not positive definite at the SAEM estimate (min eigenvalue \
-                -9.510e-2, max 1.250e1)";
+    let head = "the FOCEI R matrix needed an eigenvalue floor at the SAEM estimate (it is not \
+                positive definite: min eigenvalue -9.510e-2, max 1.250e1)";
     let why = " SAEM does not minimise the FOCEI objective R is the Hessian of, so its estimate \
                need not be a stationary point of that objective, and R⁻¹ there would be the \
                inverse of an eigenvalue-floored matrix rather than a covariance.";
@@ -1654,7 +1658,7 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
         ..non_stationary_facts(None)
     });
     assert!(
-        quad.contains("the 7-node quadrature R matrix is not positive definite"),
+        quad.contains("the 7-node quadrature R matrix needed an eigenvalue floor"),
         "{quad}"
     );
     assert!(
@@ -1730,4 +1734,65 @@ fn cov_objective_method_reads_quadrature_then_interaction() {
     assert_eq!(cov_objective_method(&o(M::FoceI, true, 3)), M::Laplace);
     assert_eq!(cov_objective_method(&o(M::Saem, true, 1)), M::FoceI);
     assert_eq!(cov_objective_method(&o(M::Saem, false, 1)), M::Foce);
+}
+
+#[test]
+fn the_non_stationary_warning_says_which_of_the_two_floored_cells_r_is_in() {
+    // Codex review r1 §3: the floor clips every eigenvalue under `max(1e-10·λ_max, 1e-12)`,
+    // so a strictly positive-definite `R` like diag(1, 1e-11) triggers the fallback too. The
+    // clause must be true in both cells, and must differ between them. Both in one test, so a
+    // state stuck on either branch reddens it.
+    let pd = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 1e-11,
+        max_eigenvalue: 1.0,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        pd.contains(
+            "the FOCEI R matrix needed an eigenvalue floor at the SAEM estimate (it is positive \
+             definite but near-singular: min eigenvalue 1.000e-11, max 1.000e0)"
+        ),
+        "{pd}"
+    );
+    assert!(!pd.contains("not positive definite"), "{pd}");
+    let indefinite = format_non_stationary_warning(&non_stationary_facts(None));
+    assert!(
+        indefinite.contains("(it is not positive definite: min eigenvalue -9.510e-2"),
+        "{indefinite}"
+    );
+    assert!(!indefinite.contains("near-singular"), "{indefinite}");
+    // Zero is not positive: an exactly singular R is the second cell.
+    let singular = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 0.0,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        singular.contains("(it is not positive definite: min eigenvalue 0.000e0"),
+        "{singular}"
+    );
+}
+
+#[test]
+fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
+    // The premise of the cell above, measured on the production floor rather than assumed:
+    // diag(1, 1e-11) is positive definite, and `invert_psd_with_floor` clips it, so the
+    // fallback gate fires for a sampler and not for FOCEI.
+    let r = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 1e-11]));
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&r).expect("inverse");
+    assert!(
+        inv.min_eigenvalue > 0.0 && inv.n_clipped == 1,
+        "{} {}",
+        inv.min_eigenvalue,
+        inv.n_clipped
+    );
+    assert!(r_falls_back_to_s(
+        EstimationMethod::Saem,
+        inv.n_clipped,
+        CovarianceMethod::Hessian
+    ));
+    assert!(!r_falls_back_to_s(
+        EstimationMethod::FoceI,
+        inv.n_clipped,
+        CovarianceMethod::Hessian
+    ));
 }

@@ -6619,7 +6619,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // accident of wording.
         (WarningSeverity::Info, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_non_stationary_estimate") {
-        // #1781: `R` was not positive definite at a SAEM / IMP / IMPMAP / VI estimate, which
+        // #1781: `R` needed an eigenvalue floor at a SAEM / IMP / IMPMAP / VI estimate, which
         // that method never optimised the objective of. Two forms, one token: `S⁻¹` replaced
         // the requested estimator (degraded but present — `CovarianceRegularized`, and *not*
         // `REGULARIZED_PREFIX`, so the #1512 strictness gate on the eigen-floor does not fire
