@@ -3448,7 +3448,19 @@ fn optimize_nlopt_once(
         // probe that happens to land on the due window from being recorded as
         // where the fit is (#1317) — `best_seen` is updated just above, so it is
         // never empty here, and it is the same tracker the #59 restore reads.
-        if crate::io::checkpoint::is_due() {
+        //
+        // #1617 review round 7: and only once something feasible has been *seen*. Until
+        // then `best_seen` ranks `guard_penalty_value`s, so its minimum is the scaled
+        // midpoint of the declared bounds — and a checkpoint is a *starting point* for the
+        // next run, which is the one place the exit-time fallback below cannot help: resume
+        // from such a file and the midpoint becomes the resumed fit's own start, so the
+        // fallback faithfully restores it and #1617's point defect survives the interrupt.
+        // Writing nothing is the right answer rather than writing the optimizer start,
+        // because an absent file means "resume from the model's initial estimates", which is
+        // exactly where a run that has found nothing should begin. `is_due()` is tested
+        // first: it is `false` whenever no sink is active, so the default path does not take
+        // the plateau lock.
+        if crate::io::checkpoint::is_due() && plateau_tracker_cl.lock().unwrap().2 > 0 {
             best_seen_cl
                 .lock()
                 .unwrap()

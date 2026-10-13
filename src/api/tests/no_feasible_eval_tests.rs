@@ -48,6 +48,7 @@
 //! | restore the θ coordinates only, leaving ω/σ on the best-seen point | E1 — assertion 4, ω = `0.9999999524299102`, the middle of its ±6 log rail |
 //! | `no_feasible()` broadened so it claims a feasible run | U1 **and** E2 |
 //! | either per-evaluation tally records one rejection per *run* | E1 (guard) and E5 (non-finite), each "all 1 of its trials" against 4 |
+//! | the checkpoint write's feasible-eval gate dropped | E6 — a resume point holding the midpoint in all four packed coordinates |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -703,6 +704,152 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
         result.warnings
     );
     assert!(!result.converged);
+}
+
+/// **E6 — an infeasible run writes no checkpoint** (#1617 review round 7 #1).
+///
+/// The one exit the exit-time fallback cannot cover. A checkpoint is a *starting point* for
+/// the next run, and it is written from inside the objective closure, where `best_seen`
+/// still ranks nothing but `guard_penalty_value`s — so its minimum is the scaled midpoint.
+/// Resume from such a file and the midpoint becomes the resumed fit's **own** start, which
+/// the fallback then faithfully restores: #1617's point defect, preserved across an
+/// interrupt, with every other test in this file green.
+///
+/// Driven through `optimize_population` rather than `fit()`, and that is not a shortcut —
+/// it is the only way to observe the write. `fit_inner` calls `checkpoint::abandon()` on
+/// entry (clearing a sink armed by the test) and `finish_success()` on the way out, which
+/// **deletes** the file; a run that completes therefore leaves nothing to read by
+/// construction. The scenario is an *interrupted* run, which a test cannot stage through
+/// `fit()`, so it is staged one level down, where the sink the test arms is the one the
+/// objective sees. The first version of this test armed the sink and called `fit()`; the
+/// mutation below left it green, which is how the vacuity was found.
+///
+/// `interval_secs = 0` makes every evaluation due — the production default is a wall-clock
+/// interval. The sink is a `thread_local!` and the objective closure runs on this thread
+/// (NLopt calls back on its caller; the rayon pool is for the per-subject inner loop), and
+/// `abandon()` afterwards keeps it from leaking into the other tests sharing this binary's
+/// threads while leaving the file for the assertion.
+///
+/// Mutation (run): drop `&& plateau_tracker_cl.lock().unwrap().2 > 0` → a checkpoint
+/// appears holding the midpoint and this test fires.
+#[test]
+fn an_infeasible_run_writes_no_checkpoint() {
+    let path = std::env::temp_dir()
+        .join(format!("ferx_ckpt_1617_{}.tmp", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    crate::io::checkpoint::remove(&path);
+    crate::io::checkpoint::init(
+        path.clone(),
+        "test".to_string(),
+        None,
+        None,
+        vec!["focei".to_string()],
+        vec![
+            "TVCL".into(),
+            "TVV".into(),
+            "ETA_V".into(),
+            "PROP_ERR".into(),
+        ],
+        0,
+    );
+
+    let model = starvable_model();
+    let pop = two_subjects();
+    let result = crate::estimation::outer_optimizer::optimize_population(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts(3),
+    );
+    crate::io::checkpoint::abandon();
+
+    // The fixture still delivers an infeasible trace.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        "{:?}",
+        result.warnings
+    );
+
+    let cp = crate::io::checkpoint::load(&path);
+    crate::io::checkpoint::remove(&path);
+    // Nothing feasible was ever scored, so there is no point worth resuming from. An
+    // absent file means "start from the model's initial estimates", which is where a run
+    // that found nothing should begin.
+    assert!(
+        cp.is_none(),
+        "a run with no feasible evaluation must not persist a resume point; it wrote \
+         packed = {:?}",
+        cp.as_ref().map(|c| c.packed.clone()),
+    );
+}
+
+/// **E7 — the derivative-free arm reports its starting estimates too** (#1617 review
+/// round 7 #2).
+///
+/// BOBYQA is handed the flat `1e20` wall rather than the quadratic bowl (`grad` is `None`,
+/// so there is no gradient to integrate), so it never walks to the box centre. That is a
+/// difference in *where the penalty's minimum is*, not in what the fit reports: the
+/// fallback restores `optimizer_start_s` for every NLopt optimizer, so an all-rejected
+/// BOBYQA run comes back at its starting estimates, exactly like the gradient arm — which
+/// is the sentence `docs/estimation/foce.qmd` got wrong until this round, and nothing
+/// pinned it.
+///
+/// `starvable_model` is not infeasible under BOBYQA (its opening `rhobeg = 0.5` probes stay
+/// where the inner loop converges, which is why the issue's own BOBYQA row reports a real
+/// OFV). One θ and `inner_maxiter = 1` is: 17 trials, all rejected.
+#[test]
+fn an_infeasible_derivative_free_run_also_reports_its_start() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.05
+[individual_parameters]
+  CL = 1.0
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+    )
+    .expect("parse");
+    let pop = two_subjects();
+    let options = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        ..opts(1)
+    };
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+
+    // (1) The fixture still delivers an infeasible trace — under the derivative-free arm,
+    //     which is the half this test exists for.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        "BOBYQA must still be rejected at every trial here, or this test is pinning the \
+         gradient arm's behaviour by accident: {:?}",
+        result.warnings
+    );
+    assert!(!result.converged);
+    // (2) ...and it reports its starting estimates, not its terminal iterate.
+    assert!(
+        (result.theta[0] - 10.0).abs() <= 1e-12 * 10.0,
+        "the fallback restores the optimizer's start for every NLopt optimizer, BOBYQA \
+         included; got {}",
+        result.theta[0]
+    );
+    assert!(
+        (result.omega[(0, 0)] - 0.04).abs() <= 1e-12 * 0.04,
+        "got {}",
+        result.omega[(0, 0)]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

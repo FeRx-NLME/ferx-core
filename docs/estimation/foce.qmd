@@ -708,10 +708,12 @@ therefore walks to the box centre and stops there with NLopt `Success`, because 
 really is stationary at the centre.
 
 The derivative-free `bobyqa` is handed a flat `1e20` wall instead — it asks for no gradient,
-so there is nothing to integrate — and a flat objective has no centre to walk to. That is a
-difference in the *estimates*, not in the verdict: a BOBYQA run whose every trial is
-rejected still reports `W_NO_FEASIBLE_EVAL` and `converged: false`, it just reports them
-wherever it stopped rather than at the midpoint.
+so there is nothing to integrate — and a flat objective has no centre to walk to. So the
+midpoint is a property of the *gradient* arm specifically; what the two arms share is
+everything a reader sees. A BOBYQA run whose every trial is rejected reports
+`W_NO_FEASIBLE_EVAL`, `converged: false`, and its **starting estimates**, exactly like the
+gradient arm: the fallback below restores the point the optimizer was handed for every NLopt
+optimizer, not just the ones that would otherwise land on the midpoint.
 
 Until [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that came back as a *fit*. The best-seen
 restore ranked penalties only, so it landed on the centre; the final inner loop re-scored
