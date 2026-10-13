@@ -1834,8 +1834,9 @@ fn check_iov_occasions(
 /// Derive each subject's IOV occasion labels from a model-side rule
 /// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
 /// `Subject::occasions` (parallel to `obs_times`), `Subject::dose_occasions`
-/// (parallel to `doses`) and `Subject::pk_only_occasions` (parallel to
-/// `pk_only_times`, #1876). This is the DSL alternative to a dataset occasion
+/// (parallel to `doses`), `Subject::pk_only_occasions` (parallel to
+/// `pk_only_times`, #1876) and `Subject::reset_occasions` (parallel to
+/// `reset_times`, #1944). This is the DSL alternative to a dataset occasion
 /// column; downstream grouping (`split_obs_by_occasion`) is identical either way.
 ///
 /// When `had_column` is true the model *also* set `iov_column`; the DSL rule wins
@@ -1883,6 +1884,14 @@ pub(crate) fn apply_iov_occasion_rule(
                 // does: that window holds the whole interval the row governs.
                 s.pk_only_occasions = s
                     .pk_only_times
+                    .iter()
+                    .map(|&t| window_occ(edges, t))
+                    .collect();
+                // A reset row is a record too, and `reset_times` is on the same clock.
+                // Left alone, it kept the dataset's labels under `iov_column`, or stayed
+                // empty and fell back to the record before the reset.
+                s.reset_occasions = s
+                    .reset_times
                     .iter()
                     .map(|&t| window_occ(edges, t))
                     .collect();
@@ -1935,6 +1944,13 @@ pub(crate) fn apply_iov_occasion_rule(
                 // an in-memory subject's unsorted `pk_only_times` still maps correctly.
                 s.pk_only_occasions = s
                     .pk_only_times
+                    .iter()
+                    .map(|&t| dose_times.partition_point(|&d| d <= t).saturating_sub(1) as u32)
+                    .collect();
+                // A reset row by the same rule. At-or-before puts an EVID=4 row, or an
+                // EVID=3 row co-timed with a dose, in the occasion that dose opens.
+                s.reset_occasions = s
+                    .reset_times
                     .iter()
                     .map(|&t| dose_times.partition_point(|&d| d <= t).saturating_sub(1) as u32)
                     .collect();
