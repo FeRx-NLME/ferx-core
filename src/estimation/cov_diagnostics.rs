@@ -22,7 +22,7 @@
 //! true rather than emitted unconditionally.
 
 use crate::ode::OdeSolverOptions;
-use crate::types::{CompiledModel, Population};
+use crate::types::{CompiledModel, CovarianceMethod, EstimationMethod, FitOptions, Population};
 
 /// Which Hessian the covariance step differentiated (#520).
 ///
@@ -934,6 +934,304 @@ pub(crate) fn fd_inner_gradient_tolerance_note(
              moving the model into the analytic sensitivity scope will help (#520).",
             ode.subject_label(),
         ))
+    }
+}
+
+// ── #1781: the objective a sampler's estimate is scored on ─────────────────────────────────
+
+/// The `W_` token opening both forms of [`format_non_stationary_warning`] (#1781).
+/// `classify_warning` keys on it, so it is pinned here rather than repeated as prose.
+pub(crate) const NON_STATIONARY_TOKEN: &str = "W_COV_NON_STATIONARY_ESTIMATE";
+
+/// The `W_` token of [`format_quadrature_objective_note`] (#1781).
+pub(crate) const QUADRATURE_OBJECTIVE_TOKEN: &str = "W_COV_QUADRATURE_OBJECTIVE";
+
+/// The `W_` token of [`format_quadrature_declined_warning`] (#1781).
+pub(crate) const QUADRATURE_DECLINED_TOKEN: &str = "W_COV_QUADRATURE_DECLINED";
+
+/// Gauss–Hermite nodes per random-effect dimension for the #1781 covariance objective.
+///
+/// Measured on `examples/tte_exponential.ferx` at ferx's IMP estimate (release, Linux
+/// x86_64): the `R⁻¹` SE of ω² reads 0.5718 / 0.6420 / 0.6411 / 0.6412 at 3 / 5 / 7 / 9
+/// nodes, and SE(TVLAMBDA) 0.008155 / 0.008184 / 0.008184 / 0.008184. Seven is the first
+/// count within 2e-4 of nine on both; three is 11% low on ω².
+pub(crate) const COV_AGQ_NODES: usize = 7;
+
+/// The largest tensor grid (`COV_AGQ_NODES^n_eta` nodes per subject) the covariance step
+/// takes the quadrature objective on: `7³`, so up to three random effects. Every one of the
+/// `~2·n_free²` stencil points scores every node, so the grid multiplies the whole step.
+pub(crate) const COV_AGQ_MAX_GRID: usize = 343;
+
+/// Whether `method`'s point estimate is, by construction, a minimiser of the objective whose
+/// Hessian the covariance step's `R` matrix is (#1781).
+///
+/// `R` is always the curvature of the deterministic marginal `pop_nll_opts` scores — FOCE,
+/// FOCEI, or the quadrature marginal — at the reported estimate. The FOCE-family and Laplace
+/// outer loops minimise exactly that objective, so a non-positive-definite `R` at their
+/// estimate is a statement about the objective there (a saddle, a flat direction). SAEM,
+/// IMP, IMPMAP and VI do not: they run a stochastic EM or a variational bound, report the
+/// point it stopped at, and only *score* the deterministic marginal there afterwards. Nothing
+/// makes that point a stationary point of it, so `R` can be indefinite there for the plain
+/// reason that the estimate sits on the objective's slope. Measured on
+/// `examples/tte_exponential.ferx`: SAEM stops at ω² = 0.054 while the FOCEI minimum is at
+/// 0.29. In the packed coordinate `u = log ω` (ω² = e^{2u}) the curvature is
+/// `4ω²·∂OFV/∂ω² + 4ω⁴·∂²OFV/∂(ω²)²`, and with the OFV still falling at `∂OFV/∂ω² ≈ −0.41`
+/// (an eval-only grid at SAEM's θ) the first term alone is −0.089 — the FD Hessian's −0.095
+/// eigenvalue, the same within 12% at every `fd_hessian_step` from 1e-1 to 1e-2. Bayes is
+/// listed for exhaustiveness; it never runs the covariance step.
+///
+/// An exhaustive match, so a new method has to declare which side it is on.
+pub(crate) fn estimate_minimises_cov_objective(method: EstimationMethod) -> bool {
+    match method {
+        EstimationMethod::Foce
+        | EstimationMethod::FoceI
+        | EstimationMethod::FoceGn
+        | EstimationMethod::FoceGnHybrid
+        | EstimationMethod::Laplace => true,
+        EstimationMethod::Saem
+        | EstimationMethod::Imp
+        | EstimationMethod::Impmap
+        | EstimationMethod::Vi
+        | EstimationMethod::Bayes => false,
+    }
+}
+
+/// Why a sampler fit on a non-Gaussian model could not take the quadrature objective (#1781).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuadratureDecline {
+    /// A mixture: the covariance step differentiates the K-fold mixture objective instead.
+    Mixture,
+    /// Inter-occasion variability: the grid would span the stacked (η, κ₁..κ_K) too.
+    Iov,
+    /// `COV_AGQ_NODES^n_eta` nodes per subject exceeds [`COV_AGQ_MAX_GRID`].
+    Grid { n_eta: usize, grid: usize },
+}
+
+/// The objective the covariance step differentiates at a fit's estimate (#1781).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CovObjectiveRoute {
+    /// The objective `options` already selects — the fit's own for the FOCE family and
+    /// Laplace, FOCEI / FOCE for a sampler on an all-Gaussian model.
+    AsFitted,
+    /// The `n_agq`-node adaptive Gauss–Hermite marginal (`method = laplace, n_agq = n`).
+    Quadrature { n_agq: usize },
+    /// A sampler on a non-Gaussian model that the quadrature could not serve.
+    Declined(QuadratureDecline),
+}
+
+/// Which objective the covariance step should differentiate for a `method` fit (#1781).
+///
+/// SAEM, IMP and IMPMAP estimate the *exact* marginal likelihood; the covariance step's
+/// default objective is FOCEI's (or FOCE's), a Laplace approximation of it. On an all-Gaussian
+/// model the two minima are close, which the NONMEM anchors of those methods pin. On a model
+/// with a non-Gaussian endpoint they need not be: on `examples/tte_exponential.ferx` the exact
+/// minimum is ω² = 0.0715 (brute-force quadrature outside ferx, and ferx's own 9-node AGQ
+/// fit), the FOCEI minimum ω² = 0.29, and the FOCEI `R` at the samplers' estimates is
+/// indefinite. The quadrature marginal is the exact one to quadrature accuracy, so the
+/// sampler's estimate is (to Monte-Carlo accuracy) its minimum, and `R` is its curvature.
+///
+/// VI is left on its fitted objective: it targets a variational bound, not the marginal.
+pub(crate) fn cov_objective_route(
+    method: EstimationMethod,
+    has_non_gaussian: bool,
+    n_eta: usize,
+    is_mixture: bool,
+    is_iov: bool,
+) -> CovObjectiveRoute {
+    let sampler = matches!(
+        method,
+        EstimationMethod::Saem | EstimationMethod::Imp | EstimationMethod::Impmap
+    );
+    if !sampler || !has_non_gaussian || n_eta == 0 {
+        return CovObjectiveRoute::AsFitted;
+    }
+    if is_mixture {
+        return CovObjectiveRoute::Declined(QuadratureDecline::Mixture);
+    }
+    if is_iov {
+        return CovObjectiveRoute::Declined(QuadratureDecline::Iov);
+    }
+    let grid = crate::estimation::agq::grid_size(COV_AGQ_NODES, n_eta);
+    if grid > COV_AGQ_MAX_GRID {
+        return CovObjectiveRoute::Declined(QuadratureDecline::Grid { n_eta, grid });
+    }
+    CovObjectiveRoute::Quadrature {
+        n_agq: COV_AGQ_NODES,
+    }
+}
+
+/// The informational note for [`CovObjectiveRoute::Quadrature`] (#1781). Every sentence is
+/// pinned by `cov_diagnostics_tests.rs`.
+pub(crate) fn format_quadrature_objective_note(
+    method: EstimationMethod,
+    n_agq: usize,
+    n_eta: usize,
+) -> String {
+    let m = method.label();
+    let grid = crate::estimation::agq::grid_size(n_agq, n_eta);
+    format!(
+        "{QUADRATURE_OBJECTIVE_TOKEN}: Covariance step: R and S were taken on the {n_agq}-node \
+         adaptive Gauss–Hermite marginal ({grid} nodes per subject; the objective of `method = \
+         laplace, n_agq = {n_agq}`), not on the FOCEI objective. {m} estimates the exact \
+         marginal likelihood, and with a non-Gaussian endpoint the FOCEI approximation of it \
+         can have its minimum far from the {m} estimate, where its curvature is not a \
+         covariance."
+    )
+}
+
+/// The warning for [`CovObjectiveRoute::Declined`] (#1781). Every sentence is pinned by
+/// `cov_diagnostics_tests.rs`.
+pub(crate) fn format_quadrature_declined_warning(
+    method: EstimationMethod,
+    objective: EstimationMethod,
+    decline: QuadratureDecline,
+) -> String {
+    let m = method.label();
+    let obj = objective.label();
+    let reason = match decline {
+        QuadratureDecline::Mixture => {
+            "the model is a mixture, whose covariance step differentiates the mixture \
+             objective"
+                .to_string()
+        }
+        QuadratureDecline::Iov => "the model has inter-occasion variability, which the \
+             quadrature would have to integrate over as well"
+            .to_string(),
+        QuadratureDecline::Grid { n_eta, grid } => format!(
+            "{n_eta} random effects need a {COV_AGQ_NODES}^{n_eta} = {grid}-node grid per \
+             subject, over the covariance step's {COV_AGQ_MAX_GRID}-node limit"
+        ),
+    };
+    format!(
+        "{QUADRATURE_DECLINED_TOKEN}: Covariance step: the standard errors are the {obj} \
+         objective's curvature at the {m} estimate. With a non-Gaussian endpoint that \
+         objective can have its minimum far from the {m} estimate, and the standard errors \
+         are then unreliable. The quadrature marginal that replaces it after {m} was not \
+         used because {reason}. For standard errors, {}.",
+        non_stationary_remedy(method, objective, None)
+    )
+}
+
+/// Whether the covariance step replaces a requested `R⁻¹` / `R⁻¹SR⁻¹` by `S⁻¹` (#1781).
+///
+/// Exactly when the eigenvalue floor fired on `R` (`n_clipped > 0`) at an estimate its
+/// objective never optimised. Both estimators would then invert a floored matrix: `R⁻¹` puts
+/// `1/floor` on the clipped direction and `R⁻¹SR⁻¹` puts `1/floor²` there, which is why the
+/// sandwich read 1e4–4e7 where `R⁻¹` read 4–10 on the #1781 sweep. `S` is the per-subject
+/// score cross-product, positive semi-definite by construction. An estimate that *did*
+/// minimise the objective keeps the existing floored-and-warned behaviour: there the
+/// indefinite direction is information about the objective, and replacing the estimator would
+/// hide it.
+pub(crate) fn r_falls_back_to_s(
+    method: EstimationMethod,
+    n_clipped: usize,
+    requested: CovarianceMethod,
+) -> bool {
+    n_clipped > 0
+        && requested != CovarianceMethod::CrossProduct
+        && !estimate_minimises_cov_objective(method)
+}
+
+/// The deterministic marginal whose Hessian `R` is, as the method that minimises it — the
+/// objective `pop_nll_opts` scores under `options` (#1781). Quadrature when the stage carries
+/// AGQ nodes, otherwise FOCEI or FOCE by `interaction`.
+pub(crate) fn cov_objective_method(options: &FitOptions) -> EstimationMethod {
+    if options.agq_nodes().is_some() {
+        EstimationMethod::Laplace
+    } else if options.interaction {
+        EstimationMethod::FoceI
+    } else {
+        EstimationMethod::Foce
+    }
+}
+
+/// The facts [`format_non_stationary_warning`] is assembled from (#1781).
+pub(crate) struct NonStationaryFacts<'a> {
+    /// The estimator that produced the point (SAEM, IMP, …).
+    pub method: EstimationMethod,
+    /// The method minimising the objective `R` differentiates ([`cov_objective_method`]).
+    pub objective: EstimationMethod,
+    /// The estimator the caller asked for (`r` or `rsr`).
+    pub requested: CovarianceMethod,
+    /// Smallest eigenvalue of the symmetrised free-block Hessian of the OFV.
+    pub min_eigenvalue: f64,
+    /// Largest eigenvalue of the same.
+    pub max_eigenvalue: f64,
+    /// `Some(reason)` when `S` could not be formed or inverted, so no covariance is returned.
+    pub s_unavailable: Option<&'a str>,
+    /// `Some(n)` when `R` is the #1781 `n`-node quadrature marginal's Hessian.
+    pub quadrature_nodes: Option<usize>,
+}
+
+/// How to get an `R`-based covariance for `method`'s fit: a chain whose last estimating stage
+/// minimises `objective`. IMP may only be a chain's final stage, so its route is the reverse
+/// chain with IMP as an evaluator.
+fn non_stationary_remedy(
+    method: EstimationMethod,
+    objective: EstimationMethod,
+    quadrature_nodes: Option<usize>,
+) -> String {
+    let obj = objective.label().to_ascii_lowercase();
+    let name = objective_name(objective, quadrature_nodes);
+    let nodes = quadrature_nodes
+        .map(|n| format!(" and `n_agq = {n}`"))
+        .unwrap_or_default();
+    match method {
+        EstimationMethod::Imp => format!(
+            "fit with `methods = [{obj}, imp]`{nodes} and `imp_eval_only = true`, which takes R \
+             at the {name} minimum and evaluates the importance-sampled likelihood there"
+        ),
+        _ => format!(
+            "polish the estimate with `methods = [{}, {obj}]`{nodes}, which takes R at the \
+             {name} minimum",
+            method.label().to_ascii_lowercase(),
+        ),
+    }
+}
+
+/// How the messages name the objective `R` differentiates: the method label, or
+/// "`n`-node quadrature" when the step ran on the #1781 quadrature marginal.
+fn objective_name(objective: EstimationMethod, quadrature_nodes: Option<usize>) -> String {
+    match quadrature_nodes {
+        Some(n) => format!("{n}-node quadrature"),
+        None => objective.label().to_string(),
+    }
+}
+
+/// The warning for an `R` matrix that is not positive definite at an estimate its objective
+/// never optimised (#1781). Two forms, keyed on `s_unavailable`: `S⁻¹` was returned instead
+/// (a warning), or `S` was unavailable too and the step failed (no standard errors).
+///
+/// Every sentence is pinned by `cov_diagnostics_tests.rs`, both forms in one test.
+pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
+    let obj = objective_name(f.objective, f.quadrature_nodes);
+    let method = f.method.label();
+    let head = format!(
+        "the {obj} R matrix is not positive definite at the {method} estimate (min eigenvalue \
+         {:.3e}, max {:.3e})",
+        f.min_eigenvalue, f.max_eigenvalue
+    );
+    let why = format!(
+        "{method} does not minimise the {obj} objective R is the Hessian of, so its estimate \
+         need not be a stationary point of that objective, and R⁻¹ there would be the inverse \
+         of an eigenvalue-floored matrix rather than a covariance."
+    );
+    let remedy = format!(
+        "For R-based standard errors, {}.",
+        non_stationary_remedy(f.method, f.objective, f.quadrature_nodes)
+    );
+    match f.s_unavailable {
+        None => format!(
+            "{NON_STATIONARY_TOKEN}: Covariance step: {head}, so covariance_method = {} was \
+             replaced by S⁻¹ (covariance_method = s). {why} S, the cross-product of the \
+             per-subject scores, is positive semi-definite by construction. {remedy}",
+            f.requested.label()
+        ),
+        Some(reason) => format!(
+            "{NON_STATIONARY_TOKEN}: Covariance step failed: {head}, and the score \
+             cross-product S that would replace it is unavailable ({reason}). SE estimates not \
+             available. {why} {remedy}"
+        ),
     }
 }
 

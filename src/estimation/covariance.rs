@@ -6,8 +6,11 @@
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
 use crate::estimation::cov_diagnostics::{
-    format_offdiag_nan_warning, format_regularized_warning, format_salvage_note, CovHessianSource,
-    CovRegularizationFacts, CovScopeDecline, OdeToleranceFacts,
+    cov_objective_method, cov_objective_route, format_non_stationary_warning,
+    format_offdiag_nan_warning, format_quadrature_declined_warning,
+    format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
+    r_falls_back_to_s, CovHessianSource, CovObjectiveRoute, CovRegularizationFacts,
+    CovScopeDecline, NonStationaryFacts, OdeToleranceFacts,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -23,6 +26,10 @@ use std::collections::HashSet;
 pub(crate) struct CovarianceOutput {
     pub matrix: DMatrix<f64>,
     pub warnings: Vec<String>,
+    /// The estimator `matrix` actually is. The requested one, except where #1781 replaced an
+    /// `R⁻¹` / `R⁻¹SR⁻¹` that would have inverted a floored `R` at an estimate the objective
+    /// never optimised by `S⁻¹` ([`crate::estimation::cov_diagnostics::r_falls_back_to_s`]).
+    pub method: CovarianceMethod,
 }
 
 /// Return type of [`compute_covariance`].
@@ -1142,7 +1149,41 @@ pub(super) fn reconverge_population(
     (params, ehs, hms, kaps)
 }
 
+/// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
+/// every unit test that drives the step directly wants. Production goes through
+/// [`run_covariance_step_inner`], which names the estimator explicitly.
+#[cfg(test)]
 pub(crate) fn compute_covariance(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> CovarianceStepResult {
+    compute_covariance_for(
+        options.method,
+        x_hat,
+        template,
+        model,
+        population,
+        eta_hats,
+        h_matrices,
+        kappas,
+        options,
+    )
+}
+
+/// The covariance step for an estimate produced by `fit_method`, which may differ from
+/// `options.method` — the method whose objective the step differentiates. They differ exactly
+/// on the #1781 quadrature route, where a SAEM / IMP / IMPMAP estimate is scored on the
+/// `method = laplace, n_agq = n` marginal; `fit_method` is what decides whether that estimate
+/// minimised the objective ([`r_falls_back_to_s`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_covariance_for(
+    fit_method: crate::types::EstimationMethod,
     x_hat: &[f64],
     template: &ModelParameters,
     model: &CompiledModel,
@@ -1558,6 +1599,7 @@ pub(crate) fn compute_covariance(
         return CovarianceStepResult::Success(CovarianceOutput {
             matrix: DMatrix::zeros(n, n),
             warnings: vec![],
+            method: options.covariance_method,
         });
     }
     let mut hess_free = DMatrix::zeros(n_free, n_free);
@@ -1607,14 +1649,40 @@ pub(crate) fn compute_covariance(
     // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
     // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
     let r_inv = inv.inverse.clone() * 2.0;
+    // #1781: an `R` the floor had to clip, at an estimate its objective never optimised
+    // (SAEM / IMP / IMPMAP / VI), is not inverted at all — the estimator becomes `S⁻¹`. The
+    // floored direction is the objective's slope at a non-stationary point, not a precision,
+    // and `R⁻¹` / `R⁻¹SR⁻¹` would report `1/floor` / `1/floor²` along it. `estimator` is the
+    // single value every downstream branch reads, so the eigen-floor warning, the salvage
+    // note and the published label all describe the matrix that is actually returned.
+    let fallback_to_s = r_falls_back_to_s(fit_method, inv.n_clipped, options.covariance_method);
+    let estimator = if fallback_to_s {
+        CovarianceMethod::CrossProduct
+    } else {
+        options.covariance_method
+    };
+    // Only built on the fallback, where both failure arms below need it.
+    let non_stationary = |s_unavailable: Option<&str>| {
+        format_non_stationary_warning(&NonStationaryFacts {
+            method: fit_method,
+            objective: cov_objective_method(options),
+            requested: options.covariance_method,
+            min_eigenvalue: inv.min_eigenvalue,
+            max_eigenvalue: inv.max_eigenvalue,
+            s_unavailable,
+            // Only the #1781 route scores an estimate on another method's objective.
+            quadrature_nodes: (fit_method != options.method)
+                .then(|| options.agq_nodes())
+                .flatten(),
+        })
+    };
     // The same `R⁻¹` with the floored directions dropped instead of floored — the covariance
     // the data alone supports. Carried through the *same* estimator and the *same* reported
     // -parameter transform as `r_inv`, so the inflation the message prints is the inflation of
     // the numbers on the page (#1508 review §1). Built only when the floor actually fired and
     // only when the warning can be emitted at all (the cross-product estimator never returns
     // `R⁻¹`, so nothing there is inflated by this floor).
-    let r_inv_ref = (inv.n_clipped > 0
-        && options.covariance_method != CovarianceMethod::CrossProduct)
+    let r_inv_ref = (inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct)
         .then(|| inv.unclipped_inverse.clone() * 2.0);
 
     // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
@@ -1623,7 +1691,12 @@ pub(crate) fn compute_covariance(
     // (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching `R = ½·H_ofv`.
     // Anchored against NONMEM `$COV MATRIX=S`/`RSR` for both FOCEI (#266) and
     // FOCE (no-INTER) (#250): all SEs within ~10% of NONMEM.
-    let (cov_free, cov_free_ref) = if options.covariance_method == CovarianceMethod::Hessian {
+    //
+    // On the #1781 fallback neither failure of `S` is `Unusable`: `R` is non-positive-definite
+    // there, which is the `FailedNonPd` contract, so the SIR fallback still gets its
+    // |λ|-rectified proposal — and the reason names both matrices instead of advising the
+    // `covariance_method = r or rsr` this step has just declined to use.
+    let (cov_free, cov_free_ref) = if estimator == CovarianceMethod::Hessian {
         (r_inv, r_inv_ref)
     } else {
         let s_free = assemble_score_cross_product(
@@ -1635,11 +1708,35 @@ pub(crate) fn compute_covariance(
         }
         let s_free = match s_free {
             Ok(s) => s,
+            Err(reason) if fallback_to_s => {
+                return CovarianceStepResult::FailedNonPd {
+                    reason: non_stationary(Some(&reason)),
+                    fallback_proposal: build_non_pd_fallback_proposal(
+                        &hess_free_sym,
+                        &free_idx,
+                        n,
+                        4.0,
+                    ),
+                }
+            }
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        match combine_covariance_and_reference(options.covariance_method, r_inv, r_inv_ref, &s_free)
-        {
+        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free) {
             Some(pair) => pair,
+            None if fallback_to_s => {
+                return CovarianceStepResult::FailedNonPd {
+                    reason: non_stationary(Some(
+                        "S is singular or rank-deficient: typically fewer subjects than free \
+                         parameters, or collinear per-subject scores",
+                    )),
+                    fallback_proposal: build_non_pd_fallback_proposal(
+                        &hess_free_sym,
+                        &free_idx,
+                        n,
+                        4.0,
+                    ),
+                };
+            }
             None => {
                 return CovarianceStepResult::Unusable(
                     "Covariance step failed: the score cross-product matrix S is singular or \
@@ -1684,14 +1781,10 @@ pub(crate) fn compute_covariance(
     // named subjects' terms use a different estimator than the rest — would then be a
     // statement about a matrix this step threw away.
     let salvaged_ids: Vec<&str> = match source {
-        CovHessianSource::HybridRMatrix
-            if options.covariance_method != CovarianceMethod::CrossProduct =>
-        {
-            salvaged
-                .iter()
-                .map(|&i| population.subjects[i].id.as_str())
-                .collect()
-        }
+        CovHessianSource::HybridRMatrix if estimator != CovarianceMethod::CrossProduct => salvaged
+            .iter()
+            .map(|&i| population.subjects[i].id.as_str())
+            .collect(),
         CovHessianSource::HybridRMatrix
         | CovHessianSource::AnalyticRMatrix
         | CovHessianSource::FdStencil => Vec::new(),
@@ -1707,7 +1800,17 @@ pub(crate) fn compute_covariance(
     // the returned covariance actually uses `R⁻¹` (Hessian and sandwich); the
     // cross-product path returns `S⁻¹` (with a full-rank `S` guaranteed above), so
     // a clipped `R` there would be a misleading note about a matrix it didn't use.
-    if inv.n_clipped > 0 && options.covariance_method != CovarianceMethod::CrossProduct {
+    // #1781: the fallback replaced `R⁻¹` by `S⁻¹`, so the floor warning just below — about a
+    // matrix this step no longer returns — is skipped by the same `estimator` gate, and this
+    // one says what happened instead.
+    if fallback_to_s {
+        let msg = non_stationary(None);
+        if options.verbose {
+            eprintln!("  {}", msg);
+        }
+        cov_warnings.push(msg);
+    }
+    if inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct {
         // #520 C1/C2 and the label fix. Severity is graded on magnitude (`|min λ| / λ_max` and
         // the variance inflation the floor caused), never on the clipped count; the route is
         // named from what actually ran, so "FD Hessian" is no longer printed on the analytic
@@ -1775,6 +1878,7 @@ pub(crate) fn compute_covariance(
     CovarianceStepResult::Success(CovarianceOutput {
         matrix: cov,
         warnings: cov_warnings,
+        method: estimator,
     })
 }
 
@@ -2192,13 +2296,54 @@ pub(crate) fn run_covariance_step_inner(
         };
         &scaled_options
     };
+    // #1781: which objective `R` and `S` differentiate. A SAEM / IMP / IMPMAP estimate on a
+    // model with a non-Gaussian endpoint is scored on the quadrature marginal — the exact
+    // likelihood those methods estimate — rather than on the FOCEI objective, whose minimum
+    // can sit far from it. `fit_method` keeps the estimator that produced the point, which
+    // `compute_covariance_for` needs for its own #1781 gate.
+    let fit_method = options.method;
+    let quadrature_options;
+    let options = match cov_objective_route(
+        fit_method,
+        model.has_non_gaussian(),
+        model.n_eta,
+        template.mixture.is_some(),
+        model.n_kappa > 0,
+    ) {
+        CovObjectiveRoute::AsFitted => options,
+        CovObjectiveRoute::Quadrature { n_agq } => {
+            warnings.push(format_quadrature_objective_note(
+                fit_method,
+                n_agq,
+                model.n_eta,
+            ));
+            quadrature_options = FitOptions {
+                method: crate::types::EstimationMethod::Laplace,
+                n_agq,
+                ..options.clone()
+            };
+            &quadrature_options
+        }
+        CovObjectiveRoute::Declined(decline) => {
+            warnings.push(format_quadrature_declined_warning(
+                fit_method,
+                cov_objective_method(options),
+                decline,
+            ));
+            options
+        }
+    };
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    // The estimator the returned matrix actually is: `routed`, unless `compute_covariance`
+    // itself replaced it (#1781's `S⁻¹` fallback), which it reports on its output.
+    let mut used = routed;
     let cov_timer = std::time::Instant::now();
-    let matrix = match compute_covariance(
-        x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
+    let matrix = match compute_covariance_for(
+        fit_method, x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
     ) {
         CovarianceStepResult::Success(out) => {
             warnings.extend(out.warnings);
+            used = out.method;
             Some(out.matrix)
         }
         CovarianceStepResult::Unusable(msg) => {
@@ -2215,12 +2360,11 @@ pub(crate) fn run_covariance_step_inner(
         }
     };
     CovStepOutcome {
-        // `routed`, not `options.covariance_method` as it arrived: the two are the
-        // same binding by construction here (`options` is rebound to
-        // `scaled_options` exactly when they differ), but naming `routed` is what
-        // makes it read as the estimator `compute_covariance` was configured with
-        // rather than the one the caller asked for (#1382).
-        method: published_covariance_method(matrix.as_ref(), routed),
+        // `used`: the estimator `compute_covariance` was configured with (`routed`, never the
+        // caller's request as it arrived, #1382) — or, where it fell back to `S⁻¹` on its own
+        // (#1781), the one it returned. A label naming the request there would describe a
+        // matrix that was never built.
+        method: published_covariance_method(matrix.as_ref(), used),
         matrix,
         wall_time_secs: cov_timer.elapsed().as_secs_f64(),
         warnings,
@@ -2942,5 +3086,367 @@ mod tests {
         let mut plain = model.default_params.clone();
         plain.mixture = None;
         assert_eq!(diagnostic_omega(&plain)[(0, 0)], plain.omega.matrix[(0, 0)]);
+    }
+
+    // ── #1781: R at an estimate the covariance objective never optimised ──────────────────
+
+    /// `examples/tte_exponential.ferx` with its initial estimates moved to `(λ, ω²)`, parsed,
+    /// with the 30-subject example dataset read through the model's endpoint routing.
+    #[cfg(feature = "survival")]
+    fn tte_exponential_at(
+        lambda: f64,
+        omega: f64,
+    ) -> (crate::types::CompiledModel, crate::types::Population) {
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+        let src = src
+            .replace(
+                "theta TVLAMBDA(0.05, 0.001, 10.0)",
+                &format!("theta TVLAMBDA({lambda:?}, 0.001, 10.0)"),
+            )
+            .replace(
+                "omega ETA_LAMBDA ~ 0.09",
+                &format!("omega ETA_LAMBDA ~ {omega:?}"),
+            );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        let (pop, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            "data/tte_exponential.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("data");
+        (model, pop)
+    }
+
+    /// The covariance-step inputs at the model's initial estimates: the packed point, the
+    /// parameters, and the EBEs converged there (the score cross-product reads them as given).
+    #[cfg(feature = "survival")]
+    #[allow(clippy::type_complexity)]
+    fn inputs_at_init(
+        model: &crate::types::CompiledModel,
+        pop: &crate::types::Population,
+        opts: &crate::types::FitOptions,
+    ) -> (
+        Vec<f64>,
+        crate::types::ModelParameters,
+        Vec<nalgebra::DVector<f64>>,
+        Vec<DMatrix<f64>>,
+    ) {
+        let p = model.default_params.clone();
+        let x = crate::estimation::parameterization::pack_params(&p);
+        let (etas, hs): (Vec<_>, Vec<_>) = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                let e = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                    model, s, &p, 200, 1e-8, None, None, 0, opts,
+                );
+                (e.eta, e.h_matrix)
+            })
+            .unzip();
+        (x, p, etas, hs)
+    }
+
+    #[cfg(feature = "survival")]
+    fn opts_for(
+        method: crate::types::EstimationMethod,
+        covariance_method: CovarianceMethod,
+    ) -> crate::types::FitOptions {
+        crate::types::FitOptions {
+            method,
+            covariance_method,
+            ..crate::types::FitOptions::default()
+        }
+    }
+
+    /// `compute_covariance` itself at the model's initial estimates — the step on the
+    /// objective `options` selects, with no #1781 routing in front of it.
+    #[cfg(feature = "survival")]
+    fn cov_at_init(
+        model: &crate::types::CompiledModel,
+        pop: &crate::types::Population,
+        opts: &crate::types::FitOptions,
+    ) -> super::CovarianceStepResult {
+        let (x, p, etas, hs) = inputs_at_init(model, pop, opts);
+        let kappas = vec![Vec::new(); pop.subjects.len()];
+        super::compute_covariance(&x, &p, model, pop, &etas, &hs, &kappas, opts)
+    }
+
+    /// The whole step as a fit's finalizer runs it — routing, warnings, published label.
+    #[cfg(feature = "survival")]
+    fn step_at_init(
+        model: &crate::types::CompiledModel,
+        pop: &crate::types::Population,
+        opts: &crate::types::FitOptions,
+    ) -> super::CovStepOutcome {
+        let (x, p, etas, hs) = inputs_at_init(model, pop, opts);
+        let kappas = vec![Vec::new(); pop.subjects.len()];
+        super::run_covariance_step_inner(&x, &p, model, pop, &etas, &hs, &kappas, opts, None)
+    }
+
+    #[cfg(feature = "survival")]
+    fn success(r: super::CovarianceStepResult, label: &str) -> super::CovarianceOutput {
+        use super::CovarianceStepResult as R;
+        match r {
+            R::Success(o) => o,
+            R::Unusable(m) => panic!("{label}: unusable: {m}"),
+            R::FailedNonPd { reason, .. } => panic!("{label}: non-PD: {reason}"),
+        }
+    }
+
+    /// Messages in `w` opening with `token`.
+    #[cfg(feature = "survival")]
+    fn count_token(w: &[String], token: &str) -> usize {
+        w.iter().filter(|w| w.starts_with(token)).count()
+    }
+
+    /// SAEM's estimate on the 30-subject example, as the release CLI prints it (Linux x86_64,
+    /// 2026-10-12): θ = 0.038756, ω² = 0.054346. The FOCEI OFV is still falling in ω² there
+    /// (its minimum is 0.033183 / 0.291718), so the FOCEI `R` is indefinite.
+    #[cfg(feature = "survival")]
+    const SAEM_POINT: (f64, f64) = (0.038756, 0.054346);
+    /// The FOCEI minimum on the same data, as the CLI prints it. `R` is positive definite.
+    #[cfg(feature = "survival")]
+    const FOCEI_POINT: (f64, f64) = (0.033183, 0.291718);
+
+    /// #1781, the fallback: on an objective the estimate never minimised, an `R` the floor had
+    /// to clip is replaced by `S⁻¹` — for every estimator on that side of
+    /// `estimate_minimises_cov_objective` and for both `r` and `rsr` — and the result *is*
+    /// `S⁻¹`, bit for bit. Driven through `compute_covariance` on the FOCEI objective, which
+    /// is what the step still differentiates wherever the quadrature route declines (VI, a
+    /// mixture, IOV, > 3 random effects).
+    ///
+    /// Before the fix this point returned `R⁻¹` with SE(log λ) = 108 and `R⁻¹SR⁻¹` with 3.3e5,
+    /// where `S⁻¹` gives 0.220 and `R⁻¹` at the FOCEI minimum 0.265 (measured here).
+    ///
+    /// Three straddles, each inside this one test so a gate stuck on either branch fails it:
+    /// the method (FOCEI at the same point keeps the floored `R` and its `REGULARIZED_PREFIX`
+    /// warning, and says nothing about stationarity); the clip (SAEM at the FOCEI minimum,
+    /// where nothing is clipped, keeps `R⁻¹`, bit-identical to FOCEI's there); and the request
+    /// (`s` asked for directly carries no fallback warning). The published label is checked
+    /// through `run_covariance_step_inner` under VI, the one estimator on this side of the
+    /// gate that the quadrature route leaves on FOCEI (`fit()` refuses VI on a non-Gaussian
+    /// model, so the step is driven directly).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_floored_r_at_a_non_stationary_estimate_is_replaced_by_s_inverse() {
+        use crate::estimation::cov_diagnostics::{NON_STATIONARY_TOKEN, REGULARIZED_PREFIX};
+        use crate::types::EstimationMethod as M;
+        let token = |w: &[String]| count_token(w, NON_STATIONARY_TOKEN);
+        let floor = |w: &[String]| count_token(w, REGULARIZED_PREFIX) > 0;
+
+        let (model, pop) = tte_exponential_at(SAEM_POINT.0, SAEM_POINT.1);
+        let s_opts = opts_for(M::Saem, CovarianceMethod::CrossProduct);
+        let s_ref = success(cov_at_init(&model, &pop, &s_opts), "saem s");
+        assert_eq!(
+            token(&s_ref.warnings),
+            0,
+            "s requested: no fallback to report"
+        );
+        assert_eq!(s_ref.method, CovarianceMethod::CrossProduct);
+        let se_s = s_ref.matrix[(0, 0)].sqrt();
+        assert!(
+            se_s.is_finite() && se_s > 0.1 && se_s < 0.5,
+            "SE(log λ) from S⁻¹ = {se_s}"
+        );
+
+        for method in [M::Saem, M::Imp, M::Impmap, M::Vi] {
+            for requested in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
+                let label = format!("{method:?} {requested:?}");
+                let out = success(
+                    cov_at_init(&model, &pop, &opts_for(method, requested)),
+                    &label,
+                );
+                assert_eq!(out.method, CovarianceMethod::CrossProduct, "{label}");
+                assert_eq!(
+                    out.matrix, s_ref.matrix,
+                    "{label}: the matrix is S⁻¹ itself"
+                );
+                assert_eq!(token(&out.warnings), 1, "{label}: {:?}", out.warnings);
+                assert!(
+                    !floor(&out.warnings),
+                    "{label}: no floor warning for an unused R"
+                );
+            }
+        }
+        let vi = step_at_init(&model, &pop, &opts_for(M::Vi, CovarianceMethod::Hessian));
+        assert_eq!(
+            vi.method,
+            Some(CovarianceMethod::CrossProduct),
+            "the published label"
+        );
+        assert_eq!(vi.matrix.as_ref(), Some(&s_ref.matrix));
+
+        // Straddle 1 — the method. FOCEI minimises this objective: same point, same R, and
+        // the floored inverse is kept (and is the absurd number the issue reported).
+        let focei = success(
+            cov_at_init(&model, &pop, &opts_for(M::FoceI, CovarianceMethod::Hessian)),
+            "focei r",
+        );
+        assert_eq!(focei.method, CovarianceMethod::Hessian);
+        assert!(
+            floor(&focei.warnings),
+            "precondition: R is clipped here: {:?}",
+            focei.warnings
+        );
+        assert_eq!(token(&focei.warnings), 0);
+        assert!(
+            focei.matrix[(0, 0)].sqrt() > 10.0,
+            "{}",
+            focei.matrix[(0, 0)].sqrt()
+        );
+
+        // Straddle 2 — the clip. At the FOCEI minimum nothing is clipped, so SAEM keeps R⁻¹.
+        let (model, pop) = tte_exponential_at(FOCEI_POINT.0, FOCEI_POINT.1);
+        let h = CovarianceMethod::Hessian;
+        let saem = success(cov_at_init(&model, &pop, &opts_for(M::Saem, h)), "saem");
+        let focei = success(cov_at_init(&model, &pop, &opts_for(M::FoceI, h)), "focei");
+        assert_eq!(saem.method, CovarianceMethod::Hessian);
+        assert_eq!((token(&saem.warnings), floor(&saem.warnings)), (0, false));
+        assert_eq!(
+            saem.matrix, focei.matrix,
+            "the method matters only through the gate"
+        );
+    }
+
+    /// #1781: when the fallback's `S` is singular as well — one subject, two free parameters —
+    /// the step fails as `FailedNonPd` (the SIR fallback keeps its proposal), with the
+    /// non-stationary reason rather than the cross-product message's advice to use `r` or
+    /// `rsr`, which is what was just declined. The same subject under a FOCEI fit asking for
+    /// `s` still gets that ordinary message; and a subject whose `R` is positive definite at
+    /// the same point never reaches `S` at all.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_non_stationary_fallback_with_a_singular_s_fails_non_pd() {
+        use super::CovarianceStepResult as R;
+        use crate::estimation::cov_diagnostics::NON_STATIONARY_TOKEN;
+        use crate::types::EstimationMethod as M;
+        let (model, full) = tte_exponential_at(SAEM_POINT.0, SAEM_POINT.1);
+        let one = |k: usize| crate::types::Population {
+            subjects: vec![full.subjects[k].clone()],
+            ..full.clone()
+        };
+        let saem_r = opts_for(M::Saem, CovarianceMethod::Hessian);
+        // Subject 1 (index 0): an event at 7.23 h. R is indefinite at this point.
+        match cov_at_init(&model, &one(0), &saem_r) {
+            R::FailedNonPd {
+                reason,
+                fallback_proposal,
+            } => {
+                assert!(
+                    reason.starts_with(&format!(
+                        "{NON_STATIONARY_TOKEN}: Covariance step failed: the FOCEI R matrix"
+                    )),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("(S is singular or rank-deficient"),
+                    "{reason}"
+                );
+                assert!(
+                    !reason.contains("Use covariance_method = r or rsr"),
+                    "{reason}"
+                );
+                let n = crate::estimation::parameterization::packed_len(&model.default_params);
+                assert_eq!(fallback_proposal.shape(), (n, n));
+                assert!(fallback_proposal.iter().all(|v| v.is_finite()));
+            }
+            R::Success(o) => panic!("expected FailedNonPd, got {:?}", o.method),
+            R::Unusable(m) => panic!("expected FailedNonPd, got Unusable: {m}"),
+        }
+        let vi = step_at_init(&model, &one(0), &opts_for(M::Vi, CovarianceMethod::Hessian));
+        assert_eq!(
+            (vi.matrix.is_none(), vi.method),
+            (true, None),
+            "no matrix, no label"
+        );
+        assert!(
+            vi.sir_fallback_proposal.is_some(),
+            "FailedNonPd keeps the SIR proposal"
+        );
+        match cov_at_init(
+            &model,
+            &one(0),
+            &opts_for(M::FoceI, CovarianceMethod::CrossProduct),
+        ) {
+            R::Unusable(m) => assert!(m.contains("Use covariance_method = r or rsr"), "{m}"),
+            _ => panic!("FOCEI + s on one subject: the ordinary singular-S message"),
+        }
+        // Subject 4 (index 3): R is positive definite at the same point — no fallback.
+        match cov_at_init(&model, &one(3), &saem_r) {
+            R::Success(o) => assert_eq!(o.method, CovarianceMethod::Hessian),
+            _ => panic!("subject 4: R is positive definite, so R⁻¹ is returned"),
+        }
+    }
+
+    /// #1781, the fix: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model is scored on the
+    /// `COV_AGQ_NODES`-node quadrature marginal. Through `run_covariance_step_inner` — the
+    /// route lives there — the matrix is **bit-identical** to `compute_covariance` asked for
+    /// `method = laplace, n_agq = 7` directly, it is `R⁻¹` (positive definite, nothing
+    /// floored, no fallback), and the route note is emitted exactly once.
+    ///
+    /// The straddle is the method, at the same point: FOCEI keeps its own objective, floored,
+    /// with no route note. The value is banded against the exact marginal's `R⁻¹` at its own
+    /// minimum, computed outside ferx (composite Simpson over η, 4001 points; Newton on
+    /// log λ, log ω²): SE(log λ) = 0.008182 / 0.033776 = 0.2422. At SAEM's point the measured
+    /// value is 0.22171 (Linux x86_64) — 8.5% under the reference, because the point is not
+    /// the reference's minimum (θ is 15% higher). Before the fix the same call returned 108.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_sampler_estimate_on_a_non_gaussian_model_is_scored_on_the_quadrature_marginal() {
+        use crate::estimation::cov_diagnostics::{
+            COV_AGQ_NODES, NON_STATIONARY_TOKEN, QUADRATURE_OBJECTIVE_TOKEN, REGULARIZED_PREFIX,
+        };
+        use crate::types::EstimationMethod as M;
+        let (model, pop) = tte_exponential_at(SAEM_POINT.0, SAEM_POINT.1);
+        let h = CovarianceMethod::Hessian;
+        let direct = success(
+            cov_at_init(
+                &model,
+                &pop,
+                &crate::types::FitOptions {
+                    n_agq: COV_AGQ_NODES,
+                    ..opts_for(M::Laplace, h)
+                },
+            ),
+            "laplace n_agq = 7",
+        );
+        assert_eq!(direct.method, h);
+        let se = direct.matrix[(0, 0)].sqrt();
+        eprintln!("SE(log λ) on the 7-node marginal at SAEM's point: {se:.6}");
+        assert!(
+            se.is_finite() && (0.2422 - se).abs() < 0.03,
+            "SE(log λ) = {se}"
+        );
+
+        for method in [M::Saem, M::Imp, M::Impmap] {
+            let out = step_at_init(&model, &pop, &opts_for(method, h));
+            let label = format!("{method:?}");
+            assert_eq!(
+                out.matrix.as_ref(),
+                Some(&direct.matrix),
+                "{label}: the 7-node R⁻¹"
+            );
+            assert_eq!(out.method, Some(h), "{label}");
+            assert_eq!(
+                count_token(&out.warnings, QUADRATURE_OBJECTIVE_TOKEN),
+                1,
+                "{label}"
+            );
+            assert_eq!(
+                count_token(&out.warnings, NON_STATIONARY_TOKEN),
+                0,
+                "{label}"
+            );
+            assert_eq!(count_token(&out.warnings, REGULARIZED_PREFIX), 0, "{label}");
+        }
+        let focei = step_at_init(&model, &pop, &opts_for(M::FoceI, h));
+        assert_eq!(count_token(&focei.warnings, QUADRATURE_OBJECTIVE_TOKEN), 0);
+        assert_eq!(count_token(&focei.warnings, REGULARIZED_PREFIX), 1);
+        let focei_se = focei.matrix.expect("floored R⁻¹")[(0, 0)].sqrt();
+        assert!(focei_se > 10.0, "FOCEI keeps its own objective: {focei_se}");
     }
 }
