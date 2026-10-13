@@ -99,7 +99,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.cache }}
+      - name: Fetch the canakinumab MBMA data (#1913)
+        # `tests/mbma_canakinumab_case_study.rs` anchors the bounded-endpoint MBMA path on
+        # data whose licence (CC BY-NC-ND) forbids committing them, so the file is
+        # downloaded from Europe PMC here and verified against the sha256 pinned in the
+        # script. It lands in the git-ignored `data/external/`.
+        #
+        # Core leg only: the anchor needs no `nn`, and one download a night is enough.
+        #
+        # NO actions/cache and NO artifact, on purpose. A cache entry written on `main` can
+        # be restored by any branch's workflow, a fork PR's included, so caching the file
+        # would hand the data to anyone who opens a PR. The download is ~10 MB and took
+        # minutes when measured, so it is paid every night.
+        #
+        # `continue-on-error`: a Europe PMC outage must not cost the rest of the suite. The
+        # cargo step below sets FERX_REQUIRE_EXTERNAL_DATA=1 on this leg, so a failed fetch
+        # still turns the job red, through the anchor's own panic, which names the cause.
+        # The 15-minute cap keeps a hung download inside the job's 120-minute ceiling next
+        # to the 100-minute test budget.
+        if: matrix.leg == 'core'
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          python3 tools/mbma_canakinumab_fetch.py
+          python3 tools/mbma_canakinumab_fetch.py --check
       - name: cargo test (ci-test profile + slow-tests)
+        env:
+          # A missing canakinumab file is a red test on the leg that fetched it, and a
+          # skip on the leg that did not (see the step above).
+          FERX_REQUIRE_EXTERNAL_DATA: ${{ matrix.leg == 'core' && '1' || '' }}
         # `--profile ci-test` (defined in Cargo.toml) keeps release-level
         # optimisation so the heavy fits run fast, but drops fat LTO — the
         # whole-program link tax that otherwise dominates this build.

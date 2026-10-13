@@ -49,6 +49,7 @@ the AGENTS.md "compare with NONMEM output" rule:
 | **FOCE + IOV EBE search, residual variance at f(η=0, κ=0)** | the IOV twin of the row above — [#1722](https://github.com/FeRx-NLME/ferx-core/issues/1722) (`$OMEGA BLOCK(1)` κ with `SAME` per occasion, `$EST METHOD=1`, no `INTER`). `examples/warfarin_iov.ferx` on `data/warfarin_iov.csv`, σ ≈ 19%. Not degenerate on a dose's incoming side: occasion 2's dose lands on residual drug. `MINIMIZATION SUCCESSFUL` with `PROBLEMS OCCURRED`, `#OBJV = 205.09053792965955`; arm64 and arm64-nofma agree to 2e-6. ferx at NONMEM's estimates (Linux aarch64 = macOS arm64 in every printed digit): OFV 205.090538163 (|Δ| **2.3e-7**), η̂ 4.9e-6 and κ̂ 4.9e-7 vs `.phi`, per-subject OBJ 7.3e-5 — against **203.806423** (Δ −1.284) before #1722, with subject 10's ETA_KA at −0.542 against NONMEM's −1.272. Python: 205.090543 frozen, 203.806424 not. **Provenance: NONMEM 7.6.0, `nm3` anchor build, the #1710 warfarin_iov FOCE run (2026-10-06).** | `foce_ebe_freeze_iov.ctl` | `examples/warfarin_iov.ferx` *(tests in `tests/foce_ebe_variance_nonmem_anchor.rs`)* |
 | **A pk-only row runs under its own occasion** | on IOV data, an `EVID=2` row (or its `EVID=0, MDV=1` spelling) runs `$PK` under its own `OCC`, and under the end-of-interval rule that occasion's κ governs the interval ending at the row — [#1876](https://github.com/FeRx-NLME/ferx-core/issues/1876) (`ADVAN2 TRANS2`, `$EST METHOD=1` with and without `INTER`, `MAXEVAL=0`, at `warfarin_iov`'s initial estimates). **A** is `data/warfarin_iov.csv`; **E** adds an `EVID=2` row at TIME 30 / OCC 1 and at 150 / OCC 2 on every subject; **X** adds one at TIME 110 / **OCC 2** between two OCC-1 records, the case that tells the row's own label from a neighbour lookup; **XM** is X with the row written as `EVID=0, MDV=1`. NONMEM gives XM the same OBJ as X to every digit, so XM has no `.ext` of its own and is tested against X's. Each run has wrong-convention twins: `_k0` (`IF(EVID.EQ.2) KAPPA = 0`, the κ = 0 convention ferx had before #1876) and, on X, `_prev` (`KAPPA = ETA(4)`, the previous record's occasion, which equals A to 4e-11). NONMEM OBJ, FOCE / FOCEI: E 332.26485166 / 340.50988983, X 333.38539700 / 341.52149272. The nearest wrong convention is 0.788 away (X_k0, FOCEI). ferx, analytical and `[odes]`, on dual inner gradients, Linux x86_64: worst \|ΔOFV\| **5.0e-8**, bound 1e-6. Under that convention (PR #1875 at `e1249c08`), ferx equalled `_k0` to every printed digit. **Provenance: NONMEM 7.6.0, `nonmem:7.6.0-anchor`, run by @TeunP on PR #1875, 2026-10-10.** | `iov_pk_only_{foce,focei}_{A,E,E_k0,X,X_k0,X_prev}.ctl` (12) | `iov_pk_only_{an,ode}_{foce,focei}.ferx` *(tests in `tests/iov_pk_only_nonmem_anchor.rs`)* |
 | **A pk-only record starts the clock, and a tie follows file order** | an `EVID=2` or `EVID=0, MDV=1` row is a record. At `TIME 0` it starts the subject's clock, as NONMEM's first record of any type does ([#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809)). In a co-timed tie, the first record in file order governs the interval ending at the tie ([#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810)). The comparison is `PRED` at η = 0 (`METHOD=0 MAXEVAL=0`). `evid2_clock` (`ADVAN13 TOL=9`): an `[odes]` model whose state moves on its own (`PLB·exp(−TF·T)` in `$DES`), on constant- and varying-covariate subjects and on one with a later bolus. `tied_evid2` / `tied_evid2_advan1`: #1810's seven tie cases on `ADVAN13` and on `ADVAN1`. ferx `predict()` against the `.tab`'s `PRED` (11 significant figures), Linux x86_64: worst **2.8e-9** / **0** / **4.7e-11**, bound 1e-7. On the merge-base `9a12c915`, before both fixes, the worst errors were **3.90 / 4.00 / 2.47**. **Provenance: NONMEM 7.6.0, `nonmem:7.6.0-anchor`, run by @TeunP on PR #1875, 2026-10-10; each `.ctl` equals its `.lst` echo.** | `evid2_clock.ctl`, `tied_evid2.ctl`, `tied_evid2_advan1.ctl` | `evid2_clock_fit.ferx`, `tied_evid2_fit.ferx`, `tied_evid2_advan1_fit.ferx` *(tests in `tests/record_clock_nonmem_anchor.rs`)* |
+| **Canakinumab MBMA** | bounded-endpoint MBMA on real literature data: weighted logit readout (`weight = 1/sqrt(NARM)`, σ estimated), `kappa … weight = NARM`; the published `clamp` is present but never binds on these data, so it is not covered — [#1913](https://github.com/FeRx-NLME/ferx-core/issues/1913). **Data not in the repository** (CC BY-NC-ND); see [Canakinumab MBMA](#canakinumab-mbma-1913). | `mbma_canakinumab.ctl` | `tests/data/mbma_canakinumab/mbma_canakinumab.ferx` *(tests in `tests/mbma_canakinumab_case_study.rs`)* |
 
 The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
 (one subject, 100 mg IV bolus, seven samples over 24 h) — see
@@ -1116,3 +1117,58 @@ log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 `tests/level_se_nonmem_anchor.rs` evaluates ferx at NONMEM (a)'s optimum
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
 gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digit).
+
+## Canakinumab MBMA (#1913)
+
+Bracis et al., CPT:PSP 2026;15:e70158, Case Study 2, final model r03: 9 studies, 15
+arms, 140 ACR20 proportions. `mbma_canakinumab.ctl` is the NONMEM twin of
+`tests/data/mbma_canakinumab/mbma_canakinumab.ferx`: κ written out as one `ETA` per
+arm (`$OMEGA BLOCK(1) … SAME`) divided by `SQRT(NARM)`, residual SD `THETA(7)/SQRT(NARM)`
+with `$SIGMA 1 FIX`, so the objective includes the same Jacobian ferx's
+`weight =` does and the two OFVs compare directly.
+
+**The data are not here and must not be added.** The article is CC BY-NC-ND 4.0;
+a derived CSV is an adaptation. Unlike every other anchor here, run it from a copy
+of the `.ctl` in a folder **outside** the repository, with the data provisioned
+beside it: `python3 tools/mbma_canakinumab_fetch.py --out <run dir>/mbma_canakinumab.csv`.
+`.gitignore` excludes `mbma_canakinumab*.csv` anywhere as a backstop, and
+`no_external_data_is_tracked` fails if one is ever tracked. The
+committed `results/mbma_canakinumab.{lst,ext,cov}` contain estimates only (checked: no
+data record is printed in the `.lst`).
+
+**Fit** (`nm3`, 2026-10-12): `MINIMIZATION SUCCESSFUL` with `PROBLEMS OCCURRED`,
+`#OBJV = −277.86235425800453`; arm64 and arm64-nofma agree to 2e-9. ferx's converged
+FOCE-I fit (Linux aarch64 = macOS arm64 in every printed digit): |ΔOFV| **3.7e-8**,
+worst relative parameter error **1.19e-5** (ω²). The published Monolix SAEM estimates
+are a different optimum — the exact likelihood, not FOCE's — 1.82 OFV above this one
+on ferx's objective. At that published point ferx reproduces Monolix's linearised
+−2LL 684.263422 to **3.9e-7** after adding back `Σ ln N_j` = 703.0047 and `n·ln 2π`.
+
+**Standard errors.** NONMEM's `$COV MATRIX=R` is not the SE reference here: it gives
+SE(T50_POP) = 0.110 where ferx gives 0.227 and the profile below gives 0.227, and
+SE(B_T50_ADA) = 0.087 against 0.120. The reference is instead a NONMEM **profile**:
+each parameter `FIX`ed at θ̂ ± δ, δ = SE_ferx/2, all others re-estimated (18 runs, `nm3`,
+anchor image), and `SE = δ·√(2/(ΔOFV₋ + ΔOFV₊))`, the symmetric second difference.
+
+| Parameter | ferx `R⁻¹` SE | ΔOFV₋ / ΔOFV₊ | profile SE | NONMEM `$COV` SE |
+|---|---|---|---|---|
+| EMAX_POP | 0.032993 | 0.2545 / 0.2406 | 0.033156 | 0.039931 |
+| B_EMAX_ABA | 0.144107 | 0.3085 / 0.1946 | 0.143654 | 0.126369 |
+| B_EMAX_ADA | 0.132640 | 0.2155 / 0.2723 | 0.134293 | 0.134237 |
+| B_EMAX_CAN | 0.372044 | 0.2541 / 0.2425 | 0.373343 | 0.372701 |
+| T50_POP | 0.226947 | 0.2545 / 0.2453 | 0.226998 | 0.110257 |
+| B_T50_ADA | 0.120021 | 0.2463 / 0.2531 | 0.120086 | 0.086622 |
+| ADD_ERR (SD) | 0.155422 | 0.2637 / 0.2373 | 0.155258 | 0.139667 |
+| ω² BSV | 0.076222 | 0.3189 / 0.1949 | 0.075198 | 0.077372 |
+| γ² KAPPA | 1.871683 | 0.4679 / 0.1586 | *(1.672, not quadratic)* | 1.871254 |
+
+γ²'s profile is 3× asymmetric even at ±SE/2 (its SE exceeds the estimate), so it has
+no curvature to read; the test compares γ² with the `$COV` SE instead. Worst
+`|ln(SE_ferx/SE_ref)|` over the nine: **0.0135** (ω²). Several profile refits end
+`TERMINATED` (rounding errors), which puts a few 1e-3 of noise on the ΔOFVs; the test
+bound (0.03) is set above that, not at the realised gap. A first pass at δ = SE_ferx,
+averaging one-sided SEs, gave ferx/profile ratios 0.94–1.00 on the θ; halving δ and
+taking the symmetric difference moved them to 0.988–1.003, the convergence towards
+`R⁻¹` the profile should show.
+Run folders: `~/NONMEMruns/mbma_canakinumab/profile05_*` (δ = SE/2) and `profile_*`
+(δ = SE).
