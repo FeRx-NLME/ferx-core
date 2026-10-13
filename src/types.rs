@@ -6639,6 +6639,23 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // prose arm below claims. Same `(Critical, Convergence)` verdict the
         // prose arm gives, reached deterministically.
         (WarningSeverity::Critical, WarningCode::Convergence)
+    } else if lower.contains("w_no_feasible_eval") {
+        // #1617: not one of the outer optimizer's trials was feasible — every one was
+        // rejected by the EBE convergence guard or returned a non-finite objective — so
+        // the verdict was demoted and the estimates reported are the ones the fit started
+        // from. Same `(Critical, Convergence)` as the generic non-convergence line it
+        // accompanies: a run that never scored the real objective is exactly the case
+        // `require_converged` exists to reject.
+        //
+        // Matched on its `W_` token and placed with the other token arms, ahead of every
+        // prose one. The message says "did not converge" nowhere — it says "no OFV was
+        // ever minimised" — so the prose `convergence` arm below does **not** claim it,
+        // and without this arm it would fall through to the `general` bucket at `Warning`
+        // severity. Its non-finite arm also lists the same candidate causes
+        // `W_NONFINITE_OBJECTIVE` does ("infusion duration", "residual variance", …),
+        // which is prose a later edit could grow into a phrase one of the arms below
+        // claims.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_per_cmt_unmatched") {
         // #1405: a declared per-CMT `[scaling]` / `[error_model]` / `y[CMT=N]` entry
         // that no observation matched. Matched on its `W_` token and placed with the

@@ -690,6 +690,53 @@ restarted. And a second stall is reported as a stall: you get `converged: false`
 `Outer optimization did not converge` warning, which is the honest signal and bounds the
 worst case at two optimizations.
 
+### When no evaluation is feasible {#no-feasible-evaluation}
+
+The outer optimizer can also stop having never scored the real objective at all. Every
+trial it made was rejected — by the [EBE convergence
+guard](../model-file/fit-options.qmd#parameter-scaling-and-ebe-convergence), or because the
+objective came back non-finite — and what the optimizer minimised instead was the guard's
+own rejection penalty.
+
+That penalty is a quadratic bowl centred on the **midpoint of the declared bounds** in the
+packed, scaled space the optimizer works in. It has to be: NLopt's line search interpolates
+on the value and the gradient together, so a rejected trial has to return a value that
+integrates the centre-push gradient handed back with it (a flat wall plus a non-zero
+gradient fails the search outright, [#486](https://github.com/FeRx-NLME/ferx-core/issues/486)). A gradient
+optimizer handed nothing but that penalty therefore walks to the box centre and stops there
+with NLopt `Success`, because the penalty really is stationary at the centre.
+
+Until [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that came back as a *fit*. The best-seen
+restore ranked penalties only, so it landed on the centre; the final inner loop re-scored
+that point into an ordinary finite OFV; and every downstream check read a plausible number.
+On the issue's warfarin reproduction at `inner_maxiter = 5`, each θ came back at
+$\sqrt{\text{lower} \cdot \text{upper}}$ to 3e-9 (`TVCL` 0.1, `TVV` 7.071, `TVKA` 0.7071),
+each ω at 1 — the middle of the ±6 log rail — and `converged: true`, 500 OFV units from the
+optimum the same model reaches with the default inner budget.
+
+A run with no feasible evaluation now reports `converged: false` with a `Critical`
+`convergence` warning carrying the `W_NO_FEASIBLE_EVAL` token, and the estimates it reports
+are the ones it started from rather than the penalty's minimum. The warning names which of
+the guard's triggers fired, because the remedies are not the same:
+
+| What the trace says | What to change |
+|---|---|
+| Too many subjects' inner loops unconverged | Raise `inner_maxiter` so the inner loop can reach the EBEs, or raise `max_unconverged_frac` (`1.0` disables the guard) to proceed with the unconverged subjects. |
+| Subjects rejected at their inner start | Neither knob: `max_unconverged_frac` is not consulted for this trigger. The individual likelihood was already degenerate at the previous trial's EBEs — change the model or its initial estimates. |
+| Every trial non-finite | The guard never came into it. Find the record or parameter that poisons the objective, as for [`W_NONFINITE_OBJECTIVE`](../warnings.qmd#non-finite-objective). |
+
+A **cancelled** run is not reported this way: its evaluations short-circuit before the
+feasible-evaluation counter advances, so its trace is infeasible by construction.
+
+Two notes on reading such a run. The reported OFV is a real objective — the starting
+estimates, scored by the final inner loop — so it is not a sentinel and
+`W_NONFINITE_OBJECTIVE` does not fire; the number is simply not a minimum of anything. And
+`gradient = fd` can hide the whole case, because it also swaps the outer optimizer away from
+L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
+too](optimizers.qmd#gradient-fd-moves-the-optimizer)), which keeps a flat rejection wall
+instead of the quadratic bowl and so never walks to the centre. A 35-point OFV gap between
+the two routes on the same model is that difference, not a wrong analytic gradient.
+
 ## Warm Starting
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.
