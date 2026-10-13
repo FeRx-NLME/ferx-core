@@ -509,6 +509,10 @@ fn check_simulate_preconditions(
     ))?;
     #[cfg(feature = "survival")]
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
+    // snapshot for its event times (#1853; as fit() does).
+    #[cfg(feature = "survival")]
+    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
     first_error(&check_absorption_dosing(model, population))
 }
 

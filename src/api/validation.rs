@@ -3572,6 +3572,114 @@ pub(crate) fn check_survival_tv_covariates(
     None
 }
 
+/// Reject a model whose **ODE-accumulated hazard integrates a `TIME`-dependent
+/// disposition** — currently silently frozen at `TIME = 0` (#1853), the `TIME` axis of
+/// the freeze [`check_survival_tv_covariates`] refuses on the covariate axis (#741).
+///
+/// `survival::ode_cumhaz_hazard` (the TTE objective's dedicated engine and
+/// `predict_survival`) and `survival::draw_ode_tte_latent` (`simulate()`'s event times)
+/// take one `$PK` snapshot, `(model.pk_param_fn)(…, 0.0)`, and integrate the whole
+/// timeline under it. Since #1575 every *dose-record* quantity is read at its own dose
+/// record instead, so what remains frozen is the disposition the `[odes]` RHS integrates
+/// (CL, V and the like), the parameters the hazard expression itself reads, and `init()`.
+///
+/// Meanwhile a subject of such a model declines the #570 one-solve share
+/// (`model_uses_time_anywhere`) and takes its *Gaussian* predictions from the per-record
+/// event-driven walk, which evaluates `$PK` at every record. So the two halves of one
+/// objective read two different concentration curves. Measured on a 1-cpt IV model with
+/// `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0·exp(BETA·C)`
+/// (`tests/survival_time_dependent_pk_refused.rs`): at `t = 8` the Gaussian pass predicts
+/// `central = 33.790` — the per-record convention, to 10 significant figures against a
+/// closed form computed outside both engines — while the hazard pass reads `44.933`; at
+/// `t = 20`, `3.065` against `13.534`. `H(20)` is 10.1 % high, and the exact-event
+/// `−log L` is off by 0.046 per subject. The frozen hazard is also *bit-identical* across
+/// `KT = 0` and `KT = 0.05`: the `TIME` coefficient has no influence at all on the
+/// survival term it was written for.
+///
+/// Until a per-record disposition reaches the hazard pass (#1920), refuse rather than
+/// silently mis-fit. The refusal is exact per parameter: a `TIME`-reading parameter the hazard
+/// pass already reads per dose record (`MTT`, `ALAG1`, …) does **not** trip it — see
+/// `OdeRhsProgram::reads_indiv_param_in_rhs`
+/// and `tests/one_snapshot_dose_reads_survival.rs`, the #1575 fixture that must stay
+/// fittable.
+///
+/// Returns `None` for every model with no `OdeAccumulated` hazard, and for every model
+/// none of whose `[odes]`-read individual parameters depends on `TIME`. `fit()` and every
+/// predict / simulate entry point surface the message as an `Err`, as they do for #741.
+///
+/// **Not wired into `predict_categorical`**, although #741's check is. The two have
+/// different mechanisms: #741 refuses there because the *logit predictor itself* is
+/// evaluated at a frozen snapshot, while the freeze here is read only by
+/// `survival::ode_cumhaz_hazard` and `survival::draw_ode_tte_latent`, which that entry
+/// point never calls. A call there would refuse a categorical prediction whose own answer
+/// is unaffected, and no test could kill it.
+///
+/// **One gate, not two.** A `crate::parser::model_parser::compiled_model_uses_time_builtin`
+/// fast exit in front of the loop would be free and would read as the load-bearing
+/// narrow-vs-wide choice (asking `pk::model_uses_time_anywhere` instead must not refuse a
+/// `TIME`-reading `[odes]` RHS, which the integrator clock honours, #610). Measured: it is
+/// neither. Swapping the narrow flag for the wide one left all seven unit tests green,
+/// because `params_reading_time` already answers all-`false` for such a model — two
+/// predicates rejecting the same inputs, so the test pinning either could not fail. The
+/// mask is the gate; `.min()?` on the endpoint list is the cheap discriminator in front
+/// of it.
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    // The lowest `OdeAccumulated` CMT, so the message names one deterministically on a
+    // model with several — and the cheap exit for every model without one.
+    let cmt = model
+        .endpoints
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                EndpointLikelihood::Tte {
+                    hazard: HazardSpec::OdeAccumulated { .. },
+                    ..
+                }
+            )
+        })
+        .map(|(cmt, _)| *cmt)
+        .min()?;
+    let rhs = model.ode_spec.as_ref()?.rhs_program.as_ref()?;
+    let reads_time = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()?
+        .params_reading_time();
+    for (i, name) in model.indiv_param_names.iter().enumerate() {
+        if !reads_time.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        // `indiv_param_names` can be longer than the `[odes]` block's own parameter list
+        // (a `pk(... = TIME)` desugaring's synthetic, a `[scaling]` Form C readout
+        // synthetic — both appended after `build_ode_spec` has run). The compiled block
+        // cannot read such a name, so it is not frozen by this snapshot; skipping it is
+        // the answer, not a bail-out.
+        if !rhs.has_indiv_param(i) {
+            continue;
+        }
+        let in_rhs = rhs.reads_indiv_param_in_rhs(i);
+        let in_init = rhs.reads_indiv_param_in_init(i);
+        let site = match (in_rhs, in_init) {
+            (true, true) => "the [odes] RHS and an init(...) seed read",
+            (true, false) => "the [odes] RHS reads",
+            (false, true) => "an [odes] init(...) seed reads",
+            (false, false) => continue,
+        };
+        return Some(format!(
+            "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+             integrated with the individual parameters frozen at their TIME=0 values, but \
+             `{name}` reads the `TIME` built-in and {site} it. A TIME-dependent \
+             disposition on a drug-driven hazard is not yet supported (#1853): the Gaussian \
+             predictions evaluate `[individual_parameters]` at every record while the hazard \
+             pass keeps the TIME=0 value. Hold `{name}` constant in TIME for now."
+        ));
+    }
+    None
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state

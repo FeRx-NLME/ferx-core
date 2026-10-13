@@ -196,6 +196,9 @@ pub fn predict_diag(
     // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // Same freeze on the `TIME` axis (#1853; as fit() does).
+    #[cfg(feature = "survival")]
+    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
     check_analytic_readout_support(model, population).map_or(Ok(()), Err)?;
     first_error(&check_absorption_dosing(model, population))?;
     // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
@@ -479,6 +482,9 @@ pub fn predict_survival(
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so refuse instead (#741).
     check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    // Same freeze on the `TIME` axis — this entry point is the one that reports `H`/`h`
+    // off the frozen snapshot (#1853; as fit() does).
+    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
     // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
     // level block, a population not bound for the bound block, or a covariate the data
     // lacks each returned `Ok` here — `NaN` survival for the first two, the covariate

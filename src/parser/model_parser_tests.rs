@@ -30192,3 +30192,387 @@ fn too_many_unbound_parameters_for_the_free_slots_is_refused() {
         "{err}"
     );
 }
+
+// ---- #1853: per-parameter `TIME` dependence, and which reads are the disposition ----
+
+/// A joint PK-TTE ODE model whose `[individual_parameters]` block is `ip`.
+fn time_taint_model(ip: &str) -> CompiledModel {
+    let m = format!(
+        r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVKT(0.05, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+{ip}
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"
+    );
+    parse_model_string(&m).unwrap_or_else(|e| panic!("model compiles: {e}"))
+}
+
+/// `(name, reads TIME)` pairs, in declaration order, for the model built from `ip`.
+fn time_mask_of(ip: &str) -> Vec<(String, bool)> {
+    let model = time_taint_model(ip);
+    let mask = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present")
+        .params_reading_time();
+    assert_eq!(
+        mask.len(),
+        model.indiv_param_names.len(),
+        "the mask must be parallel to indiv_param_names"
+    );
+    model.indiv_param_names.iter().cloned().zip(mask).collect()
+}
+
+/// `name`'s entry in the mask; panics if the model has no such parameter, so a renamed
+/// fixture fails loudly instead of silently asserting about nothing.
+fn reads_time(mask: &[(String, bool)], name: &str) -> bool {
+    mask.iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("no parameter {name} in {mask:?}"))
+        .1
+}
+
+/// The mask is **per parameter**, not per block: the one parameter that reads `TIME`
+/// is flagged and its time-free siblings are not. Both halves matter — a mask stuck
+/// on `true` (the whole-block flag `uses_time_builtin`, which the refusal must not
+/// use) passes the first assertion and fails the rest.
+#[test]
+fn the_time_mask_flags_only_the_parameter_that_reads_time() {
+    let mask = time_mask_of(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n\
+         \x20 V    = TVV\n\
+         \x20 KA   = TVKA\n\
+         \x20 H0   = TVH0\n\
+         \x20 BETA = TVBETA\n",
+    );
+    assert!(reads_time(&mask, "CL"), "CL reads TIME: {mask:?}");
+    for free in ["V", "KA", "H0", "BETA"] {
+        assert!(
+            !reads_time(&mask, free),
+            "{free} does not read TIME: {mask:?}"
+        );
+    }
+}
+
+/// Taint is **transitive**: a parameter whose own right-hand side never mentions
+/// `TIME` still depends on it through an intermediate that does. The fixpoint is
+/// what finds this; a single straight-line pass would miss the forward reference.
+#[test]
+fn the_time_mask_propagates_through_an_intermediate() {
+    let mask = time_mask_of(
+        "  DECAY = 1.0 + TVKT * TIME\n\
+         \x20 CL    = TVCL * DECAY * exp(ETA_CL)\n\
+         \x20 V     = TVV\n\
+         \x20 KA    = TVKA\n\
+         \x20 H0    = TVH0\n\
+         \x20 BETA  = TVBETA\n",
+    );
+    assert!(reads_time(&mask, "DECAY"), "DECAY reads TIME: {mask:?}");
+    assert!(
+        reads_time(&mask, "CL"),
+        "CL reads TIME through DECAY: {mask:?}"
+    );
+    assert!(!reads_time(&mask, "V"), "V is time-free: {mask:?}");
+}
+
+/// A `TIME`-reading **condition** taints every parameter assigned under it, although
+/// no branch body mentions `TIME`: which value `CL` takes is a function of `TIME`.
+/// `V` is assigned in the same `if` to pin that the rule is the condition's, not the
+/// branch's: both are tainted here, and the time-free control is `KA`, outside.
+#[test]
+fn the_time_mask_taints_an_assignment_under_a_time_reading_condition() {
+    let mask = time_mask_of(
+        "  CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV\n\
+         \x20 if (TIME < 5.0) {\n\
+         \x20   CL = TVCL * 2.0 * exp(ETA_CL)\n\
+         \x20   V  = TVV * 2.0\n\
+         \x20 }\n\
+         \x20 KA   = TVKA\n\
+         \x20 H0   = TVH0\n\
+         \x20 BETA = TVBETA\n",
+    );
+    assert!(
+        reads_time(&mask, "CL"),
+        "CL is assigned under a TIME condition: {mask:?}"
+    );
+    assert!(
+        reads_time(&mask, "V"),
+        "V is assigned under the same TIME condition: {mask:?}"
+    );
+    assert!(
+        !reads_time(&mask, "KA"),
+        "KA is outside the if: {mask:?} — the taint must be the condition's, not the block's"
+    );
+}
+
+/// No `TIME` anywhere in `[individual_parameters]` ⇒ every entry is `false`. The
+/// straddle against the three tests above, and the fast path the #1853 gate exits on.
+#[test]
+fn the_time_mask_is_empty_for_a_time_free_block() {
+    let ip = "  CL   = TVCL * exp(ETA_CL)\n\
+              \x20 V    = TVV\n\
+              \x20 KA   = TVKA\n\
+              \x20 H0   = TVH0\n\
+              \x20 BETA = TVBETA\n";
+    let mask = time_mask_of(ip);
+    assert!(
+        mask.iter().all(|(_, t)| !t),
+        "no parameter reads TIME: {mask:?}"
+    );
+    assert!(
+        !compiled_model_uses_time_builtin(&time_taint_model(ip)),
+        "and the whole-block flag agrees"
+    );
+}
+
+/// A **dose-record** quantity is not a disposition read (#1575): the absorption
+/// kernel's arguments are lifted out of the RHS lines by `extract_input_rate_terms`
+/// before they are compiled, and `ALAG1` is a magic name the RHS never mentions. So
+/// `MTT`/`NTR`/`ALAG1` answer `false` while `CL`/`V`/`KA` — and the hazard's own
+/// `H0`/`BETA`, which ride on the injected `d/dt(__chz_*)` row — answer `true`.
+///
+/// This is the predicate that keeps the #1853 refusal off the #1575 fixture, so a
+/// mutation making it answer `true` for everything (`|| true`, or asking the PK slot
+/// instead of the var slot) has to redden here.
+#[test]
+fn only_a_disposition_read_counts_as_one() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVMTT(1.0, FIX)
+  theta TVN(3.0, FIX)
+  theta TVLAG(0.5, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  MTT   = TVMTT
+  NTR   = TVN
+  ALAG1 = TVLAG
+  H0    = TVH0
+  BETA  = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let model = parse_model_string(M).expect("the #1575-shaped model compiles");
+    let rhs = model
+        .ode_spec
+        .as_ref()
+        .expect("ODE model")
+        .rhs_program
+        .as_ref()
+        .expect("RHS program present");
+    let idx = |name: &str| {
+        model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
+    };
+    for disposition in ["CL", "V", "KA", "H0", "BETA"] {
+        assert!(
+            rhs.reads_indiv_param_in_rhs(idx(disposition)),
+            "{disposition} is read by the [odes] RHS"
+        );
+    }
+    for dose_only in ["MTT", "NTR", "ALAG1"] {
+        assert!(
+            !rhs.reads_indiv_param_in_rhs(idx(dose_only)),
+            "{dose_only} is a dose-record quantity, read at each dose record (#1575) — \
+             not part of the frozen disposition"
+        );
+    }
+    // No `init(...)` in this model, so the init half is `false` for every parameter —
+    // and recorded at full length, which is what keeps its `unwrap_or(true)` from
+    // answering `true` for all of them.
+    for name in &model.indiv_param_names {
+        assert!(
+            !rhs.reads_indiv_param_in_init(idx(name)),
+            "{name}: no init(...) in this model"
+        );
+    }
+}
+
+/// The `init(state) = …` half: `BASE` is read by the init and by nothing else, so the
+/// RHS half says `false` and the init half says `true`. `CL` is the control on the
+/// other side — read by the RHS, not by the init — so a mutation collapsing the two
+/// accessors into one reddens here.
+#[test]
+fn an_init_seed_read_is_recorded_separately_from_an_rhs_read() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVBASE(5.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let model = parse_model_string(M).expect("the init(...) model compiles");
+    let rhs = model
+        .ode_spec
+        .as_ref()
+        .expect("ODE model")
+        .rhs_program
+        .as_ref()
+        .expect("RHS program present");
+    let idx = |name: &str| {
+        model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
+    };
+    assert!(
+        rhs.reads_indiv_param_in_init(idx("BASE")),
+        "BASE is read by init(central)"
+    );
+    assert!(
+        !rhs.reads_indiv_param_in_rhs(idx("BASE")),
+        "BASE is read by nothing else"
+    );
+    assert!(
+        rhs.reads_indiv_param_in_rhs(idx("CL")),
+        "CL is read by the RHS"
+    );
+    assert!(
+        !rhs.reads_indiv_param_in_init(idx("CL")),
+        "CL is not read by init(central)"
+    );
+}
+
+/// **The index-alignment invariant** the #1853 gate's two predicates rest on: a caller
+/// walking `CompiledModel::indiv_param_names` may index
+/// `OdeRhsProgram::reads_indiv_param_in_rhs` / `_in_init` with the same `i`.
+///
+/// It is not free. `indiv_var_names` grows *after* `build_ode_spec` has compiled the
+/// `[odes]` block — `append_readout_synth_param` appends a `[scaling]` Form C synthetic
+/// (#1636/#486) and the `pk(... = TIME)` desugaring appends `__ferx_pktime_*` (#486) —
+/// and on the ODE parameter layout both appends happen *before* that call
+/// (`if uses_ode_param_layout`, the analytical path appends later). This model has such a
+/// synthetic (`__ferx_ro_th2`, from `[scaling] y = central / V * TVS`), so it is the
+/// fixture that would notice if the ODE-path append moved after the compile: every name
+/// is in scope here.
+///
+/// `has_indiv_param` is what keeps the gate correct if it ever does move — a trailing
+/// name's var slot does not exist, and `state_count + i` past the end is an
+/// *intermediate's* slot, so the accessors would answer about an unrelated variable.
+#[test]
+fn every_indiv_param_name_is_in_scope_for_the_compiled_odes_block() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVS(2.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V * TVS
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let model = parse_model_string(M).expect("the Form C joint model compiles");
+    let rhs = model
+        .ode_spec
+        .as_ref()
+        .expect("ODE model")
+        .rhs_program
+        .as_ref()
+        .expect("RHS program present");
+    // The straddle: this fixture must actually carry a name appended by the readout
+    // desugaring, or it pins nothing.
+    assert!(
+        model
+            .indiv_param_names
+            .iter()
+            .any(|n| n.starts_with("__ferx_ro_")),
+        "fixture must carry a [scaling] Form C synthetic: {:?}",
+        model.indiv_param_names
+    );
+    for (i, name) in model.indiv_param_names.iter().enumerate() {
+        assert!(
+            rhs.has_indiv_param(i),
+            "{name} (index {i}) is outside the compiled [odes] block's parameter list; \
+             the #1853 gate must skip it rather than read an intermediate's slot"
+        );
+    }
+}

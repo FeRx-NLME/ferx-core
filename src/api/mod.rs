@@ -34,7 +34,9 @@ pub use validation::{
     check_model_data_warnings, check_model_options, validate_model_file, validate_output_columns,
 };
 #[cfg(feature = "survival")]
-pub(crate) use validation::{check_rtte_records, check_survival_tv_covariates};
+pub(crate) use validation::{
+    check_rtte_records, check_survival_time_dependent_pk, check_survival_tv_covariates,
+};
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
@@ -332,6 +334,12 @@ mod ode_solver_options_tests;
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
+
+// #1853: an ODE-accumulated hazard integrates one `TIME = 0` `$PK` snapshot, so a
+// `TIME`-dependent disposition / `init()` is refused — the `TIME` axis of #741's freeze.
+#[cfg(all(test, feature = "survival"))]
+#[path = "tests/survival_time_dependent_pk_tests.rs"]
+mod survival_time_dependent_pk_tests;
 
 // #898: a precondition failure on a non-`fit()` entry point is an `Err` carrying `fit()`'s
 // text, not a panic.

@@ -14176,6 +14176,31 @@ fn build_ode_spec(
     // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
     // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
     let pk_reads_model_time = pk_reads_tafd || pk_reads_solver_time || pk_reads_tad;
+    // Which individual parameters an `init(state) = …` seed reads (#1853). Recorded
+    // here, by name, because the init expressions are resolved by name against the map
+    // `init_fn` builds below (states + individual parameters, all three cases) and are
+    // then sealed inside that closure. Always `indiv_count` long — all-`false` for a
+    // model with no init — because `reads_indiv_param_as_disposition` reads a missing
+    // entry as `true`.
+    let init_indiv_reads: Vec<bool> = {
+        let mut read_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, expr) in &init_specs {
+            visit_expr_nodes(expr, &mut |e| {
+                if let Expression::Variable(name) = e {
+                    read_names.insert(name.to_ascii_uppercase());
+                }
+            });
+        }
+        indiv_names_owned
+            .iter()
+            .map(|n| read_names.contains(&n.to_ascii_uppercase()))
+            .collect()
+    };
+    debug_assert_eq!(
+        init_indiv_reads.len(),
+        indiv_count,
+        "init_indiv_reads must be parallel to indiv_param_names"
+    );
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -14192,6 +14217,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        init_indiv_reads,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -25924,6 +25950,17 @@ pub struct OdeRhsProgram {
     /// (#1210) — that path has no accumulator handling and is reachable only if a routing
     /// gate is widened.
     has_chz: bool,
+    /// Per individual parameter `i` (declaration order, parallel to
+    /// [`crate::types::CompiledModel::indiv_param_names`]): does an `init(state) = …`
+    /// expression read it? The companion of [`Self::reads_indiv_param_in_rhs`], which
+    /// documents the distinction both accessors exist for.
+    ///
+    /// Recorded here rather than on [`crate::ode::OdeSpec`] — where `init_fn` itself
+    /// lives — because `OdeSpec`'s fields are `pub` and exhaustively named at 79
+    /// construction sites, while this struct's are private and built in exactly one
+    /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
+    /// parse time or not at all.
+    init_indiv_reads: Vec<bool>,
 }
 
 impl OdeRhsProgram {
@@ -25966,6 +26003,71 @@ impl OdeRhsProgram {
     /// signal, that a gate stopped asking one of them.
     pub(crate) fn reads_model_time(&self) -> bool {
         self.uses_time_vars() || self.reads_time_builtin()
+    }
+
+    /// Does the compiled `[odes]` block read individual parameter `i` (declaration
+    /// order, parallel to [`crate::types::CompiledModel::indiv_param_names`]) as part of
+    /// the **disposition** it integrates — the RHS, the injected `d/dt(__chz_<cmt>)`
+    /// hazard rows included (#1853)?
+    ///
+    /// The distinction that makes this worth asking is #1575's: the engines read every
+    /// *dose-record* quantity — absorption kernel (`transit(n=…, mtt=…)` and friends),
+    /// pathway fraction, route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`,
+    /// the SS run-in — at each dose record, while the disposition is one snapshot. A
+    /// kernel argument is therefore *not* a disposition read, and structurally cannot be
+    /// one here: `extract_input_rate_terms` lifts the kernel call out of the RHS lines
+    /// before they are compiled, so `MTT` in `d/dt(depot) = transit(n=NTR, mtt=MTT) - …`
+    /// never reaches `stmts`. `F{c}`/`ALAG{c}` are magic names the RHS does not mention
+    /// at all. A `D{n}`/`R{n}` that the RHS *also* reads is the #993 double use, rejected
+    /// elsewhere.
+    ///
+    /// Asked by slot, not by name: the RHS binds individual parameter `i` to var slot
+    /// `state_count + i` (see [`Self::eval_rhs_g`]), which is one slot per parameter even
+    /// where two names share a PK slot (#1356, #1898) — so this is exact per parameter,
+    /// not per PK slot.
+    ///
+    /// The two halves are separate accessors because the refusal's *message* has to say
+    /// which one it found, and "the RHS reads it" and "an `init(...)` seed reads it" are
+    /// different sentences pointing at different lines of the model file. Both require
+    /// [`Self::has_indiv_param`] first: an index beyond this block's own list is not a
+    /// question either of them can answer.
+    pub(crate) fn reads_indiv_param_in_rhs(&self, i: usize) -> bool {
+        debug_assert!(
+            self.has_indiv_param(i),
+            "ask has_indiv_param first: slot state_count + {i} is an intermediate's"
+        );
+        self.has_indiv_param(i) && stmts_read_slots(&self.stmts, &[self.state_count + i])
+    }
+
+    /// Is individual parameter `i` (declaration order) in this compiled block's own
+    /// parameter list at all?
+    ///
+    /// **`CompiledModel::indiv_param_names` can be longer.** `build_ode_spec` runs on the
+    /// list as it stands when the `[odes]` block is compiled, and names are appended after
+    /// that — a `pk(... = TIME)` desugaring's `__ferx_pktime_*`, a `[scaling]` Form C
+    /// readout synthetic (#1636). Such a name is invisible to the compiled block: the RHS
+    /// could not have referenced it, nor could an `init(...)` expression, whose resolvable
+    /// names come from the same slice. It also has no var slot of its own — `state_count +
+    /// i` past the end lands on an *intermediate's* slot, so asking the accessors below
+    /// about it would return some unrelated variable's answer.
+    ///
+    /// So a caller walking `CompiledModel::indiv_param_names` must skip the indices this
+    /// returns `false` for. "The `[odes]` block does not read it" is the truth for them,
+    /// not a default.
+    pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
+        i < self.indiv_to_params_slot.len()
+    }
+
+    /// The `init(state) = …` half of [`Self::reads_indiv_param_in_rhs`]'s contract; see
+    /// that accessor, and [`Self::init_indiv_reads`] for why it is recorded here.
+    ///
+    /// Requires [`Self::has_indiv_param`], like its sibling. Within that range a missing
+    /// record reads `true`: the record is built at full length (asserted at
+    /// construction), so a short one is an inconsistency, and a gate must not mistake
+    /// "not recorded" for "not read".
+    pub(crate) fn reads_indiv_param_in_init(&self, i: usize) -> bool {
+        debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
+        self.has_indiv_param(i) && self.init_indiv_reads.get(i).copied().unwrap_or(true)
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -26256,6 +26358,92 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
         }
     }
     dyn_vars.iter().map(|&d| !d).collect()
+}
+
+/// Classify each individual-parameter var slot as **time-dependent** (`true`): its
+/// value changes with the `TIME` built-in, directly or through another slot that
+/// does (#1853). The `[individual_parameters]` analogue of
+/// [`compute_cov_static_mask`], and the per-parameter refinement of
+/// [`IndivParamProgram::uses_time_builtin`], which is one flag for the whole block.
+///
+/// `TIME` is the only time axis this block has: `T`, `TAD` and `TAFD` are ordinary
+/// covariates outside `[odes]` (see [`ODE_INIT_SCOPE_BUILTINS`]), and a covariate that
+/// varies within a subject is a separate refusal (#741). A direct `pk(... = TIME)`
+/// mapping is desugared into a `__ferx_pktime_* = TIME` statement upstream (#486), so it
+/// is an ordinary assignment here.
+///
+/// Same monotone fixpoint as `compute_cov_static_mask`, for the same reason (var
+/// references can be forward, so one pass is not enough), and the same branch rule: an
+/// assignment under an `if` whose condition reads `TIME` is time-dependent however
+/// time-free its own right-hand side is, because *which* value it takes depends on
+/// `TIME`. The four walks it asks — [`stmts_read_time_builtin`], [`stmts_read_slots`],
+/// [`cond_reads_time_builtin`], [`cond_reads_slots`] — are the ones the rest of the file
+/// already uses, rather than a second `Op`-by-`Op` enumeration that could drift from
+/// [`bytecode_is_dynamic`]'s.
+///
+/// Name-based `Statement::Assign` / `DiffEq` arms are skipped, exactly as
+/// `compute_cov_static_mask` skips them: the snapshot this runs on is the *resolved*
+/// program (`build_pk_param_fn` clones `stmts_owned` after `resolve_variable_indices`),
+/// where every assignment carries its slot.
+fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
+    fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
+        // The slot list the two slot-walks take, rebuilt per statement group from the
+        // current mask (`n_vars` is tens, and this runs once per model).
+        let tainted = |mask: &[bool]| -> Vec<usize> {
+            mask.iter()
+                .enumerate()
+                .filter_map(|(i, &t)| t.then_some(i))
+                .collect()
+        };
+        for s in stmts {
+            match s {
+                Statement::AssignBc(idx, _) | Statement::AssignIdx(idx, _) => {
+                    if time_vars.get(*idx).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let one = std::slice::from_ref(s);
+                    let slots = tainted(time_vars);
+                    if ctx_time || stmts_read_time_builtin(one) || stmts_read_slots(one, &slots) {
+                        if let Some(slot) = time_vars.get_mut(*idx) {
+                            *slot = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The `else` arm fires only when *every* branch condition was false,
+                    // so it is governed by all of them — the same rule
+                    // `compute_cov_static_mask` applies.
+                    let mut any_cond_time = ctx_time;
+                    for (cond, body) in branches {
+                        let slots = tainted(time_vars);
+                        let branch_time = ctx_time
+                            || cond_reads_time_builtin(cond)
+                            || cond_reads_slots(cond, &slots);
+                        any_cond_time |= branch_time;
+                        walk(body, branch_time, time_vars, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, any_cond_time, time_vars, changed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut time_vars = vec![false; n_vars];
+    loop {
+        let mut changed = false;
+        walk(stmts, false, &mut time_vars, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+    time_vars
 }
 
 /// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
@@ -26573,6 +26761,28 @@ impl IndivParamProgram {
     /// contents to `pk_slots()` (#534 review #2).
     pub(crate) fn pk_slots_ref(&self) -> &[usize] {
         &self.pk_slot_indices
+    }
+
+    /// Which **top-level individual parameters** depend on the `TIME` built-in, one
+    /// `bool` per entry of [`crate::types::CompiledModel::indiv_param_names`] and in
+    /// that order (#1853).
+    ///
+    /// The per-parameter refinement of [`Self::uses_time_builtin`]: that flag answers
+    /// "does this block read `TIME` at all", which is what the *routing* gates need
+    /// ([`compiled_model_uses_time_builtin`]), while a refusal has to name the parameter
+    /// and must not fire on a model whose only `TIME`-reading parameter is one the
+    /// engines already read at each dose record (#1575). See
+    /// [`compute_time_dependent_mask`] for the walk and for why `TIME` is the only axis.
+    ///
+    /// The slot layout contract is [`Self::n_top_level_vars`]'s: var slot `i` below that
+    /// length is `indiv_param_names[i]` (#1356, pinned by
+    /// `indiv_param_values_are_var_slot_ordered`). A slot the mask does not cover reads
+    /// `true` — a missing answer must not look like "time-free" to a gate.
+    pub(crate) fn params_reading_time(&self) -> Vec<bool> {
+        let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
+        (0..self.n_top_level_vars)
+            .map(|i| mask.get(i).copied().unwrap_or(true))
+            .collect()
     }
 
     /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
