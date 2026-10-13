@@ -38,7 +38,7 @@
 //! "increase `maxiter`" advice are both withheld, because neither has anything to act on.
 //!
 //! **Mutation sweep.** The first six edits were each applied and run (`--lib`, this
-//! filter); none of them reddens E2, the converged control:
+//! filter); none of them reddens E2, the feasible control:
 //!
 //! | Edit | Test that dies |
 //! |---|---|
@@ -46,6 +46,7 @@
 //! | drop the `no_feasible_eval_warning` call only | E1 — assertion 2, at θ = `[2.0, 10.0]` |
 //! | drop the `optimizer_start_s` fallback only | E1 — assertion 3, θ[0] = `0.14142136177403178` |
 //! | restore the θ coordinates only, leaving ω/σ on the best-seen point | E1 — assertion 4, ω = `0.9999999524299102`, the middle of its ±6 log rail |
+//! | `no_feasible()` broadened so it claims a feasible run | U1 **and** E2 |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -324,20 +325,38 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
     );
 }
 
-/// **E2 — the control.** The same model and data with the default inner budget
-/// converges, and the fix leaves it alone.
+/// **E2 — the feasible control, bounded** (#1617 review round 5).
 ///
-/// This is the other half of the differential pair, and it is the half that makes E1
-/// mean something: `no_feasible_eval_warning` keyed on anything coarser than the
-/// feasible-eval count — "the guard fired at all", say, which it does transiently on
-/// plenty of healthy fits — would demote this run too. The optimum is also measured
-/// here, so E1's assertion (3) is comparing the midpoint against a number this test
-/// shows the data actually chooses.
+/// The other half of the differential pair, and the half that makes E1 mean something:
+/// `no_feasible_eval_warning` keyed on anything coarser than the feasible-eval count — "the
+/// guard fired at all", say, which it does transiently on plenty of healthy fits — would
+/// demote this run too.
+///
+/// **Bounded on purpose.** The first version ran this to convergence at
+/// `outer_maxiter = 200` and asserted `converged`, which is a Tier-3 shape sitting in the
+/// always-run `--lib` suite: AGENTS.md reserves convergence fits for the `slow-tests` gate,
+/// and on a 2-subject fit whose ω is informed by two subjects the convergence *verdict* is
+/// the most trajectory-sensitive thing in the result — the kind of assertion that goes red
+/// for a reason unrelated to the guard logic it is meant to protect. `outer_maxiter = 4`
+/// gives it `4·(n+1) = 20` evaluations and it comes back `MaxEvalReached`, which is all this
+/// test needs. `a_healthy_fit_still_converges_to_its_optimum` keeps the convergence
+/// assertion, gated.
+///
+/// One bound covers both ways the fix could damage a feasible run, which is why it is a
+/// bound on the objective and not on θ: the midpoint the defect reported scores **24.578**
+/// and the initial estimates score **76.847**, so an objective below 24 proves the run
+/// neither reported the penalty's minimum nor got reverted to its start. Measured here:
+/// −8.876 at evaluation 20 (macOS arm64), ~33 units of headroom, so no platform's
+/// trajectory can reach the bound.
 #[test]
-fn a_fit_that_reaches_the_optimum_is_untouched() {
+fn a_feasible_fit_is_untouched() {
     let model = starvable_model();
     let pop = two_subjects();
-    let result = fit(&model, &pop, &model.default_params, &opts(200)).expect("fit");
+    let options = FitOptions {
+        outer_maxiter: 4,
+        ..opts(200)
+    };
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
     assert!(
         !result
@@ -349,30 +368,71 @@ fn a_fit_that_reaches_the_optimum_is_untouched() {
         result.warnings
     );
     assert!(
-        result.converged,
-        "the control arm must still converge (ofv = {}, theta = {:?})",
-        result.ofv, result.theta,
-    );
-    // The optimum, measured on this branch (macOS arm64; the numbers below are
-    // bounds, not digit-for-digit anchors, so the platform does not matter):
-    // ofv = −10.403144, theta = [1.0369668, 11.9827432], omega = [[0.0024070]].
-    // That is 35 OFV units below the 24.578 the defect reported, and θ nowhere near
-    // the midpoint — which is the whole reason the defect is a defect and not a
-    // cosmetic flag.
-    assert!(
-        result.ofv < 0.0,
-        "the converged objective must be the −10.4 optimum, not the 24.6 the midpoint \
-         scores; got {}",
+        result.ofv < 24.0,
+        "a feasible run must report an objective it actually descended to — below the \
+         24.578 the midpoint scores and the 76.847 the initial estimates score, either of \
+         which would mean the fix damaged a run it has no business touching; got {}",
         result.ofv
+    );
+    assert_eq!(
+        result.n_iterations, 20,
+        "this test is the *bounded* control: it must stop on its 4·(n+1) = 20-evaluation \
+         budget rather than run to convergence, which is `a_healthy_fit_still_converges_to_\
+         its_optimum`'s job behind the `slow-tests` gate. It made {} evaluations.",
+        result.n_iterations
     );
     for (i, mid) in BOUND_MIDPOINT.iter().enumerate() {
         assert!(
             (result.theta[i] - mid).abs() > 1e-3 * mid,
-            "the optimum must be distinct from the bound midpoint for E1's assertion (3) to \
-             discriminate; theta[{i}] = {} vs midpoint {mid}",
+            "a feasible run's estimates must be distinct from the bound midpoint, so E1's \
+             assertion (3) discriminates; theta[{i}] = {} vs midpoint {mid}",
             result.theta[i],
         );
     }
+}
+
+/// **E2b — Tier 3: a healthy fit still reaches its optimum and says so.**
+///
+/// The convergence half of E2, in the tier AGENTS.md puts convergence fits in. It is
+/// cheap (the same 2-subject closed form, ~36 evaluations) but it *is* a fit to
+/// convergence and it asserts the verdict, so it runs nightly via `slow-tests` and on
+/// pushes to `main` that touch estimation code rather than on every PR. E2 carries the
+/// per-PR half.
+///
+/// The optimum, measured on this branch at `8b8caf3c` (macOS arm64 — the numbers below are
+/// bounds, not digit anchors, per AGENTS.md's reference-platform rule):
+/// `ofv = −10.403143919119280`, `theta = [1.0369668486435517, 11.982743248520865]`,
+/// `omega = [[0.002407034368112816]]`. That is 35 OFV units below the 24.578 the defect
+/// reported — the whole reason #1617 is a defect and not a cosmetic flag.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_healthy_fit_still_converges_to_its_optimum() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let result = fit(&model, &pop, &model.default_params, &opts(200)).expect("fit");
+
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        "{:?}",
+        result.warnings
+    );
+    assert!(
+        result.converged,
+        "a fit that reaches its optimum must still report it (ofv = {}, theta = {:?})",
+        result.ofv, result.theta,
+    );
+    assert!(
+        result.ofv < 0.0,
+        "the converged objective is the −10.4 optimum, not the 24.6 the midpoint scores; \
+         got {}",
+        result.ofv
+    );
 }
 
 /// **E3 — a cancelled run is not reported as a defect, at the call site.**
