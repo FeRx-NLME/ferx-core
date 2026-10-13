@@ -334,7 +334,11 @@ pub fn read_nonmem_csv_with_covariates(
 /// table's column order matches the declaration), then each `extra` column not
 /// already present. Dedup is case-sensitive, matching the declared spelling.
 fn declared_union(decls: &[CovariateDecl], extra: &[String]) -> Vec<String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    union_exact(decls.iter().map(|d| d.name.clone()).collect(), extra)
+}
+
+/// `base` followed by each `extra` column not already in it (case-sensitive).
+fn union_exact(mut union: Vec<String>, extra: &[String]) -> Vec<String> {
     for c in extra {
         if !union.iter().any(|n| n == c) {
             union.push(c.clone());
@@ -726,7 +730,7 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
     path: &Path,
     routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, None, None, None, None, routing, &[]).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(path, None, &[], None, None, None, routing, &[]).map(|(pop, _)| pop)
 }
 
 /// The one reader every wrapper above delegates to: it builds the covariate
@@ -761,8 +765,11 @@ pub(crate) fn read_nonmem_csv_routed(
             augment_with_filter(&mut union, filter);
             Some(union)
         }
+        // An explicit list is read as list ∪ extras (#1936): a model-aware caller's
+        // extras are columns the model reads, which a narrower list must not drop.
         None => covariate_columns.map(|cols| {
-            let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            let base: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            let mut v = union_exact(base, extra_columns);
             augment_with_filter(&mut v, filter);
             v
         }),
@@ -773,6 +780,7 @@ pub(crate) fn read_nonmem_csv_routed(
     read_nonmem_csv_impl(
         path,
         cols_ref.as_deref(),
+        extra_columns,
         iov_column,
         decls,
         filter,
@@ -788,12 +796,18 @@ pub(crate) fn read_nonmem_csv_routed(
 /// undeclared covariates) are read into the [`Population`] leniently. `None` on
 /// both is the legacy auto-detect [`read_nonmem_csv`] path.
 ///
+/// `auto_extras`: on the auto-detect path (`covariate_columns = None`), columns
+/// the model reads that auto-detection would otherwise skip — a role column or
+/// the `iov_column` (#1936). Matched to headers exactly (case-sensitive), so a
+/// case-differing spelling stays unread rather than silently binding.
+///
 /// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
 /// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
 /// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
 fn read_nonmem_csv_impl(
     path: &Path,
     covariate_columns: Option<&[&str]>,
+    auto_extras: &[String],
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
@@ -921,7 +935,9 @@ fn read_nonmem_csv_impl(
         Some(cols) => cols.iter().map(|c| c.to_string()).collect(),
         None => headers
             .iter()
-            .filter(|h| !is_standard(h))
+            // Header order; a referenced role / `iov_column` header joins the
+            // set in place, so no column can appear twice (#1936).
+            .filter(|h| !is_standard(h) || auto_extras.iter().any(|e| e == *h))
             .cloned()
             .collect(),
     };

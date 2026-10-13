@@ -480,6 +480,6 @@ That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's 
 |---------|--------|------|
 | Diagonal IOV | `OMEGA BLOCK(n) SAME` with one kappa per block | `kappa NAME ~ variance` (Option A) |
 | Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |
-| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]` |
+| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]`; `OCC` can also be read in `[individual_parameters]` (`if (OCC == 2) …`), no `[covariates]` declaration needed |
 | Occasion from model | `IF(TIME.LT.24) OCC=1` logic in `$PK` | `iov_occasion = dose` or `time(...)` in `[fit_options]` |
 | Kappa in PK | `ETA(n)` with `SAME` block | `KAPPA_xxx` in `[individual_parameters]` |

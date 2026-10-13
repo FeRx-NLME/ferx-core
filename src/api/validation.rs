@@ -65,9 +65,11 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 ///
 /// Unresolved names that read as random effects get their own `E_ETA_NOT_DECLARED`
 /// diagnostic, pushed first so [`first_error`](crate::diagnostics::first_error) — which is what `fit()` reports —
-/// surfaces the actionable message instead of "covariate not found in data". The
-/// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
-/// historical `Err(String)` for the names that remain.
+/// surfaces the actionable message instead of "covariate not found in data". Of the
+/// names that remain, one that is an exact header of the file the population was
+/// read from gets its own `E_MISSING_COVARIATE` text — the column is in the data,
+/// the reader did not take it (#1936); every other name keeps the message text
+/// byte-for-byte identical to the historical `Err(String)`.
 ///
 /// "Carries" means the *predictor* can resolve the name, which is a slightly wider
 /// test than membership in `Population::covariate_names`. A CSV-read population
@@ -111,10 +113,53 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         );
     }
 
-    if plain.is_empty() {
-        return diags;
-    }
+    // A name that is an exact header of the file this population was read from is
+    // not missing from the data: the reader that built the population did not take
+    // it as a covariate. A model-aware read takes every column the model
+    // references (#1936), so this is reachable only from a model-free
+    // `read_nonmem_csv*` population handed to `fit()`. It gets its own message;
+    // the historical text below keeps every other name byte-for-byte. An in-memory
+    // population (`input_columns` empty) and a case-differing spelling stay there.
+    let (unread, plain): (Vec<&str>, Vec<&str>) = plain
+        .iter()
+        .partition(|n| population.input_columns.iter().any(|h| h == *n));
 
+    if !plain.is_empty() {
+        diags.push(missing_covariate_diagnostic(population, &plain));
+    }
+    if !unread.is_empty() {
+        diags.push(unread_column_diagnostic(&unread));
+    }
+    diags
+}
+
+/// `E_MISSING_COVARIATE` for columns the data has but the population's reader did
+/// not read as covariates (#1936). Never says "not found in data" (it was found),
+/// and never names `[covariates]`: the caller read the data without the model, so
+/// a model-file remedy would not reach the read that dropped the column.
+fn unread_column_diagnostic(unread: &[&str]) -> Diagnostic {
+    Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references column(s) that are in the data but were not read as \
+             covariates: {}. A read that does not know the model takes only the \
+             covariate columns it is given, or, auto-detecting, every column except the \
+             record columns (ID, TIME, DV, AMT, CMT, ...) and the `iov_column`. Read the \
+             data with the model (`read_population_with` / `read_population_for`), which \
+             reads every column the model references, or add the column(s) to \
+             `covariate_columns`.",
+            unread.join(", "),
+        ),
+    )
+    .with_suggestion(format!(
+        "read the data with `read_population_with`, or add {} to `covariate_columns`",
+        unread.join(", ")
+    ))
+}
+
+/// The historical `E_MISSING_COVARIATE`, byte-for-byte: `plain` are names the data
+/// does not have under that exact spelling.
+fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diagnostic {
     let available = if population.covariate_names.is_empty() {
         "(none)".to_string()
     } else {
@@ -151,20 +196,17 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
             },
         )
     };
-    diags.push(
-        Diagnostic::error(
-            "E_MISSING_COVARIATE",
-            format!(
-                "Model references covariate(s) not found in data (case-sensitive): {}. \
-                 Available covariate columns: {}.{}",
-                plain.join(", "),
-                available,
-                builtin_hint,
-            ),
-        )
-        .with_suggestion(format!("available covariate columns: {}", available)),
-    );
-    diags
+    Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references covariate(s) not found in data (case-sensitive): {}. \
+             Available covariate columns: {}.{}",
+            plain.join(", "),
+            available,
+            builtin_hint,
+        ),
+    )
+    .with_suggestion(format!("available covariate columns: {}", available))
 }
 
 /// Whether `population` carries the covariate `name` in the sense
