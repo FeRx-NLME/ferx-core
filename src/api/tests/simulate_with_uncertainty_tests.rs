@@ -907,6 +907,45 @@ const INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC: &str = "\
   DV ~ proportional(PROP)
 ";
 
+// 2-cpt IG, in-domain at the point estimate: k10 = k12 = 0.1, k21 = 0.05 → α ≈ 0.228 <
+// 1/(2·MAT·CV²) = 0.833. Twin-less through the inert `[scaling]` block.
+//
+// This is the **cross-cell** of the two wording predicates — IG *and* 2-cpt — and the only
+// fixture covering `PkModel::TwoCptIg` in `twinless_absorption_closed_form` (#1823 review
+// r6). Without it, dropping `TwoCptIg` from either that family list or the IG arm of
+// `absorption_flip_flop_wording` left the whole suite green: measured, both mutations
+// survived. The round-2 argument that three fixtures suffice because the two wording
+// predicates are independent was right about the *wording* and wrong about the family
+// predicate, which enumerates all four variants.
+const INDOMAIN_TWINLESS_IG_2CPT_SRC: &str = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  MAT = TVMAT
+  CV2 = TVCV2
+
+[structural_model]
+  pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
 /// #1485: every sentence of the skip warning, on all three families, with both sides of
 /// each wording gate asserted in the same test — transit vs IG (domain + ODE rewrite) and
 /// 1-cpt vs 2-cpt (the confluent-eigenvalue clause).
@@ -1857,21 +1896,42 @@ fn simulated_flip_flop_warning_wording_per_family() {
     let transit = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
     let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
     let transit2 = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC);
+    let ig2 = parse_fixture(INDOMAIN_TWINLESS_IG_2CPT_SRC);
+    // All four `PkModel` variants the family predicate enumerates, so dropping any one of
+    // them from it reddens here (#1823 review r6 — before `ig2` existed, dropping
+    // `TwoCptIg` left the suite green).
+    assert_eq!(
+        [
+            transit.pk_model,
+            ig.pk_model,
+            transit2.pk_model,
+            ig2.pk_model
+        ],
+        [
+            PkModel::OneCptTransit,
+            PkModel::OneCptIg,
+            PkModel::TwoCptTransit,
+            PkModel::TwoCptIg
+        ]
+    );
 
     // ω² chosen per family so each produces crossers: the IG abscissa sits at 0.833 (vs
-    // ke = 0.1) and the 2-cpt α at 0.4 (vs 0.285), so they need a wider draw than the
-    // 1-cpt transit fixture's 0.2-vs-0.125.
+    // ke = 0.1) and the 2-cpt α at 0.4 (vs 0.285) / 0.228 (vs 0.833), so they need a wider
+    // draw than the 1-cpt transit fixture's 0.2-vs-0.125.
     let (t1, t1_zeroed, _) = flip_flop_run(&transit, 0.09, 300, 7, None);
     let (ig1, ig1_zeroed, _) = flip_flop_run(&ig, 4.0, 300, 7, None);
     let (t2, t2_zeroed, _) = flip_flop_run(&transit2, 1.0, 300, 7, None);
+    let (ig2m, ig2_zeroed, _) = flip_flop_run(&ig2, 4.0, 300, 7, None);
     let t1 = t1.expect("transit crossers");
     let ig1 = ig1.expect("IG crossers");
     let t2 = t2.expect("2-cpt transit crossers");
+    let ig2m = ig2m.expect("2-cpt IG crossers");
 
     for (msg, zeroed, name) in [
         (&t1, t1_zeroed, "one_cpt_transit"),
         (&ig1, ig1_zeroed, "one_cpt_ig"),
         (&t2, t2_zeroed, "two_cpt_transit"),
+        (&ig2m, ig2_zeroed, "two_cpt_ig"),
     ] {
         // Sentence 1 — the count, the cause, and the consequence for `ipred`.
         assert!(
@@ -1917,22 +1977,27 @@ fn simulated_flip_flop_warning_wording_per_family() {
         assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
         assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
     }
-    // Transit vs IG: the domain bound and the ODE rewrite.
+    // Transit vs IG: the domain bound and the ODE rewrite, on both compartment counts.
     for m in [&t1, &t2] {
         assert!(m.contains("transit rate KTR = (n+1)/mtt"), "{m}");
         assert!(m.contains("explicit ODE `transit()` model"), "{m}");
         assert!(!m.contains("igd()") && !m.contains("MAT"), "{m}");
     }
-    assert!(ig1.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{ig1}");
-    assert!(ig1.contains("explicit ODE `igd()` model"), "{ig1}");
-    assert!(!ig1.contains("KTR") && !ig1.contains("transit()"), "{ig1}");
-    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge.
-    assert!(
-        t2.contains("or with coincident disposition eigenvalues"),
-        "{t2}"
-    );
-    assert!(!t1.contains("coincident"), "{t1}");
-    assert!(!ig1.contains("coincident"), "{ig1}");
+    for m in [&ig1, &ig2m] {
+        assert!(m.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{m}");
+        assert!(m.contains("explicit ODE `igd()` model"), "{m}");
+        assert!(!m.contains("KTR") && !m.contains("transit()"), "{m}");
+    }
+    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge — on both families.
+    for m in [&t2, &ig2m] {
+        assert!(
+            m.contains("or with coincident disposition eigenvalues"),
+            "{m}"
+        );
+    }
+    for m in [&t1, &ig1] {
+        assert!(!m.contains("coincident"), "{m}");
+    }
 }
 
 /// #1823: on a model whose ODE twin was built and then declined (#1008) the tally carries

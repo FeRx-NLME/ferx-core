@@ -1567,12 +1567,18 @@ pub struct SimulationResult {
 /// #1645 its diagnostics — including a skipped flip-flop draw (#786) — come back on
 /// [`simulate_with_uncertainty_diag`]'s `warnings`.
 ///
-/// Since #1823 both `_diag` forms also carry one `W_SIMULATED_FLIP_FLOP` count of the dosed
+/// Since #1823 both `_diag` forms also carry one `W_SIMULATED_FLIP_FLOP` count of the
 /// simulated individuals whose *sampled* η entered a twin-less transit / IG closed form's
 /// flip-flop regime, where it clamps: none of that individual's rows carries any
 /// contribution from the doses its subject was given. (*Undosed*, not drug-free — an
-/// `[initial_conditions]` baseline is itself drug and survives the clamp.) Those rows are returned either way — the count is the only thing that
-/// says they are degenerate, which is why the row-only entry points cannot report it.
+/// `[initial_conditions]` baseline is itself drug and survives the clamp.) Those rows are
+/// returned either way — the count is the only thing that says they are degenerate, which
+/// is why the row-only entry points cannot report it.
+///
+/// Its denominator is the individuals whose subject carries a dose of positive amount
+/// **strictly before one of its observations**, not every dosed individual: without that,
+/// no returned row could have carried the dose whether the closed form clamped or not, so
+/// an ODE rewrite would produce the same rows. The message states that eligibility.
 /// **Searching the rows for `ipred == 0.0` is not an alternative**: four things run on the
 /// closed form's output after the clamp (an `[initial_conditions]` baseline, a Form-C
 /// `[scaling] y = <expr>` readout, the LTBS log transform, the FREM row override), and

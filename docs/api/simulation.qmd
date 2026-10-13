@@ -399,15 +399,16 @@ readouts make the point: measured at ω²~CL~ = 0.09 / n_sim = 300 / seed 7, the
 same 27 clamped individuals give **27** zero rows under `y = central/V` and
 **0** under `y = central/V + 2.5`.
 
-So the warning does not say what the rows contain — it says the drug contributes
-nothing to them, and that **searching the output for a zero row will not
-reliably find them**. The count is the reliable channel. Measured on an
+So the warning does not say what the rows contain — it says nothing from the
+subject's doses reaches them (they are *undosed*, not drug-free: the baseline in
+the second row of the table above is itself drug), and that **searching the
+output for a zero row will not reliably find them**. The count is the reliable channel. Measured on an
 `[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero
 row between them.
 
 An individual is not counted at all unless its subject carries a dose of positive
 amount **strictly before one of its observations**: without that, no returned row
-could have carried the drug either way, so nothing was lost and an ODE rewrite
+could have carried the dose either way, so nothing was lost and an ODE rewrite
 would produce the same rows. The count's denominator is those eligible individuals,
 and the warning says so rather than claiming every dosed individual is counted.
 
