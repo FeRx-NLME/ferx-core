@@ -3840,7 +3840,8 @@ fn pk_slot_rows_hold_their_invariants_on_every_slot_source() {
         ),
         (
             // Review r2 #4: `D1` is bound to the `cl` role *and* carries a
-            // modeled-duration slot, so it owns two rows.
+            // modeled-duration slot, so it owns two rows. The exact rows are
+            // asserted in `pk_slot_rows_give_one_name_both_of_its_slots`.
             "role plus modeled dose on one name",
             "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
              omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
@@ -3921,4 +3922,43 @@ fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
         Some(cl),
         "PK_IDX_CL must resolve to CL, not to D1"
     );
+}
+
+/// Review r3 #1: the exact rows for a name that owns **two** PK slots. The generic
+/// invariants (one row per slot, indices in range, bounded by the program's pairs)
+/// are all satisfied by a `pk_slot_rows` deduplicated by name, which would silently
+/// drop one of the two — so the shape needs its row list pinned, not just its
+/// invariants.
+///
+/// `pk two_cpt_iv(cl=D1, …)` alongside `D1 = …` parses because the modeled-dose
+/// mapping is not a `pk(...)` role and the #1359 one-variable-two-roles reject does
+/// not see it. The derivative that depends on both rows is asserted against FD in
+/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`.
+#[test]
+fn pk_slot_rows_give_one_name_both_of_its_slots() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    assert_eq!(m.indiv_param_names, vec!["D1".to_string(), "V".to_string()]);
+    // `pk_indices` keeps one entry per name and drops the modeled slot entirely,
+    // which is why it cannot answer this question either way.
+    assert_eq!(m.pk_indices, vec![PK_IDX_CL, PK_IDX_V]);
+    let mut rows = m.pk_slot_rows();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (9, 0)],
+        "D1 (name index 0) must own both CL's slot and its modeled-duration slot"
+    );
+    // Three rows for two names: the inequality review r2 #4 disproved.
+    assert!(rows.len() > m.pk_indices.len());
+    // The reverse lookup still answers each slot with the one name that owns it.
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_CL), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(9), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
 }

@@ -1205,6 +1205,101 @@ mod tests {
         }
     }
 
+    /// Characterization of #1930 (review r3 #2), the first of the two shapes
+    /// `docs/model-file/fit-options.qmd` now names as *not* covered by step 1: a
+    /// PK role bound to a **literal**. No individual parameter owns the slot, so
+    /// layers 1 and 2 are skipped and layer 3 searches every θ for the canonical
+    /// slot name as a substring — here `THCL_A`, a readout coefficient, because it
+    /// contains `CL`. The clearance is a literal in this model, so the correct
+    /// answer is `None`: there is nothing to estimate.
+    ///
+    /// Pins today's answer so the docs sentence describing it can die. Invert when
+    /// #1930 is fixed.
+    #[test]
+    fn nca_resolves_a_literal_bound_role_by_canonical_name() {
+        let src = "[parameters]\n  theta THCL_A(0.5, 0.0, 5.0)\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+             omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n  \
+             BASE = THCL_A\n\
+             [structural_model]\n  pk one_cpt_oral(cl=1.0, v=V, ka=KA)\n\
+             [scaling]\n  y = central / V + BASE\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // The premise: no individual parameter owns CL's slot, because a literal
+        // binds the role. This is also #1899's own lookup answering correctly —
+        // `None` rather than some unrelated name's index.
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_CL),
+            None,
+            "a literal-bound role owns no individual parameter"
+        );
+        let cl = find_theta_for_slot(&m, PK_IDX_CL);
+        assert_eq!(
+            cl.map(|i| m.default_params.theta_names[i].as_str()),
+            Some("THCL_A"),
+            "#1930: layer 3 matches `THCL_A` because it contains `CL`. When this \
+             starts failing (ideally returning None), #1930 has been fixed — update \
+             docs/model-file/fit-options.qmd with it."
+        );
+        // The slots that do have owners are unaffected.
+        let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+        assert_eq!(m.default_params.theta_names[v], "TVV");
+    }
+
+    /// Characterization of #1930 (review r3 #2), second shape: the mu-reference
+    /// match is **not checked for uniqueness**. Layer 1 iterates `model.mu_refs`,
+    /// a `HashMap`, and takes the first η whose name qualifies, so when two η names
+    /// both end in `_CL` the winner depends on hash-seed order and **changes
+    /// between processes** — measured 10/10 over 20 launches, alternating between
+    /// `TVCL` (the real clearance θ) and `THS` (an unbound intermediate's).
+    ///
+    /// Asserted as set membership, not as a value: pinning either outcome would be
+    /// a flaky test, and that it *has* two outcomes is the defect. What is asserted
+    /// firmly is the premise — that two η names qualify — so a fix that makes the
+    /// lookup deterministic will have to come back here.
+    #[test]
+    fn nca_mu_ref_match_is_ambiguous_when_two_eta_names_qualify() {
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
+             theta THS(3.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+             omega IIV_CL ~ 0.25\n  omega ETA_V ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA\n  S = THS * exp(IIV_CL)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // #1899's lookup is exact and unaffected: CL's slot is owned by `CL`, not by
+        // the unbound `S`, in either hash order.
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_CL), Some(cl_pos));
+        // The premise: two eta names satisfy layer 1's `_CL` rule.
+        let qualifying: Vec<&String> = m
+            .mu_refs
+            .keys()
+            .filter(|e| {
+                let u = e.to_ascii_uppercase();
+                u == "CL" || u.ends_with("_CL")
+            })
+            .collect();
+        assert_eq!(
+            qualifying.len(),
+            2,
+            "both ETA_CL and IIV_CL must qualify, or the ambiguity is not present: \
+             {qualifying:?}"
+        );
+        // #1930: which one wins is hash-seed order, so only membership is asserted.
+        let got = find_theta_for_slot(&m, PK_IDX_CL)
+            .map(|i| m.default_params.theta_names[i].clone())
+            .expect("a theta");
+        assert!(
+            got == "TVCL" || got == "THS",
+            "#1930: layer 1 returns one of the two qualifying etas' thetas, \
+             non-reproducibly; got {got}"
+        );
+    }
+
     /// `docs/model-file/fit-options.qmd` offers two workarounds for the #1922
     /// collision and names a second η spelling that resolves. Each is a claim a
     /// reader will act on, so each gets an assertion:
