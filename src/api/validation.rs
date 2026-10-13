@@ -3597,9 +3597,10 @@ pub(crate) fn check_survival_tv_covariates(
 /// survival term it was written for.
 ///
 /// Until a per-record disposition reaches the hazard pass (#1920), refuse rather than
-/// silently mis-fit. **The refusal is exact per parameter, and per endpoint**: it fires
-/// only where freezing that parameter can actually move that accumulator, which rules out
-/// two shapes a syntactic "does the RHS mention it" would have refused —
+/// silently mis-fit. **The granularity is per parameter and per endpoint** — not per
+/// block, and not per model — so the refusal fires only where freezing *that* parameter
+/// can reach *that* accumulator, which rules out two shapes a "does the RHS mention it"
+/// test would have refused —
 ///
 /// * a quantity the hazard pass already reads at each dose record (`MTT`, `ALAG1`,
 ///   `F`, `D{n}`/`R{n}`, …; #1575), and
@@ -3611,7 +3612,14 @@ pub(crate) fn check_survival_tv_covariates(
 /// lives; `tests/one_snapshot_dose_reads_survival.rs` is the #1575 fixture that must stay
 /// fittable.
 ///
-/// **One documented over-refusal remains (#1931):** both analyses are flow-insensitive
+/// **Both halves are structural, not value-based**, which is where the remaining
+/// over-refusals live: a parameter whose `TIME` term cancels (`CL = TVCL + 0.0 * TIME`)
+/// reads `TIME` as far as the mask is concerned, and the slice follows a read whether or
+/// not the value it carries matters. Deciding either would mean constant-folding the
+/// program, and the direction of the error is a loud refusal whose remedy — delete the
+/// term — is right for the model anyway.
+///
+/// **One more documented over-refusal (#1931):** both analyses are flow-insensitive
 /// with respect to *kills*, so a `TIME`-dependent definition that a later unconditional
 /// assignment discards is still followed, and a model carrying such a dead store is
 /// refused although its effective `$PK` is time-free. The direction is the safe one — a
@@ -3677,9 +3685,24 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     // `pub` too, so a hand-assembled or hand-edited model can present a working
     // `pk_param_fn` and `[odes]` RHS with the metadata stripped — and would have kept the
     // silent freeze this check exists to stop. A `.ferx` file cannot reach either arm.
+    //
+    // What this cannot defend against is metadata that is *present but stale* — a
+    // `pk_param_fn`, `OdeSpec::rhs` or `init_fn` replaced while the parser's snapshot of
+    // the same program is kept. That is the crate's standing invariant, not this check's:
+    // the snapshots exist because `sens/` evaluates them over `Dual2` as the exact
+    // derivative of those very closures (the `*_g_dual_matches_fd` parity tests are the
+    // statement of it), so a model whose snapshot and closure disagree has a wrong
+    // gradient before it has a wrong refusal. No check can compare a closure against a
+    // program; the parser builds them together, which is the only reason either is
+    // trustworthy.
     let unanalysable = |what: &str, how: &str| -> Option<String> {
         Some(format!(
-            "[event_model] on CMT={first_cmt}: this model carries an ODE-accumulated              (joint PK-TTE) hazard, whose pass integrates the individual parameters frozen              at their TIME=0 values, but it has no {what}, so whether that freeze applies              cannot be determined (#1853). Every model parsed from a `.ferx` file carries              one; a `CompiledModel` assembled or edited by hand may not. Build it through              `parse_model_string` / `parse_model_file`{how}."
+            "[event_model] on CMT={first_cmt}: this model carries an ODE-accumulated \
+             (joint PK-TTE) hazard, whose pass integrates the individual parameters \
+             frozen at their TIME=0 values, but it has no {what}, so whether that freeze \
+             applies cannot be determined (#1853). Every model parsed from a `.ferx` file \
+             carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
+             through `parse_model_string` / `parse_model_file`{how}."
         ))
     };
     let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
@@ -3690,7 +3713,7 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     };
     let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
         return unanalysable(
-            "compiled `[individual_parameters]` program              (`CompiledModel::indiv_param_partials`)",
+            "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
             " rather than replacing that field with `IndivParamPartials::empty()`",
         );
     };

@@ -366,7 +366,7 @@ the [odes] RHS reads it. ...
 ```
 
 The refusal is narrow in three ways, so what it stops is a model whose two halves can
-genuinely disagree:
+disagree — narrow by *structure*, not by value (see the caveats below it):
 
 - a `TIME` read that stays inside the `[odes]` **RHS** — `d/dt(central) = … · (1 + K · TIME)`,
   or a Weibull / Gompertz baseline hazard — is fine: the integrator resolves `TIME` at
@@ -380,10 +380,12 @@ genuinely disagree:
   lands in it. On a competing-risks model the error names the endpoint whose own hazard is
   affected.
 
-One case is still refused that need not be: a `TIME`-dependent definition that a later
-line overwrites before anything reads it is followed anyway
-([#1931](https://github.com/FeRx-NLME/ferx-core/issues/1931)) — delete the dead line, which
-is what the model already means.
+Two cases are still refused that need not be, both because the test is structural rather
+than value-based. A `TIME`-dependent definition that a later line overwrites before
+anything reads it is followed anyway
+([#1931](https://github.com/FeRx-NLME/ferx-core/issues/1931)); and a `TIME` term that
+cancels — `CL = TVCL + 0.0 * TIME` — counts as a `TIME` read. In both the remedy is to
+delete the line or the term, which is what the model already means.
 
 Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for
 now; a per-record disposition for the hazard pass is tracked in

@@ -26025,8 +26025,12 @@ impl OdeRhsProgram {
     ///
     /// * seed `chz_slot` itself;
     /// * a statement writing a slot already in the slice puts everything it reads in;
-    /// * an `if` whose body writes a slot in the slice puts **every one of its
-    ///   conditions'** reads in, since they decide whether that write happens;
+    /// * an `if` whose branch `k` writes a slot in the slice puts the reads of
+    ///   conditions **`0..=k`** in — and of no later one — since branch `k` runs exactly
+    ///   when those decided it should; a needed `else` takes the whole prefix. Adding
+    ///   every condition instead over-refuses a `TIME`-reading condition that governs
+    ///   only a sibling arm the hazard never sees, and adding the needed arm's own
+    ///   condition alone under-approximates the other way (round-2 review of PR #1924);
     /// * a name-based `Statement::Assign` / `DiffEq` — which the resolved program does
     ///   not contain — puts *every* slot in, so an unresolved snapshot degrades to the
     ///   syntactic answer rather than to a false accept.

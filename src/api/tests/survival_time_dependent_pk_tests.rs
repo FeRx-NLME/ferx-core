@@ -82,6 +82,30 @@ const TIME_FREE_IP: &str = "  CL   = TVCL * exp(ETA_CL)\n  \
                             H0   = TVH0\n  \
                             BETA = TVBETA\n";
 
+/// Every message this check produces, rendered and checked for shape rather than content.
+///
+/// A multi-line `format!` whose continuations are mis-escaped renders with runs of literal
+/// whitespace where the line breaks were — 42 of them in the fail-closed arm as first
+/// written (round-4 review of PR #1924) — and a `contains` assertion on a fragment that
+/// happens to sit inside one line cannot see it. This is the assertion that can: no run of
+/// two spaces, no newline, no tab, and a length a terminal can print.
+fn assert_message_is_well_formed(label: &str, msg: &str) {
+    assert!(
+        !msg.contains("  "),
+        "{label}: the rendered message has a run of literal whitespace — a mis-escaped \
+         `format!` continuation: {msg:?}"
+    );
+    assert!(
+        !msg.contains('\n') && !msg.contains('\t'),
+        "{label}: the rendered message must be one line: {msg:?}"
+    );
+    assert!(
+        (80..=900).contains(&msg.len()),
+        "{label}: message length {} is outside the 80..=900 a diagnostic should sit in",
+        msg.len()
+    );
+}
+
 /// A `TIME`-dependent **disposition** parameter the `[odes]` RHS reads is refused, and
 /// the message names the parameter, the endpoint, the site and the remedy.
 ///
@@ -100,6 +124,7 @@ fn a_time_dependent_disposition_on_an_ode_hazard_is_refused() {
     );
     let msg = check_survival_time_dependent_pk(&model)
         .expect("a TIME-dependent CL on an ODE-accumulated hazard must be refused");
+    assert_message_is_well_formed("the disposition refusal", &msg);
     for want in [
         "CMT=3",
         "frozen at their TIME=0 values",
@@ -131,6 +156,7 @@ fn a_time_dependent_init_seed_on_an_ode_hazard_is_refused() {
     );
     let msg = check_survival_time_dependent_pk(&model)
         .expect("a TIME-dependent init(...) seed must be refused");
+    assert_message_is_well_formed("the init-seed refusal", &msg);
     assert!(
         msg.contains("`BASE` reads the `TIME` built-in and an [odes] init(...) seed reads it"),
         "the message must name the init site: {msg}"
@@ -153,6 +179,7 @@ fn a_parameter_read_by_both_the_rhs_and_the_init_names_both() {
     );
     let msg = check_survival_time_dependent_pk(&model)
         .expect("a TIME-dependent CL read by both sites must be refused");
+    assert_message_is_well_formed("the both-sites refusal", &msg);
     assert!(
         msg.contains(
             "`CL` reads the `TIME` built-in and the [odes] RHS and an init(...) seed read it"
@@ -537,6 +564,7 @@ fn missing_analysis_metadata_is_refused_rather_than_passed() {
     no_ip.indiv_param_partials = IndivParamPartials::empty();
     let msg = check_survival_time_dependent_pk(&no_ip)
         .expect("a model with no [individual_parameters] program must not be passed");
+    assert_message_is_well_formed("the missing-$PK-program refusal", &msg);
     for want in [
         "CMT=3",
         "no compiled `[individual_parameters]` program",
@@ -550,6 +578,7 @@ fn missing_analysis_metadata_is_refused_rather_than_passed() {
     no_rhs.ode_spec.as_mut().expect("ODE model").rhs_program = None;
     let msg = check_survival_time_dependent_pk(&no_rhs)
         .expect("a model with no compiled [odes] program must not be passed");
+    assert_message_is_well_formed("the missing-[odes]-program refusal", &msg);
     for want in [
         "CMT=3",
         "no compiled `[odes]` program",
@@ -584,9 +613,15 @@ fn missing_analysis_metadata_is_refused_rather_than_passed() {
 /// accepted or refused for the real reason — that is what keeps this from being a test
 /// that passes because everything is refused.
 ///
-/// The error direction is the safe one: a loud over-refusal whose remedy (delete the dead
-/// line) is right for the model anyway, rather than a silent freeze. When #1931 lands,
-/// the two `assert!(… .is_some())` below become `assert_eq!(…, None)`.
+/// A third arm covers the sibling imprecision — a `TIME` term that **cancels**
+/// (`+ 0.0 * TIME`) is a `TIME` read to a structural test — which is not #1931: no
+/// definition is killed there, the value simply does not depend on `TIME`, and deciding it
+/// would mean constant-folding the program.
+///
+/// The error direction is the safe one in all three: a loud over-refusal whose remedy
+/// (delete the dead line, or the cancelling term) is right for the model anyway, rather
+/// than a silent freeze. When #1931 lands, its two `assert!(… .is_some())` below become
+/// `assert_eq!(…, None)`; the cancelling arm stays as it is.
 #[test]
 fn the_time_mask_and_the_slice_ignore_a_killed_definition() {
     // `[individual_parameters]`: `CL`'s TIME-dependent definition is overwritten.
@@ -609,6 +644,22 @@ fn the_time_mask_and_the_slice_ignore_a_killed_definition() {
         None,
         "the same model without the dead line must be accepted, or the arm above is \
          refusing for some other reason"
+    );
+
+    // A `TIME` term that cancels is a `TIME` read to a structural test. Same direction,
+    // same remedy (delete the term), and it is *not* #1931 — no definition is killed here,
+    // the value simply does not depend on `TIME` (round-4 review of PR #1924).
+    let cancelling = joint_model(
+        "  CL   = TVCL * exp(ETA_CL) + 0.0 * TIME\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        PLAIN_ODES,
+    );
+    assert!(
+        check_survival_time_dependent_pk(&cancelling).is_some(),
+        "a cancelling TIME term is still a TIME read: the test is structural, not value-based"
     );
 
     // `[odes]`: `KEFF`'s read of the TIME-dependent `CL` is overwritten before use.
