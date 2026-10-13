@@ -2149,8 +2149,8 @@ fn build_iov_sources(
     let combined_for = |k: usize| layout.combined_effect(stacked_eta, k);
     // A pk-only row runs under its own occasion's group (`crate::pk::pk_only_row_occasion`,
     // #1876), like production `predict_iov`. A labelled row always has one, since
-    // `iov_occasion_groups` covers pk-only occasions. One whose occasion has no group (an
-    // in-memory row with no label, whose fallback finds a reset-only occasion or none) gets
+    // `iov_occasion_groups` covers pk-only occasions, and so does every record an unlabelled
+    // row's fallback scan reads. One with no group (no labelled record at all) gets
     // the BSV-only effect `[η_bsv, κ = 0]` with its κ derivatives dropped from the stacked
     // axes (group `None` below), so the prediction holds κ fixed at 0 there. That κ = 0
     // vector is single-sourced with the ODE IOV provider via the shared helper (#598

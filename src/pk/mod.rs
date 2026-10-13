@@ -968,9 +968,10 @@ pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
 /// rather than κ = 0. `None` only for a subject with no labelled record at all.
 ///
 /// The row's own label always has a κ slot: `iov_occasion_groups` gives an occasion that
-/// only pk-only rows carry a group of its own. A miss is left only to the fallback scan,
-/// which can land on a reset-only occasion, and every caller maps it, like `None`, to
-/// κ = 0.
+/// only pk-only rows carry a group of its own. So does every record the fallback scan
+/// reads (a reset is not one of them), so the row has no group only when the scan finds
+/// no labelled record at all — a subject with no κ group, where every caller's κ = 0 is
+/// the only value there is.
 pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
     if let Some(&occ) = subject.pk_only_occasions.get(m) {
         return Some(occ);
@@ -979,9 +980,9 @@ pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
 }
 
 /// The κ group of pk-only row `m` ([`pk_only_row_occasion`] through `occ_to_k`), as the
-/// `sens/` providers seed it. `None` is the κ = 0 row: no resolvable occasion, or a
-/// fallback occasion with no group, which is where production's `combined_for` lands on
-/// a miss.
+/// `sens/` providers seed it. `None` is the κ = 0 row, where production's `combined_for`
+/// lands on a miss. For `occ_to_k` built from `iov_occasion_groups` that is only a
+/// subject with no labelled record, and so no group to miss.
 pub(crate) fn pk_only_row_group(
     subject: &Subject,
     m: usize,
@@ -1377,7 +1378,7 @@ pub(crate) fn compute_event_pk_params_iov(
 /// for the k-th occasion group in `iov_occasion_groups` order, including dose-only
 /// and pk-only-only occasions. A pk-only row (`EVID=2`, or `EVID=0` with `MDV=1`) runs
 /// under its own occasion, or the record before it when unlabelled; zero kappa only
-/// when that fallback occasion has no group (#1876, `pk_only_row_occasion`).
+/// when no record carries a label (#1876, `pk_only_row_occasion`).
 ///
 /// Every `PkModel` variant has event-driven analytical support and every ODE
 /// model takes the ODE path, so the dispatch below is total; an unsupported

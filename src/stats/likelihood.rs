@@ -2851,8 +2851,8 @@ pub fn iov_combined_effect(
 /// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
 /// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
 /// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
-/// for one whose occasion has none, which only an unlabelled in-memory row's fallback can
-/// reach (matching production `predict_iov`'s
+/// for one with no resolvable occasion, an unlabelled in-memory row on a subject where no
+/// record carries a label (matching production `predict_iov`'s
 /// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
 /// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
 /// review).
