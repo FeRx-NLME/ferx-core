@@ -8331,7 +8331,9 @@ mod absorption {
     /// bases first (the dense part double-counts their directions: residuals
     /// differ); a probe not projected against its subject's basis (residuals
     /// differ); every column dense (the count of population-wide vectors
-    /// fails).
+    /// fails); a multi-subject column's remnant kept whenever it is nonzero,
+    /// not judged against the original column's norm (the in-span column of
+    /// the second fixture becomes a direction, review r2 R2-1).
     #[test]
     fn the_block_basis_spans_what_a_dense_basis_spans() {
         let lens = [2usize, 3, 2];
@@ -8381,6 +8383,48 @@ mod absorption {
         }
         assert!(basis.residual(&vec![(0, vec![2.0, 4.0])]).unwrap() < 1e-12);
         assert!(basis.residual(&vec![(2, vec![1.0, 0.0])]).unwrap() > 1e-3);
+
+        // Review r2, R2-1: a multi-subject column inside the per-subject span
+        // leaves only rounding after the local projection; judged against its
+        // own norm that remnant became a unit vector and shrank every residual
+        // (0.35× the true one, measured). It must add no direction.
+        let lens = [3usize, 3];
+        let offsets = [0usize, 3];
+        let a = vec![0.3, -1.1, 0.7];
+        let b = vec![1.3, 0.2, -0.9];
+        let inside: Pieces = vec![
+            (0, a.iter().map(|x| 0.1 * x).collect()),
+            (1, b.iter().map(|x| 0.7 * x).collect()),
+        ];
+        let cols = vec![vec![(0, a.clone())], vec![(1, b.clone())], inside];
+        let basis = BlockBasis::new(&cols, &lens, &offsets);
+        assert_eq!(
+            basis.dense.len(),
+            0,
+            "a column in the local span adds nothing"
+        );
+        for k in 0..400 {
+            let x = k as f64;
+            let z: Pieces = vec![
+                (0, vec![(0.37 * x).sin(), (1.1 * x).cos(), 0.3]),
+                (1, vec![0.2, (0.7 * x).sin(), (0.13 * x).cos()]),
+            ];
+            let mut r = vec![0.0; 6];
+            for (s, piece) in &z {
+                r[offsets[*s]..offsets[*s] + 3].copy_from_slice(piece);
+            }
+            let n = dot(&r, &r).sqrt();
+            let mut d0 = r[..3].to_vec();
+            project_out(&mut d0, &orthonormal_basis(&[a.clone()]));
+            let mut d1 = r[3..].to_vec();
+            project_out(&mut d1, &orthonormal_basis(&[b.clone()]));
+            let want = (dot(&d0, &d0) + dot(&d1, &d1)).sqrt() / n;
+            let got = basis.residual(&z).unwrap();
+            assert!(
+                got.is_finite() && (got - want).abs() < 1e-12,
+                "probe {k}: {got} vs {want}"
+            );
+        }
     }
 
     /// B4. The span residual on synthetic columns: a multiple of a column is in

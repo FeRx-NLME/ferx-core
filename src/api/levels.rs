@@ -2129,22 +2129,33 @@ impl BlockBasis {
             singles[col[0].0].push(col[0].1.clone());
         }
         let local: Vec<Vec<Vec<f64>>> = singles.iter().map(|c| orthonormal_basis(c)).collect();
-        let multis: Vec<Vec<f64>> = cols
-            .iter()
-            .filter(|c| c.len() > 1)
-            .map(|col| {
-                let mut v = vec![0.0; n_rows];
-                for (s, piece) in col {
-                    let mut piece = piece.clone();
-                    project_out(&mut piece, &local[*s]);
-                    v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(&piece);
-                }
-                v
-            })
-            .collect();
+        // Each multi-subject column, projected against the local bases and the
+        // dense part so far, adds a direction only when what is left is not
+        // rounding of the *original* column — the test `orthonormal_basis`
+        // applies on a dense column. Judged against the remnant's own norm, a
+        // column inside the local span would turn ~1e-17 of rounding into a
+        // unit vector and shrink every residual (#1961 review r2, R2-1).
+        let mut dense: Vec<Vec<f64>> = Vec::new();
+        for col in cols.iter().filter(|c| c.len() > 1) {
+            let c_norm = col.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+            if c_norm == 0.0 || !c_norm.is_finite() {
+                continue;
+            }
+            let mut v = vec![0.0; n_rows];
+            for (s, piece) in col {
+                let mut piece = piece.clone();
+                project_out(&mut piece, &local[*s]);
+                v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(&piece);
+            }
+            project_out(&mut v, &dense);
+            let n = dot(&v, &v).sqrt();
+            if n > 1e-12 * c_norm {
+                dense.push(v.into_iter().map(|x| x / n).collect());
+            }
+        }
         BlockBasis {
             local,
-            dense: orthonormal_basis(&multis),
+            dense,
             offsets: offsets.to_vec(),
             n_rows,
         }
