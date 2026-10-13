@@ -431,6 +431,12 @@ When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption 
 
 The warning used to add "SDE process noise may also help" on ODE models. It no longer does: the Kalman filter behind `[diffusion]` propagates the state covariance but never corrects the state mean with the observed data, so it inflates the observation variance instead of supplying the dynamics the statistic is reporting — see [what the filter does not do](model-file/diffusion.qmd#what-the-filter-does-not-do).
 
+Under a [`correlation` line](model-file/residual-correlation.qmd#diagnostics) both
+statistics are taken on each subject's residuals **decorrelated by the fitted
+residual covariance** (`L⁻¹(y − IPRED)`), not on IWRES: IWRES of a correlated model
+are correlated by construction, so they would report the correlation the line
+models. The `IWRES` column itself is unchanged.
+
 ### Covariance Status
 
 `covariance_status: CovarianceStatus` takes one of three values:

@@ -136,6 +136,27 @@ it.
 - A `factor()` effect on the visit absorbs mean structure, not residual
   dependence; it is not a substitute.
 
+## Diagnostics
+
+The pooled Durbin–Watson statistic and lag-1 correlation (`dw_statistic`,
+`iwres_lag1_r`) are taken on each subject's residuals decorrelated by the fitted
+`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`. Under the model these are independent, so a
+value outside `[1.5, 2.5]` reports dependence the line does **not** explain. On the
+naproxen data at NONMEM's optima:
+
+| | raw IWRES | decorrelated |
+|---|---|---|
+| `cs` | 0.99 | 1.43 — warns, with the `ar1` advice |
+| `ar1` | 0.94 | 1.69 — silent |
+
+Compound symmetry correlates every two visits of an arm equally, and what is left
+is the decay with distance that `ar1` carries. The `IWRES` column is unchanged
+(per-row standardised).
+
+A `by` column that no model expression reads is a required data column but is not
+listed in the "used in model expressions but not declared in `[covariates]`"
+warning: its type changes nothing.
+
 ## Simulation
 
 `simulate()` and the NPDE reference simulation draw the residual vector of a

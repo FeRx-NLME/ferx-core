@@ -278,6 +278,48 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
 /// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
 /// against a truth of 1.0. The hint returns with the mean update.
+/// [`dw_autocorrelation_warning`] for a model with a `correlation` line (#1081),
+/// where `dw` is taken on the residuals decorrelated by the fitted `R`
+/// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
+/// line does **not** explain, so the advice is about the line first: under `cs`
+/// every pair of a block correlates equally, and serial dependence that decays with
+/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima:
+/// `cs` leaves DW 1.43, `ar1` 1.69).
+pub(crate) fn dw_autocorrelation_warning_decorrelated(
+    dw: f64,
+    line: &str,
+    kind: crate::types::ResidualSerialKind,
+) -> Option<String> {
+    if !dw.is_finite() {
+        return None;
+    }
+    let what = format!("in the residuals decorrelated by `{line}` (Durbin-Watson = {dw:.2})");
+    if dw < 1.5 {
+        let advice = match kind {
+            crate::types::ResidualSerialKind::Cs => {
+                " Compound symmetry correlates every two rows of a block equally; if the \
+                 dependence decays with the distance between visits, `ar1` models that. \
+                 Otherwise the structural model may be missing dynamics."
+            }
+            crate::types::ResidualSerialKind::Ar1 => {
+                " The structural model may be missing dynamics, or the grouping may not \
+                 cover the rows that are dependent."
+            }
+        };
+        Some(format!(
+            "Positive autocorrelation remains {what}: the within-group correlation does \
+             not explain it.{advice}"
+        ))
+    } else if dw > 2.5 {
+        Some(format!(
+            "Negative autocorrelation {what}. The residual correlation may be \
+             over-estimated, or the error model misspecified."
+        ))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn dw_autocorrelation_warning(dw: f64) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -2837,7 +2879,18 @@ fn fit_inner(
         native_warnings.push(entry);
     }
 
-    let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
+    // Under a `correlation` line the raw IWRES are correlated by construction; the
+    // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
+    let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
+        crate::stats::residual_error::whitened_residual_autocorrelation(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        )
+    } else {
+        iwres_autocorrelation(&subjects)
+    };
 
     // Covariance status. Bayesian fits report posterior credible intervals
     // instead of a Hessian covariance, so the covariance step is never
@@ -2900,7 +2953,16 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    if let Some(msg) = dw_autocorrelation_warning(dw_statistic) {
+    let dw_warning = match (
+        &model.residual_serial,
+        crate::api::validation::residual_correlation_line(model),
+    ) {
+        (Some(serial), Some(line)) => {
+            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
+        }
+        _ => dw_autocorrelation_warning(dw_statistic),
+    };
+    if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
 

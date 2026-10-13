@@ -2158,6 +2158,65 @@ pub fn compute_iwres_with_correlations(
 /// Returns `(lag1_r, durbin_watson)` where DW = 2.0 indicates no autocorrelation.
 /// Returns `(f64::NAN, f64::NAN)` when no subject has enough observations.
 pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
+    residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
+}
+
+/// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same
+/// pooled statistics on each subject's IWRES **whitened by the residual covariance
+/// the model fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the
+/// individual predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
+///
+/// Under the model `w` is independent standard normal, so the statistic asks what
+/// it asks of an independent-residual model — is there dependence the model does
+/// *not* explain? On raw IWRES it would report the correlation the line was written
+/// to model (Durbin–Watson 0.99 on the naproxen `cs` fit). A subject whose `R` does
+/// not factor contributes nothing, as a subject with < 2 finite IWRES does.
+pub(crate) fn whitened_residual_autocorrelation(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    subjects: &[SubjectResult],
+) -> (f64, f64) {
+    let series: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .zip(subjects)
+        .map(|(subject, res)| {
+            let n = res.iwres.len();
+            if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
+                return Vec::new();
+            }
+            let err_keys = model.error_spec.obs_keys(subject);
+            let mult = model.ruv_obs_mult(subject, &params.theta);
+            let r = r_matrix_maybe_scaled(
+                &model.error_spec,
+                &res.ipred,
+                err_keys.as_ref(),
+                subject,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                mult.as_deref(),
+            );
+            let Some(chol) = r.clone().cholesky() else {
+                return Vec::new();
+            };
+            let e = nalgebra::DVector::from_iterator(
+                n,
+                (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()),
+            );
+            chol.l()
+                .solve_lower_triangular(&e)
+                .map(|w| w.as_slice().to_vec())
+                .unwrap_or_default()
+        })
+        .collect();
+    residual_autocorrelation(series.iter().map(Vec::as_slice))
+}
+
+/// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series,
+/// one per subject (shared by [`iwres_autocorrelation`] and
+/// [`whitened_residual_autocorrelation`]).
+fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64, f64) {
     // Accumulators for Durbin-Watson: Σ(eᵢ - eᵢ₋₁)², Σeᵢ²
     let mut dw_num = 0.0_f64;
     let mut dw_den = 0.0_f64;
@@ -2170,9 +2229,8 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     let mut sum_y2 = 0.0_f64; // Σ e[t+1]²
     let mut n_pairs: usize = 0;
 
-    for subj in subjects {
-        let valid: Vec<f64> = subj
-            .iwres
+    for residuals in series {
+        let valid: Vec<f64> = residuals
             .iter()
             .copied()
             .filter(|v| v.is_finite())

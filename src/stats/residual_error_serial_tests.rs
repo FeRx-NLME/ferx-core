@@ -524,3 +524,56 @@ fn has_cross_observation_residual_sees_a_serial_block() {
         cov(ResidualSerialKind::Cs, 0.4)
     ));
 }
+
+/// The decorrelated autocorrelation statistic (#1081 follow-up) is the plain one
+/// taken on `L⁻¹ (y − f)`: build residuals `e = L z` from a chosen `z` and the
+/// subject's own `R`, hand the function their IWRES, and it must return the
+/// statistic of `z` — while the raw IWRES give a different one, so the test sees
+/// the whitening and not a pass-through.
+#[test]
+fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVY(10.0, 1.0, 100.0)\n  theta RHO(0.7) FIX\n  sigma ADD_ERR ~ 1.5 (sd)\n\
+         [individual_parameters]\n  Y0 = TVY\n[structural_model]\n  y = Y0\n[error_model]\n  \
+         DV ~ additive(ADD_ERR)\n  correlation ar1(RHO) by ARM\n",
+    )
+    .expect("parses");
+    let params = model.default_params.clone();
+    let mut s = subject_with(&[Some(1.0), Some(1.0), Some(2.0), Some(1.0), Some(2.0)]);
+    s.obs_rgroup = residual_groups(&model, &s);
+    let ipred = vec![10.0; 5];
+    let r = r_matrix_maybe_scaled(
+        &model.error_spec,
+        &ipred,
+        &[1; 5],
+        &s,
+        &params.sigma.values,
+        model.residual_cov_at(&params),
+        None,
+    );
+    let l = r.clone().cholesky().expect("PD").l();
+    let z = nalgebra::DVector::from_vec(vec![0.8, -0.3, 1.1, 0.4, -0.9]);
+    let e = &l * &z;
+    s.observations = (0..5).map(|j| ipred[j] + e[j]).collect();
+    let mut res = crate::types::test_helpers::dummy_subject("1", 0, 5);
+    res.ipred = ipred.clone();
+    res.iwres = (0..5).map(|j| e[j] / r[(j, j)].sqrt()).collect();
+    let pop = crate::types::Population {
+        subjects: vec![s],
+        covariate_names: vec!["ARM".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let got = whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res));
+    let want = residual_autocorrelation(std::iter::once(z.as_slice()));
+    assert!(got.0.is_finite() && got.1.is_finite(), "{got:?}");
+    assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
+    assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
+    let raw = iwres_autocorrelation(std::slice::from_ref(&res));
+    assert!(
+        (raw.1 - want.1).abs() > 0.1,
+        "raw {raw:?} vs whitened {want:?}"
+    );
+}

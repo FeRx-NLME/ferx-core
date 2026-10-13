@@ -215,13 +215,14 @@ const CS_EST: [f64; 10] = [
     0.557777,
 ];
 
-/// T13: the covariance step at NONMEM's own optimum (one evaluation, every θ and ω
-/// free, `outer_maxiter = 0`). Covariance under a `correlation` line takes the FD
-/// Hessian route (`CovScopeDecline::ResidualCorrelations`), and SE(ρ̂) must be
-/// NONMEM's `$COV MATRIX=R` value. Realised (macOS arm64): SE 0.077541 against
-/// 0.077592, 0.07% (bound 0.5%). The objective is exact there too, so this is Tier 2.
-#[test]
-fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
+/// NONMEM's `ar1_est` optimum, same layout as [`CS_EST`].
+const AR1_EST: [f64; 10] = [
+    5.18727, 1.13276, 0.599296, 0.974667, 0.833842, 0.819166, -0.839378, 0.597282, 0.389372,
+    0.557854,
+];
+
+/// The free twin of `kind` started at a NONMEM optimum `est`.
+fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
     let names = [
         "TVE0",
         "TVEMAX",
@@ -231,7 +232,7 @@ fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
         "B_EMAX_TRT",
         "B_LET50_TRT",
     ];
-    let mut src = free_twin("cs").replace("theta RHO(0.3,", &format!("theta RHO({},", CS_EST[7]));
+    let mut src = free_twin(kind).replace("theta RHO(0.3,", &format!("theta RHO({},", est[7]));
     for (i, name) in names.iter().enumerate() {
         let decl = MODEL
             .lines()
@@ -244,19 +245,26 @@ fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
         let init = decl[decl.find('(').unwrap() + 1..decl.find(',').unwrap()].to_string();
         src = src.replace(
             &decl,
-            &decl.replacen(&format!("({init},"), &format!("({},", CS_EST[i]), 1),
+            &decl.replacen(&format!("({init},"), &format!("({},", est[i]), 1),
         );
     }
     src = src
         .replace(
             "ETA_E0   ~ 0.3862622500000001",
-            &format!("ETA_E0   ~ {}", CS_EST[8]),
+            &format!("ETA_E0   ~ {}", est[8]),
         )
-        .replace(
-            "ETA_EMAX ~ 0.54567769",
-            &format!("ETA_EMAX ~ {}", CS_EST[9]),
-        );
-    let r = run(&src, Some(0), true);
+        .replace("ETA_EMAX ~ 0.54567769", &format!("ETA_EMAX ~ {}", est[9]));
+    src
+}
+
+/// T13: the covariance step at NONMEM's own optimum (one evaluation, every θ and ω
+/// free, `outer_maxiter = 0`). Covariance under a `correlation` line takes the FD
+/// Hessian route (`CovScopeDecline::ResidualCorrelations`), and SE(ρ̂) must be
+/// NONMEM's `$COV MATRIX=R` value. Realised (macOS arm64): SE 0.077541 against
+/// 0.077592, 0.07% (bound 0.5%). The objective is exact there too, so this is Tier 2.
+#[test]
+fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
+    let r = run(&at_optimum("cs", &CS_EST), Some(0), true);
     assert!(
         (r.ofv - ESTIMATES[0].1).abs() < 1e-4,
         "at NONMEM's optimum: {}",
@@ -270,4 +278,50 @@ fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
         "SE(ρ̂) ferx {se} vs NONMEM {}",
         ESTIMATES[0].3
     );
+}
+
+/// #1081 follow-up: under a `correlation` line the Durbin–Watson statistic is taken
+/// on the residuals decorrelated by the fitted `R`, and on this dataset that is a
+/// live diagnostic, not a constant. At NONMEM's optima (macOS arm64 and Linux
+/// alike):
+///
+/// | | raw IWRES DW | decorrelated DW |
+/// |---|---|---|
+/// | `cs` | 0.987 | 1.427 |
+/// | `ar1` | 0.938 | 1.691 |
+///
+/// Raw IWRES would warn on both — they are correlated by construction. Decorrelated,
+/// `cs` still warns (a serial decay compound symmetry cannot carry), and with the
+/// `ar1` advice; `ar1` does not. The `ar1` fit is the 6-OFV-better one.
+#[test]
+fn durbin_watson_is_taken_on_decorrelated_residuals() {
+    let mut seen = Vec::new();
+    for (kind, est, want_dw) in [("cs", &CS_EST, 1.4267), ("ar1", &AR1_EST, 1.6909)] {
+        let r = run(&at_optimum(kind, est), Some(0), false);
+        let raw = ferx_core::stats::residual_error::iwres_autocorrelation(&r.subjects);
+        assert!(r.dw_statistic.is_finite() && raw.1.is_finite());
+        eprintln!(
+            "{kind}: decorrelated DW {:.4}, raw IWRES DW {:.4}",
+            r.dw_statistic, raw.1
+        );
+        assert!(
+            (r.dw_statistic - want_dw).abs() < 1e-3,
+            "{kind}: DW {}",
+            r.dw_statistic
+        );
+        assert!(raw.1 < 1.5, "{kind}: raw IWRES would warn (the straddle)");
+        let dw: Vec<&String> = r.warnings.iter().filter(|w| w.contains("Durbin")).collect();
+        seen.push((kind, dw.len()));
+        if kind == "cs" {
+            assert_eq!(dw.len(), 1, "{dw:?}");
+            assert!(dw[0].starts_with(
+                "Positive autocorrelation remains in the residuals decorrelated by \
+                 `correlation cs(RHO) by ARM` (Durbin-Watson = 1.43)"
+            ));
+            assert!(dw[0].contains("`ar1` models that"), "{}", dw[0]);
+        } else {
+            assert!(dw.is_empty(), "{dw:?}");
+        }
+    }
+    assert_eq!(seen, vec![("cs", 1), ("ar1", 0)]);
 }

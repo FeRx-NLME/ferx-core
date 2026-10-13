@@ -219,3 +219,31 @@ fn iiv_on_ruv_and_block_sigma_are_refused() {
          `block_sigma`: the two are different residual correlations, and a model takes one."
     );
 }
+
+/// #1081 follow-up: a `by` column the model expressions do not read is not reported
+/// as an undeclared covariate "used in model expressions" — its type changes
+/// nothing. The same column read by an expression too still is. Both sides, and the
+/// column is a required data column either way.
+#[test]
+fn a_by_column_alone_is_not_an_undeclared_expression_covariate() {
+    let line = "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(RHO) by ARM";
+    let with_block = |indiv_extra: &str| {
+        parse_model_string(&format!(
+            "{}[covariates]\n  WT continuous\n",
+            text(RHO, indiv_extra, line)
+        ))
+        .expect("parses")
+    };
+    let undeclared = |m: &crate::types::CompiledModel| {
+        m.parse_warnings
+            .iter()
+            .find(|w| w.starts_with("Covariate(s) used in model expressions"))
+            .cloned()
+    };
+    let by_only = with_block("");
+    assert_eq!(undeclared(&by_only), None, "{:?}", by_only.parse_warnings);
+    assert!(by_only.referenced_covariates.contains(&"ARM".to_string()));
+    let also_read = with_block(" * (1 + 0 * ARM)");
+    let w = undeclared(&also_read).expect("an expression read is reported");
+    assert!(w.contains(": ARM."), "{w}");
+}

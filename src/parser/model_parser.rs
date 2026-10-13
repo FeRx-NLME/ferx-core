@@ -5566,12 +5566,6 @@ pub fn parse_full_model_with(
     if !selector_covariates.is_empty() {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
-    // A `correlation … by COL` line's columns are required data columns (#1081),
-    // read per row: the reader has to take them and the pruning has to keep them.
-    if let Some(decl) = &correlation_decl {
-        register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
-    }
-
     // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
     // up in the same per-event `HashMap` every other covariate consumer uses — but they
     // are named in the block rather than in an expression, so none of the statement
@@ -6342,6 +6336,15 @@ pub fn parse_full_model_with(
                 undeclared.join(", ")
             ));
         }
+    }
+
+    // A `correlation … by COL` line's columns are required data columns (#1081),
+    // read per row: the reader has to take them and the pruning has to keep them.
+    // Registered after the warning above, which is about columns *model
+    // expressions* read: a grouping column's type changes nothing, so a `by` column
+    // the expressions do not also read is not reported there.
+    if let Some(decl) = &correlation_decl {
+        register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
     }
 
     // Record what this model was compiled from (#1621), so a fit can carry it.

@@ -4699,7 +4699,7 @@ const OMEGA_REGULARIZATION_FLOOR: f64 = 1e-8;
 pub(crate) const RESIDUAL_CORRELATION_RAIL: f64 = 0.995;
 
 /// The `correlation <kind>(RHO) by COL` line as the user wrote it (#1081).
-fn residual_correlation_line(model: &CompiledModel) -> Option<String> {
+pub(crate) fn residual_correlation_line(model: &CompiledModel) -> Option<String> {
     let serial = model.residual_serial.as_ref()?;
     let rho = model
         .theta_names
