@@ -1013,10 +1013,14 @@ fn build_init_params(parsed: &ParsedModel) -> ModelParameters {
     parsed.model.default_params.clone()
 }
 
-/// Covariates referenced by the model but missing from the `[covariates]`
-/// declaration. These are still read (leniently) so the model works; the parser
-/// has already warned that they ought to be declared.
-fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+/// Every data column the model itself reads — the one owner of "what a
+/// model-aware read must take from the CSV" (#1936). Passed to the reader as
+/// `extra` on **both** the `[covariates]` path and the no-block path, so a model
+/// reading a role column or its `iov_column` (NONMEM's `$PK` spelling of
+/// `IF (OCC.EQ.2)`) reads the same columns whether or not it declares anything.
+/// Before #1936 only the declared path passed them: an unrelated
+/// `[covariates] WT` line turned `E_MISSING_COVARIATE` on `OCC` into a working fit.
+pub(crate) fn referenced_columns(model: &CompiledModel) -> Vec<String> {
     model
         .referenced_covariates
         .iter()
@@ -1024,8 +1028,17 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
         // `bind_theta_levels` after the read, never present in the CSV — asking
         // the reader for it would fail on a column the user never wrote.
         .filter(|c| !crate::parser::model_parser::is_level_index_column(c))
-        .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
+        .collect()
+}
+
+/// Covariates referenced by the model but missing from the `[covariates]`
+/// declaration. These are still read (leniently) so the model works; the parser
+/// has already warned that they ought to be declared.
+fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+    referenced_columns(model)
+        .into_iter()
+        .filter(|c| !decls.iter().any(|d| &d.name == c))
         .collect()
 }
 
@@ -1363,7 +1376,9 @@ pub(crate) fn read_population_routed_by(
         data_path,
         None,
         None,
-        &[],
+        // The same columns `read_population_for` reads for this model (#1936), so
+        // a reload's `covariate_names` match the fit's (`PopulationFingerprint`).
+        &referenced_columns(model),
         iov_column,
         None,
         &obs_routing_for(model, MissingDvPolicy::Skip),
@@ -1461,7 +1476,8 @@ fn read_population_for_policy(
     let routing = obs_routing_for(model, missing_dv);
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
-        None => (None, Vec::new()),
+        // No block: still read every column the model references (#1936).
+        None => (None, referenced_columns(model)),
     };
     read_nonmem_csv_routed(
         Path::new(data_path),

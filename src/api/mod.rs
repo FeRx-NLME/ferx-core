@@ -255,6 +255,10 @@ mod simulation_design_covariates_tests;
 mod endpoint_routing_tests;
 
 #[cfg(test)]
+#[path = "tests/referenced_role_column_read_tests.rs"]
+mod referenced_role_column_read_tests;
+
+#[cfg(test)]
 #[path = "tests/per_cmt_unmatched_tests.rs"]
 mod per_cmt_unmatched_tests;
 
