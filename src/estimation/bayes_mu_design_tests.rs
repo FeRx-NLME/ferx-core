@@ -354,3 +354,219 @@ fn a_non_affine_typical_value_is_left_to_the_random_walk() {
         "an additive covariate inside the typical value is not a linear regression"
     );
 }
+
+/// Set covariate `name` to `value` on every record of every subject, so it
+/// is subject-constant (the group keeps its exact, data-free engine).
+fn set_covariate(pop: &mut Population, name: &str, value: impl Fn(usize) -> f64) {
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        let v = value(i);
+        let maps = std::iter::once(&mut s.covariates)
+            .chain(s.dose_covariates.iter_mut())
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.pk_only_covariates.iter_mut())
+            .chain(s.reset_covariates.iter_mut());
+        for m in maps {
+            if let Some(slot) = m.get_mut(name) {
+                *slot = v;
+            }
+        }
+    }
+}
+
+fn has_coord(d: &MuDesign<'_>, model: &CompiledModel, name: &str) -> bool {
+    d.theta_indices().contains(&theta_idx(model, name))
+}
+
+/// An odd nonlinear term cancels from every symmetric second difference about
+/// the start, so a numerical probe admitted `(WT/70)^(θ + (θ − 0.75)³)` as
+/// affine and drew θ_WT from a wrong conditional (codex review of #1951). The
+/// structural check refuses it; the affine control in the same test is
+/// admitted, so a gate stuck on either answer fails here.
+#[test]
+fn an_odd_nonlinear_exponent_is_not_admitted_but_the_affine_one_is() {
+    let affine = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("model text");
+    let odd = affine.replace(
+        "(WT / 70)^THETA_WT",
+        "(WT / 70)^(THETA_WT + (THETA_WT - 0.6)^3)",
+    );
+    assert_ne!(odd, affine, "precondition: the substitution happened");
+    let (_m, pop) = cov_model();
+
+    let m_aff = crate::parser::model_parser::parse_model_string(&affine).expect("parses");
+    let d_aff = MuDesign::build(&m_aff, &pop, &m_aff.default_params, true).expect("design");
+    assert!(
+        has_coord(&d_aff, &m_aff, "THETA_WT"),
+        "control: the affine exponent is drawn"
+    );
+
+    let m_odd = crate::parser::model_parser::parse_model_string(&odd).expect("parses");
+    assert!(
+        m_odd
+            .covariate_mu_refs
+            .iter()
+            .any(|c| c.eta_name == "ETA_CL"),
+        "precondition: the odd form is still a recorded covariate mu-reference"
+    );
+    let d_odd = MuDesign::build(&m_odd, &pop, &m_odd.default_params, true)
+        .expect("the anchors still cover every eta");
+    assert!(
+        !has_coord(&d_odd, &m_odd, "THETA_WT"),
+        "a cubic in THETA_WT is not a linear regression coefficient"
+    );
+    // The group is refused as a whole: its other exponent stays on the
+    // random walk too, while the anchors keep the conjugate move.
+    assert!(!has_coord(&d_odd, &m_odd, "THETA_CRCL"));
+    assert!(has_coord(&d_odd, &m_odd, "TVCL"));
+}
+
+/// Every subject at the covariates' reference values makes the exponent
+/// columns zero, so their conditional precision is singular. They must go
+/// back to the random walk — not freeze — and the typical values must keep
+/// moving (codex review of #1951: the whole move used to be skipped).
+#[test]
+fn reference_valued_covariates_send_their_exponents_back_to_the_random_walk() {
+    let (model, mut pop) = cov_model();
+    set_covariate(&mut pop, "WT", |_| 70.0);
+    set_covariate(&mut pop, "CRCL", |_| 100.0);
+    let d = MuDesign::build(&model, &pop, &model.default_params, true).expect("design");
+    assert!(!has_coord(&d, &model, "THETA_WT"));
+    assert!(!has_coord(&d, &model, "THETA_CRCL"));
+    for tv in ["TVCL", "TVV1", "TVQ", "TVV2", "TVKA"] {
+        assert!(has_coord(&d, &model, tv), "{tv} keeps the conjugate move");
+    }
+    let omega = dense_omega(model.n_eta, model.eta_names.clone());
+    let mut theta = model.default_params.theta.clone();
+    let mut etas = fixture_etas(pop.subjects.len(), model.n_eta);
+    let open = vec![f64::INFINITY; theta.len()];
+    let neg = vec![f64::NEG_INFINITY; theta.len()];
+    let before = theta.clone();
+    let out = d.draw(
+        &mut theta,
+        &mut etas,
+        &omega,
+        &neg,
+        &open,
+        &pop,
+        &mut StdRng::seed_from_u64(11),
+    );
+    assert_eq!(out, DrawOutcome::Moved);
+    let tvcl = theta_idx(&model, "TVCL");
+    assert_ne!(theta[tvcl], before[tvcl], "TVCL moved");
+}
+
+/// A covariate constant across subjects but not at its reference value makes
+/// its exponent's column a multiple of the typical value's: collinear, not
+/// zero. Only that exponent is dropped.
+#[test]
+fn a_constant_covariate_drops_only_its_collinear_exponent() {
+    let (model, mut pop) = cov_model();
+    set_covariate(&mut pop, "CRCL", |_| 50.0);
+    let d = MuDesign::build(&model, &pop, &model.default_params, true).expect("design");
+    assert!(!has_coord(&d, &model, "THETA_CRCL"), "collinear with TVCL");
+    assert!(has_coord(&d, &model, "THETA_WT"), "WT still varies");
+    assert!(has_coord(&d, &model, "TVCL"));
+    let omega = dense_omega(model.n_eta, model.eta_names.clone());
+    let etas = fixture_etas(pop.subjects.len(), model.n_eta);
+    assert!(
+        d.conditional(&model.default_params.theta, &etas, &omega)
+            .is_some(),
+        "the reduced design's conditional can be formed"
+    );
+}
+
+/// The structural walker on the forms it must and must not accept.
+#[test]
+fn affinity_is_proven_from_the_expression_form() {
+    use crate::parser::model_parser::{BinOp, Expression as E};
+    let free = |_t: usize| true;
+    let th = |t| Box::new(E::Theta(t));
+    let cov = |n: &str| Box::new(E::Covariate(n.to_string()));
+    let lit = |v| Box::new(E::Literal(v));
+    // θ0 · (WT/70)^θ1 · exp(θ2·SEX) → log θ0, θ1, θ2.
+    let e = E::BinOp(
+        Box::new(E::BinOp(
+            th(0),
+            BinOp::Mul,
+            Box::new(E::Power(
+                Box::new(E::BinOp(cov("WT"), BinOp::Div, lit(70.0))),
+                th(1),
+            )),
+        )),
+        BinOp::Mul,
+        Box::new(E::UnaryFn(
+            "exp".into(),
+            Box::new(E::BinOp(th(2), BinOp::Mul, cov("SEX"))),
+        )),
+    );
+    let mut got = log_form(&e, &free).expect("affine");
+    got.sort_unstable();
+    assert_eq!(got, vec![(0, true), (1, false), (2, false)]);
+    // sqrt(θ0) and θ0·θ0 are log-affine.
+    assert_eq!(
+        log_form(&E::UnaryFn("sqrt".into(), th(0)), &free),
+        Some(vec![(0, true)])
+    );
+    assert_eq!(
+        log_form(&E::BinOp(th(0), BinOp::Mul, th(0)), &free),
+        Some(vec![(0, true)])
+    );
+    // θ0 + c·θ1 under the log link: ln of a sum is not affine.
+    let sum = E::BinOp(
+        th(0),
+        BinOp::Add,
+        Box::new(E::BinOp(cov("CRCL"), BinOp::Mul, th(1))),
+    );
+    assert_eq!(log_form(&sum, &free), None);
+    // ... but under the identity/logit link it is.
+    let mut got = lin_form(&sum, &free).expect("affine");
+    got.sort_unstable();
+    assert_eq!(got, vec![(0, false), (1, false)]);
+    // A product of two thetas is not linear; θ on two scales is refused.
+    assert_eq!(lin_form(&E::BinOp(th(0), BinOp::Mul, th(1)), &free), None);
+    let both = E::BinOp(
+        th(0),
+        BinOp::Mul,
+        Box::new(E::UnaryFn(
+            "exp".into(),
+            Box::new(E::BinOp(th(0), BinOp::Mul, cov("WT"))),
+        )),
+    );
+    assert_eq!(log_form(&both, &free), None);
+    // A FIX-ed theta is a constant.
+    let fixed_1 = |t: usize| t != 1;
+    assert_eq!(
+        log_form(&E::BinOp(th(0), BinOp::Mul, th(1)), &fixed_1),
+        Some(vec![(0, true)])
+    );
+}
+
+/// End to end: with the exponents' columns zero, every free θ still moves —
+/// the typical values on the conjugate move, the exponents on the random walk
+/// under their declared bounds.
+#[test]
+fn run_bayes_samples_every_theta_when_the_covariates_are_at_reference() {
+    let (model, mut pop) = cov_model();
+    set_covariate(&mut pop, "WT", |_| 70.0);
+    set_covariate(&mut pop, "CRCL", |_| 100.0);
+    let mut opts = crate::types::FitOptions::default();
+    opts.bayes_warmup = 60;
+    opts.bayes_iters = 60;
+    opts.bayes_chains = 2;
+    opts.bayes_seed = Some(1);
+    opts.saem_n_mh_steps = 2;
+    let res = crate::estimation::bayes::run_bayes(&model, &pop, &model.default_params, &opts)
+        .expect("bayes runs");
+    let b = res.bayes.as_ref().expect("BayesResult");
+    for name in ["TVCL", "TVV1", "THETA_WT", "THETA_CRCL"] {
+        let s = b.summaries.iter().find(|s| s.name == name).expect(name);
+        assert!(
+            s.sd.is_finite() && s.sd > 0.0,
+            "{name} never moved (sd {})",
+            s.sd
+        );
+    }
+    for name in ["THETA_WT", "THETA_CRCL"] {
+        let s = b.summaries.iter().find(|s| s.name == name).expect(name);
+        assert!(s.q025 >= 0.01 && s.q975 <= 5.0, "{name} left its bounds");
+    }
+}

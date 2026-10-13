@@ -38,16 +38,17 @@
 //! acceptance ratio is the indicator itself.
 
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupMember};
-use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, Population, Subject};
+use crate::parser::model_parser::{BinOp, Expression};
+use crate::types::{CompiledModel, ModelParameters, MuTransform, OmegaMatrix, Population, Subject};
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
 
-/// Relative tolerance of the affinity check: a coordinate whose second
-/// difference exceeds this (relative to the size of `μ`) is not linear on that
-/// scale. Rounding in `ln θ + θ_WT·ln(WT/70)` is ~1e-15, a genuinely curved
-/// typical value is O(1).
-const AFFINE_TOL: f64 = 1e-8;
+/// Rank floor of [`full_rank_columns`]: a column is kept when more than this
+/// fraction of its (normalised) squared length is not explained by the columns
+/// already kept. 1e-10 sits far below any covariate a dataset can identify and
+/// far above rounding (~1e-15).
+const RANK_TOL: f64 = 1e-10;
 
 /// How one η's mu is computed.
 enum MuRow<'m> {
@@ -185,17 +186,23 @@ impl<'m> MuDesign<'m> {
                 if group.needs_data_term {
                     continue;
                 }
-                let free: Vec<usize> = group
-                    .theta_idx
-                    .iter()
-                    .copied()
-                    .filter(|&t| is_free(t))
-                    .collect();
-                let Some(group_coords) =
-                    affine_coords(&group.members, &free, &anchor_thetas, params, population)
+                let Some(group_coords) = affine_coords(&group.members, &is_free, &params.theta)
                 else {
                     continue;
                 };
+                // A theta already a coordinate (an anchor, or another group's)
+                // must keep its scale.
+                let mut merged: Coords = coords.iter().map(|c| (c.theta_idx, c.log)).collect();
+                let mut ok = true;
+                for c in &group_coords {
+                    match merge(merged.clone(), vec![(c.theta_idx, c.log)]) {
+                        Some(m) => merged = m,
+                        None => ok = false,
+                    }
+                }
+                if !ok {
+                    continue;
+                }
                 for c in group_coords {
                     if !coords.iter().any(|k| k.theta_idx == c.theta_idx) {
                         coords.push(c);
@@ -227,7 +234,19 @@ impl<'m> MuDesign<'m> {
         if design.coords.is_empty() {
             return None;
         }
-        design.x = design.design_matrices(&params.theta, population)?;
+        let x = design.design_matrices(&params.theta, population)?;
+        // Keep only coordinates the data can identify through the φ_i; the
+        // rest go back to the random walk (`theta_indices` no longer lists
+        // them), so no free theta is ever left without a move.
+        let kept = full_rank_columns(&x, design.coords.len());
+        if kept.is_empty() {
+            return None;
+        }
+        design.coords = kept.iter().map(|&k| design.coords[k]).collect();
+        design.x = x
+            .into_iter()
+            .map(|xi| xi.select_columns(kept.iter()))
+            .collect();
         Some(design)
     }
 
@@ -257,7 +276,7 @@ impl<'m> MuDesign<'m> {
     }
 
     /// `X_i` by central differences in `β` — exact up to rounding, because the
-    /// affinity was checked when the design was resolved.
+    /// affinity was proven from the expression when the design was resolved.
     fn design_matrices(&self, theta: &[f64], population: &Population) -> Option<Vec<DMatrix<f64>>> {
         let p = self.coords.len();
         let n_eta = self.rows.len();
@@ -399,8 +418,7 @@ fn design_reads(rows: &[MuRow<'_>], t: usize) -> bool {
 }
 
 /// A finite-difference step for one `β` coordinate. Any step is exact for an
-/// affine function; this one is large enough that the affinity check sees a
-/// curvature of O(1) and small enough to stay in a sane region of θ.
+/// affine function; this one stays in a sane region of θ.
 fn step_for(c: BetaCoord, beta: f64) -> f64 {
     if c.log {
         0.25
@@ -409,81 +427,157 @@ fn step_for(c: BetaCoord, beta: f64) -> f64 {
     }
 }
 
-/// Decide the scale of each free theta of a group so every member's `μ` is
-/// affine in the coordinates, or `None` when no such choice exists.
+/// One `β` coordinate set: `(theta_idx, log)` pairs, at most one per theta.
+type Coords = Vec<(usize, bool)>;
+
+/// Union of two coordinate sets, or `None` when one theta would need both
+/// scales (`TVCL * exp(TVCL * WT)` is affine in neither).
+fn merge(mut a: Coords, b: Coords) -> Option<Coords> {
+    for (t, log) in b {
+        match a.iter().find(|&&(u, _)| u == t) {
+            Some(&(_, l)) if l != log => return None,
+            Some(_) => {}
+            None => a.push((t, log)),
+        }
+    }
+    Some(a)
+}
+
+/// Whether `e` is free of every free theta and of everything that varies
+/// within a subject or with η: literals, covariates, FIX-ed thetas, and any
+/// arithmetic or unary function of those.
+fn is_const(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> bool {
+    match e {
+        Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => true,
+        Expression::Theta(t) => !is_free(*t),
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            is_const(a, is_free) && is_const(b, is_free)
+        }
+        Expression::UnaryFn(_, a) => is_const(a, is_free),
+        _ => false,
+    }
+}
+
+/// The coordinates in which `e` itself is **affine**, by structure: a sum of
+/// constant multiples of free thetas (natural scale) and of logs of
+/// log-affine factors. `None` for anything else — a power or product of two
+/// theta-dependent terms, a conditional, a level gather, an NN output.
+fn lin_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
+    if is_const(e, is_free) {
+        return Some(Vec::new());
+    }
+    match e {
+        Expression::Theta(t) => Some(vec![(*t, false)]),
+        Expression::BinOp(a, BinOp::Add | BinOp::Sub, b) => {
+            merge(lin_form(a, is_free)?, lin_form(b, is_free)?)
+        }
+        Expression::BinOp(a, BinOp::Mul, b) if is_const(a, is_free) => lin_form(b, is_free),
+        Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) if is_const(b, is_free) => {
+            lin_form(a, is_free)
+        }
+        Expression::UnaryFn(f, a) if f == "log" || f == "ln" => log_form(a, is_free),
+        _ => None,
+    }
+}
+
+/// The coordinates in which `ln(e)` is affine, by structure: a product or
+/// quotient of free thetas (log scale), constants, constant powers of such
+/// factors (`sqrt` included), `exp` of an affine term, and a constant base raised to an affine
+/// exponent — `TVCL * (WT/70)^THETA_WT * exp(THETA_SEX * SEX)`.
+fn log_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
+    if is_const(e, is_free) {
+        return Some(Vec::new());
+    }
+    match e {
+        Expression::Theta(t) => Some(vec![(*t, true)]),
+        Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) => {
+            merge(log_form(a, is_free)?, log_form(b, is_free)?)
+        }
+        Expression::Power(base, exp) if is_const(base, is_free) => lin_form(exp, is_free),
+        Expression::Power(base, exp) if is_const(exp, is_free) => log_form(base, is_free),
+        Expression::UnaryFn(f, a) if f == "exp" => lin_form(a, is_free),
+        Expression::UnaryFn(f, a) if f == "sqrt" => log_form(a, is_free),
+        _ => None,
+    }
+}
+
+/// The `β` coordinates of a group: the scale of each free theta its members
+/// read, proven from the parsed typical values — `g(A_i(θ))` is affine in
+/// them — or `None` when any member is not of a recognised affine form.
 ///
-/// A theta that is also an anchor is held to the log scale. Otherwise the log
-/// scale is tried first for a positive theta with a non-negative lower bound
-/// (a typical value), then the natural scale (an exponent, a slope). Each
-/// choice is checked per coordinate by a second difference, then jointly along
-/// a mixed direction to rule out cross terms (`θ_a·θ_b`).
+/// Structural, not numerical, on purpose: probing `μ` at a few points cannot
+/// prove affinity, because an odd term such as `(θ − θ₀)³` cancels from every
+/// symmetric second difference about `θ₀` (codex review of #1951). A form the
+/// walker does not recognise stays on the random walk, which is always valid.
 fn affine_coords(
     members: &[GroupMember<'_>],
-    free: &[usize],
-    anchor_thetas: &[usize],
-    params: &ModelParameters,
-    population: &Population,
+    is_free: &dyn Fn(usize) -> bool,
+    theta0: &[f64],
 ) -> Option<Vec<BetaCoord>> {
-    let theta0 = &params.theta;
-    let mus = |theta: &[f64]| -> Vec<f64> {
-        population
-            .subjects
-            .iter()
-            .flat_map(|s| members.iter().map(move |m| m.mu(theta, s)))
-            .collect()
-    };
-    let base = mus(theta0);
-    if base.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let scale = base.iter().fold(1.0_f64, |a, v| a.max(v.abs()));
-    let affine_along = |dirs: &[(BetaCoord, f64)]| -> bool {
-        let shifted = |sign: f64| {
-            let mut t = theta0.clone();
-            for &(c, h) in dirs {
-                t[c.theta_idx] = c.to_theta(c.to_beta(theta0[c.theta_idx]) + sign * h);
+    let mut coords: Coords = Vec::new();
+    for m in members {
+        let form = match m.transform {
+            MuTransform::Log => log_form(m.typical(), is_free)?,
+            MuTransform::Logit | MuTransform::Identity | MuTransform::LogitProbability => {
+                lin_form(m.typical(), is_free)?
             }
-            mus(&t)
         };
-        let (up, dn) = (shifted(1.0), shifted(-1.0));
-        up.iter()
-            .zip(&dn)
-            .zip(&base)
-            .all(|((u, d), b)| (u - 2.0 * b + d).abs() <= AFFINE_TOL * scale)
-    };
-    let mut coords = Vec::with_capacity(free.len());
-    for &t in free {
-        let v = theta0[t];
-        let positive = v > 0.0 && params.theta_lower.get(t).copied().unwrap_or(0.0) >= 0.0;
-        let candidates: &[bool] = if anchor_thetas.contains(&t) {
-            &[true]
-        } else if positive {
-            &[true, false]
-        } else {
-            &[false]
-        };
-        let chosen = candidates.iter().copied().find(|&log| {
-            let c = BetaCoord { theta_idx: t, log };
-            affine_along(&[(c, step_for(c, c.to_beta(v)))])
-        })?;
-        coords.push(BetaCoord {
-            theta_idx: t,
-            log: chosen,
-        });
+        coords = merge(coords, form)?;
     }
-    // Jointly: a mixed direction catches a product of two coordinates.
-    let mixed: Vec<(BetaCoord, f64)> = coords
+    // `β = ln θ` needs θ > 0 at the start (the exp map keeps it there).
+    if coords
         .iter()
-        .enumerate()
-        .map(|(k, &c)| {
-            let sign = if k % 2 == 0 { 1.0 } else { -0.7 };
-            (c, sign * step_for(c, c.to_beta(theta0[c.theta_idx])))
-        })
-        .collect();
-    if !affine_along(&mixed) {
+        .any(|&(t, log)| log && !(theta0.get(t).copied().unwrap_or(f64::NAN) > 0.0))
+    {
         return None;
     }
-    Some(coords)
+    Some(
+        coords
+            .into_iter()
+            .map(|(theta_idx, log)| BetaCoord { theta_idx, log })
+            .collect(),
+    )
+}
+
+/// The coordinates, in order, that keep the stacked design `[X_1; …; X_N]` at
+/// full column rank: a coordinate whose column is zero (every subject at the
+/// covariate's reference value) or a combination of the columns already kept
+/// (a covariate constant across subjects duplicates the typical value) is
+/// left out. Its conditional precision would be singular, and adding a ridge
+/// would be a prior; on the random walk it is sampled under its declared one.
+///
+/// Rank is judged on the column-normalised Gram matrix, by its Cholesky with a
+/// pivot floor of `RANK_TOL`.
+fn full_rank_columns(x: &[DMatrix<f64>], p: usize) -> Vec<usize> {
+    let mut gram = DMatrix::<f64>::zeros(p, p);
+    for xi in x {
+        gram += xi.transpose() * xi;
+    }
+    let mut kept: Vec<usize> = Vec::new();
+    for k in 0..p {
+        if !(gram[(k, k)] > 0.0) {
+            continue;
+        }
+        let mut trial = kept.clone();
+        trial.push(k);
+        let n = trial.len();
+        let g = DMatrix::from_fn(n, n, |a, b| {
+            let (i, j) = (trial[a], trial[b]);
+            gram[(i, j)] / (gram[(i, i)] * gram[(j, j)]).sqrt()
+        });
+        // LDLᵀ-style check: the smallest Cholesky pivot of a correlation
+        // matrix is the fraction of the new column not explained by the kept.
+        let ok = Cholesky::new(g)
+            .map(|c| {
+                let l = c.l();
+                (0..n).all(|d| l[(d, d)] * l[(d, d)] > RANK_TOL)
+            })
+            .unwrap_or(false);
+        if ok {
+            kept = trial;
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
