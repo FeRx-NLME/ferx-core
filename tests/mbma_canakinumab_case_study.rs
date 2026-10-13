@@ -8,9 +8,10 @@
 //! `tests/mbma_naproxen_case_study.rs` anchors the continuous-endpoint path (SE
 //! weighting, σ fixed to 1). This one covers what that cannot: a weighted **logit**
 //! readout (`weight = 1/sqrt(NARM)`, σ **estimated**), the sample-size-weighted
-//! between-arm κ (`kappa … weight = NARM`), the `clamp` before the logit, and SIR,
-//! all on real literature data. The model is
-//! `tests/data/mbma_canakinumab/mbma_canakinumab.ferx`.
+//! between-arm κ (`kappa … weight = NARM`) and SIR, all on real literature data. The
+//! model is `tests/data/mbma_canakinumab/mbma_canakinumab.ferx`. It keeps the
+//! published `clamp` before the logit, but the clamp never binds on these data, so
+//! nothing here tests it (see [`TOL_PUB_OFV`]).
 //!
 //! ## The data are not in the repository
 //!
@@ -66,11 +67,20 @@ const DEFAULT_DATA: &str = "data/external/mbma_canakinumab.csv";
 
 // ---- Data fingerprint ------------------------------------------------------------
 //
-// The fetch script pins the derived file's sha256 (ecc4a9fb…f738); the test has no
-// hashing crate, so it checks the shape and a checksum of the file's values instead.
-// A wrong file (Y-derived DV, a dropped arm, a recoded drug) moves one of these.
+// The fetch script pins the derived file's sha256 (ecc4a9fb…f738). The test has no
+// hashing crate, so it checks the shape and per-column sums as read by ferx's own
+// reader instead: Σ DV for the response, Σ NARM for the weights, and one sum per
+// drug indicator. A Y-derived DV, a dropped arm, a changed arm size or a recoded drug
+// each moves at least one of them.
 const N_STUDIES: usize = 9;
 const N_OBS: usize = 140;
+/// `Σ NARM` and `Σ` of each drug indicator over the 140 observation rows.
+const SUM_COVARIATES: [(&str, f64); 4] = [
+    ("NARM", 27608.0),
+    ("ABATA", 40.0),
+    ("ADALI", 43.0),
+    ("CANAKI", 4.0),
+];
 /// `Σ DV` over the derived file, `DV = transY/√Narm` — the published transform, not
 /// `logit(Y/100)`, which differs by up to 5.5e-3 per row.
 const SUM_DV: f64 = -28.777668972433098;
@@ -163,8 +173,25 @@ const TOL_SE_RATIO: f64 = 0.03;
 fn data_path() -> Option<PathBuf> {
     locate_data(
         std::env::var_os("FERX_CANAKINUMAB_CSV").map(PathBuf::from),
-        std::env::var("FERX_REQUIRE_EXTERNAL_DATA").as_deref() == Ok("1"),
+        require_flag(std::env::var("FERX_REQUIRE_EXTERNAL_DATA").ok().as_deref()),
     )
+}
+
+/// The value of `FERX_REQUIRE_EXTERNAL_DATA` that turns a skip into a panic: exactly
+/// `"1"`, which is what `slow-tests.yml` sets on the leg that fetches the data, while
+/// the other leg gets `""`.
+fn require_flag(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Both sides of the flag, as the workflow spells them: `"1"` requires the data,
+/// and the other leg's `""`, an unset variable, and `"0"` do not.
+#[test]
+fn require_flag_is_exactly_one() {
+    assert!(require_flag(Some("1")));
+    for v in [Some(""), None, Some("0")] {
+        assert!(!require_flag(v), "{v:?} must not require the data");
+    }
 }
 
 /// [`data_path`] with the environment passed in, so the require-or-skip rule is
@@ -217,9 +244,14 @@ fn model_path() -> PathBuf {
 }
 
 /// The shipped model with its initial values replaced by the Table S5 estimates,
-/// written to a per-process temporary file so it goes through the same
-/// `prepare_run` pipeline as the shipped one.
+/// written to a temporary file so it goes through the same `prepare_run` pipeline
+/// as the shipped one. The name carries the process id AND a per-call counter: the
+/// two data tests run on parallel threads of one process, and each removes its file
+/// after reading it, so a shared name would let one test delete the other's model
+/// between its write and its `prepare_run`.
 fn published_model_file() -> PathBuf {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let src = std::fs::read_to_string(model_path()).expect("read the model");
     let subs = [
         ("EMAX_POP(0.40,", format!("EMAX_POP({PUB_EMAX_POP},")),
@@ -248,7 +280,7 @@ fn published_model_file() -> PathBuf {
         out = out.replace(from, to);
     }
     let path = std::env::temp_dir().join(format!(
-        "ferx_mbma_canakinumab_published_{}.ferx",
+        "ferx_mbma_canakinumab_published_{}_{call}.ferx",
         std::process::id()
     ));
     std::fs::write(&path, out).expect("write the published-value model");
@@ -271,15 +303,50 @@ fn check_population(pop: &ferx_core::types::Population) {
         "Σ DV = {sum:.12}, expected {SUM_DV:.12}: not the file tools/mbma_canakinumab_fetch.py \
          derives (sha256 ecc4a9fb…f738)"
     );
+    for (name, want) in SUM_COVARIATES {
+        let mut got = 0.0;
+        for s in &pop.subjects {
+            // `obs_covariates` is empty when nothing varies within the subject, and
+            // then `covariates` stands for every observation (the documented fallback;
+            // studies 6, 8, 9 are single-arm). Otherwise it must be one row per obs.
+            let rows: Vec<&std::collections::HashMap<String, f64>> = if s.obs_covariates.is_empty()
+            {
+                vec![&s.covariates; s.observations.len()]
+            } else {
+                assert_eq!(
+                    s.obs_covariates.len(),
+                    s.observations.len(),
+                    "subject {}: one covariate row per observation",
+                    s.id
+                );
+                s.obs_covariates.iter().collect()
+            };
+            for row in rows {
+                // No `unwrap_or(0.0)`: a column the reader dropped must fail here,
+                // not sum to a plausible number.
+                got += row
+                    .get(name)
+                    .unwrap_or_else(|| panic!("subject {}: no {name} covariate", s.id));
+            }
+        }
+        assert!(
+            (got - want).abs() < 1e-9,
+            "Σ {name} = {got}, expected {want}: not the file tools/mbma_canakinumab_fetch.py \
+             derives (sha256 ecc4a9fb…f738)"
+        );
+    }
 }
 
 /// Acceptance 5 of #1913: the licence forbids redistributing the data or anything
-/// derived from it, so nothing under `data/external/` may ever be tracked. Runs on
-/// every PR; needs no data.
+/// derived from it, so nothing under `data/external/` may ever be tracked, and no
+/// `mbma_canakinumab*.csv` anywhere. The second pathspec exists because the NONMEM
+/// twin reads the same file next to its `.ctl` in `nonmem_anchor/`, a directory where
+/// committing `<name>.csv` beside `<name>.ctl` is the convention. Runs on every PR;
+/// needs no data.
 #[test]
 fn no_external_data_is_tracked() {
     let out = std::process::Command::new("git")
-        .args(["ls-files", "--", "data/external"])
+        .args(["ls-files", "--", "data/external", "*mbma_canakinumab*.csv"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("git must be runnable for this check");
@@ -291,7 +358,7 @@ fn no_external_data_is_tracked() {
     let tracked = String::from_utf8_lossy(&out.stdout);
     assert!(
         tracked.trim().is_empty(),
-        "files under data/external/ are tracked, and may not be (CC BY-NC-ND; #1913):\n{tracked}"
+        "canakinumab data are tracked, and may not be (CC BY-NC-ND; #1913):\n{tracked}"
     );
 }
 
@@ -519,7 +586,11 @@ fn fit_reproduces_nonmem_foce_optimum_profile_ses_and_runs_sir() {
         "worst |ln(SE_ferx / SE_ref)| {worst_ratio:.4} ≥ {TOL_SE_RATIO}"
     );
 
-    // ---- SIR ----
+    // ---- SIR: a smoke check, not an anchor ----
+    // SIR ran, is not degenerate, and gives finite, ordered intervals with γ² inside
+    // its own. That is all. A wrong proposal that still yields usable draws would
+    // pass; there is no external SIR reference for this dataset. The interval
+    // contents are pinned against the covariance step in `tests/sir_ci_kappa.rs`.
     let ess = r.sir_ess.expect("in-fit SIR ran: sir_ess");
     assert!(ess.is_finite() && ess > 10.0, "degenerate SIR, ESS {ess}");
     for (what, ci) in [

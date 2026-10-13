@@ -22,7 +22,10 @@ bench_*.csv
 
 # Externally provisioned data that may not be redistributed (#1913): written by
 # tools/mbma_canakinumab_fetch.py, read by the test of the same name. Never commit.
+# The name pattern also covers a copy next to nonmem_anchor/mbma_canakinumab.ctl,
+# where `<name>.csv` beside `<name>.ctl` is otherwise the committed convention.
 data/external/
+mbma_canakinumab*.csv
 
 # Python bytecode from the nonmem_anchor reference scripts
 __pycache__/

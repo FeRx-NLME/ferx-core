@@ -1,8 +1,9 @@
 $PROBLEM canakinumab RA MBMA, Bracis et al. 2026 Case Study 2 final model (r03), FOCE-I (#1913)
 ; The NONMEM twin of tests/data/mbma_canakinumab/mbma_canakinumab.ferx.
-; The data are NOT in the repository (CC BY-NC-ND 4.0); provision them with
-;   python3 tools/mbma_canakinumab_fetch.py --out mbma_canakinumab.csv
-; next to this file. Written for the anchor image: nm3 mbma_canakinumab.ctl
+; The data are NOT in the repository (CC BY-NC-ND 4.0) and must never be. Copy this
+; file to a run folder OUTSIDE the repository and provision the data there:
+;   python3 tools/mbma_canakinumab_fetch.py --out <run dir>/mbma_canakinumab.csv
+; Written for the anchor image: nm3 mbma_canakinumab.ctl
 ;
 ; NONMEM has no weight on an $OMEGA, so the between-arm kappa is written out by
 ; hand: one ETA per arm (ARM 0 / ARM 1, OMEGA SAME), divided by SQRT(NARM). The

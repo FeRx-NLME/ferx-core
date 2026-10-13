@@ -77,8 +77,9 @@ DEFAULT_OUT = "data/external/mbma_canakinumab.csv"
 
 # sha256 of the upstream `data_9studies.csv` (inside PSP4-15-e70158-s002.zip).
 UPSTREAM_SHA256 = "d71c7e0882e95eae4f096387a95c33ed1c4fa0fe85eb57d317886dee94553b27"
-# sha256 of the derived ferx-layout CSV this script writes. Also printed by the
-# anchor test, which refuses a file with any other hash.
+# sha256 of the derived ferx-layout CSV this script writes, and what `--check`
+# verifies. The anchor test does no hashing: it fingerprints the file by its shape
+# and per-column sums instead (`check_population` in the test).
 DERIVED_SHA256 = "ecc4a9fb284983c8be7f66b84bf295ffa09ff714f10e8e4d00c962a78c8cf738"
 
 EXPECTED_COLUMNS = [
