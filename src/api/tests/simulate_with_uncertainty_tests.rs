@@ -992,21 +992,27 @@ fn uncertainty_skip_warning_wording_per_family() {
     assert!(!ig1.contains("coincident"), "{ig1}");
 }
 
-/// #1485 review finding 3: on a model whose ODE twin was built and then declined (#1008),
-/// the aggregate keeps the decline clause the per-draw lines used to carry — it names the
-/// easier fix. The `[scaling]` fixture, whose twin was never built, must not carry it.
-#[test]
-fn uncertainty_skip_warning_carries_the_twin_decline_clause() {
-    // The M1 transit fixture with `[scaling]` swapped for an individual parameter named
-    // after the twin's own `central` state: the twin's parse rejects the collision.
-    let declined_src = INDOMAIN_TWINLESS_TRANSIT_SRC
+/// The M1 transit fixture with `[scaling]` swapped for an individual parameter named after
+/// the twin's own `central` state: the twin is built and its parse rejects the collision
+/// (#1008), so the model is twin-less *and* carries
+/// [`crate::types::absorption_twin_decline_reason`]. One builder for the two tests that need
+/// that distinction (#1485's skip warning and #1823's tally).
+fn declined_twin_transit_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC
         .replace("  MTT = TVMTT\n", "  MTT = TVMTT\n  CENTRAL = TVX\n")
         .replace(
             "  theta TVMTT(20.0, 0.05, 200.0)\n",
             "  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVX(1.0, 0.0, 10.0)\n",
         )
-        .replace("[scaling]\n  obs_scale = 1\n\n", "");
-    let declined = parse_fixture(&declined_src);
+        .replace("[scaling]\n  obs_scale = 1\n\n", "")
+}
+
+/// #1485 review finding 3: on a model whose ODE twin was built and then declined (#1008),
+/// the aggregate keeps the decline clause the per-draw lines used to carry — it names the
+/// easier fix. The `[scaling]` fixture, whose twin was never built, must not carry it.
+#[test]
+fn uncertainty_skip_warning_carries_the_twin_decline_clause() {
+    let declined = parse_fixture(&declined_twin_transit_src());
     assert!(declined.absorption_ode_equivalent.is_none(), "twin-less");
     assert!(
         crate::types::absorption_twin_decline_reason(&declined).is_some(),
@@ -1150,6 +1156,415 @@ fn uncertainty_refuses_a_flip_flop_point_estimate() {
     let point = simulate(&model, &pop, &params, 1).expect_err("simulate refuses too");
     assert_eq!(err.to_string(), point.to_string());
     assert!(!err.to_string().contains("uncertainty draws"), "{err}");
+}
+
+// ── #1823 simulated-η flip-flop tally ────────────────────────────────────────
+// The entry-point refusal samples η = 0, the #785 warning samples the fitted EBEs and the
+// #786/#1485 skip samples each draw's η = 0 θ. None of them sees an individual whose own
+// *sampled* η crosses the tilting abscissa, which on a twin-less closed form comes back as
+// `ipred = 0` for the whole profile with nothing said on any channel.
+
+/// Simulated individuals whose whole profile came back identically zero, and how many were
+/// simulated in all, keyed by `(draw, sim, id)`.
+///
+/// Read off the **rows**, never from `absorption_flip_flop_at` — the predicate the fix
+/// counts on. Two different things: that is what makes the equality asserted in
+/// `simulated_flip_flop_count_equals_the_zeroed_individuals` an oracle rather than a
+/// restatement of the implementation.
+fn zeroed_individuals(results: &[SimulationResult]) -> (usize, usize) {
+    let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
+    for r in results {
+        let all_zero = per_individual
+            .entry((r.draw, r.sim, r.id.clone()))
+            .or_insert(true);
+        *all_zero &= r.ipred == 0.0;
+    }
+    (
+        per_individual.values().filter(|z| **z).count(),
+        per_individual.len(),
+    )
+}
+
+/// The single `W_SIMULATED_FLIP_FLOP` warning in `warnings`, or `None`.
+fn flip_flop_warning(warnings: &[String]) -> Option<String> {
+    let hits: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("W_SIMULATED_FLIP_FLOP"))
+        .collect();
+    assert!(hits.len() <= 1, "at most one tally warning: {warnings:#?}");
+    hits.first().map(|w| (*w).clone())
+}
+
+/// `simulate_with_options_diag` with ω²(ETA_CL) widened to `var`: the tally warning (if
+/// any), the zeroed-individual count read off the rows, and the individuals simulated.
+///
+/// Widening ω is how a crosser is produced at all — the fixture's point estimate is
+/// in-domain by construction (the entry points refuse it otherwise), so the crossing has
+/// to come from the η draw, which is exactly the gap under test.
+fn flip_flop_run(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+    match_method: Option<crate::propensity_match::MatchMethod>,
+) -> (Option<String>, usize, usize) {
+    let pop = tiny_population();
+    assert_eq!(model.n_eta, 1, "every fixture here carries one η");
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        match_method,
+        ..Default::default()
+    };
+    let out = simulate_with_options_diag(model, &pop, &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates");
+    // The row-only wrapper is the same rows, so the tally cannot have perturbed the draw
+    // order (it consumes no randomness).
+    let rows = simulate_with_options(model, &pop, &params, n_sim, &opts).expect("rows");
+    assert_eq!(rows.len(), out.results.len());
+    for (a, b) in rows.iter().zip(&out.results) {
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+    }
+    let (zeroed, total) = zeroed_individuals(&out.results);
+    (flip_flop_warning(&out.warnings), zeroed, total)
+}
+
+/// #1823: the count the warning reports is exactly the number of simulated individuals
+/// whose profile came back identically zero — on the measured fixture from the issue, and
+/// on its twin-carrying control, where both are zero.
+///
+/// Measured on this branch at `afe7f52b`: 27 of 600 individuals (4.5%) at ω² = 0.09 /
+/// n_sim = 300 / seed 7, and 260 of 4000 (6.5%) at n_sim = 2000 / seed 42. Pre-fix every
+/// one of those individuals contributed three finite `ipred = 0.0` rows and no warning on
+/// any channel.
+#[test]
+fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(model.absorption_ode_equivalent.is_none(), "twin-less");
+    // The point estimate is in-domain, so nothing refuses this run and the η = 0 gates are
+    // all silent — the crossing is the draw's, not θ's.
+    assert!(check_absorption_flip_flop_no_twin(
+        &model,
+        &tiny_population(),
+        &model.default_params.theta
+    )
+    .is_none());
+
+    for (n_sim, seed, want) in [(300usize, 7u64, 27usize), (2000, 42, 260)] {
+        let (msg, zeroed, total) = flip_flop_run(&model, 0.09, n_sim, seed, None);
+        assert_eq!(total, 2 * n_sim, "two subjects per replicate");
+        assert_eq!(zeroed, want, "measured at afe7f52b (n_sim={n_sim})");
+        assert!(zeroed > 0, "the fixture must produce crossers to be a test");
+        let msg = msg.expect("a crossing individual must be reported");
+        assert!(
+            msg.contains(&format!(
+                "{zeroed} of {total} simulated individuals were evaluated"
+            )),
+            "count must equal the zeroed individuals: {msg}"
+        );
+    }
+
+    // The twin-carrying control: the same model without the inert `[scaling]`, at ω² = 4 —
+    // 44× the variance above — reroutes every crosser to its ODE `transit()` twin, so no
+    // individual is zeroed and nothing is reported.
+    let twin = parse_fixture(PLAIN_TWIN_TRANSIT_SRC);
+    assert!(twin.absorption_ode_equivalent.is_some(), "twin-carrying");
+    let (msg, zeroed, total) = flip_flop_run(&twin, 4.0, 300, 7, None);
+    assert_eq!((zeroed, total), (0, 600), "the twin serves both regimes");
+    assert_eq!(msg, None, "a twin-carrying model has nothing to report");
+}
+
+/// #1823: the propensity-matched branch of `simulate_with_options_diag` builds its own
+/// `eta_slice` (a pool draw reassigned by Mahalanobis matching), so it carries its own
+/// `observe` call. Deleting *that* call must redden a test — this one — and deleting the
+/// unmatched branch's call must not: the two sides of the twin are mutated separately.
+#[test]
+fn simulated_flip_flop_count_covers_the_propensity_matched_branch() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (msg, zeroed, total) = flip_flop_run(
+        &model,
+        0.09,
+        300,
+        7,
+        Some(crate::propensity_match::MatchMethod::Optimal),
+    );
+    assert!(
+        zeroed > 0,
+        "the matched run must produce crossers or this proves nothing"
+    );
+    assert_eq!(total, 600);
+    let msg = msg.expect("a matched run reports its crossers too");
+    assert!(
+        msg.contains(&format!("{zeroed} of {total} simulated individuals")),
+        "{msg}"
+    );
+    // Not compared against the unmatched run's count: the matched branch draws a whole
+    // replicate's η pool before emitting any rows, so the two branches consume the RNG in a
+    // different order and their pools differ from the second subject on.
+}
+
+/// #1823: every sentence of the warning, on all three absorption families, with both sides
+/// of each wording gate asserted in the same test — transit vs IG (domain + ODE rewrite)
+/// and 1-cpt vs 2-cpt (the confluent-eigenvalue clause). Mirrors
+/// `uncertainty_skip_warning_wording_per_family`, which gates on the same two helpers, so
+/// three fixtures kill both gates in both directions (the two predicates are independent:
+/// one keys on IG-vs-transit, the other on 1-cpt-vs-2-cpt).
+///
+/// Deleting any one of the three sentences must redden this test; that is the point of
+/// asserting each separately rather than matching the whole string.
+#[test]
+fn simulated_flip_flop_warning_wording_per_family() {
+    let transit = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+    let transit2 = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC);
+
+    // ω² chosen per family so each produces crossers: the IG abscissa sits at 0.833 (vs
+    // ke = 0.1) and the 2-cpt α at 0.4 (vs 0.285), so they need a wider draw than the
+    // 1-cpt transit fixture's 0.2-vs-0.125.
+    let (t1, t1_zeroed, _) = flip_flop_run(&transit, 0.09, 300, 7, None);
+    let (ig1, ig1_zeroed, _) = flip_flop_run(&ig, 4.0, 300, 7, None);
+    let (t2, t2_zeroed, _) = flip_flop_run(&transit2, 1.0, 300, 7, None);
+    let t1 = t1.expect("transit crossers");
+    let ig1 = ig1.expect("IG crossers");
+    let t2 = t2.expect("2-cpt transit crossers");
+
+    for (msg, zeroed, name) in [
+        (&t1, t1_zeroed, "one_cpt_transit"),
+        (&ig1, ig1_zeroed, "one_cpt_ig"),
+        (&t2, t2_zeroed, "two_cpt_transit"),
+    ] {
+        // Sentence 1 — the count, the cause, and the consequence for `ipred`.
+        assert!(
+            msg.contains(&format!(
+                "{zeroed} of 600 simulated individuals were evaluated"
+            )),
+            "{name}: {msg}"
+        );
+        assert!(msg.contains("flip-flop regime"), "{name}: {msg}");
+        assert!(
+            msg.contains(&format!("twin-less {name} closed form has no solution")),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains("predicted as an identically-zero profile"),
+            "{name}: {msg}"
+        );
+        // Sentence 2 — why zeros are worse than missing rows.
+        assert!(
+            msg.contains("not missing from the output — they are zeros"),
+            "{name}: {msg}"
+        );
+        assert!(msg.contains("pulled toward zero"), "{name}: {msg}");
+        assert!(
+            msg.contains("under a proportional error model their simulated DV is 0"),
+            "{name}: {msg}"
+        );
+        // Sentence 3 — the way out, and that it is per individual.
+        assert!(
+            msg.contains("which reroutes per individual and is valid in both regimes"),
+            "{name}: {msg}"
+        );
+        // It must not claim the starting estimates are the problem (the η = 0 refusal's
+        // advice, which is false on a fixture whose point estimate is in-domain).
+        assert!(!msg.contains("starting estimates"), "{name}: {msg}");
+        // The token carries the category, not the "flip-flop regime" prose.
+        let entry = crate::types::classify_warning(msg);
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+    // Transit vs IG: the domain bound and the ODE rewrite.
+    for m in [&t1, &t2] {
+        assert!(m.contains("transit rate KTR = (n+1)/mtt"), "{m}");
+        assert!(m.contains("explicit ODE `transit()` model"), "{m}");
+        assert!(!m.contains("igd()") && !m.contains("MAT"), "{m}");
+    }
+    assert!(ig1.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{ig1}");
+    assert!(ig1.contains("explicit ODE `igd()` model"), "{ig1}");
+    assert!(!ig1.contains("KTR") && !ig1.contains("transit()"), "{ig1}");
+    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge.
+    assert!(
+        t2.contains("or with coincident disposition eigenvalues"),
+        "{t2}"
+    );
+    assert!(!t1.contains("coincident"), "{t1}");
+    assert!(!ig1.contains("coincident"), "{ig1}");
+}
+
+/// #1823: on a model whose ODE twin was built and then declined (#1008) the tally carries
+/// the decline clause — the easier fix than the rewrite it just suggested. The `[scaling]`
+/// fixture, whose twin was never built, must not carry it. Both sides in one test, so a
+/// clause stuck on either branch reddens it.
+#[test]
+fn simulated_flip_flop_warning_carries_the_twin_decline_clause() {
+    let declined = parse_fixture(&declined_twin_transit_src());
+    assert!(declined.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        crate::types::absorption_twin_decline_reason(&declined).is_some(),
+        "the twin was built and declined"
+    );
+    let scaling = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(crate::types::absorption_twin_decline_reason(&scaling).is_none());
+
+    let clause = "its twin was built and then rejected by its own parse";
+    let (with, with_zeroed, _) = flip_flop_run(&declined, 0.09, 300, 7, None);
+    let (without, without_zeroed, _) = flip_flop_run(&scaling, 0.09, 300, 7, None);
+    assert!(with_zeroed > 0 && without_zeroed > 0, "both must cross");
+    let with = with.expect("declined-twin crossers");
+    let without = without.expect("scaling crossers");
+    assert!(with.contains(clause), "{with}");
+    assert!(
+        with.contains("CENTRAL"),
+        "the twin parser's own reason is quoted: {with}"
+    );
+    assert!(!without.contains(clause), "{without}");
+}
+
+/// #1823: the `W_SIMULATED_FLIP_FLOP` token arm sits ahead of every prose arm because the
+/// message quotes the twin parser's own error text verbatim (#1008), and a decline reason
+/// that happens to say "ill-conditioned" would otherwise be claimed by the
+/// `condition_number` arm and come back `Critical` — a VPC consumer branching on that would
+/// read an estimation failure where the finding is a degenerate simulated profile. Mirrors
+/// `classify_warning_twin_decline_beats_prose_arms_in_the_reason`, and is what makes the
+/// token arm more than a duplicate of the `flip-flop regime` prose arm (which classifies
+/// the plain message correctly on its own).
+#[test]
+fn simulated_flip_flop_warning_classifies_on_its_token_not_the_reason() {
+    let mut model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    model
+        .parse_warnings
+        .push(crate::types::absorption_twin_declined_warning(
+            "[odes]: the Jacobian is ill-conditioned at the initial state",
+        ));
+    let pop = tiny_population();
+    let theta = model.default_params.theta.clone();
+    let mut tally = SimulatedFlipFlopTally::default();
+    // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2.
+    tally.observe(&model, &pop.subjects[0], &theta, &[0.6]);
+    let msg = tally.warning(&model).expect("a crossing individual");
+    assert!(
+        msg.contains("ill-conditioned"),
+        "the reason is quoted: {msg}"
+    );
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(entry.category, crate::types::WarningCode::FlipFlop, "{msg}");
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+}
+
+/// #1823: no crossing individual, no warning — on a narrow ω where every draw stays
+/// in-domain (the straddle partner of the wide-ω runs above), on a twin-carrying model at a
+/// ω 44× wider, and on a non-absorption model, which has no flip-flop regime at all.
+#[test]
+fn simulated_flip_flop_warning_silent_without_a_crosser() {
+    for (name, model, var) in [
+        (
+            "narrow ω",
+            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
+            1e-4,
+        ),
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
+        ("non-absorption", tiny_model(), 4.0),
+    ] {
+        let (msg, zeroed, total) = flip_flop_run(&model, var, 300, 7, None);
+        assert_eq!((zeroed, total), (0, 600), "{name}");
+        assert_eq!(msg, None, "{name}");
+    }
+}
+
+/// #1823: a wrong-length η is skipped rather than read past the end inside `pk_param_fn`.
+/// Production cannot deliver one (`simulate_inner_with_draw` resizes every `eta_slice` to
+/// `n_eta + n_kappa`), so the guard is pinned on the helper directly — a would-be crosser
+/// at the wrong shape must not be counted on either side of the ratio.
+#[test]
+fn simulated_flip_flop_tally_skips_a_wrong_length_eta() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let theta = &model.default_params.theta;
+    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&model, &pop.subjects[0], theta, &crosser);
+    tally.observe(&model, &pop.subjects[1], theta, &[]);
+    tally.observe(&model, &pop.subjects[1], theta, &[0.6, 0.6]);
+    let msg = tally
+        .warning(&model)
+        .expect("the well-shaped crosser is counted");
+    assert!(
+        msg.contains("1 of 1 simulated individuals"),
+        "the two mis-shaped etas count on neither side: {msg}"
+    );
+}
+
+/// #1823: on `simulate_with_uncertainty_diag` the per-individual tally and the #1485
+/// per-draw skip are two different findings and both are reported on one run. The skip
+/// counts θ draws the closed form cannot serve at all; the tally counts individuals inside
+/// the draws that *did* run, so a skipped draw contributes to neither side of its ratio —
+/// which is why the denominator is the surviving draws' individuals, not 2 × n_draws.
+///
+/// Measured at `afe7f52b`: 172 of 2000 draws skipped, and 365 of 3656 individuals zeroed
+/// across the 1828 draws that ran (1095 of the 10968 returned rows).
+#[test]
+fn uncertainty_reports_the_tally_alongside_the_skipped_draws() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 0.09;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2000,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(42),
+    };
+    let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("some draws run");
+    let ran: std::collections::BTreeSet<usize> = out.results.iter().map(|r| r.draw).collect();
+    assert_eq!(ran.len(), 1828, "measured at afe7f52b");
+    // Both findings, in this order: the coarser per-draw skip first.
+    let skip = only_skip_warning(&out.warnings);
+    assert!(skip.contains("172 of 2000 uncertainty draws"), "{skip}");
+    let (zeroed, total) = zeroed_individuals(&out.results);
+    assert_eq!((zeroed, total), (365, 3656), "measured at afe7f52b");
+    assert_eq!(out.results.len(), 10968, "3 rows per individual");
+    let msg = flip_flop_warning(&out.warnings).expect("the tally is reported here too");
+    assert!(
+        msg.contains("365 of 3656 simulated individuals"),
+        "the denominator is the individuals that ran, not 2 × n_draws: {msg}"
+    );
+    let skip_at = out.warnings.iter().position(|w| w == skip).unwrap();
+    let tally_at = out.warnings.iter().position(|w| *w == msg).unwrap();
+    assert!(skip_at < tally_at, "{:#?}", out.warnings);
+}
+
+/// #1823: `simulate` / `simulate_with_seed` have no diagnostics channel, so the tally is
+/// counted at the shared chokepoint and dropped — their rows are the `_diag` form's rows,
+/// bit for bit, on the same seed. Pins that the fix did not quietly grow a second row
+/// implementation, and that the row-only contract
+/// (`the_row_only_entry_points_stay_silent_by_contract`) still holds for a run that *does*
+/// have something to report.
+#[test]
+fn row_only_simulate_still_returns_the_diag_rows_when_individuals_cross() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+    let opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let diag = simulate_with_options_diag(&model, &pop, &params, 300, &opts).expect("diag");
+    assert!(
+        flip_flop_warning(&diag.warnings).is_some(),
+        "the fixture must report something, or 'the rows are the same' is vacuous"
+    );
+    let rows = simulate_with_seed(&model, &pop, &params, 300, 7).expect("rows");
+    assert_eq!(rows.len(), diag.results.len());
+    for (a, b) in rows.iter().zip(&diag.results) {
+        assert_eq!((a.draw, a.sim, &a.id), (b.draw, b.sim, &b.id));
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+        assert_eq!(format!("{:?}", a.outcome), format!("{:?}", b.outcome));
+    }
+    let (zeroed, _) = zeroed_individuals(&rows);
+    assert!(zeroed > 0, "the row-only form returns the zeroed rows too");
 }
 
 #[test]

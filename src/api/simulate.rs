@@ -546,8 +546,11 @@ pub fn simulate_with_options(
 /// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
 /// only the rows.
 ///
-/// Three sources feed `warnings`, in this order: per-subject simulation diagnostics (a
-/// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), capped
+/// Four sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
+/// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals whose sampled η entered a
+/// twin-less transit / IG closed form's flip-flop regime and came back as an
+/// identically-zero profile (#1823), capped
 /// steady-state equilibrations (#867), and — new in #1280 / #1304 — the shared non-fit
 /// diagnostics bundle (parse warnings, data-reader warnings, the model/data checks,
 /// experimental-feature notices, and this pass's ODE-solver diagnostics). Before it, a model
@@ -649,6 +652,7 @@ pub fn simulate_with_options_diag(
         Some(m) => m,
         None => {
             let mut warnings = Vec::new();
+            let mut flip_flop = SimulatedFlipFlopTally::default();
             // One scope around the whole pass, not one per subject: this loop is serial (the
             // RNG draw order is part of `simulate`'s contract), so the thread-local scope sees
             // every subject's integrations. #1304.
@@ -663,9 +667,11 @@ pub fn simulate_with_options_diag(
                     opts.horizon,
                     &mut rng,
                     &mut warnings,
+                    &mut flip_flop,
                 )
             });
             let results = results?;
+            warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(super::non_fit_diagnostics(
                 model,
@@ -748,6 +754,7 @@ pub fn simulate_with_options_diag(
 
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
+    let mut flip_flop = SimulatedFlipFlopTally::default();
     // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
     // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty_diag`
     // calls once per draw, and that caller opens one scope around all of its draws (with its
@@ -763,9 +770,11 @@ pub fn simulate_with_options_diag(
             opts.horizon,
             &mut rng,
             &mut warnings,
+            &mut flip_flop,
         )
     });
     let results = results?;
+    warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     warnings.extend(super::non_fit_diagnostics(
         model,
@@ -788,8 +797,14 @@ fn simulate_inner<R: rand::Rng>(
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
     // These entry points return only the rows; per-subject simulation diagnostics
     // (#762 degenerate RTTE, #763 degenerate hazard draw) are collected but surfaced
-    // only on the `simulate_with_options` path (`SimulationOutput.warnings`).
+    // only on the `simulate_with_options` path (`SimulationOutput.warnings`). The
+    // same holds for the #1823 flip-flop tally: it is counted (the chokepoint owns the
+    // count, so every entry point counts identically) and then dropped here, because
+    // these two entry points have no diagnostics channel at all —
+    // `the_row_only_entry_points_stay_silent_by_contract` pins that. Use
+    // `simulate_with_options_diag` when the count matters.
     let mut warnings = Vec::new();
+    let mut flip_flop = SimulatedFlipFlopTally::default();
     simulate_inner_with_draw(
         model,
         population,
@@ -800,6 +815,7 @@ fn simulate_inner<R: rand::Rng>(
         None,
         rng,
         &mut warnings,
+        &mut flip_flop,
     )
 }
 
@@ -1144,6 +1160,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     warnings: &mut Vec<String>,
+    flip_flop: &mut SimulatedFlipFlopTally,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
 
@@ -1219,6 +1236,13 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 for (i, subject) in population.subjects.iter().enumerate() {
                     let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    // #1823: on a twin-less transit / IG closed form this η can sit past
+                    // the tilting abscissa, where the closed form clamps the whole profile
+                    // to 0 and there is no twin to reroute to. Record it here, on the
+                    // η the emitter is about to predict with — both branches, so a
+                    // propensity-matched run is counted on the η it was assigned, not the
+                    // one it drew.
+                    flip_flop.observe(model, subject, &params.theta, &eta_slice);
                     emit_subject_rows(
                         model,
                         subject,
@@ -1242,6 +1266,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let eta = &params.omega.chol * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    flip_flop.observe(model, subject, &params.theta, &eta_slice);
                     emit_subject_rows(
                         model,
                         subject,
@@ -1312,7 +1337,10 @@ pub fn simulate_with_uncertainty(
 /// `results` is exactly what [`simulate_with_uncertainty`] returns. `warnings` carries, in this
 /// order: the per-subject simulation diagnostics (a degenerate hazard draw, #763 / #762), one
 /// `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every draw skipped because it landed in the
-/// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), capped steady-state
+/// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), one
+/// `W_SIMULATED_FLIP_FLOP` count of the individuals *inside* the draws that ran whose own
+/// sampled η landed there (#1823 — the skip is decided at each draw's η = 0 θ, so both can
+/// fire on one run), capped steady-state
 /// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
 /// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
 /// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
@@ -1434,6 +1462,12 @@ fn simulate_uncertainty_draws(
     // 1-based indices of the skipped draws, and the first one's reason (#1485).
     let mut skipped: Vec<usize> = Vec::new();
     let mut first_reason: Option<String> = None;
+    // One #1823 tally across every draw that *did* run: a skipped draw simulates no
+    // individual, so it contributes to neither side of the ratio. The two counts answer
+    // different questions — a skipped draw is a θ the closed form cannot serve at all, a
+    // tallied individual is an η within an otherwise serviceable draw — so both warnings
+    // can fire on one run.
+    let mut flip_flop = SimulatedFlipFlopTally::default();
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
@@ -1460,6 +1494,7 @@ fn simulate_uncertainty_draws(
             None,
             rng,
             sim_warnings,
+            &mut flip_flop,
         )?;
         results.append(&mut rows);
     }
@@ -1477,6 +1512,10 @@ fn simulate_uncertainty_draws(
             draws.len(),
         ));
     }
+    // After the skip warning, so the coarser finding (a θ the closed form cannot serve at
+    // all) is read first. Not before the `?` above: a run whose every draw was skipped is
+    // refused, and it simulated no individual to tally anyway.
+    sim_warnings.extend(flip_flop.warning(model));
     Ok(())
 }
 
@@ -1527,6 +1566,12 @@ pub struct SimulationResult {
 /// `simulate_with_uncertainty()` returns a flat row vec and so has no channel either; since
 /// #1645 its diagnostics — including a skipped flip-flop draw (#786) — come back on
 /// [`simulate_with_uncertainty_diag`]'s `warnings`.
+///
+/// Since #1823 both `_diag` forms also carry one `W_SIMULATED_FLIP_FLOP` count of the
+/// simulated individuals whose *sampled* η entered a twin-less transit / IG closed form's
+/// flip-flop regime, where it clamps and the individual's whole profile comes back as
+/// `ipred = 0`. Those rows are returned either way — the count is the only thing that says
+/// they are degenerate, which is why the row-only entry points cannot report it.
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` /
 /// `the_row_only_entry_points_stay_silent_by_contract` pin the two lists so a new entry point
 /// cannot quietly join the silent one.

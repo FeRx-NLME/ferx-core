@@ -3638,6 +3638,45 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
+/// Whether `model` is a transit / inverse-Gaussian **closed form carrying no ODE twin** —
+/// the one family whose flip-flop regime has nothing to reroute to, and so the only one
+/// that can silently return an identically-zero profile.
+///
+/// A twin-*carrying* model is rerouted per evaluation by
+/// [`crate::pk::effective_model_for_eval`] and is correct in both regimes (it is only
+/// *warned* about, #776); a non-absorption model has no flip-flop regime at all. One
+/// predicate for the three gates that share it — the η = 0 refusal
+/// ([`check_absorption_flip_flop_no_twin`]), the fit-end EBE warning
+/// ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) and the
+/// simulated-η tally ([`SimulatedFlipFlopTally`], #1823) — so a family added to one
+/// is added to all three rather than to whichever copy the author happened to read.
+pub(crate) fn twinless_absorption_closed_form(model: &CompiledModel) -> bool {
+    matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && model.absorption_ode_equivalent.is_none()
+}
+
+/// The tilting abscissa and the ODE rewrite's forcing function for `model`'s absorption
+/// family — the two strings every flip-flop message interpolates, in one place so a
+/// re-worded domain cannot reach one message and not another.
+fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'static str) {
+    match model.pk_model {
+        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
+        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
+    }
+}
+
+/// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
+/// 1-cpt model, which has a single disposition exponential and so no such edge.
+fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
+    if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
+        ", or with coincident disposition eigenvalues"
+    } else {
+        ""
+    }
+}
+
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
@@ -3661,11 +3700,7 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     theta: &[f64],
 ) -> Option<String> {
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) || model.absorption_ode_equivalent.is_some()
-    {
+    if !twinless_absorption_closed_form(model) {
         return None;
     }
     // Model-family-specific domain / ODE-forcing wording (the tilting abscissa and the
@@ -3715,15 +3750,8 @@ pub(crate) fn uncertainty_draws_skipped_warning(
     skipped: &[usize],
     n: usize,
 ) -> String {
-    let (domain, ode_fn) = match model.pk_model {
-        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
-        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
-    };
-    let confluent = if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
-        ", or with coincident disposition eigenvalues"
-    } else {
-        ""
-    };
+    let (domain, ode_fn) = absorption_flip_flop_wording(model);
+    let confluent = absorption_confluent_clause(model);
     let list = skipped
         .iter()
         .map(|k| k.to_string())
@@ -3741,6 +3769,93 @@ pub(crate) fn uncertainty_draws_skipped_warning(
         model_name = model.pk_model.canonical_name(),
         decline = twin_decline_clause(model),
     )
+}
+
+/// Per-run tally of simulated individuals whose **sampled η** entered the flip-flop regime
+/// of a twin-less transit / IG closed form, where the whole profile comes back as
+/// `ipred = 0` (#1823).
+///
+/// The three gates that existed before all sample a *fixed* η: the entry-point refusal
+/// ([`check_absorption_flip_flop_no_twin`]) evaluates η = 0 typical values, the fit-end
+/// warning ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) evaluates the
+/// fitted EBEs, and the uncertainty skip ([`uncertainty_draws_skipped_warning`], #786 /
+/// #1485) evaluates each *draw's* η = 0 θ. None of them sees the individual
+/// `simulate()` draws from N(0, Ω) whose own η pushes `ke` to or past the tilting
+/// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
+/// reroute to and returns the closed form, which clamps — so the individual contributes
+/// finite, plottable rows that are all zero, and every summary computed over them (a VPC
+/// band, a prediction interval, a mean) is pulled toward zero. Counting them is the only
+/// channel that says so.
+///
+/// [`observe`](Self::observe) is one `matches!` for every model outside this family, which
+/// is every model but a twin-less transit / IG closed form; the `total` denominator is
+/// therefore counted only for that family, and a tally that never observed one reports
+/// nothing.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SimulatedFlipFlopTally {
+    /// Individuals (subject × replicate × uncertainty draw) whose sampled η crossed.
+    crossed: usize,
+    /// Individuals simulated in all — the denominator `crossed` is reported against.
+    total: usize,
+}
+
+impl SimulatedFlipFlopTally {
+    /// Record one simulated individual, evaluated at the `η` slice the row emitter is about
+    /// to predict with (`n_eta + n_kappa` long, the κ tail zeroed by the caller).
+    ///
+    /// The predicate is [`crate::pk::absorption_flip_flop_at`] — the same one
+    /// `effective_model_for_eval` routes on — not `ipred == 0.0`: a zero prediction has
+    /// other causes (a dose of 0, an observation before the first dose), and the question
+    /// here is specifically whether the closed form's domain was left.
+    pub(crate) fn observe(
+        &mut self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        if !twinless_absorption_closed_form(model) {
+            return;
+        }
+        // A twin-less transit / IG closed form takes no IOV (rejected by
+        // `check_absorption_closed_form_support`), so `eta` is the BSV vector the
+        // prediction uses. Guard the length anyway so an unexpected shape is skipped
+        // rather than read past the end inside `pk_param_fn`.
+        if eta.len() != model.n_eta + model.n_kappa {
+            return;
+        }
+        self.total += 1;
+        if crate::pk::absorption_flip_flop_at(model, subject, theta, eta) {
+            self.crossed += 1;
+        }
+    }
+
+    /// The one `W_SIMULATED_FLIP_FLOP` warning this run owes its caller, or `None` when no
+    /// simulated individual crossed (the common case, and every non-absorption model).
+    pub(crate) fn warning(&self, model: &CompiledModel) -> Option<String> {
+        if self.crossed == 0 {
+            return None;
+        }
+        let (domain, ode_fn) = absorption_flip_flop_wording(model);
+        let confluent = absorption_confluent_clause(model);
+        Some(format!(
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals were evaluated at an η \
+             inside the flip-flop regime (disposition rate ≥ {domain}){confluent}, \
+             where the twin-less \
+             {model_name} closed form has no solution, and were predicted as an \
+             identically-zero profile. \
+             Those individuals are not missing from the output — they are zeros, so every \
+             summary taken over these rows (a VPC band, a prediction interval, a mean) is \
+             pulled toward zero; under a proportional error model their simulated DV is 0 \
+             as well. \
+             Rewrite the model as an explicit ODE `{ode_fn}` model, which reroutes per \
+             individual and is valid in both regimes.{decline}",
+            k = self.crossed,
+            n = self.total,
+            model_name = model.pk_model.canonical_name(),
+            decline = twin_decline_clause(model),
+        ))
+    }
 }
 
 /// The refusal `simulate_with_uncertainty_diag` returns when **every** one of its `n > 0`

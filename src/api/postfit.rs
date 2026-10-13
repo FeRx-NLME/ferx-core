@@ -1945,11 +1945,7 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 ) -> Option<(String, WarningEntry)> {
     // Only a twin-less transit/IG closed form can degenerate this way: a twin-carrying
     // model reroutes per-eval, a non-absorption model has no flip-flop regime.
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) || model.absorption_ode_equivalent.is_some()
-    {
+    if !crate::api::twinless_absorption_closed_form(model) {
         return None;
     }
     // Twin-less transit/IG closed forms reject IOV up front, so `eta_hats` carry exactly

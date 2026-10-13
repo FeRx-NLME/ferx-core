@@ -16,7 +16,8 @@ mod validation;
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
 pub(crate) use validation::{
-    all_uncertainty_draws_skipped_diags, uncertainty_draws_skipped_warning,
+    all_uncertainty_draws_skipped_diags, twinless_absorption_closed_form,
+    uncertainty_draws_skipped_warning, SimulatedFlipFlopTally,
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{

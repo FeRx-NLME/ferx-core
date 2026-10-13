@@ -338,6 +338,47 @@ with the flip-flop error `simulate()` gives at that θ, `E_TRANSIT_FLIP_FLOP`
 (`E_IG_FLIP_FLOP`), and so is a run in which every draw is skipped. Writing the model as an explicit ODE
 `transit()` / `igd()` model avoids the skip altogether.
 
+A draw that *survives* can still contain individuals in that regime, because the
+skip is decided at the draw's typical (η = 0) parameters. Those are counted
+separately; see
+[Individuals in the flip-flop regime](#simulated-flip-flop).
+
+## Individuals in the flip-flop regime {#simulated-flip-flop}
+
+The checks above all read a **fixed** η: every entry point refuses a model whose
+typical (η = 0) parameters are in the flip-flop regime of a twin-less transit /
+inverse-Gaussian closed form, and `simulate_with_uncertainty()` skips a
+*parameter draw* whose own typical values land there. Neither sees an individual
+whose **sampled η** pushes `ke` to or past the tilting abscissa — `KTR =
+(n+1)/mtt` for transit, `1/(2·MAT·CV²)` for inverse-Gaussian.
+
+A twin-*carrying* model reroutes such an individual to its exact ODE twin, which
+is valid in both regimes, and nothing is lost. A twin-less one has nothing to
+reroute to: the closed form clamps, and that individual's whole profile comes
+back as `ipred = 0` — finite, plottable rows that are all zero. Under a
+proportional error model its simulated DV is 0 too.
+
+The `_diag` entry points report this as one per-run count
+([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
+
+```
+W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals were evaluated at an η
+inside the flip-flop regime (disposition rate ≥ transit rate KTR = (n+1)/mtt),
+where the twin-less one_cpt_transit closed form has no solution, and were
+predicted as an identically-zero profile. ...
+```
+
+Those rows are **not** dropped, so they pull every summary taken over them — a
+VPC band, a prediction interval, a mean — toward zero. On the fixture measured
+in #1823 (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`, ω²~CL~ = 0.09),
+5.9% of simulated individuals crossed, and the 5th percentile of IPRED at t = 3
+read 0.0000 against 0.0331 on the same model with its twin.
+
+Rewrite the model as an explicit ODE `transit()` / `igd()` model: that reroutes
+per individual, so no draw is clamped. `simulate()` and `simulate_with_seed()`
+return rows only and so stay silent — use `simulate_with_options_diag()` or
+`simulate_with_uncertainty_diag()` when the count matters (a VPC, for example).
+
 ## Result Types
 
 ```rust
