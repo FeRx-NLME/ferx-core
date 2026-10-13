@@ -3449,4 +3449,72 @@ mod tests {
         let focei_se = focei.matrix.expect("floored R⁻¹")[(0, 0)].sqrt();
         assert!(focei_se > 10.0, "FOCEI keeps its own objective: {focei_se}");
     }
+
+    /// #1781: a sampler fit the quadrature route cannot serve — here four random effects, a
+    /// `7⁴ = 2401`-node grid — keeps the FOCEI objective and carries
+    /// `W_COV_QUADRATURE_DECLINED` exactly once, through the same `run_covariance_step_inner`
+    /// the finalizers call; FOCEI on the same model carries neither route message. Three
+    /// subjects keep it a Tier-1 cost: only the warnings are asserted, not the matrix.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_sampler_fit_past_the_quadrature_grid_limit_is_warned_and_stays_on_focei() {
+        use crate::estimation::cov_diagnostics::{
+            QUADRATURE_DECLINED_TOKEN, QUADRATURE_OBJECTIVE_TOKEN,
+        };
+        use crate::types::EstimationMethod as M;
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+            .expect("model file")
+            .replace(
+                "omega ETA_LAMBDA ~ 0.09",
+                "omega ETA_LAMBDA ~ 0.09\n  omega ETA_B ~ 0.05\n  omega ETA_C ~ 0.05\n  \
+                 omega ETA_D ~ 0.05",
+            )
+            .replace(
+                "scale  = TVLAMBDA * exp(ETA_LAMBDA)",
+                "scale  = TVLAMBDA * exp(ETA_LAMBDA + ETA_B + ETA_C + ETA_D)",
+            );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert_eq!(model.n_eta, 4);
+        let (full, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            "data/tte_exponential.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("data");
+        let pop = crate::types::Population {
+            subjects: full.subjects[..3].to_vec(),
+            ..full.clone()
+        };
+        let h = CovarianceMethod::Hessian;
+        let saem = step_at_init(&model, &pop, &opts_for(M::Saem, h));
+        assert_eq!(
+            count_token(&saem.warnings, QUADRATURE_DECLINED_TOKEN),
+            1,
+            "{:?}",
+            saem.warnings
+        );
+        assert_eq!(count_token(&saem.warnings, QUADRATURE_OBJECTIVE_TOKEN), 0);
+        let declined = saem
+            .warnings
+            .iter()
+            .find(|w| w.starts_with(QUADRATURE_DECLINED_TOKEN))
+            .expect("declined");
+        assert!(
+            declined.contains("4 random effects need a 7^4 = 2401-node grid"),
+            "{declined}"
+        );
+        let focei = step_at_init(&model, &pop, &opts_for(M::FoceI, h));
+        assert!(
+            !focei
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_COV_QUADRATURE")),
+            "{:?}",
+            focei.warnings
+        );
+    }
 }
