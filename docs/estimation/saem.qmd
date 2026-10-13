@@ -796,13 +796,13 @@ The exact-marginal row is computed outside ferx (brute-force quadrature over η)
 `tests/sampler_covariance_non_gaussian.rs` bands each estimator against. `s` moves too,
 because its per-subject scores are now the quadrature marginal's rather than FOCEI's. Taken at
 each sampler's *own* estimate instead, the same oracle agrees with every routed `r`, `s` and
-`rsr` SE to within 2e-3 relative — the default `fd_hessian_step` sets that, not the node
+`rsr` SE to about 2e-3 relative — the default `fd_hessian_step` sets that, not the node
 count. SAEM's
 row is the furthest off because its estimate is: its exact −2 log L is 166.879 against 166.527
 at the minimum, where IMP and IMPMAP are within 0.001.
 
 Separately, wherever R needs an eigenvalue floor (it is indefinite, or has an eigenvalue
-under `1e-10·λ_max`) at an estimate its objective was never
+under `max(1e-10·λ_max, 1e-12)`) at an estimate its objective was never
 minimised at — a SAEM, IMP, IMPMAP or VI estimate — `r` and `rsr` no longer invert the
 floored matrix (`rsr` squared the floor): the step returns `S⁻¹` instead and says so in
 `W_COV_NON_STATIONARY_ESTIMATE`, or fails with that code when S is singular too. On

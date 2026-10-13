@@ -1208,9 +1208,11 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
     let obj = objective_name(f.objective, f.quadrature_nodes);
     let method = f.method.label();
     // The floor clips every eigenvalue under `max(1e-10·λ_max, 1e-12)`, positive ones included
-    // (Codex review r1 §3), so the clause says which of the two cells this is.
+    // (Codex review r1 §3) — even a well-conditioned R whose eigenvalues are all under the
+    // absolute 1e-12 (diag(1e-13, 2e-13), condition number 2, r2) — so the clause says which of
+    // the two cells this is without calling the second one near-singular.
     let state = if f.min_eigenvalue > 0.0 {
-        "positive definite but near-singular"
+        "positive definite with eigenvalues below the numerical floor"
     } else {
         "not positive definite"
     };

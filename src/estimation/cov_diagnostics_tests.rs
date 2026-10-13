@@ -1750,17 +1750,39 @@ fn the_non_stationary_warning_says_which_of_the_two_floored_cells_r_is_in() {
     assert!(
         pd.contains(
             "the FOCEI R matrix needed an eigenvalue floor at the SAEM estimate (it is positive \
-             definite but near-singular: min eigenvalue 1.000e-11, max 1.000e0)"
+             definite with eigenvalues below the numerical floor: min eigenvalue 1.000e-11, max \
+             1.000e0)"
         ),
         "{pd}"
     );
-    assert!(!pd.contains("not positive definite"), "{pd}");
+    assert!(
+        !pd.contains("not positive definite") && !pd.contains("near-singular"),
+        "{pd}"
+    );
     let indefinite = format_non_stationary_warning(&non_stationary_facts(None));
     assert!(
         indefinite.contains("(it is not positive definite: min eigenvalue -9.510e-2"),
         "{indefinite}"
     );
-    assert!(!indefinite.contains("near-singular"), "{indefinite}");
+    assert!(
+        !indefinite.contains("below the numerical floor"),
+        "{indefinite}"
+    );
+    // The absolute-floor cell (Codex review r2): every eigenvalue under 1e-12, condition
+    // number 2 — positive definite and well-conditioned, so not "near-singular" either.
+    let absolute = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 1e-13,
+        max_eigenvalue: 2e-13,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        absolute.contains(
+            "(it is positive definite with eigenvalues below the numerical floor: min eigenvalue \
+             1.000e-13, max 2.000e-13)"
+        ),
+        "{absolute}"
+    );
+    assert!(!absolute.contains("near-singular"), "{absolute}");
     // Zero is not positive: an exactly singular R is the second cell.
     let singular = format_non_stationary_warning(&NonStationaryFacts {
         min_eigenvalue: 0.0,
@@ -1795,4 +1817,13 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
         inv.n_clipped,
         CovarianceMethod::Hessian
     ));
+    // And the absolute-floor cell: diag(1e-13, 2e-13) is clipped by `1e-12` at condition 2.
+    let tiny = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-13, 2e-13]));
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&tiny).expect("inverse");
+    assert!(
+        inv.min_eigenvalue > 0.0 && inv.n_clipped == 2,
+        "{} {}",
+        inv.min_eigenvalue,
+        inv.n_clipped
+    );
 }

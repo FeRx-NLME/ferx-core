@@ -9,6 +9,11 @@ fixed points, without moving them — the same-point anchor
 src/estimation/covariance.rs::the_sampler_points_match_the_exact_marginal_covariance reads.
 At a point that is not the minimum, R is the Hessian of the OFV in (log lambda, log omega2),
 which is a linear map of ferx's packed (log lambda, log omega), so the two agree there too.
+
+Precision: R is a central second difference of the summed OFV at h = 1e-4, S a central
+difference of each subject's -log L at h = 1e-5. Against derivatives taken under the
+integral instead (Codex review r2 on #1781), the printed SEs differ by up to ~2.5e-4
+relative (SE(omega2), R and RSR); quote them to that precision, not to their printed digits.
 """
 import math, csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1]))]
