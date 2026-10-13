@@ -1746,7 +1746,13 @@ fn accumulate_fixed_eta_packed_gradient_with_sens(
         }
     }
 
-    if n_obs == 0 {
+    // No data term at all — neither a Gaussian row nor a non-Gaussian record. `n_obs` counts
+    // only `subject.observations`, the Gaussian rows; a TTE / `[binary_model]` / CTMM subject
+    // keeps its likelihood in `obs_records`, so gating on `n_obs` alone returned the Ω block
+    // and dropped the θ score of every such subject (#1781) — the AGQ twin of #1744. That made
+    // `method = laplace` stall on `examples/tte_exponential.ferx` (OFV 166.647 under L-BFGS
+    // against 166.527 under BOBYQA) and its `S` matrix read SE(TVLAMBDA) ≈ 0.2 for ≈ 0.008.
+    if n_obs == 0 && subject.obs_records.is_empty() {
         return Some(());
     }
 
@@ -2631,6 +2637,12 @@ fn node_nll_gradient(
     eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
+    // A TTE / binary / count record has no analytic η-channel, and the inner gradient below
+    // would return the prior (plus any CTMM block) without it. Decline, so the grid response
+    // takes its finite-difference re-sweep, which scores every record (#1781).
+    if !crate::estimation::inner_optimizer::non_gaussian_eta_grad_served(model, subject) {
+        return None;
+    }
     if stack.is_iov() {
         let iov = params.omega_iov.as_ref()?;
         crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov(
@@ -5258,6 +5270,131 @@ mod tests {
                 {
                     assert_eq!(fresh.to_bits(), reused.to_bits());
                 }
+            }
+        }
+    }
+
+    /// #1781 — the AGQ twins of #1744. A subject whose records are all non-Gaussian (TTE events
+    /// in `obs_records`, no Gaussian `observations`) lost its data term from the quadrature
+    /// gradient twice over: the fixed-b score returned before its θ block whenever
+    /// `subject.observations` was empty, and the grid response contracted each node against an
+    /// inner `∂nll/∂b` that was the Ω prior alone. Two halves, both on
+    /// `examples/tte_exponential.ferx`'s 30 event-only subjects at (approximately) the exact
+    /// marginal's minimum, λ = 0.0338, ω² = 0.0715:
+    ///
+    /// 1. the fixed-b score's θ coordinate against a central difference of `Stack::nll_at`
+    ///    at a non-mode `b` — before the fix it was exactly 0 against an FD of ≈ −0.7;
+    /// 2. the population gradient against a central difference of the reconverged AGQ OFV at
+    ///    1, 3 and 7 nodes — the total derivative an optimizer and the covariance step's `S`
+    ///    consume. With the first fix alone it read (θ, ω) = (1.008, 2.441) at seven nodes
+    ///    against an FD of (0.0257, 0.0003), and (0.869, 4.727) at one node against
+    ///    (0.0109, −0.0692); before either, `method = laplace` with L-BFGS stalled at OFV
+    ///    166.647 (BOBYQA: 166.527).
+    ///
+    /// Mutation-checked: restoring the `n_obs == 0` early return kills half 1 (θ score 0 vs
+    /// FD −0.670); dropping the `non_gaussian_eta_grad_served` guard in `node_nll_gradient`
+    /// kills half 2 (0.869 vs 0.0109 at one node). Bounds are measured (Linux x86_64,
+    /// `|g − fd| / max(|fd|, 1)`): worst 1.6e-6 at three and seven nodes, bound 1e-5; at one
+    /// node 8.5e-4 on θ, bound 2e-3. The one-node gap was not isolated here; the exact-anchor
+    /// Hessian of a TTE subject is itself finite-differenced, whose θ-roughness #1778
+    /// measured, and is the likeliest source.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn an_event_only_subject_keeps_its_theta_score() {
+        use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+        let model = parse_model_string(
+            &src.replace("theta TVLAMBDA(0.05,", "theta TVLAMBDA(0.0338,")
+                .replace("omega ETA_LAMBDA ~ 0.09", "omega ETA_LAMBDA ~ 0.0715"),
+        )
+        .expect("parse");
+        let (pop, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            "data/tte_exponential.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("data");
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let fixed = packed_fixed_mask(template);
+        let params = unpack_params(&x, template);
+        assert!(
+            pop.subjects
+                .iter()
+                .all(|s| s.observations.is_empty() && !s.obs_records.is_empty()),
+            "precondition: every subject is event-only"
+        );
+
+        // Half 1 — the fixed-b score.
+        let subject = &pop.subjects[0];
+        let stack = Stack::new(&model, &params, 0);
+        let b = [0.3];
+        let mut g = vec![0.0; x.len()];
+        accumulate_fixed_eta_packed_gradient(
+            &model, subject, &params, template, &stack, &b, 1.0, &mut g,
+        )
+        .expect("score");
+        let mut scratch = crate::pk::EventPkParams::default();
+        let mut nll = |xv: &[f64]| {
+            let p = unpack_params(xv, template);
+            Stack::new(&model, &p, 0).nll_at(&model, subject, &p, &b, &mut scratch, None)
+        };
+        let h = 1e-6 * (1.0 + x[0].abs());
+        let (mut xp, mut xm) = (x.clone(), x.clone());
+        xp[0] += h;
+        xm[0] -= h;
+        let fd = (nll(&xp) - nll(&xm)) / (2.0 * h);
+        assert!(
+            fd.abs() > 0.1,
+            "precondition: θ moves this subject's likelihood: {fd}"
+        );
+        assert!(
+            (g[0] - fd).abs() < 1e-9 * fd.abs().max(1.0),
+            "θ score {} vs FD {fd}",
+            g[0]
+        );
+
+        // Half 2 — the population gradient against the reconverged objective.
+        let ofv = |xv: &[f64], n: usize| {
+            let p = unpack_params(xv, template);
+            let (e, _, _, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+                &model, &pop, &p, 500, 1e-12, None, None, 0, 0,
+            );
+            2.0 * agq_population_nll(&model, &pop, &p, &e, &[], n, HessianAnchor::Exact)
+        };
+        let (ehs, _, _, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        for (n, tol) in [(1usize, 2e-3), (3, 1e-5), (7, 1e-5)] {
+            let g = agq_population_gradient(
+                &model,
+                &pop,
+                &params,
+                template,
+                &x,
+                &ehs,
+                &[],
+                n,
+                HessianAnchor::Exact,
+            )
+            .expect("gradient");
+            for k in (0..x.len()).filter(|&k| !fixed[k]) {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let (mut xp, mut xm) = (x.clone(), x.clone());
+                xp[k] += h;
+                xm[k] -= h;
+                let fd = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
+                assert!(g[k].is_finite() && fd.is_finite(), "n = {n}, coord {k}");
+                let err = (g[k] - fd).abs() / fd.abs().max(1.0);
+                eprintln!(
+                    "n = {n}, coord {k}: gradient {:.8} FD {fd:.8} rel {err:.2e}",
+                    g[k]
+                );
+                assert!(err < tol, "n = {n}, coord {k}: {} vs FD {fd}", g[k]);
             }
         }
     }

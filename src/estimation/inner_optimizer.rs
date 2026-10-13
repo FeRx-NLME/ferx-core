@@ -2734,6 +2734,18 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
     }
 }
 
+/// Whether [`analytic_eta_nll_gradient_with_schedule`] serves **every** non-Gaussian term
+/// `subject` carries: none at all, or only CTMM state records its exact program covers.
+///
+/// That function assumes the answer is yes — for a subject with no Gaussian rows it returns
+/// the Ω prior plus the CTMM block and nothing else — so a caller that can reach it with a
+/// TTE, `[binary_model]` or count record must ask first. The inner loop does, through
+/// [`analytic_inner_grad_supported`]; AGQ's per-node `∂nll/∂b` asks directly (#1781), since
+/// it had been contracting the grid response against a gradient missing the whole event term.
+pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subject) -> bool {
+    !subject_has_survival_records(subject) || ctmm_records_fully_analytic(model, subject)
+}
+
 /// Whether **every** non-Gaussian record on this subject is a CTMM state observation that
 /// the analytic path can serve exactly (#759) — i.e. the subject's whole non-Gaussian data
 /// term is `−Σ log P(Δt)[s,s']` on a time-homogeneous generator with a dual-evaluable
@@ -2877,7 +2889,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // demands that *every* record on the subject be a CTMM state observation the program
     // can serve, so a subject that also carries a TTE / binary / count record (whose terms
     // remain FD-only) still declines the whole gradient rather than silently omitting them.
-    if subject_has_survival_records(subject) && !ctmm_records_fully_analytic(model, subject) {
+    if !non_gaussian_eta_grad_served(model, subject) {
         return false;
     }
     // No Gaussian observations ⇒ no Gaussian data term, hence nothing for the PK provider
