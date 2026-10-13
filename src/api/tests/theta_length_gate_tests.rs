@@ -449,6 +449,9 @@ fn the_survival_predictors_refuse_what_predict_diag_refuses() {
         }
     }
     pop.covariate_names.retain(|c| c != "X");
+    // "The data lacks X": drop the header too. Left in `input_columns`, `X` reads as a
+    // header the reader skipped and gets #1936's "in the data but not read" text instead.
+    pop.input_columns.retain(|c| c != "X");
     let e = predict_categorical(&bin.model, &pop, &bin.model.default_params)
         .expect_err("predict_categorical, no X");
     assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");

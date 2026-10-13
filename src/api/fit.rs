@@ -26,6 +26,7 @@ use crate::stats::residual_error::{
     compute_iwres_with_correlations, compute_r_matrix_with_correlations,
     compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
 };
+use crate::stats::stacked_layout::stacked_width;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -848,10 +849,10 @@ fn fit_unstamped(
             let max_occ = population
                 .subjects
                 .iter()
-                .map(|s| crate::stats::likelihood::iov_occasion_groups(s).len())
+                .map(|s| crate::stats::stacked_layout::group_count(s))
                 .max()
                 .unwrap_or(0);
-            let d = model.n_eta + max_occ * model.n_kappa;
+            let d = stacked_width(model.n_eta, model.n_kappa, max_occ);
             let grid = crate::estimation::agq::grid_size(n_nodes, d);
             if grid > crate::estimation::agq::MAX_AGQ_GRID {
                 let label = if matches!(method, EstimationMethod::Laplace) {
@@ -897,6 +898,13 @@ fn fit_unstamped(
     //     problem balloons; warn so the multiplication isn't silent.
     if derive_occ {
         // Distinct occasion labels seen across observations and doses, per subject.
+        // Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
+        // (#1876): a derived rule is monotone in time, so on a subject whose observations
+        // and doses share one occasion such a row lies before or after all of them. Its κ is
+        // then at most weakly informed: only when a second such row lies between it and the
+        // first dose or observation, and the model has an `init(...)` baseline, does it
+        // govern a non-empty interval on nonzero state. Counting it would let the
+        // unidentifiable case below through, so the check errs on the conservative side.
         let distinct_occ = |s: &Subject| -> usize {
             let mut occs: Vec<u32> = s.occasions.clone();
             occs.extend_from_slice(&s.dose_occasions);

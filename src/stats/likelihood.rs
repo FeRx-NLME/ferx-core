@@ -2523,20 +2523,20 @@ pub fn foce_subject_nll_iov(
         );
     }
 
-    let occ_groups = iov_occasion_groups(subject);
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
+    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_iov, subject);
     // Defensive: the EBE pipeline always yields exactly one κ vector per
     // occasion group, each of width n_iov. A mismatch would silently leave the
     // unmatched occasions' ipreds (and H columns) at 0.0 and score the
     // augmented marginal against wrong predictions, so bail with the large
     // finite sentinel — mirroring the guards in `individual_nll_iov`.
-    if kappas.len() != occ_groups.len() || kappas.iter().any(|k| k.len() != n_iov) {
+    if kappas.len() != layout.n_groups() || kappas.iter().any(|k| k.len() != n_iov) {
         return 1e20;
     }
-    let k_occ = occ_groups.len();
-    let n_b = n_eta + k_occ * n_iov;
+    let k_occ = layout.n_groups();
+    let n_b = layout.n_stacked();
 
     // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
     // (proper cross-occasion carryover; issue #104), plus the augmented
@@ -2560,7 +2560,7 @@ pub fn foce_subject_nll_iov(
     let mut kpert = kappa_slices.clone();
     const EPS: f64 = 1e-6;
     for k in 0..k_occ {
-        let col_base = n_eta + k * n_iov;
+        let col_base = layout.kappa_offset(k);
         for ki in 0..n_iov {
             let orig = kpert[k][ki];
             let step = EPS * (1.0 + orig.abs());
@@ -2583,7 +2583,7 @@ pub fn foce_subject_nll_iov(
     }
     for (k, kap) in kappas.iter().enumerate() {
         for ki in 0..n_iov {
-            b_hat[n_eta + k * n_iov + ki] = kap[ki];
+            b_hat[layout.kappa_offset(k) + ki] = kap[ki];
         }
     }
 
@@ -2591,7 +2591,7 @@ pub fn foce_subject_nll_iov(
     // `from_matrix` regularises if a sub-block is not PD, matching the
     // robustness of the non-IOV OmegaMatrix path; the standard/interaction
     // FOCE routines below read only `Σ_b.matrix`.
-    let sigma_b_mat = build_block_diag_omega(&omega_bsv.matrix, &omega_iov.matrix, k_occ);
+    let sigma_b_mat = layout.prior(&omega_bsv.matrix, &omega_iov.matrix);
     let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
 
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
@@ -2994,10 +2994,20 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// empty observation-index list. This preserves existing stacked-kappa ordering for the
 /// common case while assigning dose-only occasions their own axes, so dose carryover into
 /// later observations can be differentiated analytically.
+///
+/// Occasions carried only by pk-only rows (`EVID=2` / `EVID=0, MDV=1`,
+/// `Subject::pk_only_occasions`) come last, in file order, also with an empty list. Such a
+/// row runs `$PK` under its own occasion (#1876) and governs the interval ending at it, so
+/// its κ moves every later prediction; NONMEM gives that occasion an `ETA` like any other.
+/// Without a group here the row would fall back to κ = 0.
 pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut groups = split_obs_by_occasion(subject);
     let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
-    for &occ in &subject.dose_occasions {
+    for &occ in subject
+        .dose_occasions
+        .iter()
+        .chain(&subject.pk_only_occasions)
+    {
         if seen.insert(occ) {
             groups.push((occ, Vec::new()));
         }
@@ -3018,10 +3028,10 @@ pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashM
 }
 
 /// The combined effect vector `[η_bsv, κ_g]` for occasion group `g`, sliced from a
-/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The **single source** of the κ-axis offset
-/// (`base = n_eta + g·n_kappa`) so the closed-form and ODE IOV providers cannot seed κ onto
-/// different axes — a change to the stacked layout now touches one place (#466 review
-/// round 2).
+/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The κ-axis offset itself is owned by
+/// `stats::stacked_layout` (`kappa_offset`, #1082); this keeps its public signature and
+/// delegates there, so the closed-form and ODE IOV providers cannot seed κ onto different
+/// axes (#466 review round 2).
 pub fn iov_combined_effect(
     stacked_eta: &[f64],
     n_eta: usize,
@@ -3030,16 +3040,19 @@ pub fn iov_combined_effect(
 ) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
-    let base = n_eta + g * n_kappa;
+    let base = crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g);
     c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
     c
 }
 
-/// The combined effect vector `[η_bsv, 0…0]` for an **EVID=2 pk-only** event — the κ=0
-/// counterpart of [`iov_combined_effect`]. Pk-only breakpoints carry no occasion, so their
-/// IOV κ block is held at zero (matching production `predict_iov`'s `combined_for(u32::MAX)`
-/// branch). Shares the stacked-η layout with [`iov_combined_effect`] so the closed-form and
-/// ODE IOV providers cannot seed the κ=0 block differently (#598 review).
+/// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
+/// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
+/// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
+/// for one with no resolvable occasion, an unlabelled in-memory row on a subject where no
+/// record carries a label (matching production `predict_iov`'s
+/// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
+/// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
+/// review).
 pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
@@ -3054,26 +3067,7 @@ pub fn build_block_diag_omega(
     omega_iov: &DMatrix<f64>,
     n_occasions: usize,
 ) -> DMatrix<f64> {
-    let n_bsv = omega_bsv.nrows();
-    let n_iov = omega_iov.nrows();
-    let n_total = n_bsv + n_occasions * n_iov;
-    let mut m = DMatrix::zeros(n_total, n_total);
-    // BSV block
-    for i in 0..n_bsv {
-        for j in 0..n_bsv {
-            m[(i, j)] = omega_bsv[(i, j)];
-        }
-    }
-    // K copies of IOV block
-    for k in 0..n_occasions {
-        let offset = n_bsv + k * n_iov;
-        for i in 0..n_iov {
-            for j in 0..n_iov {
-                m[(offset + i, offset + j)] = omega_iov[(i, j)];
-            }
-        }
-    }
-    m
+    crate::stats::stacked_layout::block_diag_stack(omega_bsv, omega_iov, n_occasions)
 }
 
 /// IOV-aware individual NLL: uses per-occasion kappas.
@@ -3322,6 +3316,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -3817,6 +3812,21 @@ mod tests {
         assert_eq!(groups[1], (2, vec![3, 4, 5]));
         assert_eq!(groups[2], (3, Vec::new()));
         assert_eq!(groups[3], (4, Vec::new()));
+    }
+
+    /// An occasion only pk-only rows carry gets a group too, after the dose-only ones and
+    /// in file order; one an observation or a dose already carries does not get a second.
+    #[test]
+    fn test_iov_occasion_groups_appends_pk_only_occ() {
+        let mut subj = make_simple_subject();
+        subj.dose_occasions = vec![1, 3];
+        subj.pk_only_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        subj.pk_only_occasions = vec![6, 2, 5, 3, 6, 1];
+        let groups = iov_occasion_groups(&subj);
+        let ids: Vec<u32> = groups.iter().map(|(occ, _)| *occ).collect();
+        assert_eq!(ids, vec![1, 2, 3, 6, 5]);
+        assert_eq!(groups[3], (6, Vec::new()));
+        assert_eq!(groups[4], (5, Vec::new()));
     }
 
     #[test]
@@ -4478,6 +4488,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 100],
             obs_records: vec![],
         };
@@ -4667,6 +4678,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0],
             obs_records: vec![],
         };

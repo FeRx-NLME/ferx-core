@@ -29,6 +29,7 @@
 //! so a full averaging window is collected *after* settling before breaking. Otherwise
 //! early stopping would simply trade under-convergence for a noisy last iterate.
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::DVector;
 
 use crate::estimation::nn_reg::NnRegularizer;
@@ -447,7 +448,7 @@ fn build_families(
 ) -> Vec<Box<dyn VariationalFamily>> {
     k_occasions
         .iter()
-        .map(|&k| build_family(kind, n_eta + k * n_kappa))
+        .map(|&k| build_family(kind, stacked_width(n_eta, n_kappa, k)))
         .collect()
 }
 
@@ -975,7 +976,7 @@ pub fn run_vi(
         kappa_means.push(
             (0..k_occasions[i])
                 .map(|g| {
-                    let off = n_eta + g * n_kappa;
+                    let off = kappa_offset(n_eta, n_kappa, g);
                     (0..n_kappa).map(|c| mu[off + c]).collect()
                 })
                 .collect(),

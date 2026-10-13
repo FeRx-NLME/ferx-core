@@ -1006,6 +1006,7 @@ fn oral_subject(times: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -1766,6 +1767,7 @@ fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -2672,6 +2674,7 @@ fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
         occasions: vec![1; n],
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
         obs_l2: Vec::new(),
@@ -3210,6 +3213,7 @@ fn subject_with_doses_and_resets(
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -5125,6 +5129,7 @@ fn ode_lagtime_full_sens_matches_analytical_twin() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -6032,6 +6037,7 @@ fn tvcov_subject(
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -7146,9 +7152,109 @@ fn iov_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
+}
+
+/// `dose_pk_snapshots` (the per-dose PK the IOV covariance sweep bounds its kinks with)
+/// must give every dose the κ of **its own** occasion group — including the **last**
+/// group, whose κ block ends exactly at `b.len()` (#1937: the `<=` boundary of the guard
+/// was untested, so `<` silently handed the last group's doses κ = 0). The κ sits on the
+/// lag, so a wrong κ moves a dose's arrival time, i.e. the kink the sweep must not cross.
+///
+/// Groups, in stacked order: obs occasions 1 and 2, then dose-only occasion 3 (the last).
+/// A fourth dose carries no occasion label and must read κ = 0, as must the last group
+/// when `b` is one entry short (no panic).
+#[test]
+fn dose_pk_snapshots_give_each_dose_its_own_groups_kappa_including_the_last() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_IOV).expect("parse IOV + lag");
+    let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
+    assert_eq!((n_eta, n_kappa), (2, 1));
+    let mut subject = iov_subject();
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(48.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(60.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    // Three labelled doses; the fourth has no entry, so it reads occasion "none".
+    subject.dose_occasions = vec![1, 2, 3];
+    let groups: Vec<u32> = crate::stats::likelihood::iov_occasion_groups(&subject)
+        .iter()
+        .map(|(occ, _)| *occ)
+        .collect();
+    assert_eq!(
+        groups,
+        vec![1, 2, 3],
+        "occasion 3 is the last, dose-only group"
+    );
+
+    let theta = model.default_params.theta.clone();
+    let eta = [0.1, -0.05];
+    // Distinct, non-zero κ per group, written at the literal pre-#1082 offsets.
+    let kappas = [0.3, -0.4, 0.7];
+    let mut b = eta.to_vec();
+    b.extend_from_slice(&kappas);
+    assert_eq!(b.len(), n_eta + groups.len() * n_kappa);
+
+    let at = |kappa: f64, k: usize| {
+        let combined = [eta[0], eta[1], kappa];
+        (model.pk_param_fn)(
+            &theta,
+            &combined,
+            subject.dose_cov(k),
+            subject.doses[k].time,
+        )
+        .values
+    };
+    let bits = |v: [f64; crate::types::MAX_PK_PARAMS]| v.map(f64::to_bits);
+
+    let snaps = dose_pk_snapshots(&model, &subject, &theta, &b, true);
+    assert_eq!(snaps.len(), 4);
+    for (k, (&kappa, name)) in kappas
+        .iter()
+        .zip(["occasion 1", "occasion 2", "occasion 3 (last group)"])
+        .enumerate()
+    {
+        assert_eq!(
+            bits(snaps[k].values),
+            bits(at(kappa, k)),
+            "dose {k}, {name}: own κ"
+        );
+    }
+    assert_eq!(
+        bits(snaps[3].values),
+        bits(at(0.0, 3)),
+        "unlabelled dose: κ = 0"
+    );
+    // Straddle: κ = 0 would give the last group's dose a different snapshot, so the
+    // assertion above can tell the two apart.
+    assert_ne!(
+        bits(at(kappas[2], 2)),
+        bits(at(0.0, 2)),
+        "the last group's κ must move its dose's PK, or the test cannot see a κ = 0 read"
+    );
+
+    // One entry short: the last group's block no longer fits → κ = 0, no panic; the
+    // earlier groups still read theirs.
+    let short = dose_pk_snapshots(&model, &subject, &theta, &b[..b.len() - 1], true);
+    assert_eq!(
+        bits(short[0].values),
+        bits(at(kappas[0], 0)),
+        "short b: occasion 1"
+    );
+    assert_eq!(
+        bits(short[1].values),
+        bits(at(kappas[1], 1)),
+        "short b: occasion 2"
+    );
+    assert_eq!(
+        bits(short[2].values),
+        bits(at(0.0, 2)),
+        "short b: last group → κ = 0"
+    );
 }
 
 /// Closed-form **IOV × lagtime** (#486). Before this the CF IOV walk declined *any*
@@ -7234,6 +7340,7 @@ fn ss_bolus_lag_iov_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -8784,6 +8891,7 @@ fn ode_iov_above_legacy_axis_cap_body() {
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -8864,6 +8972,7 @@ fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -11142,7 +11251,8 @@ fn ode_iov_init_first_order_provider_matches_fd_of_predict_iov() {
 fn ode_iov_static_cov_pkonly_breakpoint_matches_fd_of_predict_iov() {
     let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
     let mut subject = iov_subject();
-    // EVID=2 breakpoint at t=18 (occasion 2), no covariate snapshot → static-cov path.
+    // Unlabelled EVID=2 breakpoint at t=18, so under the t = 12 record's occasion 1
+    // (#1876); no covariate snapshot → static-cov path.
     subject.pk_only_times = vec![18.0];
     assert!(
         subject.pk_only_covariates.is_empty() && !subject.has_tv_covariates(),
@@ -11473,6 +11583,7 @@ fn iov_reset_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -11732,9 +11843,10 @@ const WARFARIN_IOV_TVCOV_3CPT: &str = r#"
 /// Two-occasion IOV subject with a WT covariate that varies across records
 /// (occasion-1 doses/obs at a lighter weight, occasion-2 heavier), so the
 /// individual `CL` switches both by κ (occasion) and by WT (covariate). When
-/// `pk_only` is set, an EVID=2 covariate breakpoint (WT jump at t=18, no
-/// occasion) sits between the occasion-2 observations — exercising the κ=0
-/// `pk_only` source on the IOV+TV-cov path.
+/// `pk_only` is set, an EVID=2 covariate breakpoint (WT jump at t=18, unlabelled)
+/// sits between the occasion-1 and occasion-2 observations — exercising the
+/// `pk_only` source on the IOV+TV-cov path. Unlabelled, it runs under the t = 12
+/// record's occasion 1 (#1876; `check_pk_only_row_takes_its_own_kappa` covers labels).
 fn iov_tvcov_subject(pk_only: bool) -> Subject {
     let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
@@ -11767,6 +11879,7 @@ fn iov_tvcov_subject(pk_only: bool) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -11793,9 +11906,9 @@ fn iov_tvcov_provider_matches_fd_of_predict_iov() {
 }
 
 /// 1-cpt oral IOV + TV-cov **with an EVID=2 covariate breakpoint**: a WT jump
-/// carried by a `pk_only` record (no occasion → κ fixed at 0) between the
-/// occasion-2 observations. Exercises the new `pk_only` source on the IOV path,
-/// which the previous code bailed out of.
+/// carried by an unlabelled `pk_only` record (so under the t = 12 record's
+/// occasion, #1876) between the occasion-1 and occasion-2 observations. Exercises
+/// the `pk_only` source on the IOV path, which the previous code bailed out of.
 #[test]
 fn iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
     let model = parse_model_string(WARFARIN_IOV_TVCOV).expect("parse warfarin IOV+TVcov");
@@ -11810,6 +11923,169 @@ fn iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
         &subject,
         &[0.2, 10.0, 1.5, 0.75],
         &[0.12, -0.08, 0.20, 0.05, -0.10],
+    );
+}
+
+/// #1876 on every IOV engine branch. `base` gets a pk-only row at t = 9, between the
+/// occasion-1 observations at 6 and 12, so it governs `(6, 9]`. The t = 12 observation
+/// then depends on occasion 2's κ through that row alone, and only when the row runs
+/// under its own `OCC = 2`:
+///
+/// | labelling | groups | `∂pred(12)/∂κ₂` | `∂pred(12)/∂κ₉` |
+/// |---|---|---|---|
+/// | own `OCC = 2` | 2 | live | — |
+/// | none (in-memory; the scan picks the t = 6 record, occasion 1) | 2 | exactly 0 | — |
+/// | `OCC = 9`, which only the row carries | 3 | exactly 0 | live |
+///
+/// Occasion 9 gets the third κ group, since `iov_occasion_groups` appends the occasions
+/// only pk-only rows carry. Before that it had none, and the row ran under κ = 0.
+///
+/// Each side is asserted on its own, so a reverted site names itself: production
+/// (`predict_iov` under a κ step), the outer `Dual2` jet and the inner `Dual1` gradient.
+/// Then the whole jet is checked against FD of `predict_iov`. `cov` is the row's WT
+/// snapshot; `None` leaves `pk_only_covariates` empty, which is the static-source branch.
+fn check_pk_only_row_takes_its_own_kappa(
+    model: &CompiledModel,
+    base: Subject,
+    cov: Option<f64>,
+    theta: &[f64],
+    stacked: &[f64],
+) {
+    let mut subject = base;
+    subject.pk_only_times = vec![9.0];
+    subject.pk_only_covariates = cov.map(wt_map).into_iter().collect();
+    assert_eq!(subject.obs_times[1..3], [6.0, 12.0], "fixture layout");
+    assert_eq!(subject.occasions[1..3], [1, 1], "fixture layout");
+    let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
+    let kappa_cl = model
+        .kappa_names
+        .iter()
+        .position(|n| n == "KAPPA_CL")
+        .expect("KAPPA_CL declared");
+    let axis_of = |g: usize| n_eta + g * n_kappa + kappa_cl;
+    for (label, occ, n_groups, live) in [
+        ("own OCC 2", Some(2u32), 2, Some(1)),
+        ("unlabelled", None, 2, None),
+        ("OCC 9, only the row carries it", Some(9), 3, Some(2)),
+    ] {
+        let mut s = subject.clone();
+        s.pk_only_occasions = occ.into_iter().collect();
+        assert_eq!(
+            crate::stats::likelihood::iov_occasion_groups(&s).len(),
+            n_groups,
+            "{label}: κ groups"
+        );
+        // A third group's κ is nonzero, like the other two.
+        let mut st0 = stacked.to_vec();
+        st0.extend(std::iter::repeat_n(0.07, (n_groups - 2) * n_kappa));
+        let kappas_of = |st: &[f64]| -> Vec<Vec<f64>> {
+            (0..n_groups)
+                .map(|g| st[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa].to_vec())
+                .collect()
+        };
+        let pred =
+            |st: &[f64]| crate::pk::predict_iov(model, &s, theta, &st[..n_eta], &kappas_of(st))[2];
+        let outer = subject_sensitivities_iov(model, &s, theta, &st0).expect("outer supported");
+        let inner = subject_eta_grad_iov(model, &s, theta, &st0).expect("inner supported");
+        // Every group after occasion 1's is live only if the row runs under it.
+        for g in 1..n_groups {
+            let is_live = live == Some(g);
+            // Production.
+            let mut stepped = st0.clone();
+            stepped[axis_of(g)] += 0.1;
+            let (p0, p1) = (pred(&st0), pred(&stepped));
+            assert!(
+                p0.is_finite() && p1.is_finite(),
+                "{label}: production {p0}, {p1}"
+            );
+            if is_live {
+                assert!(
+                    (p1 - p0).abs() > 1e-4 * p0.abs(),
+                    "{label}: production predict_iov ignores group {g}'s κ at t = 12 ({p0} → {p1})"
+                );
+            } else {
+                assert_eq!(
+                    p0.to_bits(),
+                    p1.to_bits(),
+                    "{label}: production predict_iov let group {g}'s κ reach t = 12"
+                );
+            }
+            // The two dual providers, each on its own.
+            for (side, d) in [
+                ("outer Dual2", outer.obs[2].df_deta[axis_of(g)]),
+                ("inner Dual1", inner[2].df_deta[axis_of(g)]),
+            ] {
+                assert!(d.is_finite(), "{label}: {side} {d}");
+                if is_live {
+                    assert!(
+                        d.abs() > 1e-4 * p0.abs(),
+                        "{label}: {side} ∂pred(12)/∂κ of group {g} = {d}, the pk-only row did \
+                         not seed it"
+                    );
+                } else {
+                    assert_eq!(d, 0.0, "{label}: {side} let group {g}'s κ reach t = 12");
+                }
+            }
+        }
+        eprintln!("pk-only labelling: {label}");
+        check_iov_provider_vs_fd(model, &s, theta, &st0);
+        check_iov_inner_matches_outer(model, &s, theta, &st0);
+    }
+}
+
+#[test]
+fn iov_pk_only_row_takes_its_own_kappa_closed_form_per_event() {
+    let model = parse_model_string(WARFARIN_IOV_TVCOV).expect("parse warfarin IOV+TVcov");
+    assert!(iov_analytical_supported(&model));
+    check_pk_only_row_takes_its_own_kappa(
+        &model,
+        iov_tvcov_subject(false),
+        Some(75.0),
+        &[0.2, 10.0, 1.5, 0.75],
+        &[0.12, -0.08, 0.20, 0.05, -0.10],
+    );
+}
+
+#[test]
+fn iov_pk_only_row_takes_its_own_kappa_closed_form_static() {
+    let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+    assert!(iov_analytical_supported(&model));
+    let base = iov_subject();
+    assert!(!base.has_tv_covariates(), "static-source branch");
+    check_pk_only_row_takes_its_own_kappa(
+        &model,
+        base,
+        None,
+        &[0.2, 10.0, 1.5],
+        &[0.12, -0.08, 0.20, 0.05, -0.10],
+    );
+}
+
+#[test]
+fn iov_pk_only_row_takes_its_own_kappa_ode_per_event() {
+    let model = parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov");
+    assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+    check_pk_only_row_takes_its_own_kappa(
+        &model,
+        iov_tvcov_subject(false),
+        Some(75.0),
+        &[0.2, 10.0, 0.75],
+        &[0.12, -0.08, 0.05, -0.10],
+    );
+}
+
+#[test]
+fn iov_pk_only_row_takes_its_own_kappa_ode_static() {
+    let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+    assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+    let base = iov_subject();
+    assert!(!base.has_tv_covariates(), "static-source branch");
+    check_pk_only_row_takes_its_own_kappa(
+        &model,
+        base,
+        None,
+        &[0.2, 10.0],
+        &[0.12, -0.08, 0.05, -0.10],
     );
 }
 
@@ -13421,6 +13697,7 @@ fn iov_subject_with_occasions(k: usize) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions,
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -13776,6 +14053,7 @@ fn transit_iov_walk_subject() -> Subject {
         obs_l2: vec![],
         dose_occasions: doses.iter().map(|&(_, o, _)| o).collect(),
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
     }

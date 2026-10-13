@@ -17,6 +17,8 @@ An **occasion** is a distinct time window during which the same kappa value appl
 - **From the data** — an integer column (e.g. `OCC`) named via `iov_column` in `[fit_options]`.
 - **From the model** — a rule (`iov_occasion = dose` or `iov_occasion = time(...)`) that derives the occasion of each row from its timeline, so you do not have to precompute an occasion column. See [Declaring occasions in the model](#declaring-occasions-in-the-model).
 
+**Every record runs under its own occasion**, including the rows that are neither a dose nor a scored observation: an `EVID=2` row, an `EVID=0` row with `MDV=1`, and a reset (`EVID=3`/`4`). Under the end-of-interval rule such a row governs the interval that ends at it, so its occasion's κ is the one in force over that interval. NONMEM runs `$PK` on these rows the same way (#1133, #1876). An occasion that only `EVID=2` or `MDV=1` rows carry gets a κ of its own, like one that only doses carry: it is informed through the interval the row governs, and a row after the subject's last observation leaves the objective unchanged. A subject built in memory without per-row labels for them takes the occasion of the last labelled record before the row.
+
 ### Kappa parameters
 
 **Kappa** (κ) is the IOV random effect, analogous to eta (η) for BSV. Each kappa is drawn independently per occasion:
@@ -371,7 +373,7 @@ This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `
 
 **Clock.** Both rules bucket observations *and* doses on ferx's internal event clock — the same monotonic timeline the solver integrates on. For reset-stacked subjects (`EVID=3/4`, where the data-file `TIME` restarts each period) that clock keeps advancing across the reset, so `time(...)` breakpoints separate the periods correctly and each dose stays in the same occasion as its co-timed observations.
 
-**Identifiability.** A rule that yields only one occasion for every subject (e.g. `time(...)` breakpoints outside the sampling window, or `dose` on single-dose subjects) leaves kappa confounded with between-subject variability, so `fit()` errors — set breakpoints inside the sampling window, use `dose` on a multiple-dose design, or supply an `iov_column`. On the other end, `dose` on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer `time(...)` windows there. If the model declares no `kappa`, `iov_occasion` has no effect and a warning says so.
+**Identifiability.** A rule that yields only one occasion for every subject (e.g. `time(...)` breakpoints outside the sampling window, or `dose` on single-dose subjects) leaves kappa confounded with between-subject variability, so `fit()` errors. The count is over doses and observations: an `EVID=2` or `MDV=1` row that a breakpoint puts in an occasion of its own lies before or after all of them, so its κ informs nothing and does not lift the error. Set breakpoints inside the sampling window, use `dose` on a multiple-dose design, or supply an `iov_column`. On the other end, `dose` on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer `time(...)` windows there. If the model declares no `kappa`, `iov_occasion` has no effect and a warning says so.
 
 ## Algorithm Details
 
@@ -477,6 +479,6 @@ That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's 
 |---------|--------|------|
 | Diagonal IOV | `OMEGA BLOCK(n) SAME` with one kappa per block | `kappa NAME ~ variance` (Option A) |
 | Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |
-| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]` |
+| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]`; `OCC` can also be read in `[individual_parameters]` (`if (OCC == 2) …`), no `[covariates]` declaration needed |
 | Occasion from model | `IF(TIME.LT.24) OCC=1` logic in `$PK` | `iov_occasion = dose` or `time(...)` in `[fit_options]` |
 | Kappa in PK | `ETA(n)` with `SAME` block | `KAPPA_xxx` in `[individual_parameters]` |

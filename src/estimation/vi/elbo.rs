@@ -32,6 +32,7 @@
 //! function of `(x, φ)`, which is what makes the finite-difference parity tests
 //! exact rather than noisy.
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -46,7 +47,7 @@ use crate::estimation::inner_optimizer::{
 };
 use crate::estimation::parameterization::{lower_tri_iter, theta_packs_log, unpack_params};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{iov_occasion_groups, obs_nll_subject_into};
+use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::{
     BloqMethod, CompiledModel, ErrorModel, ErrorSpec, ModelParameters, OmegaMatrix, Population,
     Subject,
@@ -217,7 +218,7 @@ pub fn stacked_prior(
 
     let n_eta = omega.dim();
     let n_kappa = iov.dim();
-    let d = n_eta + k_occasions * n_kappa;
+    let d = stacked_width(n_eta, n_kappa, k_occasions);
 
     let mut m = DMatrix::zeros(d, d);
     let mut mask = DMatrix::from_element(d, d, false);
@@ -228,7 +229,7 @@ pub fn stacked_prior(
         }
     }
     for g in 0..k_occasions {
-        let off = n_eta + g * n_kappa;
+        let off = kappa_offset(n_eta, n_kappa, g);
         for i in 0..n_kappa {
             for j in 0..n_kappa {
                 m[(off + i, off + j)] = iov.matrix[(i, j)];
@@ -649,7 +650,7 @@ pub(crate) fn subject_k_occasions(model: &CompiledModel, subject: &Subject) -> u
     if model.n_kappa == 0 {
         0
     } else {
-        iov_occasion_groups(subject).len()
+        crate::stats::stacked_layout::group_count(subject)
     }
 }
 
@@ -667,7 +668,7 @@ fn split_stacked(
     }
     let kappas = (0..k_occasions)
         .map(|g| {
-            let off = n_eta + g * n_kappa;
+            let off = kappa_offset(n_eta, n_kappa, g);
             z[off..off + n_kappa].to_vec()
         })
         .collect();
@@ -702,7 +703,7 @@ fn subject_terms(
     let d = family.n_eta();
     debug_assert_eq!(
         d,
-        n_eta + k_occasions * n_kappa,
+        stacked_width(n_eta, n_kappa, k_occasions),
         "family dimension must match this subject's stacked vector"
     );
     let s = cfg.n_mc_samples.max(1);
@@ -920,7 +921,7 @@ pub fn population_neg_elbo(
             let k_occ = (t.d_omega.nrows().saturating_sub(n_eta)) / n_kappa.max(1);
             let mut d_iov = DMatrix::<f64>::zeros(n_kappa, n_kappa);
             for g in 0..k_occ {
-                let off = n_eta + g * n_kappa;
+                let off = kappa_offset(n_eta, n_kappa, g);
                 d_iov += t.d_omega.view((off, off), (n_kappa, n_kappa));
             }
             chain_omega_grad(
@@ -1048,7 +1049,7 @@ pub fn closed_form_omega(
         }
         let k = k_occasions.get(i).copied().unwrap_or(0);
         for g in 0..k {
-            let off = n_eta + g * n_kappa;
+            let off = kappa_offset(n_eta, n_kappa, g);
             let mu_k = mu.rows(off, n_kappa);
             acc_iov += s.view((off, off), (n_kappa, n_kappa)) + &mu_k * mu_k.transpose();
             n_occ_total += 1;

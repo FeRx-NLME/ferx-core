@@ -41,6 +41,7 @@ use crate::estimation::parameterization::{
 use crate::sens::provider::{subject_sensitivities, ObsSens, SubjectSens};
 use crate::stats::residual_error::{residual_rd, residual_rd2};
 use crate::stats::special::m3_censored_outer;
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::types::{CompiledModel, ModelParameters, Population, ResidualCorrelation, Subject};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -1574,8 +1575,8 @@ pub fn subject_theta_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k_groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    let n_stacked = model.n_eta + k_groups * model.n_kappa;
+    let k_groups = crate::stats::stacked_layout::group_count(subject);
+    let n_stacked = stacked_width(model.n_eta, model.n_kappa, k_groups);
     if stacked_eta_hat.len() != n_stacked {
         return None;
     }
@@ -2079,10 +2080,10 @@ pub fn subject_packed_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let k = crate::stats::stacked_layout::group_count(subject);
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_stacked = n_eta_bsv + k * n_iov;
+    let n_stacked = stacked_width(n_eta_bsv, n_iov, k);
     if stacked_eta_hat.len() != n_stacked {
         return None;
     }
@@ -2126,7 +2127,7 @@ pub fn subject_packed_gradient_iov(
     // Sum the K diagonal IOV sub-blocks (shared κ-variance / SAME).
     let mut m_iov = DMatrix::<f64>::zeros(n_iov, n_iov);
     for kk in 0..k {
-        let off = n_eta_bsv + kk * n_iov;
+        let off = kappa_offset(n_eta_bsv, n_iov, kk);
         m_iov += m_mat.view((off, off), (n_iov, n_iov));
     }
     let iov_packed = chol_pack(&m_iov, &omega_iov.chol, omega_iov.diagonal);
@@ -3227,7 +3228,10 @@ fn frozen_eta_dx_assemble_iov(
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut r = DVector::zeros(n_st);
         for kk in 0..k_occ {
-            r += m_l_response(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+            r += m_l_response(
+                kappa_offset(n_eta_bsv, n_iov, kk) + i,
+                kappa_offset(n_eta_bsv, n_iov, kk) + j,
+            );
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         out[iov_start + e] = r * chain;
@@ -3281,10 +3285,10 @@ pub fn subject_eta_dx_iov(
     )?;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let k = crate::stats::stacked_layout::group_count(subject);
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_st = n_eta_bsv + k * n_iov;
+    let n_st = stacked_width(n_eta_bsv, n_iov, k);
     if stacked_eta_hat.len() != n_st {
         return None;
     }
@@ -3359,7 +3363,10 @@ pub fn subject_eta_dx_iov(
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut resp = DVector::zeros(n_st);
         for kk in 0..k {
-            resp += m_l_response(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+            resp += m_l_response(
+                kappa_offset(n_eta_bsv, n_iov, kk) + i,
+                kappa_offset(n_eta_bsv, n_iov, kk) + j,
+            );
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         out[iov_start + e] = resp * chain;
@@ -3456,10 +3463,10 @@ pub fn subject_packed_gradient_foce_iov(
     )?;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let k = crate::stats::stacked_layout::group_count(subject);
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_st = n_eta_bsv + k * n_iov;
+    let n_st = stacked_width(n_eta_bsv, n_iov, k);
     if stacked_eta_hat.len() != n_st {
         return None;
     }
@@ -3650,8 +3657,8 @@ pub fn subject_packed_gradient_foce_iov(
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut raw = 0.0;
         for kk in 0..k {
-            let row = n_eta_bsv + kk * n_iov + i;
-            let col = n_eta_bsv + kk * n_iov + j;
+            let row = kappa_offset(n_eta_bsv, n_iov, kk) + i;
+            let col = kappa_offset(n_eta_bsv, n_iov, kk) + j;
             raw += entry_grad(row, col) + cg.omega_entry(row, col, &cjl);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };

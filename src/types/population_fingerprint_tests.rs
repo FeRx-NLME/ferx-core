@@ -34,6 +34,7 @@ fn subject() -> Subject {
         obs_l2: vec![0, 3],
         dose_occasions: vec![1, 2],
         reset_occasions: vec![2],
+        pk_only_occasions: vec![2],
         fremtype: vec![0, 100],
         obs_records: vec![
             ObsRecord::DiscreteState {
@@ -149,6 +150,11 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
         (
             "reset_occasions",
             |s| s.reset_occasions[0] = 3,
+            Row::Records,
+        ),
+        (
+            "pk_only_occasions",
+            |s| s.pk_only_occasions[0] = 3,
             Row::Records,
         ),
         ("fremtype", |s| s.fremtype[1] = 200, Row::Records),
@@ -344,8 +350,8 @@ fn every_field_is_hashed_into_its_own_digest() {
     let fp = PopulationFingerprint::of(&base);
     assert_eq!(fp.first_difference(&base), None, "a population is its own");
     let rows = perturbations();
-    // 20 `Subject` fields + 9 `DoseEvent` + the `ObsRecord` fields (+ `Event`'s).
-    assert_eq!(rows.len(), if cfg!(feature = "survival") { 44 } else { 38 });
+    // 21 `Subject` fields + 9 `DoseEvent` + the `ObsRecord` fields (+ `Event`'s).
+    assert_eq!(rows.len(), if cfg!(feature = "survival") { 45 } else { 39 });
     for (field, perturb, want) in rows {
         let mut s = subject();
         perturb(&mut s);
@@ -522,9 +528,10 @@ fn the_fingerprint_round_trips_through_json() {
 }
 
 /// Review r1 #1, both sides of the gate in one test: a fit that derives its occasion
-/// labels leaves the population's `occasions` / `dose_occasions` out — on the
-/// stamping side and on the comparing side — and a fit that reads them from a
-/// column keeps them in. Every other field is still compared under a derived rule.
+/// labels leaves the population's `occasions` / `dose_occasions` /
+/// `pk_only_occasions` out — on the stamping side and on the comparing side — and
+/// a fit that reads them from a column keeps them in. Every other field is still
+/// compared under a derived rule.
 ///
 /// Mutations — ignore the flag (always hash the labels): the derived cell differs;
 /// always leave them out: the column cell passes; flag only the stamping side:
@@ -535,6 +542,7 @@ fn derived_occasion_labels_are_left_out_only_when_the_fit_derives_them() {
     let mut relabelled = base.clone();
     relabelled.subjects[0].occasions = vec![0, 0];
     relabelled.subjects[0].dose_occasions = vec![0, 1];
+    relabelled.subjects[0].pk_only_occasions = vec![0];
 
     let derived = PopulationFingerprint::of_with(&base, true);
     assert_eq!(derived.first_difference(&relabelled), None, "derived rule");

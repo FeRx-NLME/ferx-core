@@ -1,3 +1,4 @@
+use crate::stats::stacked_layout::block_diag_stack;
 use crate::types::{
     CompiledModel, ModelParameters, MuTransform, OmegaMatrix, ResidualCorrelation, SigmaVector,
 };
@@ -2040,22 +2041,8 @@ pub(crate) fn block_chol_full(
     n_eta: usize,
     n_iov: usize,
 ) -> DMatrix<f64> {
-    let n = n_eta + k * n_iov;
-    let mut l = DMatrix::zeros(n, n);
-    for r in 0..n_eta {
-        for c in 0..n_eta {
-            l[(r, c)] = l_bsv[(r, c)];
-        }
-    }
-    for kk in 0..k {
-        let off = n_eta + kk * n_iov;
-        for r in 0..n_iov {
-            for c in 0..n_iov {
-                l[(off + r, off + c)] = l_iov[(r, c)];
-            }
-        }
-    }
-    l
+    debug_assert_eq!((l_bsv.nrows(), l_iov.nrows()), (n_eta, n_iov));
+    block_diag_stack(l_bsv, l_iov, k)
 }
 
 #[cfg(test)]

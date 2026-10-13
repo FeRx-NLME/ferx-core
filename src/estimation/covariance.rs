@@ -812,7 +812,7 @@ pub(super) fn analytic_cov_assembly(
         .map(|(i, (subject, eta_hat))| {
             let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
                 let kap = kappas.get(i)?;
-                if kap.len() != crate::stats::likelihood::iov_occasion_groups(subject).len()
+                if kap.len() != crate::stats::stacked_layout::group_count(subject)
                     || kap.iter().any(|k| k.len() != model.n_kappa)
                 {
                     return None;

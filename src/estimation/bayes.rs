@@ -24,9 +24,7 @@ use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
 use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{
-    individual_nll_into_with_schedule_cov, individual_nll_iov, iov_occasion_groups,
-};
+use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
 use crate::types::{
     BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
     Subject,
@@ -666,7 +664,7 @@ pub fn run_bayes(
             let mut kappas: Vec<Vec<Vec<f64>>> = (0..n_subjects)
                 .map(|i| {
                     let n_occ = if n_kappa > 0 {
-                        iov_occasion_groups(&population.subjects[i]).len()
+                        crate::stats::stacked_layout::group_count(&population.subjects[i])
                     } else {
                         0
                     };
