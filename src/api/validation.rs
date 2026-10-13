@@ -3908,8 +3908,14 @@ impl SimulatedFlipFlopTally {
         if eta.len() != model.n_eta + model.n_kappa {
             return;
         }
+        self.total += 1;
         // An individual whose parameters are not finite is not a measurement of the closed
-        // form's domain at all, and must not be reported as one (#1823 review r7).
+        // form's domain at all, and must not be reported as a **crossing** (#1823 review r7).
+        //
+        // It stays in the *denominator*, which the message calls the individuals "dosed
+        // before one of their observations" — an overflowed draw is one of those, and
+        // dropping it from both sides would make the reported share larger than the
+        // population it was measured over (#1823 review r8). Only `crossed` is gated.
         //
         // [`crate::pk::absorption_flip_flop_at`]'s own contract already says so — it returns
         // `false` "for invalid parameters — there the closed form's `0` is a deliberate
@@ -3931,7 +3937,6 @@ impl SimulatedFlipFlopTally {
         if !pk.values.iter().all(|v| v.is_finite()) {
             return;
         }
-        self.total += 1;
         if crate::pk::absorption_flip_flop_at(model, subject, theta, eta) {
             self.crossed += 1;
         }

@@ -1393,6 +1393,27 @@ fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
     let mut tally = SimulatedFlipFlopTally::default();
     tally.observe(&cl_and_v, subject, &theta, &[0.6]);
     assert_eq!(tally.warning(&cl_and_v), None);
+
+    // **Mixed, which is the case the guard's placement decides** (#1823 review r8). An
+    // overflowed individual is still *eligible* — it is dosed before an observation, which
+    // is what the message's denominator names — so it belongs in that denominator even
+    // though it is not a crossing. One finite crosser beside one overflowed draw is
+    // therefore "1 of 2", not "1 of 1": dropping it from both sides would report a larger
+    // share than the population the count was measured over.
+    //
+    // Asserting the non-finite individual *alone* cannot see this — there is no crossing,
+    // so no warning is emitted at all — which is why this case exists separately.
+    let theta = cl_only.default_params.theta.clone();
+    let mut mixed = SimulatedFlipFlopTally::default();
+    mixed.observe(&cl_only, subject, &theta, &[0.6]); // finite crosser
+    mixed.observe(&cl_only, subject, &theta, &[710.0]); // eligible, overflowed
+    let msg = mixed
+        .warning(&cl_only)
+        .expect("the finite crosser is reported");
+    assert!(
+        msg.contains("1 of 2 simulated individuals dosed before one of their observations"),
+        "the overflowed individual stays in the denominator: {msg}"
+    );
 }
 
 /// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
