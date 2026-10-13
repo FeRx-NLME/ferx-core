@@ -203,15 +203,17 @@ fn read_nm_eval_tab() -> Vec<NmRow> {
 /// fix ferx left κ̂ empty on this path, so every per-row diagnostic was the κ = 0
 /// prediction while the OFV (which integrates κ itself) still agreed.
 ///
-/// Every gap is folded and printed before anything is asserted, so a run without the fix
+/// The structural checks (observation count, MIXEST, finiteness) run inside the loop. The
+/// gap asserts run only after the folded gaps are printed, so a run without the fix
 /// reports how far it lands rather than stopping at the κ̂ count. A subject with no κ̂ is
 /// compared at κ = 0, the value its postfit then used.
 ///
 /// CWRES is printed, not asserted. ferx's CWRES linearizes over η only (`compute_cwres`
 /// gets η̂, the η Jacobian and the IIV Ω), while NONMEM's linearizes over every ETA, the
 /// occasion κs included. Recomputed outside both engines from NONMEM's own tabled ETAs,
-/// the η-only recipe reproduces ferx's column and the [η, κ₁, κ₂] recipe NONMEM's (to
-/// 2e-10 on subjects 1 and 16). That is an IOV defect of its own, not #1932's: #1948.
+/// over all 30 subjects, the η-only recipe reproduces ferx's column to 4.8e-7 (the gap
+/// between the two engines' η̂ and κ̂) and the [η, κ₁, κ₂] recipe reproduces NONMEM's to
+/// 2.1e-10. That is an IOV defect of its own, not #1932's: #1948.
 #[test]
 fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
     let pop: ferx_core::Population = read_nonmem_csv(
@@ -240,15 +242,14 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
     let (mut ipred_gap, mut iwres_gap, mut cwres_gap, mut eta_gap) = (0f64, 0f64, 0f64, 0f64);
     let mut no_kappa = 0usize;
     for (i, sr) in res.subjects.iter().enumerate() {
-        let rows: Vec<&NmRow> = nm.iter().filter(|r| r.id == i + 1).collect();
+        // Keyed on the subject's own ID, not its position: every subject has 8
+        // observations, so the count check below cannot see a reorder.
+        let id: usize = sr.id.parse().expect("numeric subject ID");
+        let rows: Vec<&NmRow> = nm.iter().filter(|r| r.id == id).collect();
+        assert!(!rows.is_empty(), "subject {id}: not in the NONMEM table");
         let obs: Vec<&&NmRow> = rows.iter().filter(|r| r.evid == 0).collect();
-        assert_eq!(
-            sr.ipred.len(),
-            obs.len(),
-            "subject {}: observation count",
-            i + 1
-        );
-        assert_eq!(sr.mixest, Some(rows[0].mixe), "subject {}: MIXEST", i + 1);
+        assert_eq!(sr.ipred.len(), obs.len(), "subject {id}: observation count");
+        assert_eq!(sr.mixest, Some(rows[0].mixe), "subject {id}: MIXEST");
         let k = res.ebe_kappas.get(i).map_or(&[][..], |k| k.as_slice());
         if k.len() != 2 {
             no_kappa += 1;
@@ -256,15 +257,14 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
         let kappa = |occ: usize| k.get(occ).map_or(0.0, |v| v[0]);
         let ferx_eta = [sr.eta[0], kappa(0), kappa(1)];
         for (j, (&f, &n)) in ferx_eta.iter().zip(&rows[0].eta).enumerate() {
-            assert!(f.is_finite(), "subject {}: ETA{} = {f}", i + 1, j + 1);
+            assert!(f.is_finite(), "subject {id}: ETA{} = {f}", j + 1);
             eta_gap = eta_gap.max((f - n).abs());
         }
         for (o, r) in obs.iter().enumerate() {
             let (fi, fw, fc) = (sr.ipred[o], sr.iwres[o], sr.cwres[o]);
             assert!(
                 fi.is_finite() && fw.is_finite() && fc.is_finite(),
-                "subject {} obs {o}: IPRED {fi} IWRES {fw} CWRES {fc}",
-                i + 1
+                "subject {id} obs {o}: IPRED {fi} IWRES {fw} CWRES {fc}"
             );
             ipred_gap = ipred_gap.max((fi - r.ipred).abs());
             iwres_gap = iwres_gap.max((fw - r.iwres).abs());

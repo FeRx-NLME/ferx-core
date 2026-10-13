@@ -746,6 +746,13 @@ mod tests {
             );
         }
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&eval.shrinkage_kappa),
+            bits(&conv.shrinkage_kappa),
+            "κ shrinkage: eval-only {:?} vs converged {:?}",
+            eval.shrinkage_kappa,
+            conv.shrinkage_kappa
+        );
         for (e, c) in eval.subjects.iter().zip(&conv.subjects) {
             assert_eq!(bits(&e.ipred), bits(&c.ipred), "IPRED, subject {}", e.id);
             assert_eq!(bits(&e.iwres), bits(&c.iwres), "IWRES, subject {}", e.id);
