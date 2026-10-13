@@ -91,14 +91,29 @@ fn an_unbound_parameters_slot_does_not_move_the_objective() {
         "the Auto arm must stay on the analytic inner gradient: {fallback:?}"
     );
 
-    // Measured (macOS arm64, this fixture): analytic 4980.879260375328,
-    // fd 4980.879260374284 — relative difference 2.1e-13, the two inner optimizers
-    // stopping at η̂ that agree to the inner convergence tolerance and nothing more.
-    // The bound below is that number with ~5000x headroom.
+    // Measured on the reference platform — `tools/linux-test.sh --jobs 2 -- test
+    // --test unbound_param_slot_gradient --no-default-features --features ci`,
+    // `ferx-platform: Linux/aarch64 glibc 2.41`:
+    //
+    //   analytic = 4980.879260375328   fd = 4980.879260375087
+    //   relative difference 4.8e-14
+    //
+    // The two inner optimizers stop at η̂ that agree to the inner convergence
+    // tolerance and nothing more. macOS arm64 gives the same analytic value to
+    // every digit and 2.1e-13 on the FD arm; the bound below is the Linux number
+    // with ~2e4 headroom, which also clears macOS by ~5e3.
     //
     // With the fix toggled off (both fallback sites keyed back on `pk_indices`) the
-    // analytic arm returns 4991.568002512913 — a 10.69 OFV gap, 5e9 times this
-    // bound. So the bound is nowhere near the loose kind that stops testing.
+    // analytic arm returns 4991.568002512913 — a 10.69 OFV gap, relative 2.1e-3,
+    // i.e. 2e6 times this bound. So the bound is nowhere near the loose kind that
+    // stops testing. It is in any case a *relative* agreement between two routes in
+    // one process rather than an absolute fit band, so the OS math library shifts
+    // both arms together.
+
+    // Printed so the realised agreement can be read off a `--nocapture` run on the
+    // reference platform (`tools/linux-test.sh`, or `gh workflow run slow-tests.yml
+    // -f nocapture=true`) rather than re-derived from a local one.
+    eprintln!("gradient-route OFV: analytic={analytic:.12} fd={fd:.12}");
     let rel = (analytic - fd).abs() / fd.abs().max(1.0);
     assert!(
         rel < 1e-9,

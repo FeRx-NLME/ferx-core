@@ -5147,9 +5147,9 @@ impl CompiledModel {
             .collect()
     }
 
-    /// `(pk_slot, `[`indiv_param_names`](Self::indiv_param_names)` index)` for every
-    /// individual parameter that owns a PK slot — **the slot lookup that cannot
-    /// return a placeholder** (#1899).
+    /// `(pk_slot, name index)` for every individual parameter that owns a PK slot —
+    /// **the slot lookup that cannot return a placeholder** (#1899). The name index
+    /// is into [`indiv_param_names`](Self::indiv_param_names).
     ///
     /// `pk_indices` cannot serve as one. On an analytical model a name that no
     /// `pk(...)` role binds and no readout reads gets the placeholder `0`, which is

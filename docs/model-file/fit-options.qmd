@@ -269,14 +269,26 @@ refinement runs on top:
 The CL eta's omega is also updated from inter-subject CV² when ≥ 3 subjects have
 a valid NCA estimate.
 
-Each pooled estimate is routed to the θ behind the individual parameter that the
-`[structural_model]` line actually binds to that PK role. An intermediate the
-block declares on the way — `CLWT = exp(CLWT_EXP * log(WT/70))` above
-`CL = TVCL * CLWT * exp(ETA_CL)`, say — is never mistaken for the role it feeds,
-whatever order the block declares it in. Through ferx 0.4.0 such an intermediate
-could capture the role when it was declared *before* the bound parameter: the
-clearance estimate landed on `CLWT_EXP`, the allometric exponent, and `ETA_CL`'s
-variance was left at the model default (#1899).
+Each pooled estimate is routed to a θ in two steps: find the individual parameter
+the `[structural_model]` line binds to that PK role, then find that parameter's θ
+— through its mu-reference when it carries an η, otherwise by searching
+`[parameters]` for a θ whose name contains the parameter's name.
+
+The first step is exact. An intermediate the block declares on the way —
+`CLWT = exp(CLWT_EXP * log(WT/70))` above `CL = TVCL * CLWT * exp(ETA_CL)`, say —
+is never mistaken for the role it feeds, whatever order the block declares it in.
+Through ferx 0.4.0 such an intermediate could capture the role when it was
+declared *before* the bound parameter: the clearance estimate landed on
+`CLWT_EXP`, the allometric exponent (pinned at its upper bound, since a clearance
+is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
+model default (#1899).
+
+The second step is exact for a parameter **with** an η and a name search for one
+without. The search takes the first θ whose name *contains* the parameter's name,
+so a parameter with no IIV whose name is a substring of an earlier θ's name
+resolves to that θ — `V = TVV` declared alongside a `theta TVCL` resolves to
+`TVCL`, which then receives the volume estimate instead of the clearance one
+(#1922). Give such a parameter an η, or a θ name that does not collide.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
