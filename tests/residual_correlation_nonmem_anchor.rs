@@ -325,3 +325,114 @@ fn durbin_watson_is_taken_on_decorrelated_residuals() {
     }
     assert_eq!(seen, vec![("cs", 1), ("ar1", 0)]);
 }
+
+/// Plan T13, SIR leg (#1081 review r1 #8): a short SIR at NONMEM's `cs` optimum
+/// keeps every resampled ρ inside its θ box `[−0.24, 0.99]` — ρ packs on the linear
+/// scale (its lower bound is negative), so this is the box doing the work, not a
+/// log transform — and the draws spread (a degenerate SIR would pass the box
+/// check with one repeated value). At ρ̂ = 0.51 ± 0.08 the box is ≥ 6 SE away, so
+/// the check that carries weight here is the last one: the draws are centred on ρ̂
+/// with the spread of SE(ρ̂), i.e. SIR scores the correlated objective.
+#[test]
+fn sir_keeps_every_rho_draw_inside_its_theta_box() {
+    let parsed = parse_full_model(&at_optimum("cs", &CS_EST)).expect("parses");
+    let model = parsed.model;
+    let (pop, _) =
+        read_population_for(&model, &parsed.covariate_decls, DATA, None, None, None, &[])
+            .expect("anchor data reads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        sir: true,
+        sir_samples: 300,
+        sir_resamples: 150,
+        sir_seed: Some(1081),
+        sir_keep_samples: true,
+        ..parsed.fit_options
+    };
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    let draws = r.sir_resamples_packed.as_ref().expect("resamples kept");
+    let rho: Vec<f64> = draws.iter().map(|d| d[7]).collect();
+    assert!(rho.len() >= 100, "{} draws", rho.len());
+    assert!(rho.iter().all(|v| v.is_finite()), "non-finite ρ draw");
+    let (lo, hi) = rho
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
+    let n = rho.len() as f64;
+    let mean = rho.iter().sum::<f64>() / n;
+    let sd = (rho.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+    eprintln!(
+        "SIR ρ draws: {} in [{lo:.4}, {hi:.4}], mean {mean:.4} sd {sd:.4}, ESS {:?}",
+        rho.len(),
+        r.sir_ess
+    );
+    assert!(
+        lo >= -0.24 && hi <= 0.99,
+        "ρ draw outside its box: [{lo}, {hi}]"
+    );
+    assert!(hi - lo > 0.05, "draws do not spread: [{lo}, {hi}]");
+    // And they sample the right objective: centred on ρ̂ and spread like SE(ρ̂).
+    // Realised (seed 1081): mean 0.4867 against ρ̂ 0.5095 (0.29 SE), sd 0.0818
+    // against NONMEM's SE 0.0776 (+5%). Bounds: half an SE, and ±25%.
+    let (rho_hat, se) = (CS_EST[7], ESTIMATES[0].3);
+    assert!(
+        (mean - rho_hat).abs() < 0.5 * se,
+        "SIR mean {mean} vs ρ̂ {rho_hat}"
+    );
+    assert!((sd / se - 1.0).abs() < 0.25, "SIR sd {sd} vs SE {se}");
+}
+
+/// Combined-error probes (#1081 review r1 #9): `(probe, kind, ρ, NONMEM OBJ)`, FOCEI
+/// (`METHOD=1 INTER MAXEVAL=0`), `nonmem_anchor/residual_correlation/results/comb_*.ext`.
+/// NONMEM: `Y = F + F·θ₉·RESP + WPSE·RESA`, `θ₉ = 0.03`, both parts mixed through the
+/// same Cholesky factor of `C(ρ)` from independent `EPS(1..5)` / `EPS(6..10)`, so
+/// `R_jk = C_jk (f_j f_k θ₉² + w_j w_k)`. Here `R` depends on `f(η)`: the serial
+/// `∂R/∂f` enters the FOCEI inner search and its interaction term, which the
+/// additive-only probes above cannot see. The ρ = 0 control isolates the
+/// combined-error convention from the correlation.
+const COMB_PROBES: &[(&str, &str, f64, f64)] = &[
+    ("comb_cs_r0", "cs", 0.0, -161.469_171_370_695_25),
+    ("comb_cs_p05", "cs", 0.5, -189.777_337_517_105_99),
+    ("comb_ar1_m04", "ar1", -0.4, -130.742_944_153_769_29),
+    ("comb_ar1_p05", "ar1", 0.5, -189.944_415_907_175_34),
+];
+
+/// Worst realised `|ferx − NONMEM|` over [`COMB_PROBES`]: 6.2e-8 (`comb_cs_p05`,
+/// macOS arm64) — an order above the additive probes because the FOCEI inner search
+/// now has an `f`-dependent `R` to converge on. ~10× headroom.
+const COMB_TOL: f64 = 6e-7;
+
+/// The twin with a combined error: proportional SD 0.03, the weighted additive part
+/// unchanged.
+fn comb_twin(kind: &str, rho: f64) -> String {
+    twin(kind, rho)
+        .replace(
+            "  sigma ADD_ERR ~ 1.0 (variance) FIX",
+            "  sigma PROP_ERR ~ 0.03 (sd) FIX\n  sigma ADD_ERR ~ 1.0 (variance) FIX",
+        )
+        .replace(
+            "DV ~ additive(ADD_ERR) weight = WPSE",
+            "DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE",
+        )
+}
+
+#[test]
+fn combined_error_correlation_matches_nonmem_focei() {
+    let mut worst = 0.0_f64;
+    for &(probe, kind, rho, nm) in COMB_PROBES {
+        let src = comb_twin(kind, rho);
+        assert!(src.contains("DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE"));
+        let ofv = run(&src, Some(0), false).ofv;
+        assert!(ofv.is_finite(), "{probe}: OFV {ofv}");
+        let err = (ofv - nm).abs();
+        eprintln!("{probe}: ferx {ofv:.12} NONMEM {nm:.12} |Δ| {err:.3e}");
+        assert!(
+            err < COMB_TOL,
+            "{probe}: ferx {ofv:.10} vs NONMEM {nm:.10} (|Δ| {err:.3e})"
+        );
+        worst = worst.max(err);
+    }
+    eprintln!("combined worst |Δ| = {worst:.3e}");
+}

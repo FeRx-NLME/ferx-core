@@ -1193,15 +1193,31 @@ exact), which agrees with NONMEM to ≤ 2e-13 on every evaluation probe.
 | `ar1_p05` | 0.5 | −202.052628694 | −202.052628695 |
 | `ar1_m04` | −0.4 | −121.386775570 | −121.386775567 |
 
-Worst `|Δ|` 2.8e-9 (the FOCE inner tolerance on η̂). Estimation (`METHOD=1`, every
+Worst `|Δ|` 2.8e-9 (the FOCE inner tolerance on η̂).
+
+**Combined error** (`gen_comb.py`, `comb_*.ctl`): `Y = F + F·θ₉·RESP + WPSE·RESA` with
+`θ₉ = 0.03`, each part mixed through the same Cholesky factor of `C(ρ)` from its own
+`EPS` set, i.e. `R_jk = C_jk (f_j f_k θ₉² + w_j w_k)`; `METHOD=1 INTER MAXEVAL=0`. Here
+`R` depends on `f(η)`, so the serial `∂R/∂f` enters the FOCEI inner search.
+
+| Probe | ρ | NONMEM OBJ | ferx (FOCEI) |
+|---|---|---|---|
+| `comb_cs_r0` | 0 | −161.469171371 | −161.469171329 |
+| `comb_cs_p05` | 0.5 | −189.777337517 | −189.777337456 |
+| `comb_ar1_m04` | −0.4 | −130.742944154 | −130.742944113 |
+| `comb_ar1_p05` | 0.5 | −189.944415907 | −189.944415889 |
+
+Worst `|Δ|` 6.2e-8. Estimation (`METHOD=1`, every
 θ and ω free, ρ from 0.3, `$COV MATRIX=R`; both `MINIMIZATION SUCCESSFUL`):
 
 | | NONMEM OBJ | NONMEM ρ̂ (SE) | ferx OBJ | ferx ρ̂ (SE) |
 |---|---|---|---|---|
-| `cs_est` | −199.734575 | 0.509450 (0.077592) | −199.734574 | 0.509408 (0.077553) |
-| `ar1_est` | −205.932728 | 0.597282 (0.063339) | −205.932665 | 0.597259 (0.063279) |
+| `cs_est` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
+| `ar1_est` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
 
-ferx numbers are macOS arm64 with `outer_ftol = 1e-10`, `outer_xtol = 1e-8`; at the
+ferx numbers are Linux aarch64, the reference platform (macOS arm64: −199.734574 /
+0.509408 / 0.077553 and −205.932665 / 0.597259 / 0.063279), with `outer_ftol = 1e-10`,
+`outer_xtol = 1e-8`; at the
 default tolerances BOBYQA stops ~0.03 OFV short on this dataset's flat
 TVEMAX / B_EMAX_FLARE ridge, and ferx scores NONMEM's own optimum at −199.734575.
 

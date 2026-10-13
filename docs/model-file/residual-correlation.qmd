@@ -179,12 +179,18 @@ per arm at irregular times), at fixed parameters:
 | `ar1`, ρ = 0.5 | −202.052628694 | −202.052628695 | 9.7e-10 |
 | `ar1`, ρ = −0.4 | −121.386775570 | −121.386775567 | 2.8e-9 |
 
-Estimated, every θ and ω free (`METHOD=1`, `$COV MATRIX=R`):
+With a combined error (`combined(PROP_ERR, ADD_ERR) weight = WPSE`, proportional SD
+0.03), where `R` depends on the prediction and FOCEI's inner search sees the
+correlation's `∂R/∂f`, four probes (`cs` ρ = 0, 0.5; `ar1` ρ = −0.4, 0.5) agree with
+NONMEM's `METHOD=1 INTER` to 6.2e-8 at worst.
+
+Estimated, every θ and ω free (`METHOD=1`, `$COV MATRIX=R`); ferx on Linux aarch64, the
+reference platform for fit numbers:
 
 | | NONMEM OBJ | NONMEM ρ̂ (SE) | ferx OBJ | ferx ρ̂ (SE) |
 |---|---|---|---|---|
-| `cs` | −199.734575 | 0.509450 (0.077592) | −199.734574 | 0.509408 (0.077553) |
-| `ar1` | −205.932728 | 0.597282 (0.063339) | −205.932665 | 0.597259 (0.063279) |
+| `cs` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
+| `ar1` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
 
 against −173.508 for independent residuals: 26 and 32 OFV points for one
 parameter. The control streams, results and an independent closed-form oracle are

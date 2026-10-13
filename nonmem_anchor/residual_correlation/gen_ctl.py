@@ -148,8 +148,9 @@ RUNS = [('cs', 0.0, False, 'cs_r0'), ('cs', 0.5, False, 'cs_p05'), ('cs', -0.2, 
         ('ar1', 0.5, False, 'ar1_p05'), ('ar1', -0.4, False, 'ar1_m04'),
         ('car', 0.8, False, 'car_p08'), ('car', 0.3, False, 'car_p03'),
         ('cs', 0.3, True, 'cs_est'), ('ar1', 0.3, True, 'ar1_est'), ('car', 0.5, True, 'car_est')]
-for struct, rho, est, name in RUNS:
-    os.makedirs(name, exist_ok=True)
-    open(f'{name}/{name}.ctl', 'w').write(ctl(struct, rho, est))
-    shutil.copy('napx1081.csv', f'{name}/')
-print('ok')
+if __name__ == '__main__':
+    for struct, rho, est, name in RUNS:
+        os.makedirs(name, exist_ok=True)
+        open(f'{name}/{name}.ctl', 'w').write(ctl(struct, rho, est))
+        shutil.copy('napx1081.csv', f'{name}/')
+    print('ok')
