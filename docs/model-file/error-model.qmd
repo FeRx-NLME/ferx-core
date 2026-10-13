@@ -496,6 +496,10 @@ The same modifier rides an IOV `kappa` declaration, where it weights the
 `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
 [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
 
+The visits of one arm can also be given correlated residuals —
+`correlation cs(RHO) by ARM` or `ar1(RHO)`, with the weights on both sides of
+the correlation. See [Within-group residual correlation](residual-correlation.qmd).
+
 ### Simulating an arm that is not in the data
 
 The weight is a data column. `fit()` always has one — the arm exists, and its

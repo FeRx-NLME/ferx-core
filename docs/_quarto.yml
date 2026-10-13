@@ -70,6 +70,7 @@ website:
           - model-file/lagtime.qmd
           - model-file/steady-state.qmd
           - model-file/error-model.qmd
+          - model-file/residual-correlation.qmd
           - model-file/bloq.qmd
           - model-file/ode-models.qmd
           - model-file/absorption.qmd

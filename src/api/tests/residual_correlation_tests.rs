@@ -379,3 +379,51 @@ fn a_line_that_couples_nothing_is_reported() {
         "{d:#?}"
     );
 }
+
+/// FREM and a mixture each get their own refusal; the plain model gets neither.
+#[test]
+fn scope_refuses_frem_and_mixture() {
+    let base = src("cs", "(0.3, -0.4, 0.95)", "", "");
+    assert!(with_code(&scope_for(&base, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").is_empty());
+    let frem = src(
+        "cs",
+        "(0.3, -0.4, 0.95)",
+        "",
+        "  frem_predictions = TVV/ETA_CL:100\n  frem_sigma = ADD_ERR\n",
+    );
+    assert!(
+        one(&scope_for(&frem, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
+            .contains("is not supported with FREM covariate pseudo-observations.")
+    );
+    let mixture = base
+        .replace(
+            "  omega ETA_CL ~ 0.09\n",
+            "  omega ETA_CL ~ 0.09\n  theta MIXL(0.0, -10.0, 10.0)\n",
+        )
+        .replace(
+            "[individual_parameters]",
+            "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.4\n[individual_parameters]",
+        );
+    assert!(one(
+        &scope_for(&mixture, &focei()),
+        "E_RESIDUAL_CORRELATION_SCOPE"
+    )
+    .contains("is not supported with a mixture model."));
+}
+
+/// A non-Gaussian endpoint (`[binary_model]` needs the `survival` feature, which the
+/// TTE/CTMM CI leg builds).
+#[cfg(feature = "survival")]
+#[test]
+fn scope_refuses_a_non_gaussian_endpoint() {
+    let base = src("cs", "(0.3, -0.4, 0.95)", "", "");
+    let binary = base.replace(
+        "[fit_options]",
+        "[binary_model]\n  cmt   = 3\n  logit = TVCL - 1\n[fit_options]",
+    );
+    assert!(one(
+        &scope_for(&binary, &focei()),
+        "E_RESIDUAL_CORRELATION_SCOPE"
+    )
+    .contains("is not supported with a time-to-event, binary, categorical or Markov endpoint."));
+}
