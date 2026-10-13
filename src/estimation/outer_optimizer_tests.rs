@@ -1700,6 +1700,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -2522,6 +2523,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             obs_records: vec![],
         })
         .collect();

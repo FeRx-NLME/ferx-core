@@ -1791,8 +1791,9 @@ fn check_iov_occasions(
 
 /// Derive each subject's IOV occasion labels from a model-side rule
 /// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
-/// `Subject::occasions` (parallel to `obs_times`) and `Subject::dose_occasions`
-/// (parallel to `doses`). This is the DSL alternative to a dataset occasion
+/// `Subject::occasions` (parallel to `obs_times`), `Subject::dose_occasions`
+/// (parallel to `doses`) and `Subject::pk_only_occasions` (parallel to
+/// `pk_only_times`, #1876). This is the DSL alternative to a dataset occasion
 /// column; downstream grouping (`split_obs_by_occasion`) is identical either way.
 ///
 /// When `had_column` is true the model *also* set `iov_column`; the DSL rule wins
@@ -1835,6 +1836,14 @@ pub(crate) fn apply_iov_occasion_rule(
                 // land in a different occasion than its co-timed samples (#757).
                 s.occasions = s.obs_times.iter().map(|&t| window_occ(edges, t)).collect();
                 s.dose_occasions = s.doses.iter().map(|d| window_occ(edges, d.time)).collect();
+                // A pk-only row on the same clock (#1876). One the reader moved a ULP below
+                // an edge (#1810) lands in the earlier window, as a #614-moved observation
+                // does: that window holds the whole interval the row governs.
+                s.pk_only_occasions = s
+                    .pk_only_times
+                    .iter()
+                    .map(|&t| window_occ(edges, t))
+                    .collect();
             }
             IovOccasionRule::PerDose => {
                 // Each distinct administration *time* opens a new occasion. Doses
@@ -1879,6 +1888,13 @@ pub(crate) fn apply_iov_occasion_rule(
                         }
                         j.saturating_sub(1) as u32
                     })
+                    .collect();
+                // A pk-only row by the same rule (#1876). Searched rather than walked, so
+                // an in-memory subject's unsorted `pk_only_times` still maps correctly.
+                s.pk_only_occasions = s
+                    .pk_only_times
+                    .iter()
+                    .map(|&t| dose_times.partition_point(|&d| d <= t).saturating_sub(1) as u32)
                     .collect();
             }
         }

@@ -37,6 +37,7 @@ fn subject() -> Subject {
         reset_times: vec![23.],
         reset_covariates: vec![cov(120.)],
         reset_occasions: vec![22],
+        pk_only_occasions: Vec::new(),
         ..Default::default()
     }
 }
@@ -143,9 +144,11 @@ fn iov_scratch_reuses_capacity_but_refreshes_every_event_snapshot() {
                 expected_cl(105., 24., k2),
                 max_relative = 1e-13
             );
+            // No `pk_only_occasions` here, so the t = 10 row takes the occasion of the
+            // record before it, the t = 3 observation's 11 (#1876); it was κ = 0 before.
             approx::assert_relative_eq!(
                 scratch.pk_only[0].cl(),
-                expected_cl(95., 10., 0.),
+                expected_cl(95., 10., k1),
                 max_relative = 1e-13
             );
             if ode {

@@ -110,6 +110,7 @@ pub(super) fn subject_with_dose_time(id: &str, dose_time: f64, scale: f64) -> Su
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
