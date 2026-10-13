@@ -1359,135 +1359,197 @@ fn twinless_transit_form_c_src() -> String {
     )
 }
 
+/// The same fixture with a Form-C readout that **preserves** zero: the readout sees the
+/// central *amount*, so `central / V` recovers the concentration exactly and a clamped
+/// individual still reads `0`.
+///
+/// Structurally indistinguishable from [`twinless_transit_form_c_src`] —
+/// `analytic_readout.is_some()` for both — and the opposite row value. This pair is why the
+/// message makes no claim about what a clamped row contains (#1823 review r2).
+fn twinless_transit_form_c_zero_preserving_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
+        "[scaling]\n  obs_scale = 1\n",
+        "[scaling]\n  y = central/V\n",
+    )
+}
+
 /// The M1 fixture under log-transform-both-sides: `apply_log_transform` maps the clamped
 /// `0` to `ln(LTBS_FLOOR)`, a large negative number, so again not a zero.
 fn twinless_transit_ltbs_src() -> String {
     INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  DV ~ proportional(PROP)", "  log(DV) ~ additive(PROP)")
 }
 
-/// #1823 review r1: **both sides of the message's outcome gate**, and each of its three
-/// inputs, in one test — so forcing `clamp_shows_as_literal_zero` either way reddens it.
+/// #1823 review r2: the message **claims nothing about what a clamped individual's rows
+/// contain**, because no structural predicate can know.
 ///
-/// The clamp applies to the closed form's dose-driven term, and three things run after it
-/// (`pk/mod.rs`): `add_analytical_init`, `apply_analytic_readout`, `apply_log_transform`.
-/// Any of them lifts a clamped profile off zero. The first version of this warning claimed
-/// "predicted as an identically-zero profile" unconditionally, which was **false on two of
-/// the three twin-decline causes the same message names** — measured here: 27 clamped
-/// individuals and 0 zero rows on each of the three lifters.
+/// Round 1 replaced an unconditional "identically-zero profile" with a gate on
+/// `analytical_init` / `analytic_readout` / `log_transform`. Round 2 showed that gate is
+/// unfixable in principle: the two Form-C readouts `y = central/V` and
+/// `y = central/V + 2.5` are the *same* gate input (`analytic_readout.is_some()`) and give
+/// opposite row values — 27 zero rows and 0 zero rows on the same seed. A fourth
+/// post-clamp layer, `apply_frem_prediction_override` (`pk/mod.rs:3156`), was outside the
+/// gate entirely. So the message now states the clamp (certain, structural) and tells the
+/// reader that searching for a zero row will not find these individuals.
 ///
-/// The count itself is asserted against the **dose-free twin** on all four fixtures, which
-/// is what makes this a check on the claim and not on the wording: a clamped individual
-/// equals its dose-free twin bit for bit, a non-clamped one does not.
+/// This test pins that: across five fixtures whose zero-row counts span 0 and 27, the
+/// count is right on every one (verified by the **dose-free twin**, not by looking for
+/// zeros) and the message says the same thing on every one. The spread in the last column
+/// is the evidence that no value claim would be safe.
+///
+/// | fixture | post-clamp layer | clamped | rows reading 0 |
+/// |---|---|---|---|
+/// | `[scaling] obs_scale = 1` | none (a divisor; zero stays zero) | 27 | 27 |
+/// | `y = central/V` | Form-C readout, zero-preserving | 27 | 27 |
+/// | `y = central/V + 2.5` | Form-C readout, additive | 27 | 0 |
+/// | `init(central) = BASE` | `[initial_conditions]` baseline | 27 | 0 |
+/// | `log(DV) ~ additive(PROP)` | LTBS log transform | 27 | 0 |
 #[test]
-fn simulated_flip_flop_warning_says_what_the_clamp_shows_as() {
+fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
     let plain = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let form_c_zero = parse_fixture(&twinless_transit_form_c_zero_preserving_src());
+    let form_c_add = parse_fixture(&twinless_transit_form_c_src());
     let init = parse_fixture(TWINLESS_TRANSIT_INIT_SRC);
-    let form_c = parse_fixture(&twinless_transit_form_c_src());
     let ltbs = parse_fixture(&twinless_transit_ltbs_src());
 
-    // Each lifter fixture is twin-less, in-domain at η = 0, and carries exactly the one
-    // lifter it is here to exercise — so the gate is driven by a different input each time.
-    for (name, m) in [
-        ("init", &init),
-        ("form_c", &form_c),
-        ("ltbs", &ltbs),
-        ("plain", &plain),
-    ] {
+    let cases = [
+        ("obs_scale", &plain, 27usize),
+        ("form_c_zero_preserving", &form_c_zero, 27),
+        ("form_c_additive", &form_c_add, 0),
+        ("init_baseline", &init, 0),
+        ("ltbs", &ltbs, 0),
+    ];
+    for (name, m, want_zero_rows) in cases {
         assert!(m.absorption_ode_equivalent.is_none(), "{name}: twin-less");
         assert!(
             check_absorption_flip_flop_no_twin(m, &tiny_population(), &m.default_params.theta)
                 .is_none(),
             "{name}: the point estimate is in-domain"
         );
-    }
-    assert_eq!(
-        (
-            init.analytical_init.len(),
-            init.analytic_readout.is_some(),
-            init.log_transform
-        ),
-        (1, false, false)
-    );
-    assert_eq!(
-        (
-            form_c.analytical_init.len(),
-            form_c.analytic_readout.is_some(),
-            form_c.log_transform
-        ),
-        (0, true, false)
-    );
-    assert_eq!(
-        (
-            ltbs.analytical_init.len(),
-            ltbs.analytic_readout.is_some(),
-            ltbs.log_transform
-        ),
-        (0, false, true)
-    );
-    assert_eq!(
-        (
-            plain.analytical_init.len(),
-            plain.analytic_readout.is_some(),
-            plain.log_transform
-        ),
-        (0, false, false),
-        "the M1 fixture's `obs_scale` divisor is not a lifter: it multiplies, so 0 stays 0"
-    );
+        // The count, verified against the dose-free twin — the oracle that holds whatever
+        // the rows contain.
+        let (msg, clamped, total) = clamped_run(m, 0.09, 300, 7);
+        assert_eq!((clamped, total), (27, 600), "{name}: measured at afe7f52b");
+        // …and the rows themselves, which is where the fixtures disagree.
+        let (zeroed, _) = zeroed_individuals(&flip_flop_rows(m, 0.09, 300, 7));
+        assert_eq!(
+            zeroed, want_zero_rows,
+            "{name}: measured at afe7f52b — the spread across fixtures is the point"
+        );
 
-    // Two phrases that appear in exactly one branch each. Not "adds to or transforms that
-    // output afterwards": both halves say that (one of them negated), so a test keying on it
-    // passes on either branch.
-    let zero_half = "whole profiles are identically zero (`ipred = 0`)";
-    let lifted_half = "cannot be found by looking for one";
-    for (name, model, lifted) in [
-        ("init", &init, true),
-        ("form_c", &form_c, true),
-        ("ltbs", &ltbs, true),
-        ("plain", &plain, false),
-    ] {
-        let (msg, clamped, total) = clamped_run(model, 0.09, 300, 7);
-        assert_eq!(total, 600, "{name}");
-        assert_eq!(clamped, 27, "{name}: measured at afe7f52b");
         let msg = msg.expect("a clamped individual must be reported");
-        // The invariant half of the claim, true on every fixture.
+        // The four claims the message makes, all of them true on every fixture above.
         assert!(
             msg.contains(&format!(
-                "{clamped} of {total} simulated individuals were evaluated"
+                "{clamped} of {total} simulated individuals that received a dose"
             )),
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("their entire dose-driven concentration was clamped to zero"),
+            msg.contains(
+                "their entire dose-driven concentration was clamped to zero — the drug \
+                 contributes nothing to any of their rows"
+            ),
             "{name}: {msg}"
         );
-        // …and the gated half, both sides asserted on every fixture.
-        let (zeroed, _) = zeroed_individuals(&flip_flop_rows(model, 0.09, 300, 7));
-        if lifted {
-            assert!(msg.contains(lifted_half), "{name}: {msg}");
-            assert!(!msg.contains(zero_half), "{name}: {msg}");
-            // …and it names the three things that can lift the clamp off zero, so the
-            // reader can tell which one their model has.
+        assert!(
+            msg.contains("pulled toward the profile this model would produce with no drug at all"),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains("searching the output for a zero row will not reliably find them"),
+            "{name}: {msg}"
+        );
+        // And nothing that predicts the row values, in either direction.
+        for banned in [
+            "identically zero",
+            "identically-zero",
+            "they are zeros",
+            "`ipred = 0`.",
+            "cannot be found by looking for one",
+            "simulated DV is 0",
+        ] {
             assert!(
-                msg.contains("`[initial_conditions]` baseline")
-                    && msg.contains("Form-C `[scaling] y = <expr>` readout")
-                    && msg.contains("log transform"),
-                "{name}: {msg}"
+                !msg.contains(banned),
+                "{name}: the message must not predict the row value ({banned:?}): {msg}"
             );
-            assert!(
-                !msg.contains("their simulated DV is 0"),
-                "{name}: the proportional-DV claim belongs to the zero branch: {msg}"
-            );
-            assert_eq!(
-                zeroed, 0,
-                "{name}: not one of the {clamped} clamped individuals reads zero — \
-                 which is exactly why the message must not say they do"
-            );
-        } else {
-            assert!(msg.contains(zero_half), "{name}: {msg}");
-            assert!(!msg.contains(lifted_half), "{name}: {msg}");
-            assert_eq!(zeroed, clamped, "{name}: here the clamp IS a literal zero");
         }
     }
+    // The decisive pair, stated as its own assertion so the structural
+    // indistinguishability cannot quietly stop being true.
+    assert_eq!(
+        (
+            form_c_zero.analytic_readout.is_some(),
+            form_c_add.analytic_readout.is_some()
+        ),
+        (true, true),
+        "both Form-C fixtures present identically to any structural predicate"
+    );
+}
+
+/// #1823 review r2: a subject carrying no positive dose amount is **not** counted — on
+/// either side of the ratio.
+///
+/// Its profile is drug-free with the clamp and without it, so nothing was lost and an ODE
+/// rewrite would produce the same rows; counting it would attach "the drug contributes
+/// nothing to any of their rows" to a placebo arm and inflate the denominator. Measured
+/// before the fix: an `AMT = 0` second subject pushed the count to 27 of 600 while all 900
+/// of its own rows were already zero.
+///
+/// Both sides in one test: the dosed subject's crossers are still counted, the placebo
+/// subject's are not, and a population of placebo subjects alone reports nothing at all.
+#[test]
+fn simulated_flip_flop_tally_skips_an_undosed_subject() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let theta = model.default_params.theta.clone();
+    let dosed = tiny_population();
+    let placebo = dose_free(&dosed);
+    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+
+    // One dosed crosser and one placebo crosser, same η: only the dosed one counts.
+    let mut mixed = SimulatedFlipFlopTally::default();
+    mixed.observe(&model, &dosed.subjects[0], &theta, &crosser);
+    mixed.observe(&model, &placebo.subjects[0], &theta, &crosser);
+    let msg = mixed.warning(&model).expect("the dosed crosser is counted");
+    assert!(
+        msg.contains("1 of 1 simulated individuals that received a dose"),
+        "the placebo individual counts on neither side: {msg}"
+    );
+
+    // Placebo subjects only — nothing to report, however far their η crosses.
+    let mut placebo_only = SimulatedFlipFlopTally::default();
+    for s in &placebo.subjects {
+        placebo_only.observe(&model, s, &theta, &crosser);
+    }
+    assert_eq!(placebo_only.warning(&model), None);
+
+    // End to end, through `simulate_with_options_diag`: a population whose second subject
+    // is a placebo reports a denominator of 300 rather than 600 — only S1's 300 replicates
+    // are dosed individuals.
+    let mut half = tiny_population();
+    half.subjects[1].doses[0].amt = 0.0;
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+    let opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let out = simulate_with_options_diag(&model, &half, &params, 300, &opts).expect("sim");
+    let reported = flip_flop_warning(&out.warnings).expect("the dosed subject still crosses");
+    // S1 is dosed and S2 is not, so the denominator is 300, not 600 — and the placebo
+    // subject's own 900 rows are all zero whether or not it crossed, which is exactly why
+    // counting it would have been meaningless.
+    assert!(
+        reported.contains("of 300 simulated individuals that received a dose"),
+        "{reported}"
+    );
+    assert_eq!(
+        out.results
+            .iter()
+            .filter(|r| r.id == "S2" && r.ipred == 0.0)
+            .count(),
+        900,
+        "every placebo row is zero, crossing or not"
+    );
 }
 
 /// #1823: the count the warning reports is exactly the number of simulated individuals
@@ -1519,7 +1581,7 @@ fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
         let msg = msg.expect("a crossing individual must be reported");
         assert!(
             msg.contains(&format!(
-                "{zeroed} of {total} simulated individuals were evaluated"
+                "{zeroed} of {total} simulated individuals that received a dose"
             )),
             "count must equal the zeroed individuals: {msg}"
         );
@@ -1560,7 +1622,9 @@ fn simulated_flip_flop_count_covers_the_propensity_matched_branch() {
     assert_eq!(total, 600);
     let msg = msg.expect("a matched run reports its crossers too");
     assert!(
-        msg.contains(&format!("{zeroed} of {total} simulated individuals")),
+        msg.contains(&format!(
+            "{zeroed} of {total} simulated individuals that received a dose"
+        )),
         "{msg}"
     );
     // Not compared against the unmatched run's count: the matched branch draws a whole
@@ -1601,7 +1665,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
         // Sentence 1 — the count, the cause, and the consequence for `ipred`.
         assert!(
             msg.contains(&format!(
-                "{zeroed} of 600 simulated individuals were evaluated"
+                "{zeroed} of 600 simulated individuals that received a dose"
             )),
             "{name}: {msg}"
         );
@@ -1614,23 +1678,22 @@ fn simulated_flip_flop_warning_wording_per_family() {
             msg.contains("their entire dose-driven concentration was clamped to zero"),
             "{name}: {msg}"
         );
-        // Sentence 2 — the outcome, on its literal-zero branch (these three fixtures carry
-        // no `[initial_conditions]` / Form-C readout / log transform;
-        // `simulated_flip_flop_warning_says_what_the_clamp_shows_as` covers the other side).
+        // Sentence 2 — the consequence for anything computed over those rows.
         assert!(
-            msg.contains("whole profiles are identically zero (`ipred = 0`)"),
+            msg.contains("Those rows are still returned and still summarised"),
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("not missing from the output — they are zeros"),
+            msg.contains("pulled toward the profile this model would produce with no drug"),
             "{name}: {msg}"
         );
-        assert!(msg.contains("pulled toward zero"), "{name}: {msg}");
+        // Sentence 3 — why a zero row is not the way to find them
+        // (`..._claims_nothing_about_the_row_values` is what makes this sentence necessary).
         assert!(
-            msg.contains("under a proportional error model their simulated DV is 0"),
+            msg.contains("searching the output for a zero row will not reliably find them"),
             "{name}: {msg}"
         );
-        // Sentence 3 — the way out, and that it is per individual.
+        // Sentence 4 — the way out, and that it is per individual.
         assert!(
             msg.contains("which reroutes per individual and is valid in both regimes"),
             "{name}: {msg}"

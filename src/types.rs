@@ -6383,11 +6383,15 @@ pub enum WarningCode {
     Simulation,
     /// A transit / inverse-Gaussian absorption closed form entered the flip-flop
     /// regime (disposition rate ≥ the tilting abscissa), where it returns an
-    /// identically-zero profile. One cause, three phases: auto-rerouted to the ODE twin
-    /// (an informational heads-up, #776); or, on a twin-less model, a silently degenerate
-    /// likelihood contribution at a subject's fitted EBE (#785) or an identically-zero
-    /// simulated individual whose drawn η crossed the abscissa (`W_SIMULATED_FLIP_FLOP`,
-    /// #1823) — neither of which the η = 0 entry-point reject can catch.
+    /// identically-zero *dose-driven* profile. One cause, three phases: auto-rerouted to the
+    /// ODE twin (an informational heads-up, #776); or, on a twin-less model, a silently
+    /// degenerate likelihood contribution at a subject's fitted EBE (#785), or a dosed
+    /// simulated individual whose drawn η crossed the abscissa, so the drug contributes
+    /// nothing to any of its rows (`W_SIMULATED_FLIP_FLOP`, #1823) — neither of which the
+    /// η = 0 entry-point reject can catch. Note that such a row is not necessarily
+    /// `ipred == 0.0`: a baseline, a Form-C readout, a log transform or the FREM override
+    /// runs after the clamp, so the count is the only reliable way to find these
+    /// individuals.
     FlipFlop,
     /// An analytic transit / inverse-Gaussian model's ODE twin could not be built, so
     /// the model keeps no ODE fallback (#1008). The twin is an ODE model while the

@@ -356,7 +356,8 @@ A twin-*carrying* model reroutes such an individual to its exact ODE twin, which
 is valid in both regimes, and nothing is lost. A twin-less one has nothing to
 reroute to: the closed form clamps, and that individual's **entire dose-driven
 concentration becomes zero** — the drug contributes nothing to any of its rows.
-The rows are still returned, still finite and still plotted.
+The rows are still returned, still finite and still plotted, and they are not
+necessarily zeros (see below).
 
 The `_diag` entry points report this as one per-run count
 ([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
@@ -368,27 +369,35 @@ where the twin-less one_cpt_transit closed form has no solution, so their entire
 dose-driven concentration was clamped to zero. ...
 ```
 
-### What a clamped individual's rows look like
+### Why looking for a zero row will not find them
 
-Whether those rows read as literal zeros depends on what the model layers on the
-closed form's output *afterwards*. Three things can, all applied after the clamp:
+The clamp removes the closed form's **dose-driven** term. Four things then run on
+that output, in this order (`pk/mod.rs`):
 
-| Layer | Effect on a clamped individual |
+| Step | What it does to a clamped (zero) prediction |
 |---|---|
-| none (the plain case) | `ipred = 0` on every row |
-| `[initial_conditions] init(central) = ...` | the baseline's decay alone |
-| a Form-C `[scaling] y = <expr>` readout | whatever the readout evaluates to at a zero state |
-| log-transform-both-sides (`log(DV) ~ additive(...)`) | `ln` of the internal floor, a large negative number |
+| `add_analytical_init` — `[initial_conditions] init(central) = ...` | adds the baseline's decay, so the row is the baseline alone |
+| `apply_analytic_readout` — Form-C `[scaling] y = <expr>` | whatever `<expr>` evaluates to at a zero state |
+| `apply_scaling` — Form-A/B `[scaling] obs_scale = <expr>` | divides by a positive scale, so a zero stays zero |
+| `apply_log_transform` — `log(DV) ~ additive(...)` / `DV ~ log_additive(...)` | `ln` of the internal floor, a large negative number |
+| `apply_frem_prediction_override` — FREM `FREMTYPE > 0` rows | replaced by `theta + eta` (from code reading; not measured) |
 
-A Form-A/B `[scaling] obs_scale = <expr>` divisor is **not** one of them — it
-multiplies, so zero stays zero.
+Whether a clamped row ends up at `0.0` is therefore a question about the values
+the model's own expressions produce, not about its structure. Two Form-C
+readouts make the point: measured at ω²~CL~ = 0.09 / n_sim = 300 / seed 7, the
+same 27 clamped individuals give **27** zero rows under `y = central/V` and
+**0** under `y = central/V + 2.5`.
 
-This matters because two of those three layers are themselves reasons the ODE
-twin was declined, so on a twin-less model the literal-zero case is the *special*
-one. The warning says which case the model is in, and **looking for a zero row is
-not a reliable way to find a clamped individual**. Measured on the #1823 fixture
-with an `[initial_conditions]` baseline: 27 of 600 individuals clamped, and not
-one zero row between them.
+So the warning does not say what the rows contain — it says the drug contributes
+nothing to them, and that **searching the output for a zero row will not
+reliably find them**. The count is the reliable channel. Measured on an
+`[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero
+row between them.
+
+An individual whose subject carries **no positive dose amount** is not counted at
+all: there is no dose-driven term for the clamp to remove, so nothing is lost and
+an ODE rewrite would produce the same rows. The count's denominator is the dosed
+individuals.
 
 ### Why it biases a VPC
 
