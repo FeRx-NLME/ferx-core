@@ -1203,10 +1203,36 @@ fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, 
             .or_insert(true);
         *same &= x.ipred.to_bits() == y.ipred.to_bits();
     }
-    (
-        per_individual.values().filter(|m| **m).count(),
-        per_individual.len(),
-    )
+    let matched = per_individual.values().filter(|m| **m).count();
+    // The oracle has to be able to say "no" (#1823 review r3). If a fixture's dose never
+    // reached an observation — dosed after the last one, a `lagtime` past it, `f = 0` —
+    // then *every* individual matches its dose-free twin, crossing or not, and the
+    // comparison stops discriminating. The callers assert an exact count, which already
+    // catches that; this makes the requirement explicit so relaxing one of them to
+    // `> 0` cannot quietly re-open it.
+    assert!(
+        matched < per_individual.len(),
+        "the dose-free oracle is degenerate on this fixture: all {} individuals match it, \
+         so the comparison cannot distinguish a clamped individual from a live one",
+        per_individual.len()
+    );
+    (matched, per_individual.len())
+}
+
+/// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
+/// file is degenerate, so nothing else can reach it — and a guard whose job is to reject a
+/// *future* fixture is worth nothing if it cannot be shown to fire at all.
+///
+/// Two identical row sets are exactly the degenerate case: every individual matches, so the
+/// comparison cannot tell a clamped individual from a live one.
+#[test]
+#[should_panic(expected = "the dose-free oracle is degenerate on this fixture")]
+fn dose_free_oracle_rejects_a_degenerate_fixture() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let rows = flip_flop_rows(&model, 1e-4, 2, 7);
+    assert!(!rows.is_empty(), "the fixture emits rows");
+    // `rows` against itself: matched == total, which must be refused.
+    dose_free_matches(&rows, &rows);
 }
 
 /// Simulated individuals whose whole profile came back identically zero, and how many were
@@ -1452,7 +1478,10 @@ fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("pulled toward the profile this model would produce with no drug at all"),
+            msg.contains(
+                "every VPC band, prediction interval or mean computed over them describes a \
+                 subject with no drug in it"
+            ),
             "{name}: {msg}"
         );
         assert!(
@@ -1467,6 +1496,9 @@ fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
             "`ipred = 0`.",
             "cannot be found by looking for one",
             "simulated DV is 0",
+            // …and nothing asserting the clamp *moved* anything: false for a `lagtime`
+            // past the last observation or `f = 0` (#1823 review r3).
+            "pulled toward",
         ] {
             assert!(
                 !msg.contains(banned),
@@ -1550,6 +1582,99 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
         900,
         "every placebo row is zero, crossing or not"
     );
+}
+
+/// #1823 review r3: a dose that lands **after every observation** is not counted either —
+/// no returned row could have carried the drug whether or not the closed form clamped.
+///
+/// Measured: with observations at t = 1, 2, 3 and the dose moved to t = 100, the prediction
+/// is `[0, 0, 0]` with the dose and `[0, 0, 0]` without it, at a crossing η *and* at η = 0.
+/// So the clamp changed nothing, and before this gate the individual was counted anyway.
+/// `<=`, not `<`: ferx applies a dose before an observation at the same time, so a dose
+/// landing exactly on the last observation still reaches it and is still counted — both
+/// sides of that boundary are asserted here.
+#[test]
+fn simulated_flip_flop_tally_skips_a_dose_after_every_observation() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let theta = model.default_params.theta.clone();
+    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+    let base = tiny_population();
+    let last_obs = *base.subjects[0].obs_times.last().expect("an obs grid");
+
+    let at = |t: f64| {
+        let mut s = base.subjects[0].clone();
+        s.doses[0].time = t;
+        s
+    };
+    // The clamp is invisible for a late dose: the rows are the same with and without it,
+    // and the same at a crossing η as at η = 0.
+    let late = at(100.0);
+    let mut undosed_late = late.clone();
+    undosed_late.doses[0].amt = 0.0;
+    for eta in [[0.0_f64], crosser] {
+        assert_eq!(
+            crate::pk::compute_predictions_with_tv(&model, &late, &theta, &eta),
+            crate::pk::compute_predictions_with_tv(&model, &undosed_late, &theta, &eta),
+            "a dose at t = 100 reaches no observation at t = 1, 2, 3 (η = {eta:?})"
+        );
+    }
+
+    // The straddle on `d.time <= last_obs`: a dose exactly on the last observation counts,
+    // one just after it does not.
+    for (name, t, want) in [
+        ("on the last observation", last_obs, true),
+        ("just after it", last_obs + 1e-9, false),
+        ("long after it", 100.0, false),
+        ("before the first", 0.0, true),
+    ] {
+        let mut tally = SimulatedFlipFlopTally::default();
+        tally.observe(&model, &at(t), &theta, &crosser);
+        assert_eq!(
+            tally.warning(&model).is_some(),
+            want,
+            "dose {name} (t = {t}): expected counted = {want}"
+        );
+    }
+
+    // `any`, not `all`: one qualifying dose among several is enough. Every other fixture
+    // carries exactly one dose, which makes the two spellings indistinguishable — measured
+    // in the #1823 r3 sweep, where `.any` → `.all` survived the whole suite until this
+    // case was added. A two-dose subject discriminates in both directions.
+    let two_doses = |a: f64, b: f64| {
+        let mut s = base.subjects[0].clone();
+        s.doses = vec![
+            DoseEvent::new(a, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(b, 100.0, 1, 0.0, false, 0.0),
+        ];
+        s.dose_occasions = vec![1, 1];
+        s
+    };
+    for (name, a, b, want) in [
+        ("one in range, one late", 0.0, 100.0, true),
+        ("one late, one in range", 100.0, last_obs, true),
+        ("both late", 100.0, 200.0, false),
+    ] {
+        let mut tally = SimulatedFlipFlopTally::default();
+        tally.observe(&model, &two_doses(a, b), &theta, &crosser);
+        assert_eq!(
+            tally.warning(&model).is_some(),
+            want,
+            "two doses, {name}: expected counted = {want}"
+        );
+    }
+
+    // A subject with no observations at all is likewise not counted: there is no row for
+    // the clamp to have affected.
+    let mut no_obs = base.subjects[0].clone();
+    no_obs.obs_times.clear();
+    no_obs.obs_raw_times.clear();
+    no_obs.observations.clear();
+    no_obs.obs_cmts.clear();
+    no_obs.cens.clear();
+    no_obs.occasions.clear();
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&model, &no_obs, &theta, &crosser);
+    assert_eq!(tally.warning(&model), None);
 }
 
 /// #1823: the count the warning reports is exactly the number of simulated individuals
@@ -1684,7 +1809,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
             "{name}: {msg}"
         );
         assert!(
-            msg.contains("pulled toward the profile this model would produce with no drug"),
+            msg.contains("describes a subject with no drug in it"),
             "{name}: {msg}"
         );
         // Sentence 3 — why a zero row is not the way to find them

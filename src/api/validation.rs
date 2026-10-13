@@ -3784,8 +3784,15 @@ pub(crate) fn uncertainty_draws_skipped_warning(
 /// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
 /// reroute to and returns the closed form, which clamps — so the individual contributes
 /// finite, plottable rows carrying none of the drug, and every summary computed over them
-/// (a VPC band, a prediction interval, a mean) is pulled toward the drug-free profile.
+/// (a VPC band, a prediction interval, a mean) describes a subject with no drug in it.
 /// Counting them is the only channel that says so.
+///
+/// The message says that and stops. It does **not** say the clamp *moved* anything, because
+/// for a few degenerate designs it did not — an absorption `lagtime` past the last
+/// observation, or `f = 0`, leaves the rows where they already were. Those are
+/// individual-parameter expressions, so excluding them needs the predictor; the two
+/// structural halves that can be excluded — no positive dose, and no dose at or before an
+/// observation — are ([`observe`](Self::observe), #1823 review r2 / r3).
 ///
 /// **The count says nothing about what those rows contain**, deliberately. Four things run
 /// on the closed form's output *after* the clamp (`pk/mod.rs`, in order):
@@ -3845,14 +3852,31 @@ impl SimulatedFlipFlopTally {
         // Measured there: an `AMT = 0` second subject contributed its crossers to a count
         // of 27 while all 900 of its rows were already zero.
         //
-        // The test is deliberately "did this subject receive drug", a structural fact, and
-        // not "did the dose reach an observation" — a subject dosed after its last
-        // observation is still counted. That second question is about the value the
-        // prediction takes, and a structural predicate answering it is exactly the mistake
-        // `clamp_shows_as_literal_zero` was (review r2): it reads the model's shape and
-        // guesses at its arithmetic. Such a design is degenerate anyway, and the message
-        // stays true for it — the drug does contribute nothing to its rows.
-        if !subject.doses.iter().any(|d| d.amt > 0.0) {
+        // The dose must also land at or before an observation, or no returned row could
+        // have carried the drug either way (#1823 review r3; measured there: obs at
+        // t = 1, 2, 3 with the dose at t = 100 predicted `[0, 0, 0]` with the dose and
+        // `[0, 0, 0]` without it, at a crossing η *and* at η = 0). `<=`, not `<`: ferx
+        // applies a dose before an observation at the same time, so a dose on the last
+        // observation does reach it. Both halves read dose and observation **times**, which
+        // are data — this is still a structural test, not a guess at the predictor.
+        //
+        // What it deliberately does **not** cover: a `lagtime` that pushes absorption past
+        // the last observation, or `f = 0`. Those are individual-parameter *expressions*,
+        // η-dependent and evaluated per individual, so excluding them needs the predictor —
+        // which is exactly the mistake `clamp_shows_as_literal_zero` was (review r2). Such
+        // an individual is still counted, and the message stays true for it: the drug does
+        // contribute nothing to its rows. The claim that was *not* safe there — that the
+        // clamp moved anything — was removed from the message in the same round.
+        let last_obs = subject
+            .obs_times
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !subject
+            .doses
+            .iter()
+            .any(|d| d.amt > 0.0 && d.time <= last_obs)
+        {
             return;
         }
         // A twin-less transit / IG closed form takes no IOV (rejected by
@@ -3882,9 +3906,9 @@ impl SimulatedFlipFlopTally {
              {domain}){confluent}, where the twin-less {model_name} closed form has no \
              solution, so their entire dose-driven concentration was clamped to zero — the \
              drug contributes nothing to any of their rows. \
-             Those rows are still returned and still summarised, so every summary taken \
-             over them (a VPC band, a prediction interval, a mean) is pulled toward the \
-             profile this model would produce with no drug at all. \
+             Those rows are still returned and still summarised, so every VPC band, \
+             prediction interval or mean computed over them describes a subject with no \
+             drug in it. \
              Whether they read as a literal `ipred = 0` depends on what this model layers \
              on the closed form's output afterwards, so searching the output for a zero row \
              will not reliably find them. \
