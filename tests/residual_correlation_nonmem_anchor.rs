@@ -183,9 +183,10 @@ fn free_twin(kind: &str) -> String {
         )
 }
 
-/// Bands from the realised error (macOS arm64; Linux numbers in the PR):
-/// `cs` |ΔOFV| 1e-6, |Δρ̂| 4.2e-5, SE 0.05%; `ar1` |ΔOFV| 6.3e-5, |Δρ̂| 2.3e-5,
-/// SE 0.1%.
+/// Bands from the realised error. Linux aarch64 (the reference platform):
+/// `cs` |ΔOFV| 1.2e-5, |Δρ̂| 6.1e-5, SE 0.05%; `ar1` |ΔOFV| 1e-6, |Δρ̂| 6e-6,
+/// SE 0.1%. macOS arm64: `cs` 1e-6 / 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
+/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% — ≥ 8× the worst of either platform.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
