@@ -728,11 +728,23 @@ the guard's triggers fired, because the remedies are not the same:
 A **cancelled** run is not reported this way: its evaluations short-circuit before the
 feasible-evaluation counter advances, so its trace is infeasible by construction.
 
-Two notes on reading such a run. The reported OFV is a real objective — the starting
-estimates, scored by the final inner loop — so it is not a sentinel and
-`W_NONFINITE_OBJECTIVE` does not fire; the number is simply not a minimum of anything. And
-`gradient = fd` can hide the whole case, because it also swaps the outer optimizer away from
-L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
+Three notes on reading such a run.
+
+The run keeps its "increase `maxiter`" advice to itself. A run that scored nothing has no
+fit to tighten and a longer outer budget buys only more rejected trials, so when the outer
+budget *is* exhausted the usual budget warning is withheld and `W_NO_FEASIBLE_EVAL` stands
+alone — the budget that binds is `inner_maxiter`, which it names.
+
+Whether `W_NONFINITE_OBJECTIVE` also fires depends on which row of the table above you are
+in. On the **guard-rejection** rows the reported OFV is a real objective — the starting
+estimates, scored by the final inner loop — so it is not a sentinel and only
+`W_NO_FEASIBLE_EVAL` appears; the number is simply not a minimum of anything. On the
+**every-trial-non-finite** row the re-score at the starting estimates is usually non-finite
+too, and then both warnings appear: `W_NO_FEASIBLE_EVAL` for the trace and
+`W_NONFINITE_OBJECTIVE` for the number. Two warnings, two different facts.
+
+Finally, `gradient = fd` can hide the whole case, because it also swaps the outer optimizer
+away from L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
 too](optimizers.qmd#gradient-fd-moves-the-optimizer)), which keeps a flat rejection wall
 instead of the quadratic bowl and so never walks to the centre. A 35-point OFV gap between
 the two routes on the same model is that difference, not a wrong analytic gradient.

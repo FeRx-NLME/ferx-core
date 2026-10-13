@@ -34,7 +34,8 @@
 //! **What the fix is.** `no_feasible_eval_warning` reads the feasible-eval count the
 //! plateau tracker already keeps, demotes `converged`, and names the guard, the share
 //! of unconverged subjects and the remedy; the restore falls back to the point the
-//! optimizer started from instead of the penalty's minimum.
+//! optimizer started from instead of the penalty's minimum; the #1277 restart and the
+//! "increase `maxiter`" advice are both withheld, because neither has anything to act on.
 //!
 //! **Mutation sweep.** The first six edits were each applied and run (`--lib`, this
 //! filter); none of them reddens E2, the converged control:
@@ -45,7 +46,8 @@
 //! | drop the `no_feasible_eval_warning` call only | E1 — assertion 2, at θ = `[2.0, 10.0]` |
 //! | drop the `optimizer_start_s` fallback only | E1 — assertion 3, θ[0] = `0.14142136177403178` |
 //! | call site passes `cancelled: false` | E3 |
-//! | `classify_warning`'s token arm off | U7 **and** E1 assertion 4 — `Warning`/`general` |
+//! | drop `&& !feasibility.no_feasible()` from the `max_eval_reached` arm | E4 |
+//! | `classify_warning`'s token arm off | U7 **and** E1 assertion 5 — `Warning`/`general` |
 //! | hard-reject **remedy** sentence deleted whole | U4 |
 //!
 //! The last row is the #1405 shape — a diagnostic's advice half that no test can kill is a
@@ -61,7 +63,7 @@ use crate::estimation::outer_optimizer::{
     no_feasible_eval_warning, RunFeasibility, NO_FEASIBLE_EVAL_TOKEN,
 };
 use crate::parser::model_parser::parse_model_string;
-use crate::types::{WarningCode, WarningSeverity};
+use crate::types::{Optimizer, WarningCode, WarningSeverity};
 use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +343,79 @@ fn a_cancelled_run_carries_no_no_feasible_eval_warning() {
             .iter()
             .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "cancellation is not an EBE-guard finding: {:?}",
+        result.warnings
+    );
+}
+
+/// **E4 — the budget advice is withheld** (#1617 review round 1 #2).
+///
+/// "Outer optimization hit the evaluation budget (maxiter = N) before converging; increase
+/// maxiter for a tighter fit." offers to tighten a fit that does not exist, and a longer
+/// *outer* budget buys only more rejected trials: the budget that actually binds is
+/// `inner_maxiter`, which `W_NO_FEASIBLE_EVAL` names. Two warnings pointing at different
+/// knobs, one of them useless, is how a reader is sent the wrong way.
+///
+/// Staging `MaxEvalReached` **and** an infeasible trace together took a fixture search,
+/// and what did not work is worth recording, because each near-miss looks like it should:
+///
+/// * `optimizer = bobyqa` never triggers the guard on this model — its opening
+///   `rhobeg = 0.5` probes stay near the initial estimates, where the inner loop converges
+///   inside its budget. (That is also why the issue's own BOBYQA row reports a real OFV at
+///   the initial values rather than a midpoint.)
+/// * `nlopt_lbfgs` at `outer_maxiter = 1` is infeasible throughout but stops on NLopt's
+///   own criterion: the guard penalty is an exact sphere in scaled space and L-BFGS solves
+///   it in 4 evaluations, one inside the `1·(n+1) = 5` budget. Measured by mutation — with
+///   the gate removed the budget warning still did not appear, so a fixture that merely
+///   *spends* its budget is not enough; the status has to be `MaxEvalReached`.
+/// * `slsqp` escapes into feasible territory on the same model (`n_iterations = 5`, no
+///   `W_NO_FEASIBLE_EVAL`), so it earns the budget warning legitimately.
+///
+/// `mma` is the combination: capped like SLSQP, so it crawls rather than solving the
+/// sphere, and still infeasible at every trial.
+///
+/// Mutation (run): drop `&& !feasibility.no_feasible()` from the `max_eval_reached` arm →
+/// "increase maxiter for a tighter fit" reappears and assertion (3) fires.
+#[test]
+fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let options = FitOptions {
+        optimizer: Optimizer::Mma,
+        outer_maxiter: 1,
+        ..opts(3)
+    };
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+
+    // (1) The fixture still delivers an infeasible trace...
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        "the fixture must still produce a run with no feasible evaluation: {:?}",
+        result.warnings
+    );
+    // (2) ...and one that spent its whole outer budget, which is what makes NLopt return
+    //     `MaxEvalReached` and the warning below reachable at all. `outer_eval_budget` is
+    //     `outer_maxiter · (n + 1)` = 5 here. There is no field carrying NLopt's status,
+    //     so the evaluation count is the nearest observable — and it is not sufficient on
+    //     its own (see the L-BFGS near-miss above), which is why the mutation is what
+    //     establishes that assertion (3) can fail.
+    assert_eq!(
+        result.n_iterations, 5,
+        "this test needs a run that exhausted its 5-evaluation outer budget; it made {}. \
+         The `max_eval_reached` arm that assertion (3) guards is then never taken and the \
+         assertion is vacuous.",
+        result.n_iterations
+    );
+    // (3) ...so the generic budget advice must be withheld.
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("increase maxiter")),
+        "a run that never scored the objective has no fit to tighten, so the \
+         \"increase maxiter\" advice must not be offered next to W_NO_FEASIBLE_EVAL: {:?}",
         result.warnings
     );
 }
