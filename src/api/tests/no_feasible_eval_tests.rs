@@ -45,6 +45,7 @@
 //! | both halves of the fix off | E1 — assertion 2, `converged = true` at θ = `[0.14142136, 7.07106785]` |
 //! | drop the `no_feasible_eval_warning` call only | E1 — assertion 2, at θ = `[2.0, 10.0]` |
 //! | drop the `optimizer_start_s` fallback only | E1 — assertion 3, θ[0] = `0.14142136177403178` |
+//! | restore the θ coordinates only, leaving ω/σ on the best-seen point | E1 — assertion 4, ω = `0.9999999524299102`, the middle of its ±6 log rail |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -163,6 +164,13 @@ fn opts(inner_maxiter: usize) -> FitOptions {
 /// minimum sits, and what the defect reported as the estimate.
 const BOUND_MIDPOINT: [f64; 2] = [0.14142135623730953, 7.0710678118654755];
 
+/// ω at the middle of its packed rail, which is the ω half of the same signature. Omega is
+/// Cholesky-packed in log space on a ±6 rail, so the box centre is `log L = 0`, i.e.
+/// `ω = 1` — the value the issue reports for all three of warfarin's diagonal elements.
+/// Declared here is `0.04`, so the two are 25× apart and an assertion on one cannot be
+/// satisfied by the other.
+const OMEGA_MIDPOINT: f64 = 1.0;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  E1/E2 — the differential pair, end to end through `fit()`
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,11 +191,14 @@ const BOUND_MIDPOINT: [f64; 2] = [0.14142135623730953, 7.0710678118654755];
 ///    names as the defect ("the reported OFV is a real objective at the midpoint …
 ///    the defect is the point, not the score"). Demoting the flag alone would leave
 ///    a fit whose θ is a number the data never chose.
-/// 4. **they are the declared initial estimates** — the positive half of (3), which
-///    on its own would pass at any third wrong value. Exact by construction (`2.0`,
-///    `10.0`), so the bound is a round-trip tolerance and not a fit tolerance: the
-///    reported θ comes back through `pack_with_bounds` → `clamp_to_bounds` →
-///    `unpack_params`, which costs `10.0` one ULP.
+/// 4. **they are the declared initial estimates, in every packed family** — the positive
+///    half of (3), which on its own would pass at any third wrong value, and across θ, ω
+///    and σ rather than θ alone, since the issue's signature covers ω too (each at the
+///    middle of its ±6 log rail, i.e. `1`). Exact by construction (`2.0`, `10.0`, `0.04`,
+///    `sqrt(0.05)` — σ reads back as an SD), so the bound is a round-trip tolerance and not
+///    a fit tolerance: the reported
+///    values come back through `pack_with_bounds` → `clamp_to_bounds` → `unpack_params`,
+///    which costs `10.0` one ULP.
 /// 5. **a warning names the guard, the share and the remedy**, carries
 ///    `W_NO_FEASIBLE_EVAL` and classifies `Critical`/`convergence`.
 /// 6. **the warning set for this row** — the generic `Outer optimization did not converge`
@@ -229,7 +240,11 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
             result.theta[i],
         );
     }
-    // (4) ...they are the values the model declared. One ULP of round-trip, not a fit
+    // (4) ...they are the values the model declared — in **every** packed family, not just
+    //     θ (#1617 review round 4). The restore copies the whole scaled vector, and the
+    //     issue reports ω at the midpoint of its own rail alongside the θ midpoints; a
+    //     partial restore over the θ coordinates alone would leave ω and σ at the penalty's
+    //     minimum with the θ assertions above still green. One ULP of round-trip, not a fit
     //     tolerance: `10.0` comes back as `10.000000000000002` through the packer.
     for (i, init) in [2.0_f64, 10.0].iter().enumerate() {
         assert!(
@@ -239,6 +254,29 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
             result.theta[i],
         );
     }
+    assert!(
+        (result.omega[(0, 0)] - 0.04).abs() <= 1e-12 * 0.04,
+        "#1617: omega must come back at its declared 0.04, not the middle of its packed \
+         rail ({OMEGA_MIDPOINT}); got {}",
+        result.omega[(0, 0)],
+    );
+    assert!(
+        (result.omega[(0, 0)] - OMEGA_MIDPOINT).abs() > 0.5,
+        "#1617: omega is at the centre of its ±6 log rail — the ω half of the midpoint \
+         signature the issue reports; got {}",
+        result.omega[(0, 0)],
+    );
+    // σ is reported on the **standard-deviation** scale: a bare `sigma NAME ~ X` declares a
+    // variance and the parser converts it via `sqrt` (#56), so the declared `0.05` reads
+    // back as `sqrt(0.05) = 0.223606797749979`. Measured, not assumed — the first version of
+    // this assertion compared against `0.05` and failed on exactly that factor.
+    let sigma_declared = 0.05_f64.sqrt();
+    assert!(
+        (result.sigma[0] - sigma_declared).abs() <= 1e-12 * sigma_declared,
+        "#1617: sigma must come back at its declared 0.05 (= {sigma_declared} as an SD); \
+         got {}",
+        result.sigma[0],
+    );
     // (5) ...and it says why.
     let entry = result
         .warnings_structured
