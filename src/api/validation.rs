@@ -65,9 +65,11 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 ///
 /// Unresolved names that read as random effects get their own `E_ETA_NOT_DECLARED`
 /// diagnostic, pushed first so [`first_error`](crate::diagnostics::first_error) — which is what `fit()` reports —
-/// surfaces the actionable message instead of "covariate not found in data". The
-/// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
-/// historical `Err(String)` for the names that remain.
+/// surfaces the actionable message instead of "covariate not found in data". Of the
+/// names that remain, one that is an exact header of the file the population was
+/// read from gets its own `E_MISSING_COVARIATE` text — the column is in the data,
+/// the reader did not take it (#1936); every other name keeps the message text
+/// byte-for-byte identical to the historical `Err(String)`.
 ///
 /// "Carries" means the *predictor* can resolve the name, which is a slightly wider
 /// test than membership in `Population::covariate_names`. A CSV-read population

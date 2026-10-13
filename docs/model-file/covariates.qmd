@@ -57,10 +57,11 @@ off the data).
 
 - **Optional & backward-compatible.** When the block is absent, behaviour is
   unchanged: every non-standard CSV column is auto-detected as a covariate.
-  A record column (`ID`, `TIME`, `DV`, `AMT`, `CMT`, …) or the `iov_column` is
-  not auto-detected, but one the model reads — `if (OCC == 2) …` in
+  A record column (`ID`, `DV`, `AMT`, `CMT`, …) or the `iov_column` is not
+  auto-detected, but one the model reads — `if (OCC == 2) …` in
   `[individual_parameters]`, as in a NONMEM `$PK` — is read all the same, with
-  or without this block (#1936).
+  or without this block (#1936). `TIME` in `[individual_parameters]` is the
+  built-in record time, not a read of the column.
 - **Authoritative for the table and typing.** Only the listed columns appear in
   the covariate table and carry a declared type; other non-standard columns
   (e.g. `STUDY`, `DATE`) are not tabled.
