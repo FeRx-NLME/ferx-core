@@ -659,7 +659,7 @@ fn test_kappa_shrinkage_pooled_zero_when_rms_matches_omega_sd() {
     // mean(κ²) = 1 → shrinkage = 0
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
     let kappas = make_kappas(vec![vec![1.0], vec![-1.0]]);
-    let sh = compute_kappa_shrinkage(&kappas, &omega);
+    let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert_eq!(sh.len(), 1);
     assert!((sh[0]).abs() < 1e-10, "expected ~0, got {}", sh[0]);
 }
@@ -674,7 +674,7 @@ fn test_kappa_shrinkage_pooled_positive_when_shrunk() {
         vec![0.01, 0.02],
         vec![-0.01, -0.02],
     ]);
-    let sh = compute_kappa_shrinkage(&kappas, &omega);
+    let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert!(sh[0] > 0.9, "expected high shrinkage, got {}", sh[0]);
 }
 
@@ -682,7 +682,7 @@ fn test_kappa_shrinkage_pooled_positive_when_shrunk() {
 fn test_kappa_shrinkage_pooled_nan_when_omega_zero() {
     let omega = DMatrix::zeros(1, 1);
     let kappas = make_kappas(vec![vec![0.1], vec![-0.1]]);
-    let sh = compute_kappa_shrinkage(&kappas, &omega);
+    let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert!(sh[0].is_nan());
 }
 
@@ -690,7 +690,7 @@ fn test_kappa_shrinkage_pooled_nan_when_omega_zero() {
 fn test_kappa_shrinkage_pooled_nan_when_fewer_than_2_obs() {
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
     let kappas = make_kappas(vec![vec![0.5]]);
-    let sh = compute_kappa_shrinkage(&kappas, &omega);
+    let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert!(sh[0].is_nan());
 }
 
@@ -698,7 +698,7 @@ fn test_kappa_shrinkage_pooled_nan_when_fewer_than_2_obs() {
 fn test_kappa_shrinkage_by_occ_returns_empty_for_single_occasion() {
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
     let kappas = make_kappas(vec![vec![0.5], vec![-0.5]]);
-    let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+    let sh = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
     assert!(sh.is_empty(), "expected empty for 1 occasion, got {:?}", sh);
 }
 
@@ -714,7 +714,7 @@ fn test_kappa_shrinkage_by_occ_values() {
         vec![1.0, 0.1],
         vec![-1.0, -0.1],
     ]);
-    let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+    let sh = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
     assert_eq!(sh.len(), 2, "expected 2 occasions");
     assert!(
         (sh[0][0]).abs() < 1e-10,
@@ -735,13 +735,217 @@ fn test_kappa_shrinkage_two_kappas_independent() {
         vec![DVector::from_vec(vec![1.0, 0.1])],
         vec![DVector::from_vec(vec![-1.0, -0.1])],
     ];
-    let sh = compute_kappa_shrinkage(&kappas, &omega);
+    let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert_eq!(sh.len(), 2);
     assert!((sh[0]).abs() < 1e-10, "kappa 0 shrinkage ~0, got {}", sh[0]);
     assert!(
         (sh[1] - 0.9).abs() < 1e-10,
         "kappa 1 shrinkage ~0.9, got {}",
         sh[1]
+    );
+}
+
+/// #1911: an uninformed group (κ̂ = 0, the prior mode) no longer moves the pooled
+/// shrinkage — it equals the informed groups' value alone, bit for bit, while the same
+/// κ̂ with the group counted reads higher (the straddle: without it the test would pass
+/// on a filter that drops nothing, since an all-informed mask is the old behaviour).
+#[test]
+fn test_kappa_shrinkage_pooled_skips_uninformed_group() {
+    let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+    let with_extra = make_kappas(vec![vec![0.6, 0.0], vec![-0.4, 0.0], vec![0.5, 0.0]]);
+    let informed_only = make_kappas(vec![vec![0.6], vec![-0.4], vec![0.5]]);
+    let mask = vec![vec![true, false]; 3];
+    let filtered = compute_kappa_shrinkage(&with_extra, &mask, &omega);
+    let alone = compute_kappa_shrinkage(&informed_only, &[], &omega);
+    let unfiltered = compute_kappa_shrinkage(&with_extra, &[], &omega);
+    assert_eq!(
+        filtered[0].to_bits(),
+        alone[0].to_bits(),
+        "{filtered:?} vs {alone:?}"
+    );
+    // mean κ̂² over 6 pairs is half that over 3: 1 − (1 − s)/√2 > s.
+    assert!(
+        unfiltered[0] > filtered[0] + 0.1,
+        "counting the uninformed group must read higher: {unfiltered:?} vs {filtered:?}"
+    );
+}
+
+/// The all-informed control: a mask of all `true` is bit-identical to no mask, pooled
+/// and per slot.
+#[test]
+fn test_kappa_shrinkage_all_informed_mask_is_identity() {
+    let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.7, 1.3]));
+    let kappas: Vec<Vec<DVector<f64>>> = (0..4)
+        .map(|i| {
+            (0..3)
+                .map(|g| {
+                    DVector::from_vec(vec![
+                        0.1 * (i as f64) - 0.17 * g as f64,
+                        0.3 - 0.07 * i as f64,
+                    ])
+                })
+                .collect()
+        })
+        .collect();
+    let mask = vec![vec![true; 3]; 4];
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&compute_kappa_shrinkage(&kappas, &mask, &omega)),
+        bits(&compute_kappa_shrinkage(&kappas, &[], &omega))
+    );
+    let a = compute_kappa_shrinkage_by_occ(&kappas, &mask, &omega);
+    let b = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
+    assert_eq!(a.len(), 3);
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(bits(x), bits(y));
+    }
+}
+
+/// A subject with no informed group contributes nothing: the result equals the one
+/// without that subject, and a population where no group is informed is NaN (fewer
+/// than two pairs), not a 0/0.
+#[test]
+fn test_kappa_shrinkage_subject_with_no_informed_group_excluded() {
+    let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+    let with = make_kappas(vec![vec![0.6, 0.2], vec![-0.4, 0.3], vec![0.0, 0.0]]);
+    let without = make_kappas(vec![vec![0.6, 0.2], vec![-0.4, 0.3]]);
+    let mask = vec![vec![true, true], vec![true, true], vec![false, false]];
+    let a = compute_kappa_shrinkage(&with, &mask, &omega);
+    let b = compute_kappa_shrinkage(&without, &[], &omega);
+    assert_eq!(a[0].to_bits(), b[0].to_bits(), "{a:?} vs {b:?}");
+    let none = vec![vec![false, false]; 3];
+    assert!(compute_kappa_shrinkage(&with, &none, &omega)[0].is_nan());
+    let by_occ = compute_kappa_shrinkage_by_occ(&with, &none, &omega);
+    assert_eq!(by_occ.len(), 2);
+    assert!(by_occ.iter().flatten().all(|v| v.is_nan()), "{by_occ:?}");
+}
+
+/// Per slot: an uninformed group leaves its slot's value to the informed subjects, and
+/// a slot where fewer than two subjects are informed is NaN — the issue's
+/// `[[0.912], [1.0]]` (second slot a pk-only-only occasion after every observation)
+/// reads `[[…], [NaN]]`.
+///
+/// Slot 3 is informed **after** the uninformed slot 2 — the reachable order
+/// `[obs, obs, dose after the last obs, mid-course pk-only row]`, since groups run
+/// observed → dose-only → pk-only. A filtered group keeps its position: slot 3 holds
+/// the subjects' slot-3 κ̂ and slot 2 stays NaN. Renumbering after the filter would
+/// shift those κ̂ into slot 2 (#1958 review r1 #1).
+#[test]
+fn test_kappa_shrinkage_by_occ_skips_uninformed_group() {
+    let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+    let kappas = make_kappas(vec![
+        vec![0.6, 0.5, 0.0, 0.7],
+        vec![-0.4, -0.3, 0.0, -0.2],
+        vec![0.5, 0.0, 0.0, 0.0],
+    ]);
+    let mask = vec![
+        vec![true, true, false, true],
+        vec![true, true, false, true],
+        vec![true, false, false, false],
+    ];
+    let sh = compute_kappa_shrinkage_by_occ(&kappas, &mask, &omega);
+    assert_eq!(sh.len(), 4, "{sh:?}");
+    let alone = |v: Vec<f64>| {
+        compute_kappa_shrinkage(
+            &make_kappas(v.into_iter().map(|x| vec![x]).collect()),
+            &[],
+            &omega,
+        )[0]
+    };
+    assert_eq!(
+        sh[1][0].to_bits(),
+        alone(vec![0.5, -0.3]).to_bits(),
+        "{sh:?}"
+    );
+    assert!(
+        sh[2][0].is_nan(),
+        "uninformed slot 2 must stay empty: {sh:?}"
+    );
+    assert_eq!(
+        sh[3][0].to_bits(),
+        alone(vec![0.7, -0.2]).to_bits(),
+        "{sh:?}"
+    );
+    // Slot 0 is all informed: unchanged.
+    let unmasked = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
+    assert_eq!(sh[0][0].to_bits(), unmasked[0][0].to_bits());
+}
+
+/// The helper `fit()` calls derives the mask from the model and the population. Three
+/// subjects observe OCC 1 (t = 1) and OCC 2 (t = 2); a pk-only row adds OCC 3.
+///
+/// - Trailing (t = 5, the #1906 `iov_pk_only_*_AT` shape): uninformed on the PK model,
+///   so the pooled and per-slot values equal the two observed groups' alone.
+/// - Mid-course (t = 1.5): on the PK model the interval it closes reaches the t = 2
+///   observation, so it counts (the unmasked value); on the compartment-free MBMA model
+///   nothing carries over, so it does not (the observed-only value). One fixture, both
+///   sides of `is_algebraic()`.
+#[test]
+fn test_kappa_shrinkages_reads_informed_rule_from_population() {
+    use crate::parser::model_parser::parse_model_string;
+    let pk = parse_model_string(include_str!("../../../examples/warfarin_iov.ferx")).unwrap();
+    let pred = parse_model_string(include_str!(
+        "../../../tests/data/mbma_placebo/mbma_placebo.ferx"
+    ))
+    .unwrap();
+    assert!(!pk.is_algebraic() && pred.is_algebraic());
+    let pop = |pk_only_at: Option<f64>| {
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            dose_occasions: vec![1],
+            obs_times: vec![1.0, 2.0],
+            observations: vec![1.0, 1.0],
+            occasions: vec![1, 2],
+            pk_only_times: pk_only_at.into_iter().collect(),
+            pk_only_occasions: pk_only_at.map(|_| 3).into_iter().collect(),
+            ..Subject::default()
+        };
+        Population {
+            subjects: vec![subject; 3],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    };
+    let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+    let observed = make_kappas(vec![vec![0.6, 0.2], vec![-0.4, 0.3], vec![0.5, -0.1]]);
+    let with_pk = make_kappas(vec![
+        vec![0.6, 0.2, 0.0],
+        vec![-0.4, 0.3, 0.0],
+        vec![0.5, -0.1, 0.0],
+    ]);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let (base, base_occ) = kappa_shrinkages(&pk, &pop(None), &observed, &omega);
+    // Control: the all-observed population is the unmasked value.
+    assert_eq!(
+        bits(&base),
+        bits(&compute_kappa_shrinkage(&observed, &[], &omega))
+    );
+    let unmasked = compute_kappa_shrinkage(&with_pk, &[], &omega);
+    assert!(unmasked[0] > base[0] + 0.05, "{unmasked:?} vs {base:?}");
+
+    let (at, at_occ) = kappa_shrinkages(&pk, &pop(Some(5.0)), &with_pk, &omega);
+    assert_eq!(bits(&at), bits(&base), "trailing pk-only row, PK model");
+    assert_eq!(at_occ.len(), 3);
+    assert!(at_occ[2][0].is_nan(), "{at_occ:?}");
+    for s in 0..2 {
+        assert_eq!(bits(&at_occ[s]), bits(&base_occ[s]));
+    }
+
+    let (mid_pk, _) = kappa_shrinkages(&pk, &pop(Some(1.5)), &with_pk, &omega);
+    assert_eq!(
+        bits(&mid_pk),
+        bits(&unmasked),
+        "mid-course pk-only row, PK model"
+    );
+    let (mid_pred, _) = kappa_shrinkages(&pred, &pop(Some(1.5)), &with_pk, &omega);
+    assert_eq!(
+        bits(&mid_pred),
+        bits(&base),
+        "mid-course pk-only row, MBMA model"
     );
 }
 
