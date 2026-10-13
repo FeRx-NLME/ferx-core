@@ -8,12 +8,22 @@
 //!
 //! **The input space, enumerated** (the message is as much the deliverable as the
 //! predicate, and a claim no test can kill is a claim nobody has checked):
-//! `{ reads TIME } × { read by the RHS, by an init() seed, by both, by neither }
-//!  × { OdeAccumulated hazard, analytic hazard }`. The cells that must refuse are the
-//! first three with an `OdeAccumulated` hazard; every other cell must return `None`, and
-//! each has a test below — including the two that look like they should refuse and must
-//! not: a `TIME`-reading **dose-record** quantity (#1575 reads those per dose record) and
-//! a `TIME`-reading **`[odes]` RHS** (the integrator clock honours that, #610).
+//! `{ reads TIME } × { reaches the accumulator through the RHS, through an init() seed,
+//! through both, through neither } × { OdeAccumulated hazard, analytic hazard }`. The
+//! cells that must refuse are the first three with an `OdeAccumulated` hazard; every
+//! other cell must return `None`, and each has a test below — including the four that
+//! look like they should refuse and must not:
+//!
+//! * a `TIME`-reading **dose-record** quantity (#1575 reads those per dose record);
+//! * a `TIME`-reading **`[odes]` RHS** (the integrator clock honours that, #610);
+//! * a `TIME`-reading parameter the **hazard does not depend on** (`hazard = H0` with a
+//!   time-dependent `CL`), and an `init()` of a state it does not depend on;
+//! * no `OdeAccumulated` endpoint at all.
+//!
+//! The "reaches" half is a dependency slice, not a syntax scan, so two further cells have
+//! their own tests: a parameter read **only by an `[odes]` `if` condition** must refuse
+//! (control dependence), and on a competing-risks model the message must name the
+//! endpoint whose own hazard is affected rather than the lowest CMT.
 
 use super::*;
 use crate::parser::model_parser::{compiled_model_uses_time_builtin, parse_model_string};
@@ -21,6 +31,12 @@ use crate::parser::model_parser::{compiled_model_uses_time_builtin, parse_model_
 /// A joint PK-TTE ODE model: `[individual_parameters]` is `ip`, the `[odes]` block is
 /// `odes`. Two states, so the injected `d/dt(__chz_3)` accumulator makes the hazard CMT 3.
 fn joint_model(ip: &str, odes: &str) -> CompiledModel {
+    joint_model_with_hazard(ip, odes, "H0 * exp(BETA * (central / V))")
+}
+
+/// [`joint_model`] with the `hazard =` expression spelled out — the arms that need an
+/// accumulator the disposition does *not* reach.
+fn joint_model_with_hazard(ip: &str, odes: &str, hazard: &str) -> CompiledModel {
     let m = format!(
         r"
 [parameters]
@@ -45,7 +61,7 @@ fn joint_model(ip: &str, odes: &str) -> CompiledModel {
   obs_scale = V
 [event_model]
   cmt    = 3
-  hazard = H0 * exp(BETA * (central / V))
+  hazard = {hazard}
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
@@ -223,6 +239,185 @@ fn a_time_free_joint_model_is_not_refused() {
     let model = joint_model(TIME_FREE_IP, PLAIN_ODES);
     assert!(!compiled_model_uses_time_builtin(&model));
     assert_eq!(check_survival_time_dependent_pk(&model), None);
+}
+
+/// **A parameter the accumulator does not depend on is not refused** (round-1 review of
+/// PR #1924). `CL` reads `TIME` and the `[odes]` RHS reads `CL`, but this model's hazard
+/// integrates a constant `H0`, so `H` and `h` are the same whatever `$PK` snapshot the
+/// hazard pass runs under — the model is handled correctly and refusing it would be a
+/// false refusal.
+///
+/// The straddle is the identical model with the hazard reading `central`, which **must**
+/// refuse. One line of `[event_model]` apart, so the arms cannot both be satisfied by a
+/// gate stuck on either answer.
+#[test]
+fn a_time_dependent_parameter_the_hazard_does_not_depend_on_is_not_refused() {
+    let drug_free = joint_model_with_hazard(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        PLAIN_ODES,
+        "H0 * 1.0",
+    );
+    assert!(
+        compiled_model_uses_time_builtin(&drug_free),
+        "straddle: the block must read TIME, or the taint half is what returns None"
+    );
+    assert_eq!(
+        check_survival_time_dependent_pk(&drug_free),
+        None,
+        "freezing CL cannot move an accumulator that integrates a constant"
+    );
+
+    let drug_driven = joint_model(
+        "  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  \
+         V    = TVV\n  \
+         KA   = TVKA\n  \
+         H0   = TVH0\n  \
+         BETA = TVBETA\n",
+        PLAIN_ODES,
+    );
+    assert!(
+        check_survival_time_dependent_pk(&drug_driven).is_some(),
+        "the same model whose hazard reads `central` must refuse — otherwise the arm \
+         above passes because nothing refuses anything"
+    );
+}
+
+/// **Control dependence is part of the slice.** `SW` reads `TIME` and is read by nothing
+/// but an `if` condition inside the `[odes]` block — no derivative mentions it. But that
+/// condition decides which `KEFF` the integration runs under, and `KEFF` is what
+/// `central`'s derivative reads, so freezing `SW` at `TIME = 0` pins the system to one
+/// branch for the whole timeline while the Gaussian half switches branches at every
+/// record.
+///
+/// A slice that only followed data reads would miss it and accept this model. It is the
+/// one fixture whose `TIME`-reading parameter reaches the accumulator *only* through a
+/// condition, so dropping `chz_dependency_slice`'s control-dependence arm has to redden
+/// here.
+#[test]
+fn a_time_dependent_parameter_read_only_by_an_odes_condition_is_refused() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKT(0.05, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  SW   = TVKT * TIME
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  if (SW > 0.5) {
+    KEFF = CL / V
+  } else {
+    KEFF = 0.5 * CL / V
+  }
+  d/dt(central) = -KEFF * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let model = parse_model_string(M).expect("the branching [odes] model compiles");
+    // The straddle: `SW` is an individual parameter of this model, `CL` is time-free, and
+    // only `SW` reads `TIME` — so a refusal naming anything else would be a different
+    // finding.
+    assert!(
+        model.indiv_param_names.iter().any(|n| n == "SW"),
+        "fixture must declare SW: {:?}",
+        model.indiv_param_names
+    );
+    let msg = check_survival_time_dependent_pk(&model)
+        .expect("a TIME-dependent [odes] branch condition must be refused");
+    assert!(
+        msg.contains("`SW` reads the `TIME` built-in and the [odes] RHS reads it"),
+        "the message must name SW: {msg}"
+    );
+}
+
+/// **The message names the endpoint whose own hazard depends on the parameter**, not the
+/// lowest-numbered one (round-1 review of PR #1924). Two ODE-accumulated causes: CMT 3
+/// integrates a constant, CMT 4 reads `central`, and the `TIME`-dependent `CL` reaches
+/// only the second — so the message must say `CMT=4` although 3 sorts first.
+#[test]
+fn the_message_names_the_endpoint_whose_hazard_depends_on_the_parameter() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKT(0.05, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model flat]
+  cmt    = 3
+  hazard = H0 * 1.0
+[event_model exposure]
+  cmt    = 4
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let model = parse_model_string(M).expect("the competing-risks joint model compiles");
+    // The straddle: two ODE-accumulated endpoints, and the flat one sorts first.
+    let mut ode_cmts: Vec<usize> = model
+        .endpoints
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                crate::types::EndpointLikelihood::Tte {
+                    hazard: crate::types::HazardSpec::OdeAccumulated { .. },
+                    ..
+                }
+            )
+        })
+        .map(|(cmt, _)| *cmt)
+        .collect();
+    ode_cmts.sort_unstable();
+    assert_eq!(
+        ode_cmts,
+        vec![3, 4],
+        "fixture must carry two ODE-accumulated endpoints with the flat one first"
+    );
+    let msg = check_survival_time_dependent_pk(&model).expect("the exposure hazard is frozen");
+    assert!(
+        msg.contains("CMT=4"),
+        "the message must name the endpoint whose hazard reads `central`: {msg}"
+    );
+    assert!(
+        !msg.contains("CMT=3"),
+        "CMT 3 integrates a constant and is unaffected: {msg}"
+    );
 }
 
 /// Scope: the freeze this refuses is the **ODE-accumulated** hazard's single `$PK`

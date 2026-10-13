@@ -30329,6 +30329,48 @@ fn the_time_mask_taints_an_assignment_under_a_time_reading_condition() {
     );
 }
 
+/// **An `else if` body inherits every earlier condition.** Branch `k` runs only when
+/// conditions `0..k` were all false, so `CL` here is `2·TVCL` for `TIME ≥ 5` and `TVCL`
+/// before it — time-dependent, although its own governing condition (`TVSW > 0`) is
+/// time-free and its right-hand side never mentions `TIME`.
+///
+/// Found by the round-1 review of PR #1924: the first version governed each arm by
+/// `ctx_time || cond_k` alone, so this model was **falsely accepted** and its hazard went
+/// on freezing `CL`. The single-arm test above cannot see it — with one branch there is no
+/// earlier condition to inherit — which is why this fixture is separate and has a second
+/// arm whose own condition is deliberately time-free.
+///
+/// `AUX` is the control: it is assigned in the `TIME`-reading arm, so it must be tainted
+/// either way, and `KA` outside the `if` must not be.
+#[test]
+fn the_time_mask_taints_an_else_if_body_governed_by_an_earlier_time_condition() {
+    let mask = time_mask_of(
+        "  CL  = TVCL * exp(ETA_CL)\n\
+         \x20 AUX = 0.0\n\
+         \x20 if (TIME < 5.0) {\n\
+         \x20   AUX = 1.0\n\
+         \x20 } else if (TVKT > 0.0) {\n\
+         \x20   CL = 2.0 * TVCL * exp(ETA_CL)\n\
+         \x20 }\n\
+         \x20 V    = TVV\n\
+         \x20 KA   = TVKA\n\
+         \x20 H0   = TVH0\n\
+         \x20 BETA = TVBETA\n",
+    );
+    assert!(
+        reads_time(&mask, "CL"),
+        "CL is assigned in an `else if` body an earlier TIME condition governs: {mask:?}"
+    );
+    assert!(
+        reads_time(&mask, "AUX"),
+        "AUX is assigned under the TIME condition itself: {mask:?}"
+    );
+    assert!(
+        !reads_time(&mask, "KA"),
+        "KA is outside the if: {mask:?} — the taint must not spill past the block"
+    );
+}
+
 /// No `TIME` anywhere in `[individual_parameters]` ⇒ every entry is `false`. The
 /// straddle against the three tests above, and the fast path the #1853 gate exits on.
 #[test]
@@ -30349,17 +30391,18 @@ fn the_time_mask_is_empty_for_a_time_free_block() {
     );
 }
 
-/// A **dose-record** quantity is not a disposition read (#1575): the absorption
-/// kernel's arguments are lifted out of the RHS lines by `extract_input_rate_terms`
-/// before they are compiled, and `ALAG1` is a magic name the RHS never mentions. So
-/// `MTT`/`NTR`/`ALAG1` answer `false` while `CL`/`V`/`KA` — and the hazard's own
-/// `H0`/`BETA`, which ride on the injected `d/dt(__chz_*)` row — answer `true`.
+/// A **dose-record** quantity is not in the hazard accumulator's dependency slice
+/// (#1575): the absorption kernel's arguments are lifted out of the RHS lines by
+/// `extract_input_rate_terms` before they are compiled, and `ALAG1` is a magic name the
+/// RHS never mentions. So `MTT`/`NTR`/`ALAG1` answer `false` while `CL`/`V`/`KA` — reached
+/// through `central`, which the hazard reads — and the hazard's own `H0`/`BETA` answer
+/// `true`.
 ///
 /// This is the predicate that keeps the #1853 refusal off the #1575 fixture, so a
 /// mutation making it answer `true` for everything (`|| true`, or asking the PK slot
 /// instead of the var slot) has to redden here.
 #[test]
-fn only_a_disposition_read_counts_as_one() {
+fn only_a_read_the_accumulator_depends_on_counts() {
     const M: &str = r"
 [parameters]
   theta TVCL(1.0, FIX)
@@ -30397,13 +30440,13 @@ fn only_a_disposition_read_counts_as_one() {
   method = focei
 ";
     let model = parse_model_string(M).expect("the #1575-shaped model compiles");
-    let rhs = model
-        .ode_spec
-        .as_ref()
-        .expect("ODE model")
-        .rhs_program
-        .as_ref()
-        .expect("RHS program present");
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let rhs = ode.rhs_program.as_ref().expect("RHS program present");
+    let chz = *ode
+        .chz_state_slots
+        .first()
+        .expect("the [event_model] hazard injects an accumulator");
+    let slice = rhs.chz_dependency_slice(chz);
     let idx = |name: &str| {
         model
             .indiv_param_names
@@ -30411,41 +30454,111 @@ fn only_a_disposition_read_counts_as_one() {
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
     };
-    for disposition in ["CL", "V", "KA", "H0", "BETA"] {
+    for reached in ["CL", "V", "KA", "H0", "BETA"] {
         assert!(
-            rhs.reads_indiv_param_in_rhs(idx(disposition)),
-            "{disposition} is read by the [odes] RHS"
+            rhs.indiv_param_reaches_chz(idx(reached), &slice),
+            "{reached} reaches the accumulator: the hazard reads `central`, whose \
+             derivative reads CL/V/KA"
         );
     }
     for dose_only in ["MTT", "NTR", "ALAG1"] {
         assert!(
-            !rhs.reads_indiv_param_in_rhs(idx(dose_only)),
+            !rhs.indiv_param_reaches_chz(idx(dose_only), &slice),
             "{dose_only} is a dose-record quantity, read at each dose record (#1575) — \
              not part of the frozen disposition"
         );
     }
-    // No `init(...)` in this model, so the init half is `false` for every parameter —
-    // and recorded at full length, which is what keeps its `unwrap_or(true)` from
-    // answering `true` for all of them.
+    // No `init(...)` in this model, so the init half is `false` for every parameter.
     for name in &model.indiv_param_names {
         assert!(
-            !rhs.reads_indiv_param_in_init(idx(name)),
+            !rhs.init_reads_indiv_param_reaching_chz(idx(name), &slice),
             "{name}: no init(...) in this model"
         );
     }
 }
 
-/// The `init(state) = …` half: `BASE` is read by the init and by nothing else, so the
-/// RHS half says `false` and the init half says `true`. `CL` is the control on the
-/// other side — read by the RHS, not by the init — so a mutation collapsing the two
-/// accessors into one reddens here.
+/// **The slice is a dependency cut, not a syntax scan** (round-1 review of PR #1924).
+/// `CL` and `V` are read by the `[odes]` RHS, but this model's accumulator integrates a
+/// constant `H0`, so freezing them cannot move `H` or `h`: refusing such a model would be
+/// a false refusal of one the engines handle correctly.
+///
+/// The straddle is the same model with `hazard = H0 * exp(BETA * central / V)`, where the
+/// accumulator does depend on them — asserted here, so "nothing reaches the accumulator"
+/// cannot silently become the answer for every model.
 #[test]
-fn an_init_seed_read_is_recorded_separately_from_an_rhs_read() {
+fn a_parameter_the_accumulator_does_not_depend_on_is_not_in_the_slice() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 2
+  hazard = HAZARD_EXPR
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    let probe = |hazard: &str, want: bool| {
+        let model =
+            parse_model_string(&M.replace("HAZARD_EXPR", hazard)).expect("the model compiles");
+        let ode = model.ode_spec.as_ref().expect("ODE model");
+        let rhs = ode.rhs_program.as_ref().expect("RHS program present");
+        let chz = *ode.chz_state_slots.first().expect("accumulator injected");
+        let slice = rhs.chz_dependency_slice(chz);
+        let idx = |name: &str| {
+            model
+                .indiv_param_names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
+        };
+        for p in ["CL", "V"] {
+            assert_eq!(
+                rhs.indiv_param_reaches_chz(idx(p), &slice),
+                want,
+                "hazard = {hazard}: {p} reaching the accumulator should be {want}"
+            );
+        }
+        // `H0` is in the hazard row either way — the control that the slice is not simply
+        // empty in the first arm.
+        assert!(
+            rhs.indiv_param_reaches_chz(idx("H0"), &slice),
+            "hazard = {hazard}: H0 is read by the accumulator row itself"
+        );
+    };
+    probe("H0 * 1.0", false);
+    probe("H0 * exp(BETA * (central / V))", true);
+}
+
+/// An `init(state) = …` read counts only when the **state it seeds** is in the slice.
+/// `BASE` seeds `central`, which the hazard reads, so it counts; `OFF` seeds `other`,
+/// a state nothing returns from, so it does not. Both are read by an init and by nothing
+/// else, so the only thing separating them is the state test — which a mutation dropping
+/// it would collapse.
+#[test]
+fn an_init_seed_counts_only_for_a_state_the_accumulator_depends_on() {
     const M: &str = r"
 [parameters]
   theta TVCL(1.0, FIX)
   theta TVV(10.0, FIX)
   theta TVBASE(5.0, FIX)
+  theta TVOFF(3.0, FIX)
   theta TVH0(0.02, FIX)
   theta TVBETA(0.1, FIX)
   omega ETA_CL ~ 0.09
@@ -30454,17 +30567,20 @@ fn an_init_seed_read_is_recorded_separately_from_an_rhs_read() {
   CL   = TVCL * exp(ETA_CL)
   V    = TVV
   BASE = TVBASE
+  OFF  = TVOFF
   H0   = TVH0
   BETA = TVBETA
 [structural_model]
-  ode(obs_cmt=central, states=[central])
+  ode(obs_cmt=central, states=[central, other])
 [odes]
   init(central) = BASE
+  init(other)   = OFF
   d/dt(central) = -(CL/V) * central
+  d/dt(other)   = -0.1 * other
 [scaling]
   obs_scale = V
 [event_model]
-  cmt    = 2
+  cmt    = 3
   hazard = H0 * exp(BETA * (central / V))
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -30472,13 +30588,10 @@ fn an_init_seed_read_is_recorded_separately_from_an_rhs_read() {
   method = focei
 ";
     let model = parse_model_string(M).expect("the init(...) model compiles");
-    let rhs = model
-        .ode_spec
-        .as_ref()
-        .expect("ODE model")
-        .rhs_program
-        .as_ref()
-        .expect("RHS program present");
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let rhs = ode.rhs_program.as_ref().expect("RHS program present");
+    let chz = *ode.chz_state_slots.first().expect("accumulator injected");
+    let slice = rhs.chz_dependency_slice(chz);
     let idx = |name: &str| {
         model
             .indiv_param_names
@@ -30487,20 +30600,24 @@ fn an_init_seed_read_is_recorded_separately_from_an_rhs_read() {
             .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
     };
     assert!(
-        rhs.reads_indiv_param_in_init(idx("BASE")),
-        "BASE is read by init(central)"
+        rhs.init_reads_indiv_param_reaching_chz(idx("BASE"), &slice),
+        "BASE seeds `central`, which the hazard reads"
     );
     assert!(
-        !rhs.reads_indiv_param_in_rhs(idx("BASE")),
-        "BASE is read by nothing else"
+        !rhs.init_reads_indiv_param_reaching_chz(idx("OFF"), &slice),
+        "OFF seeds `other`, which the accumulator does not depend on"
     );
+    // Neither is read anywhere else, so the RHS half is false for both — the init half is
+    // the only thing that can separate them.
+    for name in ["BASE", "OFF"] {
+        assert!(
+            !rhs.indiv_param_reaches_chz(idx(name), &slice),
+            "{name} is read by an init(...) and by nothing else"
+        );
+    }
     assert!(
-        rhs.reads_indiv_param_in_rhs(idx("CL")),
-        "CL is read by the RHS"
-    );
-    assert!(
-        !rhs.reads_indiv_param_in_init(idx("CL")),
-        "CL is not read by init(central)"
+        rhs.indiv_param_reaches_chz(idx("CL"), &slice),
+        "CL is read by `central`'s derivative, which the hazard depends on"
     );
 }
 

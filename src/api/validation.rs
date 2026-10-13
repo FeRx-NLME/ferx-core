@@ -3586,9 +3586,9 @@ pub(crate) fn check_survival_tv_covariates(
 /// Meanwhile a subject of such a model declines the #570 one-solve share
 /// (`model_uses_time_anywhere`) and takes its *Gaussian* predictions from the per-record
 /// event-driven walk, which evaluates `$PK` at every record. So the two halves of one
-/// objective read two different concentration curves. Measured on a 1-cpt IV model with
-/// `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0·exp(BETA·C)`
-/// (`tests/survival_time_dependent_pk_refused.rs`): at `t = 8` the Gaussian pass predicts
+/// objective can read two different concentration curves. Measured on a 1-cpt IV model
+/// with `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0·exp(BETA·C)`
+/// (`tests/survival_time_dependent_pk.rs`): at `t = 8` the Gaussian pass predicts
 /// `central = 33.790` — the per-record convention, to 10 significant figures against a
 /// closed form computed outside both engines — while the hazard pass reads `44.933`; at
 /// `t = 20`, `3.065` against `13.534`. `H(20)` is 10.1 % high, and the exact-event
@@ -3597,14 +3597,22 @@ pub(crate) fn check_survival_tv_covariates(
 /// survival term it was written for.
 ///
 /// Until a per-record disposition reaches the hazard pass (#1920), refuse rather than
-/// silently mis-fit. The refusal is exact per parameter: a `TIME`-reading parameter the hazard
-/// pass already reads per dose record (`MTT`, `ALAG1`, …) does **not** trip it — see
-/// `OdeRhsProgram::reads_indiv_param_in_rhs`
-/// and `tests/one_snapshot_dose_reads_survival.rs`, the #1575 fixture that must stay
+/// silently mis-fit. **The refusal is exact per parameter, and per endpoint**: it fires
+/// only where freezing that parameter can actually move that accumulator, which rules out
+/// two shapes a syntactic "does the RHS mention it" would have refused —
+///
+/// * a quantity the hazard pass already reads at each dose record (`MTT`, `ALAG1`,
+///   `F`, `D{n}`/`R{n}`, …; #1575), and
+/// * a parameter the accumulator does not depend on — `CL` on a model whose
+///   `hazard = H0` integrates a constant, or an `init()` of a state the hazard never
+///   sees (round-1 review of PR #1924).
+///
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] is where that
+/// lives; `tests/one_snapshot_dose_reads_survival.rs` is the #1575 fixture that must stay
 /// fittable.
 ///
 /// Returns `None` for every model with no `OdeAccumulated` hazard, and for every model
-/// none of whose `[odes]`-read individual parameters depends on `TIME`. `fit()` and every
+/// none of whose `TIME`-dependent individual parameters can reach one. `fit()` and every
 /// predict / simulate entry point surface the message as an `Err`, as they do for #741.
 ///
 /// **Not wired into `predict_categorical`**, although #741's check is. The two have
@@ -3613,6 +3621,15 @@ pub(crate) fn check_survival_tv_covariates(
 /// `survival::ode_cumhaz_hazard` and `survival::draw_ode_tte_latent`, which that entry
 /// point never calls. A call there would refuse a categorical prediction whose own answer
 /// is unaffected, and no test could kill it.
+///
+/// **Not a complete guard on the low-level public surface, by the same boundary #741
+/// draws.** `stats::likelihood::individual_nll*` and `survival::simulate_tte` are `pub`
+/// and reach the frozen snapshot directly, and neither this check nor
+/// [`check_survival_tv_covariates`] runs there: both are validation at the documented
+/// entry points, and `individual_nll` is called per subject per objective evaluation, so a
+/// model-level walk inside it would run millions of times to answer a question that
+/// cannot change during a fit. Widening the guard to that surface is one decision
+/// covering both checks (#1926), not something to do for one of them.
 ///
 /// **One gate, not two.** A `crate::parser::model_parser::compiled_model_uses_time_builtin`
 /// fast exit in front of the loop would be free and would read as the load-bearing
@@ -3626,56 +3643,73 @@ pub(crate) fn check_survival_tv_covariates(
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
     use crate::types::{EndpointLikelihood, HazardSpec};
-    // The lowest `OdeAccumulated` CMT, so the message names one deterministically on a
-    // model with several — and the cheap exit for every model without one.
-    let cmt = model
-        .endpoints
-        .iter()
-        .filter(|(_, e)| {
-            matches!(
-                e,
-                EndpointLikelihood::Tte {
-                    hazard: HazardSpec::OdeAccumulated { .. },
-                    ..
-                }
-            )
-        })
-        .map(|(cmt, _)| *cmt)
-        .min()?;
+    // Neither `?` here is a silent bail-out on a reachable model: an `OdeAccumulated`
+    // hazard is parsed out of an `[odes]` block, which always yields both an `ode_spec`
+    // and a compiled `rhs_program`, and a model with no `[individual_parameters]`
+    // program has no parameter that could read `TIME`. A hand-assembled
+    // `CompiledModel` missing either is the only `None`, and for it the engine returns
+    // NaN curves rather than a frozen answer.
     let rhs = model.ode_spec.as_ref()?.rhs_program.as_ref()?;
     let reads_time = model
         .indiv_param_partials
         .indiv_param_program
         .as_ref()?
         .params_reading_time();
-    for (i, name) in model.indiv_param_names.iter().enumerate() {
-        if !reads_time.get(i).copied().unwrap_or(false) {
-            continue;
+    // No `TIME`-dependent parameter ⇒ nothing is frozen, and no slice has to be built.
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
+    // Every `OdeAccumulated` endpoint with its own accumulator slot, in CMT order: the
+    // message must name the endpoint whose hazard actually depends on the parameter, not
+    // merely the lowest-numbered one (round-1 review of PR #1924). Deterministic in both
+    // loops — CMT order outside, declaration order inside.
+    let mut ode_hazards: Vec<(usize, usize)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, e)| match e {
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            } => Some((*cmt, *chz_state)),
+            _ => None,
+        })
+        .collect();
+    ode_hazards.sort_unstable();
+    for (cmt, chz_state) in ode_hazards {
+        // What this accumulator's value depends on. Built per endpoint, because two
+        // hazards on one model can read different states.
+        let slice = rhs.chz_dependency_slice(chz_state);
+        for (i, name) in model.indiv_param_names.iter().enumerate() {
+            if !reads_time.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // `indiv_param_names` can be longer than the `[odes]` block's own parameter
+            // list (a `pk(... = TIME)` desugaring's synthetic, a `[scaling]` Form C
+            // readout synthetic — both appended after `build_ode_spec` has run). The
+            // compiled block cannot read such a name, so it is not frozen by this
+            // snapshot; skipping it is the answer, not a bail-out.
+            if !rhs.has_indiv_param(i) {
+                continue;
+            }
+            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
+            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
+            let site = match (in_rhs, in_init) {
+                (true, true) => "the [odes] RHS and an init(...) seed read",
+                (true, false) => "the [odes] RHS reads",
+                (false, true) => "an [odes] init(...) seed reads",
+                // The parameter cannot affect this accumulator — a dose-record quantity
+                // (#1575), or a part of the system the hazard does not depend on.
+                (false, false) => continue,
+            };
+            return Some(format!(
+                "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                 integrated with the individual parameters frozen at their TIME=0 values, but \
+                 `{name}` reads the `TIME` built-in and {site} it. A TIME-dependent \
+                 disposition on a drug-driven hazard is not yet supported (#1853): the Gaussian \
+                 predictions evaluate `[individual_parameters]` at every record while the hazard \
+                 pass keeps the TIME=0 value. Hold `{name}` constant in TIME for now."
+            ));
         }
-        // `indiv_param_names` can be longer than the `[odes]` block's own parameter list
-        // (a `pk(... = TIME)` desugaring's synthetic, a `[scaling]` Form C readout
-        // synthetic — both appended after `build_ode_spec` has run). The compiled block
-        // cannot read such a name, so it is not frozen by this snapshot; skipping it is
-        // the answer, not a bail-out.
-        if !rhs.has_indiv_param(i) {
-            continue;
-        }
-        let in_rhs = rhs.reads_indiv_param_in_rhs(i);
-        let in_init = rhs.reads_indiv_param_in_init(i);
-        let site = match (in_rhs, in_init) {
-            (true, true) => "the [odes] RHS and an init(...) seed read",
-            (true, false) => "the [odes] RHS reads",
-            (false, true) => "an [odes] init(...) seed reads",
-            (false, false) => continue,
-        };
-        return Some(format!(
-            "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
-             integrated with the individual parameters frozen at their TIME=0 values, but \
-             `{name}` reads the `TIME` built-in and {site} it. A TIME-dependent \
-             disposition on a drug-driven hazard is not yet supported (#1853): the Gaussian \
-             predictions evaluate `[individual_parameters]` at every record while the hazard \
-             pass keeps the TIME=0 value. Hold `{name}` constant in TIME for now."
-        ));
     }
     None
 }

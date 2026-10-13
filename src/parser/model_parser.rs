@@ -14176,31 +14176,31 @@ fn build_ode_spec(
     // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
     // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
     let pk_reads_model_time = pk_reads_tafd || pk_reads_solver_time || pk_reads_tad;
-    // Which individual parameters an `init(state) = …` seed reads (#1853). Recorded
-    // here, by name, because the init expressions are resolved by name against the map
-    // `init_fn` builds below (states + individual parameters, all three cases) and are
-    // then sealed inside that closure. Always `indiv_count` long — all-`false` for a
-    // model with no init — because `reads_indiv_param_as_disposition` reads a missing
-    // entry as `true`.
-    let init_indiv_reads: Vec<bool> = {
-        let mut read_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (_, expr) in &init_specs {
+    // Per `init(state) = …` directive, which individual parameters it reads (#1853).
+    // Collected by name, because an init expression is resolved by name against the map
+    // `init_fn` builds below (states + individual parameters, all three cases) and is
+    // then sealed inside that closure, where nothing can inspect it. The state's slot
+    // rides along so `chz_dependency_slice` can ask whether that seed can reach the
+    // hazard accumulator at all.
+    let init_indiv_reads: Vec<(usize, Vec<usize>)> = init_specs
+        .iter()
+        .map(|(state_idx, expr)| {
+            let mut read_names: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             visit_expr_nodes(expr, &mut |e| {
                 if let Expression::Variable(name) = e {
                     read_names.insert(name.to_ascii_uppercase());
                 }
             });
-        }
-        indiv_names_owned
-            .iter()
-            .map(|n| read_names.contains(&n.to_ascii_uppercase()))
-            .collect()
-    };
-    debug_assert_eq!(
-        init_indiv_reads.len(),
-        indiv_count,
-        "init_indiv_reads must be parallel to indiv_param_names"
-    );
+            let params: Vec<usize> = indiv_names_owned
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| read_names.contains(&n.to_ascii_uppercase()))
+                .map(|(i, _)| i)
+                .collect();
+            (*state_idx, params)
+        })
+        .collect();
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -25950,17 +25950,20 @@ pub struct OdeRhsProgram {
     /// (#1210) — that path has no accumulator handling and is reachable only if a routing
     /// gate is widened.
     has_chz: bool,
-    /// Per individual parameter `i` (declaration order, parallel to
-    /// [`crate::types::CompiledModel::indiv_param_names`]): does an `init(state) = …`
-    /// expression read it? The companion of [`Self::reads_indiv_param_in_rhs`], which
-    /// documents the distinction both accessors exist for.
+    /// One entry per `init(state) = …` directive: `(the state's slot, the individual
+    /// parameters the expression reads, as indices into
+    /// [`crate::types::CompiledModel::indiv_param_names`])`.
+    ///
+    /// The state slot is load-bearing, not decoration: an `init()` is frozen by the
+    /// hazard pass's one snapshot only when the state it seeds can reach the
+    /// accumulator — see [`Self::chz_dependency_slice`].
     ///
     /// Recorded here rather than on [`crate::ode::OdeSpec`] — where `init_fn` itself
     /// lives — because `OdeSpec`'s fields are `pub` and exhaustively named at 79
     /// construction sites, while this struct's are private and built in exactly one
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
-    init_indiv_reads: Vec<bool>,
+    init_indiv_reads: Vec<(usize, Vec<usize>)>,
 }
 
 impl OdeRhsProgram {
@@ -26005,38 +26008,187 @@ impl OdeRhsProgram {
         self.uses_time_vars() || self.reads_time_builtin()
     }
 
-    /// Does the compiled `[odes]` block read individual parameter `i` (declaration
-    /// order, parallel to [`crate::types::CompiledModel::indiv_param_names`]) as part of
-    /// the **disposition** it integrates — the RHS, the injected `d/dt(__chz_<cmt>)`
-    /// hazard rows included (#1853)?
+    /// The **backward slice** of the cumulative-hazard accumulator in `chz_slot`: one
+    /// `bool` per var slot of this compiled `[odes]` block, `true` where that slot's
+    /// value can affect the accumulator (#1853, round-1 review of PR #1924).
     ///
-    /// The distinction that makes this worth asking is #1575's: the engines read every
-    /// *dose-record* quantity — absorption kernel (`transit(n=…, mtt=…)` and friends),
-    /// pathway fraction, route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`,
-    /// the SS run-in — at each dose record, while the disposition is one snapshot. A
-    /// kernel argument is therefore *not* a disposition read, and structurally cannot be
-    /// one here: `extract_input_rate_terms` lifts the kernel call out of the RHS lines
-    /// before they are compiled, so `MTT` in `d/dt(depot) = transit(n=NTR, mtt=MTT) - …`
-    /// never reaches `stmts`. `F{c}`/`ALAG{c}` are magic names the RHS does not mention
-    /// at all. A `D{n}`/`R{n}` that the RHS *also* reads is the #993 double use, rejected
-    /// elsewhere.
+    /// This is the predicate the #1853 refusal needs, and a syntactic "does the RHS
+    /// mention it" is not: on a model with `CL = TVCL·(1 + K·TIME)`,
+    /// `d/dt(central) = −(CL/V)·central` and `hazard = H0`, the accumulator integrates
+    /// `H0` alone, so freezing `CL` at `TIME = 0` cannot move `H` or `h` and refusing the
+    /// model would be a false refusal of a correctly-handled one. `d/dt(chz)` reading
+    /// `central` is what pulls `central` — and through its own derivative `CL` and `V` —
+    /// into the slice.
     ///
-    /// Asked by slot, not by name: the RHS binds individual parameter `i` to var slot
-    /// `state_count + i` (see [`Self::eval_rhs_g`]), which is one slot per parameter even
-    /// where two names share a PK slot (#1356, #1898) — so this is exact per parameter,
-    /// not per PK slot.
+    /// A standard backward slice, by fixpoint over the var slots (a slot can be written
+    /// after the statement that reads it, so one pass is not enough):
     ///
-    /// The two halves are separate accessors because the refusal's *message* has to say
-    /// which one it found, and "the RHS reads it" and "an `init(...)` seed reads it" are
-    /// different sentences pointing at different lines of the model file. Both require
-    /// [`Self::has_indiv_param`] first: an index beyond this block's own list is not a
-    /// question either of them can answer.
-    pub(crate) fn reads_indiv_param_in_rhs(&self, i: usize) -> bool {
+    /// * seed `chz_slot` itself;
+    /// * a statement writing a slot already in the slice puts everything it reads in;
+    /// * an `if` whose body writes a slot in the slice puts **every one of its
+    ///   conditions'** reads in, since they decide whether that write happens;
+    /// * a name-based `Statement::Assign` / `DiffEq` — which the resolved program does
+    ///   not contain — puts *every* slot in, so an unresolved snapshot degrades to the
+    ///   syntactic answer rather than to a false accept.
+    ///
+    /// Each statement's read set is probed with [`stmts_read_slots`] one slot at a time
+    /// rather than extracted by a new walk, so there is no second reader of the bytecode
+    /// to drift from it; `n_vars_total` is tens and this runs once per model.
+    ///
+    /// **What it deliberately leaves out** is the dose-record half: the input-rate
+    /// forcings (absorption kernel, pathway fraction, route lag), `F`/`ALAG`/`D`/`R` and
+    /// the `SS=1` run-in reach the states too, but the hazard pass reads each of them at
+    /// its own dose record (#1575), so they are not frozen and have no business in a
+    /// slice of what *is*. `extract_input_rate_terms` has already lifted them out of
+    /// `stmts`, so this falls out rather than needing a rule.
+    pub(crate) fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
+        /// Every slot any statement in `stmts` writes, recursively.
+        fn writes_into(stmts: &[Statement], out: &mut Vec<usize>) {
+            for s in stmts {
+                match s {
+                    Statement::AssignBc(i, _)
+                    | Statement::AssignIdx(i, _)
+                    | Statement::DiffEqBc(i, _)
+                    | Statement::DiffEqIdx(i, _) => out.push(*i),
+                    Statement::Assign(..) | Statement::DiffEq(..) => {}
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (_, body) in branches {
+                            writes_into(body, out);
+                        }
+                        if let Some(eb) = else_body {
+                            writes_into(eb, out);
+                        }
+                    }
+                }
+            }
+        }
+        fn add(slot: usize, needed: &mut [bool], changed: &mut bool) {
+            if let Some(x) = needed.get_mut(slot) {
+                if !*x {
+                    *x = true;
+                    *changed = true;
+                }
+            }
+        }
+        fn expand(stmts: &[Statement], n: usize, needed: &mut Vec<bool>, changed: &mut bool) {
+            for s in stmts {
+                match s {
+                    Statement::AssignBc(i, _)
+                    | Statement::AssignIdx(i, _)
+                    | Statement::DiffEqBc(i, _)
+                    | Statement::DiffEqIdx(i, _) => {
+                        // A write to a slot outside the mask (`usize::MAX`, an
+                        // unresolvable name) is treated as needed: its reads go in.
+                        if !needed.get(*i).copied().unwrap_or(true) {
+                            continue;
+                        }
+                        let one = std::slice::from_ref(s);
+                        for t in 0..n {
+                            if stmts_read_slots(one, &[t]) {
+                                add(t, needed, changed);
+                            }
+                        }
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        let mut written: Vec<usize> = Vec::new();
+                        for (_, body) in branches {
+                            writes_into(body, &mut written);
+                        }
+                        if let Some(eb) = else_body {
+                            writes_into(eb, &mut written);
+                        }
+                        // Control dependence: if anything inside lands in the slice, the
+                        // conditions deciding whether it runs are in it too.
+                        if written
+                            .iter()
+                            .any(|&w| needed.get(w).copied().unwrap_or(true))
+                        {
+                            for (cond, _) in branches {
+                                for t in 0..n {
+                                    if cond_reads_slots(cond, &[t]) {
+                                        add(t, needed, changed);
+                                    }
+                                }
+                            }
+                        }
+                        for (_, body) in branches {
+                            expand(body, n, needed, changed);
+                        }
+                        if let Some(eb) = else_body {
+                            expand(eb, n, needed, changed);
+                        }
+                    }
+                    // Unresolved arms cannot be attributed to a slot; the resolved
+                    // program has none (`resolve_variable_indices` rewrites every one to
+                    // `AssignBc`/`DiffEqBc`). Degrade to "everything reaches the hazard",
+                    // which is the pre-slice syntactic answer.
+                    Statement::Assign(..) | Statement::DiffEq(..) => {
+                        for t in 0..n {
+                            add(t, needed, changed);
+                        }
+                    }
+                }
+            }
+        }
+
+        let n = self.n_vars_total;
+        let mut needed = vec![false; n];
+        let mut changed = false;
+        add(chz_slot, &mut needed, &mut changed);
+        loop {
+            let mut changed = false;
+            expand(&self.stmts, n, &mut needed, &mut changed);
+            if !changed {
+                break;
+            }
+        }
+        needed
+    }
+
+    /// Does individual parameter `i` (declaration order, parallel to
+    /// [`crate::types::CompiledModel::indiv_param_names`]) lie in a
+    /// [`Self::chz_dependency_slice`] — i.e. does the RHS read it somewhere the
+    /// accumulator depends on?
+    ///
+    /// Asked by **var slot** (`state_count + i`, see [`Self::eval_rhs_g`]), which is one
+    /// slot per parameter even where two names share a PK slot (#1356, #1898), so this is
+    /// exact per parameter rather than per PK slot. Parameter slots are read and never
+    /// written, so a `true` here *is* "a statement the accumulator depends on reads it".
+    ///
+    /// Requires [`Self::has_indiv_param`] first.
+    pub(crate) fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
         debug_assert!(
             self.has_indiv_param(i),
             "ask has_indiv_param first: slot state_count + {i} is an intermediate's"
         );
-        self.has_indiv_param(i) && stmts_read_slots(&self.stmts, &[self.state_count + i])
+        self.has_indiv_param(i)
+            && slice
+                .get(self.state_count + i)
+                .copied()
+                .unwrap_or(/* outside the mask: assume it reaches */ true)
+    }
+
+    /// The `init(state) = …` half of [`Self::indiv_param_reaches_chz`]: does an initial
+    /// condition **of a state the accumulator depends on** read individual parameter `i`?
+    ///
+    /// The state test is what keeps this from refusing a seed the hazard cannot see —
+    /// `init(peripheral) = BASE` on a model whose accumulator reads only `central` and
+    /// whose `peripheral` never returns to it.
+    ///
+    /// Requires [`Self::has_indiv_param`] first. A seed whose state slot is outside the
+    /// mask counts as reaching, for the same reason the sibling does.
+    pub(crate) fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
+        debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
+        self.has_indiv_param(i)
+            && self.init_indiv_reads.iter().any(|(state_slot, params)| {
+                slice.get(*state_slot).copied().unwrap_or(true) && params.contains(&i)
+            })
     }
 
     /// Is individual parameter `i` (declaration order) in this compiled block's own
@@ -26048,7 +26200,7 @@ impl OdeRhsProgram {
     /// readout synthetic (#1636). Such a name is invisible to the compiled block: the RHS
     /// could not have referenced it, nor could an `init(...)` expression, whose resolvable
     /// names come from the same slice. It also has no var slot of its own — `state_count +
-    /// i` past the end lands on an *intermediate's* slot, so asking the accessors below
+    /// i` past the end lands on an *intermediate's* slot, so asking the accessors above
     /// about it would return some unrelated variable's answer.
     ///
     /// So a caller walking `CompiledModel::indiv_param_names` must skip the indices this
@@ -26056,18 +26208,6 @@ impl OdeRhsProgram {
     /// not a default.
     pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
-    }
-
-    /// The `init(state) = …` half of [`Self::reads_indiv_param_in_rhs`]'s contract; see
-    /// that accessor, and [`Self::init_indiv_reads`] for why it is recorded here.
-    ///
-    /// Requires [`Self::has_indiv_param`], like its sibling. Within that range a missing
-    /// record reads `true`: the record is built at full length (asserted at
-    /// construction), so a short one is an inconsistency, and a gate must not mistake
-    /// "not recorded" for "not read".
-    pub(crate) fn reads_indiv_param_in_init(&self, i: usize) -> bool {
-        debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
-        self.has_indiv_param(i) && self.init_indiv_reads.get(i).copied().unwrap_or(true)
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -26414,20 +26554,35 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     branches,
                     else_body,
                 } => {
-                    // The `else` arm fires only when *every* branch condition was false,
-                    // so it is governed by all of them — the same rule
-                    // `compute_cov_static_mask` applies.
-                    let mut any_cond_time = ctx_time;
+                    // Branch `k` fires only when conditions `0..k` were all false and its
+                    // own is true, so it is governed by **every condition up to and
+                    // including its own** — not by its own alone. An `else if` whose
+                    // condition is time-free still takes its value from `TIME` when an
+                    // earlier arm's condition reads it:
+                    //
+                    //   if (TIME < 5) { AUX = 1 } else if (SW > 0) { CL = 2 * TVCL }
+                    //
+                    // `CL` is `2·TVCL` for `TIME ≥ 5` and `TVCL` before it. The running
+                    // accumulation below is what sees that; a per-arm `ctx_time ||
+                    // cond_k` does not, and the resulting false accept is exactly what
+                    // this gate exists to prevent (round-1 review of PR #1924). The
+                    // `else` arm is governed by all of them, which is the same variable
+                    // after the loop.
+                    //
+                    // `compute_cov_static_mask` has the per-arm shape and the same hole
+                    // for its own question (an `else if` body folded to a constant
+                    // although which value it takes depends on θ/η) — filed as #1927,
+                    // deliberately not changed here.
+                    let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);
-                        let branch_time = ctx_time
+                        governed = governed
                             || cond_reads_time_builtin(cond)
                             || cond_reads_slots(cond, &slots);
-                        any_cond_time |= branch_time;
-                        walk(body, branch_time, time_vars, changed);
+                        walk(body, governed, time_vars, changed);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, any_cond_time, time_vars, changed);
+                        walk(eb, governed, time_vars, changed);
                     }
                 }
                 _ => {}

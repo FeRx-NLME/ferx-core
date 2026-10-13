@@ -343,8 +343,9 @@ the `hazard =` expression itself reads, and `init(...)`.
 
 The Gaussian half of the same objective does not freeze them — a model whose `$PK` reads
 `TIME` routes its predictions through the per-record event-driven walk, which evaluates
-`[individual_parameters]` at every record, as NONMEM's `$PK` does. So the two halves would
-integrate different concentration curves. Measured on a 1-cpt IV model with
+`[individual_parameters]` at every record, as NONMEM's `$PK` does, while the hazard pass
+keeps the `TIME = 0` value. The two halves can therefore integrate different
+concentration curves. Measured on a 1-cpt IV model with
 `CL = TVCL · (1 + 0.05 · TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0 · exp(BETA · C)`:
 at `t = 8` the Gaussian pass predicts `central = 33.79` while the hazard pass reads
 `44.93`; at `t = 20`, `3.07` against `13.53`. `H(20)` comes out 10.1 % high and the
@@ -363,11 +364,22 @@ individual parameters frozen at their TIME=0 values, but `CL` reads the `TIME` b
 the [odes] RHS reads it. ...
 ```
 
-A `TIME` read that stays inside the `[odes]` RHS — `d/dt(central) = … · (1 + K · TIME)`, or
-a Weibull / Gompertz baseline hazard — is **not** affected: the integrator resolves `TIME`
-at every step, so nothing there is frozen. Hold the *individual parameters* a drug-driven
-hazard integrates constant in `TIME` for now; a per-record disposition for the hazard pass
-is tracked in [#1920](https://github.com/FeRx-NLME/ferx-core/issues/1920).
+The refusal is narrow in three ways, so a model it can only mis-fit is the only one it
+stops:
+
+- a `TIME` read that stays inside the `[odes]` **RHS** — `d/dt(central) = … · (1 + K · TIME)`,
+  or a Weibull / Gompertz baseline hazard — is fine: the integrator resolves `TIME` at
+  every step, so nothing there is frozen;
+- a `TIME`-reading **dose-record** quantity is fine, as above;
+- a `TIME`-reading parameter the **hazard does not depend on** is fine. `hazard = H0` with
+  a time-dependent `CL` integrates a constant, so the accumulator is the same whatever
+  snapshot the hazard pass runs under; ferx cuts a dependency slice back from each
+  `d/dt(__chz_<cmt>)` row and refuses only what lands in it. On a competing-risks model the
+  error names the endpoint whose own hazard is affected.
+
+Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for
+now; a per-record disposition for the hazard pass is tracked in
+[#1920](https://github.com/FeRx-NLME/ferx-core/issues/1920).
 
 ### Simulating drug-driven event times
 
