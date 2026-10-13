@@ -216,6 +216,12 @@ stencil (Shi 2021 step-size selection).
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
 
+`method = laplace` with `n_agq > 1` integrates the event likelihood by adaptive quadrature
+instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact marginal. After
+those three, the covariance step uses the 7-node quadrature marginal rather than the FOCEI
+objective — see [SAEM: covariance step on a non-Gaussian
+model](saem.qmd#saem-covariance-non-gaussian) (#1781).
+
 ## Joint PK-TTE {#joint-pk-tte}
 
 When the hazard depends on drug exposure, write it as an expression over the PK
