@@ -363,10 +363,17 @@ The `_diag` entry points report this as one per-run count
 ([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
 
 ```
-W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals were evaluated at an η
-inside the flip-flop regime (disposition rate ≥ transit rate KTR = (n+1)/mtt),
-where the twin-less one_cpt_transit closed form has no solution, so their entire
-dose-driven concentration was clamped to zero. ...
+W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals that received a dose were
+evaluated at an η inside the flip-flop regime (disposition rate ≥ transit rate
+KTR = (n+1)/mtt), where the twin-less one_cpt_transit closed form has no
+solution, so their entire dose-driven concentration was clamped to zero — the
+drug contributes nothing to any of their rows. Those rows are still returned and
+still summarised, so every VPC band, prediction interval or mean computed over
+them describes a subject with no drug in it. Whether they read as a literal
+`ipred = 0` depends on what this model layers on the closed form's output
+afterwards, so searching the output for a zero row will not reliably find them.
+Rewrite the model as an explicit ODE `transit()` model, which reroutes per
+individual and is valid in both regimes.
 ```
 
 ### Why looking for a zero row will not find them
@@ -395,9 +402,16 @@ reliably find them**. The count is the reliable channel. Measured on an
 row between them.
 
 An individual is not counted at all unless its subject carries a dose of positive
-amount **at or before one of its observations**: without that, no returned row
+amount **strictly before one of its observations**: without that, no returned row
 could have carried the drug either way, so nothing was lost and an ODE rewrite
 would produce the same rows. The count's denominator is those dosed individuals.
+
+Strictly before, not at or before: a transit or IG absorption contributes exactly
+zero central concentration at elapsed time zero, so a dose landing *on* an
+observation reaches it with nothing. Measured — with the dose moved to the last
+observation, the prediction is bit-identical to the same subject with `AMT = 0`
+at η = 0, on both the transit and the IG fixture; moving it `1e-9` earlier gives
+`1.67e-39`, small but not zero.
 
 Two designs that *are* still counted, because excluding them would need the
 predictor rather than the data: an absorption `lagtime` that pushes absorption

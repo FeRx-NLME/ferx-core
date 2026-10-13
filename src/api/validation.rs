@@ -3852,13 +3852,28 @@ impl SimulatedFlipFlopTally {
         // Measured there: an `AMT = 0` second subject contributed its crossers to a count
         // of 27 while all 900 of its rows were already zero.
         //
-        // The dose must also land at or before an observation, or no returned row could
-        // have carried the drug either way (#1823 review r3; measured there: obs at
+        // The dose must also land **strictly before** an observation, or no returned row
+        // could have carried the drug either way (#1823 review r3; measured there: obs at
         // t = 1, 2, 3 with the dose at t = 100 predicted `[0, 0, 0]` with the dose and
-        // `[0, 0, 0]` without it, at a crossing η *and* at η = 0). `<=`, not `<`: ferx
-        // applies a dose before an observation at the same time, so a dose on the last
-        // observation does reach it. Both halves read dose and observation **times**, which
-        // are data — this is still a structural test, not a guess at the predictor.
+        // `[0, 0, 0]` without it, at a crossing η *and* at η = 0).
+        //
+        // `<`, not `<=`, and the reason is this family specifically (review r4): a transit
+        // or IG absorption contributes **exactly** zero central concentration at elapsed
+        // time zero — nothing has transited yet — so a dose landing on the last
+        // observation reaches it with nothing, whatever the event ordering does. Measured:
+        // with the dose moved to the last observation the prediction is bit-identical to
+        // the dose-free twin at η = 0 (last row exactly `0.0`) on both the transit and the
+        // IG fixture, while moving it `1e-9` earlier gives `1.67e-39` — small, but not
+        // zero, so the strict test is on the right side of the boundary. (`<=` would be
+        // correct for an IV bolus, which jumps instantaneously; this family is oral.)
+        //
+        // Both halves read dose and observation **times**, which are data — this is still
+        // a structural test, not a guess at the predictor.
+        //
+        // The two clocks are directly comparable here: `obs_times` is the internal monotonic
+        // clock, which diverges from the raw data TIME only across an EVID=3/4 reset, and
+        // `check_absorption_closed_form_support` refuses a reset on any transit / IG closed
+        // form before a simulation starts. So a counted subject has no stacked occasions.
         //
         // What it deliberately does **not** cover: a `lagtime` that pushes absorption past
         // the last observation, or `f = 0`. Those are individual-parameter *expressions*,
@@ -3875,7 +3890,7 @@ impl SimulatedFlipFlopTally {
         if !subject
             .doses
             .iter()
-            .any(|d| d.amt > 0.0 && d.time <= last_obs)
+            .any(|d| d.amt > 0.0 && d.time < last_obs)
         {
             return;
         }

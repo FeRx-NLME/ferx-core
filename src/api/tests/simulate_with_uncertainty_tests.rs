@@ -1219,6 +1219,54 @@ fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, 
     (matched, per_individual.len())
 }
 
+/// #1823 review r4: the `W_SIMULATED_FLIP_FLOP` example quoted in
+/// `docs/api/simulation.qmd` is the text the implementation actually emits.
+///
+/// Review r4 found the example stale — it had kept the pre-r2 wording and omitted "that
+/// received a dose". A hand-copied message in prose cannot be kept honest by reading it, so
+/// this reads the fenced block out of the page and asserts the real warning contains it
+/// (whitespace-normalised, since the page hard-wraps). Any future reword of the message now
+/// reddens here until the page is updated, in either direction.
+#[test]
+fn the_documented_warning_example_is_the_message_the_code_emits() {
+    let page = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/api/simulation.qmd"
+    ))
+    .expect("the simulation docs page is in the repo");
+    // The one fenced block that quotes this warning.
+    let start = page
+        .find("W_SIMULATED_FLIP_FLOP: 27 of 600")
+        .expect("the page quotes the warning");
+    let end = start
+        + page[start..]
+            .find("\n```")
+            .expect("the quote sits in a fenced block");
+    let quoted = normalize_ws(&page[start..end]);
+    assert!(
+        quoted.len() > 200,
+        "the quoted example is the whole message, not a fragment: {quoted}"
+    );
+
+    // The real thing, at the fixture and seed the page names.
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (msg, clamped, total) = clamped_run(&model, 0.09, 300, 7);
+    assert_eq!((clamped, total), (27, 600), "the page's 27 of 600");
+    let emitted = normalize_ws(&msg.expect("the fixture reports"));
+    assert!(
+        emitted.contains(&quoted),
+        "the documented example has drifted from the emitted message.\n\
+         page:    {quoted}\n\
+         emitted: {emitted}"
+    );
+}
+
+/// Collapse every run of whitespace to one space, so a hard-wrapped quote in a `.qmd` page
+/// compares against the single-line message the code builds.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
 /// file is degenerate, so nothing else can reach it — and a guard whose job is to reject a
 /// *future* fixture is worth nothing if it cannot be shown to fire at all.
@@ -1584,62 +1632,83 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
     );
 }
 
-/// #1823 review r3: a dose that lands **after every observation** is not counted either —
-/// no returned row could have carried the drug whether or not the closed form clamped.
+/// #1823 review r3 / r4: a dose that cannot reach any returned row is not counted either —
+/// and for a transit / IG absorption "cannot reach" includes landing **on** the last
+/// observation, not only after it.
 ///
-/// Measured: with observations at t = 1, 2, 3 and the dose moved to t = 100, the prediction
-/// is `[0, 0, 0]` with the dose and `[0, 0, 0]` without it, at a crossing η *and* at η = 0.
-/// So the clamp changed nothing, and before this gate the individual was counted anyway.
-/// `<=`, not `<`: ferx applies a dose before an observation at the same time, so a dose
-/// landing exactly on the last observation still reaches it and is still counted — both
-/// sides of that boundary are asserted here.
+/// Measured (r3): with observations at t = 1, 2, 3 and the dose at t = 100 the prediction is
+/// `[0, 0, 0]` with the dose and `[0, 0, 0]` without it, at a crossing η *and* at η = 0 — so
+/// the clamp changed nothing, and before this gate the individual was counted anyway.
+///
+/// Measured (r4): the same holds for a dose exactly **at** t = 3, because a transit or IG
+/// absorption contributes exactly zero central concentration at elapsed time zero — nothing
+/// has transited yet. Moving it `1e-9` earlier gives `1.67e-39`: tiny, but not zero, so
+/// `d.time < last_obs` sits on the right side of the boundary. (`<=` would be right for an
+/// IV bolus; this family is oral.)
+///
+/// The oracle is applied **at η = 0**, deliberately. At a crossing η the with-dose and
+/// dose-free predictions are identical for *every* dose time — that is the clamp itself — so
+/// an identity asserted there says nothing about whether the dose could have contributed.
 #[test]
-fn simulated_flip_flop_tally_skips_a_dose_after_every_observation() {
+fn simulated_flip_flop_tally_skips_a_dose_that_reaches_no_observation() {
     let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
-    let theta = model.default_params.theta.clone();
-    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
     let base = tiny_population();
     let last_obs = *base.subjects[0].obs_times.last().expect("an obs grid");
-
     let at = |t: f64| {
         let mut s = base.subjects[0].clone();
         s.doses[0].time = t;
         s
     };
-    // The clamp is invisible for a late dose: the rows are the same with and without it,
-    // and the same at a crossing η as at η = 0.
-    let late = at(100.0);
-    let mut undosed_late = late.clone();
-    undosed_late.doses[0].amt = 0.0;
-    for eta in [[0.0_f64], crosser] {
-        assert_eq!(
-            crate::pk::compute_predictions_with_tv(&model, &late, &theta, &eta),
-            crate::pk::compute_predictions_with_tv(&model, &undosed_late, &theta, &eta),
-            "a dose at t = 100 reaches no observation at t = 1, 2, 3 (η = {eta:?})"
-        );
-    }
+    let undosed = |s: &Subject| {
+        let mut s = s.clone();
+        s.doses[0].amt = 0.0;
+        s
+    };
 
-    // The straddle on `d.time <= last_obs`: a dose exactly on the last observation counts,
-    // one just after it does not.
-    for (name, t, want) in [
-        ("on the last observation", last_obs, true),
-        ("just after it", last_obs + 1e-9, false),
-        ("long after it", 100.0, false),
-        ("before the first", 0.0, true),
-    ] {
-        let mut tally = SimulatedFlipFlopTally::default();
-        tally.observe(&model, &at(t), &theta, &crosser);
-        assert_eq!(
-            tally.warning(&model).is_some(),
-            want,
-            "dose {name} (t = {t}): expected counted = {want}"
-        );
+    // The oracle, at η = 0, on both families: a dose at or after the last observation
+    // contributes nothing; one just before it does.
+    for (fam, m, crosser) in [("transit", &model, 0.6_f64), ("ig", &ig, 2.3)] {
+        let theta = m.default_params.theta.clone();
+        for (name, t, reaches) in [
+            ("long after the last obs", 100.0, false),
+            ("exactly on the last obs", last_obs, false),
+            ("just before the last obs", last_obs - 1e-9, true),
+            ("before the first obs", 0.0, true),
+        ] {
+            let s = at(t);
+            let with = crate::pk::compute_predictions_with_tv(m, &s, &theta, &[0.0]);
+            let without = crate::pk::compute_predictions_with_tv(m, &undosed(&s), &theta, &[0.0]);
+            assert_eq!(
+                with != without,
+                reaches,
+                "{fam}, dose {name} (t = {t}): expected the dose to reach a row = {reaches} \
+                 (with = {with:?}, without = {without:?})"
+            );
+            // …and at the crossing η the two are identical whatever the dose time, which is
+            // why the oracle above must not be read there.
+            assert_eq!(
+                crate::pk::compute_predictions_with_tv(m, &s, &theta, &[crosser]),
+                crate::pk::compute_predictions_with_tv(m, &undosed(&s), &theta, &[crosser]),
+                "{fam}, dose {name}: the clamp makes these identical for any dose time"
+            );
+            // The gate agrees with the oracle, case for case.
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(m, &s, &theta, &[crosser]);
+            assert_eq!(
+                tally.warning(m).is_some(),
+                reaches,
+                "{fam}, dose {name}: the gate must follow the oracle"
+            );
+        }
     }
 
     // `any`, not `all`: one qualifying dose among several is enough. Every other fixture
     // carries exactly one dose, which makes the two spellings indistinguishable — measured
     // in the #1823 r3 sweep, where `.any` → `.all` survived the whole suite until this
     // case was added. A two-dose subject discriminates in both directions.
+    let theta = model.default_params.theta.clone();
+    let crosser = [0.6_f64];
     let two_doses = |a: f64, b: f64| {
         let mut s = base.subjects[0].clone();
         s.doses = vec![
@@ -1651,8 +1720,9 @@ fn simulated_flip_flop_tally_skips_a_dose_after_every_observation() {
     };
     for (name, a, b, want) in [
         ("one in range, one late", 0.0, 100.0, true),
-        ("one late, one in range", 100.0, last_obs, true),
+        ("one late, one in range", 100.0, last_obs - 0.5, true),
         ("both late", 100.0, 200.0, false),
+        ("one on the boundary, one after", last_obs, 100.0, false),
     ] {
         let mut tally = SimulatedFlipFlopTally::default();
         tally.observe(&model, &two_doses(a, b), &theta, &crosser);
