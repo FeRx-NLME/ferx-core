@@ -698,13 +698,20 @@ guard](../model-file/fit-options.qmd#parameter-scaling-and-ebe-convergence), or 
 objective came back non-finite — and what the optimizer minimised instead was the guard's
 own rejection penalty.
 
-That penalty is a quadratic bowl centred on the **midpoint of the declared bounds** in the
-packed, scaled space the optimizer works in. It has to be: NLopt's line search interpolates
-on the value and the gradient together, so a rejected trial has to return a value that
-integrates the centre-push gradient handed back with it (a flat wall plus a non-zero
-gradient fails the search outright, [#486](https://github.com/FeRx-NLME/ferx-core/issues/486)). A gradient
-optimizer handed nothing but that penalty therefore walks to the box centre and stops there
-with NLopt `Success`, because the penalty really is stationary at the centre.
+For a **gradient** optimizer that penalty is a quadratic bowl centred on the **midpoint of
+the declared bounds** in the packed, scaled space the optimizer works in. It has to be:
+NLopt's line search interpolates on the value and the gradient together, so a rejected trial
+has to return a value that integrates the centre-push gradient handed back with it (a flat
+wall plus a non-zero gradient fails the search outright,
+[#486](https://github.com/FeRx-NLME/ferx-core/issues/486)). An optimizer handed nothing but that penalty
+therefore walks to the box centre and stops there with NLopt `Success`, because the penalty
+really is stationary at the centre.
+
+The derivative-free `bobyqa` is handed a flat `1e20` wall instead — it asks for no gradient,
+so there is nothing to integrate — and a flat objective has no centre to walk to. That is a
+difference in the *estimates*, not in the verdict: a BOBYQA run whose every trial is
+rejected still reports `W_NO_FEASIBLE_EVAL` and `converged: false`, it just reports them
+wherever it stopped rather than at the midpoint.
 
 Until [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that came back as a *fit*. The best-seen
 restore ranked penalties only, so it landed on the centre; the final inner loop re-scored
@@ -713,6 +720,8 @@ On the issue's warfarin reproduction at `inner_maxiter = 5`, each θ came back a
 $\sqrt{\text{lower} \cdot \text{upper}}$ to 3e-9 (`TVCL` 0.1, `TVV` 7.071, `TVKA` 0.7071),
 each ω at 1 — the middle of the ±6 log rail — and `converged: true`, 500 OFV units from the
 optimum the same model reaches with the default inner budget.
+
+#### What the warning says {#no-feasible-evaluation-warning}
 
 A run with no feasible evaluation now reports `converged: false` with a `Critical`
 `convergence` warning carrying the `W_NO_FEASIBLE_EVAL` token, and the estimates it reports
@@ -727,7 +736,7 @@ the two ways a trial can be infeasible applied, because the remedies are not the
 A **cancelled** run is not reported this way: its evaluations short-circuit before the
 feasible-evaluation counter advances, so its trace is infeasible by construction.
 
-Three notes on reading such a run.
+#### Reading such a run {#no-feasible-evaluation-reading}
 
 A trace can be in **both** rows at once — some trials rejected by the guard, the rest
 non-finite — and then the warning reports both counts and carries both remedies, because
@@ -748,11 +757,17 @@ anything. On the **non-finite** row the re-score at the starting estimates is us
 non-finite too, and it does. Three warnings then, three different facts: the trace, the
 verdict, and the number.
 
-Finally, `gradient = fd` can hide the whole case, because it also swaps the outer optimizer
-away from L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
-too](optimizers.qmd#gradient-fd-moves-the-optimizer)), which keeps a flat rejection wall
-instead of the quadratic bowl and so never walks to the centre. A 35-point OFV gap between
-the two routes on the same model is that difference, not a wrong analytic gradient.
+Finally, comparing `gradient = fd` against the default can be misleading here, because it
+also swaps the outer optimizer away from L-BFGS to the derivative-free BOBYQA
+([`gradient = fd` moves the optimizer too](optimizers.qmd#gradient-fd-moves-the-optimizer)),
+and the two then differ in two ways at once. BOBYQA never reports the midpoint, per the
+flat-wall note above; and on some models its small opening steps keep the inner loop inside
+its budget where L-BFGS's first step does not, so it finds feasible trials and the fit comes
+back ordinary. On the model in [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that is what happens — at
+`inner_maxiter = 5` the BOBYQA route reports a real OFV at the initial values with
+`W_STALLED_AT_INIT`, 35 OFV units from the default route's midpoint — so a gap between the
+two routes is the optimizer swap, not a wrong analytic gradient. It is not a general escape:
+starve the inner loop harder and BOBYQA is rejected at every trial too.
 
 ## Warm Starting
 

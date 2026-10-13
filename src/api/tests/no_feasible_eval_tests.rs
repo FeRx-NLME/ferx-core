@@ -47,6 +47,7 @@
 //! | drop the `optimizer_start_s` fallback only | E1 — assertion 3, θ[0] = `0.14142136177403178` |
 //! | restore the θ coordinates only, leaving ω/σ on the best-seen point | E1 — assertion 4, ω = `0.9999999524299102`, the middle of its ±6 log rail |
 //! | `no_feasible()` broadened so it claims a feasible run | U1 **and** E2 |
+//! | either per-evaluation tally records one rejection per *run* | E1 (guard) and E5 (non-finite), each "all 1 of its trials" against 4 |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -121,6 +122,7 @@ fn subject(id: &str, observations: Vec<f64>) -> Subject {
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
+        pk_only_occasions: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
         cens: vec![0; 3],
@@ -161,6 +163,22 @@ fn opts(inner_maxiter: usize) -> FitOptions {
     }
 }
 
+/// The trial count the warning's head sentence quotes ("all N of its trials"), so an
+/// end-to-end test can check it against a counter the message does **not** read.
+///
+/// This is the only way to reach that number from outside: `RunFeasibility` is built inside
+/// `optimize_nlopt_once` and neither tally is published on `FitResult`
+/// (`ebe_convergence_warnings` is the guard tally, and there is none for the non-finite
+/// one). U3–U6 construct the struct by hand, which pins the *message* and bypasses the
+/// *wiring* — the gap round 6 of review found (#1617).
+fn trials_in(msg: &str) -> usize {
+    msg.split("all ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no trial count in: {msg}"))
+}
+
 /// The geometric midpoint of each θ's declared bounds — where the guard penalty's
 /// minimum sits, and what the defect reported as the estimate.
 const BOUND_MIDPOINT: [f64; 2] = [0.14142135623730953, 7.0710678118654755];
@@ -180,7 +198,7 @@ const OMEGA_MIDPOINT: f64 = 1.0;
 /// convergence, must not report the bound midpoint as its estimate, and must say
 /// which guard stopped it.
 ///
-/// Six assertions, each separately load-bearing:
+/// Seven assertions, each separately load-bearing:
 ///
 /// 1. **the trial trace is still infeasible** — non-degeneracy. The defect needs
 ///    *every* trial guard-rejected; if a later change lets one through, this fixture
@@ -202,7 +220,10 @@ const OMEGA_MIDPOINT: f64 = 1.0;
 ///    which costs `10.0` one ULP.
 /// 5. **a warning names the guard, the share and the remedy**, carries
 ///    `W_NO_FEASIBLE_EVAL` and classifies `Critical`/`convergence`.
-/// 6. **the warning set for this row** — the generic `Outer optimization did not converge`
+/// 6. **the counts come from the per-evaluation tallies** — the trial count the message
+///    quotes matches the evaluation count and the published guard tally, which is what pins
+///    the production wiring rather than only the message's formatting.
+/// 7. **the warning set for this row** — the generic `Outer optimization did not converge`
 ///    line is there too, and `W_NONFINITE_OBJECTIVE` is not. That is the per-row claim the
 ///    docs make; E5 asserts the other row, where the third warning does fire.
 ///
@@ -300,7 +321,36 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
         "the message must name both knobs the user can act on: {}",
         entry.message
     );
-    // (6) The warning *set* for this row, which is what `docs/estimation/foce.qmd` claims
+    // (6) The guard tally is per **evaluation**, checked against a counter the message does
+    //     not read. Round 6 of review found that a mutation recording one rejection for the
+    //     whole run — "all 1 of its trials" — left every end-to-end assertion green, because
+    //     the only tests touching the counts built `RunFeasibility` by hand.
+    //
+    //     All three numbers coincide *on this fixture* and the equality is asserted as a
+    //     property of it, not as an invariant: every callback here produced a guard-rejected
+    //     trial, since nothing cancelled the run and the stagnation guard never latched (it
+    //     needs 50 evaluations without improvement and this run makes 4). `n_iterations` is
+    //     the callback counter, which the warning is deliberately *not* built from — see
+    //     `RunFeasibility::n_nonfinite`.
+    assert_eq!(
+        trials_in(&entry.message),
+        result.n_iterations,
+        "every callback in this fixture produced a rejected trial, so the count the warning \
+         quotes must match the evaluation count: {}",
+        entry.message
+    );
+    assert_eq!(
+        result.ebe_convergence_warnings as usize, result.n_iterations,
+        "...and all of them were the guard's, which is the tally the message's \
+         `rejected N of them` clause is built from"
+    );
+    assert!(
+        result.n_iterations > 1,
+        "the count has to be bigger than 1 for a mutation that records a single rejection \
+         to be distinguishable; got {}",
+        result.n_iterations
+    );
+    // (7) The warning *set* for this row, which is what `docs/estimation/foce.qmd` claims
     //     and what round 3 of review corrected: the generic non-convergence line always
     //     accompanies a demoted run, and `W_NONFINITE_OBJECTIVE` does **not** fire here —
     //     the re-score at the starting estimates is a real objective (76.85), not a
@@ -627,7 +677,22 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
         "a non-finite objective is not an inner-budget problem: {}",
         entry.message
     );
-    // (4) ...and the objective gate speaks for itself. Two facts, two warnings — the
+    // (4) The non-finite tally, checked the same way E1 checks the guard's: every callback
+    //     here produced a trial (no cancellation, and 4 evaluations is far short of the
+    //     stagnation window), and none of them was the guard's.
+    assert_eq!(
+        trials_in(&entry.message),
+        result.n_iterations,
+        "{}",
+        entry.message
+    );
+    assert_eq!(
+        result.ebe_convergence_warnings, 0,
+        "the guard never fired on this row, so its tally must be empty — otherwise the arm \
+         this test pins was selected for the wrong reason"
+    );
+    assert!(result.n_iterations > 1, "got {}", result.n_iterations);
+    // (5) ...and the objective gate speaks for itself. Two facts, two warnings — the
     //     claim the docs make about this row.
     assert!(
         result
