@@ -40,7 +40,11 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   first record of a co-timed tie with a pk-only row one ULP down (`obs_times`,
 ///   `pk_only_times`). It also covers #1876, which landed with both: the reader
 ///   keeps each pk-only row's `OCC` (`pk_only_occasions`).
-pub(crate) const SCHEME: u32 = 2;
+/// - `3`: #1944. A derived `iov_occasion` rule now labels reset rows, so under
+///   `occasions_derived` `reset_occasions` is left out like the other three label
+///   vectors. Otherwise `run_covariance` / `run_sir` refused the population
+///   `run_model_with_data` returned, whose reset labels it had rewritten.
+pub(crate) const SCHEME: u32 = 3;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
@@ -52,8 +56,9 @@ pub(crate) const SCHEME: u32 = 2;
 pub struct PopulationFingerprint {
     scheme: u32,
     /// The fit derived its occasion labels from a model-side `iov_occasion` rule,
-    /// so `occasions`, `pk_only_occasions` and `dose_occasions` are left out of the records and doses
-    /// digests, here and in every population compared against this fingerprint.
+    /// so `occasions`, `pk_only_occasions`, `reset_occasions` and `dose_occasions` are
+    /// left out of the records and doses digests, here and in every population
+    /// compared against this fingerprint.
     #[serde(default)]
     occasions_derived: bool,
     /// `Population::covariate_names`, sorted.
@@ -407,8 +412,13 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     obs_records.iter().for_each(|o| obs_record(&mut r, o));
     r.f64s(pk_only_times);
     r.f64s(reset_times);
-    r.u32s(reset_occasions);
-    // A derived rule overwrites these too (`apply_iov_occasion_rule`, #1876).
+    // A derived rule overwrites these too (`apply_iov_occasion_rule`: pk-only rows
+    // since #1876, reset rows since #1944).
+    r.u32s(if occasions_derived {
+        derived_out
+    } else {
+        reset_occasions
+    });
     r.u32s(if occasions_derived {
         derived_out
     } else {

@@ -42,7 +42,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ferx_core::{fit, prepare_run, FitResult, IovOccasionRule};
+use ferx_core::{
+    fit, prepare_run, run_covariance, run_model_with_data, FitOptions, FitResult, IovOccasionRule,
+};
 
 fn anchor(name: &str) -> String {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -183,6 +185,43 @@ fn assert_arm_matches_nonmem(arm: &str, data: &str) {
 #[test]
 fn an_evid4_reset_row_reseeds_under_its_derived_occasion() {
     assert_arm_matches_nonmem("A", "iov_rule_reset.csv");
+}
+
+/// #1945 review r1 #1: the population `run_model_with_data` returns under a derived rule is
+/// one `run_covariance` accepts. `derive_output_occasions` rewrites every subject's reset
+/// label on that population, and the fit's fingerprint hashed `reset_occasions` even under
+/// `occasions_derived`, so the step refused it with "the records of subject 1 differ".
+///
+/// The model is the anchor's with `iov_column = OCC` swapped for `iov_occasion = dose`, the
+/// reviewer's reproduction, on both arms. The test also asserts that the returned reset rows
+/// carry the rule's label. Without that, a run that stopped rewriting them would pass here
+/// for the wrong reason.
+#[test]
+fn a_derived_rule_run_returns_a_population_covariance_accepts() {
+    let src = std::fs::read_to_string(anchor("iov_rule_reset.ferx")).expect("anchor model");
+    assert_eq!(src.matches("iov_column = OCC").count(), 1, "one iov_column");
+    let src = src.replace("iov_column = OCC", "iov_occasion = dose");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model = dir.path().join("iov_rule_reset_dose.ferx");
+    std::fs::write(&model, src).expect("write model");
+    let model = model.to_str().expect("utf-8 path");
+
+    for data in ["iov_rule_reset.csv", "iov_rule_reset_split.csv"] {
+        let (fitted, pop) = run_model_with_data(model, Some(&anchor(data)))
+            .unwrap_or_else(|e| panic!("{data}: run_model_with_data: {e}"));
+        for s in &pop.subjects {
+            // Period 2 is the rule's second occasion; it numbers from 0.
+            assert_eq!(
+                s.reset_occasions,
+                vec![1],
+                "{data}: subject {} reset label on the returned population",
+                s.id
+            );
+        }
+        run_covariance(&fitted, None, Some(&pop), &FitOptions::default()).unwrap_or_else(|e| {
+            panic!("{data}: run_covariance refused the returned population: {e}")
+        });
+    }
 }
 
 #[test]
