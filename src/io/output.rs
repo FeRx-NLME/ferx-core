@@ -3368,49 +3368,112 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     Ok(())
 }
 
-/// Parameter table as text
+/// One row of [`parameter_table`]: `label  estimate  SE  %RSE  type`. A fixed
+/// parameter is labelled `[FIX]` and has no SE; so does a free one whose SE
+/// the covariance step did not produce (`se = None`). Both print `---`.
+fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind: &str) -> String {
+    let label = if fixed {
+        fixed_label(name)
+    } else {
+        name.to_string()
+    };
+    let (se_str, rse_str) = match se.filter(|_| !fixed) {
+        Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
+        None => ("---".to_string(), "---".to_string()),
+    };
+    format!(
+        "{:<20} {:>12.6} {:>12} {:>10} {:>10}",
+        label, est, se_str, rse_str, kind
+    )
+}
+
+/// Parameter table as text: one row per θ, Ω variance, estimated Ω covariance,
+/// Σ, κ variance and estimated κ covariance, each with its SE and %RSE.
+///
+/// Rows are named as in the fit YAML and the console: θ, ETA, sigma and kappa
+/// names, an off-diagonal as `ETA_V × ETA_CL`. An off-diagonal is listed only
+/// when the console and `format_summary` report it (a diagonal Ω's structural
+/// zeros are not estimates). The `Type` column states the scale: `OMEGA var`,
+/// `OMEGA cov`, `SIGMA SD` (σ is stored as a standard deviation, as the fit
+/// YAML's `estimate` is), `KAPPA var`, `KAPPA cov`. The SEs are the ones
+/// `run_covariance` writes (`se_theta`, `se_omega` through
+/// [`crate::types::omega_se_at`], `se_sigma`, `se_kappa`); an SE that is absent
+/// — no covariance step, or a block-κ covariance, which has none — prints
+/// `---`, as does a fixed parameter's.
 pub fn parameter_table(result: &FitResult) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
-        "{:<20} {:>12} {:>12} {:>10} {:>8}",
+        "{:<20} {:>12} {:>12} {:>10} {:>10}",
         "Parameter", "Estimate", "SE", "%RSE", "Type"
     ));
-    lines.push("-".repeat(64));
+    lines.push("-".repeat(68));
 
     for (i, name) in result.theta_names.iter().enumerate() {
-        let est = result.theta[i];
-        let (se_str, rse_str) = match &result.se_theta {
-            Some(se) => {
-                let se_val = se[i];
-                let rse = rse_pct(est, se_val);
-                (format!("{:.6}", se_val), format!("{:.1}", rse))
-            }
-            None => ("---".to_string(), "---".to_string()),
-        };
-        lines.push(format!(
-            "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-            name, est, se_str, rse_str, "THETA"
+        lines.push(parameter_table_row(
+            name,
+            result.theta[i],
+            result.se_theta.as_ref().and_then(|se| se.get(i).copied()),
+            result.theta_fixed.get(i).copied().unwrap_or(false),
+            "THETA",
         ));
     }
 
     let n_eta = result.omega.nrows();
+    let eta_fixed = |i: usize| result.omega_fixed.get(i).copied().unwrap_or(false);
     for i in 0..n_eta {
-        for j in 0..=i {
-            let val = result.omega[(i, j)];
-            let name = format!("OMEGA({},{})", i + 1, j + 1);
-            lines.push(format!(
-                "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-                name, val, "---", "---", "OMEGA"
-            ));
-        }
+        lines.push(parameter_table_row(
+            eta_name(result, i),
+            result.omega[(i, i)],
+            crate::types::omega_se_at(&result.se_omega, n_eta, i, i),
+            eta_fixed(i),
+            "OMEGA var",
+        ));
+    }
+    for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
+        eta_name(result, k)
+    }) {
+        lines.push(parameter_table_row(
+            &format!("{} × {}", c.name_i, c.name_j),
+            c.cov,
+            crate::types::omega_se_at(&result.se_omega, n_eta, c.i, c.j),
+            eta_fixed(c.i) && eta_fixed(c.j),
+            "OMEGA cov",
+        ));
     }
 
     for (i, &s) in result.sigma.iter().enumerate() {
-        let name = format!("SIGMA({})", i + 1);
-        lines.push(format!(
-            "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-            name, s, "---", "---", "SIGMA"
+        lines.push(parameter_table_row(
+            result.sigma_names.get(i).map_or("EPS", |n| n.as_str()),
+            s,
+            result.se_sigma.as_ref().and_then(|se| se.get(i).copied()),
+            result.sigma_fixed.get(i).copied().unwrap_or(false),
+            "SIGMA SD",
         ));
+    }
+
+    if let Some(iov) = result.omega_iov.as_ref() {
+        let kappa_fixed = |i: usize| result.kappa_fixed.get(i).copied().unwrap_or(false);
+        for i in 0..iov.nrows() {
+            lines.push(parameter_table_row(
+                kappa_name(result, i),
+                iov[(i, i)],
+                result.se_kappa.as_ref().and_then(|se| se.get(i).copied()),
+                kappa_fixed(i),
+                "KAPPA var",
+            ));
+        }
+        // `run_covariance` reports no SE for a block-κ covariance.
+        for c in offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
+            kappa_name(result, k)
+        }) {
+            lines.push(parameter_table_row(
+                &format!("{} × {}", c.name_i, c.name_j),
+                c.cov,
+                None,
+                kappa_fixed(c.i) && kappa_fixed(c.j),
+                "KAPPA cov",
+            ));
+        }
     }
 
     lines.join("\n")
@@ -4916,26 +4979,183 @@ mod tests {
         r
     }
 
-    #[test]
-    fn parameter_table_lists_theta_omega_sigma_with_se() {
-        let table = parameter_table(&full_param_result(Some(vec![0.2, 0.0])));
-        assert!(table.contains("Parameter") && table.contains("Type"));
-        // THETA row carries an SE and a finite %RSE.
-        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
-        assert!(cl.contains("THETA") && cl.contains("0.200000"), "{cl}");
-        // OMEGA lower triangle: (1,1),(2,1),(2,2).
-        assert!(table.contains("OMEGA(1,1)"));
-        assert!(table.contains("OMEGA(2,1)"));
-        assert!(table.contains("OMEGA(2,2)"));
-        assert!(table.contains("SIGMA(1)"));
+    /// The cells after `label` on the row named exactly `label`, as
+    /// `[estimate, se, rse, type]` (the two-word type rejoined). Panics naming
+    /// the label when no row has it.
+    fn table_cells(table: &str, label: &str) -> [String; 4] {
+        let line = table
+            .lines()
+            .find(|l| {
+                // The label must be the whole name: the next cell is the
+                // estimate, so `ETA_V` does not match `ETA_V × ETA_CL`.
+                l.strip_prefix(label).is_some_and(|r| {
+                    r.starts_with(' ')
+                        && r.split_whitespace()
+                            .next()
+                            .is_some_and(|c| c.parse::<f64>().is_ok())
+                })
+            })
+            .unwrap_or_else(|| panic!("no `{label}` row in:\n{table}"));
+        let cells: Vec<&str> = line[label.len()..].split_whitespace().collect();
+        [
+            cells[0].to_string(),
+            cells[1].to_string(),
+            cells[2].to_string(),
+            cells[3..].join(" "),
+        ]
     }
 
+    /// `full_param_result` (a 2×2 block Ω) with every SE the covariance step
+    /// writes: θ, the packed lower triangle of Ω, Σ.
+    fn param_table_result_with_ses() -> FitResult {
+        let mut r = full_param_result(Some(vec![0.2, 0.0]));
+        // Packed column-major lower triangle: (1,1), (2,1), (2,2). Three
+        // distinct values, so a packed-index mix-up reads the wrong one.
+        r.se_omega = Some(vec![0.011, 0.003, 0.004]);
+        r.se_sigma = Some(vec![0.02]);
+        r
+    }
+
+    /// #1748: Ω and Σ rows are named by their ETA / sigma names, carry the
+    /// covariance step's SE and %RSE, and state their scale.
+    #[test]
+    fn parameter_table_names_omega_sigma_rows_and_reports_their_ses() {
+        let table = parameter_table(&param_table_result_with_ses());
+        // Catches: θ SE dropped. 0.2 / 2.0 = 10%.
+        assert_eq!(
+            table_cells(&table, "CL"),
+            ["2.000000", "0.200000", "10.0", "THETA"]
+        );
+        // Catches: Ω SE hard-coded to `---` (the defect), positional labels,
+        // and an SE read from the wrong packed index (0.003 / 0.004).
+        // 0.011 / 0.09 = 12.2%.
+        assert_eq!(
+            table_cells(&table, "ETA_CL"),
+            ["0.090000", "0.011000", "12.2", "OMEGA var"]
+        );
+        // 0.004 / 0.04 = 10%; a diagonal index for (2,2) would read 0.003.
+        assert_eq!(
+            table_cells(&table, "ETA_V"),
+            ["0.040000", "0.004000", "10.0", "OMEGA var"]
+        );
+        // Catches: the block covariance unnamed or without its own SE
+        // (0.003 / 0.01 = 30%).
+        assert_eq!(
+            table_cells(&table, "ETA_V × ETA_CL"),
+            ["0.010000", "0.003000", "30.0", "OMEGA cov"]
+        );
+        // Catches: Σ SE hard-coded, positional label, and a scale that does
+        // not say Σ is an SD. 0.02 / 0.1 = 20%.
+        assert_eq!(
+            table_cells(&table, "EPS_1"),
+            ["0.100000", "0.020000", "20.0", "SIGMA SD"]
+        );
+        // Catches: the positional labels coming back alongside the names.
+        assert!(
+            !table.contains("OMEGA(") && !table.contains("SIGMA("),
+            "{table}"
+        );
+        // A fixed θ is labelled and has no SE, even though `se_theta` has an
+        // entry for it. Catches: a fixed θ printed as if estimated.
+        assert_eq!(
+            table_cells(&table, "ZERO [FIX]"),
+            ["0.000000", "---", "---", "THETA"]
+        );
+    }
+
+    /// #1748: with no covariance step every SE and %RSE is `---`, and only then.
     #[test]
     fn parameter_table_dashes_se_when_absent() {
         let table = parameter_table(&full_param_result(None));
-        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
-        // No covariance run → SE/%RSE rendered as "---".
-        assert!(cl.contains("---"), "{cl}");
+        for label in ["CL", "ETA_CL", "ETA_V", "ETA_V × ETA_CL", "EPS_1"] {
+            let [_, se, rse, _] = table_cells(&table, label);
+            assert_eq!(
+                (se.as_str(), rse.as_str()),
+                ("---", "---"),
+                "{label}:\n{table}"
+            );
+        }
+    }
+
+    /// #1748: a diagonal Ω's structural-zero off-diagonals are not estimates,
+    /// so they get no row; a fixed ETA is labelled `[FIX]` with no SE.
+    #[test]
+    fn parameter_table_skips_a_diagonal_omegas_off_diagonals() {
+        let mut r = param_table_result_with_ses();
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.04]);
+        r.se_omega = Some(vec![0.011, 0.004]); // diagonal layout: one per ETA
+        r.omega_fixed = vec![false, true];
+        let table = parameter_table(&r);
+        // Catches: the structural zero listed as a covariance estimate.
+        assert!(
+            !table.contains("OMEGA cov") && !table.contains('×'),
+            "{table}"
+        );
+        assert_eq!(table.matches("OMEGA var").count(), 2, "{table}");
+        // Catches: the diagonal-layout SE not read.
+        assert_eq!(
+            table_cells(&table, "ETA_CL"),
+            ["0.090000", "0.011000", "12.2", "OMEGA var"]
+        );
+        // Catches: a fixed ETA printed as estimated, with the SE slot's value.
+        assert_eq!(
+            table_cells(&table, "ETA_V [FIX]"),
+            ["0.040000", "---", "---", "OMEGA var"]
+        );
+    }
+
+    /// #1748: the IOV κ rows `format_summary` gained in #1657 — each variance
+    /// with its SE, a block-κ covariance named like Ω's with `---` (the
+    /// covariance step reports no SE for it).
+    #[test]
+    fn parameter_table_lists_iov_kappa_rows() {
+        let mut r = param_table_result_with_ses();
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.002, 0.002, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_fixed = vec![false, false];
+        r.se_kappa = Some(vec![0.005, 0.006]);
+        let table = parameter_table(&r);
+        // Catches: no κ rows (the omission), and a kappa SE from the wrong slot.
+        // 0.005 / 0.05 = 10%, 0.006 / 0.03 = 20%.
+        assert_eq!(
+            table_cells(&table, "KAPPA_CL"),
+            ["0.050000", "0.005000", "10.0", "KAPPA var"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_V"),
+            ["0.030000", "0.006000", "20.0", "KAPPA var"]
+        );
+        // Catches: a block-κ covariance dropped, or given a borrowed SE.
+        assert_eq!(
+            table_cells(&table, "KAPPA_V × KAPPA_CL"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
+        // No IOV → no κ rows. Catches: κ rows printed from an absent matrix.
+        let no_iov = parameter_table(&param_table_result_with_ses());
+        assert!(!no_iov.contains("KAPPA"), "{no_iov}");
+    }
+
+    /// #1748: a `block_omega … FIX` / `block_kappa … FIX` fixes every entry
+    /// of the block (the parser refuses a partly fixed one), so its covariance
+    /// row is `[FIX]` with no SE, like its variances — even when `se_omega`
+    /// carries a slot for it.
+    #[test]
+    fn parameter_table_marks_a_fixed_blocks_covariance_fix() {
+        let mut r = param_table_result_with_ses();
+        r.omega_fixed = vec![true, true];
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.002, 0.002, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_fixed = vec![true, true];
+        let table = parameter_table(&r);
+        // Catches: an off-diagonal of a fixed block printed as estimated.
+        assert_eq!(
+            table_cells(&table, "ETA_V × ETA_CL [FIX]"),
+            ["0.010000", "---", "---", "OMEGA cov"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_V × KAPPA_CL [FIX]"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
     }
 
     // ── format_comparison: multi-run Markdown table ──────────────────────────

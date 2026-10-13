@@ -268,7 +268,13 @@ column the rest of the table compares.
   and `final.ferx`). A resumed run reuses those journals.
 * The printed summary: the step table, every step's candidates with the reason
   a failed one was excluded, the notes, and the final model's estimates **with
-  their standard errors**.
+  their standard errors**: one row per θ, Ω variance and estimated block
+  covariance (`ETA_V × ETA_CL`), Σ, and IOV κ variance and block covariance,
+  each named by the model's θ, ETA, sigma or kappa name. The `Type` column
+  gives the scale (`OMEGA var`, `OMEGA cov`, `SIGMA SD`, `KAPPA var`,
+  `KAPPA cov`); Σ is a standard deviation, so a proportional σ of 0.28 is a
+  28% CV. An SE reads `---` when the covariance step produced none (a block-κ
+  covariance never has one), and a fixed parameter is marked `[FIX]`.
 
 ## A worked run
 
