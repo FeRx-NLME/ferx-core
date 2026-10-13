@@ -355,6 +355,7 @@ mod tests {
 
     fn one_subject() -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 4.0, 8.0],

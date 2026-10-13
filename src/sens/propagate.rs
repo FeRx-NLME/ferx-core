@@ -1896,6 +1896,7 @@ mod tests {
         use std::collections::HashMap;
         let n_obs = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times,

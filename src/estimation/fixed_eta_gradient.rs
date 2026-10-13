@@ -553,7 +553,7 @@ fn obs_nll_subject_grad_impl(
             &preds_base,
             theta,
             sigma_values,
-            model.residual_cov(),
+            model.residual_cov_theta(theta),
             eta,
         );
         let mut grad = vec![0.0f64; n];
@@ -568,7 +568,7 @@ fn obs_nll_subject_grad_impl(
                 subject,
                 &theta_p,
                 sigma_values,
-                model.residual_cov(),
+                model.residual_cov_theta(theta),
                 eta,
                 pk_scratch,
             );
@@ -600,7 +600,7 @@ fn obs_nll_subject_grad_impl(
                     &preds_base,
                     theta,
                     &sigma_p,
-                    model.residual_cov(),
+                    model.residual_cov_theta(theta),
                     eta,
                 );
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)

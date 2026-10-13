@@ -9,6 +9,7 @@ const N_KAPPA: usize = 3;
 /// pk-only row, which does not create a group of its own.
 fn subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),

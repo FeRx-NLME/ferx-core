@@ -36,6 +36,7 @@ fn pk_one(cl: f64, v: f64) -> PkParams {
 fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
     let n_obs = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses,
         obs_times,

@@ -988,6 +988,7 @@ const WARFARIN: &str = r#"
 fn oral_subject(times: &[f64]) -> Subject {
     let n = times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -1749,6 +1750,7 @@ const ONECPT_IV_2ETA: &str = r#"
 fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
     let n = times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![dose],
         obs_times: times.to_vec(),
@@ -2657,6 +2659,7 @@ fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
     let n = 5usize;
     // SS=1 bolus into central (cmt 2), II = 12; the depot forcing (cmt 1) is inert here.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, true, 12.0)],
         obs_times: vec![0.5, 2.0, 4.0, 8.0, 11.0],
@@ -3195,6 +3198,7 @@ fn subject_with_doses_and_resets(
 ) -> Subject {
     let n = times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses,
         obs_times: times.to_vec(),
@@ -5111,6 +5115,7 @@ fn ode_lagtime_full_sens_matches_analytical_twin() {
     );
     let n = 6usize;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 6.0, 9.0, 12.0],
@@ -6019,6 +6024,7 @@ fn tvcov_subject(
 ) -> Subject {
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses,
         obs_times: obs_times.to_vec(),
@@ -7131,6 +7137,7 @@ fn iov_subject() -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -7319,6 +7326,7 @@ fn ss_bolus_lag_iov_subject() -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
@@ -8873,6 +8881,7 @@ fn ode_iov_above_legacy_axis_cap_body() {
         .collect();
     let n = obs_times.len();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "wide-iov".to_string(),
         doses,
         obs_times,
@@ -8954,6 +8963,7 @@ fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
         .collect();
     let n = obs_times.len();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "pna-scale-iov".to_string(),
         doses,
         obs_times,
@@ -11562,6 +11572,7 @@ fn iov_reset_subject() -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -11858,6 +11869,7 @@ fn iov_tvcov_subject(pk_only: bool) -> Subject {
         (Vec::new(), Vec::new())
     };
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -13679,6 +13691,7 @@ fn iov_subject_with_occasions(k: usize) -> Subject {
     }
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses,
         obs_times,
@@ -14032,6 +14045,7 @@ fn transit_iov_walk_subject() -> Subject {
     ];
     let n = obs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: doses
             .iter()

@@ -62,6 +62,7 @@ const TWOCPT_ODE: &str = r#"
 fn bolus_subject(times: &[f64]) -> Subject {
     let n = times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),

@@ -3356,6 +3356,16 @@ pub fn parse_full_model_with(
     if error_lines_opt.is_none() && !is_endpoint_only {
         return Err("Missing [error_model] block".to_string());
     }
+    // `correlation <kind>(RHO) by COL` (#1081) is a statement about `R`, not an
+    // endpoint, so it is taken out before the endpoint grammar sees the block.
+    let (error_lines_opt, correlation_decl) = match error_lines_opt {
+        Some(lines) => {
+            let (rest, decl) = split_correlation_line(lines)?;
+            (Some(rest), decl)
+        }
+        None => (None, None),
+    };
+    let error_lines_opt = error_lines_opt.as_ref();
     let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
         if let Some(error_lines) = error_lines_opt {
             parse_error_model(error_lines)?
@@ -4498,6 +4508,16 @@ pub fn parse_full_model_with(
         ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
         _ => Vec::new(),
     };
+    let residual_serial = match &correlation_decl {
+        Some(decl) => resolve_correlation(
+            decl,
+            &parsed_error_model,
+            iiv_on_ruv_name.as_deref(),
+            !block_sigmas.is_empty(),
+            &thetas,
+        )?,
+        None => None,
+    };
     let (error_model, error_spec) =
         build_error_spec(parsed_error_model, &sigma_names, is_ode, is_algebraic)?;
     let (residual_correlations, residual_correlation_fixed) =
@@ -4851,6 +4871,7 @@ pub fn parse_full_model_with(
         .collect();
 
     let model = CompiledModel {
+        residual_serial: residual_serial.clone(),
         priors: declared_priors,
         // `[priors] from_fit` is read further down, once `extract_blocks` output
         // is in scope, and assigned onto `model` there.
@@ -5545,6 +5566,11 @@ pub fn parse_full_model_with(
     if !selector_covariates.is_empty() {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
+    // A `correlation … by COL` line's columns are required data columns (#1081),
+    // read per row: the reader has to take them and the pruning has to keep them.
+    if let Some(decl) = &correlation_decl {
+        register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
+    }
 
     // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
     // up in the same per-event `HashMap` every other covariate consumer uses — but they
@@ -6052,6 +6078,23 @@ pub fn parse_full_model_with(
     // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
     // now carries its direct-θ channel), just never seen by `indiv_stmts`.
     event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // A `correlation` line's `ρ` is read by `R` (#1081) — and nowhere else: a
+    // second reader would split its gradient across two channels, one of which
+    // the dense-`R` routing does not know about. Even a line the parser dropped
+    // (`ρ` FIX 0) keeps its θ "used", since the user wrote it for that line.
+    if let Some(decl) = &correlation_decl {
+        if let Some(idx) = model.theta_names.iter().position(|n| *n == decl.rho) {
+            if REFERENCED_THETAS.with(|c| c.borrow().contains(&idx)) {
+                return Err(format!(
+                    "[error_model] `correlation {}({})`: theta `{}` is also used by a model \
+                     expression. The correlation of a `correlation` line is a parameter of its \
+                     own; declare a separate theta for it.",
+                    decl.kind_name, decl.rho, decl.rho
+                ));
+            }
+            event_model_used_thetas.extend(std::iter::once(idx));
+        }
+    }
     // A θ a `[covariate_model]` relation declares (`=> THETA_CL_WT(...)`) while the
     // relation still waits on a data statistic (#1738): the relation emits no
     // expression until it is bound, so nothing in `indiv_stmts` reads the θ yet —
@@ -18119,6 +18162,145 @@ fn error_model_semicolon_hint(lines: &[String]) -> Option<String> {
         .then(|| semicolon_is_not_a_comment("error_model", shown))
 }
 
+/// A `correlation <kind>(RHO) by COL[, COL…]` line of `[error_model]` (#1081),
+/// as written: names not yet resolved.
+struct CorrelationDecl {
+    /// `cs` / `ar1`, lowercased.
+    kind_name: String,
+    kind: crate::types::ResidualSerialKind,
+    /// The θ named as `ρ`.
+    rho: String,
+    by: Vec<String>,
+}
+
+/// Every `correlation` structure the parser accepts, as `(keyword, kind)`.
+const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
+    ("cs", crate::types::ResidualSerialKind::Cs),
+    ("ar1", crate::types::ResidualSerialKind::Ar1),
+];
+
+/// Take the `correlation …` line (#1081) out of an `[error_model]` block and
+/// parse it, returning the remaining lines for the endpoint grammar. At most one
+/// such line; it must be the whole line.
+fn split_correlation_line(
+    lines: &[String],
+) -> Result<(Vec<String>, Option<CorrelationDecl>), String> {
+    let head = Regex::new(r"(?i)^\s*correlation\b").unwrap();
+    let full = Regex::new(
+        r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",
+    )
+    .unwrap();
+    let mut rest = Vec::with_capacity(lines.len());
+    let mut decl: Option<CorrelationDecl> = None;
+    for line in lines {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if !head.is_match(code) {
+            rest.push(line.clone());
+            continue;
+        }
+        if decl.is_some() {
+            return Err(
+                "[error_model] has more than one `correlation` line; a model takes one \
+                        residual correlation structure"
+                    .to_string(),
+            );
+        }
+        let Some(c) = full.captures(code) else {
+            return Err(format!(
+                "[error_model]: cannot read `{code}`. Expected `correlation <structure>(THETA) by \
+                 COLUMN`, e.g. `correlation cs(RHO) by ARM`, where <structure> is one of: {}.",
+                correlation_kind_list()
+            ));
+        };
+        let kind_name = c[1].to_lowercase();
+        let Some(&(_, kind)) = CORRELATION_KINDS.iter().find(|(k, _)| *k == kind_name) else {
+            return Err(format!(
+                "[error_model] `correlation {}(…)`: unknown structure `{}`. Supported: {}.",
+                &c[1],
+                &c[1],
+                correlation_kind_list()
+            ));
+        };
+        let by: Vec<String> = c[3]
+            .trim_matches(|ch: char| ch == '(' || ch == ')' || ch.is_whitespace())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        decl = Some(CorrelationDecl {
+            kind_name,
+            kind,
+            rho: c[2].to_string(),
+            by,
+        });
+    }
+    Ok((rest, decl))
+}
+
+fn correlation_kind_list() -> String {
+    CORRELATION_KINDS
+        .iter()
+        .map(|(k, _)| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a `correlation` line against the rest of the model (#1081): its `ρ`
+/// must be a declared θ, and the line is refused next to the residual features
+/// phase 1 does not compose it with. `Ok(None)` when `ρ` is `FIX`ed at 0 — the
+/// line is then dropped, exactly as a `FIX` zero `block_sigma` off-diagonal is,
+/// so the model is the independent one bit for bit.
+fn resolve_correlation(
+    decl: &CorrelationDecl,
+    parsed: &ParsedErrorModel,
+    iiv_on_ruv: Option<&str>,
+    has_block_sigma: bool,
+    thetas: &[ThetaSpec],
+) -> Result<Option<crate::types::ResidualSerial>, String> {
+    let line = format!("correlation {}({})", decl.kind_name, decl.rho);
+    match parsed {
+        ParsedErrorModel::Single(..) => {}
+        ParsedErrorModel::PerCmt(_) => {
+            return Err(format!(
+                "[error_model] `{line}` is not supported with per-CMT (multi-endpoint) error \
+                 models: the correlation applies to one endpoint's rows."
+            ))
+        }
+        ParsedErrorModel::Selected { .. } => {
+            return Err(format!(
+                "[error_model] `{line}` is not supported with a covariate-selected \
+                 (`if … else`) error model."
+            ))
+        }
+    }
+    if let Some(eta) = iiv_on_ruv {
+        return Err(format!(
+            "[error_model] `{line}` is not supported together with `iiv_on_ruv = {eta}`."
+        ));
+    }
+    if has_block_sigma {
+        return Err(format!(
+            "[error_model] `{line}` is not supported in a model that also declares \
+             `block_sigma`: the two are different residual correlations, and a model takes one."
+        ));
+    }
+    let Some((rho_theta, spec)) = thetas.iter().enumerate().find(|(_, t)| t.name == decl.rho)
+    else {
+        return Err(format!(
+            "[error_model] `{line}`: `{}` is not a theta declared in [parameters]. The \
+             correlation is an ordinary theta, e.g. `theta {}(0.3, -0.2, 0.95)`.",
+            decl.rho, decl.rho
+        ));
+    };
+    if spec.fixed && spec.init == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::types::ResidualSerial {
+        kind: decl.kind,
+        rho_theta,
+        by: decl.by.clone(),
+    }))
+}
+
 fn parse_error_model(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
@@ -29204,3 +29386,7 @@ mod adaptive_dosing_tests;
 #[cfg(test)]
 #[path = "model_parser_theta_eta_linked_tests.rs"]
 mod theta_eta_linked_tests;
+
+#[cfg(test)]
+#[path = "model_parser_residual_correlation_tests.rs"]
+mod residual_correlation_tests;

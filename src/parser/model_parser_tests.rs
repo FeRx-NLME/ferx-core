@@ -2402,6 +2402,7 @@ fn infusion_population() -> crate::types::Population {
 fn tv_cov_population() -> crate::types::Population {
     crate::types::Population {
         subjects: vec![crate::types::Subject {
+            obs_rgroup: Vec::new(),
             id: "TV1".to_string(),
             doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -11859,6 +11860,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
     let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
 
     let subject = crate::types::Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
@@ -11931,6 +11933,7 @@ fn test_selected_error_obs_keys_dispatch() {
 
     // Two rows in the *same* CMT (=1) but different `FREE` flags.
     let subject = crate::types::Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
@@ -22061,6 +22064,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             .map(|&z| HashMap::from([("ZCOV".to_string(), z)]))
             .collect();
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.clone(),
@@ -22181,6 +22185,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
 
     let population = Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],

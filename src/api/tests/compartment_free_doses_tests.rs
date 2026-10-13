@@ -42,6 +42,7 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
             .into_iter()
             .enumerate()
             .map(|(i, doses)| Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", i + 1),
                 doses,
                 obs_times: vec![1.0],

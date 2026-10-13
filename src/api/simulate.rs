@@ -990,10 +990,10 @@ pub(crate) fn draw_correlations<'a>(
     model: &'a CompiledModel,
     params: &'a ModelParameters,
 ) -> crate::stats::residual_error::ResidualCov<'a> {
-    if params.residual_is_dense() {
-        params.residual_cov()
+    if model.residual_cov_at(params).is_dense() {
+        model.residual_cov_at(params)
     } else {
-        model.residual_cov()
+        model.residual_cov_theta(&params.theta)
     }
 }
 
@@ -1022,6 +1022,17 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     rng: &mut R,
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
+    // `simulate()` takes the caller's population as given, so a `correlation`
+    // line's blocks are read here when nothing assigned them (#1081); a fitted
+    // population carries them already.
+    let assigned: Vec<u32>;
+    let obs_rgroup: &[u32] =
+        if residual_cov.serial.is_some() && subject.obs_rgroup.len() != subject.obs_times.len() {
+            assigned = crate::stats::residual_error::residual_groups(model, subject);
+            &assigned
+        } else {
+            &subject.obs_rgroup
+        };
     let mut r = match ruv_mult {
         Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
@@ -1031,6 +1042,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
             residual_cov,
             mult,
@@ -1043,6 +1055,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
             residual_cov,
         ),

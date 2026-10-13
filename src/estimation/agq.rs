@@ -496,7 +496,7 @@ impl Stack {
                 &params.sigma.values,
                 // AGQ holds the `block_sigma` off-diagonals at their declared
                 // value (#847); `params` carries exactly that.
-                params.residual_cov(),
+                model.residual_cov_at(params),
                 scratch,
                 schedule,
                 err_keys.expect("non-IOV error keys"),
@@ -1925,7 +1925,7 @@ fn fused_node_nll_and_score(
         preds,
         &params.theta,
         &params.sigma.values,
-        params.residual_cov(),
+        model.residual_cov_at(params),
         eta,
         stack.is_iov(),
     );
@@ -2652,7 +2652,7 @@ fn node_nll_gradient(
             &params.omega,
             &params.sigma.values,
             // AGQ holds ρ at the declaration; `params` carries it (#847).
-            params.residual_cov(),
+            model.residual_cov_at(params),
             schedule,
             mult,
             err_keys,
@@ -3643,6 +3643,7 @@ mod tests {
         use std::collections::HashMap;
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -4380,6 +4381,7 @@ mod tests {
         let pk_times = [1.0, 6.0, 24.0];
         let n = pk_times.len() + fts.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: pk_times

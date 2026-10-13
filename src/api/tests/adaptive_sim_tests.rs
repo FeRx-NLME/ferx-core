@@ -313,6 +313,7 @@ fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
     let n = obs_times.len();
     let n_dose = doses.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses,
         obs_times,

@@ -29,6 +29,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -118,6 +119,7 @@ fn make_iov_population() -> Population {
     let subjects: Vec<Subject> = subject_data
         .iter()
         .map(|(id, obs)| Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1127,6 +1129,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1210,6 +1213,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -1356,6 +1360,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1457,6 +1462,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1547,6 +1553,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1645,6 +1652,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1741,6 +1749,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
     // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
     // uses to pin the estimation-side dense `R`.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
@@ -1933,7 +1942,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
-        model.default_params.residual_cov(),
+        model.residual_cov_at(&model.default_params),
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),
@@ -2105,6 +2114,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     // One subject with an explicit zero-order infusion into the depot (cmt 1):
     // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],

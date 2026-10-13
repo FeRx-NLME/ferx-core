@@ -42,6 +42,7 @@ fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 50.0 / (1.0 + t)).collect();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,

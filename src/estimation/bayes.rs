@@ -227,7 +227,7 @@ fn subject_nll(
                     omega,
                     sigma,
                     // Bayes holds the `block_sigma` off-diagonals fixed (#847).
-                    model.residual_cov(),
+                    model.residual_cov_theta(theta),
                     scratch,
                     schedule,
                 )
@@ -246,7 +246,7 @@ fn subject_nll(
             eta,
             omega,
             sigma,
-            model.residual_cov(),
+            model.residual_cov_theta(theta),
             scratch,
             schedule,
         )

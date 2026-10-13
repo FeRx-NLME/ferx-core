@@ -647,6 +647,9 @@ fn data_fingerprint(data: &Population) -> String {
             cens,
             occasions,
             obs_l2,
+            // Derived from covariate columns hashed below, by the fit's own
+            // preparation (#1081): a population as read never carries it.
+            obs_rgroup: _,
             dose_occasions,
             reset_occasions,
             pk_only_occasions,

@@ -510,6 +510,8 @@ pub(crate) fn fitted_population<'a>(
         );
     }
     let derive_occ = iov_rule_set && model.n_kappa > 0;
+    // A `correlation … by COL` line reads its blocks off the `by` columns (#1081).
+    let needs_rgroup = model.residual_serial.is_some();
     let needs_prune = population.subjects.iter().any(|s| {
         !s.dose_covariates.is_empty()
             || !s.obs_covariates.is_empty()
@@ -519,7 +521,7 @@ pub(crate) fn fitted_population<'a>(
             // `reset_covariates` must reach it rather than being gated out here.
             || !s.reset_covariates.is_empty()
     });
-    if !(needs_prune || needs_dv_log || derive_occ) {
+    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup) {
         return population;
     }
     let mut population = population;
@@ -529,6 +531,9 @@ pub(crate) fn fitted_population<'a>(
     }
     if derive_occ {
         apply_iov_occasion_rule(p, rule, had_column, warnings);
+    }
+    if needs_rgroup {
+        crate::stats::residual_error::assign_residual_groups(model, p);
     }
     if needs_dv_log {
         let n_nonpos = log_transform_observations(p);

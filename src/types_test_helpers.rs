@@ -13,6 +13,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -146,6 +147,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -219,6 +221,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
     let mut baseline_cov = HashMap::new();
     baseline_cov.insert("WT".to_string(), 70.0);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "TVCOV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],

@@ -401,7 +401,7 @@ fn fd_eta_data_grad(
                 subject,
                 theta,
                 sigma,
-                model.residual_cov(),
+                model.residual_cov_theta(theta),
                 zz,
                 scratch,
             )
@@ -1315,7 +1315,7 @@ pub(crate) fn elbo_tightness(
                 subject,
                 &params.theta,
                 &params.sigma.values,
-                params.residual_cov(),
+                model.residual_cov_at(params),
                 eta,
                 &mut scratch,
             )

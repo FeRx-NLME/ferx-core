@@ -231,6 +231,7 @@ const PLAIN_ADAPTIVE_MODEL: &str = r"
 // to trip a specific guard.
 fn adaptive_base_subject() -> crate::types::Subject {
     crate::types::Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: Vec::new(),
         obs_times: vec![24.0],

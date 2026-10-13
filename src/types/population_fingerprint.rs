@@ -377,6 +377,10 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         cens,
         occasions,
         obs_l2,
+        // Derived from the `by` columns, which `c.map` below already hashes, and
+        // set only on the fit's own prepared copy (`assign_residual_groups`), so
+        // hashing it would make a fit's population differ from the one it was given.
+        obs_rgroup: _,
         dose_occasions,
         reset_occasions,
         pk_only_occasions,

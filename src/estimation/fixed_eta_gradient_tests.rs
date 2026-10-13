@@ -23,6 +23,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     let model = analytical_model(GradientMethod::Auto);
 
     let make_subj = |id: &str, obs: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -151,6 +152,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -241,6 +243,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -382,6 +385,7 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 
     // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
     let make_subj = |id: &str, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
@@ -534,6 +538,7 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     .expect("cross-endpoint block_sigma ODE model parses");
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0],

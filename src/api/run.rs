@@ -639,6 +639,7 @@ pub fn run_model_simulate_with_overrides(
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("{}", i),
             doses: vec![DoseEvent::new(
                 0.0,

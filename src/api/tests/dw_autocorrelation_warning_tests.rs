@@ -170,6 +170,7 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
         .collect();
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
