@@ -116,8 +116,9 @@ fn ferx_fit(data: &str, rule: IovOccasionRule, labelled: bool) -> FitResult {
     fit(&run.parsed.model, &run.population, &run.init_params, &opts).expect("the cell evaluates")
 }
 
-/// `|ΔOFV|` against NONMEM, every cell. Measured on Linux x86_64: 5.747e-8 in all ten cells,
-/// so 17× headroom. Without the fix the derived cells sit at 11.00 (over `iov_column`) and
+/// `|ΔOFV|` against NONMEM 7.6.0 (`nonmem:7.6.0-anchor`), every cell. Measured on Linux
+/// aarch64: 1.226e-7 in all ten cells, so 8× headroom. (Against NONMEM 7.5.1 it was 5.747e-8;
+/// the two NONMEM builds differ by 6.5e-8 at `MAXEVAL=0`.) Without the fix the derived cells sit at 11.00 (over `iov_column`) and
 /// 28.05 (no column), seven orders of magnitude out.
 const OFV_TOL: f64 = 1e-6;
 /// `|Δη̂|` and `|Δκ̂|` against NONMEM's `.phi`, every subject. Measured on Linux x86_64:

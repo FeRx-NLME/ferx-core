@@ -1,24 +1,18 @@
-Tue Oct 13 09:19:32 UTC 2026
-$PROBLEM    ferx iov_occasion anchor A -- the occasion an EVID=4 reset
-;           row re-seeds A_0 under
+Tue Oct 13 03:11:11 PM UTC 2026
+$PROBLEM ferx iov_occasion anchor A -- the occasion an EVID=4 reset row re-seeds A_0 under
 ; A two-period crossover: period 2 opens at t=12 with one EVID=4 row (reset + 100 mg). The
-
 ; occasion is DERIVED from TIME, as ferx's `iov_occasion = time(12)` / `= dose` derive it, and
-
 ; the data's OCC column is read but not used. KAPPA enters BASE, which reaches the prediction
-
 ; only through A_0, i.e. at t=0 and at the reset's re-seed, and CL. So the reset row's own
-
 ; $PK (occasion 2) decides the seed, and a seed under occasion 1 or under no occasion moves
-
 ; the objective.
-$INPUT      ID TIME DV MDV EVID AMT CMT OCC
-$DATA      iov_rule_reset.csv IGNORE=@
+$INPUT ID TIME DV MDV EVID AMT CMT OCC
+$DATA iov_rule_reset.csv IGNORE=@
 
 ; Closed form: A_0 is a $PK feature on every ADVAN, and ferx's side integrates [odes], so
-
 ; the two engines share no solver.
 $SUBROUTINE ADVAN1 TRANS2
+
 $PK
   OCCT = 1
   IF (TIME.GE.12) OCCT = 2
@@ -35,18 +29,18 @@ $ERROR
   IPRED = F
   Y = IPRED*(1 + EPS(1))
 
-$THETA  (0.01,5.0,100.0) ; TVCL
- (1.0,50.0,500.0) ; TVV
- (0.01,100.0,1000.0) ; TVBASE
-$OMEGA  0.04  ;     ETA_CL
-$OMEGA  BLOCK(1)
- 0.09  ; KAPPA_B occasion 1
-$OMEGA  BLOCK(1) SAME
-$SIGMA  0.0025  ; PROP, sd 0.05
-$ESTIMATION MAXEVAL=0 METHOD=1 INTER PRINT=1 NOABORT
-$TABLE      ID TIME EVID OCCT IPRED ETA1 ETA2 ETA3 NOPRINT ONEHEADER
-            FORMAT=s1PE17.10 FILE=iov_rule_reset_A.tab
+$THETA
+  (0.01, 5.0, 100.0)    ; TVCL
+  (1.0, 50.0, 500.0)    ; TVV
+  (0.01, 100.0, 1000.0) ; TVBASE
 
+$OMEGA 0.04             ; ETA_CL
+$OMEGA BLOCK(1) 0.09    ; KAPPA_B occasion 1
+$OMEGA BLOCK(1) SAME    ; occasion 2
+$SIGMA 0.0025           ; PROP, sd 0.05
+
+$ESTIMATION MAXEVAL=0 METHOD=1 INTER PRINT=1 NOABORT
+$TABLE ID TIME EVID OCCT IPRED ETA1 ETA2 ETA3 NOPRINT ONEHEADER FORMAT=s1PE17.10 FILE=iov_rule_reset_A.tab
 
 NM-TRAN MESSAGES
   
@@ -58,21 +52,22 @@ Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
       You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
   
 
-License Registered to: Novo Nordisk AS Biomodelling
-Expiration Date:    14 OCT 2027
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
 Current Date:       13 OCT 2026
-Days until program expires : 366
-1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.5.1
+Days until program expires : 306
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
  ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
  CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
  AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
  PERFORMED BY NOUS INFOSYSTEMS.
 
  PROBLEM NO.:         1
- ferx iov_occasion anchor A -- the occasion an EVID=4 reset
+ ferx iov_occasion anchor A -- the occasion an EVID=4 reset row re-seeds
 0DATA CHECKOUT RUN:              NO
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
  NO. OF DATA RECS IN DATA SET:       60
  NO. OF DATA ITEMS IN DATA SET:   8
  ID DATA ITEM IS DATA ITEM NO.:   1
@@ -132,7 +127,7 @@ Days until program expires : 366
  FIXED_EFFECT_ETAS:
 0USER-CHOSEN ITEMS:
  ID TIME EVID OCCT IPRED ETA1 ETA2 ETA3
-1DOUBLE PRECISION PREDPP VERSION 7.5.1
+1DOUBLE PRECISION PREDPP VERSION 7.6.0 (nm760)
 
  ONE COMPARTMENT MODEL (ADVAN1)
 0MAXIMUM NO. OF BASIC PK PARAMETERS:   2
@@ -173,6 +168,7 @@ Days until program expires : 366
  #METH: First Order Conditional Estimation with Interaction (Evaluation)
 
  ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
  ANALYSIS TYPE:                           POPULATION
  CONDITIONAL ESTIMATES USED:              YES
  CENTERED ETA:                            NO
@@ -193,7 +189,7 @@ Days until program expires : 366
  EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
        IN SHRINKAGE (ETASTYPE):             NO
  NON-INFL. ETA CORRECTION (NONINFETA):      0
- RAW OUTPUT FILE (FILE): psn.ext
+ RAW OUTPUT FILE (FILE): iov_rule_reset_A.ext
  EXCLUDE TITLE (NOTITLE):                   NO
  EXCLUDE COLUMN LABELS (NOLABEL):           NO
  FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
@@ -214,8 +210,8 @@ Days until program expires : 366
  IPRD=IPREDI
  IRS=IRESI
 
- Elapsed evaluation time in seconds:     0.01
- Elapsed postprocess time in seconds:     0.04
+ Elapsed evaluation time in seconds:     0.02
+ Elapsed postprocess time in seconds:     0.01
 1
  
  
@@ -249,7 +245,7 @@ Days until program expires : 366
 
 
 
- #OBJV:********************************************      -81.413       **************************************************
+ #OBJV:********************************************           -81.413       *********************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -321,6 +317,6 @@ Days until program expires : 366
 +        5.00E-02
  
  Elapsed finaloutput time in seconds:     0.01
- #CPUT: Total CPU Time in Seconds,        0.047
+ #CPUT: Total CPU Time in Seconds,        0.065
 Stop Time:
-Tue Oct 13 09:19:45 UTC 2026
+Tue Oct 13 03:11:17 PM UTC 2026
