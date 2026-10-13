@@ -188,6 +188,39 @@ fn the_summary_shows_every_step_every_candidate_and_the_estimates() {
     );
 }
 
+/// #1748: the final-model table gives the Ω and Σ rows their names and their
+/// standard errors, which is what the docs promise ("the final model's
+/// estimates with their standard errors"). Before, every Ω/Σ SE read `---`
+/// under a positional `OMEGA(1,1)` / `SIGMA(1)` label.
+#[test]
+fn the_final_model_table_names_omega_and_sigma_and_shows_their_ses() {
+    let mut result = result();
+    let fit = result.final_fit.as_mut().unwrap();
+    // The warfarin fixture: three diagonal ETAs, one proportional σ.
+    fit.se_omega = Some(vec![0.0123, 0.0045, 0.0678]);
+    fit.se_sigma = Some(vec![0.0019]);
+    let out = render_summary(&result);
+    let row = |name: &str| {
+        out.lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("no `{name}` row in:\n{out}"))
+            .to_string()
+    };
+    let eta_ka = row("ETA_KA");
+    assert!(
+        eta_ka.contains("0.067800") && eta_ka.ends_with("OMEGA var"),
+        "{eta_ka}"
+    );
+    let sigma = row("PROP_ERR");
+    assert!(
+        sigma.contains("0.001900") && sigma.ends_with("SIGMA SD"),
+        "{sigma}"
+    );
+    assert!(!out.contains("OMEGA(") && !out.contains("SIGMA("), "{out}");
+    // A diagonal Ω has no covariance rows.
+    assert!(!out.contains("OMEGA cov"), "{out}");
+}
+
 /// A row the step carried forward *and* the gate rejected says both.
 ///
 /// A search that has to return something can hand back a model that failed the
