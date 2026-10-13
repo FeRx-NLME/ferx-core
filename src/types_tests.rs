@@ -3967,3 +3967,41 @@ fn pk_slot_rows_give_one_name_both_of_its_slots() {
     assert_eq!(m.indiv_param_for_pk_slot(9), Some(0));
     assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
 }
+
+/// Review r6: deleting the `debug_assert!` in
+/// [`CompiledModel::pk_slot_rows`](super::CompiledModel::pk_slot_rows) was a minimal
+/// production edit no test caught, and by its nature none can: the condition it
+/// guards is unreachable on every accepted model (measured — deleting the range
+/// filter beside it leaves the whole suite green), so observing it would need a
+/// hand-built `IndivParamProgram` with an out-of-range `var_slot`, which its private
+/// fields do not allow without a test-only constructor.
+///
+/// So the guard's **presence** is what is asserted, in the same spirit as
+/// `tests/public_api_boundary.rs`'s structural bans. What it buys is not style: a
+/// future mapping that pointed a pair past `indiv_param_names` would otherwise have
+/// its row silently filtered away, which is a lost gradient row — #1899's own
+/// failure mode — rather than a loud test failure.
+#[test]
+fn pk_slot_rows_keeps_its_range_guard() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
+        .expect("src/types.rs is valid UTF-8");
+    let body = {
+        let start = src
+            .find("pub(crate) fn pk_slot_rows(&self)")
+            .expect("pk_slot_rows must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub(crate) fn indiv_param_for_pk_slot")
+            .expect("indiv_param_for_pk_slot follows pk_slot_rows");
+        &rest[..end]
+    };
+    assert!(
+        body.contains("debug_assert!"),
+        "pk_slot_rows must keep its debug_assert over pk_var_slots: a pair pointing \
+         past indiv_param_names would otherwise lose a gradient row silently"
+    );
+    assert!(
+        body.contains("i < self.indiv_param_names.len()"),
+        "pk_slot_rows must keep the range condition the assert and the filter share"
+    );
+}
