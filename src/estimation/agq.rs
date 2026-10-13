@@ -73,6 +73,7 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
+use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -376,7 +377,7 @@ impl Stack {
     fn new(model: &CompiledModel, params: &ModelParameters, n_occ: usize) -> Self {
         let n_eta = model.n_eta;
         let n_kappa = if n_occ == 0 { 0 } else { model.n_kappa };
-        let d = n_eta + n_occ * n_kappa;
+        let d = stacked_width(n_eta, n_kappa, n_occ);
 
         let (omega_joint_inv, prior_sd) = match (&params.omega_iov, n_kappa) {
             (Some(iov), k) if k > 0 => {
@@ -416,7 +417,7 @@ impl Stack {
 
     /// Dimension of the integration variable.
     fn d(&self) -> usize {
-        self.n_eta + self.n_occ * self.n_kappa
+        stacked_width(self.n_eta, self.n_kappa, self.n_occ)
     }
 
     fn is_iov(&self) -> bool {
@@ -426,10 +427,7 @@ impl Stack {
     fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<&'a [f64]>) {
         let eta = &b[..self.n_eta];
         let kappas = (0..self.n_occ)
-            .map(|k| {
-                let s = self.n_eta + k * self.n_kappa;
-                &b[s..s + self.n_kappa]
-            })
+            .map(|k| &b[kappa_range(self.n_eta, self.n_kappa, k)])
             .collect();
         (eta, kappas)
     }
@@ -517,8 +515,7 @@ impl Stack {
         if self.n_occ <= INLINE_OCCASIONS && !force_legacy {
             let kappas: [&[f64]; INLINE_OCCASIONS] = std::array::from_fn(|k| {
                 if k < self.n_occ {
-                    let s = self.n_eta + k * self.n_kappa;
-                    &b[s..s + self.n_kappa]
+                    &b[kappa_range(self.n_eta, self.n_kappa, k)]
                 } else {
                     &[]
                 }
@@ -1135,7 +1132,7 @@ pub(crate) fn subject_grid_and_weights(
     weights: &[f64],
 ) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
     let n_occ = if model.n_kappa > 0 {
-        crate::stats::likelihood::iov_occasion_groups(subject).len()
+        crate::stats::stacked_layout::group_count(subject)
     } else {
         0
     };

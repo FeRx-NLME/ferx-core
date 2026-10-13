@@ -34,6 +34,7 @@ use super::sens_outer_gradient::{mixed_eta_theta, subject_natural_gradient, Poin
 use crate::estimation::parameterization::{theta_packs_log, unpack_params};
 use crate::estimation::sens_outer_gradient::prepare;
 use crate::sens::provider::{subject_sensitivities_cov, SubjectSens};
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -475,20 +476,16 @@ fn iov_stack(
     }
     let iov = params.omega_iov.as_ref()?;
     let (ne, nk) = (model.n_eta, model.n_kappa);
-    let occasions = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    let d = ne + occasions * nk;
+    let occasions = crate::stats::stacked_layout::group_count(subject);
+    let d = stacked_width(ne, nk, occasions);
     if b.len() != d || iov.dim() != nk || params.omega.dim() != ne {
         return None;
     }
-    let mut matrix = DMatrix::zeros(d, d);
-    matrix
-        .view_mut((0, 0), (ne, ne))
-        .copy_from(&params.omega.matrix);
-    for k in 0..occasions {
-        matrix
-            .view_mut((ne + k * nk, ne + k * nk), (nk, nk))
-            .copy_from(&iov.matrix);
-    }
+    let matrix = crate::stats::stacked_layout::block_diag_stack(
+        &params.omega.matrix,
+        &iov.matrix,
+        occasions,
+    );
     let inv = crate::estimation::importance_sampling::build_joint_omega_inv(
         &params.omega.inv,
         &iov.inv,
@@ -503,7 +500,7 @@ fn iov_stack(
     for (r, c) in omega_entries(iov.diagonal, nk) {
         let mut e = DMatrix::zeros(d, d);
         for k in 0..occasions {
-            let off = ne + k * nk;
+            let off = kappa_offset(ne, nk, k);
             e[(off + r, off + c)] = 1.0;
             e[(off + c, off + r)] = 1.0;
         }

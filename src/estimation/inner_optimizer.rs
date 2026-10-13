@@ -1,10 +1,10 @@
 use crate::pk;
 use crate::stats::likelihood::{
     individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen,
-    iov_occasion_groups,
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
+use crate::stats::stacked_layout::{kappa_offset, kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
@@ -197,8 +197,8 @@ fn iov_inner_subject_route(
     {
         return None;
     }
-    let k_occasions = iov_occasion_groups(subject).len();
-    let n_flat = model.n_eta + k_occasions * model.n_kappa;
+    let k_occasions = crate::stats::stacked_layout::group_count(subject);
+    let n_flat = stacked_width(model.n_eta, model.n_kappa, k_occasions);
     let stacked = vec![0.0; n_flat];
     crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
 }
@@ -281,11 +281,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if eff.ss_absorption_out_of_scope(subject) {
             return "steady-state dose + built-in absorption forcing";
         }
-        let occ_groups = iov_occasion_groups(subject);
-        if occ_groups.is_empty() {
+        let layout = crate::stats::stacked_layout::StackedLayout::of(eff, subject);
+        if layout.n_groups() == 0 {
             return "no observation occasions";
         }
-        let n_stacked = eff.n_eta + occ_groups.len() * eff.n_kappa;
+        let n_stacked = layout.n_stacked();
         let m_dim = eff.n_theta + n_stacked;
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
@@ -2087,10 +2087,9 @@ fn find_ebe_iov(
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
 
-    let occ_groups = iov_occasion_groups(subject);
-    let k_occasions = occ_groups.len();
+    let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
-    let n_flat = n_eta + k_occasions * n_kappa;
+    let n_flat = stacked_width(n_eta, n_kappa, k_occasions);
 
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
@@ -2124,7 +2123,7 @@ fn find_ebe_iov(
             .map(|(pi, mi)| pi - mi)
             .collect();
         let kappas: Vec<Vec<f64>> = (0..k_occasions)
-            .map(|k| p[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa].to_vec())
+            .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
             .collect();
         individual_nll_iov_frozen(
             model,
@@ -2231,7 +2230,7 @@ fn find_ebe_iov(
             .map(|(p, m)| p - m)
             .collect();
         let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-            .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
+            .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
             .collect();
         // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
         // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
@@ -2320,7 +2319,7 @@ fn find_ebe_iov(
         .map(|(p, m)| p - m)
         .collect();
     let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
+        .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
         .collect();
 
     // H-matrix: BSV columns only (∂f/∂η_bsv with κ fixed at the EBE). The BSV block of
@@ -3530,7 +3529,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
     let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
-    let n_stacked = n_eta + k_occasions * n_kappa;
+    let n_stacked = stacked_width(n_eta, n_kappa, k_occasions);
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),
     // so `v`/`dv_df` carry that factor and the `η_ruv` column gets the variance term
@@ -3600,7 +3599,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
         *g += prior_bsv[k];
     }
     for occ in 0..k_occasions {
-        let base = n_eta + occ * n_kappa;
+        let base = kappa_offset(n_eta, n_kappa, occ);
         let kappa_g = DVector::from_column_slice(&stacked_true[base..base + n_kappa]);
         let prior_kg = &omega_iov.inv * &kappa_g;
         for c in 0..n_kappa {
@@ -4372,7 +4371,7 @@ fn iov_prior_maha(
     let mut q = ebe_prior_maha(&bsv, &params.omega);
     if let Some(oi) = params.omega_iov.as_ref() {
         for k in 0..k_occasions {
-            q += ebe_prior_maha(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa], oi);
+            q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
         }
     }
     q

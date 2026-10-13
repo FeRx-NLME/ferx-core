@@ -305,13 +305,9 @@ pub(crate) fn effective_model_for_eval_iov<'a>(
         return model.effective_for(subject);
     }
     let n_eta = model.n_eta.min(stacked_eta.len());
-    let kappas: Vec<&[f64]> = if model.n_kappa == 0 {
-        Vec::new()
-    } else {
-        stacked_eta[n_eta..].chunks(model.n_kappa).collect()
-    };
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let combined_for = iov_occasion_eta(&occ_groups, &stacked_eta[..n_eta], &kappas, model.n_kappa);
+    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    let kappas = layout.kappa_chunks(stacked_eta);
+    let combined_for = iov_occasion_eta(&layout, &stacked_eta[..n_eta], &kappas);
     let mut ev = EventPkParams::default();
     fill_iov_record_params(
         model,
@@ -346,21 +342,16 @@ fn absorption_walk_or_twin<'a>(
 /// ([`crate::stats::likelihood::iov_occasion_groups`] order), `κ = 0` for an occasion
 /// with no group — an occasion-less caller asks for `u32::MAX` and gets that.
 fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &'a crate::stats::stacked_layout::StackedLayout,
     eta_bsv: &'a [f64],
     kappas: &'a [K],
-    n_kappa: usize,
 ) -> impl Fn(u32) -> Vec<f64> + 'a {
-    let occ_to_k: std::collections::HashMap<u32, usize> = occ_groups
-        .iter()
-        .enumerate()
-        .map(|(k, (occ_id, _))| (*occ_id, k))
-        .collect();
+    let n_kappa = layout.n_kappa();
     move |occ_id: u32| -> Vec<f64> {
         let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
         c.extend_from_slice(eta_bsv);
-        match occ_to_k.get(&occ_id) {
-            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
+        match layout.group_of(occ_id) {
+            Some(k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
             _ => c.extend(std::iter::repeat_n(0.0, n_kappa)),
         }
         c
@@ -1521,8 +1512,8 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let combined_for = iov_occasion_eta(&occ_groups, eta_bsv, kappas, n_kappa);
+    let layout = crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), n_kappa, subject);
+    let combined_for = iov_occasion_eta(&layout, eta_bsv, kappas);
 
     // Exact initial reservations preserve the convenience API's old footprint
     // for short vectors; later probes keep these capacities without allocating.
@@ -1705,7 +1696,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             // loops) with a bit-identical result (#723 review / efficiency
             // follow-up, #769).
             let raw = preds.clone();
-            for (occ_id, obs_indices) in &occ_groups {
+            for (occ_id, obs_indices) in layout.groups() {
                 // Dose-only occasions own no observations, so their scaling pass
                 // would write nothing — skip the redundant full `apply_scaling`
                 // (+ clone) rather than compute and discard it.
@@ -1746,7 +1737,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
         // observation is labelled. Unlabelled subjects fall through to the shared
         // κ = 0 call below, which is what the non-IOV path does too.
         let raw = preds.clone();
-        for (occ_id, obs_indices) in &occ_groups {
+        for (occ_id, obs_indices) in layout.groups() {
             if obs_indices.is_empty() {
                 continue;
             }

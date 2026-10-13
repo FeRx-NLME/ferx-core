@@ -855,8 +855,8 @@ fn emit_subject_rows<R: rand::Rng>(
         // exact order `predict_iov` indexes its `kappas` argument by. Empty when
         // the subject carries no occasion labels, in which case `predict_iov`
         // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
-        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+        let n_groups = crate::stats::stacked_layout::group_count(subject);
+        let kappas: Vec<Vec<f64>> = (0..n_groups)
             .map(|_| {
                 let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
                 (&omega_iov.chol * DVector::from_column_slice(&z))

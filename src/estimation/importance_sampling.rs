@@ -24,8 +24,9 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{iov_occasion_groups, m3_logcdf, obs_nll_subject_into};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into};
 use crate::stats::special::ln_gamma;
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
     ess_from_weights, log_sum_exp2 as logsumexp2,
     log_sum_exp_normalised as logsumexp_with_normalised,
@@ -166,7 +167,7 @@ pub fn run_importance_sampling(
             if kap_len == 0 {
                 continue;
             }
-            let n_occ = iov_occasion_groups(subject).len();
+            let n_occ = crate::stats::stacked_layout::group_count(subject);
             if kap_len != n_occ {
                 return Err(format!(
                     "IS: subject {} has {} κ occasion block(s) but {} observation \
@@ -276,10 +277,9 @@ pub fn run_importance_sampling(
                 let log_det_omega_iov = log_det_omega_iov
                     .expect("omega_iov present for IOV model (checked in run_importance_sampling)");
 
-                let occ_groups = iov_occasion_groups(subject);
-                let n_occ = occ_groups.len();
+                let n_occ = crate::stats::stacked_layout::group_count(subject);
                 let n_iov = model.n_kappa;
-                let n_b = n_eta + n_occ * n_iov;
+                let n_b = stacked_width(n_eta, n_iov, n_occ);
 
                 // Joint prior precision (block-diagonal: Ω_bsv⁻¹ plus one Ω_iov⁻¹
                 // block per occasion). Built once and shared by the Hessian
@@ -311,7 +311,7 @@ pub fn run_importance_sampling(
                 }
                 for (k, kappa_occ) in kap.iter().enumerate() {
                     for ki in 0..n_iov {
-                        mode_joint[n_eta + k * n_iov + ki] = kappa_occ[ki];
+                        mode_joint[kappa_offset(n_eta, n_iov, k) + ki] = kappa_occ[ki];
                     }
                 }
 
@@ -1694,7 +1694,7 @@ fn compute_joint_posterior_hessian(
     _scratch: &mut EventPkParams,
 ) -> DMatrix<f64> {
     let n_obs = subject.observations.len();
-    let n_b = n_eta + n_occ * n_iov;
+    let n_b = stacked_width(n_eta, n_iov, n_occ);
 
     if n_obs == 0 {
         // No observations: posterior = prior
@@ -1747,7 +1747,7 @@ fn compute_joint_posterior_hessian(
     let mut kap_perturbed: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
 
     for k in 0..n_occ {
-        let col_base = n_eta + k * n_iov;
+        let col_base = kappa_offset(n_eta, n_iov, k);
         for ki in 0..n_iov {
             let orig = kap_perturbed[k][ki];
             let step = EPS * (1.0 + orig.abs());
@@ -1800,27 +1800,8 @@ pub(crate) fn build_joint_omega_inv(
     n_iov: usize,
     n_occ: usize,
 ) -> DMatrix<f64> {
-    let n_b = n_eta + n_occ * n_iov;
-    let mut m = DMatrix::zeros(n_b, n_b);
-
-    // BSV block
-    for i in 0..n_eta {
-        for j in 0..n_eta {
-            m[(i, j)] = omega_inv[(i, j)];
-        }
-    }
-
-    // K copies of IOV block
-    for k in 0..n_occ {
-        let offset = n_eta + k * n_iov;
-        for i in 0..n_iov {
-            for j in 0..n_iov {
-                m[(offset + i, offset + j)] = omega_iov_inv[(i, j)];
-            }
-        }
-    }
-
-    m
+    debug_assert_eq!((omega_inv.nrows(), omega_iov_inv.nrows()), (n_eta, n_iov));
+    crate::stats::stacked_layout::block_diag_stack(omega_inv, omega_iov_inv, n_occ)
 }
 
 /// Joint (eta, kappa) IS estimate for IOV models.
@@ -1893,7 +1874,7 @@ fn subject_is_estimate_joint(
         // Split into eta and kappa parts (κ buffer reused across draws).
         let eta_sample = &sample_joint[..n_eta];
         for (k, kappa_occ) in kappas_sampled.iter_mut().enumerate() {
-            let start = n_eta + k * n_iov;
+            let start = kappa_offset(n_eta, n_iov, k);
             kappa_occ.copy_from_slice(&sample_joint[start..start + n_iov]);
         }
 

@@ -2738,7 +2738,7 @@ fn run_subject_tvcov<const M: usize>(
 fn ode_iov_subject_supported(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<(Vec<(u32, Vec<usize>)>, usize, usize)> {
+) -> Option<(crate::stats::stacked_layout::StackedLayout, usize)> {
     if !ode_iov_supported(model) {
         return None;
     }
@@ -2811,12 +2811,11 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let k_groups = occ_groups.len();
-    if k_groups == 0 {
+    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    if layout.n_groups() == 0 {
         return None;
     }
-    let n_stacked = model.n_eta + k_groups * model.n_kappa;
+    let n_stacked = layout.n_stacked();
     // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
     // since `K` is per subject) so an extremely many-occasion subject routes to FD rather
     // than a silent `_ => None` downgrade.
@@ -2824,7 +2823,7 @@ fn ode_iov_subject_supported(
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
-    Some((occ_groups, n_stacked, m_dim))
+    Some((layout, m_dim))
 }
 
 /// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
@@ -2843,8 +2842,8 @@ pub fn ode_subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let (occ_groups, n_stacked, m_dim) = ode_iov_subject_supported(model, subject)?;
-    if stacked_eta.len() != n_stacked {
+    let (layout, m_dim) = ode_iov_subject_supported(model, subject)?;
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     dispatch_ode_iov_axes!(
@@ -2854,7 +2853,7 @@ pub fn ode_subject_sensitivities_iov(
         subject,
         theta,
         stacked_eta,
-        &occ_groups,
+        &layout,
     )
 }
 
@@ -2870,7 +2869,8 @@ pub fn ode_subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let (occ_groups, n_stacked, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let n_stacked = layout.n_stacked();
     if stacked_eta.len() != n_stacked {
         return None;
     }
@@ -2881,7 +2881,7 @@ pub fn ode_subject_eta_grad_iov(
         subject,
         theta,
         stacked_eta,
-        &occ_groups,
+        &layout,
     )
 }
 
@@ -2904,7 +2904,8 @@ fn seed_pk_dual2_iov<const M: usize>(
     n_theta: usize,
 ) -> Vec<Dual2<M>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+    let kappa_base =
+        group.map(|g| n_theta + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(n_theta + c)
@@ -3005,7 +3006,7 @@ fn run_subject_iov<const M: usize>(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<SubjectSens> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
@@ -3013,13 +3014,12 @@ fn run_subject_iov<const M: usize>(
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
-    let k_groups = occ_groups.len();
-    let n_stacked = n_eta + k_groups * n_kappa;
+    let k_groups = layout.n_groups();
+    let n_stacked = layout.n_stacked();
     let cov = &subject.covariates;
 
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
-    let combined_for =
-        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
+    let occ_to_k = layout.occ_to_group();
+    let combined_for = |g: usize| layout.combined_effect(stacked_eta, g);
 
     // Seed an occasion group's stacked PK duals at a covariate snapshot. `n_rows`
     // matches the program eval's `model.pk_indices`-parallel rows (the convention
@@ -3060,8 +3060,7 @@ fn run_subject_iov<const M: usize>(
                             time: f64|
      -> Option<Vec<Dual2<M>>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let combined_pk_only =
-            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let combined_pk_only = layout.combined_pk_only(stacked_eta);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
@@ -3337,7 +3336,7 @@ fn seed_pk_dual1_iov<const N: usize>(
     n_kappa: usize,
 ) -> Vec<Dual1<N>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| n_eta + g * n_kappa);
+    let kappa_base = group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(c)
@@ -3370,7 +3369,7 @@ fn run_subject_iov_eta<const N: usize>(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<Vec<ObsGrad>> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
@@ -3378,13 +3377,12 @@ fn run_subject_iov_eta<const N: usize>(
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
-    let k_groups = occ_groups.len();
-    let n_stacked = n_eta + k_groups * n_kappa;
+    let k_groups = layout.n_groups();
+    let n_stacked = layout.n_stacked();
     let cov = &subject.covariates;
 
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
-    let combined_for =
-        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
+    let occ_to_k = layout.occ_to_group();
+    let combined_for = |g: usize| layout.combined_effect(stacked_eta, g);
 
     // Per-event `TIME` seeding — the inner counterpart of the outer `run_subject_iov`
     // (#486). Same thread-local guard + per-event forcing.
@@ -3415,8 +3413,7 @@ fn run_subject_iov_eta<const N: usize>(
                             time: f64|
      -> Option<Vec<Dual1<N>>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let combined_pk_only =
-            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let combined_pk_only = layout.combined_pk_only(stacked_eta);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
