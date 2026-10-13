@@ -145,6 +145,43 @@ All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
 
+#### The `s` and `rsr` estimators
+
+`covariance_method = s` (`S⁻¹`) and `rsr` (`R⁻¹SR⁻¹`) need a per-subject score
+$g_i = \partial(-\log L_i)/\partial x$, and under a mixture that is the score of the
+**mixture marginal** $L_i = \sum_k p_{ik} L_{ik}$:
+
+$$
+g_i = \sum_k w_{ik}\left(\frac{\partial\, \mathrm{nll}_{ik}}{\partial x} - \frac{\partial \ln p_{ik}}{\partial x}\right),
+\qquad w_{ik} = \frac{p_{ik} L_{ik}}{\sum_j p_{ij} L_{ij}},
+$$
+
+where $w_{ik}$ is the subject's posterior class probability (the `PMIX` column) and
+each class's $\partial\,\mathrm{nll}_{ik}/\partial x$ is the ordinary FOCE/FOCEI
+subject score taken under that class — its typical values, its Ω/Σ overrides, and
+its own η̂ (and κ̂ under IOV). As for a single-population fit, η̂ is held at its
+value at the estimates (a fixed-mode score), so every class-specific θ and every
+mixing coefficient gets its own non-zero score column.
+
+Before #1956 the mixture score was taken from the single-population objective
+under class 1 only. The class-2 θ and the mixing-fraction columns of `S` were then
+exactly zero, so `s` was refused as singular and `rsr` reported wrong SEs for
+every parameter. At the NONMEM finals of `tests/nonmem/mixture_iv_cov.ctl`
+(evaluation-only, measured on macOS arm64), ferx now reports:
+
+| SE | `r` | `s` | `rsr` |
+|---|---|---|---|
+| `TVCL1` | 0.1058 | 0.1340 | 0.0874 |
+| `TVCL2` | 0.2543 | 0.2521 | 0.3044 |
+| `V` | 0.1861 | 0.2119 | 0.1704 |
+| `p(1)` | 0.1026 | 0.1226 | 0.1142 |
+
+The `r` column matches NONMEM's `MATRIX=R` to 0.15 %. The `MATRIX=S` and default
+`$COVARIANCE` reference runs for `s` and `rsr`
+(`tests/nonmem/mixture_iv_cov_{s,rsr}.ctl`) are pending, and
+`tests/mixture_cov_s_nonmem.rs` anchors against them once their output is
+committed.
+
 ## Inter-occasion variability under a mixture
 
 A mixture may carry inter-occasion variability (a `kappa` on a structural
