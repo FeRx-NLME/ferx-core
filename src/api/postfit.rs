@@ -931,39 +931,81 @@ pub(crate) fn kappa_weight_typicals(
         .collect()
 }
 
-/// Kappa shrinkage pooled across all subject-occasion pairs.
+/// The informed κ̂ vectors of `kappas_per_subject`: each subject's groups filtered by
+/// `informed` (parallel per subject, from `iov_group_informed`), with the group's
+/// position in that subject's own list kept. A group with no mask entry is kept.
+fn informed_kappas<'a>(
+    kappas_per_subject: &'a [Vec<DVector<f64>>],
+    informed: &'a [Vec<bool>],
+) -> impl Iterator<Item = (usize, &'a DVector<f64>)> + 'a {
+    kappas_per_subject
+        .iter()
+        .enumerate()
+        .flat_map(move |(i, occ_kappas)| {
+            let mask = informed.get(i);
+            occ_kappas
+                .iter()
+                .enumerate()
+                .filter(move |(g, _)| mask.and_then(|m| m.get(*g)).copied().unwrap_or(true))
+        })
+}
+
+/// `1 - sqrt(mean(κ̂²)) / sqrt(var)` over `kappas` for kappa `k`; NaN when `var` is
+/// non-positive or fewer than two vectors are pooled.
+fn kappa_shrinkage_over(kappas: &[&DVector<f64>], var: f64, k: usize) -> f64 {
+    let n = kappas.len();
+    if var <= 0.0 || n < 2 {
+        return f64::NAN;
+    }
+    let ms = kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+    1.0 - ms.sqrt() / var.sqrt()
+}
+
+/// Kappa shrinkage pooled across the informed subject-occasion pairs.
 ///
 /// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
-/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
-/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
-/// two (subject, occasion) observations are available.
+/// runs over every (subject, occasion group) pair that `informed` marks — a group no
+/// observation can read has κ̂ = 0 (the prior mode) and would push the shrinkage up
+/// while leaving the objective unchanged (#1911). A subject with no informed group
+/// contributes nothing. Returns NaN for a given kappa when the corresponding diagonal
+/// of `omega_iov` is non-positive or when fewer than two informed pairs remain.
 pub(crate) fn compute_kappa_shrinkage(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<f64> {
     let n_kappa = omega_iov.nrows();
     if n_kappa == 0 {
         return vec![];
     }
-    // Flatten all per-subject per-occasion kappa vectors into one iterator.
-    let all_kappas: Vec<&DVector<f64>> = kappas_per_subject
-        .iter()
-        .flat_map(|occ_kappas| occ_kappas.iter())
+    let all_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+        .map(|(_, kv)| kv)
         .collect();
-    let n = all_kappas.len();
-    if n < 2 {
-        return vec![f64::NAN; n_kappa];
-    }
     (0..n_kappa)
-        .map(|k| {
-            let var = omega_iov[(k, k)];
-            if var <= 0.0 {
-                return f64::NAN;
-            }
-            let ms = all_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-            1.0 - ms.sqrt() / var.sqrt()
-        })
+        .map(|k| kappa_shrinkage_over(&all_kappas, omega_iov[(k, k)], k))
         .collect()
+}
+
+/// `(shrinkage_kappa, shrinkage_kappa_by_occ)` of a fit over `population`: both pooled
+/// over the groups `iov_group_informed` marks, so the console, `format_summary`, the
+/// fit YAML and `FitResult` all read one informed rule (#1911). A compartment-free
+/// `model` carries no state between records, so there only a group's own observations
+/// inform it.
+pub(crate) fn kappa_shrinkages(
+    model: &CompiledModel,
+    population: &Population,
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let informed: Vec<Vec<bool>> = population
+        .subjects
+        .iter()
+        .map(|s| crate::stats::likelihood::iov_group_informed(s, !model.is_algebraic()))
+        .collect();
+    (
+        compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
+        compute_kappa_shrinkage_by_occ(kappas_per_subject, &informed, omega_iov),
+    )
 }
 
 /// Kappa shrinkage broken out by occasion index.
@@ -971,7 +1013,9 @@ pub(crate) fn compute_kappa_shrinkage(
 /// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
 /// **0-based position within each subject's own occasion list** — i.e. the
 /// order in which distinct OCC values were first encountered in that subject's
-/// rows (matching `split_obs_by_occasion`).
+/// rows (matching `split_obs_by_occasion`). Only the groups `informed` marks enter a
+/// slot, as for [`compute_kappa_shrinkage`]; a slot with fewer than two informed pairs
+/// is NaN.
 ///
 /// **Important limitation for unbalanced designs:** `occ_idx` is a position
 /// index, *not* the raw OCC column value.  When subjects have different OCC
@@ -986,6 +1030,7 @@ pub(crate) fn compute_kappa_shrinkage(
 /// or no kappa parameters exist.
 pub(crate) fn compute_kappa_shrinkage_by_occ(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<Vec<f64>> {
     let n_kappa = omega_iov.nrows();
@@ -1003,20 +1048,12 @@ pub(crate) fn compute_kappa_shrinkage_by_occ(
     }
     (0..n_occ)
         .map(|occ_idx| {
-            let occ_kappas: Vec<&DVector<f64>> = kappas_per_subject
-                .iter()
-                .filter_map(|occ_vecs| occ_vecs.get(occ_idx))
+            let occ_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+                .filter(|(g, _)| *g == occ_idx)
+                .map(|(_, kv)| kv)
                 .collect();
-            let n = occ_kappas.len();
             (0..n_kappa)
-                .map(|k| {
-                    let var = omega_iov[(k, k)];
-                    if var <= 0.0 || n < 2 {
-                        return f64::NAN;
-                    }
-                    let ms = occ_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-                    1.0 - ms.sqrt() / var.sqrt()
-                })
+                .map(|k| kappa_shrinkage_over(&occ_kappas, omega_iov[(k, k)], k))
                 .collect()
         })
         .collect()

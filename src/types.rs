@@ -7052,8 +7052,9 @@ pub struct FitResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kappa_weight_typical: Vec<Option<f64>>,
     pub se_kappa: Option<Vec<f64>>,
-    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over all
-    /// subject-occasion pairs.  Empty when `n_kappa == 0`.
+    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over the
+    /// subject-occasion pairs an observation informs — an occasion group no observation
+    /// can read (κ̂ = 0, the prior mode) is left out (#1911). Empty when `n_kappa == 0`.
     pub shrinkage_kappa: Vec<f64>,
     /// Per-occasion kappa shrinkage: `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`.
     /// `occ_idx` is the 0-based position within each subject's own occasion list
@@ -7061,6 +7062,7 @@ pub struct FitResult {
     /// **not** the raw OCC column value.  For unbalanced designs where subjects
     /// have different OCC sequences, a given `occ_idx` may map to different OCC
     /// values across subjects — use `shrinkage_kappa` (pooled) in that case.
+    /// Only informed groups enter a slot; one fewer than two subjects inform is `NaN`.
     /// Empty when `n_kappa == 0` or only one occasion is present.
     pub shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     /// Per-subject, per-occasion kappa EBEs.

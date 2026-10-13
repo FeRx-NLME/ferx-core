@@ -3015,6 +3015,57 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     groups
 }
 
+/// Whether any scored observation can read each [`iov_occasion_groups`] entry's κ,
+/// parallel to that list (#1911).
+///
+/// A group that owns an observation is informed. A group with none — a dose-only
+/// occasion, or one only pk-only rows carry — can reach a prediction only through
+/// state carried forward in time, so:
+///
+/// - with `carries_state = false` (a compartment-free, `$PRED`-style model, whose every
+///   prediction reads its own record's parameters alone) it is never informed — the MBMA
+///   arm-visit reported only as an `MDV = 1` row;
+/// - otherwise it acts from its first record onward (a dose's carryover; the interval a
+///   pk-only row closes), so it is informed exactly when some observation sits at or
+///   after that record's time.
+///
+/// An uninformed group's κ̂ is the prior mode 0 and it leaves the objective unchanged.
+/// The time rule is conservative at a tie (an observation at the record's own time
+/// counts), so it only ever drops groups the data cannot see.
+pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<bool> {
+    let records = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .zip(&subject.dose_occasions)
+        .chain(
+            subject
+                .pk_only_times
+                .iter()
+                .copied()
+                .zip(&subject.pk_only_occasions),
+        );
+    iov_occasion_groups(subject)
+        .into_iter()
+        .map(|(occ, obs_idx)| {
+            if !obs_idx.is_empty() {
+                return true;
+            }
+            if !carries_state {
+                return false;
+            }
+            let first = records
+                .clone()
+                .filter(|&(_, &o)| o == occ)
+                .map(|(t, _)| t)
+                .fold(f64::INFINITY, f64::min);
+            // No record found (cannot happen for a group built from one) or a non-finite
+            // time: keep it, the historical behaviour.
+            !first.is_finite() || subject.obs_times.iter().any(|&t| t >= first)
+        })
+        .collect()
+}
+
 /// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
 /// returns). Shared by the closed-form (`build_iov_sources`) and ODE (`run_subject_iov` /
 /// `run_subject_iov_eta`) IOV providers so the occasion→group mapping is defined once
@@ -3827,6 +3878,50 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 6, 5]);
         assert_eq!(groups[3], (6, Vec::new()));
         assert_eq!(groups[4], (5, Vec::new()));
+    }
+
+    /// #1911: a group without observations is informed iff an observation sits at or
+    /// after its first record. Observations run t = 1..6. Groups: OCC 1, 2 (own obs);
+    /// 3 dose-only at t = 2 (carryover reaches t = 3..6 → informed); 4 dose-only at
+    /// t = 10 (after every obs → not); 5 pk-only at t = 6 (tie with the last obs → kept,
+    /// the conservative side); 6 pk-only at t = 8 and 12 (first record after the obs →
+    /// not); 7 dose at t = 9 then pk-only at t = 1 (the EARLIEST record across both
+    /// kinds decides → informed). OCC 2 also gets a dose at t = 50, after its own
+    /// observations: a group that owns an observation is informed whatever its records'
+    /// times. Under `carries_state = false` only the two observation groups remain.
+    #[test]
+    fn test_iov_group_informed_by_first_record_time() {
+        let mut subj = make_simple_subject();
+        subj.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(9.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(50.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subj.dose_occasions = vec![1, 3, 4, 7, 2];
+        subj.pk_only_times = vec![6.0, 12.0, 8.0, 1.0];
+        subj.pk_only_occasions = vec![5, 6, 6, 7];
+        let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 7, 5, 6]);
+        assert_eq!(
+            iov_group_informed(&subj, true),
+            vec![true, true, true, false, true, true, false]
+        );
+        assert_eq!(
+            iov_group_informed(&subj, false),
+            vec![true, true, false, false, false, false, false]
+        );
+    }
+
+    /// Without dose-only or pk-only groups every group owns an observation, so the mask
+    /// is all-true and the shrinkage is the historical one (the #1911 control).
+    #[test]
+    fn test_iov_group_informed_all_true_for_observation_groups() {
+        let subj = make_simple_subject();
+        for carries_state in [true, false] {
+            assert_eq!(iov_group_informed(&subj, carries_state), vec![true, true]);
+        }
     }
 
     #[test]

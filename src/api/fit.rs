@@ -2737,10 +2737,7 @@ fn fit_inner(
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
     let (shrinkage_kappa, shrinkage_kappa_by_occ) =
         if let Some(ref omega_iov) = result.params.omega_iov {
-            (
-                compute_kappa_shrinkage(&result.kappas, &omega_iov.matrix),
-                compute_kappa_shrinkage_by_occ(&result.kappas, &omega_iov.matrix),
-            )
+            kappa_shrinkages(model, population, &result.kappas, &omega_iov.matrix)
         } else {
             (Vec::new(), Vec::new())
         };
