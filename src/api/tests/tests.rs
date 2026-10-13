@@ -824,23 +824,48 @@ fn test_kappa_shrinkage_subject_with_no_informed_group_excluded() {
 /// a slot where fewer than two subjects are informed is NaN — the issue's
 /// `[[0.912], [1.0]]` (second slot a pk-only-only occasion after every observation)
 /// reads `[[…], [NaN]]`.
+///
+/// Slot 3 is informed **after** the uninformed slot 2 — the reachable order
+/// `[obs, obs, dose after the last obs, mid-course pk-only row]`, since groups run
+/// observed → dose-only → pk-only. A filtered group keeps its position: slot 3 holds
+/// the subjects' slot-3 κ̂ and slot 2 stays NaN. Renumbering after the filter would
+/// shift those κ̂ into slot 2 (#1958 review r1 #1).
 #[test]
 fn test_kappa_shrinkage_by_occ_skips_uninformed_group() {
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
     let kappas = make_kappas(vec![
-        vec![0.6, 0.5, 0.0],
-        vec![-0.4, -0.3, 0.0],
-        vec![0.5, 0.0, 0.0],
+        vec![0.6, 0.5, 0.0, 0.7],
+        vec![-0.4, -0.3, 0.0, -0.2],
+        vec![0.5, 0.0, 0.0, 0.0],
     ]);
     let mask = vec![
-        vec![true, true, false],
-        vec![true, true, false],
-        vec![true, false, false],
+        vec![true, true, false, true],
+        vec![true, true, false, true],
+        vec![true, false, false, false],
     ];
     let sh = compute_kappa_shrinkage_by_occ(&kappas, &mask, &omega);
-    let slot1 = compute_kappa_shrinkage(&make_kappas(vec![vec![0.5], vec![-0.3]]), &[], &omega);
-    assert_eq!(sh[1][0].to_bits(), slot1[0].to_bits(), "{sh:?}");
-    assert!(sh[2][0].is_nan(), "{sh:?}");
+    assert_eq!(sh.len(), 4, "{sh:?}");
+    let alone = |v: Vec<f64>| {
+        compute_kappa_shrinkage(
+            &make_kappas(v.into_iter().map(|x| vec![x]).collect()),
+            &[],
+            &omega,
+        )[0]
+    };
+    assert_eq!(
+        sh[1][0].to_bits(),
+        alone(vec![0.5, -0.3]).to_bits(),
+        "{sh:?}"
+    );
+    assert!(
+        sh[2][0].is_nan(),
+        "uninformed slot 2 must stay empty: {sh:?}"
+    );
+    assert_eq!(
+        sh[3][0].to_bits(),
+        alone(vec![0.7, -0.2]).to_bits(),
+        "{sh:?}"
+    );
     // Slot 0 is all informed: unchanged.
     let unmasked = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
     assert_eq!(sh[0][0].to_bits(), unmasked[0][0].to_bits());

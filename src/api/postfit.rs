@@ -988,7 +988,7 @@ pub(crate) fn compute_kappa_shrinkage(
 
 /// `(shrinkage_kappa, shrinkage_kappa_by_occ)` of a fit over `population`: both pooled
 /// over the groups `iov_group_informed` marks, so the console, `format_summary`, the
-/// fit YAML and `FitResult` all read one informed rule (#1911). A compartment-free
+/// `.fitrx` bundle and `FitResult` all read one informed rule (#1911). A compartment-free
 /// `model` carries no state between records, so there only a group's own observations
 /// inform it.
 pub(crate) fn kappa_shrinkages(
