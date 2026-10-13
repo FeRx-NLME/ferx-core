@@ -8319,6 +8319,70 @@ mod absorption {
         assert!(wrong.is_empty(), "not refused:\n{}", wrong.join("\n"));
     }
 
+    /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
+    /// a dense basis of every column spans: on three subjects, one-subject
+    /// columns, a column across two subjects and a θ-like column across all
+    /// three, the residual of every probe — inside the span, partly outside,
+    /// on one subject or across two — equals the dense basis's to 1e-12. Only
+    /// the two multi-subject columns become population-wide vectors; the rest
+    /// stay per subject.
+    ///
+    /// Mutations — a multi-subject column not projected against the per-subject
+    /// bases first (the dense part double-counts their directions: residuals
+    /// differ); a probe not projected against its subject's basis (residuals
+    /// differ); every column dense (the count of population-wide vectors
+    /// fails).
+    #[test]
+    fn the_block_basis_spans_what_a_dense_basis_spans() {
+        let lens = [2usize, 3, 2];
+        let offsets = [0usize, 2, 5];
+        let dense_of = |p: &Pieces| {
+            let mut v = vec![0.0; 7];
+            for (s, piece) in p {
+                v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(piece);
+            }
+            v
+        };
+        let cols: Vec<Pieces> = vec![
+            vec![(0, vec![1.0, 2.0])],
+            vec![(1, vec![1.0, 0.0, 1.0])],
+            vec![(1, vec![0.0, 1.0, 1.0])],
+            vec![(0, vec![0.5, -1.0]), (2, vec![1.0, 1.0])],
+            vec![
+                (0, vec![1.0, 1.0]),
+                (1, vec![1.0, 1.0, 1.0]),
+                (2, vec![1.0, -1.0]),
+            ],
+        ];
+        let basis = BlockBasis::new(&cols, &lens, &offsets);
+        assert_eq!(
+            basis.dense.len(),
+            2,
+            "only the multi-subject columns go dense"
+        );
+        let dense = orthonormal_basis(&cols.iter().map(dense_of).collect::<Vec<_>>());
+        let probes: Vec<Pieces> = vec![
+            vec![(0, vec![2.0, 4.0])],
+            vec![(1, vec![1.0, 1.0, 2.0])],
+            vec![(2, vec![1.0, 0.0])],
+            vec![(1, vec![0.3, -0.7, 0.2])],
+            vec![(0, vec![1.0, -1.0]), (2, vec![0.2, 0.9])],
+        ];
+        for z in &probes {
+            let mut r = dense_of(z);
+            let n = dot(&r, &r).sqrt();
+            project_out(&mut r, &dense);
+            let want = dot(&r, &r).sqrt() / n;
+            let got = basis.residual(z).unwrap();
+            assert!(
+                got.is_finite() && (got - want).abs() < 1e-12,
+                "{z:?}: {got} vs {want}"
+            );
+        }
+        assert!(basis.residual(&vec![(0, vec![2.0, 4.0])]).unwrap() < 1e-12);
+        assert!(basis.residual(&vec![(2, vec![1.0, 0.0])]).unwrap() > 1e-3);
+    }
+
     /// B4. The span residual on synthetic columns: a multiple of a column is in
     /// its span, to rounding; an orthogonal part shows as its relative size; a
     /// zero column measures nothing; a repeated column adds no direction; and a

@@ -2056,7 +2056,6 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// one pass loses the orthogonality the residual relies on. A zero or
 /// non-finite column, or one already in the span, adds no direction.
 fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for c in cols {
         let c_norm = dot(c, c).sqrt();
@@ -2064,12 +2063,7 @@ fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
             continue;
         }
         let mut v = c.clone();
-        for _ in 0..2 {
-            for b in &basis {
-                let d = dot(&v, b);
-                v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
-            }
-        }
+        project_out(&mut v, &basis);
         let n = dot(&v, &v).sqrt();
         if n > 1e-12 * c_norm {
             basis.push(v.into_iter().map(|x| x / n).collect());
@@ -2078,22 +2072,100 @@ fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
     basis
 }
 
-/// `‖g − P g‖ / ‖g‖` against an orthonormal `basis` ([`orthonormal_basis`]),
-/// projected twice for the same reason; `None` when `g` is zero.
-fn residual_against(g: &[f64], basis: &[Vec<f64>]) -> Option<f64> {
-    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-    let g_norm = dot(g, g).sqrt();
-    if g_norm == 0.0 {
-        return None;
-    }
-    let mut r = g.to_vec();
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// `v` minus its projection on the orthonormal `basis`, projected twice (one
+/// re-orthogonalisation pass, as [`orthonormal_basis`] builds it).
+fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
     for _ in 0..2 {
         for b in basis {
-            let d = dot(&r, b);
-            r.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            let d = dot(v, b);
+            v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
         }
     }
-    Some(dot(&r, &r).sqrt() / g_norm)
+}
+
+/// A population-wide column of [`carried`], as its nonzero per-subject
+/// pieces: `(subject, values on that subject's records)`. A level's, a
+/// unit's or a θ read by one subject alone is one piece.
+type Pieces = Vec<(usize, Vec<f64>)>;
+
+/// `a − b`, piece by piece; a subject in both keeps one piece.
+fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
+    let mut out = a.clone();
+    for (s, v) in b {
+        match out.iter_mut().find(|(t, _)| t == s) {
+            Some((_, w)) => w.iter_mut().zip(v).for_each(|(x, y)| *x -= y),
+            None => out.push((*s, v.iter().map(|y| -y).collect())),
+        }
+    }
+    out
+}
+
+/// An orthonormal basis of the span of [`Pieces`] columns that keeps their
+/// subject structure (#1961 review, F1): columns on one subject's records are
+/// orthonormalised per subject — they are orthogonal across subjects for free
+/// — and only the columns spanning several subjects (a θ read on every
+/// record, sum-to-zero's difference against another subject's level) become
+/// population-wide vectors, orthogonalised against those per-subject bases
+/// first. The span is the one a dense basis of every column would have; the
+/// cost is in the population-wide columns alone.
+struct BlockBasis {
+    /// Per subject, the orthonormal basis of its one-subject columns.
+    local: Vec<Vec<Vec<f64>>>,
+    /// The orthonormal population-wide part.
+    dense: Vec<Vec<f64>>,
+    offsets: Vec<usize>,
+    n_rows: usize,
+}
+
+impl BlockBasis {
+    fn new(cols: &[Pieces], lens: &[usize], offsets: &[usize]) -> Self {
+        let n_rows: usize = lens.iter().sum();
+        let mut singles: Vec<Vec<Vec<f64>>> = vec![Vec::new(); lens.len()];
+        for col in cols.iter().filter(|c| c.len() == 1) {
+            singles[col[0].0].push(col[0].1.clone());
+        }
+        let local: Vec<Vec<Vec<f64>>> = singles.iter().map(|c| orthonormal_basis(c)).collect();
+        let multis: Vec<Vec<f64>> = cols
+            .iter()
+            .filter(|c| c.len() > 1)
+            .map(|col| {
+                let mut v = vec![0.0; n_rows];
+                for (s, piece) in col {
+                    let mut piece = piece.clone();
+                    project_out(&mut piece, &local[*s]);
+                    v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(&piece);
+                }
+                v
+            })
+            .collect();
+        BlockBasis {
+            local,
+            dense: orthonormal_basis(&multis),
+            offsets: offsets.to_vec(),
+            n_rows,
+        }
+    }
+
+    /// `‖z − P z‖ / ‖z‖`; `None` when `z` is zero. A non-finite value comes
+    /// back as `NaN`, which no tolerance accepts.
+    fn residual(&self, z: &Pieces) -> Option<f64> {
+        let z_norm = z.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+        if z_norm == 0.0 {
+            return None;
+        }
+        let mut r = vec![0.0; self.n_rows];
+        for (s, piece) in z {
+            let mut piece = piece.clone();
+            project_out(&mut piece, &self.local[*s]);
+            r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
+        }
+        project_out(&mut r, &self.dense);
+        Some(dot(&r, &r).sqrt() / z_norm)
+    }
 }
 
 /// Whether a contrast's coded block, with the rest of the model, reproduces an
@@ -2134,7 +2206,14 @@ fn residual_against(g: &[f64], basis: &[Vec<f64>]) -> Option<f64> {
 /// sits 3.7 decades above the one and 4.2 below the other.
 ///
 /// Only branches that refuse without it ask for it, so a model that binds
-/// without the certificate never pays for the population-wide basis.
+/// without the certificate never pays for it. On those branches it costs the
+/// population-wide columns of a [`BlockBasis`]: the other θ, and under
+/// sum-to-zero one difference per level against its group's last — cubic in
+/// the subject count there (#1961 review, F1: on a 5-η `two_cpt_oral`
+/// intercept model, release, 0.16 s at 200 subjects, 1.1 s at 400, 19 s at
+/// 1000, where the binder before #1840 refused in ~20 ms). The coarser random
+/// effects' columns, one per unit, are built only when the point is not
+/// already held without them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Carried {
     /// Every unit column of the random effect lies in the span: the contrast
@@ -2178,7 +2257,6 @@ fn carried(
         .iter()
         .map(|s| s.obs_times.len())
         .collect();
-    let n_rows: usize = lens.iter().sum();
     let offsets: Vec<usize> = lens
         .iter()
         .scan(0, |at, n| {
@@ -2200,12 +2278,13 @@ fn carried(
             .collect();
         // One population-wide column: per subject, the central difference of
         // its predictions under `perturb`, which moves θ or that subject's
-        // random effects by ±h; `None` when anything is non-finite.
+        // random effects by ±h, kept where it is not exactly zero; `None` when
+        // anything is non-finite.
         let diff_col = |subjects: &[usize],
                         h: f64,
                         perturb: &dyn Fn(f64, &mut Vec<f64>, &mut Vec<f64>, &mut Vec<Vec<f64>>)|
-         -> Option<Vec<f64>> {
-            let mut col = vec![0.0; n_rows];
+         -> Option<Pieces> {
+            let mut col = Pieces::new();
             for &s in subjects {
                 let subject = &population.subjects[s];
                 let (eta, kappa) = &res[s];
@@ -2218,7 +2297,9 @@ fn carried(
                 if d.len() != lens[s] || d.iter().any(|v| !v.is_finite()) {
                     return None;
                 }
-                col[offsets[s]..offsets[s] + lens[s]].copy_from_slice(&d);
+                if d.iter().any(|v| *v != 0.0) {
+                    col.push((s, d));
+                }
             }
             Some(col)
         };
@@ -2228,7 +2309,7 @@ fn carried(
             diff_col(&all, h, &|d, th, _, _| th[k] += d)
         };
 
-        let mut cols: Vec<Vec<f64>> = Vec::new();
+        let mut cols: Vec<Pieces> = Vec::new();
         for &k in &other_thetas {
             let Some(c) = theta_col(k) else {
                 return Carried::Held;
@@ -2239,7 +2320,7 @@ fn carried(
         // `contrast` over `groups`: under `ref` the first level of each group
         // is dropped, under sum-to-zero each level but its group's last is
         // taken against that last one.
-        let mut level_cols: Vec<Vec<f64>> = Vec::with_capacity(levels.len());
+        let mut level_cols: Vec<Pieces> = Vec::with_capacity(levels.len());
         for (i, k) in level_thetas.iter().enumerate() {
             let readers: Vec<usize> = all
                 .iter()
@@ -2257,7 +2338,7 @@ fn carried(
                         None => return Carried::Held,
                     }
                 }
-                None => vec![0.0; n_rows],
+                None => Pieces::new(),
             };
             level_cols.push(col);
         }
@@ -2268,13 +2349,7 @@ fn carried(
                 LevelContrast::Ref if !first(i) => cols.push(level_cols[i].clone()),
                 LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
                     let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
-                    cols.push(
-                        level_cols[i]
-                            .iter()
-                            .zip(&level_cols[j])
-                            .map(|(a, b)| a - b)
-                            .collect(),
-                    );
+                    cols.push(pieces_minus(&level_cols[i], &level_cols[j]));
                 }
                 _ => {}
             }
@@ -2282,7 +2357,7 @@ fn carried(
 
         // Per unit of each random effect: its column. A unit is a subject for
         // an η, an occasion group of a subject for a κ.
-        let unit_cols = |r: usize, is_kappa: bool| -> Option<Vec<Vec<f64>>> {
+        let unit_cols = |r: usize, is_kappa: bool| -> Option<Vec<Pieces>> {
             let mut out = Vec::new();
             for s in 0..population.subjects.len() {
                 let units = if is_kappa {
@@ -2304,6 +2379,31 @@ fn carried(
             }
             Some(out)
         };
+        let Some(own) = unit_cols(index, kappa) else {
+            return Carried::Held;
+        };
+        // Whether some unit keeps a direction outside the span of `cols`. A
+        // unit whose column is zero measures nothing; anything non-finite says
+        // nothing either, and falls to the refusal.
+        let outside = |cols: &[Pieces]| -> Option<bool> {
+            let basis = BlockBasis::new(cols, &lens, &offsets);
+            let mut outside = false;
+            for z in &own {
+                match basis.residual(z) {
+                    None => {}
+                    Some(r) if !r.is_finite() => return None,
+                    Some(r) => outside |= r >= SPAN_TOL,
+                }
+            }
+            Some(outside)
+        };
+        // Without the coarser random effects first: adding columns only widens
+        // the span, so a unit set held without them is held with them, and the
+        // usual refusal — an intercept carrying the direction — never builds
+        // their one column per unit (#1961 review, F1).
+        if outside(&cols) != Some(true) {
+            return Carried::Held;
+        }
         // The random effects at a coarser-or-equal unit: the other η for an η,
         // every η and the other κ for a κ.
         let coarser: Vec<(usize, bool)> = (0..model.n_eta)
@@ -2315,27 +2415,16 @@ fn carried(
                     .map(|q| (q, true)),
             )
             .collect();
+        if coarser.is_empty() {
+            continue;
+        }
         for (r, is_kappa) in coarser {
             let Some(c) = unit_cols(r, is_kappa) else {
                 return Carried::Held;
             };
             cols.extend(c);
         }
-        let Some(own) = unit_cols(index, kappa) else {
-            return Carried::Held;
-        };
-        let basis = orthonormal_basis(&cols);
-        // A unit whose column is zero measures nothing; one outside the span
-        // is the only way this point says `Identified`.
-        let mut outside = false;
-        for z in &own {
-            match residual_against(z, &basis) {
-                None => {}
-                Some(r) if !r.is_finite() => return Carried::Held,
-                Some(r) => outside |= r >= SPAN_TOL,
-            }
-        }
-        if !outside {
+        if outside(&cols) != Some(true) {
             return Carried::Held;
         }
     }
