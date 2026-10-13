@@ -50,6 +50,8 @@
 //! | either per-evaluation tally records one rejection per *run* | E1 (guard) and E5 (non-finite), each "all 1 of its trials" against 4 |
 //! | the checkpoint write's feasible-eval gate dropped | E6 — a resume point holding the midpoint in all four packed coordinates |
 //! | `&& objective_ok` dropped from the resume condition | E8 — resumes from a pre-fix penalty checkpoint and reports θ = `[0.1414, 7.0711]` |
+//! | the resume check's position half dropped (magnitude only) | E9 |
+//! | the resume check's magnitude half dropped (position only) | E10 |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -853,6 +855,39 @@ fn an_infeasible_derivative_free_run_also_reports_its_start() {
     );
 }
 
+/// Write a v1-shaped checkpoint for `model` at `packed` / `ofv`, with both integrity hashes
+/// present and `coord_names` from `coordinate_names` — so the file passes *every* resume
+/// check except the one under test. Shared by E8 and E9 so the two differ only in the point
+/// and the objective, which is the whole comparison.
+fn seed_checkpoint(path: &str, model: &CompiledModel, packed: Vec<f64>, ofv: f64) {
+    let cp = crate::io::checkpoint::Checkpoint {
+        schema_version: 1,
+        ferx_version: "0.4.0".to_string(),
+        model_hash: Some("mh".to_string()),
+        data_hash: Some("dh".to_string()),
+        method_chain: vec!["focei".to_string()],
+        stage_idx: 0,
+        packed,
+        coord_names: crate::estimation::parameterization::coordinate_names(&model.default_params),
+        iter: 3,
+        ofv,
+        unix_time: 1,
+    };
+    crate::io::checkpoint::save_atomic(path, &cp).expect("seed the checkpoint");
+}
+
+/// The `FitOptions` that make `fit()` resume from `path`.
+fn resuming_opts(path: &str, inner_maxiter: usize) -> FitOptions {
+    FitOptions {
+        checkpoint: true,
+        checkpoint_path: Some(path.to_string()),
+        checkpoint_model_hash: Some("mh".to_string()),
+        checkpoint_data_hash: Some("dh".to_string()),
+        checkpoint_interval_secs: 3600,
+        ..opts(inner_maxiter)
+    }
+}
+
 /// **E8 — a pre-fix checkpoint is refused, not resumed from** (#1617 review round 8).
 ///
 /// E6 stops the new code *writing* an infeasible checkpoint, but a gate inside the
@@ -884,31 +919,15 @@ fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
 
     // The packed midpoint, as the pre-fix code wrote it: θ log-packed, ω Cholesky-log and
     // σ log at their rail centres.
-    let packed = vec![BOUND_MIDPOINT[0].ln(), BOUND_MIDPOINT[1].ln(), 0.0, -1.5];
-    let cp = crate::io::checkpoint::Checkpoint {
-        schema_version: 1,
-        ferx_version: "0.4.0".to_string(),
-        model_hash: Some("mh".to_string()),
-        data_hash: Some("dh".to_string()),
-        method_chain: vec!["focei".to_string()],
-        stage_idx: 0,
-        packed,
-        coord_names: crate::estimation::parameterization::coordinate_names(&model.default_params),
-        iter: 3,
-        // A guard-penalty value, not an objective: `GUARD_PENALTY_BASE` plus a quadratic term.
-        ofv: 1e12 + 37.0,
-        unix_time: 1,
-    };
-    crate::io::checkpoint::save_atomic(&path, &cp).expect("seed the checkpoint");
+    // A guard-penalty `ofv` — the floor plus a quadratic term — at the penalty's minimiser.
+    seed_checkpoint(
+        &path,
+        &model,
+        vec![BOUND_MIDPOINT[0].ln(), BOUND_MIDPOINT[1].ln(), 0.0, -1.5],
+        1e12 + 37.0,
+    );
 
-    let options = FitOptions {
-        checkpoint: true,
-        checkpoint_path: Some(path.clone()),
-        checkpoint_model_hash: Some("mh".to_string()),
-        checkpoint_data_hash: Some("dh".to_string()),
-        checkpoint_interval_secs: 3600,
-        ..opts(3)
-    };
+    let options = resuming_opts(&path, 3);
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
     crate::io::checkpoint::abandon();
     crate::io::checkpoint::remove(&path);
@@ -926,7 +945,7 @@ fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
             )
         });
     assert!(
-        msg.contains("records a rejection penalty rather than an objective"),
+        msg.contains("holds the EBE guard's rejection penalty at the midpoint"),
         "refused for the wrong reason, so the new check is not what this test exercises: \
          {msg}"
     );
@@ -940,6 +959,114 @@ fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
             BOUND_MIDPOINT[i],
         );
     }
+}
+
+/// **E9 — a legitimate checkpoint with a huge objective is still resumed from** (#1617
+/// review round 9 #1).
+///
+/// The control E8 needs, and the reason the check is not a magnitude test.
+/// `Checkpoint::ofv` means different things per method — for SAEM it is an arbitrary
+/// iteration's conditional NLL, not an objective at a minimum — and `ofv_is_valid` admits
+/// finite values up to `1e14`. A threshold alone would therefore refuse a legitimate
+/// large-objective or early-SAEM checkpoint, and the first version of this fix *deleted*
+/// what it refused: somebody's long fit, thrown away on an inference.
+///
+/// So this file carries an objective **above** `GUARD_PENALTY_BASE` (`5e12`) at a point that
+/// is *not* the box centre, and it must be resumed from. Only the conjunction — the
+/// penalty's magnitude **and** its minimiser — identifies a guard-rejection checkpoint.
+///
+/// Mutation (run): drop `at_box_centre &&` so the check is magnitude-only → this file is
+/// refused and assertion (1) fires.
+#[test]
+fn a_checkpoint_with_a_huge_objective_away_from_the_box_centre_is_resumed() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let path = std::env::temp_dir()
+        .join(format!("ferx_ckpt_1617_bigofv_{}.tmp", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+
+    // Away from the centre in θ — `ln(4.0)` and `ln(40.0)`, nowhere near the
+    // `ln(sqrt(lower·upper))` midpoints — with an objective five orders past anything
+    // physical, the shape an early SAEM iteration can produce.
+    seed_checkpoint(
+        &path,
+        &model,
+        vec![4.0_f64.ln(), 40.0_f64.ln(), 0.0, -1.5],
+        5e12,
+    );
+
+    let options = resuming_opts(&path, 200);
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+
+    // (1) It was resumed from, not refused.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Resuming from checkpoint")),
+        "a checkpoint away from the box centre must be resumed from however large its \
+         recorded objective — the magnitude alone is not the fingerprint: {:?}",
+        result.warnings
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Ignoring checkpoint")),
+        "{:?}",
+        result.warnings
+    );
+}
+
+/// **E10 — a checkpoint *at* the box centre with a real objective is still resumed from.**
+///
+/// The other half of E9, and the reason the check is not a position test either. A user
+/// whose initial estimates happen to sit at the geometric midpoint of their bounds — write
+/// `theta TVV(7.07, 0.1, 500)` and they do — writes a perfectly ordinary first checkpoint
+/// *at* the box centre. A position-only check would refuse that file on every run, forever.
+///
+/// So this one carries the midpoint with `ofv = 42.0`, a real objective, and must be
+/// resumed from. Together with E9 the conjunction is pinned from both sides: E9 fails if the
+/// position half is dropped, this one if the magnitude half is.
+///
+/// Mutation (run): `objective_ok = !at_box_centre` → this file is refused and the assertion
+/// fires. (Before it existed, that mutation killed nothing.)
+#[test]
+fn a_checkpoint_at_the_box_centre_with_a_real_objective_is_resumed() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let path = std::env::temp_dir()
+        .join(format!("ferx_ckpt_1617_centre_{}.tmp", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+
+    // The box centre — the same point E8 seeds — but with an objective a fit could actually
+    // have reported there.
+    seed_checkpoint(
+        &path,
+        &model,
+        vec![BOUND_MIDPOINT[0].ln(), BOUND_MIDPOINT[1].ln(), 0.0, -1.5],
+        42.0,
+    );
+
+    let options = resuming_opts(&path, 200);
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Resuming from checkpoint")),
+        "a checkpoint at the box centre carrying a real objective is an ordinary resume \
+         point — a fit whose initial estimates sit at the midpoint writes one — and must \
+         not be refused: {:?}",
+        result.warnings
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

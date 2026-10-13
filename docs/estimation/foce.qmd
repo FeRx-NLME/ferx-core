@@ -765,11 +765,19 @@ also swaps the outer optimizer away from L-BFGS to the derivative-free BOBYQA
 and the two then differ in two ways at once. BOBYQA never reports the midpoint, per the
 flat-wall note above; and on some models its small opening steps keep the inner loop inside
 its budget where L-BFGS's first step does not, so it finds feasible trials and the fit comes
-back ordinary. On the model in [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that is what happens — at
-`inner_maxiter = 5` the BOBYQA route reports a real OFV at the initial values with
-`W_STALLED_AT_INIT`, 35 OFV units from the default route's midpoint — so a gap between the
-two routes is the optimizer swap, not a wrong analytic gradient. It is not a general escape:
-starve the inner loop harder and BOBYQA is rejected at every trial too.
+back looking ordinary. Both measured on [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617)'s own
+reproductions, and they land differently:
+
+- on the two-subject fixture at `inner_maxiter = 3`, the default route reports the midpoint
+  at OFV 24.578 while `gradient = fd` reaches the optimum at −10.403 — a 35-unit gap between
+  two routes on the same model, which is what invites the reader to suspect the analytic
+  gradient when the cause is the optimizer;
+- on warfarin at `inner_maxiter = 5`, the default route reports the midpoint at 220.52 and
+  BOBYQA reports a real objective at the *initial* values, −269.95, with
+  `W_STALLED_AT_INIT`.
+
+Neither is a general escape: starve the inner loop harder and BOBYQA is rejected at every
+trial too, carrying `W_NO_FEASIBLE_EVAL` like any other route.
 
 ## Warm Starting
 
