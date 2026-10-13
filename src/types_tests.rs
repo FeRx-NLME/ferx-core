@@ -3670,3 +3670,104 @@ fn interaction_for_truth_table() {
         }
     }
 }
+
+/// #1899: the slot lookup must not answer an unbound individual parameter for
+/// `PK_IDX_CL`, in either declaration order.
+///
+/// On an analytical model only a name the `pk(...)` line binds (or a readout /
+/// `obs_scale` / `init` reads) owns a PK slot; every other name carries the
+/// placeholder `0`, which *is* `CL`'s slot. So `pk_indices` answers both ways
+/// round: forwards it hands the intermediate `CL`'s value, backwards a
+/// `position(|&s| s == PK_IDX_CL)` scan hands `CL`'s slot the intermediate's name
+/// — the two defects #1899 covers. `pk_slot_rows` drops the placeholder rows and
+/// `indiv_param_for_pk_slot` is `find` over what is left.
+///
+/// Both orders are asserted because each consumer broke on a different one: a
+/// `position` scan loses when the intermediate is declared **before** `CL`, while
+/// a slot-keyed `seed_dim` (the sensitivity fallback) loses when it is declared
+/// **after** — so a single-order fixture leaves one half untested.
+#[test]
+fn pk_slot_rows_omit_an_unbound_individual_parameter() {
+    let before = "[parameters]\n  theta THCL(0.2, 0.001, 10.0)\n  theta THV(10.0, 0.1, 500.0)\n  \
+         theta THS(3.0, 0.01, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         omega ETA_S ~ 0.25\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+         [individual_parameters]\n  S = THS * exp(ETA_S)\n  CL = THCL * exp(ETA_CL)\n  \
+         V = THV * exp(ETA_V)\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=1.0)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let after = before
+        .replace("  S = THS * exp(ETA_S)\n  CL", "  CL")
+        .replace(
+            "  V = THV * exp(ETA_V)\n[structural_model]",
+            "  V = THV * exp(ETA_V)\n  S = THS * exp(ETA_S)\n[structural_model]",
+        );
+    for (label, src) in [("S first", before), ("S last", after.as_str())] {
+        let m = crate::parser::model_parser::parse_model_string(src)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let s_pos = m
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "S")
+            .unwrap_or_else(|| panic!("{label}: S must be declared"));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        // The defect's precondition: `S` carries CL's slot in `pk_indices`, so the
+        // old lookups could not tell the two apart. If a later change gives every
+        // name a real slot this assert fires and the test below stops testing
+        // anything — which is the point of asserting it.
+        assert_eq!(
+            m.pk_indices[s_pos], PK_IDX_CL,
+            "{label}: S must still carry the placeholder slot"
+        );
+        let rows = m.pk_slot_rows();
+        assert!(
+            !rows.iter().any(|&(_, i)| i == s_pos),
+            "{label}: S owns no slot, so it must contribute no row: {rows:?}"
+        );
+        // One row per slot — what `seed_dim_from_slots` (last row per slot wins)
+        // needs to be unambiguous.
+        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_CL),
+            Some(cl_pos),
+            "{label}: PK_IDX_CL must resolve to CL, not to S"
+        );
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_V),
+            m.indiv_param_names.iter().position(|n| n == "V"),
+            "{label}: PK_IDX_V must resolve to V"
+        );
+        // A slot no parameter owns stays unowned — the literal `ka=1.0` binds no
+        // variable, so nothing may claim `PK_IDX_KA`.
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_KA),
+            None,
+            "{label}: a literal-bound role owns no individual parameter"
+        );
+    }
+}
+
+/// #1899: a hand-built `CompiledModel` carries no individual-parameter program, so
+/// `pk_slot_rows` has nothing to read the resolved pairs off and falls back to
+/// `pk_indices` — where, for such a fixture, every entry is a real slot by
+/// construction. Pins that fallback, which the parsed-model test above cannot
+/// reach.
+#[test]
+fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA];
+    assert!(
+        m.indiv_param_partials.indiv_param_program.is_none(),
+        "the hand-built fixture must carry no program, or this tests the other arm"
+    );
+    assert_eq!(
+        m.pk_slot_rows(),
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (PK_IDX_KA, 2)]
+    );
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
+}

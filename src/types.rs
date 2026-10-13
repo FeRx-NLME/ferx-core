@@ -5147,6 +5147,68 @@ impl CompiledModel {
             .collect()
     }
 
+    /// `(pk_slot, `[`indiv_param_names`](Self::indiv_param_names)` index)` for every
+    /// individual parameter that owns a PK slot — **the slot lookup that cannot
+    /// return a placeholder** (#1899).
+    ///
+    /// `pk_indices` cannot serve as one. On an analytical model a name that no
+    /// `pk(...)` role binds and no readout reads gets the placeholder `0`, which is
+    /// `CL`'s slot (#1356), so a `pk_indices` scan read forwards answers `CL`'s value
+    /// for that name and read backwards answers that name for `CL`. Both misreads
+    /// were live: the closed-form log-normal sensitivity fallback keyed `∂p/∂η` rows
+    /// by slot and let an intermediate's row overwrite `CL`'s, and
+    /// `suggest_start::find_theta_for_slot` wrote NCA's clearance estimate onto an
+    /// intermediate's θ.
+    ///
+    /// The rows come from the individual-parameter program's resolved
+    /// `(pk_slot, var_slot)` pairs, which exist only for a name with a slot of its
+    /// own: a role binding, a spare readout / `obs_scale` / `init` slot (#650,
+    /// #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on the ODE layout every
+    /// declared name. Order is the program's (analytical: alphabetical by PK name),
+    /// so it matches `IndivParamProgram::pk_slots` row for row — which is what lets
+    /// the sensitivity fallback hand its caller the same `(rows, slots)` shape the
+    /// program path does. Each slot appears at most once (one slot per variable is
+    /// guaranteed by the one-variable-two-roles reject, #1359), so a `find` over
+    /// these rows is unambiguous where a `position` over `pk_indices` was not.
+    ///
+    /// Falls back to `pk_indices` — placeholder and all — for a hand-built
+    /// `CompiledModel` carrying no program (test fixtures, `generate_data`), where
+    /// every entry is a real slot by construction. Every parsed model has a program.
+    pub(crate) fn pk_slot_rows(&self) -> Vec<(usize, usize)> {
+        match self.indiv_param_partials.indiv_param_program.as_ref() {
+            Some(prog) => prog
+                .pk_var_slots()
+                .iter()
+                .copied()
+                // A top-level name's var slot is its `indiv_param_names` index; the
+                // `tv` / `sel_flat` vectors a consumer pairs these with are that
+                // long, so a pair pointing past them is dropped rather than indexed.
+                .filter(|&(_, i)| i < self.indiv_param_names.len())
+                .collect(),
+            None => self
+                .pk_indices
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, slot)| (slot, i))
+                .collect(),
+        }
+    }
+
+    /// The [`indiv_param_names`](Self::indiv_param_names) index whose **own** PK slot
+    /// is `pk_slot`, or `None` when no parameter owns that slot.
+    ///
+    /// The inverse direction of [`pk_slot_rows`](Self::pk_slot_rows), and the
+    /// placeholder-free replacement for `pk_indices.iter().position(|&s| s == slot)`:
+    /// that scan returns the first *declared* name whose entry equals the slot, so an
+    /// unbound intermediate declared above `CL` answers for `PK_IDX_CL` (#1899).
+    pub(crate) fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize> {
+        self.pk_slot_rows()
+            .into_iter()
+            .find(|&(slot, _)| slot == pk_slot)
+            .map(|(_, i)| i)
+    }
+
     /// Returns true when the model routes a compartment lag time to
     /// [`PK_IDX_LAGTIME`]. Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-

@@ -639,8 +639,10 @@ thread_local! {
 /// match the route (PR #950 review #2).
 ///
 /// Bounds the **program** slot list, which is what the readout allocator grows and what the
-/// providers dispatch on when the program path is live. The `lognormal_param_derivatives`
-/// fallback (`model.pk_indices`) is unchanged from before #486 and left alone here.
+/// providers dispatch on. Since #1899 the `lognormal_param_derivatives` fallback dispatches on
+/// the same list (`CompiledModel::pk_slot_rows` is the program's `(pk_slot, var_slot)` pairs
+/// whenever a program exists), so this bound covers both routes; before that it keyed on
+/// `model.pk_indices`, which this gate never saw.
 fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
     model
         .indiv_param_partials
@@ -1173,27 +1175,36 @@ pub(crate) fn tv_theta_jacobian(
 /// Fallback `∂p/∂(θ,η)` for the closed-form log-normal parameterization
 /// `pk_i = tv_i·exp(Σ_k sel[i,k]·η_k)`, used when the exact `Dual2`-over-program
 /// path is unavailable (NN-weight θ or IOV kappa make the program's axis counts
-/// disagree with the model's θ/η). The η chain is closed form; the θ chain uses
-/// the FD `tv_theta_jacobian` (ρ). Produces the same `ParamDerivs` shape the
-/// program path returns so the downstream chain is identical:
+/// disagree with the model's θ/η, or a literal-const PK role the program omits).
+/// The η chain is closed form; the θ chain uses the FD `tv_theta_jacobian` (ρ).
+/// Produces the same `ParamDerivs` shape the program path returns so the
+/// downstream chain is identical:
 ///   `∂p_i/∂η_k = pk_i·sel_ik`, `∂p_i/∂θ_m = pk_i·ρ_im`,
 ///   `∂²p_i/∂η_k∂η_l = pk_i·sel_ik·sel_il`, `∂²p_i/∂η_k∂θ_m = pk_i·sel_ik·ρ_im`.
+///
+/// `rows` is [`CompiledModel::pk_slot_rows`]: one `(pk_slot, name index)` per
+/// individual parameter that owns a slot, so row `r` of the result carries slot
+/// `rows[r].0` and is built from the `tv` / `sel_flat` entries of name
+/// `rows[r].1`. It is **not** `pk_indices`, which gives every unbound name the
+/// placeholder `0`; keyed by slot downstream (`seed_dim_from_slots` keeps the last
+/// row per slot), such a row silently overwrote `CL`'s gradient (#1899).
 fn lognormal_param_derivatives(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     pk: &crate::types::PkParams,
+    rows: &[(usize, usize)],
 ) -> crate::sens::ode_provider::ParamDerivs {
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
     let tv = (model.tv_fn.as_ref().unwrap())(theta, &subject.covariates);
     let tv_jac = tv_theta_jacobian(model, subject, theta);
-    let ni = model.pk_indices.len();
+    let ni = rows.len();
     let mut dp_deta = vec![vec![0.0; n_eta]; ni];
     let mut dp_dtheta = vec![vec![0.0; n_theta]; ni];
     let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; ni];
     let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; ni];
-    for (i, &slot) in model.pk_indices.iter().enumerate() {
+    for (r, &(slot, i)) in rows.iter().enumerate() {
         let pk_val = pk.values[slot];
         let tv_i = tv[i];
         let sel: Vec<f64> = (0..n_eta).map(|k| model.sel_flat[i * n_eta + k]).collect();
@@ -1203,15 +1214,15 @@ fn lognormal_param_derivatives(
             vec![0.0; n_theta]
         };
         for m in 0..n_theta {
-            dp_dtheta[i][m] = pk_val * rho[m];
+            dp_dtheta[r][m] = pk_val * rho[m];
         }
         for k in 0..n_eta {
-            dp_deta[i][k] = pk_val * sel[k];
+            dp_deta[r][k] = pk_val * sel[k];
             for l in 0..n_eta {
-                d2p_deta2[i][k][l] = pk_val * sel[k] * sel[l];
+                d2p_deta2[r][k][l] = pk_val * sel[k] * sel[l];
             }
             for m in 0..n_theta {
-                d2p_detadtheta[i][k][m] = pk_val * sel[k] * rho[m];
+                d2p_detadtheta[r][k][m] = pk_val * sel[k] * rho[m];
             }
         }
     }
@@ -1246,17 +1257,20 @@ fn lognormal_chain_exact(model: &CompiledModel) -> bool {
 /// those need), all θ/second-order work the inner η-gradient never reads; calling
 /// it here would silently reintroduce the very θ-axis/Hessian cost the "light
 /// provider" comment on `subject_eta_grad` says this path avoids.
+///
+/// `rows` carries the same `(pk_slot, name index)` contract as
+/// [`lognormal_param_derivatives`].
 fn lognormal_eta_derivatives_only(
     model: &CompiledModel,
     pk: &crate::types::PkParams,
+    rows: &[(usize, usize)],
 ) -> Vec<Vec<f64>> {
     let n_eta = model.n_eta;
-    let ni = model.pk_indices.len();
-    let mut dp_deta = vec![vec![0.0; n_eta]; ni];
-    for (i, &slot) in model.pk_indices.iter().enumerate() {
+    let mut dp_deta = vec![vec![0.0; n_eta]; rows.len()];
+    for (r, &(slot, i)) in rows.iter().enumerate() {
         let pk_val = pk.values[slot];
         for k in 0..n_eta {
-            dp_deta[i][k] = pk_val * model.sel_flat[i * n_eta + k];
+            dp_deta[r][k] = pk_val * model.sel_flat[i * n_eta + k];
         }
     }
     dp_deta
@@ -1266,7 +1280,8 @@ fn lognormal_eta_derivatives_only(
 /// evaluate the compiled `[individual_parameters]` program over `Dual2` seeded on
 /// `(θ, η)` when it covers the required PK slots, else fall back to the closed-form
 /// log-normal chain (`pk·sel` / `tv_theta_jacobian`) whose rows follow
-/// `pk_indices` order. Returns `None` — the caller falls back to FD — only when the
+/// [`CompiledModel::pk_slot_rows`] — the same slot list and order the program path
+/// reports (#1899). Returns `None` — the caller falls back to FD — only when the
 /// program path is unavailable AND some PK-param η is not `LogNormal` (the
 /// log-normal chain would then be wrong). Hoisted from the two byte-identical outer
 /// call sites (`apply_tvcov_init_outer`, `subject_sensitivities`) — see F4.
@@ -1291,8 +1306,10 @@ fn resolve_param_derivs(
             if !lognormal_chain_exact(model) {
                 return None;
             }
-            let pd = lognormal_param_derivatives(model, subject, theta, pk);
-            Some((pd, model.pk_indices.clone()))
+            let rows = model.pk_slot_rows();
+            let slots: Vec<usize> = rows.iter().map(|&(slot, _)| slot).collect();
+            let pd = lognormal_param_derivatives(model, subject, theta, pk, &rows);
+            Some((pd, slots))
         }
     }
 }
@@ -4946,9 +4963,10 @@ fn subject_eta_grad_impl(
     // program path (`param_derivatives_from_prog`, evaluated once per subject)
     // covers log-normal, logit-normal F, additive, … ; its `slots` follow the
     // program order. Falls back to the closed-form log-normal `pk·sel` chain (rows
-    // in `pk_indices` order) when the program path is unavailable, and to `None`
-    // (→ caller's per-point FD) only when neither applies — so the light provider
-    // serves exactly the analytical scope the full `subject_sensitivities` does.
+    // in `pk_slot_rows` order, which is the same slot list) when the program path is
+    // unavailable, and to `None` (→ caller's per-point FD) only when neither applies
+    // — so the light provider serves exactly the analytical scope the full
+    // `subject_sensitivities` does.
     let (dp_deta, slots): (Vec<Vec<f64>>, Vec<usize>) = match model
         .indiv_param_partials
         .indiv_param_program
@@ -4969,8 +4987,10 @@ fn subject_eta_grad_impl(
             if !lognormal_chain_exact(model) {
                 return None;
             }
-            let dp_deta = lognormal_eta_derivatives_only(model, &pk);
-            (dp_deta, model.pk_indices.clone())
+            let rows = model.pk_slot_rows();
+            let slots: Vec<usize> = rows.iter().map(|&(slot, _)| slot).collect();
+            let dp_deta = lognormal_eta_derivatives_only(model, &pk, &rows);
+            (dp_deta, slots)
         }
     };
     let seed_dim = seed_dim_from_slots(&slots);
@@ -7012,9 +7032,10 @@ fn subject_sensitivities_impl(
     // differences (issue #367). Its rows follow the program's `pk_var_slots` order
     // (analytical: alphabetical by PK name), NOT `pk_indices` (declaration) order.
     // Falls back to the closed-form log-normal `sel` η chain plus the FD
-    // `tv_theta_jacobian` θ chain (`ρ`) — whose rows ARE in `pk_indices` order —
-    // when the program path is unavailable (NN-weight θ / IOV kappa axis mismatch,
-    // or a literal-const PK slot the program omits).
+    // `tv_theta_jacobian` θ chain (`ρ`) — whose rows follow `pk_slot_rows`, i.e. the
+    // same `(slot, row)` pairing the program reports — when the program path is
+    // unavailable (NN-weight θ / IOV kappa axis mismatch, or a literal-const PK slot
+    // the program omits).
     let (pd, slots) = resolve_param_derivs(model, subject, theta, eta, &pk)?;
 
     // Right-size the dual width to the number of differentiated PK parameters

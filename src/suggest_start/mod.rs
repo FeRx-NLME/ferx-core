@@ -559,8 +559,12 @@ fn try_biexp_peel(
 /// Find which theta index drives a given PK slot.
 ///
 /// Three-layer lookup (model-agnostic, works with or without mu-referencing):
-/// 1. `pk_indices`: find the position in `indiv_param_names` whose PK slot matches,
-///    then look for an eta in `mu_refs` whose theta is in `theta_names`.
+/// 1. [`CompiledModel::indiv_param_for_pk_slot`]: the `indiv_param_names` entry
+///    whose **own** PK slot matches, then look for an eta in `mu_refs` whose theta
+///    is in `theta_names`. Not a `pk_indices` scan: an analytical model gives every
+///    unbound intermediate the placeholder slot `0`, so `CLWT = exp(CLWT_EXP *
+///    log(WT/70))` declared above `CL` answered for `PK_IDX_CL` and layer 2 then
+///    wrote NCA's clearance onto the allometric exponent `CLWT_EXP` (#1899).
 /// 2. Name-based fallback: search `theta_names` for a name containing the user's
 ///    `indiv_param_names[pos]` string (handles CLEARANCE → CLEARANCE, TVCL → CL, etc.).
 /// 3. Canonical-name fallback: search `theta_names` for the standard slot name
@@ -591,8 +595,8 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
 
     let params = &model.default_params;
 
-    // Layer 1: pk_indices → indiv_param_names → mu_refs → theta index.
-    if let Some(indiv_pos) = model.pk_indices.iter().position(|&s| s == pk_slot) {
+    // Layer 1: owning individual parameter → mu_refs → theta index.
+    if let Some(indiv_pos) = model.indiv_param_for_pk_slot(pk_slot) {
         let indiv_name = &model.indiv_param_names[indiv_pos];
         // Search mu_refs for an eta whose theta_name is in theta_names and whose
         // eta name matches the indiv_param_name as a whole word (case-insensitive).
@@ -631,9 +635,15 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
 }
 
 /// Find the omega diagonal index for the eta driving a given PK slot.
+///
+/// Resolves the owning individual parameter through
+/// [`CompiledModel::indiv_param_for_pk_slot`] for the same reason
+/// [`find_theta_for_slot`] does: a `pk_indices` scan answers an unbound
+/// intermediate for `PK_IDX_CL` (#1899), and its name then matches no eta, so the
+/// slot's omega came back `None` and NCA left `ETA_CL`'s variance at the default.
 fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
     let params = &model.default_params;
-    if let Some(indiv_pos) = model.pk_indices.iter().position(|&s| s == pk_slot) {
+    if let Some(indiv_pos) = model.indiv_param_for_pk_slot(pk_slot) {
         let indiv_name = &model.indiv_param_names[indiv_pos];
         let indiv_upper = indiv_name.to_ascii_uppercase();
         for (eta_name, _mu_ref) in &model.mu_refs {
@@ -1035,5 +1045,76 @@ mod tests {
             f, model.default_params.theta[f_idx],
             "the logit sweep must move THETA_F off its default"
         );
+    }
+
+    /// #1899: an unbound intermediate declared **before** `CL` carries the
+    /// placeholder PK slot `0` — `CL`'s slot — so the old
+    /// `pk_indices.iter().position(|&s| s == PK_IDX_CL)` scan answered `CLWT` for
+    /// the clearance slot. Layer 2 of `find_theta_for_slot` then matched the only
+    /// θ whose name contains `CLWT`, and NCA wrote its pooled CL/F estimate onto
+    /// the allometric exponent `CLWT_EXP`; `find_omega_idx_for_slot` matched no η
+    /// against the name `CLWT` and left `ETA_CL`'s variance at the model default.
+    ///
+    /// Both declaration orders are asserted: the lookup must be
+    /// order-independent, and the fix is a slot lookup that cannot return a
+    /// placeholder, not a reordering.
+    #[test]
+    fn nca_resolves_cl_past_an_unbound_intermediate_in_either_order() {
+        let model_src = |indiv: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
+                 theta CLWT_EXP(0.75, 0.0, 2.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                 theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+                 sigma PROP_ERR ~ 0.02 (sd)\n\
+                 [individual_parameters]\n{indiv}  V = TVV\n  KA = TVKA\n\
+                 [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            )
+        };
+        // The issue's fixture: `CL` reads `CLWT`, so the intermediate *must* come
+        // first — the broken order, and the one a covariate model is written in.
+        let before =
+            model_src("  CLWT = exp(CLWT_EXP * log(WT/70))\n  CL = TVCL * CLWT * exp(ETA_CL)\n");
+        // The mirror order, where `position` happened to find `CL` first and the
+        // answer was right by accident. It has to be pinned too: it is the half
+        // that a "reorder the block" fix would have claimed to solve, and a
+        // regression here would be invisible on the fixture above.
+        let after = model_src("  CL = TVCL * exp(ETA_CL)\n  CLWT = exp(CLWT_EXP * log(WT/70))\n");
+        for (label, src) in [("CLWT first", before), ("CLWT last", after)] {
+            let m = crate::parser::model_parser::parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            // The precondition: `CLWT` really does carry CL's slot, so the old scan
+            // could not tell the two apart.
+            let clwt_pos = m
+                .indiv_param_names
+                .iter()
+                .position(|n| n == "CLWT")
+                .unwrap();
+            assert_eq!(
+                m.pk_indices[clwt_pos], PK_IDX_CL,
+                "{label}: CLWT must still carry the placeholder slot"
+            );
+            let theta_idx = find_theta_for_slot(&m, PK_IDX_CL)
+                .unwrap_or_else(|| panic!("{label}: no theta for PK_IDX_CL"));
+            assert_eq!(
+                m.default_params.theta_names[theta_idx], "TVCL",
+                "{label}: NCA's clearance estimate must land on TVCL, not on the \
+                 allometric exponent"
+            );
+            let omega_idx = find_omega_idx_for_slot(&m, PK_IDX_CL)
+                .unwrap_or_else(|| panic!("{label}: no omega for PK_IDX_CL"));
+            assert_eq!(
+                m.default_params.omega.eta_names[omega_idx], "ETA_CL",
+                "{label}: CL's omega must resolve to ETA_CL"
+            );
+            // KA is unaffected and keeps resolving to its own theta. `PK_IDX_V` is
+            // deliberately not asserted here: layer 2 matches a θ name that
+            // *contains* the parameter name, and `TVCL` contains `V`, so this model
+            // resolves V to `TVCL` both before and after this fix. That is a
+            // pre-existing weakness of the substring fallback, not the placeholder
+            // defect, and is left alone.
+            let ka_idx = find_theta_for_slot(&m, PK_IDX_KA).unwrap();
+            assert_eq!(m.default_params.theta_names[ka_idx], "TVKA", "{label}: KA");
+        }
     }
 }

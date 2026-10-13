@@ -269,6 +269,15 @@ refinement runs on top:
 The CL eta's omega is also updated from inter-subject CV² when ≥ 3 subjects have
 a valid NCA estimate.
 
+Each pooled estimate is routed to the θ behind the individual parameter that the
+`[structural_model]` line actually binds to that PK role. An intermediate the
+block declares on the way — `CLWT = exp(CLWT_EXP * log(WT/70))` above
+`CL = TVCL * CLWT * exp(ETA_CL)`, say — is never mistaken for the role it feeds,
+whatever order the block declares it in. Through ferx 0.4.0 such an intermediate
+could capture the role when it was declared *before* the bound parameter: the
+clearance estimate landed on `CLWT_EXP`, the allometric exponent, and `ETA_CL`'s
+variance was left at the model default (#1899).
+
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
 

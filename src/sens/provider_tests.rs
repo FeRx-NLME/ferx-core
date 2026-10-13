@@ -2392,8 +2392,9 @@ fn lognormal_eta_derivatives_only_matches_full_dp_deta() {
     let eta = [0.15_f64, -0.10];
     let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
 
-    let light = lognormal_eta_derivatives_only(&model, &pk);
-    let full = lognormal_param_derivatives(&model, &subject, &theta, &pk);
+    let rows = model.pk_slot_rows();
+    let light = lognormal_eta_derivatives_only(&model, &pk, &rows);
+    let full = lognormal_param_derivatives(&model, &subject, &theta, &pk, &rows);
 
     assert_eq!(light.len(), full.dp_deta.len());
     for (l_row, f_row) in light.iter().zip(full.dp_deta.iter()) {
@@ -14338,4 +14339,194 @@ fn unbound_parameter_read_by_init_and_obs_scale_matches_fd() {
             );
         }
     }
+}
+
+/// An analytical model with an individual parameter that no `pk(...)` role binds,
+/// no readout reads, and that carries its own η: `S = THS * exp(ETA_S)`. The
+/// literal `ka=1.0` is what makes the Dual2-over-program path decline, so the
+/// closed-form log-normal fallback is the one under test.
+const UNBOUND_LOGNORMAL_AFTER_CL: &str = r#"
+[parameters]
+  theta THCL(0.2, 0.001, 10.0)
+  theta THV(10.0, 0.1, 500.0)
+  theta THS(3.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_S ~ 0.25
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = THCL * exp(ETA_CL)
+  V = THV * exp(ETA_V)
+  S = THS * exp(ETA_S)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The same model with `S` declared **first**. The old `seed_dim_from_slots` (last
+/// row per slot wins) made the defect order-dependent, so both orders are run.
+const UNBOUND_LOGNORMAL_BEFORE_CL: &str = r#"
+[parameters]
+  theta THCL(0.2, 0.001, 10.0)
+  theta THV(10.0, 0.1, 500.0)
+  theta THS(3.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_S ~ 0.25
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  S = THS * exp(ETA_S)
+  CL = THCL * exp(ETA_CL)
+  V = THV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1899: the closed-form log-normal fallback keyed its `∂p/∂(θ,η)` rows by
+/// `pk_indices`, where an individual parameter that owns no PK slot carries the
+/// placeholder `0` — `CL`'s slot. `seed_dim_from_slots` keeps the *last* row per
+/// slot, so `S = THS * exp(ETA_S)` declared after `CL` took `CL`'s compact dual
+/// axis: measured on this fixture before the fix, `∂f/∂η_CL` came back `0` against
+/// FD `-0.0258` at the first observation while `∂f/∂η_S` came back `-0.0258`
+/// against FD `0` — the two columns swapped, with the subject still reported as
+/// analytic-supported and no FD fallback and no warning. A wrong FOCE/FOCEI
+/// gradient.
+///
+/// Asserted on the full provider against central FD of the production predictor
+/// (the oracle AGENTS.md mandates for a sensitivity change) **and** on the light
+/// η-only provider, which is a second call site of the same fallback: mutating
+/// either one alone must redden its own assert.
+///
+/// The fixture is checked to actually reach the fallback — a model whose program
+/// path is live never builds these rows, so it could not observe the defect.
+#[test]
+fn an_unbound_lognormal_parameter_does_not_steal_cls_gradient_row() {
+    for (label, src) in [
+        ("S after CL", UNBOUND_LOGNORMAL_AFTER_CL),
+        ("S before CL", UNBOUND_LOGNORMAL_BEFORE_CL),
+    ] {
+        let m = parse_model_string(src).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(
+            analytical_supported(&m),
+            "{label}: must stay on the analytic provider"
+        );
+        // The row builder under test only runs on the fallback, so pin that this
+        // fixture takes it: the `ka=1.0` literal leaves `PK_IDX_KA` out of the
+        // program's slot list, and the log-normal chain is exact here.
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("a parsed model carries a program");
+        assert!(
+            !prog_covers_required_pk_slots(&m, prog),
+            "{label}: fixture must reach the log-normal fallback, not the program path"
+        );
+        assert!(
+            lognormal_chain_exact(&m),
+            "{label}: fallback must be in scope, or the subject routes to FD"
+        );
+        // The precondition for the defect: `S`'s `pk_indices` entry *is* CL's slot.
+        let s_pos = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
+        assert_eq!(
+            m.pk_indices[s_pos], PK_IDX_CL,
+            "{label}: S must still carry the placeholder slot"
+        );
+
+        let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = [0.2, 10.0, 3.0];
+        let eta = [0.1, -0.05, 0.2];
+
+        // The rows the fallback hands its caller: CL and V only, each slot once.
+        let pk = (m.pk_param_fn)(&theta, &eta, &s.covariates, 0.0);
+        let (_, slots) =
+            resolve_param_derivs(&m, &s, &theta, &eta, &pk).expect("fallback resolves");
+        let mut sorted = slots.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![PK_IDX_CL, PK_IDX_V],
+            "{label}: only the two bound parameters own a slot: {slots:?}"
+        );
+
+        // Full provider: value, ∂η, ∂²η, ∂θ, ∂²η∂θ vs central FD of production.
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+        // Light η-only provider — the second call site of the same fallback.
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        let he = 1e-6;
+        let pred =
+            |e: &[f64], j: usize| -> f64 { compute_predictions_with_tv(&m, &s, &theta, e)[j] };
+        for (j, g) in light.iter().enumerate() {
+            for k in 0..m.n_eta {
+                let mut ep = eta.to_vec();
+                ep[k] += he;
+                let mut em = eta.to_vec();
+                em[k] -= he;
+                let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+                assert!(
+                    g.df_deta[k].is_finite() && fd.is_finite(),
+                    "{label}: light obs {j} eta {k}: non-finite ({} vs {fd})",
+                    g.df_deta[k]
+                );
+                approx::assert_relative_eq!(g.df_deta[k], fd, max_relative = 2e-4, epsilon = 1e-7);
+            }
+        }
+    }
+}
+
+/// #1899 acceptance, the issue's own fixture: `KEL = CL / V` is not
+/// `g(θ, cov)·exp(η)`, so the #1669 measured log-normal flag is false and the
+/// subject **routes to FD** rather than taking the fallback at all — there is no
+/// analytic row for the placeholder to corrupt. Pins that routing, which is the
+/// other half of the acceptance ("or that subject routes to FD").
+///
+/// The straddle matters: the model-level gate still says analytic-supported, so a
+/// change that made `lognormal_chain_exact` permissive here would silently put a
+/// derived intermediate back on the closed-form chain, where `pk·sel` is simply
+/// the wrong formula for `CL/V`. The companion fixture above is the same shape
+/// with the chain exact, and it must *not* decline — asserting both sides of the
+/// gate in one test, so forcing either branch reddens it.
+#[test]
+fn a_derived_intermediate_routes_the_subject_to_fd() {
+    const KEL_FROM_CL_AND_V: &str = r#"
+[parameters]
+  theta THCL(0.2, 0.001, 10.0)
+  theta THV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = THCL * exp(ETA_CL)
+  V = THV * exp(ETA_V)
+  KEL = CL / V
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(KEL_FROM_CL_AND_V).expect("parse");
+    let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+    let theta = [0.2, 10.0];
+    let eta = [0.1, -0.05];
+    assert!(
+        !lognormal_chain_exact(&m),
+        "KEL = CL/V is not g(theta)*exp(eta), so the closed-form chain is out of scope"
+    );
+    assert!(
+        subject_sensitivities(&m, &s, &theta, &eta).is_none(),
+        "the full provider must decline so the caller finite-differences"
+    );
+    assert!(
+        subject_eta_grad(&m, &s, &theta, &eta).is_none(),
+        "the light provider must decline so the inner loop finite-differences"
+    );
+    // The other side of the same gate: with the intermediate log-normal in its own
+    // right the chain IS exact and the providers must serve it.
+    let ok = parse_model_string(UNBOUND_LOGNORMAL_AFTER_CL).expect("parse");
+    assert!(lognormal_chain_exact(&ok));
+    assert!(subject_sensitivities(&ok, &s, &[0.2, 10.0, 3.0], &[0.1, -0.05, 0.2]).is_some());
 }
