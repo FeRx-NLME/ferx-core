@@ -30196,6 +30196,13 @@ fn too_many_unbound_parameters_for_the_free_slots_is_refused() {
 // ---- #1853: per-parameter `TIME` dependence, and which reads are the disposition ----
 
 /// A joint PK-TTE ODE model whose `[individual_parameters]` block is `ip`.
+///
+/// `survival`-gated, with every test below that uses it: the parser refuses an
+/// `[event_model]` block outright without that feature ("requires building ferx-core with
+/// `--features survival`"), so an ungated test here is red in the `--features ci` job and
+/// green in the one that has it. `cargo check --tests` cannot see it — the gate is the
+/// parser's answer at run time, not a compile error.
+#[cfg(feature = "survival")]
 fn time_taint_model(ip: &str) -> CompiledModel {
     let m = format!(
         r"
@@ -30230,6 +30237,7 @@ fn time_taint_model(ip: &str) -> CompiledModel {
 }
 
 /// `(name, reads TIME)` pairs, in declaration order, for the model built from `ip`.
+#[cfg(feature = "survival")]
 fn time_mask_of(ip: &str) -> Vec<(String, bool)> {
     let model = time_taint_model(ip);
     let mask = model
@@ -30248,6 +30256,7 @@ fn time_mask_of(ip: &str) -> Vec<(String, bool)> {
 
 /// `name`'s entry in the mask; panics if the model has no such parameter, so a renamed
 /// fixture fails loudly instead of silently asserting about nothing.
+#[cfg(feature = "survival")]
 fn reads_time(mask: &[(String, bool)], name: &str) -> bool {
     mask.iter()
         .find(|(n, _)| n == name)
@@ -30259,6 +30268,7 @@ fn reads_time(mask: &[(String, bool)], name: &str) -> bool {
 /// is flagged and its time-free siblings are not. Both halves matter — a mask stuck
 /// on `true` (the whole-block flag `uses_time_builtin`, which the refusal must not
 /// use) passes the first assertion and fails the rest.
+#[cfg(feature = "survival")]
 #[test]
 fn the_time_mask_flags_only_the_parameter_that_reads_time() {
     let mask = time_mask_of(
@@ -30280,6 +30290,7 @@ fn the_time_mask_flags_only_the_parameter_that_reads_time() {
 /// Taint is **transitive**: a parameter whose own right-hand side never mentions
 /// `TIME` still depends on it through an intermediate that does. The fixpoint is
 /// what finds this; a single straight-line pass would miss the forward reference.
+#[cfg(feature = "survival")]
 #[test]
 fn the_time_mask_propagates_through_an_intermediate() {
     let mask = time_mask_of(
@@ -30302,6 +30313,7 @@ fn the_time_mask_propagates_through_an_intermediate() {
 /// no branch body mentions `TIME`: which value `CL` takes is a function of `TIME`.
 /// `V` is assigned in the same `if` to pin that the rule is the condition's, not the
 /// branch's: both are tainted here, and the time-free control is `KA`, outside.
+#[cfg(feature = "survival")]
 #[test]
 fn the_time_mask_taints_an_assignment_under_a_time_reading_condition() {
     let mask = time_mask_of(
@@ -30342,6 +30354,7 @@ fn the_time_mask_taints_an_assignment_under_a_time_reading_condition() {
 ///
 /// `AUX` is the control: it is assigned in the `TIME`-reading arm, so it must be tainted
 /// either way, and `KA` outside the `if` must not be.
+#[cfg(feature = "survival")]
 #[test]
 fn the_time_mask_taints_an_else_if_body_governed_by_an_earlier_time_condition() {
     let mask = time_mask_of(
@@ -30373,6 +30386,7 @@ fn the_time_mask_taints_an_else_if_body_governed_by_an_earlier_time_condition() 
 
 /// No `TIME` anywhere in `[individual_parameters]` ⇒ every entry is `false`. The
 /// straddle against the three tests above, and the fast path the #1853 gate exits on.
+#[cfg(feature = "survival")]
 #[test]
 fn the_time_mask_is_empty_for_a_time_free_block() {
     let ip = "  CL   = TVCL * exp(ETA_CL)\n\
@@ -30401,6 +30415,7 @@ fn the_time_mask_is_empty_for_a_time_free_block() {
 /// This is the predicate that keeps the #1853 refusal off the #1575 fixture, so a
 /// mutation making it answer `true` for everything (`|| true`, or asking the PK slot
 /// instead of the var slot) has to redden here.
+#[cfg(feature = "survival")]
 #[test]
 fn only_a_read_the_accumulator_depends_on_counts() {
     const M: &str = r"
@@ -30485,6 +30500,7 @@ fn only_a_read_the_accumulator_depends_on_counts() {
 /// The straddle is the same model with `hazard = H0 * exp(BETA * central / V)`, where the
 /// accumulator does depend on them — asserted here, so "nothing reaches the accumulator"
 /// cannot silently become the answer for every model.
+#[cfg(feature = "survival")]
 #[test]
 fn a_parameter_the_accumulator_does_not_depend_on_is_not_in_the_slice() {
     const M: &str = r"
@@ -30551,6 +30567,7 @@ fn a_parameter_the_accumulator_does_not_depend_on_is_not_in_the_slice() {
 /// a state nothing returns from, so it does not. Both are read by an init and by nothing
 /// else, so the only thing separating them is the state test — which a mutation dropping
 /// it would collapse.
+#[cfg(feature = "survival")]
 #[test]
 fn an_init_seed_counts_only_for_a_state_the_accumulator_depends_on() {
     const M: &str = r"
@@ -30637,6 +30654,7 @@ fn an_init_seed_counts_only_for_a_state_the_accumulator_depends_on() {
 /// `has_indiv_param` is what keeps the gate correct if it ever does move — a trailing
 /// name's var slot does not exist, and `state_count + i` past the end is an
 /// *intermediate's* slot, so the accessors would answer about an unrelated variable.
+#[cfg(feature = "survival")]
 #[test]
 fn every_indiv_param_name_is_in_scope_for_the_compiled_odes_block() {
     const M: &str = r"
