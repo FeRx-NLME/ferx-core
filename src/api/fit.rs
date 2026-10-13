@@ -1707,7 +1707,24 @@ fn fit_inner(
                     && cp.stage_idx < n_stages
                     && cp.packed.len()
                         == crate::estimation::parameterization::packed_len(init_params);
-                if hashes_ok && layout_ok {
+                // #1617 review round 8: and the recorded objective has to be one. A file
+                // written by a build predating #1617 can hold the EBE guard's *rejection
+                // penalty* instead of an objective — those writes are gated on a feasible
+                // evaluation now, but the gate cannot reach a file that already exists, and
+                // nothing else here would refuse it: `SCHEMA_VERSION` is unchanged (the
+                // layout is compatible) and `ferx_version` is recorded but not compared. Its
+                // `packed` is then the scaled midpoint of the declared bounds, so a resume
+                // would adopt that as its own start and report it — #1617's point defect,
+                // surviving an upgrade.
+                //
+                // The test is the field's own contract rather than a new threshold:
+                // `Checkpoint::ofv` is documented as "the unpenalized −2LL at that point"
+                // for the deterministic optimizers, and every value `guard_penalty_value`
+                // can return is at or above [`GUARD_PENALTY_BASE`], five orders of magnitude
+                // past any legitimate population objective. Written as `<` so a `NaN` ofv is
+                // refused too.
+                let objective_ok = cp.ofv < crate::estimation::outer_optimizer::GUARD_PENALTY_BASE;
+                if hashes_ok && layout_ok && objective_ok {
                     stage_params =
                         crate::estimation::parameterization::unpack_params(&cp.packed, init_params);
                     start_stage = cp.stage_idx;
@@ -1731,11 +1748,13 @@ fn fit_inner(
                     // are simply unavailable we can't prove staleness, so we start
                     // fresh but keep the checkpoint (a later run that does supply
                     // hashes may still use it; a successful fit removes it anyway).
-                    let stale = (hashes_present && !hashes_match) || !layout_ok;
+                    let stale = (hashes_present && !hashes_match) || !layout_ok || !objective_ok;
                     let reason = if hashes_present && !hashes_match {
                         "model or data changed since it was written"
                     } else if !layout_ok {
                         "its parameter layout does not match this model"
+                    } else if !objective_ok {
+                        "it records a rejection penalty rather than an objective, so the run                          that wrote it had no feasible evaluation"
                     } else {
                         "its model/data integrity hashes are unavailable"
                     };

@@ -1229,8 +1229,21 @@ fn ebe_guard_rejects(
 /// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
 /// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
 /// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+/// The floor of [`guard_penalty_value`] — the wall a guard-rejected gradient evaluation
+/// returns before the quadratic term is added, so every value that function can produce is
+/// `>= GUARD_PENALTY_BASE`.
+///
+/// Named and `pub(crate)` because `api::fit`'s resume check reads it (#1617 review round 8):
+/// a checkpoint whose recorded objective is at or above this floor was written from a
+/// guard-rejected point, which violates [`crate::io::checkpoint::Checkpoint::ofv`]'s own
+/// contract ("the unpenalized −2LL at that point") and means the file came from a run with
+/// no feasible evaluation. Far above any legitimate population objective — real −2 log L
+/// reaches ~10⁶–10⁷ even for very large cohorts, five orders below this — and below the
+/// `1e20` wall the derivative-free arm returns, so it catches both shapes.
+pub(crate) const GUARD_PENALTY_BASE: f64 = 1e12;
+
 fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
-    const BASE: f64 = 1e12;
+    const BASE: f64 = GUARD_PENALTY_BASE;
     let pen: f64 = xs
         .iter()
         .enumerate()

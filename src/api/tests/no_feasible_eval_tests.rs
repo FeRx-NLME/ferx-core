@@ -49,6 +49,7 @@
 //! | `no_feasible()` broadened so it claims a feasible run | U1 **and** E2 |
 //! | either per-evaluation tally records one rejection per *run* | E1 (guard) and E5 (non-finite), each "all 1 of its trials" against 4 |
 //! | the checkpoint write's feasible-eval gate dropped | E6 — a resume point holding the midpoint in all four packed coordinates |
+//! | `&& objective_ok` dropped from the resume condition | E8 — resumes from a pre-fix penalty checkpoint and reports θ = `[0.1414, 7.0711]` |
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
@@ -850,6 +851,95 @@ fn an_infeasible_derivative_free_run_also_reports_its_start() {
         "got {}",
         result.omega[(0, 0)]
     );
+}
+
+/// **E8 — a pre-fix checkpoint is refused, not resumed from** (#1617 review round 8).
+///
+/// E6 stops the new code *writing* an infeasible checkpoint, but a gate inside the
+/// objective cannot reach a file that already exists. A build predating this fix wrote the
+/// guard penalty's minimum whenever an all-rejected run was interrupted, and nothing on the
+/// resume path would have refused it: `SCHEMA_VERSION` is unchanged because the layout is
+/// compatible, and `ferx_version` is recorded but never compared. The resumed fit would
+/// adopt the midpoint as its own start and report it — #1617's point defect, surviving an
+/// upgrade, with E6 green because it deletes any existing file before testing.
+///
+/// The fixture is a pre-fix checkpoint built by hand: the midpoint in packed space
+/// (`ln(sqrt(lower·upper))` per θ, the log-rail centres for ω and σ — the exact vector the
+/// unfixed code was measured writing) and `ofv = 1e12 + 37.0`, a guard-penalty value rather
+/// than an objective. Both integrity hashes are supplied and matching, and `coord_names`
+/// comes from `coordinate_names` rather than being spelled out, so the file passes every
+/// *other* resume check — otherwise this test would pass through the hash or layout arm and
+/// assert nothing about the new one. That is what assertion (1) pins.
+///
+/// Mutation (run): drop `&& objective_ok` from the resume condition → the fit resumes from
+/// the midpoint, reports it, and assertions (1) and (2) fire.
+#[test]
+fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let path = std::env::temp_dir()
+        .join(format!("ferx_ckpt_1617_legacy_{}.tmp", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+
+    // The packed midpoint, as the pre-fix code wrote it: θ log-packed, ω Cholesky-log and
+    // σ log at their rail centres.
+    let packed = vec![BOUND_MIDPOINT[0].ln(), BOUND_MIDPOINT[1].ln(), 0.0, -1.5];
+    let cp = crate::io::checkpoint::Checkpoint {
+        schema_version: 1,
+        ferx_version: "0.4.0".to_string(),
+        model_hash: Some("mh".to_string()),
+        data_hash: Some("dh".to_string()),
+        method_chain: vec!["focei".to_string()],
+        stage_idx: 0,
+        packed,
+        coord_names: crate::estimation::parameterization::coordinate_names(&model.default_params),
+        iter: 3,
+        // A guard-penalty value, not an objective: `GUARD_PENALTY_BASE` plus a quadratic term.
+        ofv: 1e12 + 37.0,
+        unix_time: 1,
+    };
+    crate::io::checkpoint::save_atomic(&path, &cp).expect("seed the checkpoint");
+
+    let options = FitOptions {
+        checkpoint: true,
+        checkpoint_path: Some(path.clone()),
+        checkpoint_model_hash: Some("mh".to_string()),
+        checkpoint_data_hash: Some("dh".to_string()),
+        checkpoint_interval_secs: 3600,
+        ..opts(3)
+    };
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+
+    // (1) It was refused for *this* reason, not for a hash or layout mismatch — otherwise
+    //     the test would be asserting one of the pre-existing checks.
+    let msg = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("Ignoring checkpoint"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the seeded checkpoint must be refused; warnings were {:?}",
+                result.warnings
+            )
+        });
+    assert!(
+        msg.contains("records a rejection penalty rather than an objective"),
+        "refused for the wrong reason, so the new check is not what this test exercises: \
+         {msg}"
+    );
+    // (2) ...so the fit started from the model's initial estimates, not the midpoint.
+    for (i, init) in [2.0_f64, 10.0].iter().enumerate() {
+        assert!(
+            (result.theta[i] - init).abs() <= 1e-9 * init,
+            "a refused checkpoint must leave the fit starting at its declared initials; \
+             theta[{i}] = {} where {init} was declared ({} is the midpoint)",
+            result.theta[i],
+            BOUND_MIDPOINT[i],
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
