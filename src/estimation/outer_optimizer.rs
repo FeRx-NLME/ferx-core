@@ -1908,22 +1908,6 @@ pub(crate) struct RunFeasibility {
     pub(crate) n_guard_rejected: usize,
     /// Worst per-evaluation unconverged-subject count seen (the fraction trigger).
     pub(crate) max_unconverged: usize,
-    /// Worst per-evaluation start-rejected-subject count seen (the hard trigger).
-    ///
-    /// **Zero on every run this struct is built for, as the code stands**, and
-    /// deliberately kept rather than assumed away (#1617 review round 1 #4). The hard
-    /// trigger fires only through `has_informative_warm_start` in
-    /// `inner_optimizer::find_ebe_iov` — some |η| > 1e-8 carried in from a previous
-    /// trial — and [`adopt_warm_start`] withholds the EBE cache update on every guarded
-    /// evaluation (#1290), so a run whose evaluations were *all* guarded still holds the
-    /// `new_nlopt_state` zeros and no subject can be start-rejected. There is therefore no
-    /// end-to-end fixture for the arm this field selects, and the invariant it rests on is
-    /// pinned by `adopt_warm_start_takes_only_feasible_improvements`
-    /// (`adopt_warm_start(true, …)` is false for every objective pair). Change that rule
-    /// and this arm comes alive; its prose is checked against
-    /// `reject_ode_iov_inner_start`, which returns `false` unless `is_ode_iov(model)`,
-    /// rather than against a run.
-    pub(crate) max_start_rejected: usize,
     /// Subjects in the population — the denominator the guard's fraction is taken over.
     pub(crate) n_subj: usize,
     /// `FitOptions::max_unconverged_frac`, quoted back in the remedy.
@@ -1970,17 +1954,27 @@ impl RunFeasibility {
 /// the last, because the last trial of a centre-seeking walk is the least informative
 /// one and "how bad did it get" is what sizes `inner_maxiter`.
 ///
-/// Three cause arms, because the remedies are not the same thing:
+/// Two cause arms, because the remedies are not the same thing:
 ///
-/// * a **start rejection** is unconditional — [`ebe_guard_rejects`] ignores
-///   `max_unconverged_frac` for it — so neither knob in the other arm's advice would
-///   change the outcome, and saying otherwise would send the reader round a loop. This is
-///   the one arm with no reachable production input today; see
-///   [`RunFeasibility::max_start_rejected`] for why, and for what would change it;
-/// * the **fraction** trigger is the one `inner_maxiter` and `max_unconverged_frac`
-///   actually move;
-/// * a trace of **non-finite** objectives never involved the guard at all, so naming
-///   the guard there would be false.
+/// * the **guard** rejected the trials, which is the case `inner_maxiter` and
+///   `max_unconverged_frac` move;
+/// * a trace of **non-finite** objectives never involved the guard at all, so naming the
+///   guard there would be false, and the remedy is the data/model one
+///   [`gate_converged_on_objective`] gives.
+///
+/// [`ebe_guard_rejects`] has a *second*, unconditional trigger — a subject rejected at its
+/// inner start — and this message deliberately does **not** branch on it (#1617 review
+/// rounds 1 #4 / 2 #4). That trigger fires only through `has_informative_warm_start` in
+/// `inner_optimizer::find_ebe_iov`, i.e. some |η| > 1e-8 carried in from a previous trial,
+/// and [`adopt_warm_start`] withholds the EBE cache update on every guarded evaluation
+/// (#1290) — so a run whose evaluations were *all* guarded still holds the
+/// `new_nlopt_state` zeros and no subject can be start-rejected. An arm for it would be
+/// advice no run can produce, which is prose nobody has checked; the earlier version
+/// shipped one and it is gone. The guard arm's sentence is therefore worded to stay *true*
+/// rather than merely useful if that cell is ever reached — "at worst N of M … failed to
+/// converge, **against** `max_unconverged_frac`", not "above" it, so a rejection that was
+/// not the fraction trigger's is not misdescribed. The invariant the unreachability rests
+/// on is pinned by `adopt_warm_start_takes_only_feasible_improvements`.
 ///
 /// `cancelled` short-circuits the whole thing: a cancelled run returns `1e20` from the
 /// top of the objective before the feasible counter advances, so its trace is
@@ -1995,28 +1989,11 @@ pub(crate) fn no_feasible_eval_warning(
     *converged = false;
 
     let n_subj = run.n_subj.max(1);
-    let (cause, remedy) = if run.max_start_rejected > 0 {
+    let (cause, remedy) = if run.n_guard_rejected > 0 {
         (
             format!(
-                "{} of {} subjects were rejected at their inner start on the worst trial — a \
-                 warm-start individual likelihood that is not a usable number — and that \
-                 trigger of the EBE convergence guard is unconditional, so no \
-                 `max_unconverged_frac` relaxes it.",
-                run.max_start_rejected, n_subj,
-            ),
-            "Change the model or its initial estimates rather than the optimizer settings: a \
-             start rejection means the individual objective was already degenerate at the \
-             previous trial's EBEs, which neither `inner_maxiter` nor `max_unconverged_frac` \
-             reaches. The trigger fires only on an ODE model with inter-occasion \
-             variability, so check `ode_reltol` / `ode_abstol` and the initial estimates of \
-             the parameters the occasion effects multiply."
-                .to_string(),
-        )
-    } else if run.n_guard_rejected > 0 {
-        (
-            format!(
-                "the EBE convergence guard rejected {} of them, with up to {} of {} subjects' \
-                 inner loops unconverged — above `max_unconverged_frac` = {}.",
+                "the EBE convergence guard rejected {} of them; at worst {} of {} subjects' \
+                 inner loops failed to converge, against `max_unconverged_frac` = {}.",
                 run.n_guard_rejected, run.max_unconverged, n_subj, run.max_unconverged_frac,
             ),
             format!(
@@ -2961,12 +2938,6 @@ fn optimize_nlopt_once(
         max_unconverged: usize,
         total_fallback: usize,
         n_convergence_warnings: usize,
-        /// Worst `n_start_rejected` seen (#1617). The guard's two triggers have
-        /// different remedies — `inner_maxiter` / `max_unconverged_frac` relax the
-        /// fraction trigger and neither touches a start rejection — so the
-        /// no-feasible-evaluation warning has to know which one fired, and
-        /// `n_convergence_warnings` counts them together.
-        max_start_rejected: usize,
     }
     let ebe_accum: Arc<Mutex<EbeAccum>> = Arc::new(Mutex::new(EbeAccum::default()));
     let ebe_accum_cl = Arc::clone(&ebe_accum);
@@ -3147,9 +3118,6 @@ fn optimize_nlopt_once(
             let mut acc = ebe_accum_cl.lock().unwrap();
             if acc.max_unconverged < ebe_stats.n_unconverged {
                 acc.max_unconverged = ebe_stats.n_unconverged;
-            }
-            if acc.max_start_rejected < ebe_stats.n_start_rejected {
-                acc.max_start_rejected = ebe_stats.n_start_rejected;
             }
             acc.total_fallback += ebe_stats.n_fallback;
             if ebe_guard_triggered {
@@ -3601,7 +3569,6 @@ fn optimize_nlopt_once(
             n_evals: n_evals_outer.load(Ordering::Relaxed),
             n_guard_rejected: ebe_now.n_convergence_warnings,
             max_unconverged: ebe_now.max_unconverged,
-            max_start_rejected: ebe_now.max_start_rejected,
             n_subj,
             max_unconverged_frac: options.max_unconverged_frac,
             inner_maxiter: options.inner_maxiter,
@@ -3609,19 +3576,32 @@ fn optimize_nlopt_once(
         }
     };
 
+    // Whether "increase `maxiter`" is advice this run can act on (#1617 review). A run
+    // with no feasible evaluation cannot: there is no fit to tighten, and a longer *outer*
+    // budget buys only more rejected trials. `W_NO_FEASIBLE_EVAL` names the budget that
+    // actually binds — `inner_maxiter`, or `max_unconverged_frac` — so offering the outer
+    // knob beside it sends the reader at the wrong one. Only the *advice* is withheld:
+    // `max_eval_reached` itself still reads true, so `latched_stop_needs_plateau_check`
+    // above and the second arm's own conditions are unchanged.
+    //
+    // One binding read by **both** budget warnings rather than the same condition written
+    // twice (#1617 review round 2 #2). The `MaxEvalReached` arm just below is reachable and
+    // pinned by `a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter`; the bare
+    // `Failure`-with-spent-budget arm further down is not, and for a structural reason —
+    // that arm needs NLopt to return a bare `Failure`, and the guard penalty is an exact
+    // quadratic whose value and gradient agree by construction (#486), so no line search
+    // fails on it. Measured with this gate removed, across `slsqp` / `nlopt_lbfgs` / `mma`
+    // at three outer budgets on an all-rejected trace: every run came back in a *success*
+    // state with its budget exactly spent, so `!max_eval_reached` excluded the arm in all
+    // nine cases. Written twice, the unreachable copy would be an independently-breakable
+    // gate no test can reach; collapsed, the mutation that reddens E4 covers both sites.
+    let budget_advice_applies = !feasibility.no_feasible();
+
     // A spent evaluation budget gets a targeted "increase maxiter" warning; every
     // other non-convergence falls through to the generic "did not converge"
     // warning below. There is no automatic second optimization — a user who wants
     // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
-    //
-    // Not when nothing was feasible (#1617 review): "increase maxiter for a tighter fit"
-    // offers to tighten a fit that does not exist, and a longer budget buys only more
-    // rejected trials. `W_NO_FEASIBLE_EVAL` names the budget that actually binds —
-    // `inner_maxiter`, or `max_unconverged_frac` — so the generic advice here would send
-    // the reader at the wrong knob. Only the *advice* is withheld: `max_eval_reached`
-    // itself still reads true, so the `stalled_mid_descent && !budget_left` arm below and
-    // `latched_stop_needs_plateau_check` above are unchanged.
-    if max_eval_reached && !feasibility.no_feasible() {
+    if max_eval_reached && budget_advice_applies {
         warnings.push(format!(
             "Outer optimization hit the evaluation budget (maxiter = {}) before \
              converging; increase maxiter for a tighter fit.",
@@ -3983,9 +3963,9 @@ fn optimize_nlopt_once(
     // budget, not the stall — a line search that fails after crossing `maxeval`
     // is a bare `Failure`, so the `max_eval_reached` branch above never saw it.
     // Same advice as that branch, not pushed twice.
-    // `!feasibility.no_feasible()` for the same reason as the `max_eval_reached` arm
-    // above: a run that never scored the objective has no fit to tighten (#1617 review).
-    if stalled_mid_descent && !budget_left && !max_eval_reached && !feasibility.no_feasible() {
+    // `budget_advice_applies` for the same reason as the `max_eval_reached` arm above, and
+    // from the same binding — see the comment there for why it is one binding and not two.
+    if stalled_mid_descent && !budget_left && !max_eval_reached && budget_advice_applies {
         warnings.push(format!(
             "Outer optimization stopped mid-descent with its evaluation budget (maxiter = {}) \
              spent, so it was not restarted; increase maxiter for a tighter fit.",

@@ -46,19 +46,22 @@
 //! | drop the `no_feasible_eval_warning` call only | E1 — assertion 2, at θ = `[2.0, 10.0]` |
 //! | drop the `optimizer_start_s` fallback only | E1 — assertion 3, θ[0] = `0.14142136177403178` |
 //! | call site passes `cancelled: false` | E3 |
-//! | drop `&& !feasibility.no_feasible()` from the `max_eval_reached` arm | E4 |
-//! | `classify_warning`'s token arm off | U7 **and** E1 assertion 5 — `Warning`/`general` |
-//! | hard-reject **remedy** sentence deleted whole | U4 |
+//! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
+//! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
+//! | `classify_warning`'s token arm off | U6 **and** E1 assertion 5 — `Warning`/`general` |
+//! | the non-finite arm's **remedy** sentence deleted whole | U4 |
 //!
 //! The last row is the #1405 shape — a diagnostic's advice half that no test can kill is a
 //! claim nobody has checked — so every *other* sentence of the warning is covered the same
-//! way rather than by control-flow mutation alone: each of U3/U4/U5/U6 asserts a verbatim
-//! substring of each sentence it owns (head and both clauses of the fraction arm in U3, the
-//! hard-reject cause and remedy in U4, the non-finite cause and remedy in U5, the
-//! mixed-trace clause in U6), so deleting or rewording a sentence necessarily fails a named
-//! assertion. The two arms that deliberately *withhold* the other's advice assert their own
-//! remedy text, not merely the absence of the other's.
+//! way rather than by control-flow mutation alone: each of U3/U4/U5 asserts a verbatim
+//! substring of each sentence it owns (head and both clauses of the guard arm in U3, the
+//! non-finite cause and remedy in U4, the mixed-trace clause in U5), so deleting or
+//! rewording a sentence necessarily fails a named assertion. The arm that deliberately
+//! *withholds* the other's advice asserts its own remedy text, not merely the absence of
+//! the other's. E5 is the end-to-end twin of U4: the two can break independently, and the
+//! arm-order mutation reddens both.
 use super::*;
+use crate::api::nonfinite_objective_tests::{subject_with_dose_time, two_state_model};
 use crate::estimation::outer_optimizer::{
     no_feasible_eval_warning, RunFeasibility, NO_FEASIBLE_EVAL_TOKEN,
 };
@@ -420,6 +423,97 @@ fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
     );
 }
 
+/// **E5 — the non-finite arm, end to end** (#1617 review round 2 #3).
+///
+/// U4 pins the *message* for a trace of non-finite objectives, but on a synthetic
+/// `RunFeasibility`. This pins the *wiring*: that production really does classify such a
+/// run into that arm rather than the guard's. The two are independently breakable — the
+/// call site could miscount `n_guard_rejected`, or the guard could claim the run — and
+/// nothing in U4 would notice.
+///
+/// The fixture is #1296's / #1303's, reused unchanged: a two-state ODE population one of
+/// whose subjects carries a `NaN` dose time, so `timeline_has_non_finite` `NaN`-fills it
+/// and the objective is `NaN` for the whole population. That lands in this arm rather than
+/// the guard's for a reason worth stating, because it is the arm's own entry condition:
+/// `ebe_guard_rejects` needs `raw_ofv.is_finite()` for its fraction trigger and
+/// `is_ode_iov(model)` for its unconditional one, and this model is ODE but has no IOV —
+/// so the guard never fires, `n_guard_rejected` stays 0, and `guarded` is true purely
+/// because the objective is not a number.
+///
+/// This is also the end-to-end check for the claim
+/// [`docs/estimation/foce.qmd`](../../docs/estimation/foce.qmd) makes about this row and
+/// round 1 of review corrected: **both** warnings appear, because they are two different
+/// facts — `W_NO_FEASIBLE_EVAL` about the trace, `W_NONFINITE_OBJECTIVE` about the number
+/// the run finally reported.
+///
+/// Mutation (run): drop the `no_feasible_eval_warning` call → assertion (2) fires. Swap
+/// the arm order in `no_feasible_eval_warning` so the guard arm claims a trace with
+/// `n_guard_rejected == 0` → assertion (3) fires.
+#[test]
+fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
+    let model = two_state_model();
+    let pop = Population {
+        subjects: vec![
+            subject_with_dose_time("bad", f64::NAN, 1.0),
+            subject_with_dose_time("2", 0.0, 1.2),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts(200)).expect("fit");
+
+    // (1) The fixture still delivers this test's input.
+    assert!(
+        result.ofv.is_nan(),
+        "this fixture exists to make every objective non-finite; it reported {}",
+        result.ofv
+    );
+    // (2) The trace is reported as infeasible...
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains(NO_FEASIBLE_EVAL_TOKEN))
+        .unwrap_or_else(|| {
+            panic!(
+                "a run whose every objective was non-finite has no feasible evaluation \
+                 either, and must say so; got {:?}",
+                result
+                    .warnings_structured
+                    .iter()
+                    .map(|w| &w.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+    // (3) ...through the non-finite arm, not the guard's: the guard never fired here, so
+    //     naming it would be false, and `inner_maxiter` is not the budget that binds.
+    assert!(
+        entry
+            .message
+            .contains("every trial returned a non-finite objective"),
+        "{}",
+        entry.message
+    );
+    assert!(
+        !entry.message.contains("Raise `inner_maxiter`"),
+        "a non-finite objective is not an inner-budget problem: {}",
+        entry.message
+    );
+    // (4) ...and the objective gate speaks for itself. Two facts, two warnings — the
+    //     claim the docs make about this row.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+        "the reported objective is `NaN` here, so its own gate must fire too: {:?}",
+        result.warnings
+    );
+    assert!(!result.converged);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  U1..U6 — `no_feasible_eval_warning`, every cell of its input space
 //
@@ -435,7 +529,6 @@ fn fraction_run() -> RunFeasibility {
         n_evals: 7,
         n_guard_rejected: 7,
         max_unconverged: 9,
-        max_start_rejected: 0,
         n_subj: 10,
         max_unconverged_frac: 0.1,
         inner_maxiter: 3,
@@ -496,8 +589,16 @@ fn the_fraction_trigger_names_the_share_and_both_knobs() {
         msg.contains("the EBE convergence guard rejected 7 of them"),
         "{msg}"
     );
-    assert!(msg.contains("up to 9 of 10 subjects"), "{msg}");
-    assert!(msg.contains("max_unconverged_frac` = 0.1"), "{msg}");
+    assert!(msg.contains("at worst 9 of 10 subjects"), "{msg}");
+    // "against", not "above". `ebe_guard_rejects` has a second, unconditional trigger this
+    // message does not branch on (see its doc comment), so the sentence must not assert
+    // that the fraction threshold is what was exceeded — it reports the share and the
+    // threshold and lets them be read together.
+    assert!(
+        msg.contains("against `max_unconverged_frac` = 0.1"),
+        "{msg}"
+    );
+    assert!(!msg.contains("above `max_unconverged_frac`"), "{msg}");
     // The remedy sentence.
     assert!(msg.contains("Raise `inner_maxiter` (currently 3)"), "{msg}");
     assert!(msg.contains("`1.0` disables the guard"), "{msg}");
@@ -505,51 +606,7 @@ fn the_fraction_trigger_names_the_share_and_both_knobs() {
     assert!(!msg.contains("The remaining"), "{msg}");
 }
 
-/// **U4 — the hard-reject arm.** A start rejection ignores `max_unconverged_frac`
-/// ([`ebe_guard_rejects`] returns before reading it), so the message must say so and
-/// must **not** offer the fraction arm's two knobs. Offering them would send the
-/// reader round a loop: both can be raised to their limits and the trial is still
-/// rejected.
-#[test]
-fn a_start_rejection_does_not_advise_the_knobs_that_cannot_help() {
-    let mut converged = true;
-    let run = RunFeasibility {
-        max_start_rejected: 4,
-        max_unconverged: 0,
-        ..fraction_run()
-    };
-    let msg = no_feasible_eval_warning(&mut converged, &run).expect("a warning");
-    assert!(!converged);
-    // The cause sentence.
-    assert!(
-        msg.contains("4 of 10 subjects were rejected at their inner start"),
-        "{msg}"
-    );
-    assert!(msg.contains("unconditional"), "{msg}");
-    // The remedy sentence — asserted in its own right, not inferred from the absence of
-    // the other arm's advice. `!contains("Raise `inner_maxiter`")` alone would stay green
-    // with the whole advice half deleted, which is #1405's failure mode.
-    assert!(
-        msg.contains("Change the model or its initial estimates"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("neither `inner_maxiter` nor `max_unconverged_frac` reaches"),
-        "{msg}"
-    );
-    // True of every input that reaches this arm: `reject_ode_iov_inner_start` returns
-    // `false` unless `is_ode_iov(model)`, so the claim is unconditional, not a hedge.
-    assert!(
-        msg.contains("only on an ODE model with inter-occasion variability"),
-        "{msg}"
-    );
-    assert!(
-        !msg.contains("Raise `inner_maxiter`"),
-        "neither knob relaxes a start rejection, so the message must not offer them: {msg}"
-    );
-}
-
-/// **U5 — the non-finite arm.** When the guard never fired, every trial was infeasible
+/// **U4 — the non-finite arm.** When the guard never fired, every trial was infeasible
 /// because its objective was not a number. Naming the guard there would be false, and
 /// the remedy is the data/model one `W_NONFINITE_OBJECTIVE` gives, not an optimizer
 /// setting.
@@ -584,7 +641,7 @@ fn an_all_non_finite_trace_does_not_blame_the_guard() {
     );
 }
 
-/// **U6 — a mixed trace reports both halves.** Some trials guard-rejected, the rest
+/// **U5 — a mixed trace reports both halves.** Some trials guard-rejected, the rest
 /// non-finite: the counts have to add up to the trial count the head sentence quotes,
 /// or a reader subtracts and finds a trial unaccounted for.
 #[test]
@@ -604,7 +661,7 @@ fn a_mixed_trace_accounts_for_every_trial() {
     );
 }
 
-/// **U7 — the token routes to `Critical`/`convergence` on its own.** The message says
+/// **U6 — the token routes to `Critical`/`convergence` on its own.** The message says
 /// "did not converge" nowhere, so without the token arm in `classify_warning` it would
 /// land in the `general` fallback bucket at `Warning` severity — the opposite of what a
 /// consumer branching on `category` needs from a run that produced no estimate.

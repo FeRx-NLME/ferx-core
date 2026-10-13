@@ -716,32 +716,31 @@ optimum the same model reaches with the default inner budget.
 
 A run with no feasible evaluation now reports `converged: false` with a `Critical`
 `convergence` warning carrying the `W_NO_FEASIBLE_EVAL` token, and the estimates it reports
-are the ones it started from rather than the penalty's minimum. The warning names which of
-the guard's triggers fired, because the remedies are not the same:
+are the ones it started from rather than the penalty's minimum. The warning says which of
+the two ways a trial can be infeasible applied, because the remedies are not the same:
 
 | What the trace says | What to change |
 |---|---|
-| Too many subjects' inner loops unconverged | Raise `inner_maxiter` so the inner loop can reach the EBEs, or raise `max_unconverged_frac` (`1.0` disables the guard) to proceed with the unconverged subjects. |
-| Subjects rejected at their inner start | Neither knob: `max_unconverged_frac` is not consulted for this trigger. The individual likelihood was already degenerate at the previous trial's EBEs — change the model or its initial estimates. |
-| Every trial non-finite | The guard never came into it. Find the record or parameter that poisons the objective, as for [`W_NONFINITE_OBJECTIVE`](../warnings.qmd#non-finite-objective). |
+| The EBE guard rejected the trials, with *N* of *M* subjects' inner loops unconverged | Raise `inner_maxiter` so the inner loop can reach the EBEs, or raise `max_unconverged_frac` (`1.0` disables the guard) to proceed with the unconverged subjects. |
+| Every trial returned a non-finite objective | The guard never came into it. Find the record or parameter that poisons the objective, as for [`W_NONFINITE_OBJECTIVE`](../warnings.qmd#non-finite-objective). |
 
 A **cancelled** run is not reported this way: its evaluations short-circuit before the
 feasible-evaluation counter advances, so its trace is infeasible by construction.
 
-Three notes on reading such a run.
+Two notes on reading such a run.
 
-The run keeps its "increase `maxiter`" advice to itself. A run that scored nothing has no
-fit to tighten and a longer outer budget buys only more rejected trials, so when the outer
-budget *is* exhausted the usual budget warning is withheld and `W_NO_FEASIBLE_EVAL` stands
-alone — the budget that binds is `inner_maxiter`, which it names.
+The "increase `maxiter`" advice is withheld, on either row. A run that scored nothing has
+no fit to tighten and a longer *outer* budget buys only more rejected trials, so when the
+outer budget is exhausted the usual budget warning does not appear and
+`W_NO_FEASIBLE_EVAL` stands alone with whichever remedy its row carries.
 
-Whether `W_NONFINITE_OBJECTIVE` also fires depends on which row of the table above you are
-in. On the **guard-rejection** rows the reported OFV is a real objective — the starting
-estimates, scored by the final inner loop — so it is not a sentinel and only
-`W_NO_FEASIBLE_EVAL` appears; the number is simply not a minimum of anything. On the
-**every-trial-non-finite** row the re-score at the starting estimates is usually non-finite
-too, and then both warnings appear: `W_NO_FEASIBLE_EVAL` for the trace and
-`W_NONFINITE_OBJECTIVE` for the number. Two warnings, two different facts.
+Whether `W_NONFINITE_OBJECTIVE` also fires is the one thing that differs by row. On the
+**guard-rejection** row the reported OFV is a real objective — the starting estimates,
+scored by the final inner loop — so it is not a sentinel and only `W_NO_FEASIBLE_EVAL`
+appears; the number is simply not a minimum of anything. On the **non-finite** row the
+re-score at the starting estimates is usually non-finite too, and then both warnings
+appear: `W_NO_FEASIBLE_EVAL` for the trace and `W_NONFINITE_OBJECTIVE` for the number. Two
+warnings, two different facts.
 
 Finally, `gradient = fd` can hide the whole case, because it also swaps the outer optimizer
 away from L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
