@@ -550,7 +550,7 @@ fn analytic_inner_seed_hessian(
     // subject) declines here to the full provider, whose seed carries no gradient.
     #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
     let mut light_supported = model.residual_error_eta.is_none()
-        && !params.residual_is_dense()
+        && !model.residual_cov_at(params).is_dense()
         && model.frem_config.is_none()
         && !subject.obs_times.is_empty();
     // A CTMM subject's inner gradient carries the `ctmm_subject_eta_grad` block on top of
@@ -1646,7 +1646,7 @@ fn find_ebe_solve(
             // ρ, so the inner objective must see the optimizer's current value —
             // reading `model.residual_correlations` here would hold the EBE
             // search at the declared correlation while the outer loop moved it.
-            params.residual_cov(),
+            model.residual_cov_at(params),
             &mut scratch,
             schedule,
             err_keys.as_ref(),
@@ -1699,7 +1699,7 @@ fn find_ebe_solve(
             &params.sigma.values,
             // Live ρ (#847) — the same value `obj` above scores, so the BFGS
             // gradient and objective can never disagree about the residual R.
-            params.residual_cov(),
+            model.residual_cov_at(params),
             schedule,
             mult.as_deref(),
             err_keys.as_ref(),
@@ -3120,7 +3120,7 @@ pub(crate) fn analytic_eta_nll_gradient(
         omega,
         sigma,
         // HMC and the one-off diagnostic callers hold ρ at the declaration (#847).
-        model.residual_cov(),
+        model.residual_cov_theta(theta),
         None,
         mult.as_deref(),
         err_keys.as_ref(),
@@ -3386,6 +3386,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma,
             corr,
             mult,
@@ -3398,6 +3399,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma,
             corr,
         ),
@@ -3430,6 +3432,7 @@ fn dense_residual_inner_gradient(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma,
         corr,
         mult,

@@ -2570,6 +2570,7 @@ mod tests {
         let mut subjects = Vec::new();
         for id in ids {
             subjects.push(Subject {
+                obs_rgroup: Vec::new(),
                 id: (*id).to_string(),
                 doses: vec![],
                 obs_times: (0..n_obs_each).map(|j| j as f64).collect(),

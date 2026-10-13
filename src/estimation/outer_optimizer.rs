@@ -934,7 +934,7 @@ fn subject_nll(
         // Live `block_sigma` off-diagonals (#847): this is the objective the
         // outer optimizer minimises, so it has to be scored at the ρ the
         // optimizer is currently proposing.
-        params.residual_cov(),
+        model.residual_cov_at(params),
         interaction,
     )
 }
@@ -4666,7 +4666,7 @@ fn is_structural_decline(
         &model.error_spec,
         subject,
         &init_params.sigma.values,
-        init_params.residual_cov(),
+        model.residual_cov_at(init_params),
     )
 }
 
@@ -4713,7 +4713,7 @@ fn non_iov_declined_salvage(
             h_matrix,
             &params.omega,
             &params.sigma.values,
-            params.residual_cov(),
+            model.residual_cov_at(&params),
             options.interaction,
         );
         match structural_fill(nll) {
@@ -4884,7 +4884,7 @@ fn subject_reconverged_fd_gradient(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
-            params.residual_cov(),
+            model.residual_cov_at(&params),
             options.interaction,
         ))
     };

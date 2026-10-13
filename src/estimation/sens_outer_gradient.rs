@@ -534,6 +534,7 @@ fn corr_residual_diag(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma,
         residual_cov,
     );
@@ -545,6 +546,7 @@ fn corr_residual_diag(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma,
         residual_cov,
         None,
@@ -557,6 +559,7 @@ fn corr_residual_diag(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma,
         residual_cov,
         None,
@@ -597,6 +600,7 @@ pub(crate) fn corr_residual_rd_at_sigma(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma,
         residual_cov,
         None,
@@ -799,7 +803,7 @@ pub(crate) fn data_sigma_gradient(
     let err_keys = model.error_spec.obs_keys(subject);
     // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
     // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
-    let corrs = params.residual_cov();
+    let corrs = model.residual_cov_at(params);
     let correlated = corrs.is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let mut out = vec![0.0f64; n_sigma];
@@ -973,13 +977,13 @@ pub(crate) fn score_core(
     // per-obs `(r, d, d2)` diagonals once (block_sigma excludes M3/ruv/IOV, so
     // `ruv_scale = 1`). `None` bails to FD (a rare off-diagonal R). Everything else in
     // the assembly is unchanged — see `corr_residual_diag`.
-    let corr_diag = if params.residual_is_dense() {
+    let corr_diag = if model.residual_cov_at(params).is_dense() {
         Some(corr_residual_diag(
             model,
             subject,
             sens,
             sigma,
-            params.residual_cov(),
+            model.residual_cov_at(params),
         )?)
     } else {
         None
@@ -1715,7 +1719,7 @@ fn sigma_block(
     // `corr_residual_diag`'s guard in `prepare_stacked`).
     // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
     // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
-    let corrs = params.residual_cov();
+    let corrs = model.residual_cov_at(params);
     let correlated = corrs.is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     // Custom / time-varying residual-magnitude (#484/#576): `mult(θ)` is fixed
@@ -1958,7 +1962,7 @@ fn rho_block(
 ) -> Vec<f64> {
     let corrs = &params.residual_correlations;
     let mut grad = vec![0.0f64; corrs.len()];
-    if !params.residual_is_dense() || sens.obs.is_empty() {
+    if !model.residual_cov_at(params).is_dense() || sens.obs.is_empty() {
         return grad;
     }
     let n_eta = prep.n_eta;
@@ -2577,7 +2581,7 @@ pub fn subject_packed_gradient_foce(
     // analytic FOCE scope, so `R̃ = JΩJᵀ + diag(R⁰)` is unchanged apart from the
     // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
     // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
-    let correlated = params.residual_is_dense();
+    let correlated = model.residual_cov_at(&params).is_dense();
     let corr = &params.residual_correlations;
     let corr_rd0 = if correlated {
         Some(corr_residual_diag(
@@ -2585,7 +2589,7 @@ pub fn subject_packed_gradient_foce(
             subject,
             &sens0,
             sigma,
-            params.residual_cov(),
+            model.residual_cov_at(&params),
         )?)
     } else {
         None
@@ -2731,7 +2735,7 @@ pub fn subject_packed_gradient_foce(
     // `½ ∂R⁰/∂ρ (R̃⁻¹ᵢᵢ − uᵢ²)` shape, with the Fisher-z chain. No censored
     // companion term: `block_sigma` + M3 is rejected up front, so `cg` carries no
     // ρ block to add.
-    if params.residual_is_dense() {
+    if model.residual_cov_at(&params).is_dense() {
         let rho_start = rho_packed_start(template);
         let rho_terms = rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations);
         for (k, per_obs) in rho_terms.iter().enumerate() {
@@ -2780,8 +2784,9 @@ pub fn subject_packed_gradient_foce(
             &params.omega.inv,
             eta_hat,
         )?;
-        let rho_terms = params
-            .residual_is_dense()
+        let rho_terms = model
+            .residual_cov_at(&params)
+            .is_dense()
             .then(|| rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations));
         frozen_eta_dx_assemble(
             &resp,
@@ -3133,14 +3138,14 @@ pub(crate) fn subject_eta_dx_foce(
         None => None,
     };
     let corr = &params.residual_correlations;
-    let corr_rd0 = match params.residual_is_dense() {
+    let corr_rd0 = match model.residual_cov_at(&params).is_dense() {
         false => None,
         true => Some(corr_residual_diag(
             model,
             subject,
             &sens0,
             sigma,
-            params.residual_cov(),
+            model.residual_cov_at(&params),
         )?),
     };
     let rows = foce_r0_rows(
@@ -3166,8 +3171,9 @@ pub(crate) fn subject_eta_dx_foce(
         &params.omega.inv,
         eta_hat,
     )?;
-    let rho_terms = params
-        .residual_is_dense()
+    let rho_terms = model
+        .residual_cov_at(&params)
+        .is_dense()
         .then(|| rho_rd_terms(model, subject, &sens0, sigma, corr));
     Some(frozen_eta_dx_assemble(
         &resp,
@@ -3819,7 +3825,7 @@ pub(crate) fn subject_eta_dx_from_sens(
     // below come from `params`, so the predicate that gates them must too, or a
     // hand-built `ModelParameters` could disagree with the model about whether a
     // correlation exists at all.
-    let correlated = params.residual_is_dense();
+    let correlated = model.residual_cov_at(params).is_dense();
     let eta_dx_ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -3834,14 +3840,14 @@ pub(crate) fn subject_eta_dx_from_sens(
                     subject,
                     &eta_dx_ipreds,
                     &sp,
-                    params.residual_cov(),
+                    model.residual_cov_at(params),
                 )),
                 Some(corr_residual_rd_at_sigma(
                     model,
                     subject,
                     &eta_dx_ipreds,
                     &sm,
-                    params.residual_cov(),
+                    model.residual_cov_at(params),
                 )),
             )
         } else {
@@ -3942,7 +3948,7 @@ pub(crate) fn subject_eta_dx_from_sens(
     // so this one Jacobian serves both the FOCE and FOCEI callers — the same
     // reason the σ columns are shared. Every `sigma_block`-style branch is
     // inapplicable here (see `rho_block`), so the plain row is the only one.
-    if params.residual_is_dense() {
+    if model.residual_cov_at(params).is_dense() {
         let rho_start = rho_packed_start(template);
         let rho_terms = rho_rd_terms(model, subject, &sens, sigma, &params.residual_correlations);
         for (k, per_obs) in rho_terms.iter().enumerate() {

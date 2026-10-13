@@ -800,7 +800,7 @@ pub(crate) fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
-                params.residual_cov(),
+                model.residual_cov_at(params),
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
@@ -835,7 +835,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
-                    params.residual_cov(),
+                    model.residual_cov_at(params),
                     interaction,
                 )
             };

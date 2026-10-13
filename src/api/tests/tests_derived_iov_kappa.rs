@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// for every observation, while the fix yields the per-occasion CL.
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -110,6 +111,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
 fn two_occasion_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
@@ -309,6 +311,7 @@ fn tad_uses_per_dose_occasion_lag() {
     );
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![
@@ -414,6 +417,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
@@ -495,6 +499,7 @@ fn negative_alag_emits_negative_lagtime_warning() {
         .model;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
@@ -570,6 +575,7 @@ fn negative_per_route_lag_emits_negative_lagtime_warning() {
         .expect("parse ok")
         .model;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -633,6 +639,7 @@ fn negative_lag_scan_skips_analytical_models() {
     assert!(model.has_lagtime() && model.ode_spec.is_none());
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -715,6 +722,7 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
 fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
     let n = cmts.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -864,6 +872,7 @@ fn ss_dose_with_analytical_init_warns() {
 
     // Subject with a steady-state dose (ss=true, ii=24).
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
@@ -930,6 +939,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         .expect("parse ok")
         .model;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -992,6 +1002,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -1072,6 +1083,7 @@ fn combined_endpoint_model() -> CompiledModel {
 fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
     let n = dvs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],

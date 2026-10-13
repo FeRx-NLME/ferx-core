@@ -16,6 +16,7 @@ fn subject() -> Subject {
     let mut modeled = DoseEvent::modeled(12.0, 50.0, 2, true, 24.0, RateMode::ModeledRate);
     modeled.rate = 0.0;
     Subject {
+        obs_rgroup: Vec::new(),
         id: "7".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0), modeled],
         obs_times: vec![1.0, 2.0],

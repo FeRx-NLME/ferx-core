@@ -31,6 +31,7 @@ pub fn subject(
 ) -> Subject {
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses,
         obs_times,

@@ -141,6 +141,7 @@ fn subject_with_obs(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subj
     // realistic and nonzero (gradient identity holds at any obs).
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -641,6 +642,7 @@ const WARFARIN_RUV: &str = r#"
 fn ruv_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -857,6 +859,7 @@ const BLOCK_SIGMA_1CPT: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  t
 fn dense_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -922,7 +925,7 @@ fn precise_ebe_corr_with(
             subject,
             &sens0,
             &params.sigma.values,
-            params.residual_cov(),
+            model.residual_cov_at(params),
         )
         .unwrap()
         .0
@@ -941,9 +944,8 @@ fn precise_ebe_corr_with(
         // reference would silently omit the ρ coordinate's EBE-response term.
         let (rv, dv, d2v) = match &frozen_rv {
             Some(r0) => (r0.clone(), vec![0.0; r0.len()], vec![0.0; r0.len()]),
-            None => {
-                corr_residual_diag(model, subject, &sens, sigma, params.residual_cov()).unwrap()
-            }
+            None => corr_residual_diag(model, subject, &sens, sigma, model.residual_cov_at(params))
+                .unwrap(),
         };
         let mut grad = DVector::<f64>::from_column_slice(
             &(omega_inv * DVector::from_column_slice(&eta))
@@ -1664,6 +1666,7 @@ fn iov_ruv_2cpt_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 1, 2, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1710,6 +1713,7 @@ fn ruv_subject_eta(
 ) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -2171,6 +2175,7 @@ fn reset_subject_outer(model: &CompiledModel, theta: &[f64], eta_ref: &[f64], id
     let obs_times = vec![2.0, 4.0, 8.0, 60.0, 122.0, 126.0, 150.0];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: vec![
             DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0),
@@ -2245,6 +2250,7 @@ fn population_packed_gradient_ode_ss_reset_matches_fd() {
     let obs_times = vec![2.0, 8.0, 20.0, 62.0, 70.0, 90.0];
     let n = obs_times.len();
     let mut s = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0),
@@ -2676,6 +2682,7 @@ fn tvcov_subject_outer(
         m
     };
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: vec![dose],
         obs_times: obs_times.to_vec(),
@@ -2858,6 +2865,7 @@ fn population_packed_gradient_init_matches_fd() {
     let make = |id: &str, times: &[f64]| -> Subject {
         let n = times.len();
         let mut s = Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -2972,6 +2980,7 @@ fn population_packed_gradient_lagtime_matches_fd() {
     let build = |times: &[f64]| -> Subject {
         let n = times.len();
         let mut s = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -3118,6 +3127,7 @@ fn frem_outer_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let pk_times = [1.0, 6.0, 24.0];
     let n = pk_times.len() + 1;
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: pk_times
@@ -3700,6 +3710,7 @@ fn iov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -4033,6 +4044,7 @@ fn iov_ruv_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -5325,6 +5337,7 @@ fn iov_tvcov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         m
     };
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -6640,6 +6653,7 @@ const SS_ORAL_Q24: &str = r#"
 fn ss_oral_q24_subject() -> Subject {
     let times = vec![1.0, 4.0, 12.0, 23.0];
     Subject {
+        obs_rgroup: Vec::new(),
         id: "3".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
         obs_times: times.clone(),

@@ -262,6 +262,48 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
     ))
 }
 
+/// [`dw_autocorrelation_warning`] for a model with a `correlation` line (#1081),
+/// where `dw` is taken on the residuals decorrelated by the fitted `R`
+/// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
+/// line does **not** explain, so the advice is about the line first: under `cs`
+/// every pair of a block correlates equally, and serial dependence that decays with
+/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima:
+/// `cs` leaves DW 1.43, `ar1` 1.69).
+pub(crate) fn dw_autocorrelation_warning_decorrelated(
+    dw: f64,
+    line: &str,
+    kind: crate::types::ResidualSerialKind,
+) -> Option<String> {
+    if !dw.is_finite() {
+        return None;
+    }
+    let what = format!("in the residuals decorrelated by `{line}` (Durbin-Watson = {dw:.2})");
+    if dw < 1.5 {
+        let advice = match kind {
+            crate::types::ResidualSerialKind::Cs => {
+                " Compound symmetry correlates every two rows of a block equally; if the \
+                 dependence decays with the distance between visits, `ar1` models that. \
+                 Otherwise the structural model may be missing dynamics."
+            }
+            crate::types::ResidualSerialKind::Ar1 => {
+                " The structural model may be missing dynamics, or the grouping may not \
+                 cover the rows that are dependent."
+            }
+        };
+        Some(format!(
+            "Positive autocorrelation remains {what}: the within-group correlation does \
+             not explain it.{advice}"
+        ))
+    } else if dw > 2.5 {
+        Some(format!(
+            "Negative autocorrelation {what}. The residual correlation may be \
+             over-estimated, or the error model misspecified."
+        ))
+    } else {
+        None
+    }
+}
+
 /// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
 /// `None` when `dw` is non-finite or inside the `[1.5, 2.5]` band.
 ///
@@ -510,6 +552,8 @@ pub(crate) fn fitted_population<'a>(
         );
     }
     let derive_occ = iov_rule_set && model.n_kappa > 0;
+    // A `correlation … by COL` line reads its blocks off the `by` columns (#1081).
+    let needs_rgroup = model.residual_serial.is_some();
     let needs_prune = population.subjects.iter().any(|s| {
         !s.dose_covariates.is_empty()
             || !s.obs_covariates.is_empty()
@@ -519,7 +563,7 @@ pub(crate) fn fitted_population<'a>(
             // `reset_covariates` must reach it rather than being gated out here.
             || !s.reset_covariates.is_empty()
     });
-    if !(needs_prune || needs_dv_log || derive_occ) {
+    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup) {
         return population;
     }
     let mut population = population;
@@ -529,6 +573,9 @@ pub(crate) fn fitted_population<'a>(
     }
     if derive_occ {
         apply_iov_occasion_rule(p, rule, had_column, warnings);
+    }
+    if needs_rgroup {
+        crate::stats::residual_error::assign_residual_groups(model, p);
     }
     if needs_dv_log {
         let n_nonpos = log_transform_observations(p);
@@ -823,10 +870,11 @@ fn fit_unstamped(
     // see the data. `ferx check` runs the same `check_model_data` to report
     // every finding; here we stop at the first error to preserve fit()'s
     // historical fail-fast behavior and exact error strings.
-    first_error(&check_model_data_rule(
+    first_error(&crate::api::validation::check_model_data_rule_at(
         model,
         population,
         &options.iov_occasion,
+        init_params,
     ))
     .map_err(|e| e.to_string())?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
@@ -2829,7 +2877,18 @@ fn fit_inner(
         native_warnings.push(entry);
     }
 
-    let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
+    // Under a `correlation` line the raw IWRES are correlated by construction; the
+    // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
+    let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
+        crate::stats::residual_error::whitened_residual_autocorrelation(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        )
+    } else {
+        iwres_autocorrelation(&subjects)
+    };
 
     // Covariance status. Bayesian fits report posterior credible intervals
     // instead of a Hessian covariance, so the covariance step is never
@@ -2892,7 +2951,16 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    if let Some(msg) = dw_autocorrelation_warning(dw_statistic) {
+    let dw_warning = match (
+        &model.residual_serial,
+        crate::api::validation::residual_correlation_line(model),
+    ) {
+        (Some(serial), Some(line)) => {
+            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
+        }
+        _ => dw_autocorrelation_warning(dw_statistic),
+    };
+    if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
 

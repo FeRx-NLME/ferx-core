@@ -100,6 +100,16 @@ pub(crate) fn reject_unsupported_adaptive(
                 .to_string(),
         );
     }
+    // The controller's `Dv` readings draw assay noise one row at a time
+    // (`assay_resid_var`), which carries no between-row term: repeated readings in
+    // one block would come out independent (#1081).
+    if let Some(line) = crate::api::validation::residual_correlation_line(model) {
+        return Err(format!(
+            "adaptive-dosing simulation does not support `{line}`: the controller draws its \
+             assay noise one reading at a time, so readings in one block would be \
+             independent. Drop the line for the adaptive simulation."
+        ));
+    }
     // Time-varying covariates (and `TIME`-in-PK, #700), IOV (#701), and system-reset
     // events (EVID=3, #716) are all now supported by the reactive driver and are no
     // longer rejected here.

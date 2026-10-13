@@ -92,7 +92,7 @@ pub fn individual_nll_into(
         // wrapper (SAEM, HMC, VI, AGQ) holds ρ fixed at the declaration, so that
         // *is* their live value; FOCE/FOCEI, which estimate it (#847), call
         // `individual_nll_into_with_schedule` directly with the optimizer's ρ.
-        model.residual_cov(),
+        model.residual_cov_theta(theta),
         scratch,
         None,
     )
@@ -684,7 +684,7 @@ pub(crate) fn individual_nll_prepared(
         eta,
         omega,
         sigma_values,
-        model.residual_cov(),
+        model.residual_cov_theta(theta),
         pk,
         schedule,
         &prep.err_keys,
@@ -1403,6 +1403,11 @@ const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
 /// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
 /// to be scored at the optimizer's current value, not the model's declaration.
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
     model: &CompiledModel,
@@ -2129,6 +2134,7 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma_values,
         residual_cov,
         ruv_mult,
@@ -2518,7 +2524,7 @@ pub fn foce_subject_nll_iov(
             sigma_values,
             // `block_sigma` + IOV is rejected up front, so an IOV model's
             // correlations are always the (empty) declaration (#847).
-            model.residual_cov(),
+            model.residual_cov_theta(theta),
             interaction,
         );
     }
@@ -2656,7 +2662,7 @@ pub fn foce_subject_nll_iov(
             // `block_sigma` + IOV is rejected up front
             // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
             // practice and the estimated-ρ threading (#847) never reaches here.
-            model.residual_cov(),
+            model.residual_cov_theta(theta),
             model.bloq_in_force(),
             &p_obs_iov,
             None,
@@ -2716,6 +2722,11 @@ pub fn foce_population_nll_iov(
 }
 
 /// Population FOCE objective: sum over all subjects
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
     model: &CompiledModel,
@@ -2808,6 +2819,11 @@ pub(crate) fn foce_population_nll_cov(
 /// ordinary observation the likelihood scored at its `DV`, so it stays in the
 /// system: gating on the raw flag instead blanked it *and* shifted every other
 /// CWRES of that subject, because the decorrelation mixes rows (#1499).
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -3349,6 +3365,7 @@ mod tests {
 
     fn make_simple_subject() -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -3379,6 +3396,7 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -4565,6 +4583,7 @@ mod tests {
     #[test]
     fn compute_cwres_does_not_scale_frem_rows_by_iiv_on_ruv() {
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
@@ -4755,6 +4774,7 @@ mod tests {
         // With H = 0 the SB prediction f0 = ipred and R_tilde = R (diagonal), so
         // for additive error CWRES_j = (y_j − f_j) / (m_j·σ).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
@@ -5046,7 +5066,7 @@ mod tests {
             &preds,
             &p.theta,
             &p.sigma.values,
-            p.residual_cov(),
+            model.residual_cov_at(p),
             &eta,
         );
         assert!(

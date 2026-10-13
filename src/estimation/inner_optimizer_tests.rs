@@ -161,7 +161,7 @@ mod ctmm_inner {
                 &[eta0],
                 &params.omega,
                 &params.sigma.values,
-                params.residual_cov(),
+                model.residual_cov_at(params),
                 None,
                 None,
                 err_keys.as_ref(),
@@ -229,6 +229,7 @@ fn in_scope_ode_reports_and_takes_the_analytic_inner_route() {
     );
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -311,6 +312,7 @@ fn fd_fallback_warning_fires_for_all_fd_in_scope_ode_population() {
         let mut d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
         d.rate_mode = crate::types::RateMode::ModeledDuration;
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![d],
             obs_times: vec![1.0, 4.0, 8.0],
@@ -435,6 +437,7 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
     model.gradient_method = GradientMethod::Fd;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 200.0, 1, 9600.0, false, 0.0)],
         obs_times: vec![20.0],
@@ -568,6 +571,7 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
     }
     let n = obs_times.len();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 300.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -654,6 +658,7 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
     assert_eq!(model.residual_error_eta, Some(3));
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
@@ -797,6 +802,7 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
     assert!(model.is_ode_based(), "model must be on the ODE path");
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
@@ -2172,6 +2178,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -2250,6 +2257,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
 
     // Subject: 2 PK obs + 1 FREM obs
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 0.0],
@@ -2460,6 +2468,7 @@ fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
 
     // Six informative observations across the profile ⇒ all etas well identified.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
@@ -2657,6 +2666,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
     ];
     let n = rows.len();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "7".into(),
         doses: vec![DoseEvent::new(0.0, 600.0, 1, 0.0, false, 0.0)],
         obs_times: rows.iter().map(|r| r.0).collect(),
@@ -2744,6 +2754,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
     let obs_times = vec![1.0, 4.0, 8.0, 24.0];
     let n = obs_times.len();
     let no_reset_subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "no-reset".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: obs_times.clone(),
@@ -2767,6 +2778,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         obs_records: vec![],
     };
     let reset_subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "reset".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -2899,6 +2911,7 @@ fn flip_flop_transit_subject() -> Subject {
     ];
     let n = rows.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "2".into(),
         doses: vec![DoseEvent::new(0.0, 10000.0, 1, 0.0, false, 0.0)],
         obs_times: rows.iter().map(|r| r.0).collect(),
@@ -3233,7 +3246,7 @@ mod frozen_ebe_variance {
             eta,
             &p.omega,
             &p.sigma.values,
-            p.residual_cov(),
+            model.residual_cov_at(p),
             &mut pk::EventPkParams::default(),
             None,
             keys.as_ref(),
@@ -3433,7 +3446,7 @@ mod frozen_ebe_variance {
                         &eta,
                         &p.omega,
                         &p.sigma.values,
-                        p.residual_cov(),
+                        model.residual_cov_at(&p),
                         None,
                         None,
                         keys.as_ref(),
@@ -3513,6 +3526,7 @@ mod frozen_ebe_variance {
         .expect("parse");
         assert!(!model.residual_correlations.is_empty());
         let mut s = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -3549,7 +3563,7 @@ mod frozen_ebe_variance {
                 &eta,
                 &p.omega,
                 &p.sigma.values,
-                p.residual_cov(),
+                model.residual_cov_at(&p),
                 None,
                 None,
                 keys.as_ref(),
@@ -3573,6 +3587,79 @@ mod frozen_ebe_variance {
             g[0],
             gc[0]
         );
+    }
+
+    /// #1081 T6: the inner η-gradient on the dense path under a `correlation` line,
+    /// against central FD of the individual NLL — conditional (the `∂R/∂η` trace
+    /// term, through the serial `∂R/∂f`) and frozen. Combined error, so the serial
+    /// off-diagonal moves with `f`; two arms of 3 and 2 rows, interleaved.
+    #[test]
+    fn serial_residual_inner_gradient_matches_fd() {
+        for kind in ["cs", "ar1"] {
+            let model = crate::parser::model_parser::parse_model_string(&format!(
+                "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  theta RHO(0.6, -0.4, 0.95) FIX\n  omega ETA_CL ~ 0.09 FIX\n  sigma PROP_ERR ~ 0.2 (sd) FIX\n  sigma ADD_ERR ~ 1.0 (sd) FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n",
+            ))
+            .expect("parse");
+            assert!(model.residual_serial.is_some());
+            let arms = [1.0, 2.0, 1.0, 2.0, 1.0];
+            let mut s = Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+                observations: vec![0.0; 5],
+                obs_cmts: vec![1; 5],
+                obs_covariates: arms
+                    .iter()
+                    .map(|a| HashMap::from([("ARM".to_string(), *a)]))
+                    .collect(),
+                cens: vec![0; 5],
+                ..Default::default()
+            };
+            s.obs_rgroup = crate::stats::residual_error::residual_groups(&model, &s);
+            assert_eq!(s.obs_rgroup, vec![1, 2, 1, 2, 1]);
+            let p = model.default_params.clone();
+            let preds = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.1]);
+            s.observations = preds.iter().map(|v| v * 1.15 + 0.3).collect();
+            let f0 = population_variance_preds(&model, &s, &p.theta, 1).unwrap();
+            let eta = [-0.2];
+            let keys = model.error_spec.obs_keys(&s);
+            let grad = |frozen: Option<&[f64]>| {
+                analytic_eta_nll_gradient_with_schedule(
+                    &model,
+                    &s,
+                    &p.theta,
+                    &eta,
+                    &p.omega,
+                    &p.sigma.values,
+                    model.residual_cov_at(&p),
+                    None,
+                    None,
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(1),
+                    &mut DVector::zeros(1),
+                    frozen,
+                )
+                .expect("dense in scope")
+            };
+            for frozen in [None, Some(f0.as_slice())] {
+                assert_close(
+                    kind,
+                    &grad(frozen),
+                    &fd(|e| nll(&model, &s, &p, e, frozen), &eta),
+                    1e-6,
+                );
+            }
+            // ρ is live in the objective: the gradient at ρ = 0.6 is not the one an
+            // independent `R` gives.
+            let mut p0 = p.clone();
+            p0.theta[2] = 0.0;
+            let indep = fd(|e| nll(&model, &s, &p0, e, None), &eta);
+            assert!(
+                (grad(None)[0] - indep[0]).abs() > 1e-3,
+                "{kind}: ρ moves the gradient"
+            );
+        }
     }
 
     /// T4, M3-censored rows: the censored kernel at `dv_df = 0` and `V = V⁰`.
@@ -3605,7 +3692,7 @@ mod frozen_ebe_variance {
                 &eta,
                 &p.omega,
                 &p.sigma.values,
-                p.residual_cov(),
+                model.residual_cov_at(&p),
                 None,
                 None,
                 keys.as_ref(),
@@ -3678,7 +3765,7 @@ mod frozen_ebe_variance {
             &hi,
             &p.omega,
             &p.sigma.values,
-            p.residual_cov(),
+            model.residual_cov_at(&p),
             None,
             None,
             keys.as_ref(),
@@ -3740,7 +3827,7 @@ mod frozen_ebe_variance {
             &eta,
             &p.omega,
             &p.sigma.values,
-            p.residual_cov(),
+            model.residual_cov_at(&p),
             None,
             None,
             keys.as_ref(),

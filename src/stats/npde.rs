@@ -147,6 +147,11 @@ pub fn compute_npde_npd(
     ))?;
     // A covariate the data lacks reads as 0.0 in the simulated reference (#1763).
     crate::diagnostics::first_error(&crate::api::check_covariates(model, population))?;
+    // The caller's population as given: a `correlation` line's blocks are read off its
+    // `by` columns here, once, as `simulate()` does (#1081 review r2). `fit()`'s post-fit
+    // step passes a prepared population, which is borrowed unchanged.
+    let with_blocks = crate::stats::residual_error::with_residual_blocks(model, population);
+    let population: &Population = &with_blocks;
     let base_seed = effective_seed(seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;

@@ -4350,6 +4350,7 @@ mod tests {
     fn sdtab_subject(id: &str, n_obs: usize, obs_cmts: Vec<usize>) -> Subject {
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![],
             obs_times: (0..n_obs).map(|j| j as f64 + 1.0).collect(),

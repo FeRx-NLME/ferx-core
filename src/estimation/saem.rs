@@ -2370,7 +2370,7 @@ pub(crate) fn obs_nll_sum(
                 subject,
                 theta,
                 sigma_values,
-                model.residual_cov(),
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -2444,7 +2444,7 @@ fn obs_nll_sum_mix(
                 subject,
                 theta,
                 sg_i,
-                model.residual_cov(),
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -5756,7 +5756,7 @@ pub fn run_saem(
                         sigma_i,
                         // Same ρ `individual_nll_into` passes — SAEM holds
                         // `block_sigma` at its declaration.
-                        model.residual_cov(),
+                        model.residual_cov_theta(&state.theta),
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
@@ -8983,6 +8983,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -9107,6 +9108,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9211,6 +9213,7 @@ DV ~ additive(EPS)
 
         // One subject with 2 occasions (occasions = [1,1,2,2]).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0],
@@ -9339,6 +9342,7 @@ DV ~ additive(EPS)
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![
                         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -9514,6 +9518,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -11049,6 +11054,7 @@ DV ~ additive(EPS)
         use crate::types::DoseEvent;
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],

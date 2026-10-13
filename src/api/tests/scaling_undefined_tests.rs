@@ -55,6 +55,7 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
     let n = times.len();
     Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: Vec::new(),
             obs_times: times,

@@ -75,6 +75,7 @@ fn population(n_studies: usize, n_times: usize) -> Population {
             let mut covariates = HashMap::new();
             covariates.insert("STUDY".to_string(), (s + 1) as f64);
             Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", s + 1),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: (1..=n_times).map(|t| t as f64).collect(),
@@ -782,6 +783,7 @@ mod theta_gather_index_check {
         let mut covariates = HashMap::new();
         covariates.insert("PLA_IDX".to_string(), indices[0]);
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: (1..=n).map(|t| t as f64).collect(),

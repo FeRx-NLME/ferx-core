@@ -990,10 +990,10 @@ pub(crate) fn draw_correlations<'a>(
     model: &'a CompiledModel,
     params: &'a ModelParameters,
 ) -> crate::stats::residual_error::ResidualCov<'a> {
-    if params.residual_is_dense() {
-        params.residual_cov()
+    if model.residual_cov_at(params).is_dense() {
+        model.residual_cov_at(params)
     } else {
-        model.residual_cov()
+        model.residual_cov_theta(&params.theta)
     }
 }
 
@@ -1022,6 +1022,9 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     rng: &mut R,
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
+    // A `correlation` line's blocks are the subject's `obs_rgroup`: assigned once per
+    // call by `simulate_inner_with_draw`, and by `fitted_population` for NPDE (#1081).
+    let obs_rgroup: &[u32] = &subject.obs_rgroup;
     let mut r = match ruv_mult {
         Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
@@ -1031,6 +1034,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
             residual_cov,
             mult,
@@ -1043,6 +1047,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
             residual_cov,
         ),
@@ -1154,6 +1159,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // Every precondition below is an `Err`, never a panic (#898), and every
     // `simulate*` entry point returns it as is.
     check_simulate_preconditions(model, population, params)?;
+    // `simulate()` takes the caller's population as given, so a `correlation` line's
+    // residual blocks are read off its `by` columns here, once per call rather than
+    // once per replicate (#1081). A fitted population carries them already.
+    let with_blocks = crate::stats::residual_error::with_residual_blocks(model, population);
+    let population: &Population = &with_blocks;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()

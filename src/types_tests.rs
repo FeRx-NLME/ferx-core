@@ -189,6 +189,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     });
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0, 2.0],
@@ -243,6 +244,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
     model.frem_config = None;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0],
@@ -2177,6 +2179,7 @@ fn impmap_proposal_df_default_is_finite_t() {
 /// exercise.
 fn bare_subject(id: &str) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: Vec::new(),
         obs_times: Vec::new(),
