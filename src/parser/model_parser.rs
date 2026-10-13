@@ -26760,6 +26760,24 @@ impl IndivParamProgram {
         &self.pk_slot_indices
     }
 
+    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots`](Self::pk_slots),
+    /// in the same order. **One entry per resolved slot, not per parameter**: the
+    /// `pk(...)` role bindings, the spare slots the readout / `obs_scale` / `init`
+    /// readers draw (#650, #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on
+    /// the ODE layout every declared name. A name with no slot of its own is
+    /// **absent** here, where `CompiledModel::pk_indices` instead records the
+    /// placeholder `0` that aliases `CL` (#1356); a name owning two slots appears
+    /// **twice** — `pk one_cpt_iv(cl=D1, v=V)` alongside `D1 = …` yields
+    /// `[(CL, D1), (V, V), (9, D1)]`, since the modeled-dose mapping is not a role
+    /// and the #1359 one-variable-two-roles reject does not see it (review r2 #4).
+    /// `CompiledModel::pk_slot_rows` is the slot lookup built on this.
+    ///
+    /// `var_slot` is the evaluator's var slot, which for a top-level name equals its
+    /// index in `CompiledModel::indiv_param_names` (see `n_top_level_vars`).
+    pub(crate) fn pk_var_slots(&self) -> &[(usize, usize)] {
+        &self.pk_var_slots
+    }
+
     /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
     /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
     /// individual parameter (declaration order), whose `grad`/`hess` are the exact
