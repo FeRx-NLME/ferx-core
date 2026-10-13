@@ -521,7 +521,9 @@ fn evaluate_at_initial_params(
     let (eta_hats, h_matrices, kappas, ofv, mixture_posteriors) = if is_mixture {
         let m = crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
         // Carry PMIX/MIXEST like the converged path so an eval-only mixture run
-        // still emits the PMIX_*/MIXEST sdtab columns (#977).
+        // still emits the PMIX_*/MIXEST sdtab columns (#977), and the MIXEST
+        // class's κ̂ as the converged path does since #985 (#1932). Empty for a
+        // non-IOV mixture.
         let posteriors = MixturePosteriors {
             pmix: m.pmix,
             mixest: m.mixest,
@@ -529,7 +531,7 @@ fn evaluate_at_initial_params(
         (
             m.mixest_etas,
             m.mixest_h_mats,
-            Vec::new(),
+            m.mixest_kappas,
             m.ofv,
             Some(posteriors),
         )

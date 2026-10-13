@@ -158,6 +158,11 @@ structure. The analytic outer gradient does not yet emit κ-slot derivatives for
 mixture, so an IOV mixture optimises against a central-difference outer gradient;
 the covariance step runs as usual on the K-fold mixture objective.
 
+The postfit outputs use the most-probable (`MIXEST`) class's κ̂: IPRED, IWRES,
+CWRES, the per-subject OFV, κ shrinkage and the `.fitrx` `ebe_kappas`. This holds
+after a fit and also for an evaluation-only run (`maxiter = 0`, #1932), so both
+report the same diagnostics at the same parameters.
+
 ### NONMEM cross-check (`tests/nonmem/mixture_iv_iov.ctl`)
 
 Two-class bimodal-CL model with a per-occasion κ on CL (30 subjects × 2
@@ -180,6 +185,28 @@ covariance step terminates with rounding errors and substitutes the R matrix
 for mixture + IOV covariance — whereas ferx's covariance step completes. The
 mixture SE machinery itself is anchored to `$COVARIANCE MATRIX=R` in the non-IOV
 [standard-errors](#standard-errors) comparison above.
+
+### Evaluation-only cross-check (`tests/nonmem/mixture_iv_iov_eval.ctl`)
+
+The same model and data, evaluated once at NONMEM's final estimates
+(`MAXEVAL=0 POSTHOC` against ferx's `maxiter = 0`, #1932). NONMEM tables its
+`MIXEST` class's ETAs, so this compares ferx's postfit row by row. The figures are
+the largest absolute difference over all 30 subjects (κ̂ over both occasions,
+IPRED and IWRES over all 240 observations):
+
+| Quantity | ferx vs NONMEM 7.5.1 | before #1932 |
+|---|---|---|
+| OFV | 2.1e-7 | 2.1e-7 |
+| η̂ and per-occasion κ̂ | 1.8e-7 | 0.17 (κ̂ reported as 0) |
+| IPRED | 6.8e-7 | 0.59 |
+| IWRES | 5.3e-7 | 1.29 |
+| `MIXEST` | 30 / 30 agree | 30 / 30 agree |
+
+CWRES still differs, by up to 0.41, and this is not a mixture effect: ferx
+linearizes CWRES over η only, while NONMEM linearizes over every ETA, so its
+CWRES includes the occasion κs. Recomputing CWRES outside both engines from
+NONMEM's own ETAs reproduces each column, to 2e-10 for NONMEM's. The gap is
+the same on an IOV model with no mixture and is tracked as #1948.
 
 ## SAEM under a mixture
 

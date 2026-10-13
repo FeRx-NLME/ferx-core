@@ -684,6 +684,86 @@ mod tests {
         );
     }
 
+    /// #1932: the evaluation-only branch (`outer_maxiter = 0`) carries the MIXEST-class κ̂
+    /// into postfit, as #986 made the converged branch do. The twin is the converged branch
+    /// at the same point: every parameter `FIX` and `outer_maxiter = 5`. The pair straddles
+    /// `evaluate_at_initial_params`, so dropping κ̂ from either branch reddens it: the
+    /// branch that drops it fails its own "populated" check, and the diagnostics part.
+    #[test]
+    fn iov_mixture_eval_only_carries_kappa_ebes() {
+        let src: String = MIX_IOV_MODEL
+            .lines()
+            .map(|l| {
+                let t = l.trim_start();
+                if ["theta ", "omega ", "kappa ", "sigma "]
+                    .iter()
+                    .any(|p| t.starts_with(p))
+                {
+                    format!("{l} FIX\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0));
+        let run = |outer_maxiter: usize| {
+            let opts = crate::types::FitOptions {
+                outer_maxiter,
+                ..crate::types::FitOptions::default()
+            };
+            crate::api::fit(&model, &pop, &model.default_params, &opts)
+                .expect("all-FIX IOV + mixture fit should return Ok")
+        };
+        let (eval, conv) = (run(0), run(5));
+        // The same point on both branches. The marginal integrates κ itself, so the OFV
+        // agrees with or without the fix; what the fix moves is everything postfit
+        // computes from the per-subject κ̂.
+        assert_eq!(
+            eval.ofv.to_bits(),
+            conv.ofv.to_bits(),
+            "eval-only {} vs converged {}",
+            eval.ofv,
+            conv.ofv
+        );
+        for (name, res) in [("eval-only", &eval), ("converged", &conv)] {
+            assert_eq!(
+                res.ebe_kappas.len(),
+                pop.subjects.len(),
+                "{name}: one κ̂ set per subject"
+            );
+            assert!(
+                res.ebe_kappas
+                    .iter()
+                    .flatten()
+                    .any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
+                "{name}: κ̂ is estimated, not a zero placeholder"
+            );
+            assert!(
+                res.shrinkage_kappa.len() == 1 && res.shrinkage_kappa[0].is_finite(),
+                "{name}: κ shrinkage {:?}",
+                res.shrinkage_kappa
+            );
+        }
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (e, c) in eval.subjects.iter().zip(&conv.subjects) {
+            assert_eq!(bits(&e.ipred), bits(&c.ipred), "IPRED, subject {}", e.id);
+            assert_eq!(bits(&e.iwres), bits(&c.iwres), "IWRES, subject {}", e.id);
+            assert_eq!(bits(&e.cwres), bits(&c.cwres), "CWRES, subject {}", e.id);
+            assert_eq!(
+                e.ofv_contribution.to_bits(),
+                c.ofv_contribution.to_bits(),
+                "per-subject OFV, subject {}",
+                e.id
+            );
+        }
+        for (ek, ck) in eval.ebe_kappas.iter().zip(&conv.ebe_kappas) {
+            for (a, b) in ek.iter().zip(ck) {
+                assert_eq!(bits(a.as_slice()), bits(b.as_slice()), "κ̂");
+            }
+        }
+    }
+
     #[test]
     fn iov_mixture_ofv_differs_from_no_iov_marginal() {
         // The IOV marginal must actually enter the objective: at the same params, a
