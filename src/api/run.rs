@@ -1363,7 +1363,8 @@ pub fn read_population_with(
 /// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
 /// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path` when the fit
 /// recorded no model file to take the reader settings from. The same reader call
-/// as [`read_population_for`] with no covariate declarations and no row filter, so
+/// as [`read_population_for`] with no covariate declarations and no row filter
+/// (but the same model-referenced columns, #1936), so
 /// the endpoint's rows come back as event records, not as Gaussian observations
 /// (#1199). With a model file, [`read_population_as_fitted`] is the reader.
 pub(crate) fn read_population_routed_by(
@@ -1393,7 +1394,9 @@ pub(crate) fn read_population_routed_by(
 /// reader (validates declared columns exist + are numeric, builds the table, and
 /// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
 /// it falls back to the lenient reader with `fallback_columns` (the legacy
-/// `covariate_columns` argument, or `None` for auto-detect).
+/// `covariate_columns` argument, or `None` for auto-detect). Either way every
+/// column the model references is read, including a record column or the
+/// `iov_column` that auto-detection would skip (#1936).
 ///
 /// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
 /// automatically routed to `subject.obs_records` instead of the Gaussian parallel
