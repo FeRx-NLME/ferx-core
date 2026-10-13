@@ -254,3 +254,118 @@ fn routed_by_reads_what_read_population_for_reads() {
     assert!(fit_read.covariate_names.iter().any(|c| c == "OCC"));
     assert_eq!(reload.covariate_names, fit_read.covariate_names);
 }
+
+// ── `check_covariates` tells an unread header from an absent one ──
+//
+// After the reader fix the only way to reach `E_MISSING_COVARIATE` on a name the
+// data has is a population built by the model-free `read_nonmem_csv*` and handed
+// to `fit()`. Those names get their own message; every other name keeps the
+// historical text byte-for-byte.
+
+/// The historical message, spelled out so a drift in it is a red test.
+fn historical(names: &str, available: &str) -> String {
+    format!(
+        "Model references covariate(s) not found in data (case-sensitive): {names}. \
+         Available covariate columns: {available}."
+    )
+}
+
+/// A model-free read of `warfarin_iov.csv` with `OCC` as the `iov_column`: `OCC`
+/// and `CMT` are headers it does not take as covariates.
+fn model_free_population() -> Population {
+    crate::io::datareader::read_nonmem_csv(
+        Path::new(&data_path("warfarin_iov.csv")),
+        None,
+        Some("OCC"),
+    )
+    .expect("model-free read succeeds")
+}
+
+/// Both sides of the gate in one test: `OCC` (an exact header, unread) gets the
+/// new text; `OCCX` (a typo, not a header) gets the historical text byte-for-byte,
+/// and the two are separate diagnostics. Forcing the partition to either side
+/// reddens this test. Each sentence of the new text is pinned by its own
+/// assertion, so deleting any one of them names the assertion that dies:
+///   S1 "…in the data but were not read as covariates: OCC." → "names the column"
+///   S2 "A read that does not know the model takes only…"    → "explains the reader"
+///   S3 "Read the data with the model (…) … `covariate_columns`." → "remedy"
+#[test]
+fn unread_header_and_typo_get_their_own_messages() {
+    let parsed = model("OCC + 0 * OCCX", "");
+    let pop = model_free_population();
+    assert!(pop.input_columns.iter().any(|h| h == "OCC"));
+    let diags = check_covariates(&parsed.model, &pop);
+    assert_eq!(diags.len(), 2, "{diags:#?}");
+    assert!(diags.iter().all(|d| d.code == "E_MISSING_COVARIATE"));
+
+    // The typo side: historical, byte-identical, and naming only the typo.
+    assert_eq!(diags[0].message, historical("OCCX", "(none)"));
+
+    // The unread side.
+    let m = &diags[1].message;
+    // S1 names the column and says it *is* in the data.
+    assert!(
+        m.contains("in the data but were not read as covariates: OCC."),
+        "names the column: {m}"
+    );
+    // S2 explains why the reader skipped it.
+    assert!(
+        m.contains(
+            "A read that does not know the model takes only the covariate columns it is given"
+        ) && m.contains("record columns (ID, TIME, DV, AMT, CMT, ...) and the `iov_column`"),
+        "explains the reader: {m}"
+    );
+    // S3 the remedy, both halves.
+    assert!(
+        m.contains("Read the data with the model (`read_population_with` / `read_population_for`), which reads every column the model references")
+            && m.contains("add the column(s) to `covariate_columns`"),
+        "remedy: {m}"
+    );
+    // Must not say it is missing, nor offer a model-file remedy to a model-free read.
+    assert!(
+        !m.contains("not found in data") && !m.contains("[covariates]"),
+        "{m}"
+    );
+    assert!(
+        !m.contains("OCCX"),
+        "the typo belongs to the other diagnostic: {m}"
+    );
+    assert_eq!(
+        diags[1].suggestion.as_deref(),
+        Some("read the data with `read_population_with`, or add OCC to `covariate_columns`")
+    );
+}
+
+/// A role column (`CMT`) alone: one diagnostic, the new one — and a model-aware
+/// read of the same file and model reports nothing.
+#[test]
+fn unread_role_column_alone_gets_only_the_new_message() {
+    let parsed = model("CMT", "");
+    let diags = check_covariates(&parsed.model, &model_free_population());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert!(diags[0]
+        .message
+        .contains("in the data but were not read as covariates: CMT."));
+    let aware = read(&parsed, &data_path("warfarin_iov.csv"), None);
+    assert!(check_covariates(&parsed.model, &aware).is_empty());
+}
+
+/// The cells that must keep the historical text: an in-memory population
+/// (`input_columns` empty, so whether the name is a header cannot be known) and a
+/// case-differing spelling (`Occ` against the `OCC` header — not an exact header).
+/// Mutation: a case-insensitive header match, or treating an empty
+/// `input_columns` as "every name is a header".
+#[test]
+fn in_memory_and_case_differing_keep_the_historical_text() {
+    let parsed = model("OCC", "");
+    let mut in_memory = model_free_population();
+    in_memory.input_columns.clear();
+    let d = check_covariates(&parsed.model, &in_memory);
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].message, historical("OCC", "(none)"));
+
+    let parsed = model("Occ", "");
+    let d = check_covariates(&parsed.model, &model_free_population());
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].message, historical("Occ", "(none)"));
+}
