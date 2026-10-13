@@ -452,7 +452,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 ///
 /// # Errors
 ///
-/// A time-varying covariate on a hazard, a dose into a compartment the model cannot
+/// A time-varying covariate on a hazard, an individual parameter that reads `TIME` and
+/// reaches an ODE-accumulated hazard (#1853), a dose into a compartment the model cannot
 /// deliver into, or a categorical covariate value outside its `[covariate_model]` relation's
 /// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
 /// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). And

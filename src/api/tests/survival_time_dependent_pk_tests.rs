@@ -350,6 +350,96 @@ fn a_time_dependent_parameter_read_only_by_an_odes_condition_is_refused() {
     );
 }
 
+/// **Control dependence is a prefix, not "all or nothing"** (round-2 review of PR #1924).
+/// Branch `k` runs only when conditions `0..k` were all false and its own is true, so a
+/// needed write inside it is governed by conditions `0..=k` — and by no later one.
+///
+/// Three arms, which is the smallest set that pins the rule from both sides. The fixture
+/// is one `[odes]` block with a needed intermediate `K` (which `central`'s derivative
+/// reads, and the hazard reads `central`) and an unneeded one `KOTHER` (which only
+/// `other`'s derivative reads, and nothing reads `other`):
+///
+/// * **needed write in arm 0, `SW` on arm 1** — `SW` governs only the unneeded write, so
+///   it is outside the slice and the model must be **accepted**. Adding every condition
+///   whenever anything inside is needed refuses it.
+/// * **needed write in arm 1, `SW` on arm 0** — arm 1 runs only if arm 0's condition was
+///   false, so `SW` is in the slice and the model must be **refused**. Adding only the
+///   needed arm's own condition accepts it, which is a false accept.
+/// * **needed write in arm 0, `SW` on arm 0** — the plain case, **refused**, so the first
+///   arm cannot pass by the slice simply never containing `SW`.
+#[test]
+fn control_dependence_reaches_the_conditions_up_to_the_needed_arm_and_no_further() {
+    const M: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKT(0.05, FIX)
+  theta TVFLAG(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FLAG = TVFLAG
+  SW   = TVKT * TIME
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central, other])
+[odes]
+  K      = 1.0
+  KOTHER = 0.1
+BRANCHES
+  d/dt(central) = -K * (CL/V) * central
+  d/dt(other)   = -KOTHER * other
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+    // `K` is needed (the hazard reads `central`, whose derivative reads `K`); `KOTHER` is
+    // not (nothing needed reads `other`). Only `SW` reads `TIME`.
+    let needed_first = "  if (FLAG > 0.0) {\n    K = 2.0\n  } else if (SW > 0.5) {\n                            KOTHER = 0.2\n  }";
+    let needed_second = "  if (SW > 0.5) {\n    KOTHER = 0.2\n  } else if (FLAG > 0.0) {\n                             K = 2.0\n  }";
+    let needed_own = "  if (SW > 0.5) {\n    K = 2.0\n  } else if (FLAG > 0.0) {\n                          KOTHER = 0.2\n  }";
+    for (arm, branches, refuse) in [
+        ("needed write in arm 0, SW on arm 1", needed_first, false),
+        ("needed write in arm 1, SW on arm 0", needed_second, true),
+        ("needed write in arm 0, SW on arm 0", needed_own, true),
+    ] {
+        let model = parse_model_string(&M.replace("BRANCHES", branches))
+            .unwrap_or_else(|e| panic!("{arm}: the branching [odes] model compiles: {e}"));
+        // The straddle, per arm: `SW` is this model's only `TIME` reader, so a verdict
+        // either way is about `SW` and nothing else.
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "{arm}: straddle — the block must read TIME"
+        );
+        let got = check_survival_time_dependent_pk(&model);
+        if refuse {
+            let msg = got.unwrap_or_else(|| {
+                panic!("{arm}: SW governs a write the accumulator depends on — must refuse")
+            });
+            assert!(
+                msg.contains("`SW` reads the `TIME` built-in"),
+                "{arm}: the message must name SW: {msg}"
+            );
+        } else {
+            assert_eq!(
+                got, None,
+                "{arm}: SW governs only a write nothing needed reads — must be accepted"
+            );
+        }
+    }
+}
+
 /// **The message names the endpoint whose own hazard depends on the parameter**, not the
 /// lowest-numbered one (round-1 review of PR #1924). Two ODE-accumulated causes: CMT 3
 /// integrates a constant, CMT 4 reads `central`, and the `TIME`-dependent `CL` reaches

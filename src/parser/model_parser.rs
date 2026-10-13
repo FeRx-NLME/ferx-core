@@ -26096,20 +26096,40 @@ impl OdeRhsProgram {
                         branches,
                         else_body,
                     } => {
-                        let mut written: Vec<usize> = Vec::new();
-                        for (_, body) in branches {
+                        // Control dependence, **per arm**. Branch `k` runs only when
+                        // conditions `0..k` were all false and its own is true, so a
+                        // needed write inside it is governed by conditions `0..=k` — and
+                        // by no later one. A needed write in the `else` is governed by
+                        // all of them.
+                        //
+                        // Taking the highest such arm covers every lower one
+                        // (`0..=k ⊇ 0..=j` for `j < k`), so this is one prefix, not a
+                        // union of ranges. Adding *every* condition whenever *anything*
+                        // inside is needed over-refuses: a `TIME`-reading condition on a
+                        // sibling arm that only writes a state the hazard never sees
+                        // would be pulled in (round-2 review of PR #1924). Adding only
+                        // the needed arm's own condition would under-approximate the
+                        // other way, which is a false accept — hence the prefix.
+                        let needed_write = |body: &[Statement], needed: &[bool]| -> bool {
+                            let mut written: Vec<usize> = Vec::new();
                             writes_into(body, &mut written);
+                            written
+                                .iter()
+                                .any(|&w| needed.get(w).copied().unwrap_or(true))
+                        };
+                        let mut upto: Option<usize> = None;
+                        for (k, (_, body)) in branches.iter().enumerate() {
+                            if needed_write(body, needed) {
+                                upto = Some(k);
+                            }
                         }
                         if let Some(eb) = else_body {
-                            writes_into(eb, &mut written);
+                            if needed_write(eb, needed) {
+                                upto = branches.len().checked_sub(1);
+                            }
                         }
-                        // Control dependence: if anything inside lands in the slice, the
-                        // conditions deciding whether it runs are in it too.
-                        if written
-                            .iter()
-                            .any(|&w| needed.get(w).copied().unwrap_or(true))
-                        {
-                            for (cond, _) in branches {
+                        if let Some(upto) = upto {
+                            for (cond, _) in branches.iter().take(upto + 1) {
                                 for t in 0..n {
                                     if cond_reads_slots(cond, &[t]) {
                                         add(t, needed, changed);
@@ -26585,7 +26605,26 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                         walk(eb, governed, time_vars, changed);
                     }
                 }
-                _ => {}
+                // No wildcard arm, for the reason `bytecode_is_dynamic`'s `Op` list has
+                // none: a `Statement` variant this walk cannot attribute to a slot must
+                // break the build rather than default to "assigns nothing", which is the
+                // answer that loses a `TIME` read.
+                //
+                // A name-based arm taints **everything**: the resolved program contains
+                // none (`resolve_variable_indices` rewrites every assignment to
+                // `AssignBc`), but if one ever reached here its slot is unknown, and the
+                // conservative direction is a false refusal, not a false accept.
+                Statement::Assign(..) | Statement::DiffEq(..) => {
+                    for i in 0..time_vars.len() {
+                        if !time_vars[i] {
+                            time_vars[i] = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                // `d/dt(...)` is only legal in `[odes]`; the individual-parameter program
+                // this runs on has no derivative statements to taint through.
+                Statement::DiffEqBc(..) | Statement::DiffEqIdx(..) => {}
             }
         }
     }

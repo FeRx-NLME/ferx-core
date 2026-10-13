@@ -297,9 +297,10 @@ from one integration of the augmented system rather than two:
   hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure
 ```
 
-Writing `TIME` in a PK equation still splits the solve, and on a model with a
-drug-driven hazard it is refused outright — see
-[the next section](#time-dependent-disposition). `__chz_*` may not be read from `[odes]`
+Writing `TIME` in a PK equation still splits the solve, and on a model with a drug-driven
+hazard it is refused when that parameter is one the hazard depends on — see
+[the next section](#time-dependent-disposition) for the dependency test and for the three
+shapes it accepts. `__chz_*` may not be read from `[odes]`
 or seeded with `init(...)` — see
 [the ODE-models page](../model-file/ode-models.qmd#chz-is-not-your-rhs).
 
@@ -364,8 +365,8 @@ individual parameters frozen at their TIME=0 values, but `CL` reads the `TIME` b
 the [odes] RHS reads it. ...
 ```
 
-The refusal is narrow in three ways, so a model it can only mis-fit is the only one it
-stops:
+The refusal is narrow in three ways, so what it stops is a model whose two halves can
+genuinely disagree:
 
 - a `TIME` read that stays inside the `[odes]` **RHS** — `d/dt(central) = … · (1 + K · TIME)`,
   or a Weibull / Gompertz baseline hazard — is fine: the integrator resolves `TIME` at
@@ -374,8 +375,10 @@ stops:
 - a `TIME`-reading parameter the **hazard does not depend on** is fine. `hazard = H0` with
   a time-dependent `CL` integrates a constant, so the accumulator is the same whatever
   snapshot the hazard pass runs under; ferx cuts a dependency slice back from each
-  `d/dt(__chz_<cmt>)` row and refuses only what lands in it. On a competing-risks model the
-  error names the endpoint whose own hazard is affected.
+  `d/dt(__chz_<cmt>)` row — data reads, the state dynamics behind them, the `init(...)` of
+  a state they reach, and the `if` conditions governing any of it — and refuses only what
+  lands in it. On a competing-risks model the error names the endpoint whose own hazard is
+  affected.
 
 Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for
 now; a per-record disposition for the hazard pass is tracked in
