@@ -1901,11 +1901,18 @@ pub(crate) struct RunFeasibility {
     /// Unguarded evaluations, read off the feasible-eval plateau tracker. `0` means
     /// the optimizer never once scored the real objective.
     pub(crate) feasible_evals: usize,
-    /// Objective calls the optimizer made.
-    pub(crate) n_evals: usize,
-    /// How many of those [`ebe_guard_rejects`] rejected. The rest of an infeasible
-    /// trace is non-finite objectives, which the same `guarded` branch absorbs.
+    /// Evaluations [`ebe_guard_rejects`] rejected.
     pub(crate) n_guard_rejected: usize,
+    /// Evaluations the `guarded` branch absorbed for the *other* reason — the objective
+    /// was not a finite number — counted at the source rather than inferred as
+    /// "callbacks minus guard rejections" (#1617 review round 3 #2). The objective
+    /// closure has two fast paths that increment the callback counter without producing
+    /// an objective at all: cancellation (which returns before the increment) and the
+    /// latched stagnation guard, which increments it and returns the incumbent
+    /// `state.best_ofv`. A subtraction would file every post-latch callback under
+    /// "returned a non-finite objective", which is false, and no arithmetic check on the
+    /// message could notice.
+    pub(crate) n_nonfinite: usize,
     /// Worst per-evaluation unconverged-subject count seen (the fraction trigger).
     pub(crate) max_unconverged: usize,
     /// Subjects in the population — the denominator the guard's fraction is taken over.
@@ -1921,6 +1928,14 @@ pub(crate) struct RunFeasibility {
 }
 
 impl RunFeasibility {
+    /// Evaluations that actually produced an objective for the optimizer to reject —
+    /// the number the message calls the run's *trials*. Deliberately the sum of the two
+    /// causes rather than the raw callback count, so the two cannot disagree: see
+    /// [`RunFeasibility::n_nonfinite`].
+    pub(crate) fn n_trials(&self) -> usize {
+        self.n_guard_rejected + self.n_nonfinite
+    }
+
     /// Whether the run never scored the real objective. Spelled **once**, on the type,
     /// because two consumers key on it 250 lines apart — the best-seen restore, which
     /// decides *which point* the fit reports, and [`no_feasible_eval_warning`], which
@@ -1930,6 +1945,17 @@ impl RunFeasibility {
     /// defect being fixed.
     pub(crate) fn no_feasible(&self) -> bool {
         self.feasible_evals == 0 && !self.cancelled
+    }
+}
+
+/// Lower-case the first character, for a sentence fragment spliced after "For those, ".
+/// Spelled out rather than inlined so the shared remedy text exists exactly once — it is
+/// the arm's whole advice in one place and the mixed clause's in the other.
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
     }
 }
 
@@ -1989,6 +2015,10 @@ pub(crate) fn no_feasible_eval_warning(
     *converged = false;
 
     let n_subj = run.n_subj.max(1);
+    let poisoned_objective_remedy = "Look for the parameter value or record that poisons \
+         the objective at and around the starting estimates — a non-finite dose time, \
+         lagtime, bioavailability or infusion duration, a covariate model that overflows, \
+         or a residual variance driven to zero.";
     let (cause, remedy) = if run.n_guard_rejected > 0 {
         (
             format!(
@@ -2008,28 +2038,33 @@ pub(crate) fn no_feasible_eval_warning(
             "every trial returned a non-finite objective, so the EBE convergence guard never \
              came into it."
                 .to_string(),
-            "Look for the parameter value or record that poisons the objective at and around \
-             the starting estimates — a non-finite dose time, lagtime, bioavailability or \
-             infusion duration, a covariate model that overflows, or a residual variance \
-             driven to zero — rather than changing the optimizer settings."
-                .to_string(),
+            format!("{poisoned_objective_remedy} This is not an optimizer setting."),
         )
     };
-    let mixed = if run.n_guard_rejected > 0 && run.n_guard_rejected < run.n_evals {
-        format!(
-            " The remaining {} returned a non-finite objective.",
-            run.n_evals - run.n_guard_rejected,
+    // A trace with both causes gets both remedies (#1617 review round 3 #1). The guard
+    // remedy alone would be advice that cannot reach the trials whose objective was not a
+    // number — `inner_maxiter` does not make a `NaN` finite — and the reader has no way to
+    // know the sentence only covers part of what the sentence before it just reported.
+    let mixed = if run.n_guard_rejected > 0 && run.n_nonfinite > 0 {
+        (
+            format!(
+                " The remaining {} returned a non-finite objective.",
+                run.n_nonfinite,
+            ),
+            format!(" For those, {}", lower_first(poisoned_objective_remedy)),
         )
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
     Some(format!(
         "{NO_FEASIBLE_EVAL_TOKEN}: the outer optimizer finished without a single feasible \
          objective evaluation — all {} of its trials were rejected before they could be \
          ranked, so no OFV was ever minimised and the estimates reported are the ones the \
-         fit started from. Specifically, {cause}{mixed} {remedy}",
-        run.n_evals,
+         fit started from. Specifically, {cause}{} {remedy}{}",
+        run.n_trials(),
+        mixed.0,
+        mixed.1,
     ))
 }
 
@@ -2938,6 +2973,11 @@ fn optimize_nlopt_once(
         max_unconverged: usize,
         total_fallback: usize,
         n_convergence_warnings: usize,
+        /// Evaluations rejected because the objective was not a finite number rather than
+        /// by the EBE guard (#1617 review round 3 #2). Counted here, not inferred from the
+        /// callback count, because the latched-stagnation fast path increments that counter
+        /// and returns the incumbent objective without producing a trial at all.
+        n_nonfinite: usize,
     }
     let ebe_accum: Arc<Mutex<EbeAccum>> = Arc::new(Mutex::new(EbeAccum::default()));
     let ebe_accum_cl = Arc::clone(&ebe_accum);
@@ -3122,6 +3162,8 @@ fn optimize_nlopt_once(
             acc.total_fallback += ebe_stats.n_fallback;
             if ebe_guard_triggered {
                 acc.n_convergence_warnings += 1;
+            } else if !raw_ofv.is_finite() {
+                acc.n_nonfinite += 1;
             }
         }
 
@@ -3566,8 +3608,8 @@ fn optimize_nlopt_once(
         let ebe_now = ebe_accum.lock().unwrap();
         RunFeasibility {
             feasible_evals,
-            n_evals: n_evals_outer.load(Ordering::Relaxed),
             n_guard_rejected: ebe_now.n_convergence_warnings,
+            n_nonfinite: ebe_now.n_nonfinite,
             max_unconverged: ebe_now.max_unconverged,
             n_subj,
             max_unconverged_frac: options.max_unconverged_frac,

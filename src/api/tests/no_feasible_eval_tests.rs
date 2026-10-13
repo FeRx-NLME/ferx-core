@@ -48,14 +48,16 @@
 //! | call site passes `cancelled: false` | E3 |
 //! | `budget_advice_applies = true` | E4 — "increase maxiter" reappears |
 //! | guard arm claims a trace with `n_guard_rejected == 0` | U4 **and** E5 |
-//! | `classify_warning`'s token arm off | U6 **and** E1 assertion 5 — `Warning`/`general` |
+//! | `classify_warning`'s token arm off | U7 **and** E1 assertion 5 — `Warning`/`general` |
 //! | the non-finite arm's **remedy** sentence deleted whole | U4 |
+//! | the mixed trace's second **remedy** dropped | U5 |
 //!
 //! The last row is the #1405 shape — a diagnostic's advice half that no test can kill is a
 //! claim nobody has checked — so every *other* sentence of the warning is covered the same
 //! way rather than by control-flow mutation alone: each of U3/U4/U5 asserts a verbatim
 //! substring of each sentence it owns (head and both clauses of the guard arm in U3, the
-//! non-finite cause and remedy in U4, the mixed-trace clause in U5), so deleting or
+//! non-finite cause and remedy in U4, the mixed-trace clause and its second remedy in
+//! U5), so deleting or
 //! rewording a sentence necessarily fails a named assertion. The arm that deliberately
 //! *withholds* the other's advice asserts its own remedy text, not merely the absence of
 //! the other's. E5 is the end-to-end twin of U4: the two can break independently, and the
@@ -169,7 +171,7 @@ const BOUND_MIDPOINT: [f64; 2] = [0.14142135623730953, 7.0710678118654755];
 /// convergence, must not report the bound midpoint as its estimate, and must say
 /// which guard stopped it.
 ///
-/// Five assertions, each separately load-bearing:
+/// Six assertions, each separately load-bearing:
 ///
 /// 1. **the trial trace is still infeasible** — non-degeneracy. The defect needs
 ///    *every* trial guard-rejected; if a later change lets one through, this fixture
@@ -188,6 +190,9 @@ const BOUND_MIDPOINT: [f64; 2] = [0.14142135623730953, 7.0710678118654755];
 ///    `unpack_params`, which costs `10.0` one ULP.
 /// 5. **a warning names the guard, the share and the remedy**, carries
 ///    `W_NO_FEASIBLE_EVAL` and classifies `Critical`/`convergence`.
+/// 6. **the warning set for this row** — the generic `Outer optimization did not converge`
+///    line is there too, and `W_NONFINITE_OBJECTIVE` is not. That is the per-row claim the
+///    docs make; E5 asserts the other row, where the third warning does fire.
 ///
 /// Mutation (run): drop the `no_feasible_eval_warning` call at the NLopt exit →
 /// assertion 2 fires (3 and 4 pass, since the estimates *are* the inits). Drop only
@@ -255,6 +260,29 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
         entry.message.contains("max_unconverged_frac") && entry.message.contains("inner_maxiter"),
         "the message must name both knobs the user can act on: {}",
         entry.message
+    );
+    // (6) The warning *set* for this row, which is what `docs/estimation/foce.qmd` claims
+    //     and what round 3 of review corrected: the generic non-convergence line always
+    //     accompanies a demoted run, and `W_NONFINITE_OBJECTIVE` does **not** fire here —
+    //     the re-score at the starting estimates is a real objective (76.85), not a
+    //     sentinel. E5 is the same assertion on the other row, where it does fire.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Outer optimization did not converge")),
+        "a demoted run carries the generic line too: {:?}",
+        result.warnings
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+        "the objective at the reported point is finite on this row ({}), so its own gate \
+         must stay quiet: {:?}",
+        result.ofv,
+        result.warnings
     );
 }
 
@@ -515,7 +543,7 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  U1..U6 — `no_feasible_eval_warning`, every cell of its input space
+//  U1..U7 — `no_feasible_eval_warning`, every cell of its input space
 //
 //  The message's input space is (feasible_evals = 0 or > 0) × (cancelled) ×
 //  (cause: start rejection / fraction / non-finite) × (guard count = n_evals or
@@ -526,8 +554,8 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
 fn fraction_run() -> RunFeasibility {
     RunFeasibility {
         feasible_evals: 0,
-        n_evals: 7,
         n_guard_rejected: 7,
+        n_nonfinite: 0,
         max_unconverged: 9,
         n_subj: 10,
         max_unconverged_frac: 0.1,
@@ -602,8 +630,9 @@ fn the_fraction_trigger_names_the_share_and_both_knobs() {
     // The remedy sentence.
     assert!(msg.contains("Raise `inner_maxiter` (currently 3)"), "{msg}");
     assert!(msg.contains("`1.0` disables the guard"), "{msg}");
-    // No mixed-cause clause when every trial was the guard's.
+    // No mixed-cause clause, and no second remedy, when every trial was the guard's.
     assert!(!msg.contains("The remaining"), "{msg}");
+    assert!(!msg.contains("For those"), "{msg}");
 }
 
 /// **U4 — the non-finite arm.** When the guard never fired, every trial was infeasible
@@ -615,6 +644,7 @@ fn an_all_non_finite_trace_does_not_blame_the_guard() {
     let mut converged = true;
     let run = RunFeasibility {
         n_guard_rejected: 0,
+        n_nonfinite: 7,
         max_unconverged: 0,
         ..fraction_run()
     };
@@ -649,19 +679,69 @@ fn a_mixed_trace_accounts_for_every_trial() {
     let mut converged = true;
     let run = RunFeasibility {
         n_guard_rejected: 5,
+        n_nonfinite: 2,
         ..fraction_run()
     };
     let msg = no_feasible_eval_warning(&mut converged, &run).expect("a warning");
     assert!(!converged);
+    // The trial count is the sum of the two causes, not a callback count: see
+    // `RunFeasibility::n_trials`.
     assert!(msg.contains("all 7 of its trials"), "{msg}");
     assert!(msg.contains("rejected 5 of them"), "{msg}");
     assert!(
         msg.contains("The remaining 2 returned a non-finite objective"),
         "{msg}"
     );
+    // ...and *both* remedies, because neither covers the other's trials: `inner_maxiter`
+    // does not make a `NaN` finite, and chasing a poisoned record does not widen the inner
+    // budget. The guard remedy alone was what round 3 of review caught.
+    assert!(msg.contains("Raise `inner_maxiter` (currently 3)"), "{msg}");
+    assert!(
+        msg.contains("For those, look for the parameter value or record that poisons"),
+        "{msg}"
+    );
 }
 
-/// **U6 — the token routes to `Critical`/`convergence` on its own.** The message says
+/// **U6 — the trial count is the sum of the two causes, never a callback count**
+/// (#1617 review round 3 #2).
+///
+/// The objective closure's callback counter (`n_evals_outer`, which becomes
+/// `FitResult::n_iterations`) counts calls, not trials: the latched-stagnation fast path
+/// increments it and returns the incumbent objective without producing one. Deriving the
+/// non-finite count as "callbacks minus guard rejections" therefore files every post-latch
+/// callback under "returned a non-finite objective", which is false.
+///
+/// `RunFeasibility` no longer carries a callback count at all, so that subtraction is not
+/// expressible — which is the fix, and also why no fixture can observe it. Measured, the
+/// latent defect is not reachable either: the latch needs 50 evaluations without OFV
+/// improvement (the long window, since `last_sig_feasible_eval` is 0 on an infeasible
+/// trace), and every optimizer terminates on the guard penalty long before that — BOBYQA
+/// stops at 17 evaluations on the flat `1e20` wall, L-BFGS at 4 on the exact quadratic,
+/// MMA at 10, over five optimizer/budget combinations. So this pins the contract rather
+/// than a reachable failure: reintroducing the bug means reintroducing the field.
+#[test]
+fn the_trial_count_is_the_sum_of_the_two_causes() {
+    let run = RunFeasibility {
+        n_guard_rejected: 5,
+        n_nonfinite: 2,
+        ..fraction_run()
+    };
+    assert_eq!(run.n_trials(), 7);
+    assert_eq!(
+        RunFeasibility {
+            n_guard_rejected: 0,
+            n_nonfinite: 3,
+            ..fraction_run()
+        }
+        .n_trials(),
+        3
+    );
+    let mut converged = true;
+    let msg = no_feasible_eval_warning(&mut converged, &run).expect("a warning");
+    assert!(msg.contains("all 7 of its trials"), "{msg}");
+}
+
+/// **U7 — the token routes to `Critical`/`convergence` on its own.** The message says
 /// "did not converge" nowhere, so without the token arm in `classify_warning` it would
 /// land in the `general` fallback bucket at `Warning` severity — the opposite of what a
 /// consumer branching on `category` needs from a run that produced no estimate.

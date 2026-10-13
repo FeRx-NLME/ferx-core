@@ -727,20 +727,26 @@ the two ways a trial can be infeasible applied, because the remedies are not the
 A **cancelled** run is not reported this way: its evaluations short-circuit before the
 feasible-evaluation counter advances, so its trace is infeasible by construction.
 
-Two notes on reading such a run.
+Three notes on reading such a run.
+
+A trace can be in **both** rows at once — some trials rejected by the guard, the rest
+non-finite — and then the warning reports both counts and carries both remedies, because
+neither reaches the other's trials: `inner_maxiter` does not make a `NaN` finite, and
+chasing a poisoned record does not widen the inner budget.
 
 The "increase `maxiter`" advice is withheld, on either row. A run that scored nothing has
 no fit to tighten and a longer *outer* budget buys only more rejected trials, so when the
-outer budget is exhausted the usual budget warning does not appear and
-`W_NO_FEASIBLE_EVAL` stands alone with whichever remedy its row carries.
+outer budget is exhausted the usual "increase maxiter for a tighter fit" warning does not
+appear.
 
-Whether `W_NONFINITE_OBJECTIVE` also fires is the one thing that differs by row. On the
-**guard-rejection** row the reported OFV is a real objective — the starting estimates,
-scored by the final inner loop — so it is not a sentinel and only `W_NO_FEASIBLE_EVAL`
-appears; the number is simply not a minimum of anything. On the **non-finite** row the
-re-score at the starting estimates is usually non-finite too, and then both warnings
-appear: `W_NO_FEASIBLE_EVAL` for the trace and `W_NONFINITE_OBJECTIVE` for the number. Two
-warnings, two different facts.
+What *does* always accompany `W_NO_FEASIBLE_EVAL` is the generic
+`Outer optimization did not converge` line, since the run is demoted. What differs by row
+is whether `W_NONFINITE_OBJECTIVE` joins them. On the **guard-rejection** row the reported
+OFV is a real objective — the starting estimates, scored by the final inner loop — so it is
+not a sentinel and that warning does not fire; the number is simply not a minimum of
+anything. On the **non-finite** row the re-score at the starting estimates is usually
+non-finite too, and it does. Three warnings then, three different facts: the trace, the
+verdict, and the number.
 
 Finally, `gradient = fd` can hide the whole case, because it also swaps the outer optimizer
 away from L-BFGS to the derivative-free BOBYQA ([`gradient = fd` moves the optimizer
