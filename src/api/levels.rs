@@ -161,7 +161,9 @@ fn bind_levels_on_data(
     // raw, every level: two absorbing blocks that each depend on the other's
     // coding keep the conservative verdict. No second-pass block reads another
     // second-pass block's result, so the outcome does not depend on the order
-    // the blocks are declared in.
+    // the blocks are declared in — which is what lets the second pass run
+    // lazily, in declaration order, stopping at the first refusal: a
+    // certificate is never measured for a model already refused.
     let absorbing: Vec<bool> = decls
         .iter()
         .zip(&measured)
@@ -185,21 +187,13 @@ fn bind_levels_on_data(
             _ => None,
         })
         .collect();
-    for (i, ((decl, levels), m)) in decls.iter().zip(&discovered).zip(&measured).enumerate() {
-        if absorbing[i] {
-            resolved[i] = Some(resolve_contrast(
-                decl,
-                levels,
-                m,
-                with_occasions,
-                Some(&first_pass),
-            ));
-        }
-    }
 
     let mut bindings = LevelBindings::new();
-    for ((decl, levels), r) in decls.iter().zip(&discovered).zip(resolved) {
-        let (contrast, groups) = r.expect("both passes resolve every block")?;
+    for (i, ((decl, levels), m)) in decls.iter().zip(&discovered).zip(&measured).enumerate() {
+        let (contrast, groups) = match resolved[i].take() {
+            Some(r) => r,
+            None => resolve_contrast(decl, levels, m, with_occasions, Some(&first_pass)),
+        }?;
         let binding = LevelBinding {
             labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
             groups,
@@ -2549,16 +2543,20 @@ fn carried(
         // the model is aliased whatever the random effect keeps. The rank falls
         // out of the basis the residual needs anyway; the other θ's own
         // deficiency, if any, is not the block's and is subtracted.
-        let basis = BlockBasis::new(&cols, &lens, &offsets);
-        let others = BlockBasis::new(&cols[..n_other], &lens, &offsets);
-        if basis.aliased() > others.aliased() {
-            return Carried::Held;
-        }
+        //
         // Without the coarser random effects first: adding columns only widens
         // the span, so a unit set held without them is held with them, and the
         // usual refusal — an intercept carrying the direction — never builds
-        // their one column per unit (#1961 review, F1).
+        // their one column per unit (#1961 review, F1). It is held whatever the
+        // rank says, so it never builds the other θ's basis either; nor does a
+        // full basis with no aliased column, whose other θ are independent too.
+        let basis = BlockBasis::new(&cols, &lens, &offsets);
         if outside(&basis) != Some(true) {
+            return Carried::Held;
+        }
+        if basis.aliased() > 0
+            && basis.aliased() > BlockBasis::new(&cols[..n_other], &lens, &offsets).aliased()
+        {
             return Carried::Held;
         }
         // The random effects at a coarser-or-equal unit: the other η for an η,

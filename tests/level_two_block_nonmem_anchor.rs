@@ -189,8 +189,9 @@ fn two_level_blocks_match_nonmem_and_the_hand_spelling() {
          {d_eta:.3e}, max |ΔPRED| {d_pred:.3e}, max |ΔIPRED| {d_ipred:.3e}",
         level.ofv, est["OBJ"]
     );
-    // Realised, macOS arm64 debug: |ΔOFV| 5.3e-15, |Δη̂| 5.6e-17, |ΔPRED| 0, |ΔIPRED|
-    // 1.8e-15. The model is linear in η with an additive error, so η̂ is a closed form
+    // Realised, Linux aarch64 debug (`tools/linux-test.sh`, the reference platform):
+    // |ΔOFV| 5.329e-15, |Δη̂| 5.551e-17, |ΔPRED| 0, |ΔIPRED| 1.776e-15 — the same in
+    // every printed digit as macOS arm64. The model is linear in η with an additive error, so η̂ is a closed form
     // on both sides and needs no inner-optimizer allowance. The bounds leave five
     // decades or more of headroom; a level read at another level's θ moves PRED by at
     // least 0.05.
@@ -207,7 +208,16 @@ fn two_level_blocks_match_nonmem_and_the_hand_spelling() {
         level.ofv,
         hand.ofv
     );
+    // Same subjects and records first: a zip alone would compare only the overlap.
+    assert_eq!(hand.subjects.len(), level.subjects.len(), "subjects");
     for (a, b) in level.subjects.iter().zip(&hand.subjects) {
+        assert_eq!(a.id, b.id, "subject order");
+        assert_eq!(
+            (a.pred.len(), a.ipred.len()),
+            (b.pred.len(), b.ipred.len()),
+            "{}: records",
+            a.id
+        );
         assert_eq!(a.eta[0].to_bits(), b.eta[0].to_bits(), "{}: η̂", a.id);
         assert!(
             a.pred

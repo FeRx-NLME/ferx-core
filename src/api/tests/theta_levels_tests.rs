@@ -4216,6 +4216,19 @@ mod absorption {
         Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
     }
 
+    /// The contrast `text` binds level block `name` to on `pop`, or `None` when
+    /// the bind is refused.
+    pub(super) fn bound_contrast(
+        text: &str,
+        pop: &Population,
+        name: &str,
+    ) -> Option<LevelContrast> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text).ok()?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p).ok()?;
+        Some(parsed.bindings.levels[name].contrast)
+    }
+
     /// The Jacobian pieces at the initial θ and η = κ = 0 ([`jacobian_at`] for
     /// another point), by central FD of the f64 predictor: the block's
     /// per-level columns (bound under `none`), the other θ columns, the
@@ -4319,11 +4332,12 @@ mod absorption {
         const CV: [f64; 5] = [0.6, -0.9, 0.3, 1.0, -0.4];
         // Every block measured under `none`, a second one declared with its
         // own contrast too (#1963): `Jac::coded` applies that contrast.
-        let text = &["sum_to_zero_within", "sum_to_zero", "ref"]
-            .iter()
-            .fold(text.to_string(), |t, c| {
-                t.replace(&format!(", contrast = {c}]"), ", contrast = none]")
-            });
+        // Any spelling of the key: a fixture written `contrast=ref` must not stay
+        // coded here and be coded a second time by `Jac::coded` (#1985 review, F8).
+        let text = &regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
+            .unwrap()
+            .replace_all(text, ", contrast = none]")
+            .into_owned();
         let fitted = none_layout(text, pop0);
         let mut pop = pop0.clone();
         let mut parsed = parse_full_model(text).unwrap();
@@ -5445,6 +5459,19 @@ mod absorption {
                 wrong.push(format!(
                     "{tag} {token}: oracle absorbs {absorbed:?}, binder {got:?}"
                 ));
+            }
+            // The oracle coded each other block by the contrast the caller
+            // stated; where the binder binds, it must be the one it chose, or
+            // the two judge different models (#1985 review, F4).
+            if got.is_ok() {
+                for (name, stated) in others {
+                    let chosen = bound_contrast(&text(token), pop, name);
+                    if chosen != Some(*stated) {
+                        wrong.push(format!(
+                            "{tag} {token}: oracle coded {name} {stated:?}, binder chose {chosen:?}"
+                        ));
+                    }
+                }
             }
         }
         let all_absorb = absorbs.values().all(|a| *a);
