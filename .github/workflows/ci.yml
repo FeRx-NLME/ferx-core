@@ -147,7 +147,9 @@ jobs:
             --test pktte_prestart_entry \
             --test pktte_tdep_nonmem_anchor \
             --test reset_clock_nonmem_anchor \
+            --test sampler_covariance_non_gaussian \
             --test ss_chz_nonmem_anchor \
+            --test survival_time_dependent_pk \
             --test tte_convergence \
             --test tte_smoke \
             --test vi_dcm_omega_recovery \

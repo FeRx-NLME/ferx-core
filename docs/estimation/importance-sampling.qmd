@@ -313,6 +313,14 @@ The result struct flags this via `kappa_treatment = "marginalized"`
 over both η and κ uncertainty, making it directly comparable to
 NONMEM `$EST METHOD=IMP LAPLACIAN=1` on κ.
 
+## Standard errors on a non-Gaussian model
+
+With a TTE, `[binary_model]` or CTMM endpoint, the covariance step after `imp` differentiates
+the 7-node quadrature marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective,
+whose minimum can sit far from the `imp` estimate on such a model (#1781). See
+[SAEM: covariance step on a non-Gaussian model](saem.qmd#saem-covariance-non-gaussian) for
+when it applies, the measured effect, and the warnings it carries.
+
 ## Cost
 
 K × n_subjects predict calls per IMP run. For warfarin (32 subjects)

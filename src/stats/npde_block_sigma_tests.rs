@@ -112,7 +112,7 @@ fn npd_scores_a_free_block_sigma_at_the_fitted_correlation() {
     let pop = population(subject, vec![]);
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {
-        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let npd = out[0].npd[0];
         assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
         eprintln!("arm A seed {seed}: npd = {npd}");
@@ -161,7 +161,7 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
     let mut worst_npde = 0.0f64;
     let mut worst_npd = 0.0f64;
     for seed in 1..=SEEDS {
-        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let (npde, npd) = (out[0].npde[1], out[0].npd[1]);
         assert!(
             npde.is_finite() && npd.is_finite(),
@@ -222,7 +222,7 @@ fn a_fixed_block_sigma_scores_exactly_as_before_the_shared_draw() {
     ];
     for corr in [model.residual_correlations.clone(), vec![]] {
         params.residual_correlations = corr;
-        let out = compute_npde_npd(&model, &pop, &params, 200, Some(1)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, 200, Some(1), None).expect("npde");
         let got = &out[0].npde;
         eprintln!("subject 1 npde = {got:?}");
         assert_eq!(got.len(), pinned.len());
@@ -264,7 +264,7 @@ fn a_frem_subject_draws_its_pk_rows_at_the_fitted_correlation() {
 
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {
-        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let npd = out[0].npd[0];
         assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
         worst = worst.max((npd - 1.0).abs());
@@ -344,7 +344,7 @@ fn npd_carries_iiv_on_ruv_through_the_correlated_draw() {
     let pop = population(subject, vec![]);
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {
-        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let npd = out[0].npd[0];
         assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
         worst = worst.max((npd - cf).abs());
@@ -393,7 +393,7 @@ fn npd_carries_a_custom_magnitude_through_the_correlated_draw() {
     let pop = population(subject, vec![]);
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {
-        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed)).expect("npde");
+        let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let npd = out[0].npd[0];
         assert!(npd.is_finite(), "seed {seed}: npd = {npd}");
         worst = worst.max((npd - 1.0).abs());

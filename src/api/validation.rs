@@ -3667,6 +3667,195 @@ pub(crate) fn check_survival_tv_covariates(
     None
 }
 
+/// Reject a model whose **ODE-accumulated hazard integrates a `TIME`-dependent
+/// disposition** — currently silently frozen at `TIME = 0` (#1853), the `TIME` axis of
+/// the freeze [`check_survival_tv_covariates`] refuses on the covariate axis (#741).
+///
+/// `survival::ode_cumhaz_hazard` (the TTE objective's dedicated engine and
+/// `predict_survival`) and `survival::draw_ode_tte_latent` (`simulate()`'s event times)
+/// take one `$PK` snapshot, `(model.pk_param_fn)(…, 0.0)`, and integrate the whole
+/// timeline under it. Since #1575 every *dose-record* quantity is read at its own dose
+/// record instead, so what remains frozen is the disposition the `[odes]` RHS integrates
+/// (CL, V and the like), the parameters the hazard expression itself reads, and `init()`.
+///
+/// Meanwhile a subject of such a model declines the #570 one-solve share
+/// (`model_uses_time_anywhere`) and takes its *Gaussian* predictions from the per-record
+/// event-driven walk, which evaluates `$PK` at every record. So the two halves of one
+/// objective can read two different concentration curves. Measured on a 1-cpt IV model
+/// with `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0·exp(BETA·C)`
+/// (`tests/survival_time_dependent_pk.rs`): at `t = 8` the Gaussian pass predicts
+/// `central = 33.790` — the per-record convention, to 10 significant figures against a
+/// closed form computed outside both engines — while the hazard pass reads `44.933`; at
+/// `t = 20`, `3.065` against `13.534`. `H(20)` is 10.1 % high, and the exact-event
+/// `−log L` is off by 0.046 per subject. The frozen hazard is also *bit-identical* across
+/// `KT = 0` and `KT = 0.05`: the `TIME` coefficient has no influence at all on the
+/// survival term it was written for.
+///
+/// Until a per-record disposition reaches the hazard pass (#1920), refuse rather than
+/// silently mis-fit. **The granularity is per parameter and per endpoint** — not per
+/// block, and not per model — so the refusal fires only where freezing *that* parameter
+/// can reach *that* accumulator, which rules out two shapes a "does the RHS mention it"
+/// test would have refused —
+///
+/// * a quantity the hazard pass already reads at each dose record (`MTT`, `ALAG1`,
+///   `F`, `D{n}`/`R{n}`, …; #1575), and
+/// * a parameter the accumulator does not depend on — `CL` on a model whose
+///   `hazard = H0` integrates a constant, or an `init()` of a state the hazard never
+///   sees (round-1 review of PR #1924).
+///
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] is where that
+/// lives; `tests/one_snapshot_dose_reads_survival.rs` is the #1575 fixture that must stay
+/// fittable.
+///
+/// **Both halves are structural, not value-based**, which is where the remaining
+/// over-refusals live: a parameter whose `TIME` term cancels (`CL = TVCL + 0.0 * TIME`)
+/// reads `TIME` as far as the mask is concerned, and the slice follows a read whether or
+/// not the value it carries matters. Deciding either would mean constant-folding the
+/// program, and the direction of the error is a loud refusal whose remedy — delete the
+/// term — is right for the model anyway.
+///
+/// **One more documented over-refusal (#1931):** both analyses are flow-insensitive
+/// with respect to *kills*, so a `TIME`-dependent definition that a later unconditional
+/// assignment discards is still followed, and a model carrying such a dead store is
+/// refused although its effective `$PK` is time-free. The direction is the safe one — a
+/// loud error whose remedy, deleting the dead line, is right for the model anyway — and a
+/// kill-aware pass can produce a false *accept* if it mistakes a conditional write for a
+/// kill, which is the silent class this check exists to stop. Pinned, with its live twin,
+/// by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
+///
+/// Returns `None` for every model with no `OdeAccumulated` hazard, and for every model
+/// none of whose `TIME`-dependent individual parameters can reach one. `fit()` and every
+/// predict / simulate entry point surface the message as an `Err`, as they do for #741.
+///
+/// **Not wired into `predict_categorical`**, although #741's check is. The two have
+/// different mechanisms: #741 refuses there because the *logit predictor itself* is
+/// evaluated at a frozen snapshot, while the freeze here is read only by
+/// `survival::ode_cumhaz_hazard` and `survival::draw_ode_tte_latent`, which that entry
+/// point never calls. A call there would refuse a categorical prediction whose own answer
+/// is unaffected, and no test could kill it.
+///
+/// **Not a complete guard on the low-level public surface, by the same boundary #741
+/// draws.** `stats::likelihood::individual_nll*` and `survival::simulate_tte` are `pub`
+/// and reach the frozen snapshot directly, and neither this check nor
+/// [`check_survival_tv_covariates`] runs there: both are validation at the documented
+/// entry points, and `individual_nll` is called per subject per objective evaluation, so a
+/// model-level walk inside it would run millions of times to answer a question that
+/// cannot change during a fit. Widening the guard to that surface is one decision
+/// covering both checks (#1926), not something to do for one of them.
+///
+/// **One gate, not two.** A `crate::parser::model_parser::compiled_model_uses_time_builtin`
+/// fast exit in front of the loop would be free and would read as the load-bearing
+/// narrow-vs-wide choice (asking `pk::model_uses_time_anywhere` instead must not refuse a
+/// `TIME`-reading `[odes]` RHS, which the integrator clock honours, #610). Measured: it is
+/// neither. Swapping the narrow flag for the wide one left all seven unit tests green,
+/// because `params_reading_time` already answers all-`false` for such a model — two
+/// predicates rejecting the same inputs, so the test pinning either could not fail. The
+/// mask is the gate; `.min()?` on the endpoint list is the cheap discriminator in front
+/// of it.
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    // Every `OdeAccumulated` endpoint with its own accumulator slot, in CMT order: the
+    // message must name the endpoint whose hazard actually depends on the parameter, not
+    // merely the lowest-numbered one (round-1 review of PR #1924). Deterministic in both
+    // loops — CMT order outside, declaration order inside. No such endpoint is the cheap
+    // exit for every other model.
+    let mut ode_hazards: Vec<(usize, usize)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, e)| match e {
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            } => Some((*cmt, *chz_state)),
+            _ => None,
+        })
+        .collect();
+    ode_hazards.sort_unstable();
+    let first_cmt = ode_hazards.first().map(|&(cmt, _)| cmt)?;
+    // **Fail closed from here.** Both analyses below need metadata the parser always
+    // attaches, and "this model cannot be analysed" must not read as "nothing is frozen"
+    // (round-3 review of PR #1924): `CompiledModel::indiv_param_partials` is a `pub`
+    // field and `IndivParamPartials::empty()` is public API, and `OdeSpec`'s fields are
+    // `pub` too, so a hand-assembled or hand-edited model can present a working
+    // `pk_param_fn` and `[odes]` RHS with the metadata stripped — and would have kept the
+    // silent freeze this check exists to stop. A `.ferx` file cannot reach either arm.
+    //
+    // What this cannot defend against is metadata that is *present but stale* — a
+    // `pk_param_fn`, `OdeSpec::rhs` or `init_fn` replaced while the parser's snapshot of
+    // the same program is kept. That is the crate's standing invariant, not this check's:
+    // the snapshots exist because `sens/` evaluates them over `Dual2` as the exact
+    // derivative of those very closures (the `*_g_dual_matches_fd` parity tests are the
+    // statement of it), so a model whose snapshot and closure disagree has a wrong
+    // gradient before it has a wrong refusal. No check can compare a closure against a
+    // program; the parser builds them together, which is the only reason either is
+    // trustworthy.
+    let unanalysable = |what: &str, how: &str| -> Option<String> {
+        Some(format!(
+            "[event_model] on CMT={first_cmt}: this model carries an ODE-accumulated \
+             (joint PK-TTE) hazard, whose pass integrates the individual parameters \
+             frozen at their TIME=0 values, but it has no {what}, so whether that freeze \
+             applies cannot be determined (#1853). Every model parsed from a `.ferx` file \
+             carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
+             through `parse_model_string` / `parse_model_file`{how}."
+        ))
+    };
+    let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
+        return unanalysable(
+            "compiled `[odes]` program (`OdeSpec::rhs_program`)",
+            ", or drop the ODE-accumulated hazard",
+        );
+    };
+    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+        return unanalysable(
+            "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
+            " rather than replacing that field with `IndivParamPartials::empty()`",
+        );
+    };
+    let reads_time = program.params_reading_time();
+    // No `TIME`-dependent parameter ⇒ nothing is frozen, and no slice has to be built.
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
+    for (cmt, chz_state) in ode_hazards {
+        // What this accumulator's value depends on. Built per endpoint, because two
+        // hazards on one model can read different states.
+        let slice = rhs.chz_dependency_slice(chz_state);
+        for (i, name) in model.indiv_param_names.iter().enumerate() {
+            if !reads_time.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // `indiv_param_names` can be longer than the `[odes]` block's own parameter
+            // list (a `pk(... = TIME)` desugaring's synthetic, a `[scaling]` Form C
+            // readout synthetic — both appended after `build_ode_spec` has run). The
+            // compiled block cannot read such a name, so it is not frozen by this
+            // snapshot; skipping it is the answer, not a bail-out.
+            if !rhs.has_indiv_param(i) {
+                continue;
+            }
+            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
+            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
+            let site = match (in_rhs, in_init) {
+                (true, true) => "the [odes] RHS and an init(...) seed read",
+                (true, false) => "the [odes] RHS reads",
+                (false, true) => "an [odes] init(...) seed reads",
+                // The parameter cannot affect this accumulator — a dose-record quantity
+                // (#1575), or a part of the system the hazard does not depend on.
+                (false, false) => continue,
+            };
+            return Some(format!(
+                "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                 integrated with the individual parameters frozen at their TIME=0 values, but \
+                 `{name}` reads the `TIME` built-in and {site} it. A TIME-dependent \
+                 disposition on a drug-driven hazard is not yet supported (#1853): the Gaussian \
+                 predictions evaluate `[individual_parameters]` at every record while the hazard \
+                 pass keeps the TIME=0 value. Hold `{name}` constant in TIME for now."
+            ));
+        }
+    }
+    None
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
@@ -3733,6 +3922,47 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
+/// Whether `model` is a transit / inverse-Gaussian **closed form carrying no ODE twin** —
+/// the one family whose flip-flop regime has nothing to reroute to, and so the only one that
+/// can silently return an identically-zero **dose-driven contribution** (not necessarily an
+/// identically-zero profile: a baseline, readout or log transform layered on afterwards
+/// survives the clamp — see [`SimulatedFlipFlopTally`]).
+///
+/// A twin-*carrying* model is rerouted per evaluation by
+/// [`crate::pk::effective_model_for_eval`] and is correct in both regimes (it is only
+/// *warned* about, #776); a non-absorption model has no flip-flop regime at all. One
+/// predicate for the three gates that share it — the η = 0 refusal
+/// ([`check_absorption_flip_flop_no_twin`]), the fit-end EBE warning
+/// ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) and the
+/// simulated-η tally ([`SimulatedFlipFlopTally`], #1823) — so a family added to one
+/// is added to all three rather than to whichever copy the author happened to read.
+pub(crate) fn twinless_absorption_closed_form(model: &CompiledModel) -> bool {
+    matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && model.absorption_ode_equivalent.is_none()
+}
+
+/// The tilting abscissa and the ODE rewrite's forcing function for `model`'s absorption
+/// family — the two strings every flip-flop message interpolates, in one place so a
+/// re-worded domain cannot reach one message and not another.
+fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'static str) {
+    match model.pk_model {
+        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
+        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
+    }
+}
+
+/// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
+/// 1-cpt model, which has a single disposition exponential and so no such edge.
+fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
+    if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
+        ", or with coincident disposition eigenvalues"
+    } else {
+        ""
+    }
+}
+
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
@@ -3756,11 +3986,7 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     theta: &[f64],
 ) -> Option<String> {
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) || model.absorption_ode_equivalent.is_some()
-    {
+    if !twinless_absorption_closed_form(model) {
         return None;
     }
     // Model-family-specific domain / ODE-forcing wording (the tilting abscissa and the
@@ -3810,15 +4036,8 @@ pub(crate) fn uncertainty_draws_skipped_warning(
     skipped: &[usize],
     n: usize,
 ) -> String {
-    let (domain, ode_fn) = match model.pk_model {
-        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
-        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
-    };
-    let confluent = if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
-        ", or with coincident disposition eigenvalues"
-    } else {
-        ""
-    };
+    let (domain, ode_fn) = absorption_flip_flop_wording(model);
+    let confluent = absorption_confluent_clause(model);
     let list = skipped
         .iter()
         .map(|k| k.to_string())
@@ -3836,6 +4055,215 @@ pub(crate) fn uncertainty_draws_skipped_warning(
         model_name = model.pk_model.canonical_name(),
         decline = twin_decline_clause(model),
     )
+}
+
+/// Per-run tally of **dosed** simulated individuals whose **sampled η** entered the
+/// flip-flop regime of a twin-less transit / IG closed form, where the whole dose-driven
+/// concentration is clamped to zero (#1823).
+///
+/// The three gates that existed before all sample a *fixed* η: the entry-point refusal
+/// ([`check_absorption_flip_flop_no_twin`]) evaluates η = 0 typical values, the fit-end
+/// warning ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) evaluates the
+/// fitted EBEs, and the uncertainty skip ([`uncertainty_draws_skipped_warning`], #786 /
+/// #1485) evaluates each *draw's* η = 0 θ. None of them sees the individual
+/// `simulate()` draws from N(0, Ω) whose own η pushes `ke` to or past the tilting
+/// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
+/// reroute to and returns the closed form, which clamps — so the individual contributes
+/// finite, plottable rows carrying nothing from the doses the subject was given, and every
+/// summary computed over them (a VPC band, a prediction interval, a mean) describes an
+/// **undosed** subject. Counting them is the only channel that says so.
+///
+/// "Undosed", not "drug-free": an `[initial_conditions] init(central) = BASE` baseline is
+/// itself drug, and it survives the clamp (it is layered on afterwards), so such a subject's
+/// rows carry its decay. What is zero is the **dose-driven** contribution, which is exactly
+/// what the dose-free twin in the tests measures (#1823 review r5).
+///
+/// The message says that and stops. It does **not** say the clamp *moved* anything, because
+/// for a few degenerate designs it did not — an absorption `lagtime` past the last
+/// observation, or `f = 0`, leaves the rows where they already were. Those are
+/// individual-parameter expressions, so excluding them needs the predictor; the two
+/// structural halves that can be excluded — no positive dose, and no dose strictly before
+/// an observation — are ([`observe`](Self::observe), #1823 review r2 / r3 / r4), and the
+/// message names that eligibility rather than claiming every dosed individual is counted.
+///
+/// **The count says nothing about what those rows contain**, deliberately. Four things run
+/// on the closed form's output *after* the clamp (`pk/mod.rs`, in order):
+/// [`crate::pk::add_analytical_init`], [`crate::pk::apply_analytic_readout`],
+/// [`crate::pk::apply_log_transform`] and `apply_frem_prediction_override`. Whether any of
+/// them leaves a clamped row at `0.0` is a question about the *value* the model's own
+/// expressions produce, not about its structure: measured on #1823 review r2, the Form-C
+/// readouts `y = central/V` and `y = central/V + 2.5` are indistinguishable structurally
+/// (`analytic_readout.is_some()` for both) and give 27 zero rows and 0 zero rows
+/// respectively. A structural predicate that tried to answer it would be a second copy of
+/// the predictor, wrong on whichever models its approximation did not cover — so the
+/// message states the clamp, which is certain, and tells the reader that searching for a
+/// zero row will not find these individuals.
+///
+/// [`observe`](Self::observe) is two cheap field tests for every model outside this family,
+/// which is every model but a twin-less transit / IG closed form; the `total` denominator is
+/// therefore counted only for that family, and a tally that never observed one reports
+/// nothing.
+///
+/// Deliberately **not** `Copy` / `Clone`: it is an accumulator passed as `&mut` through the
+/// simulate chokepoint, and a copy taken by accident would drop every count written to it.
+#[derive(Debug, Default)]
+pub(crate) struct SimulatedFlipFlopTally {
+    /// Individuals (subject × replicate × uncertainty draw) whose sampled η crossed.
+    crossed: usize,
+    /// Dosed individuals simulated in all — the denominator `crossed` is reported against.
+    total: usize,
+}
+
+impl SimulatedFlipFlopTally {
+    /// Record one simulated individual, evaluated at the `η` slice the row emitter is about
+    /// to predict with (`n_eta + n_kappa` long, the κ tail zeroed by the caller).
+    ///
+    /// The predicate is [`crate::pk::absorption_flip_flop_at`] — the same one
+    /// `effective_model_for_eval` routes on — not `ipred == 0.0`, in both directions: a
+    /// zero prediction has other causes (an observation before the first dose), and a
+    /// clamped individual is frequently not zero at all (see the type's own docs). The
+    /// question here is specifically whether the closed form's domain was left.
+    ///
+    /// Returns without counting for a subject carrying no positive dose amount: there is no
+    /// dose-driven term for the clamp to remove, so the individual is not affected.
+    pub(crate) fn observe(
+        &mut self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        if !twinless_absorption_closed_form(model) {
+            return;
+        }
+        // A subject with no dose has no dose-driven term for the clamp to take away, so
+        // nothing was lost and there is nothing to report about it — its rows are the same
+        // with the clamp and without it, and an ODE rewrite would produce the same rows. Counting it would inflate *both* sides of the ratio and attach a
+        // message about a lost drug contribution to a placebo arm (#1823 review r2).
+        // Measured there: an `AMT = 0` second subject contributed its crossers to a count
+        // of 27 while all 900 of its rows were already zero.
+        //
+        // The dose must also land **strictly before** an observation, or no returned row
+        // could have carried the drug either way (#1823 review r3; measured there: obs at
+        // t = 1, 2, 3 with the dose at t = 100 predicted `[0, 0, 0]` with the dose and
+        // `[0, 0, 0]` without it, at a crossing η *and* at η = 0).
+        //
+        // `<`, not `<=`, and the reason is this family specifically (review r4): a transit
+        // or IG absorption contributes **exactly** zero central concentration at elapsed
+        // time zero — nothing has transited yet — so a dose landing on the last
+        // observation reaches it with nothing, whatever the event ordering does. Measured:
+        // with the dose moved to the last observation the prediction is bit-identical to
+        // the dose-free twin at η = 0 (last row exactly `0.0`) on both the transit and the
+        // IG fixture, while moving it `1e-9` earlier gives `1.67e-39` — small, but not
+        // zero, so the strict test is on the right side of the boundary. (`<=` would be
+        // correct for an IV bolus, which jumps instantaneously; this family is oral.)
+        //
+        // Both halves read dose and observation **times**, which are data — this is still
+        // a structural test, not a guess at the predictor.
+        //
+        // The two clocks are directly comparable here: `obs_times` is the internal monotonic
+        // clock, which diverges from the raw data TIME only across an EVID=3/4 reset, and
+        // `check_absorption_closed_form_support` refuses a reset on any transit / IG closed
+        // form before a simulation starts. So a counted subject has no stacked occasions.
+        //
+        // What it deliberately does **not** cover: a `lagtime` that pushes absorption past
+        // the last observation, or `f = 0`. Such an individual is still counted, and the
+        // message stays true for it — nothing from its doses reaches its rows, and since
+        // review r9 the message names "because the dose never arrived" as the alternative
+        // cause rather than attributing those rows to the clamp (measured there: lag = 50
+        // against observations at t = 1, 2, 3 predicts `[0, 0, 0]` at a crossing η *and* at
+        // η = 0, so the domain guard is never even reached). The claim that was *not* safe —
+        // that the clamp moved anything — came out of the message in review r3.
+        //
+        // **Open option** (r9): the lag is reachable from the `pk` snapshot computed below,
+        // so comparing `dose.time + lag` here instead of `dose.time` would move the count's
+        // *scope* to match its claim and let the message drop that disclaimer. That is not
+        // the "needs the predictor" objection of review r2 — it reads an individual
+        // parameter, not an arbitrary expression's value — but a per-compartment `ALAGn` and
+        // the `dose_attr_map` layout make it more than a one-line change, and `f = 0` would
+        // want the same treatment. Deferred deliberately, not overlooked.
+        let last_obs = subject
+            .obs_times
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !subject
+            .doses
+            .iter()
+            .any(|d| d.amt > 0.0 && d.time < last_obs)
+        {
+            return;
+        }
+        // A twin-less transit / IG closed form takes no IOV (rejected by
+        // `check_absorption_closed_form_support`), so `eta` is the BSV vector the
+        // prediction uses. Guard the length anyway so an unexpected shape is skipped
+        // rather than read past the end inside `pk_param_fn`.
+        if eta.len() != model.n_eta + model.n_kappa {
+            return;
+        }
+        self.total += 1;
+        // An individual whose parameters are not finite is not a measurement of the closed
+        // form's domain at all, and must not be reported as a **crossing** (#1823 review r7).
+        //
+        // It stays in the *denominator*, which the message calls the individuals "dosed
+        // before one of their observations" — an overflowed draw is one of those, and
+        // dropping it from both sides would make the reported share larger than the
+        // population it was measured over (#1823 review r8). Only `crossed` is gated.
+        //
+        // [`crate::pk::absorption_flip_flop_at`]'s own contract already says so — it returns
+        // `false` "for invalid parameters — there the closed form's `0` is a deliberate
+        // optimiser penalty, not a flip-flop to reroute to the ODE twin" — but it enforces
+        // that with positivity tests only (`cl > 0.0 && v1 > 0.0`), and `f64::INFINITY > 0.0`
+        // is `true`. So an overflowed draw reaches the comparison. Measured: at η = 710 a
+        // lognormal `CL` is `inf`, so `!(inf < KTR)` is `true`; with η on `V` as well
+        // `cl / v1` is `NaN` and `!(NaN < KTR)` is `true` too. Either way the individual was
+        // counted, and the message then attributed it to "disposition rate ≥ {the abscissa}"
+        // and recommended an ODE "valid in both regimes" — which would receive the same
+        // non-finite parameters.
+        //
+        // Enforced here rather than in the predicate: that predicate also decides **routing**
+        // for twin-*carrying* models ([`crate::pk::effective_model_for_eval`]), where sending
+        // a non-finite subject to the ODE twin is existing behaviour and a separate question.
+        // This is about what the tally claims. The extra `pk_param_fn` call lands only on a
+        // twin-less transit / IG model with an eligible dose, next to the predicate's own.
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        if !pk.values.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        if crate::pk::absorption_flip_flop_at(model, subject, theta, eta) {
+            self.crossed += 1;
+        }
+    }
+
+    /// The one `W_SIMULATED_FLIP_FLOP` warning this run owes its caller, or `None` when no
+    /// simulated individual crossed (the common case, and every non-absorption model).
+    pub(crate) fn warning(&self, model: &CompiledModel) -> Option<String> {
+        if self.crossed == 0 {
+            return None;
+        }
+        let (domain, ode_fn) = absorption_flip_flop_wording(model);
+        let confluent = absorption_confluent_clause(model);
+        Some(format!(
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
+             their observations were evaluated at an η inside the flip-flop regime \
+             (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
+             closed form has no solution and clamps its dose-driven concentration to zero. \
+             None of their rows carries any contribution from the doses the subject was \
+             given — by that clamp, or, for an individual whose absorption never reaches an \
+             observation (a `lagtime` past it, or `f = 0`), because the dose never arrived. \
+             Those rows are still returned and still summarised, so every VPC band, \
+             prediction interval or mean computed over them describes an undosed subject. \
+             Whether they read as a literal `ipred = 0` depends on what this model layers \
+             on the closed form's output afterwards, so searching the output for a zero row \
+             will not reliably find them. \
+             Rewrite the model as an explicit ODE `{ode_fn}` model, which reroutes per \
+             individual and is valid in both regimes.{decline}",
+            k = self.crossed,
+            n = self.total,
+            model_name = model.pk_model.canonical_name(),
+            decline = twin_decline_clause(model),
+        ))
+    }
 }
 
 /// The refusal `simulate_with_uncertainty_diag` returns when **every** one of its `n > 0`
@@ -4852,13 +5280,18 @@ fn car1_negative_rho_message(line: &str, what: &str) -> String {
     )
 }
 
-/// The value-level `car1` range check for an entry point that scores or draws at the
-/// given parameters without `fit()`'s validation (#1974 review r1 #1): `simulate()`
-/// draws `C_jk = ρ^Δt`, which is NaN for a negative ρ at a non-integer gap, so a
-/// negative `car1` ρ would come back as NaN DVs rather than an error. Checked on the
-/// θ's value, since that is what is drawn at, whatever its bounds.
+/// The value-level range check for an entry point that draws at the given parameters
+/// without `fit()`'s validation (#1974 review r1 #1, #1976): `simulate()` draws from the
+/// `R` the line states at θ's value, so every value `fit()`'s range check refuses for a
+/// `FIX`ed ρ is refused here too, with the same message — a negative `car1` ρ (NaN
+/// DVs, `ρ^Δt` at a non-integer gap), `|ρ| ≥ 1` for any kind, and a `cs` ρ at or
+/// below `−1/(n−1)` for the largest block. Past either edge `R` is indefinite and the
+/// PSD-safe square root in `correlated_residual_draw` would silently draw from a
+/// different matrix. Checked on the θ's value, since that is what is drawn at,
+/// whatever its bounds; the free-ρ rail does not apply, as nothing is searched.
 pub(crate) fn check_residual_correlation_value(
     model: &CompiledModel,
+    population: &Population,
     params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
@@ -4870,84 +5303,46 @@ pub(crate) fn check_residual_correlation_value(
         .get(serial.rho_theta)
         .copied()
         .unwrap_or(f64::NAN);
-    if serial.kind != crate::types::ResidualSerialKind::Car1 || v >= 0.0 {
-        return Vec::new();
-    }
     let rho = model
         .theta_names
         .get(serial.rho_theta)
         .cloned()
         .unwrap_or_default();
-    vec![Diagnostic::error(
-        "E_RESIDUAL_CORRELATION_RANGE",
-        car1_negative_rho_message(&line, &format!("theta {rho} is {v}")),
-    )]
+    residual_correlation_range(model, population, &line, RhoRange::Value(v), &|_| {
+        format!("theta {rho} is {v}")
+    })
 }
 
-/// Data-dependent admissibility of a `correlation` line (#1081).
+/// The rows of `population` that `ar1` / `car1` cannot place on one clock (#1081,
+/// #1974 review r1 #3), as data checks with no reference to θ — shared by
+/// `check_model_data` (fit, `ferx check`) and `simulate()`'s preconditions (#1976).
 ///
-/// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
-///   positive definite: compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
-///   `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
-///   negative `ρ` and a non-integer `Δt`), and a free `ρ` stays inside the rail
-///   [`RESIDUAL_CORRELATION_RAIL`]. Checked on the θ's bounds when it is free and
-///   on its value when it is `FIX`ed.
-/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
-///   of one block at the same time have no order; `car1` correlates them by
+/// * `E_RESIDUAL_CORRELATION_RESET` — a block whose rows sit on both sides of a
+///   stacked reset occasion (an EVID=3/4 record restarting TIME): its rows' TIMEs
+///   are on two clocks, so their order and the time between them are undefined.
+/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows of
+///   one block at the same time have no order; `car1` correlates them by
 ///   `ρ^0 = 1`, which makes `R` singular.
-/// * `E_RESIDUAL_CORRELATION_RESET` — under `ar1` / `car1`, a block whose rows sit
-///   on both sides of a stacked reset occasion (an EVID=3/4 record restarting TIME):
-///   its rows' TIMEs are on two clocks, so their order and the time between them are
-///   undefined (#1974 review r1 #3).
-fn check_residual_correlation(
+pub(crate) fn check_residual_correlation_data(
     model: &CompiledModel,
     population: &Population,
-    params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
         return Vec::new();
     };
-    let p = params;
-    let i = serial.rho_theta;
-    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
-    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
-    let (lo, hi) = if fixed {
-        let v = p.theta.get(i).copied().unwrap_or(f64::NAN);
-        (v, v)
-    } else {
-        (
-            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
-            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
-        )
-    };
-    let what = |side: &str| {
-        if fixed {
-            format!("theta {rho} is fixed at {lo}")
-        } else {
-            format!(
-                "the {side} bound of theta {rho} is {}",
-                if side == "lower" { lo } else { hi }
-            )
-        }
-    };
-    let mut diags = Vec::new();
-
-    // The largest block, and the first tie under a time-keyed structure.
-    let timed = matches!(
+    if !matches!(
         serial.kind,
         crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
-    );
-    let mut largest: Option<(usize, &Subject, usize)> = None;
+    ) {
+        return Vec::new();
+    }
     let mut tie: Option<(&Subject, usize, f64)> = None;
     // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
     let mut reset: Option<(&Subject, usize, usize)> = None;
     for subject in &population.subjects {
         for block in residual_blocks(model, subject) {
-            if largest.is_none_or(|(n, _, _)| block.len() > n) {
-                largest = Some((block.len(), subject, block[0]));
-            }
-            if timed && reset.is_none() {
+            if reset.is_none() {
                 // A stacked reset occasion (EVID=3/4 restarting TIME) is shifted onto
                 // the engine's monotonic `obs_times`, while the readout clock keeps the
                 // TIME as written, so the two differ by one offset per segment.
@@ -4960,7 +5355,7 @@ fn check_residual_correlation(
                     reset = Some((subject, a, b));
                 }
             }
-            if timed && tie.is_none() {
+            if tie.is_none() {
                 let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
                 times.sort_by(f64::total_cmp);
                 if let Some(w) = times.windows(2).find(|w| w[0] == w[1]) {
@@ -4970,6 +5365,7 @@ fn check_residual_correlation(
         }
     }
 
+    let mut diags = Vec::new();
     if let Some((subject, a, b)) = reset {
         diags.push(Diagnostic::error(
             "E_RESIDUAL_CORRELATION_RESET",
@@ -5005,14 +5401,61 @@ fn check_residual_correlation(
             ),
         ));
     }
+    diags
+}
 
-    let range = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+/// What `residual_correlation_range` checks ρ's range on.
+#[derive(Clone, Copy)]
+enum RhoRange {
+    /// A free θ, searched within `[lo, hi]`: the rail applies.
+    Bounds(f64, f64),
+    /// A single value — a `FIX`ed θ at fit time, or the value simulated at.
+    Value(f64),
+}
+
+/// `E_RESIDUAL_CORRELATION_RANGE` (#1081): ρ's range must keep every block's `R`
+/// positive definite — compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
+/// `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
+/// negative `ρ` and a non-integer `Δt`) — and a free `ρ` stays inside the rail
+/// [`RESIDUAL_CORRELATION_RAIL`]. `what(side)` names the offending number, e.g.
+/// "the lower bound of theta RHO is -0.2". One body for fit (bounds, or the value of
+/// a `FIX`ed θ) and simulate (the value drawn at), so the two refuse the same values
+/// with the same text (#1976).
+fn residual_correlation_range(
+    model: &CompiledModel,
+    population: &Population,
+    line: &str,
+    range: RhoRange,
+    what: &dyn Fn(&str) -> String,
+) -> Vec<Diagnostic> {
+    let Some(serial) = &model.residual_serial else {
+        return Vec::new();
+    };
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .cloned()
+        .unwrap_or_default();
+    let (lo, hi) = match range {
+        RhoRange::Bounds(lo, hi) => (lo, hi),
+        RhoRange::Value(v) => (v, v),
+    };
+    let err = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+    let mut diags = Vec::new();
     // Positive definiteness at the most demanding block.
     if serial.kind == crate::types::ResidualSerialKind::Cs {
+        let mut largest: Option<(usize, &Subject, usize)> = None;
+        for subject in &population.subjects {
+            for block in residual_blocks(model, subject) {
+                if largest.is_none_or(|(n, _, _)| block.len() > n) {
+                    largest = Some((block.len(), subject, block[0]));
+                }
+            }
+        }
         if let Some((n, subject, row)) = largest.filter(|(n, _, _)| *n >= 2) {
             let floor = -1.0 / (n as f64 - 1.0);
             if lo <= floor {
-                diags.push(range(format!(
+                diags.push(err(format!(
                     "`{line}`: {}, but subject {} has {n} rows in the block {}, and compound \
                      symmetry over {n} rows is a valid covariance only for ρ in \
                      (−1/({n}−1), 1) = ({floor:.4}, 1). Keep ρ above {floor:.4}.",
@@ -5023,27 +5466,72 @@ fn check_residual_correlation(
             }
         }
     }
-    if serial.kind == crate::types::ResidualSerialKind::Car1 && lo < 0.0 {
-        diags.push(range(car1_negative_rho_message(&line, &what("lower"))));
+    if serial.kind == crate::types::ResidualSerialKind::Car1 && (lo < 0.0 || lo.is_nan()) {
+        diags.push(err(car1_negative_rho_message(line, &what("lower"))));
     }
-    if fixed && lo.abs() >= 1.0 {
-        diags.push(range(format!(
-            "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
-            what("lower")
-        )));
-    } else if !fixed {
-        for (side, v) in [("lower", lo), ("upper", hi)] {
-            if v.abs() > RESIDUAL_CORRELATION_RAIL {
-                diags.push(range(format!(
-                    "`{line}`: {}. A free correlation is kept within ±{RESIDUAL_CORRELATION_RAIL}, \
-                     because as |ρ| approaches 1 the rows of a block become collinear and R \
-                     numerically singular. Bound theta {rho} within ±{RESIDUAL_CORRELATION_RAIL}, \
-                     or FIX it to hold a value closer to ±1.",
-                    what(side)
+    match range {
+        RhoRange::Value(_) => {
+            if lo.abs() >= 1.0 || lo.is_nan() {
+                diags.push(err(format!(
+                    "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
+                    what("lower")
                 )));
             }
         }
+        RhoRange::Bounds(..) => {
+            for (side, v) in [("lower", lo), ("upper", hi)] {
+                if v.abs() > RESIDUAL_CORRELATION_RAIL {
+                    diags.push(err(format!(
+                        "`{line}`: {}. A free correlation is kept within \
+                         ±{RESIDUAL_CORRELATION_RAIL}, because as |ρ| approaches 1 the rows of a \
+                         block become collinear and R numerically singular. Bound theta {rho} \
+                         within ±{RESIDUAL_CORRELATION_RAIL}, or FIX it to hold a value closer to \
+                         ±1.",
+                        what(side)
+                    )));
+                }
+            }
+        }
     }
+    diags
+}
+
+/// Data-dependent admissibility of a `correlation` line (#1081): the data checks of
+/// [`check_residual_correlation_data`] (`E_RESIDUAL_CORRELATION_RESET` / `_TIES`),
+/// then `E_RESIDUAL_CORRELATION_RANGE` on the θ's bounds when it is free and on its
+/// value when it is `FIX`ed.
+fn check_residual_correlation(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let p = params;
+    let i = serial.rho_theta;
+    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
+    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
+    let range = if fixed {
+        RhoRange::Value(p.theta.get(i).copied().unwrap_or(f64::NAN))
+    } else {
+        RhoRange::Bounds(
+            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
+            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
+        )
+    };
+    let what = |side: &str| match range {
+        RhoRange::Value(v) => format!("theta {rho} is fixed at {v}"),
+        RhoRange::Bounds(lo, hi) => format!(
+            "the {side} bound of theta {rho} is {}",
+            if side == "lower" { lo } else { hi }
+        ),
+    };
+    let mut diags = check_residual_correlation_data(model, population);
+    diags.extend(residual_correlation_range(
+        model, population, &line, range, &what,
+    ));
     diags
 }
 

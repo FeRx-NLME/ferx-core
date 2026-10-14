@@ -103,6 +103,7 @@ fn generate_npde_iov_anchor() {
         &model.default_params,
         NSIM,
         Some(NPDE_SEED),
+        None,
     )
     .expect("npde");
 

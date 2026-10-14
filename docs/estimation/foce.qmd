@@ -808,7 +808,7 @@ to improve on the point it starts from.
 
 The comparison is also a diagnostic. A cold re-solve that lands materially worse — or returns
 no usable number at all — raises the `ebe_start_dependent` warning (see
-[Warnings](../warnings.qmd#codes-convergence)), which quotes both objectives. The estimates are
+[Warnings](../warnings.qmd#codes-convergence-fit)), which quotes both objectives. The estimates are
 unaffected; what depends on the starting point is the EBEs at them, and so every diagnostic
 built on those (IPRED, IWRES, CWRES, shrinkage) plus the covariance step. Two things produce
 it, and the warning names both rather than guessing: an individual objective with more than one

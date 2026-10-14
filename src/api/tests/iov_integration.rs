@@ -2460,3 +2460,125 @@ fn test_iov_occasion_rule_labels_reset_rows_in_fit() {
         }
     }
 }
+
+// ── #1980: post-hoc NPDE applies a derived `iov_occasion` rule ───────────
+
+/// The fixture with its occasion labels removed: what the reader returns for a model whose
+/// occasions come from `iov_occasion` rather than `iov_column`.
+fn npde_unlabelled(mut pop: Population) -> Population {
+    for s in &mut pop.subjects {
+        s.occasions.clear();
+        s.dose_occasions.clear();
+    }
+    pop
+}
+
+fn npde_bits(out: &[crate::stats::npde::SubjectNpde]) -> Vec<(Vec<u64>, Vec<u64>)> {
+    out.iter()
+        .map(|s| {
+            (
+                s.npd.iter().map(|v| v.to_bits()).collect(),
+                s.npde.iter().map(|v| v.to_bits()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The oracle: on this fixture `iov_occasion = dose` reproduces the column's occasion groups
+/// (one per dose, the observations after each), so NPDE under the rule on the unlabelled
+/// population must equal NPDE on the labelled one bit for bit. The straddle: the unlabelled
+/// population with no rule is the κ = 0 reference, which differs, and only it carries
+/// `W_IOV_NO_OCCASIONS`.
+#[test]
+fn test_npde_derives_occasions_from_the_iov_occasion_rule() {
+    use crate::stats::npde::compute_npde_npd_diag;
+    let model = make_iov_model();
+    let params = &model.default_params;
+    let labelled = make_iov_population();
+    let unlabelled = npde_unlabelled(labelled.clone());
+    let (nsim, seed) = (50, Some(1980));
+
+    let (column, w_column) =
+        compute_npde_npd_diag(&model, &labelled, params, nsim, seed, None).expect("npde");
+    let (rule, w_rule) = compute_npde_npd_diag(
+        &model,
+        &unlabelled,
+        params,
+        nsim,
+        seed,
+        Some(&IovOccasionRule::PerDose),
+    )
+    .expect("npde");
+    let (bare, w_bare) =
+        compute_npde_npd_diag(&model, &unlabelled, params, nsim, seed, None).expect("npde");
+
+    assert!(column.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
+    assert_eq!(
+        npde_bits(&rule),
+        npde_bits(&column),
+        "NPDE under `iov_occasion = dose` must equal NPDE on the column's labels"
+    );
+    assert_ne!(
+        npde_bits(&bare),
+        npde_bits(&column),
+        "the unlabelled population with no rule must differ (κ = 0), or the oracle proves nothing"
+    );
+    assert!(w_column.is_empty(), "{w_column:?}");
+    assert!(w_rule.is_empty(), "{w_rule:?}");
+    assert_eq!(w_bare.len(), 1, "{w_bare:?}");
+    assert!(
+        w_bare[0].starts_with("W_IOV_NO_OCCASIONS") && w_bare[0].contains("4 of 4 subject(s)"),
+        "{}",
+        w_bare[0]
+    );
+
+    // A `Column` rule reads the population's own labels, as `None` does.
+    let col_rule = crate::stats::npde::compute_npde_npd(
+        &model,
+        &labelled,
+        params,
+        nsim,
+        seed,
+        Some(&IovOccasionRule::Column),
+    )
+    .expect("npde");
+    assert_eq!(npde_bits(&col_rule), npde_bits(&column));
+}
+
+/// A fit's own post-fit NPDE and the post-hoc entry point given the fit's rule and the
+/// unlabelled population the caller holds (ferx-r's `ferx_calc_npde`) agree bit for bit.
+#[test]
+fn test_npde_post_hoc_matches_the_fit_under_a_derived_rule() {
+    let model = make_iov_model();
+    let pop = npde_unlabelled(make_iov_population());
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::PerDose;
+    opts.npde_nsim = 50;
+    opts.npde_seed = Some(1980);
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(res.iov_occasion, Some(IovOccasionRule::PerDose));
+
+    let params = crate::estimation::uncertainty_samples::fitted_params_from_result(&res, &model)
+        .expect("fitted params");
+    let post_hoc = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &params,
+        opts.npde_nsim,
+        opts.npde_seed,
+        res.iov_occasion.as_ref(),
+    )
+    .expect("npde");
+    let at_fit: Vec<(Vec<u64>, Vec<u64>)> = res
+        .subjects
+        .iter()
+        .map(|s| {
+            (
+                s.npd.iter().map(|v| v.to_bits()).collect(),
+                s.npde.iter().map(|v| v.to_bits()).collect(),
+            )
+        })
+        .collect();
+    assert!(at_fit.iter().all(|(npd, _)| !npd.is_empty()));
+    assert_eq!(npde_bits(&post_hoc), at_fit);
+}

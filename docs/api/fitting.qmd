@@ -257,7 +257,7 @@ if !verdict.passed {
 
 While either threshold is enabled, a fit whose covariance step had to floor a
 Hessian eigenvalue — the `Covariance step regularized: eigenvalue floor applied …`
-[`covariance_regularized`](../warnings.qmd#codes-convergence) warning — fails
+[`covariance_regularized`](../warnings.qmd#codes-covariance) warning — fails
 as well (#1512); the non-finite cross-partial note that shares that code does
 not. The floor replaces a direction of negative or
 near-zero curvature with a finite one, so the matrix both thresholds read no

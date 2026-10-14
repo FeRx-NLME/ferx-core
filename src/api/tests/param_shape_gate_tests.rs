@@ -254,7 +254,7 @@ fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
             let p = &cell.params;
             let e = fit(&model, &pop, p, &short_fit()).expect_err("fit");
             assert_eq!(e, cell.message, "fit, {}", cell.label);
-            let npde = crate::stats::npde::compute_npde_npd(&model, &pop, p, 20, Some(4));
+            let npde = crate::stats::npde::compute_npde_npd(&model, &pop, p, 20, Some(4), None);
             if cell.label == "Ω_IOV absent" {
                 // Documented κ = 0 fallback (#1019), pinned numerically in `stats::npde`.
                 npde.expect("compute_npde_npd, absent Ω_IOV falls back to κ = 0");
@@ -487,8 +487,10 @@ fn the_gate_admits_parameters_of_the_models_own_shape() {
         assert!(fa.ofv.is_finite(), "{}", fa.ofv);
         assert_eq!(fa.ofv.to_bits(), fb.ofv.to_bits(), "fit, iov = {iov}");
 
-        let na = crate::stats::npde::compute_npde_npd(&model, &pop, &a, 20, Some(4)).expect("ok");
-        let nb = crate::stats::npde::compute_npde_npd(&model, &pop, &b, 20, Some(4)).expect("ok");
+        let na =
+            crate::stats::npde::compute_npde_npd(&model, &pop, &a, 20, Some(4), None).expect("ok");
+        let nb =
+            crate::stats::npde::compute_npde_npd(&model, &pop, &b, 20, Some(4), None).expect("ok");
         for (x, y) in na.iter().zip(&nb) {
             assert_eq!(x.npd.len(), 6);
             for (p, q) in x.npd.iter().zip(&y.npd) {

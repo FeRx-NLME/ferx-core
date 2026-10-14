@@ -216,7 +216,7 @@ fn every_predict_entry_refuses_a_theta_of_the_wrong_length() {
         assert_counts_message(&e.to_string(), n, "predict");
         let e = predict_diag(&model, &pop, &params).expect_err("predict_diag");
         assert_counts_message(&e.to_string(), n, "predict_diag");
-        let e = crate::stats::npde::compute_npde_npd(&model, &pop, &params, 20, Some(4))
+        let e = crate::stats::npde::compute_npde_npd(&model, &pop, &params, 20, Some(4), None)
             .expect_err("compute_npde_npd");
         assert_counts_message(&e.to_string(), n, "compute_npde_npd");
     }
@@ -240,9 +240,17 @@ fn a_theta_of_the_right_length_predicts_bit_identically() {
         assert!(x.pred.is_finite() && x.pred > 0.0, "{}", x.pred);
         assert_eq!(x.pred.to_bits(), y.pred.to_bits());
     }
-    let na = crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, 20, Some(4))
-        .expect("accepted");
-    let nb = crate::stats::npde::compute_npde_npd(&model, &pop, &same, 20, Some(4)).expect("ok");
+    let na = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        20,
+        Some(4),
+        None,
+    )
+    .expect("accepted");
+    let nb =
+        crate::stats::npde::compute_npde_npd(&model, &pop, &same, 20, Some(4), None).expect("ok");
     assert_eq!(na.len(), 2);
     for (x, y) in na.iter().zip(&nb) {
         assert_eq!(x.npd.len(), 3);
@@ -566,6 +574,7 @@ fn compute_npde_npd_refuses_a_missing_covariate_and_an_unbound_block() {
         &model.default_params,
         20,
         Some(4),
+        None,
     )
     .expect_err("compute_npde_npd, no WTX");
     assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
@@ -587,8 +596,14 @@ fn compute_npde_npd_refuses_a_missing_covariate_and_an_unbound_block() {
         s.covariates.insert("STUDY".to_string(), 1.0);
     }
     pop.covariate_names.push("STUDY".to_string());
-    let e =
-        crate::stats::npde::compute_npde_npd(&levels, &pop, &levels.default_params, 20, Some(4))
-            .expect_err("compute_npde_npd, unbound model");
+    let e = crate::stats::npde::compute_npde_npd(
+        &levels,
+        &pop,
+        &levels.default_params,
+        20,
+        Some(4),
+        None,
+    )
+    .expect_err("compute_npde_npd, unbound model");
     assert_unbound_names(&e, "compute_npde_npd");
 }

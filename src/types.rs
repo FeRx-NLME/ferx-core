@@ -6628,10 +6628,15 @@ pub enum WarningCode {
     Simulation,
     /// A transit / inverse-Gaussian absorption closed form entered the flip-flop
     /// regime (disposition rate ≥ the tilting abscissa), where it returns an
-    /// identically-zero profile. Either auto-rerouted to the ODE twin (an
-    /// informational heads-up, #776) or — for a twin-less model at a subject's
-    /// fitted EBE — a silently degenerate likelihood contribution the η = 0
-    /// fit-start reject could not catch (#785).
+    /// identically-zero *dose-driven* profile. One cause, three phases: auto-rerouted to the
+    /// ODE twin (an informational heads-up, #776); or, on a twin-less model, a silently
+    /// degenerate likelihood contribution at a subject's fitted EBE (#785), or a dosed
+    /// simulated individual whose drawn η crossed the abscissa, so none of its rows carries
+    /// any contribution from the doses it was given (`W_SIMULATED_FLIP_FLOP`, #1823) — neither of which the
+    /// η = 0 entry-point reject can catch. Note that such a row is not necessarily
+    /// `ipred == 0.0`: a baseline, a Form-C readout, a log transform or the FREM override
+    /// runs after the clamp, so the count is the only reliable way to find these
+    /// individuals.
     FlipFlop,
     /// An analytic transit / inverse-Gaussian model's ODE twin could not be built, so
     /// the model keeps no ODE fallback (#1008). The twin is an ODE model while the
@@ -6810,6 +6815,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::UncertaintyDrawsSkipped,
         )
+    } else if lower.contains("w_simulated_flip_flop") {
+        // #1823: simulated individuals whose drawn η crossed into a twin-less transit / IG
+        // closed form's flip-flop regime, so their dose-driven contribution came back
+        // identically zero (the whole *profile* need not be zero — a baseline or readout
+        // layered on after the clamp survives it). Shares
+        // `FlipFlop` with the η = 0 reroute note (#776) and the fitted-EBE crossing (#785) —
+        // one cause, three phases, told apart by the message. A token arm rather than the
+        // `flip-flop regime` prose arm below, because the message interpolates the twin
+        // parser's own error text when the twin was built and declined (#1008), and that text
+        // can carry a substring a later prose arm claims.
+        (WarningSeverity::Warning, WarningCode::FlipFlop)
     } else if lower.contains("w_init_not_representable") {
         // #1307: a declared value the *packer* altered before any box existed —
         // a `1e-10` log floor, or the Fisher-z rail on a free ρ. Matched on its
@@ -6863,6 +6879,32 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `covariance step:` + `parameters` arm far below would otherwise claim only by
         // accident of wording.
         (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_non_stationary_estimate") {
+        // #1781: `R` needed an eigenvalue floor at a SAEM / IMP / IMPMAP / VI estimate, which
+        // that method never optimised the objective of. Two forms, one token: `S⁻¹` replaced
+        // the requested estimator (degraded but present — `CovarianceRegularized`, and *not*
+        // `REGULARIZED_PREFIX`, so the #1512 strictness gate on the eigen-floor does not fire
+        // on a matrix that was never floored), or `S` was unavailable as well and no SEs were
+        // produced. Matched on its token, ahead of the prose arms: both forms say "covariance
+        // step" and "not positive definite", which the `CovarianceFailed` prose arm below would
+        // otherwise claim for the success form too.
+        if lower.contains("covariance step failed") {
+            (WarningSeverity::Critical, WarningCode::CovarianceFailed)
+        } else {
+            (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
+        }
+    } else if lower.contains("w_cov_quadrature_objective") {
+        // #1781: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model had its R and S taken
+        // on the quadrature marginal instead of the FOCEI objective. A route note like the
+        // salvage one above: the matrix is complete and nothing was floored. Its own token,
+        // ahead of the prose arms, because the message says "covariance step" and "FOCEI".
+        (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_quadrature_declined") {
+        // #1781: the same fit where the quadrature could not be used (mixture, IOV, grid), so
+        // the standard errors are the FOCEI objective's curvature at a point that objective
+        // need not minimise. Present but unreliable — a warning on the covariance route, not
+        // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
