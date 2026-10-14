@@ -125,12 +125,15 @@ fn run(case: &str, engine: &str) -> (FitResult, Population) {
     (r, run.population)
 }
 
-/// `|ΔOFV|` against NONMEM, every cell. Measured worst: 2.093e-8 (`reset_seed`/ode; the other
-/// eleven cells 3e-10 to 1.6e-8), so ~10× headroom. Before the fix the smallest gap was 20.6.
+/// `|ΔOFV|` against NONMEM, every cell. Measured worst on Linux aarch64 (the reference
+/// platform): 1.710e-8 (`reset_f`/ode; the other eleven cells 1.7e-10 to 1.5e-8), so ~12×
+/// headroom; on macOS arm64 2.093e-8 (`reset_seed`/ode), ~10×. Before the fix the smallest gap
+/// was 20.6.
 const OFV_TOL: f64 = 2e-7;
 /// `|ΔIPRED| / max(|IPRED|, 1e-3)` against NONMEM's full-precision `.tab`, every observation.
-/// Measured worst: 7.387e-8 (`pkonly`/ode), so ~13× headroom. Before the fix the trough at 24
-/// was off by up to 8× (`moved`) and 62× (`reset`).
+/// Measured worst on Linux aarch64: 2.171e-8 (`pkonly`/ode), ~46× headroom; on macOS arm64
+/// 7.387e-8 (`pkonly`/ode), ~13×, which sets the bound. Before the fix the trough at 24 was off
+/// by up to 8× (`moved`) and 62× (`reset`).
 const IPRED_TOL: f64 = 1e-6;
 
 fn assert_matches_nonmem(case: &str, engine: &str) {
@@ -225,8 +228,9 @@ fn a_reset_row_reseeds_init_at_its_written_time() {
 /// The sdtab individual-parameter columns report the parameters the prediction used: `CL` and
 /// `IND` at every observation against NONMEM's `.tab`, so the trough written at 24 shows the
 /// post-step `CL` (and period 2 of `reset` the pre-step one from TIME 0). `IND` carries no η, so
-/// its branch must match exactly; `CL`'s measured worst relative gap is 1.746e-9 (`moved`; `reset`
-/// 1.639e-9), the EBE agreement, so 2e-8 is ~11× headroom. Before the fix the trough at 24
+/// its branch must match exactly. `CL`'s measured worst relative gap, the EBE agreement, is
+/// 2.549e-9 on Linux aarch64 (`reset`; `moved` 2.136e-9), so 2e-8 is ~8× headroom; on macOS
+/// arm64 1.746e-9 (`moved`; `reset` 1.639e-9), ~11×. Before the fix the trough at 24
 /// reported `IND = 1` against NONMEM's `IND = 1.956`.
 #[test]
 fn the_sdtab_parameter_columns_read_the_written_time() {

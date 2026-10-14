@@ -299,7 +299,7 @@ written for it. So `if (TIME >= 24)` switches at 24 within every period, and a d
 written `TIME`. Before #1969 the parameters of a restarted period read the shifted
 clock. **Results change for a model that reads `TIME` in
 `[individual_parameters]` on such data.** On a two-period fixture the old objective was
-9800 units off NONMEM's; it now agrees to 2e-8. `TIME` inside `[odes]` still reads the
+9800 units off NONMEM's; it now agrees to 2e-8 (Linux). `TIME` inside `[odes]` still reads the
 integrator's clock, which is the shifted one in a restarted period.
 
 #### Numerical check against NONMEM

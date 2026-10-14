@@ -352,7 +352,7 @@ NONMEM's `$PK` does: a step such as `if (TIME >= 24)` takes the later branch for
 written at 24 and listed before a dose at 24
 ([#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969)). Before #1969 it took the
 earlier one, and on a 30-subject induction fixture the objective was 1007 units off
-NONMEM's; it now agrees to 2e-8.
+NONMEM's; it now agrees to 2e-8 (Linux).
 
 ## System Resets (EVID=3 / EVID=4)
 

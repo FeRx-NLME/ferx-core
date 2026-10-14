@@ -1246,7 +1246,8 @@ form and an `[odes]` twin, `param_time_<case>_{analytic,ode}.ferx`, by
 | `reset_seed` | two periods; `A_0(1) = BASE` re-seeded at the reset row | `BASE` | −455.4794675 | +466.222177 | −455.4794675 |
 
 IV (or oral) 100 at 0/24/48 (`reset_f`, `reset_seed`: 0/24 per period), so every later dose
-lands on residual drug. Worst `|ΔOFV|` over the twelve cells 2.1e-8, worst relative `IPRED`
-gap against the `.tab` 7.4e-8 (macOS arm64). `reset_seed` fixes the step size (`THETA(4)
+lands on residual drug. Worst `|ΔOFV|` over the twelve cells 1.7e-8 on Linux aarch64 (2.1e-8
+on macOS arm64), worst relative `IPRED` gap against the `.tab` 2.2e-8 on Linux (7.4e-8 on
+macOS). `reset_seed` fixes the step size (`THETA(4)
 FIX`): `BASE` is read only at a period start, so no record identifies it. Run folder:
 `~/NONMEMruns/issue1969-param-time/` (`RUN.md`, generators `gen.py` / `gen2.py`).
