@@ -155,8 +155,8 @@ fn run(src: &str, focei: &[(&str, f64)]) -> ferx_core::types::BayesResult {
             "{name}"
         );
         let in_sd = (s.mean - want).abs() / s.sd;
-        // Measured (Linux, seed 3): θ and σ ≤ 0.106 (base) / 0.102 (cov)
-        // posterior SD from FOCEI, Ω ≤ 0.25 / 0.30 (above the MLE, as
+        // Measured (Linux, seed 3): θ and σ ≤ 0.110 (base) / 0.118 (cov)
+        // posterior SD from FOCEI, Ω ≤ 0.27 / 0.31 (above the MLE, as
         // expected). The pre-#1626 sampler put TVV1 0.37 SD off on the base
         // model and THETA_WT 1.86 SD off on the covariate model.
         let band = if name.starts_with("OMEGA") { 0.5 } else { 0.25 };
@@ -186,14 +186,13 @@ fn run(src: &str, focei: &[(&str, f64)]) -> ferx_core::types::BayesResult {
 
 fn assert_converged(b: &ferx_core::types::BayesResult) {
     assert!(b.max_rhat.is_finite(), "max_rhat {}", b.max_rhat);
-    // Measured (Linux, seed 3): 1.003 (base), 1.006 (cov); over the default
-    // seed and seeds 1–3, ≤ 1.007. Pre-#1626: 1.19 (base), 2.7–7.2 (cov), at
+    // Measured (Linux, seed 3, 2,000 per chain): 1.005 (base), 1.002 (cov). Pre-#1626: 1.19 (base), 2.7–7.2 (cov), at
     // any length.
     assert!(b.max_rhat < 1.01, "max split-R-hat {}", b.max_rhat);
     for s in &b.summaries {
         assert!(s.ess_bulk.is_finite(), "{} ess", s.name);
-        // Measured minimum (seed 3): 1,029 (base), 919 (cov) of 8,000 draws,
-        // both PROP_ERR; 646 on the default seed. Pre-#1626: 7 and 3.
+        // Measured minimum (seed 3): 1,030 (base), 914 (cov) of 8,000 draws,
+        // both PROP_ERR. Pre-#1626: 7 and 3.
         assert!(s.ess_bulk > 400.0, "{}: bulk ESS {}", s.name, s.ess_bulk);
     }
 }

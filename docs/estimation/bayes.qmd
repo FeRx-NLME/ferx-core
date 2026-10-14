@@ -55,8 +55,11 @@ Each sweep, for each chain, cycles these blocks:
    $\mu \sim \mathcal{N}(\mu_{\text{old}} + \bar\eta,\ \Omega/N)$. The draw
    is applied as a shift $s$: $\theta \leftarrow \theta\,e^{s}$ and
    $\eta_i \leftarrow \eta_i - s$, which leaves each individual parameter
-   $\log\varphi_i = \mu + \eta_i$ unchanged (only the η-prior moves). This
-   Gibbs move is what gives the sampler good mixing. Covariate coefficients
+   $\log\varphi_i = \mu + \eta_i$ unchanged (only the η-prior moves). The
+   draw is accepted by a Metropolis–Hastings step scored on the real
+   likelihood. That step makes the move exact for any model, and when the
+   assumptions above hold it accepts every draw, so the move is the Gibbs
+   draw. This move is what gives the sampler good mixing. Covariate coefficients
    that enter $\log P_i$ linearly join it; see
    [Covariate coefficients](#covariate-coefficients). The move runs when every η
    is covered by a log mu-reference or such a covariate mu-reference.
@@ -104,9 +107,16 @@ for an exponent or slope), the precision is
 $P = \sum_i X_i^\top \Omega^{-1} X_i$ and the mean is
 $\beta + P^{-1}\sum_i X_i^\top\Omega^{-1}\eta_i$.
 
-The move is exact only when the data depend on those θ through the individual
-parameters alone. A coefficient stays on the random walk when any of these
-holds:
+The Gaussian is exactly the full conditional only when the typical values
+are linear in these coordinates and the data depend on the θ through the
+individual parameters alone. The move does not rely on that. Each draw is a
+proposal, accepted or rejected by a Metropolis–Hastings step that scores the
+real likelihood with the same per-subject function every other block uses, so
+the move targets the right posterior for any model. When the conditions hold,
+the acceptance ratio is 1 to rounding (measured: |log α| ≤ 5e-12), and the
+move is the exact Gibbs draw. When they do not, some draws are rejected; the
+cost is mixing, not correctness. To keep acceptance high, a coefficient stays
+on the random walk when any of these holds:
 
 - a covariate it reads changes within a subject;
 - the θ is read elsewhere in the model;
@@ -118,12 +128,15 @@ holds:
   when the covariate is constant across subjects and so duplicates the
   typical value.
 
-Linearity is established from the written form of the typical value, not by
-probing it numerically. The recognised forms are products and quotients of
-θ, constants, powers with a constant base or a constant exponent, `exp()` of
-a linear term, and `sqrt()`. Under the logit and identity links they are sums
-of constant multiples of θ. A numerical probe cannot prove linearity: an odd
-term such as `(θ - θ₀)^3` passes every symmetric check about θ₀.
+Linearity is judged from the written form of the typical value, not by
+probing it numerically. An odd term such as `(θ - θ₀)^3` passes every
+symmetric check about θ₀. The recognised forms are products and quotients of
+θ and constants, powers with a constant base or a constant exponent, and
+`exp()` of a linear term. Under the logit and identity links they are sums of
+constant multiples of θ. `log`, `ln` and `sqrt` of a θ-dependent argument are
+not recognised. The DSL evaluates them clamped (`ln(max(x, 1e-30))` and
+`sqrt(max(x, 0))`), so `log(exp(θ·c))` is flat below the floor rather than
+linear.
 
 **Prior.** Moving a coefficient onto this move changes its prior. On the
 random walk it has the default N(init, sd = 10) on log θ, truncated to its
@@ -141,7 +154,7 @@ The ratio comes from a Laplace approximation at the posterior means. Started
 from η = 0, a chain could fall into the second mode in warmup. No random-walk
 kernel climbs back out, so the run reported max R̂ ≈ 1.2 at 1,000, 6,000 and
 20,000 draws per chain alike. On this example, starting at the EBE (here the
-main mode) removed the trap: R̂ ≤ 1.012 across four seeds. Like the shared
+main mode) removed the trap: R̂ ≤ 1.008 across four seeds. Like the shared
 initial θ, the start does not change the target distribution, only where the
 chains begin. Mixture models keep η = 0, because their EBE is per class.
 
@@ -235,25 +248,28 @@ On the ferx-r examples `two_cpt_oral_base` and `two_cpt_oral_cov` (30 subjects,
 
 | model, draws per chain | before: max R̂ / min bulk ESS | after: max R̂ / min bulk ESS |
 |---|---|---|
-| base, 1,000 (defaults) | 1.194 / 7 | 1.012 / 505 |
-| base, 6,000 | 1.197 / 7 | 1.001 / 3,147 |
-| cov, 1,000 (defaults) | 2.735 / 3 | 1.005 / 625 |
-| cov, 6,000 | 7.158 / 2 | 1.001 / 3,165 |
+| base, 1,000 (defaults) | 1.194 / 7 | 1.006 / 609 |
+| base, 6,000 | 1.197 / 7 | 1.001 / 2,694 |
+| cov, 1,000 (defaults) | 2.735 / 3 | 1.017 / 482 |
+| cov, 6,000 | 7.158 / 2 | 1.002 / 2,951 |
 
-Across seeds 1–3 at the defaults, the base model gives 1.001–1.006 (before:
-1.33–2.04). The worst parameter is now σ (`PROP_ERR`), which the random-walk
-block samples. The posterior means sit within 0.11 posterior SD of the FOCEI
-estimates for every θ and σ, for example:
+Across the default seed and seeds 1–3 at the defaults, the base model gives
+1.005–1.008 (before: 1.19–2.04) and the covariate model 1.004–1.017. At 1,000
+draws per chain the 1.01 threshold sits inside the Monte Carlo noise of R̂
+itself, so one seed in four can still warn; longer chains settle it. The worst
+parameter is usually σ (`PROP_ERR`), which the random-walk block samples. The
+posterior means sit within 0.12 posterior SD of the FOCEI estimates for every
+θ and σ, for example:
 
 | parameter | FOCEI | Bayes mean (6,000 per chain) |
 |---|---:|---:|
-| base TVV1 | 48.32 | 47.99 |
-| base TVKA | 1.257 | 1.252 |
+| base TVV1 | 48.32 | 48.07 |
+| base TVKA | 1.257 | 1.253 |
 | cov THETA_WT | 0.654 | 0.665 |
-| cov THETA_CRCL | 0.565 | 0.569 |
+| cov THETA_CRCL | 0.565 | 0.571 |
 
 The Ω means sit above the MLE, as on warfarin. Warfarin itself is unchanged:
-max R̂ 1.002–1.005 and min bulk ESS 779–907 across four seeds (before:
+max R̂ 1.002–1.004 and min bulk ESS 847–986 across four seeds (before:
 1.001–1.008, 619–862).
 
 ### Warfarin
