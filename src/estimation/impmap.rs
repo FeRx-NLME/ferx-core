@@ -333,8 +333,10 @@ fn find_ebe_multistart(
     subj_seed: u64,
     cold_recheck: bool,
 ) -> (EbeResult, bool) {
-    // Whether the cold recheck replaced the warm-started mode (reported by
-    // `run_mcem` as a warning: the subject was trapped).
+    // Whether the cold-started solve beat the warm-started one by more than
+    // `RECHECK_RESCUE_MIN_GAIN` (reported by `run_mcem` as a warning). It
+    // compares cold against warm only, so a later MCETA start that beats both
+    // does not hide it.
     let mut cold_won = false;
     // Baseline: warm-start (or cold-start from η = 0).
     let mut best = find_ebe(
@@ -366,10 +368,10 @@ fn find_ebe_multistart(
         );
         if cold.nll < best.nll {
             // Selection keeps the strictly lower NLL, but only a gain above
-            // `RECHECK_RESCUE_MIN_GAIN` counts as a *different* mode for the
-            // warning: once θ moves, warm and cold solves of the same mode
-            // differ at rounding level (measured 3.6e-15 on the flip-flop
-            // fixture, against a 5.28 rescue).
+            // `RECHECK_RESCUE_MIN_GAIN` is reported: once θ moves, warm and cold
+            // solves that reach the same point differ at rounding level
+            // (measured 3.6e-15 on the flip-flop fixture, against a 5.28
+            // rescue).
             cold_won = best.nll - cold.nll > RECHECK_RESCUE_MIN_GAIN;
             best = cold;
         }
@@ -399,8 +401,6 @@ fn find_ebe_multistart(
         );
         if candidate.nll < best.nll {
             best = candidate;
-            // A random start, not the cold recheck, supplied the winning mode.
-            cold_won = false;
         }
     }
     (best, cold_won)
@@ -601,15 +601,16 @@ fn check_sobol_config(
     Ok(())
 }
 
-/// Individual-NLL gain above which a cold-recheck win counts as a rescue from
-/// a different (local) mode rather than the same mode re-solved (#1965).
+/// Individual-NLL gain above which a cold-recheck win is reported (#1965). It
+/// filters rounding-level differences between solves that reach the same
+/// point; it does not prove the warm solve sat in a separate basin.
 const RECHECK_RESCUE_MIN_GAIN: f64 = 1e-3;
 
-/// The fit warning for `impmap_map_recheck` rescues (#1965): which iterations'
-/// cold MAP recheck beat a subject's warm-started mode, and how many subjects.
-/// Each rescue is a subject that was sitting in a local mode — the bias the
-/// option exists to remove — so the user hears about it. `None` when the
-/// recheck never won.
+/// The fit warning for `impmap_map_recheck` (#1965): at which iterations, and
+/// for how many subjects, the cold-started MAP solve lowered the individual NLL
+/// by more than `RECHECK_RESCUE_MIN_GAIN` below the warm-started one — the
+/// event the option exists to catch, stated as measured. `None` when it never
+/// happened.
 fn recheck_wins_warning(label: &str, wins: &[(String, usize)]) -> Option<String> {
     if wins.is_empty() {
         return None;
@@ -621,10 +622,21 @@ fn recheck_wins_warning(label: &str, wins: &[(String, usize)]) -> Option<String>
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "{label}: the cold MAP recheck (`impmap_map_recheck`) found a better mode than the \
-         warm start {total} time(s) — iteration (subjects): {at}. Those subjects' warm-started \
-         modes were local optima; the recheck moved them."
+        "{label}: the cold MAP recheck (`impmap_map_recheck`) lowered a subject's individual \
+         NLL by more than {RECHECK_RESCUE_MIN_GAIN} below its warm-started solve {total} time(s) \
+         — iteration (subjects): {at}. The cold solution was kept; the warm start had not \
+         reached it."
     ))
+}
+
+// Iterations at which `run_mcem` *attempted* a cold MAP recheck, recorded on
+// the calling thread (the decision is made outside the rayon subject loop).
+// Test-only: lets a test pin the "every N iterations" cost contract, which the
+// rescue warning cannot see — a subject is rescued once however often the
+// recheck runs afterwards.
+#[cfg(test)]
+thread_local! {
+    static RECHECK_ATTEMPTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether MCEM iteration `k` (1-based) runs the cold MAP recheck under
@@ -1107,7 +1119,14 @@ fn run_mcem(
                 mceta,
                 seed,
                 k,
-                recheck_due(k, map_recheck),
+                {
+                    let due = recheck_due(k, map_recheck);
+                    #[cfg(test)]
+                    if due {
+                        RECHECK_ATTEMPTS.with(|a| a.borrow_mut().push(k));
+                    }
+                    due
+                },
             );
             if n_cold_wins > 0 {
                 recheck_wins.push((k.to_string(), n_cold_wins));
@@ -4645,8 +4664,8 @@ mod tests {
     }
 
     /// Every sentence of the recheck warning carries a claim (#1965): the
-    /// first, how many rescues and at which iterations; the second, what a
-    /// rescue means. `None` when nothing was rescued.
+    /// first, the threshold, the count and the iterations; the second, what was
+    /// done about it. `None` when nothing happened.
     #[test]
     fn recheck_wins_warning_states_count_iterations_and_meaning() {
         assert!(recheck_wins_warning("IMPMAP", &[]).is_none());
@@ -4656,7 +4675,39 @@ mod tests {
             w.contains("3 time(s)") && w.contains("iteration (subjects): 10 (2), final (1)."),
             "{w}"
         );
-        assert!(w.contains("warm-started modes were local optima"), "{w}");
+        assert!(
+            w.contains("by more than 0.001 below its warm-started solve"),
+            "{w}"
+        );
+        assert!(
+            w.contains("The cold solution was kept; the warm start had not reached it."),
+            "{w}"
+        );
+    }
+
+    /// The "every N iterations" cost contract (#1965), recorded where
+    /// `run_mcem` decides, not inferred from rescues: period 2 over five
+    /// iterations attempts the recheck at exactly 2 and 4 (the final pass is
+    /// separate and not recorded), and period 0 never. `k >= period` or any
+    /// other schedule that keeps rescuing once but rechecks more often fails.
+    #[test]
+    fn impmap_map_recheck_attempts_follow_the_period() {
+        let model = crate::parser::model_parser::parse_model_string(FLIPFLOP_MODEL).unwrap();
+        let pop = flipflop_pop(10);
+        let attempts = |recheck: usize| {
+            RECHECK_ATTEMPTS.with(|a| a.borrow_mut().clear());
+            let mut opts = FitOptions::default();
+            opts.impmap_iterations = 5;
+            opts.impmap_averaging = 1;
+            opts.impmap_samples = 30;
+            opts.impmap_auto = false;
+            opts.impmap_map_recheck = recheck;
+            run_impmap(&model, &pop, &model.default_params, None, &opts).expect("IMPMAP runs");
+            RECHECK_ATTEMPTS.with(|a| a.borrow().clone())
+        };
+        assert_eq!(attempts(2), vec![2, 4]);
+        assert_eq!(attempts(5), vec![5]);
+        assert!(attempts(0).is_empty());
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),
