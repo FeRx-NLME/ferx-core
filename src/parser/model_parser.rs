@@ -15819,6 +15819,35 @@ pub(crate) fn mixing_logp_grad(
     Some(out)
 }
 
+/// Central-difference `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) for **either** mixing form
+/// (#1956) — the covariance step's per-subject mixture score takes it for the `p`
+/// form, which `mixing_logp_grad` declines. The outer gradient can fall back to an FD
+/// of the whole mixture objective there; a per-subject score has no such fallback.
+/// Differences `eval_mixing_log_probs` itself, so the clamp and renormalisation the
+/// objective applies are exactly what is differentiated; same step as the logit form's
+/// expression FD.
+pub(crate) fn mixing_logp_grad_fd(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Vec<Vec<f64>> {
+    let nt = theta.len();
+    let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
+    let mut tperturb = theta.to_vec();
+    for j in 0..nt {
+        let h = 1e-6 * theta[j].abs().max(1.0);
+        tperturb[j] = theta[j] + h;
+        let fp = eval_mixing_log_probs(spec, &tperturb, covariates);
+        tperturb[j] = theta[j] - h;
+        let fm = eval_mixing_log_probs(spec, &tperturb, covariates);
+        tperturb[j] = theta[j];
+        for (c, row) in out.iter_mut().enumerate() {
+            row[j] = (fp[c] - fm[c]) / (2.0 * h);
+        }
+    }
+    out
+}
+
 fn parse_parameters(
     lines: &[String],
     level_bindings: &LevelBindings,

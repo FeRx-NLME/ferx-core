@@ -8038,7 +8038,7 @@ pub struct FitOptions {
     /// Which covariance estimator to assemble, mirroring NONMEM `$COV MATRIX=`.
     /// Default [`CovarianceMethod::Hessian`] (`R⁻¹`). [`CovarianceMethod::CrossProduct`]
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
-    /// score cross-product `S`; currently supported for FOCEI and IOV fits.
+    /// score cross-product `S`; currently supported for FOCEI, FOCE, IOV and mixture fits.
     pub covariance_method: CovarianceMethod,
     /// Whether `covariance_method` was set explicitly rather than left at its
     /// default. Exists only so the high-dimension routing guard (#1064) can
