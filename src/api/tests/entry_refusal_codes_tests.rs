@@ -688,9 +688,9 @@ fn readout_refusal_texts() {
 /// valid, so a check that refused every readout model would die too.
 #[test]
 fn ferx_check_reports_what_fit_refuses() {
-    let dir = std::env::temp_dir().join(format!("ferx-1774-check-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("dir");
-    let model = dir.join("readout.ferx");
+    // Removed on drop, so a failing assertion leaves nothing behind either.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let model = dir.path().join("readout.ferx");
     std::fs::write(
         &model,
         "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
@@ -711,7 +711,7 @@ fn ferx_check_reports_what_fit_refuses() {
             Some("E_READOUT_DEPOT_UNSUPPORTED"),
         ),
     ] {
-        let path = dir.join(format!("{}.csv", name.replace(' ', "_")));
+        let path = dir.path().join(format!("{}.csv", name.replace(' ', "_")));
         std::fs::write(&path, data).expect("write data");
         let report = validate_model_file(
             model.to_str().expect("utf-8 path"),
@@ -737,5 +737,4 @@ fn ferx_check_reports_what_fit_refuses() {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }

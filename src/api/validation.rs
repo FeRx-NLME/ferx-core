@@ -3881,6 +3881,20 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     None
 }
 
+/// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`
+/// report: `E_ENDPOINT_TIME_DEPENDENT_PK`, block `event_model` (#1774). One code for every
+/// text, the two fail-closed arms included: each says the hazard pass would read a
+/// TIME-dependent disposition at its TIME=0 snapshot, or cannot rule that out. A function of
+/// the model alone, so `ferx check` reports it without `--data`.
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
+    check_survival_time_dependent_pk(model)
+        .map(|m| {
+            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model")]
+        })
+        .unwrap_or_default()
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
@@ -8147,6 +8161,12 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+
+    // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
+    //    function of the model alone, so it needs no `--data`. `fit()` and every
+    //    predict / simulate entry point refuse it; `ferx check` reports it (#1774).
+    #[cfg(feature = "survival")]
+    diags.extend(check_survival_time_dependent_pk_diags(&parsed.model));
 
     // 2d. Undeclared random effects, *without* a dataset. With data present this
     //    is an `E_ETA_NOT_DECLARED` error from `check_covariates` below (we know

@@ -1248,18 +1248,12 @@ pub fn simulate_adaptive_from_spec(
             population.covariate_names.join(", ")
         };
         // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
-        return Err(EngineError::from_diagnostic(
-            Diagnostic::error(
-                "E_MISSING_COVARIATE",
-                format!(
-                    "[adaptive_dosing] `observe` references covariate(s) not found in data \
-                     (case-sensitive): {}. Available covariate columns: {}.",
-                    missing.join(", "),
-                    available
-                ),
-            )
-            .with_block("adaptive_dosing"),
-        )
+        return Err(super::entry_refusals::observe_covariate_missing(format!(
+            "[adaptive_dosing] `observe` references covariate(s) not found in data \
+             (case-sensitive): {}. Available covariate columns: {}.",
+            missing.join(", "),
+            available
+        ))
         .in_context("simulate_adaptive_from_spec"));
     }
     let ode = model

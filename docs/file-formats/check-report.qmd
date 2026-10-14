@@ -63,7 +63,7 @@ Treat an unrecognised code as a generic finding of its given `severity`.
 - [Data and dosing](#codes-data-and-dosing)
 - [Scaling, output and derived columns](#codes-scaling-output-and-derived)
 - [Experimental and degraded paths](#codes-experimental-and-degraded)
-- [Codes only an entry point raises](#codes-entry-point)
+- [Simulation and adaptive-dosing codes](#codes-entry-point)
 
 ### Model-file structure {#codes-model-file-structure}
 
@@ -206,6 +206,7 @@ Bioavailability `F`, lag time `ALAG`/`LAGTIME`, and the modeled infusion duratio
 | `E_ENDPOINT_UNROUTED` | error | A compartment the model declares as a non-Gaussian endpoint (`[event_model]`, `[binary_model]`, Markov) carries Gaussian observations: the population was read without endpoint routing (`read_nonmem_csv()` instead of `read_population_for()`), so the endpoint's rows would be scored as concentrations and its likelihood would contribute nothing. Raised by `fit()`, `simulate()`, `predict()`, `predict_categorical()`, `run_covariance()` and `run_sir()` ([#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)). |
 | `E_ENDPOINT_NO_RECORDS` | error | A declared non-Gaussian endpoint has no row routed to it anywhere in the data — typically the `CMT` column is missing, so every row reads as CMT 1. Raised by the entry points that run the likelihood — `fit()`, `ferx check`, `run_covariance()`, `run_sir()` — not by `simulate()` / `predict()`: a simulation template has no event rows by construction ([#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)). |
 | `E_ENDPOINT_TV_COVARIATE` | error | A covariate that varies within a subject is read by an endpoint that evaluates it once, at the subject's baseline: an analytic hazard's own parameters, any covariate under an ODE-accumulated (drug-driven) hazard, a `[binary_model]` linear predictor, or a `[markov_model]` transition intensity. The block is the endpoint's (`event_model`, `binary_model` or `markov_model`), and the message names the covariate and the first subject. Raised by `fit()`, `ferx check`, `predict()`, `predict_survival()`, `predict_categorical()` and `simulate()`; `ferx check` reports it since [#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774), so a model `fit()` refused is no longer `valid: true` ([#741](https://github.com/FeRx-NLME/ferx-core/issues/741)). |
+| `E_ENDPOINT_TIME_DEPENDENT_PK` | error | The `TIME` axis of the same freeze: an ODE-accumulated (drug-driven) hazard integrates the individual parameters at their TIME=0 values, so a `[individual_parameters]` value that reads `TIME` and reaches the hazard (through the `[odes]` right-hand side or an `init()` seed) would put the PK and hazard halves of the objective on different concentration curves ([#1853](https://github.com/FeRx-NLME/ferx-core/issues/1853)). Also raised, fail-closed, for a hand-built `CompiledModel` missing the compiled programs the analysis reads. Block `event_model`. A function of the model alone, so `ferx check` reports it without `--data` (since [#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)). Raised by `fit()`, `ferx check`, `predict()`, `predict_survival()` and `simulate()`; not by `predict_categorical()`, which never reads the frozen snapshot. |
 
 ### Scaling, output and derived columns {#codes-scaling-output-and-derived}
 
@@ -234,9 +235,9 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
 | `W_ABSORPTION_TWIN_DECLINED` | warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model stays closed-form with no ODE fallback. Subjects needing the fallback (time-varying covariates, a `TIME`-dependent parameter, IOV, SS or infusion doses, the flip-flop regime) are then rejected with an explicit error. The message carries the twin parser's own reason — most often an individual parameter named after a twin state (`CENTRAL`, `PERIPH`). See [#1008](https://github.com/FeRx-NLME/ferx-core/issues/1008). |
 
-### Codes only an entry point raises {#codes-entry-point}
+### Simulation and adaptive-dosing codes {#codes-entry-point}
 
-`ferx check` never reports these: they refuse an option, a parameter set or a call that a model file and its data do not contain, or a model `fit()` accepts but the entry point cannot run. Each is the `code()` of the `EngineError` the entry point returns; see [matching on the code](../warnings.qmd#entry-point-error-codes) ([#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)).
+`ferx check` never reports these: they refuse an option, a parameter set or a call that a model file and its data do not contain, or a model `fit()` accepts but the entry point cannot run. Each is the `code()` of the `EngineError` the entry point returns ([#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)). They are not the only codes `ferx check` cannot reach: the θ length, parameter shape, fit-binding and population codes are too, and [matching on the code](../warnings.qmd#entry-point-error-codes) lists every code an entry point returns.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
@@ -248,7 +249,7 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 | `E_ADAPTIVE_OPTIONS` | error | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite, or not strictly increasing), or with `decision_times` / `monitors` set alongside an `[adaptive_dosing]` spec that owns them. |
 | `E_ADAPTIVE_SPEC` | error | An `[adaptive_dosing]` spec that does not compile against the model: an invariant the block parser checks (on a spec built in code), an `assay_cmt` out of range, or an `observe` expression that does not compile. Block `adaptive_dosing`. |
 
-Two refusals of this kind reuse a code `ferx check` has, since the cause is the same: a missing Ω~IOV~ on `simulate()` is `E_PARAM_SHAPE`, and an `[adaptive_dosing] observe` covariate the data lack is `E_MISSING_COVARIATE` (block `adaptive_dosing`).
+Two refusals of this kind reuse an existing code, since the cause is the same: a missing Ω~IOV~ on `simulate()` is `E_PARAM_SHAPE`, the parameter-shape code the other entry points return (see [matching on the code](../warnings.qmd#entry-point-error-codes)), and an `[adaptive_dosing] observe` covariate the data lack is `E_MISSING_COVARIATE` (block `adaptive_dosing`), the code `ferx check` gives a model covariate missing from the data.
 
 ## Line-number caveat
 

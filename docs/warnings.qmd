@@ -165,6 +165,7 @@ found:
 | θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
 | population not the fit's (`run_sir()`, `run_covariance()`, `PopulationFingerprint::verify`) | `E_POPULATION_MISMATCH`; on `run_sir()` / `run_covariance()` also `E_FIT_SUBJECTS_MISMATCH` |
 | time-varying covariate on an endpoint | `E_ENDPOINT_TV_COVARIATE` |
+| `TIME`-dependent disposition under a drug-driven hazard | `E_ENDPOINT_TIME_DEPENDENT_PK` |
 | depot readout the dose superposition cannot reconstruct | `E_READOUT_DEPOT_UNSUPPORTED` |
 | a CTMM model (`predict*`, `simulate*`) | `E_CTMM_UNSUPPORTED` |
 | TTE simulatable | `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON` |

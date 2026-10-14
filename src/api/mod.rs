@@ -36,8 +36,11 @@ pub use validation::{
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
-    check_rtte_records, check_survival_time_dependent_pk, check_survival_tv_covariates,
+    check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
+// The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
+#[cfg(all(test, feature = "survival"))]
+pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;

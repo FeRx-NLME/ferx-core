@@ -6,15 +6,40 @@
 //! here and nowhere else, one constructor per cause, so two call sites refusing for the
 //! same reason cannot give two codes. Every constructor keeps the caller's message as
 //! is, so `to_string()` is the text the refusal had before it carried a code.
+//!
+//! The two refusals that reuse a code `ferx check` or another entry point already has
+//! (`E_PARAM_SHAPE`, `E_MISSING_COVARIATE`) are built here too, by name.
 
 use crate::diagnostics::{Diagnostic, EngineError};
 
-fn coded(code: &str, block: Option<&str>, message: String) -> EngineError {
+/// The one builder: an error diagnostic with an optional block.
+fn diag(code: &str, block: Option<&str>, message: String) -> Diagnostic {
     let d = Diagnostic::error(code, message);
-    EngineError::from_diagnostic(match block {
+    match block {
         Some(b) => d.with_block(b),
         None => d,
-    })
+    }
+}
+
+fn coded(code: &str, block: Option<&str>, message: String) -> EngineError {
+    EngineError::from_diagnostic(diag(code, block, message))
+}
+
+/// `E_PARAM_SHAPE`: an Ω, σ or Ω_IOV whose shape is not the model's (#1764), including
+/// a missing Ω_IOV on a model with κ, which `simulate*` refuses with #1019's message.
+pub(crate) fn param_shape(message: impl Into<String>) -> EngineError {
+    coded("E_PARAM_SHAPE", None, message.into())
+}
+
+/// `E_MISSING_COVARIATE` on block `adaptive_dosing`: an `[adaptive_dosing] observe`
+/// expression reads a covariate the data lack, the cause `ferx check` gives that code for
+/// a model expression. `simulate_adaptive_from_spec` adds its context.
+pub(crate) fn observe_covariate_missing(message: impl Into<String>) -> EngineError {
+    coded(
+        "E_MISSING_COVARIATE",
+        Some("adaptive_dosing"),
+        message.into(),
+    )
 }
 
 /// `E_CTMM_UNSUPPORTED`: a `[markov_model]` endpoint reached `predict*` / `simulate*`,
@@ -60,11 +85,7 @@ pub(crate) fn adaptive_unsupported_diag(
     block: Option<&str>,
     message: impl Into<String>,
 ) -> Diagnostic {
-    let d = Diagnostic::error("E_ADAPTIVE_UNSUPPORTED", message);
-    match block {
-        Some(b) => d.with_block(b),
-        None => d,
-    }
+    diag("E_ADAPTIVE_UNSUPPORTED", block, message.into())
 }
 
 /// `E_ADAPTIVE_OPTIONS`: `AdaptiveSimulateOptions` that give no usable schedule — an
@@ -78,5 +99,5 @@ pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
 /// model — an invariant the block parser checks, an `assay_cmt` out of range, or an
 /// `observe` expression that does not compile.
 pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
-    Diagnostic::error("E_ADAPTIVE_SPEC", message).with_block("adaptive_dosing")
+    diag("E_ADAPTIVE_SPEC", Some("adaptive_dosing"), message.into())
 }

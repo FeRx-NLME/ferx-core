@@ -771,9 +771,7 @@ fn fit_unstamped(
     // record, so a TIME-dependent CL/V/init would put the two halves of the objective on
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
-    if let Some(e) = check_survival_time_dependent_pk(model) {
-        return Err(e);
-    }
+    first_error(&check_survival_time_dependent_pk_diags(model)).map_err(|e| e.to_string())?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —

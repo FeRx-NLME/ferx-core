@@ -319,7 +319,7 @@ pub(crate) fn validate_iov_simulatable(
              with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
             model.n_kappa
         );
-        return first_error(&[Diagnostic::error("E_PARAM_SHAPE", message)]);
+        return Err(super::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -468,7 +468,7 @@ pub(crate) fn check_param_shape(
             },
             _ => continue,
         };
-        return first_error(&[Diagnostic::error("E_PARAM_SHAPE", message)]);
+        return Err(super::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -522,7 +522,7 @@ fn check_simulate_preconditions(
     // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
     // snapshot for its event times (#1853; as fit() does).
     #[cfg(feature = "survival")]
-    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
     first_error(&check_absorption_dosing(model, population))
 }
 
