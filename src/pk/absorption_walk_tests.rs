@@ -84,6 +84,7 @@ fn wt(w: f64) -> HashMap<String, f64> {
 fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
     let n = obs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: doses
             .iter()

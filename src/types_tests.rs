@@ -189,6 +189,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     });
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0, 2.0],
@@ -243,6 +244,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
     model.frem_config = None;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0],
@@ -2177,6 +2179,7 @@ fn impmap_proposal_df_default_is_finite_t() {
 /// exercise.
 fn bare_subject(id: &str) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: Vec::new(),
         obs_times: Vec::new(),
@@ -3672,4 +3675,339 @@ fn interaction_for_truth_table() {
             );
         }
     }
+}
+
+/// #1899: the slot lookup must not answer an unbound individual parameter for
+/// `PK_IDX_CL`, in either declaration order.
+///
+/// On an analytical model only a name the `pk(...)` line binds (or a readout /
+/// `obs_scale` / `init` reads) owns a PK slot; every other name carries the
+/// placeholder `0`, which *is* `CL`'s slot. So `pk_indices` answers both ways
+/// round: forwards it hands the intermediate `CL`'s value, backwards a
+/// `position(|&s| s == PK_IDX_CL)` scan hands `CL`'s slot the intermediate's name
+/// — the two defects #1899 covers. `pk_slot_rows` drops the placeholder rows and
+/// `indiv_param_for_pk_slot` is `find` over what is left.
+///
+/// Both orders are asserted because each consumer broke on a different one: a
+/// `position` scan loses when the intermediate is declared **before** `CL`, while
+/// a slot-keyed `seed_dim` (the sensitivity fallback) loses when it is declared
+/// **after** — so a single-order fixture leaves one half untested.
+#[test]
+fn pk_slot_rows_omit_an_unbound_individual_parameter() {
+    let before = "[parameters]\n  theta THCL(0.2, 0.001, 10.0)\n  theta THV(10.0, 0.1, 500.0)\n  \
+         theta THS(3.0, 0.01, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         omega ETA_S ~ 0.25\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+         [individual_parameters]\n  S = THS * exp(ETA_S)\n  CL = THCL * exp(ETA_CL)\n  \
+         V = THV * exp(ETA_V)\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=1.0)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let after = before
+        .replace("  S = THS * exp(ETA_S)\n  CL", "  CL")
+        .replace(
+            "  V = THV * exp(ETA_V)\n[structural_model]",
+            "  V = THV * exp(ETA_V)\n  S = THS * exp(ETA_S)\n[structural_model]",
+        );
+    for (label, src) in [("S first", before), ("S last", after.as_str())] {
+        let m = crate::parser::model_parser::parse_model_string(src)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let s_pos = m
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "S")
+            .unwrap_or_else(|| panic!("{label}: S must be declared"));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        // The defect's precondition: `S` carries CL's slot in `pk_indices`, so the
+        // old lookups could not tell the two apart. If a later change gives every
+        // name a real slot this assert fires and the test below stops testing
+        // anything — which is the point of asserting it.
+        assert_eq!(
+            m.pk_indices[s_pos], PK_IDX_CL,
+            "{label}: S must still carry the placeholder slot"
+        );
+        let rows = m.pk_slot_rows();
+        assert!(
+            !rows.iter().any(|&(_, i)| i == s_pos),
+            "{label}: S owns no slot, so it must contribute no row: {rows:?}"
+        );
+        // One row per slot — what `seed_dim_from_slots` (last row per slot wins)
+        // needs to be unambiguous.
+        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_CL),
+            Some(cl_pos),
+            "{label}: PK_IDX_CL must resolve to CL, not to S"
+        );
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_V),
+            m.indiv_param_names.iter().position(|n| n == "V"),
+            "{label}: PK_IDX_V must resolve to V"
+        );
+        // A slot no parameter owns stays unowned — the literal `ka=1.0` binds no
+        // variable, so nothing may claim `PK_IDX_KA`.
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_KA),
+            None,
+            "{label}: a literal-bound role owns no individual parameter"
+        );
+    }
+}
+
+/// #1899: a hand-built `CompiledModel` carries no individual-parameter program, so
+/// `pk_slot_rows` has nothing to read the resolved pairs off and falls back to
+/// `pk_indices` — where, for such a fixture, every entry is a real slot by
+/// construction. Pins that fallback, which the parsed-model test above cannot
+/// reach.
+#[test]
+fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA];
+    assert!(
+        m.indiv_param_partials.indiv_param_program.is_none(),
+        "the hand-built fixture must carry no program, or this tests the other arm"
+    );
+    assert_eq!(
+        m.pk_slot_rows(),
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (PK_IDX_KA, 2)]
+    );
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
+}
+
+/// #1899: the structural invariants [`CompiledModel::pk_slot_rows`] has to hold on
+/// every model shape its two consumers meet, asserted as a property rather than
+/// re-derived per call site:
+///
+/// * **one row per slot** — what `seed_dim_from_slots` (last row per slot wins)
+///   needs to be unambiguous, and the whole point of the lookup;
+/// * **every name index in range** — the consumers pair a row with `tv[i]` /
+///   `sel_flat[i * n_eta ..]`, both of length `indiv_param_names.len()`;
+/// * **bounded by the program's own pair list**, which is what
+///   `sens::provider::closed_form_slot_count_supported` caps at the
+///   `const_dispatch!` table width.
+///
+/// Note what is deliberately **not** asserted: `rows.len() <= pk_indices.len()`.
+/// Review r2 #4 found it false — `pk one_cpt_iv(cl=D1, v=V)` alongside `D1 = …`
+/// gives `D1` both a role slot and a modeled-dose slot, three rows for two names
+/// — so the last case below pins that shape and the *real* bound instead. The
+/// consumers never index by row count, only by slot, so the inequality was a
+/// convenience claim rather than a requirement, and asserting a false one would
+/// have been worse than asserting none.
+///
+/// The shapes are the five that put a name somewhere other than a plain `pk(...)`
+/// role: an analytical modeled-duration `D{n}` (a real slot above `PK_IDX_LAGTIME`
+/// that `pk_indices` records as the placeholder), a Form C `y` readout and a Form B
+/// `obs_scale` (spare slots from #650 / #1898), the ODE layout (every name real),
+/// and a name carrying a role *and* a modeled-dose slot.
+#[test]
+fn pk_slot_rows_hold_their_invariants_on_every_slot_source() {
+    let cases: [(&str, &str); 5] = [
+        (
+            "analytical modeled duration",
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  \
+             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             D1 = TVD1 * exp(ETA_D1)\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        ),
+        (
+            "Form C y readout",
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             theta TVB(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  BASE = TVB\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  y = central / V + BASE\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        ),
+        (
+            "Form B obs_scale",
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             theta TVS(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  S = TVS\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  obs_scale = S\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        ),
+        (
+            "ODE layout",
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KE = CL / V\n\
+             [structural_model]\n  ode(states=[central])\n\
+             [odes]\n  d/dt(central) = -KE * central\n\
+             [scaling]\n  y = central / V\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        ),
+        (
+            // Review r2 #4: `D1` is bound to the `cl` role *and* carries a
+            // modeled-duration slot, so it owns two rows. The exact rows are
+            // asserted in `pk_slot_rows_give_one_name_both_of_its_slots`.
+            "role plus modeled dose on one name",
+            "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+             [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        ),
+    ];
+    for (label, src) in cases {
+        let m = crate::parser::model_parser::parse_model_string(src)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let rows = m.pk_slot_rows();
+        // The real bound: the rows are a subset of the program's own pair list,
+        // which `closed_form_slot_count_supported` caps for the fallback.
+        let prog_pairs = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("a parsed model carries a program")
+            .pk_slots()
+            .len();
+        assert!(
+            rows.len() <= prog_pairs,
+            "{label}: rows must be a subset of the program's pairs: {} vs {prog_pairs}",
+            rows.len()
+        );
+        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
+        for &(_, i) in &rows {
+            assert!(
+                i < m.indiv_param_names.len(),
+                "{label}: name index {i} is past {} names",
+                m.indiv_param_names.len()
+            );
+        }
+    }
+}
+
+/// #1899: an analytical **modeled-duration** `D1` owns a real PK slot above
+/// `PK_IDX_LAGTIME` that `pk_indices` records as the placeholder `0` — CL's slot —
+/// so it is the same defect as an unbound intermediate's, on a parameter that
+/// drives the infusion window. Pins that the rows give it its own slot and leave
+/// `CL`'s to `CL`. The gradient consequence is asserted against FD in
+/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row`.
+#[test]
+fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_D1 ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+         D1 = TVD1 * exp(ETA_D1)\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    let d1 = m.indiv_param_names.iter().position(|n| n == "D1").unwrap();
+    let cl = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+    assert_eq!(
+        m.pk_indices[d1], PK_IDX_CL,
+        "D1's pk_indices entry must still be the placeholder, or this tests nothing"
+    );
+    let rows = m.pk_slot_rows();
+    let d1_slot = rows
+        .iter()
+        .find(|&&(_, i)| i == d1)
+        .map(|&(s, _)| s)
+        .expect("D1 owns a row");
+    assert!(
+        d1_slot > PK_IDX_LAGTIME,
+        "D1's slot must be the spare-region modeled-dose slot, got {d1_slot}"
+    );
+    assert_eq!(
+        m.indiv_param_for_pk_slot(PK_IDX_CL),
+        Some(cl),
+        "PK_IDX_CL must resolve to CL, not to D1"
+    );
+}
+
+/// Review r3 #1: the exact rows for a name that owns **two** PK slots. The generic
+/// invariants (one row per slot, indices in range, bounded by the program's pairs)
+/// are all satisfied by a `pk_slot_rows` deduplicated by name, which would silently
+/// drop one of the two — so the shape needs its row list pinned, not just its
+/// invariants.
+///
+/// `pk two_cpt_iv(cl=D1, …)` alongside `D1 = …` parses because the modeled-dose
+/// mapping is not a `pk(...)` role and the #1359 one-variable-two-roles reject does
+/// not see it.
+///
+/// This is the **only** check on the slot-9 row (review r4 #2): the companion
+/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
+/// asserts FD parity for the `cl` row, but on the plain bolus it runs that row is
+/// the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would leave its parity unchanged.
+#[test]
+fn pk_slot_rows_give_one_name_both_of_its_slots() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    assert_eq!(m.indiv_param_names, vec!["D1".to_string(), "V".to_string()]);
+    // `pk_indices` keeps one entry per name and drops the modeled slot entirely,
+    // which is why it cannot answer this question either way.
+    assert_eq!(m.pk_indices, vec![PK_IDX_CL, PK_IDX_V]);
+    let mut rows = m.pk_slot_rows();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (9, 0)],
+        "D1 (name index 0) must own both CL's slot and its modeled-duration slot"
+    );
+    // Three rows for two names: the inequality review r2 #4 disproved.
+    assert!(rows.len() > m.pk_indices.len());
+    // The reverse lookup still answers each slot with the one name that owns it.
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_CL), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(9), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+}
+
+/// Review r6: deleting the `debug_assert!` in
+/// [`CompiledModel::pk_slot_rows`](super::CompiledModel::pk_slot_rows) was a minimal
+/// production edit no test caught, and by its nature none can: the condition it
+/// guards is unreachable on every accepted model (measured — deleting the range
+/// filter beside it leaves the whole suite green), so observing it would need a
+/// hand-built `IndivParamProgram` with an out-of-range `var_slot`, which its private
+/// fields do not allow without a test-only constructor.
+///
+/// So the guard's **presence** is what is asserted, in the same spirit as
+/// `tests/public_api_boundary.rs`'s structural bans. What it buys is not style: a
+/// future mapping that pointed a pair past `indiv_param_names` would otherwise have
+/// its row silently filtered away, which is a lost gradient row — #1899's own
+/// failure mode — rather than a loud test failure.
+#[test]
+fn pk_slot_rows_keeps_its_range_guard() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
+        .expect("src/types.rs is valid UTF-8");
+    let body = {
+        let start = src
+            .find("pub(crate) fn pk_slot_rows(&self)")
+            .expect("pk_slot_rows must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub(crate) fn indiv_param_for_pk_slot")
+            .expect("indiv_param_for_pk_slot follows pk_slot_rows");
+        &rest[..end]
+    };
+    assert!(
+        body.contains("debug_assert!"),
+        "pk_slot_rows must keep its debug_assert over pk_var_slots: a pair pointing \
+         past indiv_param_names would otherwise lose a gradient row silently"
+    );
+    assert!(
+        body.contains("i < self.indiv_param_names.len()"),
+        "pk_slot_rows must keep the range condition the assert and the filter share"
+    );
 }

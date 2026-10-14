@@ -202,6 +202,7 @@ fn two_eta_model() -> CompiledModel {
 
 fn bound_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
@@ -490,7 +491,7 @@ fn data_term_quad(
             subject,
             &params.theta,
             &params.sigma.values,
-            &params.residual_correlations,
+            model.residual_cov_at(params),
             eta.as_slice(),
             &mut scratch,
         );

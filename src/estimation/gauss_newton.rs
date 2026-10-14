@@ -1791,7 +1791,7 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && kappas.is_empty()
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()
-        && template.residual_correlations.is_empty()
+        && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
 }
 
@@ -2184,7 +2184,7 @@ fn subject_nll_at(
         }
     }
 
-    crate::stats::likelihood::foce_subject_nll(
+    crate::stats::likelihood::foce_subject_nll_cov(
         model,
         subject,
         &params.theta,
@@ -2194,7 +2194,7 @@ fn subject_nll_at(
         // `block_sigma` + Gauss-Newton is rejected up front
         // (`E_BLOCK_SIGMA_METHOD_UNSUPPORTED`), so these are always empty (#847).
         &params.sigma.values,
-        &params.residual_correlations,
+        model.residual_cov_at(params),
         options.interaction,
     )
 }
@@ -2232,6 +2232,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -2305,6 +2306,7 @@ mod tests {
     fn make_population() -> Population {
         let subjects = (0..3)
             .map(|_| Subject {
+                obs_rgroup: Vec::new(),
                 id: "S1".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 4.0, 8.0],
@@ -3411,6 +3413,7 @@ mod tests {
             mixture: None,
         };
         let model = CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -3709,6 +3712,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -3782,6 +3786,7 @@ mod tests {
 
     fn make_iov_population_gn() -> Population {
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0],

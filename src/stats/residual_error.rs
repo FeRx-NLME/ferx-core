@@ -848,6 +848,56 @@ pub(crate) fn gaussian_obs_nll_scaled(
     nll
 }
 
+/// The structure a subject's residual covariance `R` is built from (#1081).
+///
+/// Every consumer that asks "can `R` couple two observation rows?" asks
+/// [`is_dense`](Self::is_dense) on one of these — directly, or through
+/// `ModelParameters::residual_is_dense` / `CompiledModel::residual_is_dense` — and
+/// every dense-`R` builder takes one, so a second source of off-diagonal terms is
+/// one field here and one clause in `is_dense`, not ~45 call sites that each test
+/// `residual_correlations.is_empty()` and would each silently score a correlated
+/// model with independent residuals if missed. `tests/residual_is_dense_is_the_one_predicate.rs`
+/// keeps it that way.
+///
+/// The per-observation *diagonal* helpers ([`ErrorSpec::variance_at_with_correlations`],
+/// [`compute_r_diag_with_correlations`], [`compute_iwres_with_correlations`]) keep
+/// taking the `block_sigma` pairs directly: those carry the within-observation
+/// `combined(...)` term, which is a property of the pairs, not of `R`'s shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResidualCov<'a> {
+    /// The `block_sigma` off-diagonal correlations (#847) — the live ones from the
+    /// parameter set being scored, or the model's declaration.
+    pub(crate) pairs: &'a [ResidualCorrelation],
+    /// A `correlation <kind>(RHO) by COL` line resolved at the θ being scored
+    /// (#1081). The blocks it couples are the subject's `obs_rgroup`.
+    pub(crate) serial: Option<SerialCov>,
+}
+
+/// A `correlation` line's structure and its `ρ` at the θ being scored (#1081).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SerialCov {
+    pub(crate) kind: crate::types::ResidualSerialKind,
+    pub(crate) rho: f64,
+}
+
+impl<'a> ResidualCov<'a> {
+    /// The structure carried by a bare `block_sigma` correlation list — the shape every
+    /// `pub` builder taking `&[ResidualCorrelation]` describes.
+    pub(crate) fn block_sigma(pairs: &'a [ResidualCorrelation]) -> Self {
+        Self {
+            pairs,
+            serial: None,
+        }
+    }
+
+    /// Can `R` hold an off-diagonal term? The one predicate for "take the dense-`R`
+    /// path" (#1081). Whether a given subject's `R` actually couples two rows is
+    /// [`has_cross_observation_residual`]'s question; this is the model-level one.
+    pub(crate) fn is_dense(&self) -> bool {
+        !self.pairs.is_empty() || self.serial.is_some()
+    }
+}
+
 /// Compute residual variances including fixed residual correlations from
 /// `block_sigma`.
 pub fn compute_r_diag_with_correlations(
@@ -1073,6 +1123,202 @@ fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
     }
 }
 
+/// The residual block of each observation row of `subject` under the model's
+/// `correlation … by COL` line (#1081), parallel to `obs_times`: rows with the
+/// same combined value of the `by` columns share a block, numbered from 1 in
+/// first-row order; a row whose `by` value is missing (absent or NaN) is in none
+/// (0). Empty when the model has no `correlation` line.
+///
+/// The value is the row's own covariate snapshot ([`Subject::obs_cov`]), so a
+/// block is a set of rows, never a time window — the IOV occasion rule does not
+/// enter.
+pub(crate) fn residual_groups(model: &crate::types::CompiledModel, subject: &Subject) -> Vec<u32> {
+    let Some(serial) = &model.residual_serial else {
+        return Vec::new();
+    };
+    let mut keys: Vec<Vec<u64>> = Vec::new();
+    (0..subject.obs_times.len())
+        .map(|j| {
+            let cov = subject.obs_cov(j);
+            let key: Option<Vec<u64>> = serial
+                .by
+                .iter()
+                .map(|col| cov.get(col).filter(|v| !v.is_nan()).map(|v| v.to_bits()))
+                .collect();
+            match key {
+                None => 0,
+                Some(key) => match keys.iter().position(|k| *k == key) {
+                    Some(i) => i as u32 + 1,
+                    None => {
+                        keys.push(key);
+                        keys.len() as u32
+                    }
+                },
+            }
+        })
+        .collect()
+}
+
+/// `population` with its residual blocks assigned — borrowed when the model has no
+/// `correlation` line or every subject already carries them, else a copy with
+/// [`assign_residual_groups`] applied (#1081). The one entry step for every public
+/// function that draws or scores a dense `R` on a population it was handed rather than
+/// one `fitted_population` prepared (`simulate()`, `compute_npde_npd`): such a caller has
+/// no way to assign blocks itself, and an unassigned population gets a NaN `R`.
+pub(crate) fn with_residual_blocks<'a>(
+    model: &crate::types::CompiledModel,
+    population: &'a crate::types::Population,
+) -> std::borrow::Cow<'a, crate::types::Population> {
+    let unassigned = model.residual_serial.is_some()
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.obs_rgroup.len() != s.obs_times.len());
+    if !unassigned {
+        return std::borrow::Cow::Borrowed(population);
+    }
+    let mut p = population.clone();
+    assign_residual_groups(model, &mut p);
+    std::borrow::Cow::Owned(p)
+}
+
+/// Give every subject of `population` its residual blocks ([`residual_groups`]),
+/// the step a population takes before a model with a `correlation` line scores
+/// it (#1081). A no-op for any other model.
+pub(crate) fn assign_residual_groups(
+    model: &crate::types::CompiledModel,
+    population: &mut crate::types::Population,
+) {
+    if model.residual_serial.is_none() {
+        return;
+    }
+    for s in &mut population.subjects {
+        s.obs_rgroup = residual_groups(model, s);
+    }
+}
+
+/// The row pairs a `correlation <kind>(RHO) by COL` line couples (#1081), as
+/// `(j, k, C_jk)` with `j < k`: every two rows sharing a nonzero `obs_rgroup`,
+/// with `C_jk = ρ` under `cs` and `ρ^|p_j − p_k|` under `ar1`, `p` being a row's
+/// position among its block's rows in time order (the data `TIME`, ties broken by
+/// row order — validation refuses a tie). A pair with `C_jk = 0` is left out, so
+/// `ρ = 0` writes nothing and `R` keeps the bits of the independent model.
+///
+/// `None` when `obs_rgroup` is not parallel to the observations: a population
+/// that was never given its residual blocks (`assign_residual_groups`). The
+/// builders turn that into a NaN `R`, which fails its factorisation, instead of
+/// scoring the rows as independent.
+fn serial_pairs(
+    serial: SerialCov,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, f64)>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if obs_rgroup.len() != n {
+        return None;
+    }
+    let time = |j: usize| -> f64 {
+        obs_raw_times
+            .get(j)
+            .or_else(|| obs_times.get(j))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let mut pos = vec![0usize; n];
+    if serial.kind == crate::types::ResidualSerialKind::Ar1 {
+        let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
+        order.sort_by(|&a, &b| {
+            obs_rgroup[a]
+                .cmp(&obs_rgroup[b])
+                .then(time(a).total_cmp(&time(b)))
+                .then(a.cmp(&b))
+        });
+        let mut prev = None;
+        let mut p = 0usize;
+        for &j in &order {
+            if prev != Some(obs_rgroup[j]) {
+                prev = Some(obs_rgroup[j]);
+                p = 0;
+            }
+            pos[j] = p;
+            p += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for j in 0..n {
+        let g = obs_rgroup[j];
+        if g == 0 {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if obs_rgroup[k] != g {
+                continue;
+            }
+            let c = match serial.kind {
+                crate::types::ResidualSerialKind::Cs => serial.rho,
+                crate::types::ResidualSerialKind::Ar1 => {
+                    serial.rho.powi(pos[j].abs_diff(pos[k]) as i32)
+                }
+            };
+            if c != 0.0 {
+                out.push((j, k, c));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `Σ_s a_s b_s σ_s²` over the sigma slots both loadings occupy — the same-slot
+/// covariance a `correlation` line scales by `C_jk` (#1081). Bilinear in the two
+/// loadings, so the derivative builders pass slope (or curvature) loadings for
+/// one side, exactly as they do for [`cross_observation_covariance`].
+fn same_slot_covariance(
+    load_a: &[(usize, f64)],
+    load_b: &[(usize, f64)],
+    sigma_values: &[f64],
+) -> f64 {
+    let mut cov = 0.0;
+    for &(idx, a) in load_a {
+        if let Some(&(_, b)) = load_b.iter().find(|(i, _)| *i == idx) {
+            let sg = sigma_values.get(idx).copied().unwrap_or(f64::NAN);
+            cov += a * b * sg * sg;
+        }
+    }
+    cov
+}
+
+/// Add a `correlation` line's off-diagonal terms to `R` (#1081):
+/// `R_jk += C_jk · Σ_s c_{j,s} c_{k,s} σ_s²` with the value loadings `loadings`.
+/// A population without its residual blocks gets a NaN `R` (see [`serial_pairs`]).
+#[allow(clippy::too_many_arguments)]
+fn fill_serial_covariances(
+    r: &mut DMatrix<f64>,
+    cov: ResidualCov<'_>,
+    loadings: &[Vec<(usize, f64)>],
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    sigma_values: &[f64],
+) {
+    let Some(serial) = cov.serial else {
+        return;
+    };
+    let Some(pairs) = serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, loadings.len())
+    else {
+        r.fill(f64::NAN);
+        return;
+    };
+    for (j, k, c) in pairs {
+        let v = c * same_slot_covariance(&loadings[j], &loadings[k], sigma_values);
+        r[(j, k)] += v;
+        r[(k, j)] += v;
+    }
+}
+
 /// Does this subject's residual covariance `R` couple two different observation rows?
 ///
 /// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
@@ -1090,9 +1336,9 @@ pub(crate) fn has_cross_observation_residual(
     error_spec: &ErrorSpec,
     subject: &Subject,
     sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    cov: ResidualCov<'_>,
 ) -> bool {
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         return false;
     }
     let loadings: Vec<Vec<(usize, f64)>> = error_spec
@@ -1100,6 +1346,22 @@ pub(crate) fn has_cross_observation_residual(
         .iter()
         .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
         .collect();
+    // A `correlation` line couples any two rows of one block (#1081). Value-free
+    // like the `block_sigma` arm below: `ρ` does not enter, so a fit whose `ρ`
+    // starts at 0 still routes the subject the way it will need at `ρ ≠ 0`. A
+    // population without its residual blocks answers `true` too — its `R` is NaN.
+    if cov.serial.is_some() {
+        let g = &subject.obs_rgroup;
+        if g.len() != loadings.len() {
+            return !loadings.is_empty();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (j, &k) in g.iter().enumerate() {
+            if k != 0 && !loadings[j].is_empty() && !seen.insert(k) {
+                return true;
+            }
+        }
+    }
     !match_partners(
         &loadings,
         &subject.obs_times,
@@ -1107,7 +1369,7 @@ pub(crate) fn has_cross_observation_residual(
         &subject.occasions,
         &subject.obs_l2,
         sigma_values,
-        correlations,
+        cov.pairs,
     )
     .is_empty()
 }
@@ -1132,6 +1394,36 @@ pub fn compute_r_matrix_with_correlations(
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+    )
+}
+
+/// [`compute_r_matrix_with_correlations`] over a resolved [`ResidualCov`] — the
+/// form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     // NOTE: deliberately NOT delegated to `_scaled` with an empty multiplier.
     // The diagonal here goes through `compute_r_diag` → `residual_variance`,
     // which forms the proportional variance as `(f·σ)·(f·σ)`; `variance_at_scaled`
@@ -1148,7 +1440,7 @@ pub fn compute_r_matrix_with_correlations(
     // and copying it in — this runs once per subject per FOCE inner/outer
     // iteration. The empty-correlation case delegates to `variance_at`, the
     // legacy `(f·σ)·(f·σ)` association the comment above relies on.
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         for (j, (&f, &cmt)) in ipreds.iter().zip(obs_cmts.iter()).enumerate() {
             r[(j, j)] = error_spec.variance_at(cmt, f, sigma_values);
         }
@@ -1173,6 +1465,15 @@ pub fn compute_r_matrix_with_correlations(
         correlations,
     );
     fill_cross_covariances(&mut r, &pairs);
+    fill_serial_covariances(
+        &mut r,
+        cov,
+        &loadings,
+        obs_rgroup,
+        obs_times,
+        obs_raw_times,
+        sigma_values,
+    );
     r
 }
 
@@ -1200,6 +1501,38 @@ pub fn compute_r_matrix_with_correlations_scaled(
     correlations: &[ResidualCorrelation],
     mult: &[Vec<f64>],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_scaled_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_r_matrix_with_correlations_scaled`] over a resolved [`ResidualCov`] —
+/// the form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_scaled_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: &[Vec<f64>],
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let mut r = DMatrix::<f64>::zeros(n, n);
     let ones: Vec<f64> = Vec::new();
@@ -1209,7 +1542,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
         let cmt = obs_cmts.get(j).copied().unwrap_or(0);
         r[(j, j)] = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, row(j));
     }
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         return r;
     }
     // Scale each observation's loadings by its multiplier row before computing
@@ -1234,6 +1567,15 @@ pub fn compute_r_matrix_with_correlations_scaled(
         correlations,
     );
     fill_cross_covariances(&mut r, &pairs);
+    fill_serial_covariances(
+        &mut r,
+        cov,
+        &loadings,
+        obs_rgroup,
+        obs_times,
+        obs_raw_times,
+        sigma_values,
+    );
     r
 }
 
@@ -1251,11 +1593,11 @@ pub(crate) fn r_matrix_maybe_scaled(
     err_keys: &[usize],
     subject: &Subject,
     sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    cov: ResidualCov<'_>,
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> DMatrix<f64> {
     match ruv_mult {
-        Some(mult) => compute_r_matrix_with_correlations_scaled(
+        Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             error_spec,
             preds,
             err_keys,
@@ -1263,11 +1605,12 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma_values,
-            correlations,
+            cov,
             mult,
         ),
-        None => compute_r_matrix_with_correlations(
+        None => compute_r_matrix_with_correlations_cov(
             error_spec,
             preds,
             err_keys,
@@ -1275,8 +1618,9 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma_values,
-            correlations,
+            cov,
         ),
     }
 }
@@ -1316,6 +1660,38 @@ pub fn compute_dr_df_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
+    compute_dr_df_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_dr_df_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_dr_df_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<DMatrix<f64>> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
@@ -1370,6 +1746,23 @@ pub fn compute_dr_df_matrices(
         let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
         out[k][(k, j)] = dkj;
         out[k][(j, k)] = dkj;
+    }
+    // A `correlation` line's `R_jk = C_jk · Σ_s c_j c_k σ²` (#1081), bilinear in
+    // the two rows' loadings like the pairs above: `∂R_jk/∂f_j` takes `j`'s slope.
+    if let Some(serial) = cov.serial {
+        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
+            Some(spairs) => {
+                for (j, k, c) in spairs {
+                    let djk = c * same_slot_covariance(&sload[j], &vload[k], sigma_values);
+                    out[j][(j, k)] += djk;
+                    out[j][(k, j)] += djk;
+                    let dkj = c * same_slot_covariance(&sload[k], &vload[j], sigma_values);
+                    out[k][(k, j)] += dkj;
+                    out[k][(j, k)] += dkj;
+                }
+            }
+            None => out.iter_mut().for_each(|m| m.fill(f64::NAN)),
+        }
     }
     out
 }
@@ -1452,6 +1845,38 @@ pub fn compute_d2r_df2_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
+    compute_d2r_df2_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_d2r_df2_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_d2r_df2_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<Vec<DMatrix<f64>>> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
@@ -1502,6 +1927,36 @@ pub fn compute_d2r_df2_matrices(
             out[j][k][(k, j)] = d;
             out[k][j][(j, k)] = d;
             out[k][j][(k, j)] = d;
+        }
+    }
+    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and —
+    // for a `power(...)` slot, whose loading is not affine — the own-row curvature
+    // `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²`.
+    if let Some(serial) = cov.serial {
+        let cload: Vec<Vec<(usize, f64)>> = scaled
+            .iter()
+            .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
+            .collect();
+        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
+            Some(spairs) => {
+                for (j, k, c) in spairs {
+                    let d = c * same_slot_covariance(&sload[j], &sload[k], sigma_values);
+                    out[j][k][(j, k)] += d;
+                    out[j][k][(k, j)] += d;
+                    out[k][j][(j, k)] += d;
+                    out[k][j][(k, j)] += d;
+                    let djj = c * same_slot_covariance(&cload[j], &vload[k], sigma_values);
+                    out[j][j][(j, k)] += djj;
+                    out[j][j][(k, j)] += djj;
+                    let dkk = c * same_slot_covariance(&cload[k], &vload[j], sigma_values);
+                    out[k][k][(j, k)] += dkk;
+                    out[k][k][(k, j)] += dkk;
+                }
+            }
+            None => out
+                .iter_mut()
+                .flat_map(|row| row.iter_mut())
+                .for_each(|m| m.fill(f64::NAN)),
         }
     }
     out
@@ -1726,6 +2181,65 @@ pub fn compute_iwres_with_correlations(
 /// Returns `(lag1_r, durbin_watson)` where DW = 2.0 indicates no autocorrelation.
 /// Returns `(f64::NAN, f64::NAN)` when no subject has enough observations.
 pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
+    residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
+}
+
+/// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same
+/// pooled statistics on each subject's IWRES **whitened by the residual covariance
+/// the model fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the
+/// individual predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
+///
+/// Under the model `w` is independent standard normal, so the statistic asks what
+/// it asks of an independent-residual model — is there dependence the model does
+/// *not* explain? On raw IWRES it would report the correlation the line was written
+/// to model (Durbin–Watson 0.99 on the naproxen `cs` fit). A subject whose `R` does
+/// not factor contributes nothing, as a subject with < 2 finite IWRES does.
+pub(crate) fn whitened_residual_autocorrelation(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    subjects: &[SubjectResult],
+) -> (f64, f64) {
+    let series: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .zip(subjects)
+        .map(|(subject, res)| {
+            let n = res.iwres.len();
+            if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
+                return Vec::new();
+            }
+            let err_keys = model.error_spec.obs_keys(subject);
+            let mult = model.ruv_obs_mult(subject, &params.theta);
+            let r = r_matrix_maybe_scaled(
+                &model.error_spec,
+                &res.ipred,
+                err_keys.as_ref(),
+                subject,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                mult.as_deref(),
+            );
+            let Some(chol) = r.clone().cholesky() else {
+                return Vec::new();
+            };
+            let e = nalgebra::DVector::from_iterator(
+                n,
+                (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()),
+            );
+            chol.l()
+                .solve_lower_triangular(&e)
+                .map(|w| w.as_slice().to_vec())
+                .unwrap_or_default()
+        })
+        .collect();
+    residual_autocorrelation(series.iter().map(Vec::as_slice))
+}
+
+/// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series,
+/// one per subject (shared by [`iwres_autocorrelation`] and
+/// [`whitened_residual_autocorrelation`]).
+fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64, f64) {
     // Accumulators for Durbin-Watson: Σ(eᵢ - eᵢ₋₁)², Σeᵢ²
     let mut dw_num = 0.0_f64;
     let mut dw_den = 0.0_f64;
@@ -1738,9 +2252,8 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     let mut sum_y2 = 0.0_f64; // Σ e[t+1]²
     let mut n_pairs: usize = 0;
 
-    for subj in subjects {
-        let valid: Vec<f64> = subj
-            .iwres
+    for residuals in series {
+        let valid: Vec<f64> = residuals
             .iter()
             .copied()
             .filter(|v| v.is_finite())
@@ -1790,6 +2303,10 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 
     (lag1_r, dw)
 }
+
+#[cfg(test)]
+#[path = "residual_error_serial_tests.rs"]
+mod serial_tests;
 
 #[cfg(test)]
 mod tests {

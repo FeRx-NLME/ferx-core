@@ -1667,6 +1667,20 @@ pub fn check_model_data_rule(
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
+    check_model_data_rule_at(model, population, iov_rule, &model.default_params)
+}
+
+/// [`check_model_data_rule`] at the parameter set a fit starts from. The one check
+/// that reads parameters, a `correlation` line's admissible ρ (#1081), reads
+/// `params`' θ bounds and `FIX` flags: `fit()` passes its `init_params`, which a
+/// caller (ferx-r, `--inits-from-nca`) may have replaced — the reason
+/// `check_variance_init_rails` reads them too (#1229).
+pub(crate) fn check_model_data_rule_at(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
@@ -1682,6 +1696,7 @@ pub fn check_model_data_rule(
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));
+    diags.extend(check_residual_correlation(model, population, params));
     // Errors only; the within-occasion-variation *warning* is a separate walk,
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
@@ -4413,7 +4428,11 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
-    if !model.residual_correlations.is_empty() {
+    diags.extend(residual_correlation_scope(model, options, &chain));
+
+    // A `correlation` line is dense too, but it has its own scope check above and
+    // the parser refuses it next to `block_sigma`, so what is left is block_sigma.
+    if model.residual_is_dense() && model.residual_serial.is_none() {
         for &m in &chain {
             if !matches!(
                 m,
@@ -4703,6 +4722,256 @@ const OMEGA_REGULARIZATION_FLOOR: f64 = 1e-8;
 /// * `ferx gam --no-fit` and `[fit_options] maxiter = 0` are documented as
 ///   "compute EBEs at initial parameter values only (equivalent to NONMEM
 ///   MAXEVAL=0)".
+/// `ρ` of a `correlation` line is free to move only below this in magnitude
+/// (#1081): the rail `block_sigma` puts on its Fisher-z (`RHO_Z_BOUND`), for the
+/// same reason — as `|ρ| → 1` the rows of a block become collinear and `R`
+/// numerically singular. A `FIX`ed `ρ` is held where the user puts it.
+pub(crate) const RESIDUAL_CORRELATION_RAIL: f64 = 0.995;
+
+/// The `correlation <kind>(RHO) by COL` line as the user wrote it (#1081).
+pub(crate) fn residual_correlation_line(model: &CompiledModel) -> Option<String> {
+    let serial = model.residual_serial.as_ref()?;
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .map(String::as_str)
+        .unwrap_or("?");
+    Some(format!(
+        "correlation {}({rho}) by {}",
+        serial.kind.keyword(),
+        serial.by.join(", ")
+    ))
+}
+
+/// Phase-1 scope of a `correlation` line (#1081): FOCE and FOCEI only, and none
+/// of the features whose objective does not take the dense `R` or whose analytic
+/// θ path has no `∂R/∂ρ`. One code, `E_RESIDUAL_CORRELATION_SCOPE`, naming the
+/// offending method or feature.
+fn residual_correlation_scope(
+    model: &CompiledModel,
+    options: &FitOptions,
+    chain: &[EstimationMethod],
+) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let scoped = |what: String, why: &str| {
+        Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_SCOPE",
+            format!(
+                "`{line}` is not supported with {what}. A residual correlation is fitted by \
+                 method = foce and focei only.{why}"
+            ),
+        )
+        .with_block("fit_options")
+    };
+    let scope = |what: String| scoped(what, "");
+    let mut diags = Vec::new();
+    if let Some(m) = chain
+        .iter()
+        .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+    {
+        diags.push(scope(format!("method = {}", m.label().to_lowercase())));
+    } else if options.n_agq > 1 {
+        diags.push(scope(format!("n_agq = {}", options.n_agq)));
+    }
+    if model.n_kappa > 0 {
+        diags.push(scoped(
+            "inter-occasion random effects (kappa)".to_string(),
+            " A kappa intercept loaded by the residual weight on the same grouping is the same \
+             covariance as `cs` with ρ ≥ 0, so the two are not identifiable together; fit one or \
+             the other (#1082).",
+        ));
+    }
+    if matches!(model.bloq_in_force(), BloqMethod::M3) {
+        diags.push(scope("bloq_method = m3".to_string()));
+    }
+    if model.frem_config.is_some() {
+        diags.push(scope("FREM covariate pseudo-observations".to_string()));
+    }
+    if model.has_non_gaussian() {
+        diags.push(scope(
+            "a time-to-event, binary, categorical or Markov endpoint".to_string(),
+        ));
+    }
+    if model.mixture.is_some() {
+        diags.push(scope("a mixture model".to_string()));
+    }
+    if model.is_sde() {
+        diags.push(scope("an SDE ([diffusion]) model".to_string()));
+    }
+    diags
+}
+
+/// The rows of each residual block of `subject`, block keys in first-row order.
+fn residual_blocks(model: &CompiledModel, subject: &Subject) -> Vec<Vec<usize>> {
+    let groups = crate::stats::residual_error::residual_groups(model, subject);
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    for (j, &g) in groups.iter().enumerate() {
+        if g == 0 {
+            continue;
+        }
+        let g = g as usize;
+        if blocks.len() < g {
+            blocks.resize(g, Vec::new());
+        }
+        blocks[g - 1].push(j);
+    }
+    blocks
+}
+
+/// `COL=value` of a block, from its first row.
+fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> String {
+    let cov = subject.obs_cov(row);
+    model
+        .residual_serial
+        .as_ref()
+        .map(|s| {
+            s.by.iter()
+                .map(|c| format!("{c}={}", cov.get(c).copied().unwrap_or(f64::NAN)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Data-dependent admissibility of a `correlation` line (#1081).
+///
+/// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
+///   positive definite: compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
+///   `ar1` needs `|ρ| < 1`, and a free `ρ` stays inside the rail
+///   [`RESIDUAL_CORRELATION_RAIL`]. Checked on the θ's bounds when it is free and
+///   on its value when it is `FIX`ed.
+/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
+///   of one block at the same time have no order.
+fn check_residual_correlation(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let p = params;
+    let i = serial.rho_theta;
+    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
+    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
+    let (lo, hi) = if fixed {
+        let v = p.theta.get(i).copied().unwrap_or(f64::NAN);
+        (v, v)
+    } else {
+        (
+            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
+            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
+        )
+    };
+    let what = |side: &str| {
+        if fixed {
+            format!("theta {rho} is fixed at {lo}")
+        } else {
+            format!(
+                "the {side} bound of theta {rho} is {}",
+                if side == "lower" { lo } else { hi }
+            )
+        }
+    };
+    let mut diags = Vec::new();
+
+    // The largest block, and the first tie under `ar1`.
+    let mut largest: Option<(usize, &Subject, usize)> = None;
+    let mut tie: Option<(&Subject, usize, f64)> = None;
+    for subject in &population.subjects {
+        for block in residual_blocks(model, subject) {
+            if largest.is_none_or(|(n, _, _)| block.len() > n) {
+                largest = Some((block.len(), subject, block[0]));
+            }
+            if serial.kind == crate::types::ResidualSerialKind::Ar1 && tie.is_none() {
+                let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
+                times.sort_by(f64::total_cmp);
+                if let Some(w) = times.windows(2).find(|w| w[0] == w[1]) {
+                    tie = Some((subject, block[0], w[0]));
+                }
+            }
+        }
+    }
+
+    if let Some((subject, row, t)) = tie {
+        diags.push(Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_TIES",
+            format!(
+                "`{line}`: subject {} has two rows at TIME {t} in the block {}. `ar1` orders a \
+                 block's rows by TIME, so tied rows have no order and no lag between them. Give \
+                 them distinct times, or use `cs`.",
+                subject.id,
+                residual_block_key(model, subject, row)
+            ),
+        ));
+    }
+
+    let range = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+    // Positive definiteness at the most demanding block.
+    if serial.kind == crate::types::ResidualSerialKind::Cs {
+        if let Some((n, subject, row)) = largest.filter(|(n, _, _)| *n >= 2) {
+            let floor = -1.0 / (n as f64 - 1.0);
+            if lo <= floor {
+                diags.push(range(format!(
+                    "`{line}`: {}, but subject {} has {n} rows in the block {}, and compound \
+                     symmetry over {n} rows is a valid covariance only for ρ in \
+                     (−1/({n}−1), 1) = ({floor:.4}, 1). Keep ρ above {floor:.4}.",
+                    what("lower"),
+                    subject.id,
+                    residual_block_key(model, subject, row)
+                )));
+            }
+        }
+    }
+    if fixed && lo.abs() >= 1.0 {
+        diags.push(range(format!(
+            "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
+            what("lower")
+        )));
+    } else if !fixed {
+        for (side, v) in [("lower", lo), ("upper", hi)] {
+            if v.abs() > RESIDUAL_CORRELATION_RAIL {
+                diags.push(range(format!(
+                    "`{line}`: {}. A free correlation is kept within ±{RESIDUAL_CORRELATION_RAIL}, \
+                     because as |ρ| approaches 1 the rows of a block become collinear and R \
+                     numerically singular. Bound theta {rho} within ±{RESIDUAL_CORRELATION_RAIL}, \
+                     or FIX it to hold a value closer to ±1.",
+                    what(side)
+                )));
+            }
+        }
+    }
+    diags
+}
+
+/// `W_RESIDUAL_CORRELATION_INERT` (#1081): a `correlation` line under which no
+/// block holds two observations couples nothing, so its `ρ` is not in the
+/// likelihood at all.
+fn residual_correlation_inert(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let coupled = population
+        .subjects
+        .iter()
+        .any(|s| residual_blocks(model, s).iter().any(|b| b.len() >= 2));
+    if coupled {
+        return Vec::new();
+    }
+    vec![Diagnostic::warning(
+        "W_RESIDUAL_CORRELATION_INERT",
+        &format!(
+            "`{line}`: no block holds more than one observation (one row per group), so no two \
+             rows are correlated and ρ does not enter the likelihood: it cannot be estimated and \
+             stays at its initial value. Check that the `by` column(s) group the rows you meant \
+             to correlate."
+        ),
+    )]
+}
+
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
@@ -5960,6 +6229,7 @@ pub fn check_model_data_warnings(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(residual_correlation_inert(model, population));
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
@@ -6846,6 +7116,10 @@ mod additive_init_scale_tests;
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
 mod residual_magnitude_tests;
+
+#[cfg(test)]
+#[path = "tests/residual_correlation_tests.rs"]
+mod residual_correlation_tests;
 
 #[cfg(test)]
 #[path = "tests/kappa_weight_tests.rs"]

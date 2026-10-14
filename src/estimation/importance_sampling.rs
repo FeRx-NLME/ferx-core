@@ -848,7 +848,7 @@ fn subject_is_estimate(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             &eta_sample,
             scratch,
         );
@@ -1231,7 +1231,7 @@ pub(crate) fn subject_is_draws_frem_rb(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             &full_eta,
             scratch,
         );
@@ -1464,7 +1464,7 @@ pub(crate) fn subject_is_draws(
             subject,
             theta,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             &eta_sample,
             scratch,
         );
@@ -2229,7 +2229,7 @@ pub(crate) fn compute_posterior_hessian(
     // loadings, so the proposal precision is built from the same `R` the
     // importance weights score against.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         let r = crate::stats::residual_error::r_matrix_maybe_scaled(
             &model.error_spec,
             &ipreds,
@@ -2240,7 +2240,7 @@ pub(crate) fn compute_posterior_hessian(
             model.error_spec.obs_keys(subject).as_ref(),
             subject,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             ruv_mult.as_deref(),
         );
         if let Some(chol) = r.cholesky() {
@@ -2346,6 +2346,7 @@ mod tests {
         use std::collections::HashMap;
 
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0],
@@ -2706,6 +2707,7 @@ mod tests {
     /// Build a Subject carrying only the fields `subject_frem_partition` reads.
     fn frem_subject(fremtype: Vec<u16>, observations: Vec<f64>) -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "t".into(),
             doses: Vec::new(),
             obs_times: Vec::new(),
@@ -2848,6 +2850,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -2936,6 +2939,7 @@ mod tests {
     fn find_optimal_iscale_frem_rb_recovers_ess_from_overconfident_hessian() {
         let model = frem_rb_test_model();
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 0.0],

@@ -2524,6 +2524,11 @@ pub enum ferx_core::types::RateMode
 pub ferx_core::types::RateMode::Fixed
 pub ferx_core::types::RateMode::ModeledDuration
 pub ferx_core::types::RateMode::ModeledRate
+pub enum ferx_core::types::ResidualSerialKind
+pub ferx_core::types::ResidualSerialKind::Ar1
+pub ferx_core::types::ResidualSerialKind::Cs
+impl ferx_core::ResidualSerialKind
+pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
@@ -2722,6 +2727,7 @@ pub ferx_core::types::CompiledModel::priors: alloc::vec::Vec<ferx_core::Paramete
 pub ferx_core::types::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::CompiledModel::residual_error_eta: core::option::Option<usize>
+pub ferx_core::types::CompiledModel::residual_serial: core::option::Option<ferx_core::ResidualSerial>
 pub ferx_core::types::CompiledModel::ruv_magnitude: core::option::Option<ferx_core::RuvMagnitude>
 pub ferx_core::types::CompiledModel::scaling: ferx_core::ScalingSpec
 pub ferx_core::types::CompiledModel::sel_flat: alloc::vec::Vec<f64>
@@ -3385,6 +3391,10 @@ pub struct ferx_core::types::ResidualCorrelation
 pub ferx_core::types::ResidualCorrelation::rho: f64
 pub ferx_core::types::ResidualCorrelation::sigma_i: usize
 pub ferx_core::types::ResidualCorrelation::sigma_j: usize
+pub struct ferx_core::types::ResidualSerial
+pub ferx_core::types::ResidualSerial::by: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::ResidualSerial::kind: ferx_core::ResidualSerialKind
+pub ferx_core::types::ResidualSerial::rho_theta: usize
 #[non_exhaustive] pub struct ferx_core::types::RuvMagnitude
 pub ferx_core::types::RuvMagnitude::per_sigma: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
 pub ferx_core::types::RuvMagnitude::per_sigma_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
@@ -3422,6 +3432,7 @@ pub ferx_core::types::Subject::obs_covariates: alloc::vec::Vec<std::collections:
 pub ferx_core::types::Subject::obs_l2: alloc::vec::Vec<i64>
 pub ferx_core::types::Subject::obs_raw_times: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::obs_records: alloc::vec::Vec<ferx_core::ObsRecord>
+pub ferx_core::types::Subject::obs_rgroup: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::occasions: alloc::vec::Vec<u32>
@@ -3875,6 +3886,11 @@ pub enum ferx_core::RateMode
 pub ferx_core::RateMode::Fixed
 pub ferx_core::RateMode::ModeledDuration
 pub ferx_core::RateMode::ModeledRate
+pub enum ferx_core::ResidualSerialKind
+pub ferx_core::ResidualSerialKind::Ar1
+pub ferx_core::ResidualSerialKind::Cs
+impl ferx_core::ResidualSerialKind
+pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
@@ -4144,6 +4160,7 @@ pub ferx_core::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::CompiledModel::residual_error_eta: core::option::Option<usize>
+pub ferx_core::CompiledModel::residual_serial: core::option::Option<ferx_core::ResidualSerial>
 pub ferx_core::CompiledModel::ruv_magnitude: core::option::Option<ferx_core::RuvMagnitude>
 pub ferx_core::CompiledModel::scaling: ferx_core::ScalingSpec
 pub ferx_core::CompiledModel::sel_flat: alloc::vec::Vec<f64>
@@ -4949,6 +4966,10 @@ pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize
 pub ferx_core::ResidualCorrelation::sigma_j: usize
+pub struct ferx_core::ResidualSerial
+pub ferx_core::ResidualSerial::by: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::ResidualSerial::kind: ferx_core::ResidualSerialKind
+pub ferx_core::ResidualSerial::rho_theta: usize
 pub struct ferx_core::RunOverrides
 pub ferx_core::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
 pub ferx_core::RunOverrides::threads: core::option::Option<usize>
@@ -5043,6 +5064,7 @@ pub ferx_core::Subject::obs_covariates: alloc::vec::Vec<std::collections::hash::
 pub ferx_core::Subject::obs_l2: alloc::vec::Vec<i64>
 pub ferx_core::Subject::obs_raw_times: alloc::vec::Vec<f64>
 pub ferx_core::Subject::obs_records: alloc::vec::Vec<ferx_core::ObsRecord>
+pub ferx_core::Subject::obs_rgroup: alloc::vec::Vec<u32>
 pub ferx_core::Subject::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::Subject::occasions: alloc::vec::Vec<u32>

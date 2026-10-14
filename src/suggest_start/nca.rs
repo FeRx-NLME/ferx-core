@@ -671,6 +671,7 @@ mod tests {
         let concs_all = vec![8.0, 7.0, 5.5, 3.5, 7.8, 6.8, 5.2]; // second dose starts at 24
 
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0),

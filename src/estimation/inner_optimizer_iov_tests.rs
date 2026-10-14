@@ -65,6 +65,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
         .expect("parse ODE IOV");
     let population = Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -197,6 +198,7 @@ fn tvcov_ltbs_reports_analytic_inner() {
     assert!(model.log_transform);
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     let tvcov_subj = || Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 24.0],
@@ -265,6 +267,7 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
         .expect("parse ODE IOV");
     // Analytic subject: doses and observations in the same occasions.
     let analytic_subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -293,6 +296,7 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
     // FD subject: more occasion groups than the widened ODE IOV dispatch serves.
     let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
     let fd_subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "2".into(),
         doses: (0..n_wide)
             .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
@@ -344,6 +348,7 @@ fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
         )
         .expect("parse ODE IOV + gradient = fd");
     let mk_subject = |id: &str| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
@@ -396,6 +401,7 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
         "model should carry a LAGTIME individual parameter"
     );
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         // Steady-state bolus (ss, ii > 0) under an estimated lagtime.
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
@@ -436,6 +442,7 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         )
         .expect("parse ODE IOV + modeled D1");
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::modeled(
             0.0,
@@ -482,6 +489,7 @@ fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
         )
         .expect("parse ODE IOV without D1");
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::modeled(
             0.0,
@@ -581,6 +589,7 @@ fn iov_fd_reason_attributes_ss_input_rate() {
         )
         .expect("parse zero_order ODE IOV");
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
@@ -626,6 +635,7 @@ fn iov_fd_reason_attributes_infusion_into_absorption() {
         .expect("parse zero_order ODE IOV");
     // Finite infusion (rate > 0, not steady state) into the absorption compartment.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
@@ -675,6 +685,7 @@ fn transit_twin_ss_forcing_is_analytic_under_iov() {
         "the closed-form transit primary is analytic"
     );
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
@@ -731,6 +742,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -804,6 +816,7 @@ fn make_iov_model() -> CompiledModel {
 
 fn make_iov_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -864,6 +877,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         .expect("parse ODE IOV");
     assert!(crate::sens::ode_provider::ode_iov_supported(&model));
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -956,6 +970,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         .expect("parse closed-form IOV + obs_scale");
     assert!(crate::sens::provider::iov_analytical_supported(&model));
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1094,6 +1109,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
         );
 
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1203,6 +1219,7 @@ fn repro555_subject22() -> Subject {
     ];
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "22".into(),
         doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -1450,6 +1467,7 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // takes it and it needs the stall. Both sides are asserted here, at the same subject.
     use crate::parser::model_parser::parse_model_string;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1559,6 +1577,7 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1661,6 +1680,7 @@ fn iov_m3_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1778,6 +1798,7 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
     assert!(crate::sens::provider::iov_analytical_supported(&model));
 
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1899,6 +1920,7 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
     // Both tails: occasion-2 tail left-censored (CENS=1), then right-censored (CENS=-1).
     for cens_sign in [1i8, -1] {
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -2015,6 +2037,7 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
 
     for cens_sign in [1i8, -1] {
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -2129,6 +2152,7 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -2357,6 +2381,7 @@ fn inner_optimizer_pin_reaches_same_ebe() {
         )
         .expect("parse");
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
@@ -2432,6 +2457,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
         .expect("parse");
     assert_eq!(model.residual_error_eta, Some(3));
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
@@ -2472,6 +2498,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
     assert_eq!(model.residual_error_eta, Some(2));
     assert!(model.ode_spec.is_some());
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
@@ -2558,6 +2585,7 @@ fn dense_residual_inner_grad_matches_fd() {
     );
 
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -2605,6 +2633,7 @@ fn dense_residual_ode_inner_grad_matches_fd() {
     assert!(!model.residual_correlations.is_empty());
     assert!(model.ode_spec.is_some());
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -2659,6 +2688,7 @@ fn dense_expression_scale_inner_grad_matches_fd() {
     ));
     assert!(!analytic_inner_common_bail(&model));
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -2704,6 +2734,7 @@ fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
     // Predictions for an LTBS model are on the log scale; perturb them so the
     // residual is nonzero.
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
@@ -2790,6 +2821,7 @@ fn ode_ltbs_inner_ebe_matches_fd() {
 fn ode_custom_magnitude_takes_analytic_inner_gradient() {
     use crate::parser::model_parser::parse_model_string;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
@@ -2855,6 +2887,7 @@ fn magnitude_inner_eta_gradient_matches_fd() {
         .expect("parse magnitude model");
     assert!(model.has_custom_ruv_magnitude());
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0],
@@ -2950,6 +2983,7 @@ fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
     assert!(model.log_transform, "log_additive must set LTBS");
     assert_eq!(model.residual_error_eta, None, "no iiv_on_ruv");
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
@@ -3029,6 +3063,7 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
     let src = "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  C0 = 5.0\n[structural_model]\n  ode(states=[central])\n[odes]\n  init(central) = C0 * V\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n";
     let model = parse_model_string(src).expect("parse");
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
@@ -3156,6 +3191,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -3228,6 +3264,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
 
 fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0],
@@ -3315,6 +3352,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -3384,6 +3422,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         endpoints: std::collections::HashMap::new(),
     };
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -3680,6 +3719,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
     // Two occasions, one 100 mg IV bolus each; observations simulated at
     // CL = 5·exp(−1.5), V = 50 (see the test doc) so the mode is far from the zero seed.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -3851,6 +3891,7 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
     let model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),

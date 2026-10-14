@@ -725,7 +725,7 @@ fn numerical_mstep_scope_gap(
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Some("the model has a correlated residual (`block_sigma`)");
     }
     #[cfg(feature = "survival")]
@@ -1430,7 +1430,7 @@ fn scalar_residual_mstep_model(
         && !is_mixture
         && n_kappa == 0
         && model.residual_error_eta.is_none()
-        && model.residual_correlations.is_empty()
+        && !model.residual_is_dense()
         && model.frem_config.is_none()
         && !model.has_custom_ruv_magnitude()
         && !model.log_transform
@@ -2370,7 +2370,7 @@ pub(crate) fn obs_nll_sum(
                 subject,
                 theta,
                 sigma_values,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -2444,7 +2444,7 @@ fn obs_nll_sum_mix(
                 subject,
                 theta,
                 sg_i,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -5747,7 +5747,7 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    crate::stats::likelihood::individual_nll_into_with_schedule(
+                    crate::stats::likelihood::individual_nll_into_with_schedule_cov(
                         model,
                         &population.subjects[i],
                         &state.theta,
@@ -5756,7 +5756,7 @@ pub fn run_saem(
                         sigma_i,
                         // Same ρ `individual_nll_into` passes — SAEM holds
                         // `block_sigma` at its declaration.
-                        &model.residual_correlations,
+                        model.residual_cov_theta(&state.theta),
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
@@ -8983,6 +8983,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -9107,6 +9108,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9211,6 +9213,7 @@ DV ~ additive(EPS)
 
         // One subject with 2 occasions (occasions = [1,1,2,2]).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0],
@@ -9339,6 +9342,7 @@ DV ~ additive(EPS)
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![
                         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -9514,6 +9518,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -11049,6 +11054,7 @@ DV ~ additive(EPS)
         use crate::types::DoseEvent;
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],

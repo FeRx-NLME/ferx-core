@@ -1067,6 +1067,7 @@ mod tests {
     fn make_test_population() -> Population {
         let subjects = vec![
             Subject {
+                obs_rgroup: Vec::new(),
                 id: "1".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0, 4.0],
@@ -1095,6 +1096,7 @@ mod tests {
                 obs_records: Vec::new(),
             },
             Subject {
+                obs_rgroup: Vec::new(),
                 id: "2".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0],
@@ -1135,6 +1137,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -1875,7 +1878,7 @@ mod tests {
             &subj,
             &theta,
             &sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(&theta),
             &eta,
             &mut scratch,
         );
@@ -2032,6 +2035,7 @@ mod tests {
         // 3 subjects with RACE: 1 (most common), 2, 3
         for (id, race) in &[("1", 1.0), ("2", 1.0), ("3", 2.0), ("4", 3.0)] {
             subjects.push(Subject {
+                obs_rgroup: Vec::new(),
                 id: id.to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0],
@@ -2197,6 +2201,7 @@ mod tests {
         let mut pop = make_test_population();
         // Add a third subject.
         pop.subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: "3".to_string(),
             observations: vec![3.0],
             obs_times: vec![1.0],

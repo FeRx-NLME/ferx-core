@@ -1609,6 +1609,7 @@ fn make_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -1682,6 +1683,7 @@ fn make_model() -> CompiledModel {
 fn make_population(n_subj: usize) -> Population {
     let subjects = (0..n_subj)
         .map(|_| Subject {
+            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 4.0, 8.0],
@@ -1936,6 +1938,7 @@ fn test_outer_ad_gradient_block_omega() {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -2432,6 +2435,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -2504,6 +2508,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
     let n_subj = 6;
     let subjects = (0..n_subj)
         .map(|_| Subject {
+            obs_rgroup: Vec::new(),
             fremtype: Vec::new(),
             id: "S".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -2952,13 +2957,23 @@ fn test_stall_retry_rejects_a_non_finite_retry() {
 fn test_mid_descent_restart_skips_a_non_finite_objective() {
     use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
 
-    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
-    assert!(worth_restarting_mid_descent(true, -676.7746, true));
-    assert!(!worth_restarting_mid_descent(true, f64::NAN, true));
-    assert!(!worth_restarting_mid_descent(true, f64::INFINITY, true));
-    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY, true));
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    assert!(worth_restarting_mid_descent(true, -676.7746, true, false));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, true, false));
+    assert!(!worth_restarting_mid_descent(
+        true,
+        f64::INFINITY,
+        true,
+        false
+    ));
+    assert!(!worth_restarting_mid_descent(
+        true,
+        f64::NEG_INFINITY,
+        true,
+        false
+    ));
     // A finite objective is not on its own a reason to restart.
-    assert!(!worth_restarting_mid_descent(false, 3209.8087, true));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, true, false));
 }
 
 /// A stall on the last permitted evaluation is not restarted (#1428): the
@@ -2971,10 +2986,42 @@ fn test_mid_descent_restart_skips_a_non_finite_objective() {
 fn test_mid_descent_restart_needs_budget_left() {
     use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
 
-    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
-    assert!(!worth_restarting_mid_descent(true, 3209.8087, false));
-    assert!(!worth_restarting_mid_descent(false, 3209.8087, false));
-    assert!(!worth_restarting_mid_descent(true, f64::NAN, false));
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    assert!(!worth_restarting_mid_descent(true, 3209.8087, false, false));
+    assert!(!worth_restarting_mid_descent(
+        false, 3209.8087, false, false
+    ));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, false, false));
+}
+
+/// A leg with **no feasible evaluation** is not restarted (#1617 review round 1 #1).
+///
+/// After the #1617 restore such a leg reports the point it was handed, so the restart
+/// would begin exactly where this leg began, with the same `hold_cap_at_init = false` and
+/// the same empty `(s, y)` memory — a deterministic replay of a prefix of the leg that
+/// just failed, which cannot find a feasible evaluation the first leg missed.
+///
+/// The verdict's *position* in `optimize_nlopt_once` does not provide this. The first
+/// version of #1617 claimed it did — the demotion sits after `stalled_mid_descent` is
+/// read — but `stalled_mid_descent` is already `true` for an all-infeasible leg that ends
+/// in a bare NLopt `Failure` rather than `Success`: `stationarity_check_pending` is set,
+/// and `failure_is_converged_plateau` cannot promote a run whose `last_sig_feasible_eval`
+/// is 0. The issue's own reproduction ends in `Success`, so no test reached the other
+/// branch. The `no_feasible_eval = true` rows below are the ones that fail if the fourth
+/// argument is dropped or OR-ed instead of AND-ed.
+#[test]
+fn test_mid_descent_restart_skips_a_run_with_no_feasible_evaluation() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    // The #1277 case: a real stall, on a real objective, with budget left.
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true, false));
+    // The same run, except nothing it evaluated was feasible.
+    assert!(!worth_restarting_mid_descent(true, 3209.8087, true, true));
+    // And it stays off whatever the other three say — the finite-objective row is the
+    // one an OR would let through.
+    assert!(!worth_restarting_mid_descent(true, -676.7746, true, true));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, true, true));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, true, true));
 }
 
 /// The restart leg's evaluation budget is the fit's budget less what the
@@ -6301,5 +6348,121 @@ mod outer_fd_fallback {
         ] {
             assert_eq!(SalvageGuardPolicy::for_optimizer(o), Off, "{o:?}");
         }
+    }
+
+    // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
+
+    /// T7, the routing straddle. A subject whose `ARM` holds two or more rows has an `R`
+    /// that depends on ρ directly — a channel the analytic outer gradient does not carry —
+    /// so it must decline to the reconverged FD gradient (#1536); a subject whose arms
+    /// are all singletons has an `R` free of ρ and stays analytic, with `∂/∂ρ = 0`
+    /// correctly. Both sides asserted here, then the population gradient's ρ component
+    /// against a central difference of the population objective. Dies if
+    /// `has_cross_observation_residual` ignores the serial source: the paired subject
+    /// then takes the analytic gradient and reports `∂/∂ρ = 0`.
+    #[test]
+    fn serial_rho_routes_paired_subjects_to_reconverged_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta RHO(0.4, -0.4, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(RHO) by ARM\n[fit_options]\n  method = focei\n",
+        )
+        .expect("model parses");
+        let subject = |id: &str, arms: [f64; 6], scale: f64| {
+            let mut s = Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+                obs_cmts: vec![1; 6],
+                cens: vec![0; 6],
+                obs_covariates: arms
+                    .iter()
+                    .map(|a| HashMap::from([("ARM".to_string(), *a)]))
+                    .collect(),
+                ..Default::default()
+            };
+            let f = crate::pk::compute_predictions_with_tv(
+                &model,
+                &s,
+                &model.default_params.theta,
+                &[0.0],
+            );
+            s.observations = f
+                .iter()
+                .enumerate()
+                .map(|(j, v)| v * scale + if j % 2 == 0 { 0.4 } else { -0.3 })
+                .collect();
+            s.obs_rgroup = crate::stats::residual_error::residual_groups(&model, &s);
+            s
+        };
+        let paired = subject("PAIRED", [1.0, 1.0, 1.0, 2.0, 2.0, 2.0], 1.2);
+        let singles = subject("SINGLES", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0.85);
+        let pop = mk_pop(vec![paired, singles]);
+        let template = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(template);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let (ehs, hms, _) = solve_at(&model, &pop, template, &x, &opts);
+        // The straddle.
+        assert!(
+            subject_analytic_outer_gradient(
+                &model,
+                &pop.subjects[0],
+                template,
+                &x,
+                ehs[0].as_slice(),
+                true
+            )
+            .is_none(),
+            "a subject with a multi-row block must decline the analytic gradient"
+        );
+        assert!(
+            subject_analytic_outer_gradient(
+                &model,
+                &pop.subjects[1],
+                template,
+                &x,
+                ehs[1].as_slice(),
+                true
+            )
+            .is_some(),
+            "a subject of singleton blocks must stay analytic"
+        );
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let g = population_gradient_sens_mixed(
+            &x,
+            template,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert_eq!(log.declined_indices(), vec![0]);
+        // ρ is θ index 2, packed on the linear scale (its lower bound is negative).
+        let k = 2;
+        let h = 1e-5;
+        let ofv_at = |dx: f64| {
+            let mut xx = x.clone();
+            xx[k] += dx;
+            solve_at(&model, &pop, template, &xx, &opts)
+                .2
+                .iter()
+                .sum::<f64>()
+        };
+        let fd = (ofv_at(h) - ofv_at(-h)) / (2.0 * h);
+        assert!(g[k].is_finite() && fd.is_finite(), "g {} fd {fd}", g[k]);
+        assert!(fd.abs() > 1e-2, "fixture: ρ moves the objective ({fd})");
+        assert!(
+            (g[k] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "∂OFV/∂ρ: assembled {} vs FD {fd}",
+            g[k]
+        );
     }
 }

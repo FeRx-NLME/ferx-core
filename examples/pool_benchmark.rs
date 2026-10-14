@@ -31,6 +31,7 @@ fn population(n: usize) -> Population {
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                     obs_times,

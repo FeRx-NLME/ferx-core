@@ -1404,7 +1404,7 @@ fn run_mcem(
                                         subject,
                                         th,
                                         &sigma_now,
-                                        &model.residual_correlations,
+                                        model.residual_cov_theta(th),
                                         &e2,
                                         scratch,
                                     );
@@ -2821,7 +2821,7 @@ fn theta_sigma_weighted_mstep(
                         subject,
                         &th,
                         &sg,
-                        &model.residual_correlations,
+                        model.residual_cov_theta(&th),
                         eta,
                         scratch,
                     );
@@ -2939,7 +2939,7 @@ fn theta_sigma_weighted_mstep_mixture(
                             subject,
                             &th,
                             &sg,
-                            &model.residual_correlations,
+                            model.residual_cov_theta(&th),
                             eta,
                             scratch,
                         );

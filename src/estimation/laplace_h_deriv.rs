@@ -182,7 +182,7 @@ pub(crate) fn subject_h_inner_dx(
         || params.omega_iov.is_some()
         || template.mixture.is_some()
         || model.residual_error_eta.is_some()
-        || !params.residual_correlations.is_empty()
+        || model.residual_cov_at(params).is_dense()
     {
         return None;
     }
@@ -444,6 +444,7 @@ mod tests {
     fn fixture_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),

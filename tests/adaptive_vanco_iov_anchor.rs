@@ -101,6 +101,7 @@ const DOSE_TOL: f64 = 1e-3;
 fn anchor_subject(decision_times: &[f64]) -> Subject {
     let n = decision_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: Vec::<DoseEvent>::new(),
         obs_times: decision_times.to_vec(),

@@ -3271,6 +3271,7 @@ mod tests {
         let eta = vec![0.1_f64; model.n_eta + model.n_kappa];
 
         let base = |doses: Vec<DoseEvent>| Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0, 4.0, 26.0],
@@ -3586,6 +3587,7 @@ mod tests {
         .expect("fixture parses");
 
         let mut subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 9.0],
@@ -3840,6 +3842,7 @@ mod tests {
 
         let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 40.0],
@@ -3886,6 +3889,7 @@ mod tests {
         // `compute_predictions` should zero the state at the reset. Dose at
         // t=0, reset at t=5, obs at t=1 (positive) and t=6 (zero).
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 6.0],
@@ -3944,6 +3948,7 @@ mod tests {
         n_obs: usize,
     ) -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: (0..n_doses).map(|i| bolus_dose(i as f64, 100.0)).collect(),
             obs_times: (0..n_obs).map(|i| 1.0 + i as f64).collect(),
@@ -3977,6 +3982,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -4196,6 +4202,7 @@ mod tests {
     #[test]
     fn test_compute_predictions_length() {
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 2.0, 4.0, 8.0],
@@ -4961,6 +4968,7 @@ mod tests {
         let obs_times = vec![1.0, 3.0, 25.0, 27.0];
         let n = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)],
             obs_times,
@@ -5623,6 +5631,7 @@ mod tests {
 
         let n_obs = obs_times.len();
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "mixed".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),

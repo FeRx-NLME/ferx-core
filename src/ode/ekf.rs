@@ -747,6 +747,7 @@ mod tests {
         );
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
@@ -990,6 +991,7 @@ mod tests {
             );
 
             let subj = Subject {
+                obs_rgroup: Vec::new(),
                 id: "1".into(),
                 doses: doses.clone(),
                 obs_times: obs_times.clone(),
@@ -1136,6 +1138,7 @@ mod tests {
         );
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
@@ -2135,6 +2138,7 @@ mod tests {
         let (got, was) = (run(&ss), run(&single));
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: ss.clone(),
             obs_times: obs_times.clone(),

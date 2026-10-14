@@ -50,6 +50,7 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// Three concentration observations after a single bolus, scaled per subject.
 fn subject(id: &str, scale: f64) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -315,7 +316,7 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
                 s,
                 &params.theta,
                 &params.sigma.values,
-                &params.residual_correlations,
+                model.residual_cov_at(&params),
                 &mu,
                 &mut scratch,
             )
@@ -1434,6 +1435,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
@@ -1895,6 +1897,7 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
         }
         let n_obs = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses,
             obs_times,

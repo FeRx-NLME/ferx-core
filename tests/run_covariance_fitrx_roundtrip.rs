@@ -2,21 +2,31 @@
 //! inline covariance step bit for bit, because the bundle carries the optimizer's packed
 //! vector and the reloaded fit unpacks the very Cholesky factor the inline step used.
 //!
-//! Each discriminating row first asserts its **premise**: the same reloaded fit with
-//! `packed_estimate` cleared — what every bundle was before #1815 — gives *different*
-//! bits, so the row cannot pass on a fixture where re-decomposing `omega` happens to
-//! land on the same factor. Which fixture discriminates is platform-dependent (the
-//! re-decomposition's last bits go through the OS math library): measured at `160cc9a3`,
-//! warfarin FOCE diverges by 9.7e-7 on macOS arm64 and 6.9e-5 on Linux/aarch64, and
-//! two_cpt_oral_cov FOCEI by 1.5e-6 / 2.8e-7, so both rows discriminate on both
-//! platforms. warfarin Laplace (review r1 #3, the docs' Laplace claim) discriminates on
-//! both too: its premise held on macOS arm64 and Linux/aarch64 in that round. warfarin_iov
-//! FOCEI (the issue's own fixture) reloads bit-identically on macOS even without the
-//! vector and diverges by 2.6e-8 on Linux, so its row asserts the claim only.
+//! **Claim**, asserted on every row: the reloaded fit repeats the inline step bit for bit.
 //!
-//! Mutations — `load_fit` reads `packed_estimate: None`: every claim dies; route
-//! `PackedEstimate::Usable` to the fallback arm in `run_covariance`: every discriminating
-//! row dies (warfarin_iov survives on macOS, as above).
+//! **Premise**, asserted over the set: the same reloaded fit with `packed_estimate`
+//! cleared — what every bundle was before #1815 — gives *different* bits, so the claim
+//! cannot pass only because re-decomposing `omega` happens to land on the same factor.
+//! A row whose premise fails still checks its claim; it just cannot tell the #1815 fix
+//! from the pre-#1815 fallback.
+//!
+//! The premise is asserted over the set, not per row, because no single row's premise
+//! is platform-stable (#1929). The legacy path re-decomposes `omega`, and the last bits
+//! of that factor go through the OS math library, so whether it lands exactly on the
+//! packed factor is a property of the libm, not of the fixture. Measured: the row that
+//! reloads bit-identically without the vector moves with the platform — warfarin FOCE
+//! on Linux x86_64 / glibc 2.28, warfarin_iov FOCEI on macOS arm64 — and the gaps that
+//! do exist move between commits on one host (warfarin FOCE on macOS arm64: 9.7e-7 at
+//! `160cc9a3`, 1.4e-11 at `afe7f52b`). A per-row table goes stale, so the test prints
+//! the set instead: one `premise` line per row with its max |Δ| over the covariance
+//! matrix and `se_theta`, then the rows that discriminate. It requires at least
+//! `MIN_DISCRIMINATING` of them: one is enough to kill the mutation below, two leave
+//! headroom for one more row landing bit-identical on some platform.
+//!
+//! Mutations (#1929, macOS arm64) — route `PackedEstimate::Usable` to the fallback arm
+//! in `run_covariance`: the claim dies on the first row whose premise holds (warfarin
+//! FOCE there). `load_fit` reads `packed_estimate: None`: the bundle assert dies first,
+//! on row one; with that assert removed, the claim dies on the same row as above.
 //!
 //! Engines: every fixture runs analytic (`Dual2`) inner gradients, asserted per fit
 //! through `gradient_method_inner`; the outer optimizer is the `auto` default.
@@ -27,14 +37,44 @@ use ferx_core::{
     Population,
 };
 
+/// Rows whose premise must hold, out of `ROWS` (module doc).
+const MIN_DISCRIMINATING: usize = 2;
+
+const ROWS: [(&str, &str, EstimationMethod); 4] = [
+    (
+        "examples/warfarin.ferx",
+        "data/warfarin.csv",
+        EstimationMethod::Foce,
+    ),
+    (
+        "examples/two_cpt_oral_cov.ferx",
+        "data/two_cpt_oral_cov.csv",
+        EstimationMethod::FoceI,
+    ),
+    // Review r1 #3: the docs' Laplace claim.
+    (
+        "examples/warfarin.ferx",
+        "data/warfarin.csv",
+        EstimationMethod::Laplace,
+    ),
+    // The issue's "done when" fixture.
+    (
+        "examples/warfarin_iov.ferx",
+        "data/warfarin_iov.csv",
+        EstimationMethod::FoceI,
+    ),
+];
+
 struct Fitted {
     model: CompiledModel,
     population: Population,
     fit: FitResult,
 }
 
-fn fit_inline(model_path: &str, data_path: &str, method: EstimationMethod) -> Fitted {
-    let prep = prepare_run(model_path, Some(data_path)).expect("prepare");
+/// `row` labels every panic: two rows share `model_path` (warfarin FOCE and Laplace).
+fn fit_inline(row: &str, model_path: &str, data_path: &str, method: EstimationMethod) -> Fitted {
+    let prep =
+        prepare_run(model_path, Some(data_path)).unwrap_or_else(|e| panic!("{row}: prepare: {e}"));
     let (model, population, init) = (prep.parsed.model, prep.population, prep.init_params);
     let options = FitOptions {
         verbose: false,
@@ -44,16 +84,16 @@ fn fit_inline(model_path: &str, data_path: &str, method: EstimationMethod) -> Fi
         sir: false,
         ..FitOptions::default()
     };
-    let fit = fit(&model, &population, &init, &options)
-        .unwrap_or_else(|e| panic!("{model_path}: fit: {e}"));
+    let fit =
+        fit(&model, &population, &init, &options).unwrap_or_else(|e| panic!("{row}: fit: {e}"));
     assert!(
         fit.gradient_method_inner.starts_with("analytic"),
-        "{model_path}: the engine this file names moved: {}",
+        "{row}: the engine this file names moved: {}",
         fit.gradient_method_inner
     );
     assert!(
         fit.packed_estimate.is_some(),
-        "{model_path}: a packed-space fit must carry packed_estimate"
+        "{row}: a packed-space fit must carry packed_estimate"
     );
     Fitted {
         model,
@@ -105,9 +145,27 @@ fn bits_of(fit: &FitResult, what: &str) -> (Vec<u64>, Vec<u64>) {
     )
 }
 
-fn roundtrip_row(model_path: &str, data_path: &str, method: EstimationMethod, premise: bool) {
-    let f = fit_inline(model_path, data_path, method);
-    let inline = bits_of(&f.fit, "inline");
+/// Max |Δ| of two bit vectors read back as `f64`. Both sides are finite (`bits_of`),
+/// so `f64::max` has no `NaN` to swallow.
+fn max_gap(a: &[u64], b: &[u64]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from_bits(*x) - f64::from_bits(*y)).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Asserts the row's claim, then returns its premise: `Some(max |Δ|)` between the legacy
+/// reload (no packed vector) and the inline step when their bits differ, `None` when
+/// they are bit-identical.
+fn roundtrip_row(
+    row: &str,
+    model_path: &str,
+    data_path: &str,
+    method: EstimationMethod,
+) -> Option<f64> {
+    let f = fit_inline(row, model_path, data_path, method);
+    let inline = bits_of(&f.fit, &format!("{row} inline"));
     let reloaded = reload(&f);
     assert_eq!(
         reloaded
@@ -118,61 +176,41 @@ fn roundtrip_row(model_path: &str, data_path: &str, method: EstimationMethod, pr
             .packed_estimate
             .as_deref()
             .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
-        "{model_path}: the bundle must carry the packed vector bit for bit"
+        "{row}: the bundle must carry the packed vector bit for bit"
     );
-    if premise {
-        let mut legacy = reloaded.clone();
-        legacy.packed_estimate = None;
-        assert!(
-            covariance_bits(&f, &legacy, "legacy") != inline,
-            "{model_path}: premise — without the packed vector the reloaded covariance \
-             must differ from the inline step on this fixture"
-        );
-    }
     assert!(
-        covariance_bits(&f, &reloaded, "reloaded") == inline,
-        "{model_path}: run_covariance on the reloaded fit must repeat the inline step"
+        covariance_bits(&f, &reloaded, &format!("{row} reloaded")) == inline,
+        "{row}: claim — run_covariance on the reloaded fit must repeat the inline step"
     );
+    let mut legacy = reloaded;
+    legacy.packed_estimate = None;
+    let legacy = covariance_bits(&f, &legacy, &format!("{row} legacy"));
+    (legacy != inline).then(|| max_gap(&legacy.0, &inline.0).max(max_gap(&legacy.1, &inline.1)))
 }
 
 #[test]
-fn warfarin_foce_reload_repeats_inline_covariance() {
-    roundtrip_row(
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Foce,
-        true,
-    );
-}
-
-#[test]
-fn two_cpt_oral_cov_focei_reload_repeats_inline_covariance() {
-    roundtrip_row(
-        "examples/two_cpt_oral_cov.ferx",
-        "data/two_cpt_oral_cov.csv",
-        EstimationMethod::FoceI,
-        true,
-    );
-}
-
-#[test]
-fn warfarin_laplace_reload_repeats_inline_covariance() {
-    roundtrip_row(
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Laplace,
-        true,
-    );
-}
-
-/// The issue's "done when" fixture. Claim only: its premise holds on Linux and not on
-/// macOS (module doc).
-#[test]
-fn warfarin_iov_focei_reload_repeats_inline_covariance() {
-    roundtrip_row(
-        "examples/warfarin_iov.ferx",
-        "data/warfarin_iov.csv",
-        EstimationMethod::FoceI,
-        false,
+fn reload_repeats_inline_covariance() {
+    let mut discriminating = Vec::new();
+    let mut identical = Vec::new();
+    for (model_path, data_path, method) in ROWS {
+        let row = format!("{model_path} {method:?}");
+        match roundtrip_row(&row, model_path, data_path, method) {
+            Some(gap) => {
+                eprintln!("premise {row}: max |legacy - inline| = {gap:e}");
+                discriminating.push(row);
+            }
+            None => {
+                eprintln!("premise {row}: bit-identical without the packed vector");
+                identical.push(row);
+            }
+        }
+    }
+    eprintln!("premise held on {discriminating:?}; failed on {identical:?}");
+    assert!(
+        discriminating.len() >= MIN_DISCRIMINATING,
+        "premise — at least {MIN_DISCRIMINATING} of {} rows must give different covariance \
+         bits without the packed vector, or the claim cannot tell the #1815 fix from the \
+         pre-#1815 fallback; held on {discriminating:?}, failed on {identical:?}",
+        ROWS.len()
     );
 }

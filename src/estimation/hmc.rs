@@ -269,6 +269,7 @@ mod tests {
         use std::collections::HashMap;
         let times = [0.5, 1.0, 2.0, 4.0, 8.0];
         crate::types::Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![crate::types::DoseEvent::new(
                 0.0, 1000.0, 1, 0.0, false, 0.0,

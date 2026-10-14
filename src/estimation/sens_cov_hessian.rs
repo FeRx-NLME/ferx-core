@@ -2520,6 +2520,7 @@ mod tests {
             .collect();
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "ode-cov".into(),
             doses: (0..occasions)
                 .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
@@ -3023,6 +3024,7 @@ mod tests {
     fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -6311,6 +6313,7 @@ mod tests {
         let base_times = vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0];
         let n = base_times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: base_times,
@@ -6632,6 +6635,7 @@ mod tests {
         let n = base_times.len();
         let eta_true = [0.12, -0.08, 0.10];
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "tv".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: base_times,
@@ -6721,6 +6725,7 @@ mod tests {
         let base_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 16.0, 20.0, 24.0];
         let n = base_times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),

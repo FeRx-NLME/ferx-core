@@ -3516,6 +3516,7 @@ fn parse_subject(
 
     Ok((
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: sorted_doses,
             obs_times,

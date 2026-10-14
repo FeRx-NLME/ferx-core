@@ -1890,6 +1890,7 @@ mod tests {
         let n = obs_times.len();
         let nd = doses.len();
         crate::types::Subject {
+            obs_rgroup: Vec::new(),
             id: "R".into(),
             doses,
             obs_times,

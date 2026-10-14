@@ -269,6 +269,45 @@ refinement runs on top:
 The CL eta's omega is also updated from inter-subject CV² when ≥ 3 subjects have
 a valid NCA estimate.
 
+Each pooled estimate is routed to a θ in two steps: find the individual parameter
+the `[structural_model]` line binds to that PK role, then find that parameter's θ
+— through its mu-reference when the parameter carries an η **named after it**,
+otherwise by searching `[parameters]` for a θ whose name contains the parameter's
+name.
+
+The first step is exact **when a declared individual parameter binds the role**. An
+intermediate the block declares on the way —
+`CLWT = exp(CLWT_EXP * log(WT/70))` above `CL = TVCL * CLWT * exp(ETA_CL)`, say —
+is never mistaken for the role it feeds, whatever order the block declares it in.
+Through ferx 0.4.0 such an intermediate could capture the role when it was
+declared *before* the bound parameter: the clearance estimate landed on
+`CLWT_EXP`, the allometric exponent (pinned at its upper bound, since a clearance
+is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
+model default (#1899).
+
+A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter, so
+there is no first step to be exact about: the lookup falls back to searching every θ
+for the canonical slot name, and a θ whose name merely contains it wins — a readout
+coefficient called `THCL_A` receives the pooled clearance, where the right answer is
+to write nothing at all (#1930).
+
+The second step is exact only through the mu-reference, and the mu-reference is
+matched **by η name**: the η must be called exactly the parameter's name or end in
+`_<PARAM>`, so `ETA_V` and `IIV_V` resolve `V` but `ETA_VOL` does not. Anything
+else falls through to the name search, which takes the first θ whose name
+*contains* the parameter's name — so a parameter whose name is a substring of an
+earlier θ's name resolves to that θ. `V = TVV` or `V = TVV * exp(ETA_VOL)`
+declared alongside a `theta TVCL` both resolve to `TVCL`, which then receives the
+volume estimate instead of the clearance one, and `TVV` is never written at all
+(#1922). Name the η after its parameter (`ETA_V`, not `ETA_VOL`), or give the θ a
+name that does not collide.
+
+The η-name match is also not checked for **uniqueness**: if two η names qualify for
+one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — one of
+them is used and which one is unspecified. In the current implementation it depends on
+hash iteration order, so the resulting start values can differ between runs of the
+same model on the same data (#1930). Keep one qualifying η name per parameter.
+
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
 
@@ -731,7 +770,7 @@ Notes:
 |-----|---------|-------------|
 | `parameter_scaling` | `auto`, `none`, `abs`, `rescale2` | `auto` | Parameter-scaling strategy for the outer optimizer (supersedes `scale_params` when non-`none`). The default `auto` applies `rescale2` to the gradient-based optimizers that benefit (`nlopt_lbfgs`/`slsqp`) and leaves the derivative-free `bobyqa` unscaled (where `rescale2` distorts its trust region). `rescale2` is the nlmixr2-style normalisation: each packed coordinate is divided by its bound half-range `(upper−lower)/2`, mapping it toward `(−1, 1)` so the optimizer sees comparable per-parameter search ranges. This markedly improves cold-start convergence — e.g. `optimizer = nlopt_lbfgs` reaches OFV −1197.23 on `two_cpt_oral_cov` (≈ nlmixr2's −1199.24) where the unscaled optimizer stalls near −1165, and cold-start FOCEI/`slsqp` on `warfarin_iov` reaches the marginal minimum instead of stalling (#335). `abs` is the legacy `\|packed value\|` normalisation (same as `scale_params = true`); `none` disables scaling for all optimizers. Writing `parameter_scaling = none` therefore also disables the `slsqp` cold-start fix. |
 | `scale_params` | `false` | Legacy boolean alias for `parameter_scaling = abs`. Divide each packed (log/Cholesky) coordinate by its initial magnitude before passing it to the optimizer. **Off by default since issue #99:** the scaling-enabled path only ever runs on log/Cholesky coordinates, where dividing by `\|log value\|` is counterproductive — e.g. `ln(V)=ln(20)≈3` gets scale 3, turning the optimizer's unit step into a ≈20× multiplicative jump in V, which overshoots and (via the uniform SLSQP gradient cap) starves the step in other dimensions such as OMEGA, halting short of the minimum. Prefer `parameter_scaling = rescale2` for gradient-based optimizers. The OFV value is unchanged at any fixed point, but the optimizer *trajectory* and stop point are not. |
-| `max_unconverged_frac` | `0.1` | Fraction of subjects (with at least `min_obs_for_convergence_check` observations) allowed to have unconverged EBEs before the outer optimizer rejects the step (returns OFV = ∞). Set to `1.0` to disable the guard. |
+| `max_unconverged_frac` | `0.1` | Fraction of subjects (with at least `min_obs_for_convergence_check` observations) allowed to have unconverged EBEs before the outer optimizer rejects the step. Set to `1.0` to disable the guard. A rejected step is scored by a rejection penalty rather than by the likelihood, so if the guard rejects *every* step the fit has minimised nothing: that run reports `converged: false` with a `W_NO_FEASIBLE_EVAL` warning naming this key and `inner_maxiter` — see [When no evaluation is feasible](../estimation/foce.qmd#no-feasible-evaluation). |
 | `min_obs_for_convergence_check` | `2` | Subjects with fewer than this many observations are excluded from the `max_unconverged_frac` check (they still run normally). |
 | `stagnation_guard` | `true` | Short-circuit the NLopt-based outer optimizers once recent evals show no OFV improvement above 1e-3 over a window of evals — `max(3·(n+1), 50)` in general, shortened to `max(n+1, 10)` for a FOCE/FOCEI gradient-based optimizer (L-BFGS, SLSQP, MMA; not Laplace/AGQ, which have reachable `outer_xtol`/`outer_ftol` stops) once the fit has improved on its first evaluation, unless its steps are growing — each of the last two at least 1.5× the one before (#1530). A gradient fit can otherwise spin on a flat objective whose outer gradient does not vanish; the growth veto keeps the short window off a fit still creeping off a saddle, where the OFV is flat but the steps are expanding. This lets SLSQP / L-BFGS terminate quickly via their own xtol/ftol on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through the remaining `outer_maxiter` budget at full inner-loop cost. Set to `false` to let the optimizer run to its natural termination criterion — useful when debugging or for problems with very slow but real OFV improvements below the threshold. |
 | `ebe_warm_start` | `false` | When an inner per-subject EBE solve fails its BFGS step and falls back to Nelder–Mead, warm-start the simplex from the BFGS partial η̂ rather than cold-starting from the prior mode η=0. A weakly-identified η (e.g. an unidentifiable peripheral volume) drives BFGS far out onto the steep prior slope, and NM slides down it to the mode in far fewer iterations than refining from 0 in the flat basin — substantially fewer prediction walks on fallback-heavy fits (≈1.7× on a 2-cpt unidentifiable-V2 benchmark). **Opt-in:** warm-starting moves the fallback subjects' EBEs, which perturbs the outer optimiser's trajectory — harmless for derivative-free BOBYQA, but it can derail a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models. Enable only after validating OFV/estimates on your model + `optimizer`; leave `false` for the historical cold-restart behaviour. |

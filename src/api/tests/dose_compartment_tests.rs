@@ -17,6 +17,7 @@ use std::collections::HashMap;
 fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
     Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0],
