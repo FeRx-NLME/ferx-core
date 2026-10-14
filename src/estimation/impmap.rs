@@ -332,7 +332,10 @@ fn find_ebe_multistart(
     omega_chol: Option<&DMatrix<f64>>,
     subj_seed: u64,
     cold_recheck: bool,
-) -> EbeResult {
+) -> (EbeResult, bool) {
+    // Whether the cold recheck replaced the warm-started mode (reported by
+    // `run_mcem` as a warning: the subject was trapped).
+    let mut cold_won = false;
     // Baseline: warm-start (or cold-start from η = 0).
     let mut best = find_ebe(
         model,
@@ -362,11 +365,17 @@ fn find_ebe_multistart(
             inner_restarts,
         );
         if cold.nll < best.nll {
+            // Selection keeps the strictly lower NLL, but only a gain above
+            // `RECHECK_RESCUE_MIN_GAIN` counts as a *different* mode for the
+            // warning: once θ moves, warm and cold solves of the same mode
+            // differ at rounding level (measured 3.6e-15 on the flip-flop
+            // fixture, against a 5.28 rescue).
+            cold_won = best.nll - cold.nll > RECHECK_RESCUE_MIN_GAIN;
             best = cold;
         }
     }
     let Some(l_omega) = omega_chol else {
-        return best;
+        return (best, cold_won);
     };
     let n_eta = l_omega.nrows();
     let mut rng = StdRng::seed_from_u64(subj_seed);
@@ -390,15 +399,18 @@ fn find_ebe_multistart(
         );
         if candidate.nll < best.nll {
             best = candidate;
+            // A random start, not the cold recheck, supplied the winning mode.
+            cold_won = false;
         }
     }
-    best
+    (best, cold_won)
 }
 
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
 /// cold-start) and then `mceta` additional random starting points drawn from
 /// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
 /// degrades to a single warm-start — identical to the previous behaviour.
+/// The fourth return value counts the subjects whose cold candidate won.
 /// `cold_recheck` adds one more candidate, the canonical cold start (η = 0;
 /// FREM covariate ETAs at their data-implied values)
 /// (`impmap_map_recheck`, #1965).
@@ -418,7 +430,7 @@ fn run_map_multistart(
     seed: u64,
     iteration: usize,
     cold_recheck: bool,
-) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, usize) {
     // Cholesky of Ω for drawing random starts (computed once, outside the
     // per-subject parallel loop).
     let omega_chol = if mceta > 0 {
@@ -427,7 +439,7 @@ fn run_map_multistart(
         None
     };
 
-    let results: Vec<EbeResult> = population
+    let results: Vec<(EbeResult, bool)> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -455,6 +467,8 @@ fn run_map_multistart(
         })
         .collect();
 
+    let n_cold_wins = results.iter().filter(|(_, won)| *won).count();
+    let results: Vec<EbeResult> = results.into_iter().map(|(r, _)| r).collect();
     let stats = InnerLoopStats {
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
         n_fallback: results.iter().filter(|r| r.used_fallback).count(),
@@ -463,7 +477,7 @@ fn run_map_multistart(
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
     let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
 
-    (eta_hats, h_matrices, stats)
+    (eta_hats, h_matrices, stats, n_cold_wins)
 }
 
 /// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
@@ -585,6 +599,32 @@ fn check_sobol_config(
         ));
     }
     Ok(())
+}
+
+/// Individual-NLL gain above which a cold-recheck win counts as a rescue from
+/// a different (local) mode rather than the same mode re-solved (#1965).
+const RECHECK_RESCUE_MIN_GAIN: f64 = 1e-3;
+
+/// The fit warning for `impmap_map_recheck` rescues (#1965): which iterations'
+/// cold MAP recheck beat a subject's warm-started mode, and how many subjects.
+/// Each rescue is a subject that was sitting in a local mode — the bias the
+/// option exists to remove — so the user hears about it. `None` when the
+/// recheck never won.
+fn recheck_wins_warning(label: &str, wins: &[(String, usize)]) -> Option<String> {
+    if wins.is_empty() {
+        return None;
+    }
+    let total: usize = wins.iter().map(|(_, n)| n).sum();
+    let at = wins
+        .iter()
+        .map(|(it, n)| format!("{it} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{label}: the cold MAP recheck (`impmap_map_recheck`) found a better mode than the \
+         warm start {total} time(s) — iteration (subjects): {at}. Those subjects' warm-started \
+         modes were local optima; the recheck moved them."
+    ))
 }
 
 /// Whether MCEM iteration `k` (1-based) runs the cold MAP recheck under
@@ -793,6 +833,8 @@ fn run_mcem(
     // eligible pairs exist, independent of `options.mu_referencing` (which only
     // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
     // EM methods likewise require mu-referencing.
+    // (iteration label, subjects whose cold MAP recheck beat the warm start).
+    let mut recheck_wins: Vec<(String, usize)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     // Same eligibility rule as SAEM: a pair qualifies when the packed theta *is*
@@ -1054,7 +1096,7 @@ fn run_mcem(
         let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
         let (eta_hats, h_matrices) = if run_inner {
             let mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (e, h, _stats) = run_map_multistart(
+            let (e, h, _stats, n_cold_wins) = run_map_multistart(
                 model,
                 population,
                 &params_k,
@@ -1067,6 +1109,9 @@ fn run_mcem(
                 k,
                 recheck_due(k, map_recheck),
             );
+            if n_cold_wins > 0 {
+                recheck_wins.push((k.to_string(), n_cold_wins));
+            }
             (e, h)
         } else {
             (Vec::new(), Vec::new())
@@ -1725,7 +1770,7 @@ fn run_mcem(
         Some(last_eta_hats.as_slice())
     };
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _stats) = run_map_multistart(
+    let (eta_hats, h_matrices, _stats, n_final_cold_wins) = run_map_multistart(
         model,
         population,
         &final_params,
@@ -1741,6 +1786,12 @@ fn run_mcem(
         // when the estimates are right — recheck on any enabled period.
         map_recheck > 0,
     );
+    if n_final_cold_wins > 0 {
+        recheck_wins.push(("final".to_string(), n_final_cold_wins));
+    }
+    if let Some(w) = recheck_wins_warning(label, &recheck_wins) {
+        warnings.push(w);
+    }
     let final_kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
 
     let ofv = 2.0
@@ -2381,7 +2432,7 @@ fn run_mcem_mixture(
                         let warm_i = prev_mean
                             .map(|pm| DVector::from_row_slice(&pm[c][i]))
                             .or_else(|| warm0.as_ref().map(|w| w[i].clone()));
-                        let ebe = find_ebe_multistart(
+                        let (ebe, _cold_won) = find_ebe_multistart(
                             model,
                             subject,
                             &params_iter,
@@ -4278,7 +4329,7 @@ mod tests {
         let params = &model.default_params;
         let subject = &pop.subjects[0];
 
-        let baseline = find_ebe_multistart(
+        let (baseline, _) = find_ebe_multistart(
             &model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7, false,
         );
         let direct = find_ebe(&model, subject, params, 50, 1e-4, None, None, 0);
@@ -4290,7 +4341,7 @@ mod tests {
         );
 
         let chol = params.omega.matrix.clone().cholesky().unwrap().l();
-        let multi = find_ebe_multistart(
+        let (multi, _) = find_ebe_multistart(
             &model,
             subject,
             params,
@@ -4428,8 +4479,10 @@ mod tests {
                 recheck,
             )
         };
-        let rechecked = solve(true);
-        let stuck = solve(false);
+        let (rechecked, rechecked_won) = solve(true);
+        let (stuck, stuck_won) = solve(false);
+        // The flag `run_mcem` reports: set only when the cold candidate won.
+        assert!(rechecked_won && !stuck_won);
         assert!(rechecked.nll.is_finite() && stuck.nll.is_finite());
         // The two modes differ only by the prior, ½(ln 0.1)²·(1/ω_V + 1/ω_KA) = 5.30.
         assert!(
@@ -4547,6 +4600,63 @@ mod tests {
             !recheck_due(2, 1000),
             "a period longer than the run never fires"
         );
+    }
+
+    /// Exactly which iterations' recheck rescued the trapped subject, read
+    /// from the fit warning (#1965). With three iterations and only subject 0
+    /// warm-started flipped, the rescue happens at the first iteration the
+    /// recheck runs and never again, so the reported iteration *is* the
+    /// schedule: period 1 → iteration 1, period 2 → iteration 2, a period
+    /// longer than the run → the final pass only, period 0 → nothing. This pins
+    /// that production forwards the current iteration `k` — a constant, `n_iter`
+    /// or `k + 1` in its place each report a different iteration.
+    #[test]
+    fn impmap_map_recheck_reports_the_iterations_it_rescued() {
+        let model = crate::parser::model_parser::parse_model_string(FLIPFLOP_MODEL).unwrap();
+        let pop = flipflop_pop(10);
+        let mut flipped = vec![DVector::zeros(3); 10];
+        flipped[0] = DVector::from_vec(vec![0.0, 0.1_f64.ln(), 0.1_f64.ln()]);
+        let recheck_warning = |recheck: usize| {
+            let mut opts = FitOptions::default();
+            opts.impmap_iterations = 3;
+            opts.impmap_averaging = 1;
+            opts.impmap_samples = 50;
+            opts.impmap_auto = false;
+            opts.impmap_map_recheck = recheck;
+            run_impmap(&model, &pop, &model.default_params, Some(&flipped), &opts)
+                .expect("IMPMAP on the flip-flop fixture")
+                .warnings
+                .into_iter()
+                .find(|w| w.contains("impmap_map_recheck"))
+        };
+        for (period, want) in [
+            (1, "iteration (subjects): 1 (1)."),
+            (2, "iteration (subjects): 2 (1)."),
+            (1000, "iteration (subjects): final (1)."),
+        ] {
+            let w = recheck_warning(period)
+                .unwrap_or_else(|| panic!("period {period}: no recheck warning"));
+            assert!(
+                w.contains(want) && w.contains("1 time(s)"),
+                "period {period}: {w}"
+            );
+        }
+        assert!(recheck_warning(0).is_none(), "period 0 must never recheck");
+    }
+
+    /// Every sentence of the recheck warning carries a claim (#1965): the
+    /// first, how many rescues and at which iterations; the second, what a
+    /// rescue means. `None` when nothing was rescued.
+    #[test]
+    fn recheck_wins_warning_states_count_iterations_and_meaning() {
+        assert!(recheck_wins_warning("IMPMAP", &[]).is_none());
+        let w = recheck_wins_warning("IMPMAP", &[("10".into(), 2), ("final".into(), 1)]).unwrap();
+        assert!(w.starts_with("IMPMAP: "), "{w}");
+        assert!(
+            w.contains("3 time(s)") && w.contains("iteration (subjects): 10 (2), final (1)."),
+            "{w}"
+        );
+        assert!(w.contains("warm-started modes were local optima"), "{w}");
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),

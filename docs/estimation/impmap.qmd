@@ -197,6 +197,12 @@ start at their data-implied values), and the better of the two
 modes is kept. The final EBE pass, which feeds the reported Laplace OFV, the
 sdtab and the covariance step, always rechecks. Set `0` to switch it off.
 
+When a recheck finds a better mode than the warm start (by more than 0.001
+in the individual NLL, so a re-solve of the same mode does not count), the
+fit reports it as a warning listing the iterations and the number of
+subjects rescued, e.g. `iteration (subjects): 10 (1)`. Each rescue is a
+subject whose warm-started mode was a local optimum.
+
 In the #1965 benchmark on `two_cpt_oral_cov` (10 seeds, K = 300, scored by a
 common large-K importance-sampled −2LL), subject 6 had a local mode 17.7
 objective units worse than its global one:
