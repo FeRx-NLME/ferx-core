@@ -207,13 +207,22 @@ differences under each convention:
 | `V` | 0.21364 | 0.21364 | 0.21193 | 0.21193 |
 | `p(1)` | 0.10881 | 0.10881 | 0.12260 | 0.12260 |
 
-Each engine matches its own column to better than 4e-6. On the
-single-population twin of this model (`--single`: $CL = TVCL\,e^{\eta}$, same
-data) the same split appears, $\operatorname{SE}(TVCL)$ = 0.0538 re-estimated
-against 0.0626 held, and ferx reports 0.0626. So until ferx's score carries the
-EBE response, expect `s` and `rsr` to differ from NONMEM's by this
-finite-sample amount on any FOCE/FOCEI model. The two conventions agree
-asymptotically. `tests/mixture_cov_s_nonmem.rs` pins both halves.
+Each engine matches its own column to better than 4e-6. The same split appears
+with no mixture at all. On the single-population twin of this model
+(`tests/nonmem/single_iv_cov_{s,rsr,r0}`: $CL = TVCL\,e^{\eta}$, same data,
+NONMEM 7.5.1 at OBJ 350.266132), $\operatorname{SE}(TVCL)$ is:
+
+| `TVCL` SE | NONMEM | oracle, η̂ re-estimated | oracle, η̂ held | ferx |
+|---|---|---|---|---|
+| `r` | 0.10068 | 0.10060 | — | 0.10060 |
+| `s` | 0.05379 | 0.05379 | 0.06262 | 0.06262 |
+| `rsr` | 0.18892 | 0.18865 | 0.16537 | 0.16537 |
+
+So the gap is 16 % on `s` and 12 % on `rsr`, while `r` agrees to 0.07 %. Until
+ferx's score carries the EBE response, expect `s` and `rsr` to differ from
+NONMEM's by this finite-sample amount on any FOCE/FOCEI model. The two
+conventions agree asymptotically. `tests/mixture_cov_s_nonmem.rs` pins both
+halves, for the mixture and for its twin.
 
 ## Inter-occasion variability under a mixture
 

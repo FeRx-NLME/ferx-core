@@ -50,7 +50,8 @@
 //!
 //! The same oracle's `--single` run shows the gap on the one-population twin of this
 //! model (`CL = TVCL·exp(η)`, same data): η̂ re-estimated `SE(TVCL) = 0.053787`, mode
-//! held `0.062615`, ferx `0.062615` — a pre-existing single-population convention, not
+//! held `0.062615`, ferx `0.062615`, and NONMEM's own `MATRIX=S` on that twin
+//! (`single_iv_cov_s`) `0.0537872` — a pre-existing single-population convention, not
 //! a mixture defect. So `s`/`rsr` are anchored here on the oracle's mode-held column,
 //! and the oracle's re-estimated column is checked against NONMEM, which pins *which*
 //! convention each engine implements. When ferx's score gains the EBE response, the
@@ -77,6 +78,23 @@ const ORACLE_S_HELD: [f64; 4] = [0.13403189, 0.25210754, 0.21192505, 0.12259852]
 const ORACLE_RSR_HELD: [f64; 4] = [0.08741343, 0.30434308, 0.17043115, 0.11422785];
 
 const NAMES: [&str; 4] = ["TVCL1", "TVCL2", "V", "P1"];
+
+/// The one-population twin's point, `single_iv_cov_*.ctl` `$THETA` (the
+/// `--single` MLE at six significant figures).
+const SG_TVCL: f64 = 1.76783;
+const SG_TVV: f64 = 9.77524;
+
+/// `mixture_iv_cov_score_oracle.py --single` at that point (TVCL, V), numpy on macOS
+/// arm64, the same three columns as the mixture's. `OBJ` is its closed-form `−2LL`
+/// (no `2π` constant, as NONMEM prints it).
+const SG_ORACLE_OBJ: f64 = 350.266131764987;
+const SG_ORACLE_R: [f64; 2] = [0.10060276, 0.18149165];
+const SG_ORACLE_S_TOTAL: [f64; 2] = [0.05378717, 0.2077644];
+const SG_ORACLE_RSR_TOTAL: [f64; 2] = [0.18865498, 0.16248856];
+const SG_ORACLE_S_HELD: [f64; 2] = [0.06261534, 0.20833995];
+const SG_ORACLE_RSR_HELD: [f64; 2] = [0.16537104, 0.1668051];
+
+const SG_NAMES: [&str; 2] = ["TVCL", "V"];
 
 fn model_src() -> String {
     format!(
@@ -106,14 +124,43 @@ fn model_src() -> String {
     )
 }
 
+/// The one-population twin, `tests/nonmem/single_iv_cov_{s,rsr,r0}.ctl`: same data,
+/// one CL, at the twin's MLE as `mixture_iv_cov_score_oracle.py --single` finds it
+/// (six significant figures).
+fn single_model_src() -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL({SG_TVCL}, 0.01, 100.0)
+  theta TVV({SG_TVV}, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    )
+}
+
 fn eval_only_fit(method: CovarianceMethod) -> FitResult {
+    eval_only_fit_of(&model_src(), method)
+}
+
+fn eval_only_fit_of(src: &str, method: CovarianceMethod) -> FitResult {
     let pop = read_nonmem_csv(
         Path::new("tests/nonmem/mixture_iv.csv"),
         Some(&["WT"]),
         None,
     )
     .unwrap();
-    let model = parse_model_string(&model_src()).unwrap();
+    let model = parse_model_string(src).unwrap();
     let opts = FitOptions {
         interaction: true, // NONMEM METHOD=1 INTER
         outer_maxiter: 0,  // NONMEM MAXEVAL=0
@@ -121,16 +168,20 @@ fn eval_only_fit(method: CovarianceMethod) -> FitResult {
         covariance_method_set: true,
         ..Default::default()
     };
-    fit(&model, &pop, &model.default_params, &opts).expect("eval-only mixture fit Ok")
+    fit(&model, &pop, &model.default_params, &opts).expect("eval-only fit Ok")
 }
 
 fn theta_ses(res: &FitResult, label: &str) -> Vec<f64> {
+    theta_ses_n(res, label, 4)
+}
+
+fn theta_ses_n(res: &FitResult, label: &str, n: usize) -> Vec<f64> {
     let se = res
         .se_theta
         .as_ref()
         .unwrap_or_else(|| panic!("{label}: no θ SEs; warnings: {:?}", res.warnings))
         .clone();
-    assert_eq!(se.len(), 4, "{label}: four θ");
+    assert_eq!(se.len(), n, "{label}: {n} θ");
     for (j, s) in se.iter().enumerate() {
         assert!(
             s.is_finite() && *s > 0.0,
@@ -144,6 +195,11 @@ fn theta_ses(res: &FitResult, label: &str) -> Vec<f64> {
 
 /// The `-1000000001` (standard error) row of a NONMEM `.ext` file: θ1..θ4.
 fn nonmem_theta_ses(stem: &str) -> Vec<f64> {
+    nonmem_theta_ses_n(stem, 4)
+}
+
+/// The `-1000000001` (standard error) row of a NONMEM `.ext` file: θ1..θn.
+fn nonmem_theta_ses_n(stem: &str, n: usize) -> Vec<f64> {
     let path = format!("tests/nonmem/{stem}.ext");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let row = text
@@ -153,22 +209,41 @@ fn nonmem_theta_ses(stem: &str) -> Vec<f64> {
     let se: Vec<f64> = row
         .split_whitespace()
         .skip(1)
-        .take(4)
+        .take(n)
         .map(|v| v.parse::<f64>().unwrap())
         .collect();
     assert!(
-        se.len() == 4 && se.iter().all(|s| s.is_finite() && *s > 0.0),
+        se.len() == n && se.iter().all(|s| s.is_finite() && *s > 0.0),
         "{path}: SE row {se:?}"
     );
     se
 }
 
+/// The `-1000000000` (final estimate) row's objective, the last column.
+fn nonmem_obj(stem: &str) -> f64 {
+    let path = format!("tests/nonmem/{stem}.ext");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let row = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("-1000000000"))
+        .unwrap_or_else(|| panic!("{path}: no -1000000000 (final) row"));
+    let obj: f64 = row.split_whitespace().last().unwrap().parse().unwrap();
+    assert!(obj.is_finite(), "{path}: OBJ {obj}");
+    obj
+}
+
+/// Worst relative gap `|got − want| / want` over the mixture's four θ.
+fn worst_rel(label: &str, got: &[f64], want: &[f64]) -> f64 {
+    worst_rel_named(label, &NAMES, got, want)
+}
+
 /// Worst relative gap `|got − want| / want`, every entry asserted finite first so a
 /// `NaN` cannot hide behind `f64::max`.
-fn worst_rel(label: &str, got: &[f64], want: &[f64]) -> f64 {
+fn worst_rel_named(label: &str, names: &[&str], got: &[f64], want: &[f64]) -> f64 {
     assert_eq!(got.len(), want.len(), "{label}: length");
+    assert_eq!(got.len(), names.len(), "{label}: names");
     let mut worst = 0.0f64;
-    for ((name, g), w) in NAMES.iter().zip(got).zip(want) {
+    for ((name, g), w) in names.iter().zip(got).zip(want) {
         assert!(g.is_finite() && w.is_finite(), "{label} {name}: {g} vs {w}");
         let rel = (g - w).abs() / w;
         eprintln!("{label} {name}: {g:.8e} vs {w:.8e} rel {rel:.3e}");
@@ -281,5 +356,116 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
     assert!(
         w_conv_s > 0.1 && w_conv_rsr > 0.1,
         "the conventions must stay distinguishable: S {w_conv_s:.3e}, RSR {w_conv_rsr:.3e}"
+    );
+}
+
+/// The one-population twin (`single_iv_cov_{s,rsr,r0}`, NONMEM 7.5.1, OBJ
+/// 350.26613177): the same split as the mixture test above, on a model with no
+/// `[mixture]` at all — so the `S` gap is ferx's single-population score convention,
+/// which the mixture path inherits per class, not anything #1956 introduced.
+///
+/// Measured worst relative gaps (NONMEM side Linux, everything else macOS arm64), and
+/// the bound each gets:
+///
+/// | comparison                        | worst           | bound  | why that bound                          |
+/// |-----------------------------------|-----------------|--------|-----------------------------------------|
+/// | NONMEM OBJ vs oracle `−2LL`       | 8.7e-12         | 1e-10  | 11×; one point, two closed forms        |
+/// | NONMEM `MATRIX=R` vs oracle `R`   | 7.2e-4 (TVCL)   | 2e-3   | 2.8×; NONMEM's FD `R` (see below)       |
+/// | NONMEM `S` vs oracle total        | 1.9e-6 (V)      | 1e-5   | 5.2×; NONMEM prints 6 figures (≤ 2.4e-6)|
+/// | NONMEM `R⁻¹SR⁻¹` vs oracle total  | 1.4e-3 (TVCL)   | 5e-3   | 3.5×; inherits NONMEM's `R` row         |
+/// | ferx `r` vs oracle `R`            | 7.9e-7 (TVCL)   | 1e-5   | 13×; analytic `R` vs the oracle's FD    |
+/// | ferx `r` vs NONMEM `MATRIX=R`     | 7.2e-4 (TVCL)   | 2e-3   | 2.8×; the NONMEM `R` row, again         |
+/// | ferx `s` vs oracle held           | 3.3e-8 (TVCL)   | 1e-6   | 30×; the oracle prints 8 figures        |
+/// | ferx `rsr` vs oracle held         | 1.6e-6 (TVCL)   | 1e-5   | 6×; the `r`-vs-oracle row above         |
+/// | ferx `s` vs NONMEM `S` (straddle) | 1.6e-1 (TVCL)   | > 0.1  | the straddle, 1.6e5× the `s` bound      |
+///
+/// The `R` gap is NONMEM's: ferx and the oracle agree to 7.9e-7, NONMEM is 7.2e-4
+/// off both — the same six-figure-point FD noise the mixture's `r` test measures.
+#[test]
+fn single_population_twin_shows_the_same_s_convention_gap() {
+    let nm_s = nonmem_theta_ses_n("single_iv_cov_s", 2);
+    let nm_rsr = nonmem_theta_ses_n("single_iv_cov_rsr", 2);
+    let nm_r = nonmem_theta_ses_n("single_iv_cov_r0", 2);
+
+    // The three NONMEM runs sit at the oracle's point: one OBJ, the oracle's `−2LL`.
+    for stem in ["single_iv_cov_s", "single_iv_cov_rsr", "single_iv_cov_r0"] {
+        let obj = nonmem_obj(stem);
+        let rel = (obj - SG_ORACLE_OBJ).abs() / SG_ORACLE_OBJ;
+        eprintln!("{stem} OBJ {obj:.11} vs oracle {SG_ORACLE_OBJ:.11} rel {rel:.3e}");
+        assert!(rel < 1e-10, "{stem} OBJ {obj} vs oracle {SG_ORACLE_OBJ}");
+    }
+
+    // NONMEM implements the re-estimated (total-derivative) convention.
+    let w_nm_r = worst_rel_named("twin NONMEM R vs oracle", &SG_NAMES, &nm_r, &SG_ORACLE_R);
+    let w_nm_s = worst_rel_named(
+        "twin NONMEM S vs oracle total",
+        &SG_NAMES,
+        &nm_s,
+        &SG_ORACLE_S_TOTAL,
+    );
+    let w_nm_rsr = worst_rel_named(
+        "twin NONMEM RSR vs oracle total",
+        &SG_NAMES,
+        &nm_rsr,
+        &SG_ORACLE_RSR_TOTAL,
+    );
+    assert!(
+        w_nm_r < 2e-3,
+        "twin NONMEM MATRIX=R vs oracle: {w_nm_r:.3e}"
+    );
+    assert!(
+        w_nm_s < 1e-5,
+        "twin NONMEM MATRIX=S vs oracle (η̂ re-estimated): {w_nm_s:.3e}"
+    );
+    assert!(
+        w_nm_rsr < 5e-3,
+        "twin NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}"
+    );
+
+    // ferx implements the mode-held convention; its `R` is the oracle's.
+    let src = single_model_src();
+    let s = theta_ses_n(
+        &eval_only_fit_of(&src, CovarianceMethod::CrossProduct),
+        "twin s",
+        2,
+    );
+    let rsr = theta_ses_n(
+        &eval_only_fit_of(&src, CovarianceMethod::Sandwich),
+        "twin rsr",
+        2,
+    );
+    let r = theta_ses_n(
+        &eval_only_fit_of(&src, CovarianceMethod::Hessian),
+        "twin r",
+        2,
+    );
+    let w_r_oracle = worst_rel_named("twin ferx r vs oracle", &SG_NAMES, &r, &SG_ORACLE_R);
+    let w_r = worst_rel_named("twin ferx r vs NONMEM MATRIX=R", &SG_NAMES, &r, &nm_r);
+    let w_s = worst_rel_named(
+        "twin ferx s vs oracle held",
+        &SG_NAMES,
+        &s,
+        &SG_ORACLE_S_HELD,
+    );
+    let w_rsr = worst_rel_named(
+        "twin ferx rsr vs oracle held",
+        &SG_NAMES,
+        &rsr,
+        &SG_ORACLE_RSR_HELD,
+    );
+    assert!(w_r_oracle < 1e-5, "twin ferx r vs oracle: {w_r_oracle:.3e}");
+    assert!(w_r < 2e-3, "twin ferx r vs NONMEM MATRIX=R: {w_r:.3e}");
+    assert!(w_s < 1e-6, "twin ferx s vs oracle (mode held): {w_s:.3e}");
+    assert!(
+        w_rsr < 1e-5,
+        "twin ferx rsr vs oracle (mode held): {w_rsr:.3e}"
+    );
+
+    // The straddle, against NONMEM's own `.ext` rather than the oracle: with no
+    // mixture, ferx's `s` is still more than 10 % off NONMEM's `MATRIX=S`.
+    let w_straddle = worst_rel_named("twin ferx s vs NONMEM S", &SG_NAMES, &s, &nm_s);
+    assert!(
+        w_straddle > 0.1,
+        "twin: ferx s must stay distinguishable from NONMEM S: {w_straddle:.3e}"
     );
 }
