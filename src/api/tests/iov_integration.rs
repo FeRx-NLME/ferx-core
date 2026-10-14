@@ -2377,6 +2377,7 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 cens: vec![0; 8],
                 occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
                 obs_l2: Vec::new(),
+                obs_rgroup: Vec::new(),
                 dose_occasions: vec![1, 2],
                 reset_occasions: reset_label.into_iter().collect(),
                 fremtype: Vec::new(),
