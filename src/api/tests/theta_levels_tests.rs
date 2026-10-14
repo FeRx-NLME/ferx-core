@@ -4234,6 +4234,41 @@ mod absorption {
         res: Vec<(String, bool, DMatrix<f64>)>,
         labels: Vec<String>,
         one_column: bool,
+        /// Every other level block (#1963): its name, its level labels, and
+        /// the `xo` columns that are its raw per-level θ, in level order.
+        others: Vec<(String, Vec<String>, Vec<usize>)>,
+    }
+
+    impl Jac {
+        /// This Jacobian with each other level block named in `contrasts` coded
+        /// by its contrast (#1963): its raw per-level columns in `xo` replaced by
+        /// `X_other · C`, by the chain rule `∂y/∂β = ∂y/∂θ_level · C`. A block
+        /// not named stays raw, as under `none`.
+        pub(super) fn coded(&self, contrasts: &[(&str, LevelContrast)]) -> Jac {
+            let mut keep: Vec<usize> = (0..self.xo.ncols()).collect();
+            let mut parts: Vec<DMatrix<f64>> = Vec::new();
+            for (name, labels, cols) in &self.others {
+                let Some(&(_, c)) = contrasts.iter().find(|(n, _)| n == name) else {
+                    continue;
+                };
+                keep.retain(|k| !cols.contains(k));
+                let raw =
+                    DMatrix::from_fn(self.xo.nrows(), cols.len(), |r, k| self.xo[(r, cols[k])]);
+                parts.push(raw * coding_of(labels, c));
+            }
+            let kept = DMatrix::from_fn(self.xo.nrows(), keep.len(), |r, k| self.xo[(r, keep[k])]);
+            let mut all: Vec<&DMatrix<f64>> = vec![&kept];
+            all.extend(parts.iter());
+            Jac {
+                xb: self.xb.clone(),
+                xo: hcat(&all),
+                z: self.z.clone(),
+                res: self.res.clone(),
+                labels: self.labels.clone(),
+                one_column: self.one_column,
+                others: Vec::new(),
+            }
+        }
     }
 
     /// Every block of `text` under `contrast = none`, on the levels `pop` shows.
@@ -4282,6 +4317,13 @@ mod absorption {
     pub(super) fn jacobian_at(text: &str, pop0: &Population, at: Point) -> Jac {
         const EV: [f64; 6] = [0.4, -0.3, 0.7, -0.6, 0.2, 0.5];
         const CV: [f64; 5] = [0.6, -0.9, 0.3, 1.0, -0.4];
+        // Every block measured under `none`, a second one declared with its
+        // own contrast too (#1963): `Jac::coded` applies that contrast.
+        let text = &["sum_to_zero_within", "sum_to_zero", "ref"]
+            .iter()
+            .fold(text.to_string(), |t, c| {
+                t.replace(&format!(", contrast = {c}]"), ", contrast = none]")
+            });
         let fitted = none_layout(text, pop0);
         let mut pop = pop0.clone();
         let mut parsed = parse_full_model(text).unwrap();
@@ -4412,6 +4454,26 @@ mod absorption {
             res.push((m.kappa_names[q].clone(), true, mat(&cols)));
         }
         let labels = fitted["PLACEBO"].labels.clone();
+        // Each other block's raw level θ, by position in `other`: the θ named
+        // `NAME[label]` for each of its labels, in level order.
+        let others = fitted
+            .iter()
+            .filter(|(name, _)| name.as_str() != "PLACEBO")
+            .map(|(name, b)| {
+                let cols: Vec<usize> = b
+                    .labels
+                    .iter()
+                    .map(|l| {
+                        let want = format!("{name}[{l}]");
+                        other
+                            .iter()
+                            .position(|&k| m.theta_names[k] == want)
+                            .unwrap_or_else(|| panic!("no θ {want}"))
+                    })
+                    .collect();
+                (name.clone(), b.labels.clone(), cols)
+            })
+            .collect();
         Jac {
             xb: mat(&block.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
             xo: mat(&other.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
@@ -4419,18 +4481,25 @@ mod absorption {
             res,
             one_column: !labels[0].contains(','),
             labels,
+            others,
         }
     }
 
     /// The coding matrix of `contrast` over the per-level columns.
     fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
-        let l = j.labels.len();
+        coding_of(&j.labels, contrast)
+    }
+
+    /// [`coding`] for a block whose levels are `labels`; a block is one-column
+    /// when its labels hold no `,`.
+    fn coding_of(labels: &[String], contrast: LevelContrast) -> DMatrix<f64> {
+        let l = labels.len();
+        let one_column = !labels.first().is_some_and(|s| s.contains(','));
         // A one-column block is a single group (`assign_groups`).
-        let grp: Vec<&str> = j
-            .labels
+        let grp: Vec<&str> = labels
             .iter()
             .map(|s| {
-                if j.one_column {
+                if one_column {
                     ""
                 } else {
                     s.split(',').next().unwrap()
@@ -5329,7 +5398,21 @@ mod absorption {
         at: Point,
         wrong: &mut Vec<String>,
     ) {
-        let jac = jacobian_at(&text("none"), pop, at);
+        agrees_with_joint_oracle_coded(tag, text, pop, at, &[], wrong)
+    }
+
+    /// [`agrees_with_joint_oracle_at`] with each other level block named in
+    /// `others` coded by the contrast given there (#1963) — the one the binder
+    /// resolves it to, which the caller states — and every other one raw.
+    pub(super) fn agrees_with_joint_oracle_coded(
+        tag: &str,
+        text: &dyn Fn(&str) -> String,
+        pop: &Population,
+        at: Point,
+        others: &[(&str, LevelContrast)],
+        wrong: &mut Vec<String>,
+    ) {
+        let jac = jacobian_at(&text("none"), pop, at).coded(others);
         // The cells a contrast must rescue: the block absorbs a random effect
         // under `none`, and the contrast is not the nested block's within-group
         // one, which removes each unit's mean outright. There a coded block
