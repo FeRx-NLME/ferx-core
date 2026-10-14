@@ -170,6 +170,7 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
         .collect();
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -188,6 +189,7 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -343,4 +345,106 @@ fn fit_pushes_exactly_the_helpers_message() {
     assert!(sde.ode_spec.is_some());
     assert!(sde.is_sde(), "the SDE arm must carry a [diffusion] block");
     assert_fit_pushes_only_the_helpers_message(&sde, "SDE");
+}
+
+// ── #1081: the decorrelated statistic under a `correlation` line ──────────────────
+
+const LINE: &str = "correlation cs(RHO) by ARM";
+
+/// The positive message under `cs`, character for character: where the statistic
+/// was taken, that the line does not explain it, and the `ar1` advice.
+#[test]
+fn decorrelated_positive_message_under_cs_is_exact() {
+    let msg =
+        dw_autocorrelation_warning_decorrelated(1.43, LINE, crate::types::ResidualSerialKind::Cs)
+            .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         cs(RHO) by ARM` (Durbin-Watson = 1.43): the within-group correlation does not \
+         explain it. Compound symmetry correlates every two rows of a block equally; if \
+         the dependence decays with the distance between visits, `ar1` models that. \
+         Otherwise the structural model may be missing dynamics."
+    );
+}
+
+/// Under `ar1` the `ar1` advice would be circular; the message names the other two
+/// causes instead.
+#[test]
+fn decorrelated_positive_message_under_ar1_is_exact() {
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.2,
+        "correlation ar1(RHO) by ARM",
+        crate::types::ResidualSerialKind::Ar1,
+    )
+    .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         ar1(RHO) by ARM` (Durbin-Watson = 1.20): the within-group correlation does not \
+         explain it. The structural model may be missing dynamics, or the grouping may \
+         not cover the rows that are dependent."
+    );
+}
+
+/// Under `car1` the advice names the one structure that differs from it — `ar1`,
+/// which decays with the visit order rather than the time — and then the other two
+/// causes. Exact, so deleting either sentence reddens it.
+#[test]
+fn decorrelated_positive_message_under_car1_is_exact() {
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.3,
+        "correlation car1(RHO) by ARM",
+        crate::types::ResidualSerialKind::Car1,
+    )
+    .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         car1(RHO) by ARM` (Durbin-Watson = 1.30): the within-group correlation does not \
+         explain it. `car1` decays the correlation with the time between rows; if it \
+         follows the visit order instead, `ar1` models that. Otherwise the structural \
+         model may be missing dynamics, or the grouping may not cover the rows that are \
+         dependent."
+    );
+}
+
+#[test]
+fn decorrelated_negative_message_is_exact() {
+    let msg =
+        dw_autocorrelation_warning_decorrelated(2.7, LINE, crate::types::ResidualSerialKind::Cs)
+            .expect("above 2.5");
+    assert_eq!(
+        msg,
+        "Negative autocorrelation in the residuals decorrelated by `correlation cs(RHO) by \
+         ARM` (Durbin-Watson = 2.70). The residual correlation may be over-estimated, or the \
+         error model misspecified."
+    );
+}
+
+/// The band and a non-finite statistic stay silent, as for the IWRES warning; and
+/// both messages land in the `dw_autocorrelation` category.
+#[test]
+fn decorrelated_warning_band_and_category() {
+    for dw in [1.5, 2.0, 2.5, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            dw_autocorrelation_warning_decorrelated(
+                dw,
+                LINE,
+                crate::types::ResidualSerialKind::Ar1
+            ),
+            None,
+            "dw = {dw}"
+        );
+    }
+    for dw in [1.0, 3.0] {
+        let msg =
+            dw_autocorrelation_warning_decorrelated(dw, LINE, crate::types::ResidualSerialKind::Cs)
+                .unwrap();
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::DwAutocorrelation,
+            "{msg}"
+        );
+    }
 }

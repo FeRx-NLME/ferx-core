@@ -26,6 +26,7 @@ use crate::stats::residual_error::{
     compute_iwres_with_correlations, compute_r_matrix_with_correlations,
     compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
 };
+use crate::stats::stacked_layout::stacked_width;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -259,6 +260,54 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
          above {}) costs O(n) finite-difference passes instead.",
         crate::types::BOBYQA_MAX_DIM
     ))
+}
+
+/// [`dw_autocorrelation_warning`] for a model with a `correlation` line (#1081),
+/// where `dw` is taken on the residuals decorrelated by the fitted `R`
+/// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
+/// line does **not** explain, so the advice is about the line first: under `cs`
+/// every pair of a block correlates equally, and serial dependence that decays with
+/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima:
+/// `cs` leaves DW 1.43, `ar1` 1.69).
+pub(crate) fn dw_autocorrelation_warning_decorrelated(
+    dw: f64,
+    line: &str,
+    kind: crate::types::ResidualSerialKind,
+) -> Option<String> {
+    if !dw.is_finite() {
+        return None;
+    }
+    let what = format!("in the residuals decorrelated by `{line}` (Durbin-Watson = {dw:.2})");
+    if dw < 1.5 {
+        let advice = match kind {
+            crate::types::ResidualSerialKind::Cs => {
+                " Compound symmetry correlates every two rows of a block equally; if the \
+                 dependence decays with the distance between visits, `ar1` models that. \
+                 Otherwise the structural model may be missing dynamics."
+            }
+            crate::types::ResidualSerialKind::Ar1 => {
+                " The structural model may be missing dynamics, or the grouping may not \
+                 cover the rows that are dependent."
+            }
+            crate::types::ResidualSerialKind::Car1 => {
+                " `car1` decays the correlation with the time between rows; if it follows \
+                 the visit order instead, `ar1` models that. Otherwise the structural model \
+                 may be missing dynamics, or the grouping may not cover the rows that are \
+                 dependent."
+            }
+        };
+        Some(format!(
+            "Positive autocorrelation remains {what}: the within-group correlation does \
+             not explain it.{advice}"
+        ))
+    } else if dw > 2.5 {
+        Some(format!(
+            "Negative autocorrelation {what}. The residual correlation may be \
+             over-estimated, or the error model misspecified."
+        ))
+    } else {
+        None
+    }
 }
 
 /// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
@@ -509,6 +558,8 @@ pub(crate) fn fitted_population<'a>(
         );
     }
     let derive_occ = iov_rule_set && model.n_kappa > 0;
+    // A `correlation … by COL` line reads its blocks off the `by` columns (#1081).
+    let needs_rgroup = model.residual_serial.is_some();
     let needs_prune = population.subjects.iter().any(|s| {
         !s.dose_covariates.is_empty()
             || !s.obs_covariates.is_empty()
@@ -518,7 +569,7 @@ pub(crate) fn fitted_population<'a>(
             // `reset_covariates` must reach it rather than being gated out here.
             || !s.reset_covariates.is_empty()
     });
-    if !(needs_prune || needs_dv_log || derive_occ) {
+    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup) {
         return population;
     }
     let mut population = population;
@@ -528,6 +579,9 @@ pub(crate) fn fitted_population<'a>(
     }
     if derive_occ {
         apply_iov_occasion_rule(p, rule, had_column, warnings);
+    }
+    if needs_rgroup {
+        crate::stats::residual_error::assign_residual_groups(model, p);
     }
     if needs_dv_log {
         let n_nonpos = log_transform_observations(p);
@@ -716,6 +770,14 @@ fn fit_unstamped(
     if let Some(e) = check_survival_tv_covariates(model, population) {
         return Err(e);
     }
+    // The `TIME` axis of the same freeze: an ODE-accumulated hazard integrates the
+    // disposition at its TIME=0 snapshot while the Gaussian half reads `$PK` at every
+    // record, so a TIME-dependent CL/V/init would put the two halves of the objective on
+    // different concentration curves (#1853).
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_survival_time_dependent_pk(model) {
+        return Err(e);
+    }
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
@@ -822,10 +884,11 @@ fn fit_unstamped(
     // see the data. `ferx check` runs the same `check_model_data` to report
     // every finding; here we stop at the first error to preserve fit()'s
     // historical fail-fast behavior and exact error strings.
-    first_error(&check_model_data_rule(
+    first_error(&crate::api::validation::check_model_data_rule_at(
         model,
         population,
         &options.iov_occasion,
+        init_params,
     ))
     .map_err(|e| e.to_string())?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
@@ -848,10 +911,10 @@ fn fit_unstamped(
             let max_occ = population
                 .subjects
                 .iter()
-                .map(|s| crate::stats::likelihood::iov_occasion_groups(s).len())
+                .map(|s| crate::stats::stacked_layout::group_count(s))
                 .max()
                 .unwrap_or(0);
-            let d = model.n_eta + max_occ * model.n_kappa;
+            let d = stacked_width(model.n_eta, model.n_kappa, max_occ);
             let grid = crate::estimation::agq::grid_size(n_nodes, d);
             if grid > crate::estimation::agq::MAX_AGQ_GRID {
                 let label = if matches!(method, EstimationMethod::Laplace) {
@@ -897,6 +960,13 @@ fn fit_unstamped(
     //     problem balloons; warn so the multiplication isn't silent.
     if derive_occ {
         // Distinct occasion labels seen across observations and doses, per subject.
+        // Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
+        // (#1876): a derived rule is monotone in time, so on a subject whose observations
+        // and doses share one occasion such a row lies before or after all of them. Its κ is
+        // then at most weakly informed: only when a second such row lies between it and the
+        // first dose or observation, and the model has an `init(...)` baseline, does it
+        // govern a non-empty interval on nonzero state. Counting it would let the
+        // unidentifiable case below through, so the check errs on the conservative side.
         let distinct_occ = |s: &Subject| -> usize {
             let mut occs: Vec<u32> = s.occasions.clone();
             occs.extend_from_slice(&s.dose_occasions);
@@ -1707,7 +1777,44 @@ fn fit_inner(
                     && cp.stage_idx < n_stages
                     && cp.packed.len()
                         == crate::estimation::parameterization::packed_len(init_params);
-                if hashes_ok && layout_ok {
+                // #1617 review round 8: and the recorded objective has to be one. A file
+                // written by a build predating #1617 can hold the EBE guard's *rejection
+                // penalty* instead of an objective — those writes are gated on a feasible
+                // evaluation now, but the gate cannot reach a file that already exists, and
+                // nothing else here would refuse it: `SCHEMA_VERSION` is unchanged (the
+                // layout is compatible) and `ferx_version` is recorded but not compared. Its
+                // `packed` is then the scaled midpoint of the declared bounds, so a resume
+                // would adopt that as its own start and report it — #1617's point defect,
+                // surviving an upgrade.
+                //
+                // Identified **structurally**, by where the point sits, and only then by
+                // its magnitude. Round 9 of review killed the magnitude-only version,
+                // rightly: `Checkpoint::ofv` means different things per method — for SAEM it
+                // is an arbitrary iteration's conditional NLL, not an objective at a minimum
+                // — and `ofv_is_valid` admits finite values up to `1e14`, so a threshold
+                // alone would refuse (and the first version *deleted*) a legitimate
+                // large-objective or early-SAEM checkpoint, throwing away hours of progress.
+                //
+                // The fingerprint is exact instead: `guard_penalty_value` is minimised at the
+                // centre of the box, and that centre is scale-free — `c_s · scale =
+                // (lower + upper) / 2` — so a penalty checkpoint's `packed` is the midpoint
+                // of the *packed* bounds in every coordinate. Measured on the unfixed code:
+                // `[-1.956011463563535, 1.9560115078359035, -2.4e-8, -1.5]` against exact
+                // midpoints `[-1.956011502714073, 1.956011502714073, 0.0, -1.5]`, agreeing to
+                // 4e-8, which is where the 1e-6 relative tolerance comes from. Requiring the
+                // magnitude *as well* makes a false positive need a `>= GUARD_PENALTY_BASE`
+                // objective **and** the box centre in every coordinate at once; `>=` rather
+                // than `<` so a `NaN` ofv does not satisfy it.
+                let packed_bounds =
+                    crate::estimation::parameterization::pack_with_bounds(init_params).bounds;
+                let at_box_centre = cp.packed.len() == packed_bounds.lower.len()
+                    && cp.packed.iter().enumerate().all(|(i, &x)| {
+                        let c = (packed_bounds.lower[i] + packed_bounds.upper[i]) / 2.0;
+                        (x - c).abs() <= 1e-6 * (1.0 + c.abs())
+                    });
+                let objective_ok = !(at_box_centre
+                    && cp.ofv >= crate::estimation::outer_optimizer::GUARD_PENALTY_BASE);
+                if hashes_ok && layout_ok && objective_ok {
                     stage_params =
                         crate::estimation::parameterization::unpack_params(&cp.packed, init_params);
                     start_stage = cp.stage_idx;
@@ -1731,11 +1838,23 @@ fn fit_inner(
                     // are simply unavailable we can't prove staleness, so we start
                     // fresh but keep the checkpoint (a later run that does supply
                     // hashes may still use it; a successful fit removes it anyway).
+                    // Deliberately **not** `|| !objective_ok` (#1617 review round 9). This
+                    // block's own rule is that deletion requires *proof* of staleness — "when
+                    // hashes are simply unavailable we can't prove staleness, so we start
+                    // fresh but keep the checkpoint" — and a fingerprint, however tight, is an
+                    // inference. Refusing to resume already closes the defect; deleting is the
+                    // half that cannot be undone if the inference is ever wrong, and it buys
+                    // nothing, because a successful fit removes the file through
+                    // `finish_success` anyway. The cost of keeping it is one warning per run.
                     let stale = (hashes_present && !hashes_match) || !layout_ok;
                     let reason = if hashes_present && !hashes_match {
                         "model or data changed since it was written"
                     } else if !layout_ok {
                         "its parameter layout does not match this model"
+                    } else if !objective_ok {
+                        "it holds the EBE guard's rejection penalty at the midpoint of \
+                         the parameter bounds, so the run that wrote it had no feasible \
+                         evaluation; the file is kept but not resumed from"
                     } else {
                         "its model/data integrity hashes are unavailable"
                     };
@@ -2729,10 +2848,7 @@ fn fit_inner(
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
     let (shrinkage_kappa, shrinkage_kappa_by_occ) =
         if let Some(ref omega_iov) = result.params.omega_iov {
-            (
-                compute_kappa_shrinkage(&result.kappas, &omega_iov.matrix),
-                compute_kappa_shrinkage_by_occ(&result.kappas, &omega_iov.matrix),
-            )
+            kappa_shrinkages(model, population, &result.kappas, &omega_iov.matrix)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -2824,7 +2940,18 @@ fn fit_inner(
         native_warnings.push(entry);
     }
 
-    let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
+    // Under a `correlation` line the raw IWRES are correlated by construction; the
+    // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
+    let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
+        crate::stats::residual_error::whitened_residual_autocorrelation(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        )
+    } else {
+        iwres_autocorrelation(&subjects)
+    };
 
     // Covariance status. Bayesian fits report posterior credible intervals
     // instead of a Hessian covariance, so the covariance step is never
@@ -2887,7 +3014,16 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    if let Some(msg) = dw_autocorrelation_warning(dw_statistic) {
+    let dw_warning = match (
+        &model.residual_serial,
+        crate::api::validation::residual_correlation_line(model),
+    ) {
+        (Some(serial), Some(line)) => {
+            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
+        }
+        _ => dw_autocorrelation_warning(dw_statistic),
+    };
+    if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
 

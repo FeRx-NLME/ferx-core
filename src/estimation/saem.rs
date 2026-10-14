@@ -15,7 +15,7 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
-    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
+    individual_nll_prepared, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -725,7 +725,7 @@ fn numerical_mstep_scope_gap(
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Some("the model has a correlated residual (`block_sigma`)");
     }
     #[cfg(feature = "survival")]
@@ -1430,7 +1430,7 @@ fn scalar_residual_mstep_model(
         && !is_mixture
         && n_kappa == 0
         && model.residual_error_eta.is_none()
-        && model.residual_correlations.is_empty()
+        && !model.residual_is_dense()
         && model.frem_config.is_none()
         && !model.has_custom_ruv_magnitude()
         && !model.log_transform
@@ -2370,7 +2370,7 @@ pub(crate) fn obs_nll_sum(
                 subject,
                 theta,
                 sigma_values,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -2444,7 +2444,7 @@ fn obs_nll_sum_mix(
                 subject,
                 theta,
                 sg_i,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -3703,7 +3703,7 @@ pub fn run_saem(
             .subjects
             .iter()
             .map(|s| {
-                let n_occ = iov_occasion_groups(s).len();
+                let n_occ = crate::stats::stacked_layout::group_count(s);
                 vec![vec![0.0f64; n_kappa]; n_occ]
             })
             .collect();
@@ -5747,7 +5747,7 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    crate::stats::likelihood::individual_nll_into_with_schedule(
+                    crate::stats::likelihood::individual_nll_into_with_schedule_cov(
                         model,
                         &population.subjects[i],
                         &state.theta,
@@ -5756,7 +5756,7 @@ pub fn run_saem(
                         sigma_i,
                         // Same ρ `individual_nll_into` passes — SAEM holds
                         // `block_sigma` at its declaration.
-                        &model.residual_correlations,
+                        model.residual_cov_theta(&state.theta),
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
@@ -8983,6 +8983,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -9001,6 +9002,7 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -9106,6 +9108,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9124,6 +9127,7 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -9209,6 +9213,7 @@ DV ~ additive(EPS)
 
         // One subject with 2 occasions (occasions = [1,1,2,2]).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0],
@@ -9227,6 +9232,7 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -9336,6 +9342,7 @@ DV ~ additive(EPS)
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![
                         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -9357,6 +9364,7 @@ DV ~ additive(EPS)
                     obs_l2: Vec::new(),
                     dose_occasions: vec![1, 2],
                     reset_occasions: Vec::new(),
+                    pk_only_occasions: Vec::new(),
                     fremtype: Vec::new(),
                     obs_records: vec![],
                 }
@@ -9510,6 +9518,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9528,6 +9537,7 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -11044,6 +11054,7 @@ DV ~ additive(EPS)
         use crate::types::DoseEvent;
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -11062,6 +11073,7 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }

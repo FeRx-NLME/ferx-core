@@ -137,7 +137,7 @@ for (i, subject_kappas) in result.ebe_kappas.iter().enumerate() {
 }
 ```
 
-> **Note**: per-kappa shrinkage is not yet computed (`shrinkage_kappa` is always returned empty). If you need a shrinkage diagnostic for IOV, derive it manually from `ebe_kappas` and `omega_iov`.
+Kappa shrinkage is reported pooled (`shrinkage_kappa`) and per occasion slot (`shrinkage_kappa_by_occ`), over the occasion groups an observation informs — see [Output files](../output.qmd).
 
 ## Tips
 

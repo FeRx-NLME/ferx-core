@@ -1405,3 +1405,425 @@ fn the_salvage_note_classifies_as_an_informational_covariance_note() {
     assert_eq!(entry.category, WarningCode::CovarianceStep);
     assert_eq!(entry.severity, WarningSeverity::Info);
 }
+
+// ── #1781: the covariance objective of a sampler's estimate ──────────────────────────────────
+//
+// Input space of the route (`cov_objective_route`): method (FOCE family / Laplace, the three
+// samplers, VI) × endpoint (all-Gaussian, non-Gaussian) × n_eta (0, ≤ 3, 4) × mixture × IOV.
+// Each predicate is straddled inside the one test below. The three messages are pure and are
+// tested sentence by sentence: deleting any sentence of any of them reddens the test named on
+// that sentence's assertion and, for the conditional parts, both sides of the gate are in the
+// same test.
+
+#[test]
+fn the_quadrature_route_takes_exactly_a_sampler_on_a_non_gaussian_model_with_eta() {
+    use EstimationMethod as M;
+    let route = |m, ng, n_eta, mix, iov| cov_objective_route(m, ng, n_eta, mix, iov);
+    let quad = CovObjectiveRoute::Quadrature {
+        n_agq: COV_AGQ_NODES,
+    };
+    // The method straddle, on an otherwise eligible model.
+    for m in [M::Saem, M::Imp, M::Impmap] {
+        assert_eq!(route(m, true, 1, false, false), quad, "{m:?}");
+    }
+    for m in [
+        M::Foce,
+        M::FoceI,
+        M::FoceGn,
+        M::FoceGnHybrid,
+        M::Laplace,
+        M::Vi,
+        M::Bayes,
+    ] {
+        assert_eq!(
+            route(m, true, 1, false, false),
+            CovObjectiveRoute::AsFitted,
+            "{m:?}"
+        );
+    }
+    // The endpoint and η straddles.
+    assert_eq!(
+        route(M::Saem, false, 1, false, false),
+        CovObjectiveRoute::AsFitted
+    );
+    assert_eq!(
+        route(M::Saem, true, 0, false, false),
+        CovObjectiveRoute::AsFitted
+    );
+    // Mixture and IOV decline; a mixture is named first when both hold.
+    let declined = |d| CovObjectiveRoute::Declined(d);
+    assert_eq!(
+        route(M::Imp, true, 1, true, false),
+        declined(QuadratureDecline::Mixture)
+    );
+    assert_eq!(
+        route(M::Imp, true, 1, false, true),
+        declined(QuadratureDecline::Iov)
+    );
+    assert_eq!(
+        route(M::Imp, true, 1, true, true),
+        declined(QuadratureDecline::Mixture)
+    );
+    // The grid straddle: 7³ = 343 is in, 7⁴ = 2401 is out.
+    assert_eq!(route(M::Saem, true, 3, false, false), quad);
+    assert_eq!(
+        route(M::Saem, true, 4, false, false),
+        declined(QuadratureDecline::Grid {
+            n_eta: 4,
+            grid: 2401
+        })
+    );
+    // Nothing declines a fit that would not have taken the route anyway.
+    assert_eq!(
+        route(M::FoceI, true, 4, true, true),
+        CovObjectiveRoute::AsFitted
+    );
+}
+
+#[test]
+fn the_quadrature_note_says_what_ran_and_why_sentence_by_sentence() {
+    let note = format_quadrature_objective_note(EstimationMethod::Imp, 7, 2);
+    // Sentence 1 — what the step differentiated, and what it did not.
+    assert!(
+        note.starts_with(
+            "W_COV_QUADRATURE_OBJECTIVE: Covariance step: R and S were taken on the 7-node \
+             adaptive Gauss–Hermite marginal (49 nodes per subject; the objective of `method = \
+             laplace, n_agq = 7`), not on the FOCEI objective."
+        ),
+        "{note}"
+    );
+    // Sentence 2 — why, naming the estimator twice.
+    assert!(
+        note.ends_with(
+            " IMP estimates the exact marginal likelihood, and with a non-Gaussian endpoint the \
+             FOCEI approximation of it can have its minimum far from the IMP estimate, where its \
+             curvature is not a covariance."
+        ),
+        "{note}"
+    );
+    let entry = classify_warning(&note);
+    assert_eq!(
+        (entry.category, entry.severity),
+        (WarningCode::CovarianceStep, WarningSeverity::Info)
+    );
+}
+
+#[test]
+fn the_declined_warning_names_the_objective_the_reason_and_the_remedy_sentence_by_sentence() {
+    use EstimationMethod as M;
+    let saem = |d| format_quadrature_declined_warning(M::Saem, M::FoceI, d);
+    let w = saem(QuadratureDecline::Mixture);
+    // Sentence 1 — the objective R and S are evaluated on. It claims nothing about which
+    // matrix the step returns, or whether it returns one (Codex review r1 §4): the step that
+    // follows may give `S⁻¹`, fall back to it, or fail, all pinned through the live declined
+    // route in `covariance::tests::a_live_iov_model_declines_the_quadrature_route_for_every_step_outcome`.
+    assert!(
+        w.starts_with(
+            "W_COV_QUADRATURE_DECLINED: Covariance step: R and S are evaluated on the FOCEI \
+             objective at the SAEM estimate."
+        ),
+        "{w}"
+    );
+    assert!(!w.contains("curvature"), "{w}");
+    // Sentence 2 — why that is unreliable.
+    assert!(
+        w.contains(
+            " With a non-Gaussian endpoint that objective can have its minimum far from the \
+             SAEM estimate, and standard errors taken from it are then unreliable."
+        ),
+        "{w}"
+    );
+    // Sentence 3 — the reason, one per decline.
+    let reason = |w: &str| {
+        let head = " The quadrature marginal that replaces it after SAEM was not used because ";
+        let at = w.find(head).unwrap_or_else(|| panic!("{w}")) + head.len();
+        w[at..w[at..].find(". For").map(|e| at + e).unwrap_or(w.len())].to_string()
+    };
+    assert_eq!(
+        reason(&w),
+        "the model is a mixture, whose covariance step differentiates the mixture objective"
+    );
+    assert_eq!(
+        reason(&saem(QuadratureDecline::Iov)),
+        "the model has inter-occasion variability, which the quadrature would have to \
+         integrate over as well"
+    );
+    assert_eq!(
+        reason(&saem(QuadratureDecline::Grid {
+            n_eta: 4,
+            grid: 2401
+        })),
+        "4 random effects need a 7^4 = 2401-node grid per subject, over the covariance step's \
+         343-node limit"
+    );
+    // Sentence 4 — the remedy, both sides of its IMP gate.
+    assert!(
+        w.ends_with(
+            " For standard errors, polish the estimate with `methods = [saem, focei]`, which \
+             takes R at the FOCEI minimum."
+        ),
+        "{w}"
+    );
+    let imp = format_quadrature_declined_warning(M::Imp, M::FoceI, QuadratureDecline::Iov);
+    assert!(
+        imp.ends_with(
+            " For standard errors, fit with `methods = [focei, imp]` and `imp_eval_only = \
+             true`, which takes R at the FOCEI minimum and evaluates the importance-sampled \
+             likelihood there."
+        ),
+        "{imp}"
+    );
+    for m in [&w, &imp] {
+        let entry = classify_warning(m);
+        assert_eq!(
+            (entry.category, entry.severity),
+            (WarningCode::CovarianceStep, WarningSeverity::Warning)
+        );
+    }
+}
+
+fn non_stationary_facts(s_unavailable: Option<&str>) -> NonStationaryFacts<'_> {
+    NonStationaryFacts {
+        method: EstimationMethod::Saem,
+        objective: EstimationMethod::FoceI,
+        requested: CovarianceMethod::Sandwich,
+        min_eigenvalue: -0.0951,
+        max_eigenvalue: 12.5,
+        s_unavailable,
+        quadrature_nodes: None,
+    }
+}
+
+#[test]
+fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
+    let head = "the FOCEI R matrix needed an eigenvalue floor at the SAEM estimate (it is not \
+                positive definite: min eigenvalue -9.510e-2, max 1.250e1)";
+    let why = " SAEM does not minimise the FOCEI objective R is the Hessian of, so its estimate \
+               need not be a stationary point of that objective, and R⁻¹ there would be the \
+               inverse of an eigenvalue-floored matrix rather than a covariance.";
+    let remedy = " For R-based standard errors, polish the estimate with `methods = [saem, \
+                  focei]`, which takes R at the FOCEI minimum.";
+
+    // The success form: S⁻¹ replaced the request.
+    let ok = format_non_stationary_warning(&non_stationary_facts(None));
+    assert!(
+        ok.starts_with(&format!(
+            "W_COV_NON_STATIONARY_ESTIMATE: Covariance step: {head}, so covariance_method = rsr \
+             was replaced by S⁻¹ (covariance_method = s)."
+        )),
+        "{ok}"
+    );
+    assert!(ok.contains(why), "{ok}");
+    assert!(
+        ok.contains(
+            " S, the cross-product of the per-subject scores, is positive semi-definite by \
+             construction."
+        ),
+        "{ok}"
+    );
+    assert!(ok.ends_with(remedy), "{ok}");
+    let entry = classify_warning(&ok);
+    assert_eq!(
+        (entry.category, entry.severity),
+        (WarningCode::CovarianceRegularized, WarningSeverity::Warning)
+    );
+
+    // The failure form: S was unavailable too.
+    let failed = format_non_stationary_warning(&non_stationary_facts(Some("S is singular")));
+    assert!(
+        failed.starts_with(&format!(
+            "W_COV_NON_STATIONARY_ESTIMATE: Covariance step failed: {head}, and the score \
+             cross-product S that would replace it is unavailable (S is singular)."
+        )),
+        "{failed}"
+    );
+    assert!(failed.contains(" SE estimates not available."), "{failed}");
+    assert!(failed.contains(why), "{failed}");
+    assert!(failed.ends_with(remedy), "{failed}");
+    assert!(!failed.contains("positive semi-definite"), "{failed}");
+    let entry = classify_warning(&failed);
+    assert_eq!(
+        (entry.category, entry.severity),
+        (WarningCode::CovarianceFailed, WarningSeverity::Critical)
+    );
+}
+
+#[test]
+fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy() {
+    // On the #1781 quadrature route `R` is the 7-node marginal's, and the remedy carries its
+    // `n_agq`; off it, neither appears. And IMP's remedy is the reverse chain.
+    let quad = format_non_stationary_warning(&NonStationaryFacts {
+        objective: EstimationMethod::Laplace,
+        quadrature_nodes: Some(7),
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        quad.contains("the 7-node quadrature R matrix needed an eigenvalue floor"),
+        "{quad}"
+    );
+    assert!(
+        quad.contains("SAEM does not minimise the 7-node quadrature objective"),
+        "{quad}"
+    );
+    assert!(
+        quad.ends_with(
+            "polish the estimate with `methods = [saem, laplace]` and `n_agq = 7`, which takes \
+             R at the 7-node quadrature minimum."
+        ),
+        "{quad}"
+    );
+    let plain = format_non_stationary_warning(&non_stationary_facts(None));
+    assert!(
+        !plain.contains("n_agq") && !plain.contains("quadrature"),
+        "{plain}"
+    );
+
+    let imp = format_non_stationary_warning(&NonStationaryFacts {
+        method: EstimationMethod::Imp,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        imp.ends_with(
+            "fit with `methods = [focei, imp]` and `imp_eval_only = true`, which takes R at the \
+             FOCEI minimum and evaluates the importance-sampled likelihood there."
+        ),
+        "{imp}"
+    );
+}
+
+#[test]
+fn the_s_fallback_needs_a_clip_a_non_minimising_estimator_and_an_r_based_request() {
+    use CovarianceMethod as C;
+    use EstimationMethod as M;
+    assert!(r_falls_back_to_s(M::Saem, 1, C::Hessian));
+    assert!(r_falls_back_to_s(M::Vi, 1, C::Sandwich));
+    assert!(
+        !r_falls_back_to_s(M::Saem, 0, C::Hessian),
+        "nothing clipped"
+    );
+    assert!(
+        !r_falls_back_to_s(M::FoceI, 1, C::Hessian),
+        "FOCEI minimised it"
+    );
+    assert!(
+        !r_falls_back_to_s(M::Laplace, 1, C::Sandwich),
+        "Laplace minimised it"
+    );
+    assert!(
+        !r_falls_back_to_s(M::Saem, 1, C::CrossProduct),
+        "S was asked for"
+    );
+    for m in [M::Saem, M::Imp, M::Impmap, M::Vi, M::Bayes] {
+        assert!(!estimate_minimises_cov_objective(m), "{m:?}");
+    }
+    for m in [M::Foce, M::FoceI, M::FoceGn, M::FoceGnHybrid, M::Laplace] {
+        assert!(estimate_minimises_cov_objective(m), "{m:?}");
+    }
+}
+
+#[test]
+fn cov_objective_method_reads_quadrature_then_interaction() {
+    let o = |method, interaction, n_agq| FitOptions {
+        method,
+        interaction,
+        n_agq,
+        ..FitOptions::default()
+    };
+    use EstimationMethod as M;
+    assert_eq!(cov_objective_method(&o(M::Laplace, true, 7)), M::Laplace);
+    assert_eq!(cov_objective_method(&o(M::FoceI, true, 3)), M::Laplace);
+    assert_eq!(cov_objective_method(&o(M::Saem, true, 1)), M::FoceI);
+    assert_eq!(cov_objective_method(&o(M::Saem, false, 1)), M::Foce);
+}
+
+#[test]
+fn the_non_stationary_warning_says_which_of_the_two_floored_cells_r_is_in() {
+    // Codex review r1 §3: the floor clips every eigenvalue under `max(1e-10·λ_max, 1e-12)`,
+    // so a strictly positive-definite `R` like diag(1, 1e-11) triggers the fallback too. The
+    // clause must be true in both cells, and must differ between them. Both in one test, so a
+    // state stuck on either branch reddens it.
+    let pd = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 1e-11,
+        max_eigenvalue: 1.0,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        pd.contains(
+            "the FOCEI R matrix needed an eigenvalue floor at the SAEM estimate (it is positive \
+             definite with eigenvalues below the numerical floor: min eigenvalue 1.000e-11, max \
+             1.000e0)"
+        ),
+        "{pd}"
+    );
+    assert!(
+        !pd.contains("not positive definite") && !pd.contains("near-singular"),
+        "{pd}"
+    );
+    let indefinite = format_non_stationary_warning(&non_stationary_facts(None));
+    assert!(
+        indefinite.contains("(it is not positive definite: min eigenvalue -9.510e-2"),
+        "{indefinite}"
+    );
+    assert!(
+        !indefinite.contains("below the numerical floor"),
+        "{indefinite}"
+    );
+    // The absolute-floor cell (Codex review r2): every eigenvalue under 1e-12, condition
+    // number 2 — positive definite and well-conditioned, so not "near-singular" either.
+    let absolute = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 1e-13,
+        max_eigenvalue: 2e-13,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        absolute.contains(
+            "(it is positive definite with eigenvalues below the numerical floor: min eigenvalue \
+             1.000e-13, max 2.000e-13)"
+        ),
+        "{absolute}"
+    );
+    assert!(!absolute.contains("near-singular"), "{absolute}");
+    // Zero is not positive: an exactly singular R is the second cell.
+    let singular = format_non_stationary_warning(&NonStationaryFacts {
+        min_eigenvalue: 0.0,
+        ..non_stationary_facts(None)
+    });
+    assert!(
+        singular.contains("(it is not positive definite: min eigenvalue 0.000e0"),
+        "{singular}"
+    );
+}
+
+#[test]
+fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
+    // The premise of the cell above, measured on the production floor rather than assumed:
+    // diag(1, 1e-11) is positive definite, and `invert_psd_with_floor` clips it, so the
+    // fallback gate fires for a sampler and not for FOCEI.
+    let r = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 1e-11]));
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&r).expect("inverse");
+    assert!(
+        inv.min_eigenvalue > 0.0 && inv.n_clipped == 1,
+        "{} {}",
+        inv.min_eigenvalue,
+        inv.n_clipped
+    );
+    assert!(r_falls_back_to_s(
+        EstimationMethod::Saem,
+        inv.n_clipped,
+        CovarianceMethod::Hessian
+    ));
+    assert!(!r_falls_back_to_s(
+        EstimationMethod::FoceI,
+        inv.n_clipped,
+        CovarianceMethod::Hessian
+    ));
+    // And the absolute-floor cell: diag(1e-13, 2e-13) is clipped by `1e-12` at condition 2.
+    let tiny = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-13, 2e-13]));
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&tiny).expect("inverse");
+    assert!(
+        inv.min_eigenvalue > 0.0 && inv.n_clipped == 2,
+        "{} {}",
+        inv.min_eigenvalue,
+        inv.n_clipped
+    );
+}

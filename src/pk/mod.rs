@@ -305,13 +305,9 @@ pub(crate) fn effective_model_for_eval_iov<'a>(
         return model.effective_for(subject);
     }
     let n_eta = model.n_eta.min(stacked_eta.len());
-    let kappas: Vec<&[f64]> = if model.n_kappa == 0 {
-        Vec::new()
-    } else {
-        stacked_eta[n_eta..].chunks(model.n_kappa).collect()
-    };
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let combined_for = iov_occasion_eta(&occ_groups, &stacked_eta[..n_eta], &kappas, model.n_kappa);
+    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    let kappas = layout.kappa_chunks(stacked_eta);
+    let combined_for = iov_occasion_eta(&layout, &stacked_eta[..n_eta], &kappas);
     let mut ev = EventPkParams::default();
     fill_iov_record_params(
         model,
@@ -344,31 +340,27 @@ fn absorption_walk_or_twin<'a>(
 
 /// `η` per record for an IOV subject: `[η_bsv, κ_g]` for occasion `occ` in group `g`
 /// ([`crate::stats::likelihood::iov_occasion_groups`] order), `κ = 0` for an occasion
-/// with no group — an EVID=2 row asks for `u32::MAX` and gets that.
+/// with no group — an occasion-less caller asks for `u32::MAX` and gets that.
 fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &'a crate::stats::stacked_layout::StackedLayout,
     eta_bsv: &'a [f64],
     kappas: &'a [K],
-    n_kappa: usize,
 ) -> impl Fn(u32) -> Vec<f64> + 'a {
-    let occ_to_k: std::collections::HashMap<u32, usize> = occ_groups
-        .iter()
-        .enumerate()
-        .map(|(k, (occ_id, _))| (*occ_id, k))
-        .collect();
+    let n_kappa = layout.n_kappa();
     move |occ_id: u32| -> Vec<f64> {
         let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
         c.extend_from_slice(eta_bsv);
-        match occ_to_k.get(&occ_id) {
-            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
+        match layout.group_of(occ_id) {
+            Some(k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
             _ => c.extend(std::iter::repeat_n(0.0, n_kappa)),
         }
         c
     }
 }
 
-/// The per-record parameters of an IOV subject — each dose and observation under its own
-/// occasion's `η`, an EVID=2 row under `κ = 0` — as [`predict_iov`] evaluates them. One
+/// The per-record parameters of an IOV subject — each dose, observation and pk-only row
+/// under its own occasion's `η` ([`pk_only_row_occasion`], #1876) — as [`predict_iov`]
+/// evaluates them. One
 /// builder for the funnel and for [`effective_model_for_eval_iov`], so the route is decided
 /// on exactly the parameters the prediction then uses.
 fn fill_iov_record_params(
@@ -402,13 +394,14 @@ fn fill_iov_record_params(
             subject.obs_times[j],
         )
     }));
-    let pk_only_combined = combined_for(u32::MAX);
     pk_only.reserve_exact(subject.pk_only_times.len());
     pk_only.extend((0..subject.pk_only_times.len()).map(|m| {
+        // `u32::MAX` names no group, so an unresolvable row gets κ = 0 (#1876).
+        let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
         pk_params_at_time(
             model,
             theta,
-            &pk_only_combined,
+            &combined_for(occ),
             subject.pk_only_cov(m),
             subject.pk_only_times[m],
         )
@@ -958,7 +951,50 @@ pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
     if let Some(&occ) = subject.reset_occasions.get(r) {
         return Some(occ);
     }
-    let t_reset = subject.reset_times.get(r).copied()?;
+    record_occasion_before(subject, subject.reset_times.get(r).copied()?)
+}
+
+/// The occasion label to evaluate an EVID=2 or EVID=0/MDV=1 **pk-only row's** `$PK`
+/// under, on the `OCC`-column IOV path (#1876) — the one spelling every IOV engine
+/// reads, production and both `sens/` providers.
+///
+/// **The row's own `OCC` when the data carries one.** NONMEM runs `$PK` at a pk-only row
+/// under that row's occasion, measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: with the
+/// row at t = 110 carrying `OCC = 2` between `OCC = 1` records, the objective is the
+/// own-occasion one, not the κ = 0 one ferx gave before #1876 nor the preceding record's.
+///
+/// A `Subject` assembled in memory without `pk_only_occasions` falls back to the same
+/// scan [`reset_row_occasion`] uses, so such a row runs under its neighbour's occasion
+/// rather than κ = 0. `None` only for a subject with no labelled record at all.
+///
+/// The row's own label always has a κ slot: `iov_occasion_groups` gives an occasion that
+/// only pk-only rows carry a group of its own. So does every record the fallback scan
+/// reads (a reset is not one of them), so the row has no group only when the scan finds
+/// no labelled record at all — a subject with no κ group, where every caller's κ = 0 is
+/// the only value there is.
+pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
+    if let Some(&occ) = subject.pk_only_occasions.get(m) {
+        return Some(occ);
+    }
+    record_occasion_before(subject, subject.pk_only_times.get(m).copied()?)
+}
+
+/// The κ group of pk-only row `m` ([`pk_only_row_occasion`] through `occ_to_k`), as the
+/// `sens/` providers seed it. `None` is the κ = 0 row, where production's `combined_for`
+/// lands on a miss. For `occ_to_k` built from `iov_occasion_groups` that is only a
+/// subject with no labelled record, and so no group to miss.
+pub(crate) fn pk_only_row_group(
+    subject: &Subject,
+    m: usize,
+    occ_to_k: &std::collections::HashMap<u32, usize>,
+) -> Option<usize> {
+    pk_only_row_occasion(subject, m).and_then(|occ| occ_to_k.get(&occ).copied())
+}
+
+/// The occasion of the last labelled record strictly before `t_at`, else of the
+/// subject's earliest labelled record — the fallback scan of [`reset_row_occasion`]
+/// and [`pk_only_row_occasion`] for a subject built without per-row labels.
+fn record_occasion_before(subject: &Subject, t_at: f64) -> Option<u32> {
     // `>=` rather than `>` on the tie, with the kinds visited in the timeline's own
     // `DoseRecord < PkOnly < Obs` order, so at an exact time tie the LAST record processed
     // wins — which is the one `last_pk` held. Visiting doses first and keeping the earlier
@@ -970,20 +1006,19 @@ pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
         if earliest.is_none_or(|(bt, _)| t < bt) {
             earliest = Some((t, occ));
         }
-        if t < t_reset && best_before.is_none_or(|(bt, _)| t >= bt) {
+        if t < t_at && best_before.is_none_or(|(bt, _)| t >= bt) {
             best_before = Some((t, occ));
         }
     };
     for (k, d) in subject.doses.iter().enumerate() {
         consider(d.time, subject.dose_occasions.get(k).copied());
     }
-    // EVID=2 rows are records too, and they are the commonest neighbour on exactly the
-    // TV-covariate datasets #1133 targets. They carry no occasion label, so `last_pk` there
-    // was the occasion-less snapshot: report κ = 0 by yielding `u32::MAX`, which
-    // `combined_for` maps to zero κ, rather than skipping the row and reaching past it to
-    // an older record's occasion.
-    for &t in subject.pk_only_times.iter() {
-        consider(t, Some(u32::MAX));
+    // A pk-only row is a record too, under its own label (#1876). An unlabelled one is
+    // skipped: its own fallback is this same scan, which would reach the same record
+    // past it. Before #1876 it yielded `u32::MAX` (κ = 0), the snapshot such a row was
+    // then evaluated under.
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        consider(t, subject.pk_only_occasions.get(m).copied());
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
         consider(t, subject.occasions.get(j).copied());
@@ -1237,15 +1272,15 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// `pk_only_cov`) is used alongside its occasion eta, so a model with both a TV
 /// covariate and IOV κ is per-event correct in both.
 ///
-/// **pk-only (EVID=2) convention — deliberately different from [`predict_iov`].** Here
+/// **pk-only (EVID=2) convention — the decision window, not the `OCC` column.** Here
 /// a pk-only record takes the κ of the decision window containing its time (like any
 /// obs record), because in the reactive setting that observation genuinely occurs
-/// *during* that occasion. The static [`predict_iov`] instead maps pk-only rows to no
-/// occasion (`u32::MAX` ⇒ κ = 0, BSV-only), following the OCC-column semantics of #104.
-/// The two are consistent *within* their own path (the adaptive driver's
-/// `segment_occ_at` also uses [`occasion_of`], so materialiser and driver agree), but a
-/// future oracle that validates an adaptive IOV run *with EVID=2 rows* against
-/// `predict_iov` must account for this — they will disagree on the pk-only κ by design.
+/// *during* that occasion. The static [`predict_iov`] instead reads the row's own `OCC`
+/// label ([`pk_only_row_occasion`], #1876). The two are consistent *within* their own
+/// path (the adaptive driver's `segment_occ_at` also uses [`occasion_of`], so
+/// materialiser and driver agree); a future oracle that validates an adaptive IOV run
+/// *with EVID=2 rows* against `predict_iov` agrees only where the row's `OCC` names the
+/// decision window containing it.
 ///
 /// **Base dose at an occasion boundary — a second [`predict_iov`] divergence.** The
 /// driver assigns a *segment's* occasion from the last observation / EVID=2 record it
@@ -1341,7 +1376,9 @@ pub(crate) fn compute_event_pk_params_iov(
 ///
 /// `eta_bsv` is the BSV eta (length `n_eta`); `kappas[k]` is the kappa vector
 /// for the k-th occasion group in `iov_occasion_groups` order, including dose-only
-/// occasions. EVID=2 rows carry no occasion label and use zero kappa.
+/// and pk-only-only occasions. A pk-only row (`EVID=2`, or `EVID=0` with `MDV=1`) runs
+/// under its own occasion, or the record before it when unlabelled; zero kappa only
+/// when no record carries a label (#1876, `pk_only_row_occasion`).
 ///
 /// Every `PkModel` variant has event-driven analytical support and every ODE
 /// model takes the ODE path, so the dispatch below is total; an unsupported
@@ -1478,8 +1515,8 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let combined_for = iov_occasion_eta(&occ_groups, eta_bsv, kappas, n_kappa);
+    let layout = crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), n_kappa, subject);
+    let combined_for = iov_occasion_eta(&layout, eta_bsv, kappas);
 
     // Exact initial reservations preserve the convenience API's old footprint
     // for short vectors; later probes keep these capacities without allocating.
@@ -1492,8 +1529,11 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
         obs_params,
         pk_only_params,
     );
-    // EVID=2 rows carry no occasion label → BSV eta with zero kappa.
-    let pk_only_combined = combined_for(u32::MAX);
+    // The BSV-only vector `[η_bsv, 0…]`: the ODE engine's subject-level `eta`, the
+    // snapshot of a reset row with no resolvable occasion, and the scale of an
+    // unlabelled observation grid. A pk-only row reads its own occasion instead
+    // (`fill_iov_record_params`, #1876).
+    let bsv_only_combined = combined_for(u32::MAX);
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): nothing to integrate or superpose. The
@@ -1502,10 +1542,9 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
         // bottom of this function rather than through a concentration.
         vec![0.0; subject.obs_times.len()]
     } else if let Some(ref ode) = model.ode_spec {
-        // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the occasion
-        // that snapshot used to carry. The reader stores no `OCC` for a reset row, so the κ
-        // comes from [`reset_row_occasion`] — the record `last_pk` would have held there —
-        // rather than from `pk_only_combined`. Using the EVID=2 κ = 0 convention here would
+        // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the row's own
+        // `OCC` or, for a subject built without one, the occasion of the record `last_pk`
+        // would have held there ([`reset_row_occasion`]) — not κ = 0. A κ = 0 seed would
         // have traded the covariate error for a κ error: on a model with κ on a parameter
         // the seed reads, it moves the whole post-reset trajectory by `exp(κ)`.
         //
@@ -1517,7 +1556,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             let t = subject.reset_times[r];
             let combined = match reset_row_occasion(subject, r) {
                 Some(occ) => combined_for(occ),
-                None => pk_only_combined.clone(),
+                None => bsv_only_combined.clone(),
             };
             pk_params_at_time(model, theta, &combined, subject.reset_cov(r), t)
         }));
@@ -1525,7 +1564,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             ode,
             subject,
             theta,
-            &pk_only_combined,
+            &bsv_only_combined,
             dose_params.as_slice(),
             obs_params.as_slice(),
             pk_only_params.as_slice(),
@@ -1649,7 +1688,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             // same combination the non-IOV `compute_predictions_with_tv` path
             // scales with. Without this the predictions would be returned UNSCALED,
             // off by the full scale factor (#723 review).
-            apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+            apply_scaling(model, subject, theta, &bsv_only_combined, &mut preds);
         } else {
             // Every observation carries an occasion label and is owned by exactly
             // one group (`subject.occasions` is parallel to the obs grid — either
@@ -1660,7 +1699,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             // loops) with a bit-identical result (#723 review / efficiency
             // follow-up, #769).
             let raw = preds.clone();
-            for (occ_id, obs_indices) in &occ_groups {
+            for (occ_id, obs_indices) in layout.groups() {
                 // Dose-only occasions own no observations, so their scaling pass
                 // would write nothing — skip the redundant full `apply_scaling`
                 // (+ clone) rather than compute and discard it.
@@ -1701,7 +1740,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
         // observation is labelled. Unlabelled subjects fall through to the shared
         // κ = 0 call below, which is what the non-IOV path does too.
         let raw = preds.clone();
-        for (occ_id, obs_indices) in &occ_groups {
+        for (occ_id, obs_indices) in layout.groups() {
             if obs_indices.is_empty() {
                 continue;
             }
@@ -2743,7 +2782,14 @@ pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> boo
 
 /// True when the analytical PK predictor must produce a value for this subject —
 /// it carries at least one Gaussian observation (an obs whose CMT is **not** a
-/// registered non-Gaussian endpoint) or a pk-only prediction time.
+/// registered non-Gaussian endpoint).
+///
+/// A pk-only record (`pk_only_times`: an EVID=2 or EVID=0/MDV=1 row) does not
+/// count. The predictor returns one value per Gaussian observation and none at a
+/// pk-only time, and the list below has no consumer that reads one. Since #1809 the
+/// reader keeps those times on every subject, constant covariates included, so
+/// counting them would re-enable the dose-compartment check for a pure-TTE
+/// population whose records carry, say, a covariate-marker row.
 ///
 /// When this is `false` on an analytical (`ode_spec.is_none()`) model, nothing
 /// consumes the predictor's concentration-time output, so the event-driven walk
@@ -2774,11 +2820,10 @@ pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subje
         if model.endpoints.is_empty() {
             return true;
         }
-        !subject.pk_only_times.is_empty()
-            || subject
-                .obs_cmts
-                .iter()
-                .any(|cmt| !model.endpoints.contains_key(cmt))
+        subject
+            .obs_cmts
+            .iter()
+            .any(|cmt| !model.endpoints.contains_key(cmt))
     }
     #[cfg(not(feature = "survival"))]
     {
@@ -3226,6 +3271,7 @@ mod tests {
         let eta = vec![0.1_f64; model.n_eta + model.n_kappa];
 
         let base = |doses: Vec<DoseEvent>| Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0, 4.0, 26.0],
@@ -3244,6 +3290,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
         };
@@ -3540,6 +3587,7 @@ mod tests {
         .expect("fixture parses");
 
         let mut subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 9.0],
@@ -3557,6 +3605,7 @@ mod tests {
             // before it is occasion 1, which is what every neighbour-inferring rule
             // resolves to, and what ferx used before this was measured.
             reset_occasions: vec![2],
+            pk_only_occasions: Vec::new(),
             cens: vec![0; 2],
             // t=1 is occasion 1, t=9 (after the reset) is occasion 2, so both are real
             // kappa groups. An occasion named ONLY on a reset row is not a group at all —
@@ -3587,6 +3636,169 @@ mod tests {
         let inferred = predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[1];
 
         assert_relative_eq!(own / inferred, 3.0, epsilon = 1e-9);
+    }
+
+    /// Records at 0 (dose, occasion 1), 2 (pk-only), 5 (obs, occasion 1) and 8 (obs,
+    /// occasion 2). Occasion 2 is a κ group through the t = 8 observation.
+    fn pk_only_occasion_subject(pk_only_occasions: Vec<u32>) -> Subject {
+        Subject {
+            id: "1".into(),
+            doses: vec![bolus_dose(0.0, 1000.0)],
+            dose_occasions: vec![1],
+            obs_times: vec![5.0, 8.0],
+            observations: vec![1.0; 2],
+            obs_cmts: vec![1; 2],
+            occasions: vec![1, 2],
+            cens: vec![0; 2],
+            pk_only_times: vec![2.0],
+            pk_only_covariates: vec![HashMap::new()],
+            pk_only_occasions,
+            ..Default::default()
+        }
+    }
+
+    /// #1876: which occasion a pk-only row resolves to. The scan fallback only runs for a
+    /// subject built in memory without labels; the reader always stores them under an
+    /// `iov_column`.
+    #[test]
+    fn pk_only_row_occasion_prefers_its_own_label_then_the_record_before_it() {
+        // Its own label, which differs from the records on both sides.
+        assert_eq!(
+            pk_only_row_occasion(&pk_only_occasion_subject(vec![7]), 0),
+            Some(7)
+        );
+        // No label: the record strictly before it, the t = 0 dose.
+        let mut s = pk_only_occasion_subject(Vec::new());
+        s.dose_occasions = vec![4];
+        assert_eq!(pk_only_row_occasion(&s, 0), Some(4));
+        // No record before it: the earliest record, the t = 0 dose, not the latest (the
+        // t = 8 observation, occasion 2).
+        s.pk_only_times = vec![-1.0];
+        assert_eq!(pk_only_row_occasion(&s, 0), Some(4));
+        // No labelled record at all.
+        let bare = Subject {
+            pk_only_times: vec![2.0],
+            ..Default::default()
+        };
+        assert_eq!(pk_only_row_occasion(&bare, 0), None);
+        // A label is not a group. `None` is the κ = 0 row in every provider.
+        let occ_to_k = HashMap::from([(1u32, 0usize), (2, 1)]);
+        let s = pk_only_occasion_subject(vec![2]);
+        assert_eq!(pk_only_row_group(&s, 0, &occ_to_k), Some(1));
+        let s = pk_only_occasion_subject(vec![9]);
+        assert_eq!(pk_only_row_group(&s, 0, &occ_to_k), None);
+    }
+
+    /// #1876: a labelled pk-only row is a record in the scan a reset (or an unlabelled
+    /// pk-only row) falls back to, and an unlabelled one is skipped there. Before #1876
+    /// the scan saw every pk-only row as `u32::MAX`, so a reset right after one got κ = 0.
+    #[test]
+    fn the_record_scan_reads_a_pk_only_rows_label() {
+        // Reset at 3: the record before it is the pk-only row at 2, labelled 3, not the
+        // dose at 0 (occasion 1).
+        let mut s = pk_only_occasion_subject(vec![3]);
+        s.reset_times = vec![3.0];
+        assert_eq!(reset_row_occasion(&s, 0), Some(3));
+        // Unlabelled, the pk-only row is skipped and the dose's occasion is used.
+        s.pk_only_occasions.clear();
+        assert_eq!(reset_row_occasion(&s, 0), Some(1));
+    }
+
+    /// #1876 on the value: the pk-only row at `t_p = 2` governs `(0, 2]` under ITS
+    /// occasion, so the t = 5 observation is `D/V·exp(−k₂·t_p − k₁·(5 − t_p))`, with
+    /// `k_i = CL·exp(κ_i)/V`. κ₁ = ln 2 and κ₂ = ln 3, so the three conventions differ:
+    ///
+    /// | pk-only row under | `(0, 2]` rate | pred(5) |
+    /// |---|---|---|
+    /// | its own occasion: 2, or 9 that only it carries (κ₉ = ln 3) | 0.3 | 20·e^−1.2 |
+    /// | κ = 0 (ferx before #1876) | 0.1 | 20·e^−0.8 |
+    /// | the record before it (occasion 1) | 0.2 | 20·e^−1.0 |
+    ///
+    /// Run on the closed form and on an `[odes]` twin, which share
+    /// `fill_iov_record_params` and nothing downstream of it.
+    #[test]
+    fn iov_pk_only_row_runs_under_its_own_occasion() {
+        use crate::parser::model_parser::parse_model_string;
+        let header = "
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.04
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+";
+        let tail = "
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let analytical =
+            parse_model_string(&format!("{header}  pk one_cpt_iv(cl=CL, v=V)\n{tail}"))
+                .expect("analytical fixture parses");
+        let ode = parse_model_string(&format!(
+            "{header}  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+{tail}"
+        ))
+        .expect("ODE fixture parses");
+        let own = 20.0 * (-1.2f64).exp();
+        let kappa0 = 20.0 * (-0.8f64).exp();
+        let previous = 20.0 * (-1.0f64).exp();
+        // Measured worst relative errors (macOS arm64): analytical 2.0e-16; ODE 1.03e-5,
+        // the same order in all three conventions, i.e. RK45 at the default `reltol = 1e-4`
+        // and not the switch at t = 2. 1e-4 keeps ~10x headroom; the straddle needs 0.22.
+        for (name, model, tol) in [("analytical", &analytical, 1e-12), ("ode", &ode, 1e-4)] {
+            let theta = model.default_params.theta.clone();
+            let pred = |labels: Vec<u32>| {
+                let s = pk_only_occasion_subject(labels);
+                let groups = crate::stats::likelihood::iov_occasion_groups(&s);
+                let mut kappas = vec![vec![0.0]; groups.len()];
+                // Occasion 9 is carried by the pk-only row alone, when it is so labelled.
+                for (occ, kappa) in [(1, 2.0f64.ln()), (2, 3.0f64.ln()), (9, 3.0f64.ln())] {
+                    if let Some(k) = groups.iter().position(|(id, _)| *id == occ) {
+                        kappas[k] = vec![kappa];
+                    }
+                }
+                predict_iov(model, &s, &theta, &[0.0], &kappas)[0]
+            };
+            let got = pred(vec![2]);
+            assert!(got.is_finite(), "{name}: {got}");
+            eprintln!(
+                "{name}: pred(5) relative error {:e}",
+                (got - own).abs() / own
+            );
+            assert!(
+                (got - own).abs() / own < tol,
+                "{name}: pred(5) = {got}, own-occasion value {own}"
+            );
+            // The straddle: the conventions differ by 22% and 49% of `own`, far above `tol`.
+            for (wrong, what) in [(kappa0, "kappa = 0"), (previous, "previous record")] {
+                assert!(
+                    (got - wrong).abs() / own > 0.1,
+                    "{name}: indistinguishable from the {what} convention"
+                );
+            }
+            // A label no dose or observation carries gets a κ group of its own, so the
+            // row runs under κ₉ = ln 3, not κ = 0.
+            let only_pk_only = pred(vec![9]);
+            assert!(
+                (only_pk_only - own).abs() / own < tol,
+                "{name}: an occasion only the pk-only row carries gave {only_pk_only}, \
+                 its own kappa gives {own} (kappa = 0 is {kappa0})"
+            );
+            // No label (an in-memory subject): the record before it, the occasion-1 dose.
+            let unlabelled = pred(Vec::new());
+            assert!(
+                (unlabelled - previous).abs() / previous < tol,
+                "{name}: unlabelled row gave {unlabelled}, previous record is {previous}"
+            );
+        }
     }
 
     /// #1133 on the adaptive (decision-window) IOV materialiser: a reset row is a record,
@@ -3630,6 +3842,7 @@ mod tests {
 
         let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 40.0],
@@ -3650,6 +3863,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3675,6 +3889,7 @@ mod tests {
         // `compute_predictions` should zero the state at the reset. Dose at
         // t=0, reset at t=5, obs at t=1 (positive) and t=6 (zero).
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 6.0],
@@ -3693,6 +3908,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3732,6 +3948,7 @@ mod tests {
         n_obs: usize,
     ) -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: (0..n_doses).map(|i| bolus_dose(i as f64, 100.0)).collect(),
             obs_times: (0..n_obs).map(|i| 1.0 + i as f64).collect(),
@@ -3750,6 +3967,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -3764,6 +3982,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -3983,6 +4202,7 @@ mod tests {
     #[test]
     fn test_compute_predictions_length() {
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 2.0, 4.0, 8.0],
@@ -4001,6 +4221,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -4747,6 +4968,7 @@ mod tests {
         let obs_times = vec![1.0, 3.0, 25.0, 27.0];
         let n = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)],
             obs_times,
@@ -4765,6 +4987,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -5408,6 +5631,7 @@ mod tests {
 
         let n_obs = obs_times.len();
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "mixed".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
@@ -5426,6 +5650,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };

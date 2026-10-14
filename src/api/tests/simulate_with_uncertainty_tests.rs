@@ -30,6 +30,7 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -188,6 +189,7 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
     let n = snaps.len();
     let base = snaps.first().cloned().unwrap_or_default();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: Vec::new(),
         obs_times: vec![0.0; n],
@@ -206,6 +208,7 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -358,6 +361,7 @@ fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("S{}", i + 1),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
@@ -376,6 +380,7 @@ fn tiny_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })

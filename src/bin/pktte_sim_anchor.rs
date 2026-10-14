@@ -67,6 +67,7 @@ fn main() {
     use std::collections::HashMap;
     let subjects = (0..N)
         .map(|i| ferx_core::types::Subject {
+            obs_rgroup: Vec::new(),
             id: (i + 1).to_string(),
             doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
             obs_times: vec![],
@@ -85,6 +86,7 @@ fn main() {
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: vec![],
+            pk_only_occasions: Vec::new(),
             fremtype: vec![],
             obs_records: vec![ObsRecord::Event {
                 time: HORIZON,

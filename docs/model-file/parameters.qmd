@@ -96,7 +96,10 @@ level per contrast group, so they require `init = 0`; `FIX` then fixes the
 whole block at zero. Bounds apply to the free coefficients, not to a derived
 negative sum, which can lie outside them. Free coefficients are named after
 their combination, so estimates report as
-`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
+`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time as written
+in the data, the `TIME` NONMEM's `$PRED` sees: a dose, `MDV=1` or `EVID=2` row
+co-timed with an observation adds no level, and after an `EVID=3`/`4` reset that
+restarts `TIME` the later period shares the earlier period's levels. Anything
 else is a covariate column, which the reader loads automatically.
 
 The two forms cannot be confused: brackets containing only digits are a level
@@ -136,9 +139,9 @@ refused with `E_THETA_LEVEL_BINDING` if anything that subject is scored on reads
 the block, and binds otherwise. Whether it reads the block is measured on its
 likelihood at two points, with the same θ as
 [Levels with no effect](#levels-with-no-effect): the initial estimates with the
-random effects at 0, and every non-`FIX` θ moved, here with each random effect
-moved by a different amount from 0.05 (so a gate on a difference of two random
-effects does not cancel). So a read that another θ or a random effect switches off at the
+random effects at 0, and every non-`FIX` θ moved, with each random effect moved
+by a different amount from 0.05 (so a gate on a difference of two random effects
+does not cancel). So a read that another θ or a random effect switches off at the
 initial estimates is refused when the moved point opens it, and the same caveat
 applies: a read that is switched off at both points looks like no read. Earlier versions indexed every such subject at
 the first level, whatever its columns said (#1797).
@@ -202,7 +205,7 @@ and it is chosen by looking at both the model and the data:
 | Situation | Default |
 |---|---|
 | The block's levels each lie within one subject (within one occasion of one subject, for a kappa) **and** the block absorbs one random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
-| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
+| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused under `none`; under any other contrast only when another θ carries the direction that contrast removes (typically an intercept) (see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)) |
 | The block absorbs **two** random effects | refused, under every contrast (see [Two random effects](#two-random-effects)) |
 | A level has no effect on the likelihood | `auto` takes a contrast that carries it; an explicit contrast that cannot is refused (see [Levels with no effect](#levels-with-no-effect)) |
 | Otherwise | sum-to-zero over **all** levels |
@@ -317,14 +320,50 @@ that enters `y` only through a time-varying term, such as `EMAX` in
 observation: on `[STUDY, VISIT]` with several times per visit, it stays
 identified.
 
-A nested block that absorbs a random effect defaults to `sum_to_zero_within`, and
-an explicit `sum_to_zero`, `ref` or `none` is refused. A **one-column** block has
-no such rescue. `PLACEBO[STUDY]` with one subject per study makes each level the
-same quantity as that subject's random effect, under every contrast, so it is
-refused, with the advice to remove the block or drop the random effect. Fitted
-anyway, ω collapses to 0. With two or more subjects per study the same model
-binds, since the random effect is then identified from the spread within each
-study.
+A nested block that absorbs a random effect defaults to `sum_to_zero_within`. An
+explicit `none` is refused. So is an explicit `sum_to_zero` or `ref` when another
+θ carries the direction that contrast removes, which is typically an intercept
+(see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)).
+A **one-column** block has no within-group rescue. `PLACEBO[STUDY]` with one
+subject per study, next to `E0 = TVE0 + PLACEBO + ETA_E0`, makes each level the same quantity
+as that subject's random effect, under every contrast, so it is refused, with
+the advice to remove the block or drop the random effect. Fitted anyway, ω
+collapses to 0. With two or more subjects per study the same model binds, since
+the random effect is then identified from the spread within each study.
+
+##### When nothing carries the levels' mean
+
+The refusals above assume the model has an intercept. Under `none` the levels
+reproduce the random effect outright. Sum-to-zero takes one direction away from
+the levels, their common mean, and `ref` takes the reference level. The random
+effect keeps that direction unless another θ carries it: a `TVE0` read on every
+record, or any θ whose effect is a combination of the levels'. Some models have
+no such θ. In `E0 = TVE0 * (1 + 0.1 * OCC) + PLACEBO + ETA_E0`, with `OCC`
+varying within each subject, `TVE0` moves every record by a different amount.
+Sum-to-zero and `ref` then bind the one-column block, `auto` takes sum-to-zero,
+and `none` alone is refused. The random effect is identified, but only through
+that one direction, however many subjects there are, so expect ω to collapse.
+On a simulated design of 20 subjects with ω² = 0.5, ferx and NONMEM 7.6.0 both
+estimate ω² ≈ 0. Their estimates agree, and ferx warns that ω reached its lower
+guard. Such a fit says the data cannot inform this random effect next to the
+block; it does not estimate ω.
+
+The binder does not guess which case applies; it **measures** it (#1840). It
+checks whether each subject's (or occasion's) random-effect column, over the
+whole population, lies in the span of the other θ, the levels coded by the
+contrast, and the coarser random effects. It uses central differences at the two
+points the other checks use. The block binds under a contrast only when, at both
+points, everything is finite and some unit keeps a direction outside that span by
+at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model with
+a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
+measured, so it keeps the refusal.
+
+The two contrasts can disagree. A θ read on one study's records alone carries the
+levels' sum but not study 1's reference level, so sum-to-zero is refused and
+`ref` binds. `auto` then takes `ref`. On `[STUDY, TIME]` with `TIME = 0` as the
+reference, an Emax term `EMAX * TIME / (TIME + ET50)` carries the sum and is 0
+at the reference, which splits the two the same way. The refusal names the
+contrast that binds.
 
 ##### When no single expression reads both
 
@@ -445,8 +484,10 @@ acts at `TIME = 0`.
 
 The check compares every record's prediction and residual magnitude after a
 step in each level's θ, at two points: the initial estimates, and a nearby
-point with every non-`FIX` θ moved inside its bounds and every random effect at
-0.05. A level counts as having no effect only when nothing changes at both. A
+point with every non-`FIX` θ moved inside its bounds and each random effect
+moved by a different amount from 0.05, the same two points the other level checks
+use, so a block read through a difference of random effects
+(`exp(PLACEBO * (ETA_CL - ETA_V))`) is live (#1852). A level counts as having no effect only when nothing changes at both. A
 block that acts only through a θ initialised at 0 therefore binds; one whose θ
 is fixed at 0 does not. Two points are not a proof: a θ that switches the block
 off near its initial estimate (a lag, a threshold) can make a live level look

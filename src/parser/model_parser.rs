@@ -3356,6 +3356,16 @@ pub fn parse_full_model_with(
     if error_lines_opt.is_none() && !is_endpoint_only {
         return Err("Missing [error_model] block".to_string());
     }
+    // `correlation <kind>(RHO) by COL` (#1081) is a statement about `R`, not an
+    // endpoint, so it is taken out before the endpoint grammar sees the block.
+    let (error_lines_opt, correlation_decl) = match error_lines_opt {
+        Some(lines) => {
+            let (rest, decl) = split_correlation_line(lines)?;
+            (Some(rest), decl)
+        }
+        None => (None, None),
+    };
+    let error_lines_opt = error_lines_opt.as_ref();
     let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
         if let Some(error_lines) = error_lines_opt {
             parse_error_model(error_lines)?
@@ -4498,6 +4508,16 @@ pub fn parse_full_model_with(
         ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
         _ => Vec::new(),
     };
+    let residual_serial = match &correlation_decl {
+        Some(decl) => resolve_correlation(
+            decl,
+            &parsed_error_model,
+            iiv_on_ruv_name.as_deref(),
+            !block_sigmas.is_empty(),
+            &thetas,
+        )?,
+        None => None,
+    };
     let (error_model, error_spec) =
         build_error_spec(parsed_error_model, &sigma_names, is_ode, is_algebraic)?;
     let (residual_correlations, residual_correlation_fixed) =
@@ -4851,6 +4871,7 @@ pub fn parse_full_model_with(
         .collect();
 
     let model = CompiledModel {
+        residual_serial: residual_serial.clone(),
         priors: declared_priors,
         // `[priors] from_fit` is read further down, once `extract_blocks` output
         // is in scope, and assigned onto `model` there.
@@ -5545,7 +5566,6 @@ pub fn parse_full_model_with(
     if !selector_covariates.is_empty() {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
-
     // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
     // up in the same per-event `HashMap` every other covariate consumer uses — but they
     // are named in the block rather than in an expression, so none of the statement
@@ -6052,6 +6072,23 @@ pub fn parse_full_model_with(
     // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
     // now carries its direct-θ channel), just never seen by `indiv_stmts`.
     event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // A `correlation` line's `ρ` is read by `R` (#1081) — and nowhere else: a
+    // second reader would split its gradient across two channels, one of which
+    // the dense-`R` routing does not know about. Even a line the parser dropped
+    // (`ρ` FIX 0) keeps its θ "used", since the user wrote it for that line.
+    if let Some(decl) = &correlation_decl {
+        if let Some(idx) = model.theta_names.iter().position(|n| *n == decl.rho) {
+            if REFERENCED_THETAS.with(|c| c.borrow().contains(&idx)) {
+                return Err(format!(
+                    "[error_model] `correlation {}({})`: theta `{}` is also used by a model \
+                     expression. The correlation of a `correlation` line is a parameter of its \
+                     own; declare a separate theta for it.",
+                    decl.kind_name, decl.rho, decl.rho
+                ));
+            }
+            event_model_used_thetas.extend(std::iter::once(idx));
+        }
+    }
     // A θ a `[covariate_model]` relation declares (`=> THETA_CL_WT(...)`) while the
     // relation still waits on a data statistic (#1738): the relation emits no
     // expression until it is bound, so nothing in `indiv_stmts` reads the θ yet —
@@ -6299,6 +6336,15 @@ pub fn parse_full_model_with(
                 undeclared.join(", ")
             ));
         }
+    }
+
+    // A `correlation … by COL` line's columns are required data columns (#1081),
+    // read per row: the reader has to take them and the pruning has to keep them.
+    // Registered after the warning above, which is about columns *model
+    // expressions* read: a grouping column's type changes nothing, so a `by` column
+    // the expressions do not also read is not reported there.
+    if let Some(decl) = &correlation_decl {
+        register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
     }
 
     // Record what this model was compiled from (#1621), so a fit can carry it.
@@ -14176,6 +14222,31 @@ fn build_ode_spec(
     // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
     // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
     let pk_reads_model_time = pk_reads_tafd || pk_reads_solver_time || pk_reads_tad;
+    // Per `init(state) = …` directive, which individual parameters it reads (#1853).
+    // Collected by name, because an init expression is resolved by name against the map
+    // `init_fn` builds below (states + individual parameters, all three cases) and is
+    // then sealed inside that closure, where nothing can inspect it. The state's slot
+    // rides along so `chz_dependency_slice` can ask whether that seed can reach the
+    // hazard accumulator at all.
+    let init_indiv_reads: Vec<(usize, Vec<usize>)> = init_specs
+        .iter()
+        .map(|(state_idx, expr)| {
+            let mut read_names: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            visit_expr_nodes(expr, &mut |e| {
+                if let Expression::Variable(name) = e {
+                    read_names.insert(name.to_ascii_uppercase());
+                }
+            });
+            let params: Vec<usize> = indiv_names_owned
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| read_names.contains(&n.to_ascii_uppercase()))
+                .map(|(i, _)| i)
+                .collect();
+            (*state_idx, params)
+        })
+        .collect();
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -14192,6 +14263,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        init_indiv_reads,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -15771,6 +15843,35 @@ pub(crate) fn mixing_logp_grad(
         }
     }
     Some(out)
+}
+
+/// Central-difference `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) for **either** mixing form
+/// (#1956) — the covariance step's per-subject mixture score takes it for the `p`
+/// form, which `mixing_logp_grad` declines. The outer gradient can fall back to an FD
+/// of the whole mixture objective there; a per-subject score has no such fallback.
+/// Differences `eval_mixing_log_probs` itself, so the clamp and renormalisation the
+/// objective applies are exactly what is differentiated; same step as the logit form's
+/// expression FD.
+pub(crate) fn mixing_logp_grad_fd(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Vec<Vec<f64>> {
+    let nt = theta.len();
+    let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
+    let mut tperturb = theta.to_vec();
+    for j in 0..nt {
+        let h = 1e-6 * theta[j].abs().max(1.0);
+        tperturb[j] = theta[j] + h;
+        let fp = eval_mixing_log_probs(spec, &tperturb, covariates);
+        tperturb[j] = theta[j] - h;
+        let fm = eval_mixing_log_probs(spec, &tperturb, covariates);
+        tperturb[j] = theta[j];
+        for (c, row) in out.iter_mut().enumerate() {
+            row[j] = (fp[c] - fm[c]) / (2.0 * h);
+        }
+    }
+    out
 }
 
 fn parse_parameters(
@@ -18117,6 +18218,146 @@ fn error_model_semicolon_hint(lines: &[String]) -> Option<String> {
     parse_error_model_inner(&without_tail)
         .is_ok()
         .then(|| semicolon_is_not_a_comment("error_model", shown))
+}
+
+/// A `correlation <kind>(RHO) by COL[, COL…]` line of `[error_model]` (#1081),
+/// as written: names not yet resolved.
+struct CorrelationDecl {
+    /// `cs` / `ar1` / `car1`, lowercased.
+    kind_name: String,
+    kind: crate::types::ResidualSerialKind,
+    /// The θ named as `ρ`.
+    rho: String,
+    by: Vec<String>,
+}
+
+/// Every `correlation` structure the parser accepts, as `(keyword, kind)`.
+const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
+    ("cs", crate::types::ResidualSerialKind::Cs),
+    ("ar1", crate::types::ResidualSerialKind::Ar1),
+    ("car1", crate::types::ResidualSerialKind::Car1),
+];
+
+/// Take the `correlation …` line (#1081) out of an `[error_model]` block and
+/// parse it, returning the remaining lines for the endpoint grammar. At most one
+/// such line; it must be the whole line.
+fn split_correlation_line(
+    lines: &[String],
+) -> Result<(Vec<String>, Option<CorrelationDecl>), String> {
+    let head = Regex::new(r"(?i)^\s*correlation\b").unwrap();
+    let full = Regex::new(
+        r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",
+    )
+    .unwrap();
+    let mut rest = Vec::with_capacity(lines.len());
+    let mut decl: Option<CorrelationDecl> = None;
+    for line in lines {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if !head.is_match(code) {
+            rest.push(line.clone());
+            continue;
+        }
+        if decl.is_some() {
+            return Err(
+                "[error_model] has more than one `correlation` line; a model takes one \
+                        residual correlation structure"
+                    .to_string(),
+            );
+        }
+        let Some(c) = full.captures(code) else {
+            return Err(format!(
+                "[error_model]: cannot read `{code}`. Expected `correlation <structure>(THETA) by \
+                 COLUMN`, e.g. `correlation cs(RHO) by ARM`, where <structure> is one of: {}.",
+                correlation_kind_list()
+            ));
+        };
+        let kind_name = c[1].to_lowercase();
+        let Some(&(_, kind)) = CORRELATION_KINDS.iter().find(|(k, _)| *k == kind_name) else {
+            return Err(format!(
+                "[error_model] `correlation {}(…)`: unknown structure `{}`. Supported: {}.",
+                &c[1],
+                &c[1],
+                correlation_kind_list()
+            ));
+        };
+        let by: Vec<String> = c[3]
+            .trim_matches(|ch: char| ch == '(' || ch == ')' || ch.is_whitespace())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        decl = Some(CorrelationDecl {
+            kind_name,
+            kind,
+            rho: c[2].to_string(),
+            by,
+        });
+    }
+    Ok((rest, decl))
+}
+
+fn correlation_kind_list() -> String {
+    CORRELATION_KINDS
+        .iter()
+        .map(|(k, _)| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a `correlation` line against the rest of the model (#1081): its `ρ`
+/// must be a declared θ, and the line is refused next to the residual features
+/// phase 1 does not compose it with. `Ok(None)` when `ρ` is `FIX`ed at 0 — the
+/// line is then dropped, exactly as a `FIX` zero `block_sigma` off-diagonal is,
+/// so the model is the independent one bit for bit.
+fn resolve_correlation(
+    decl: &CorrelationDecl,
+    parsed: &ParsedErrorModel,
+    iiv_on_ruv: Option<&str>,
+    has_block_sigma: bool,
+    thetas: &[ThetaSpec],
+) -> Result<Option<crate::types::ResidualSerial>, String> {
+    let line = format!("correlation {}({})", decl.kind_name, decl.rho);
+    match parsed {
+        ParsedErrorModel::Single(..) => {}
+        ParsedErrorModel::PerCmt(_) => {
+            return Err(format!(
+                "[error_model] `{line}` is not supported with per-CMT (multi-endpoint) error \
+                 models: the correlation applies to one endpoint's rows."
+            ))
+        }
+        ParsedErrorModel::Selected { .. } => {
+            return Err(format!(
+                "[error_model] `{line}` is not supported with a covariate-selected \
+                 (`if … else`) error model."
+            ))
+        }
+    }
+    if let Some(eta) = iiv_on_ruv {
+        return Err(format!(
+            "[error_model] `{line}` is not supported together with `iiv_on_ruv = {eta}`."
+        ));
+    }
+    if has_block_sigma {
+        return Err(format!(
+            "[error_model] `{line}` is not supported in a model that also declares \
+             `block_sigma`: the two are different residual correlations, and a model takes one."
+        ));
+    }
+    let Some((rho_theta, spec)) = thetas.iter().enumerate().find(|(_, t)| t.name == decl.rho)
+    else {
+        return Err(format!(
+            "[error_model] `{line}`: `{}` is not a theta declared in [parameters]. The \
+             correlation is an ordinary theta, e.g. `theta {}(0.3, -0.2, 0.95)`.",
+            decl.rho, decl.rho
+        ));
+    };
+    if spec.fixed && spec.init == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::types::ResidualSerial {
+        kind: decl.kind,
+        rho_theta,
+        by: decl.by.clone(),
+    }))
 }
 
 fn parse_error_model(
@@ -25924,6 +26165,20 @@ pub struct OdeRhsProgram {
     /// (#1210) — that path has no accumulator handling and is reachable only if a routing
     /// gate is widened.
     has_chz: bool,
+    /// One entry per `init(state) = …` directive: `(the state's slot, the individual
+    /// parameters the expression reads, as indices into
+    /// [`crate::types::CompiledModel::indiv_param_names`])`.
+    ///
+    /// The state slot is load-bearing, not decoration: an `init()` is frozen by the
+    /// hazard pass's one snapshot only when the state it seeds can reach the
+    /// accumulator — see [`Self::chz_dependency_slice`].
+    ///
+    /// Recorded here rather than on [`crate::ode::OdeSpec`] — where `init_fn` itself
+    /// lives — because `OdeSpec`'s fields are `pub` and exhaustively named at 79
+    /// construction sites, while this struct's are private and built in exactly one
+    /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
+    /// parse time or not at all.
+    init_indiv_reads: Vec<(usize, Vec<usize>)>,
 }
 
 impl OdeRhsProgram {
@@ -25966,6 +26221,232 @@ impl OdeRhsProgram {
     /// signal, that a gate stopped asking one of them.
     pub(crate) fn reads_model_time(&self) -> bool {
         self.uses_time_vars() || self.reads_time_builtin()
+    }
+
+    /// The **backward slice** of the cumulative-hazard accumulator in `chz_slot`: one
+    /// `bool` per var slot of this compiled `[odes]` block, `true` where that slot's
+    /// value can affect the accumulator (#1853, round-1 review of PR #1924).
+    ///
+    /// This is the predicate the #1853 refusal needs, and a syntactic "does the RHS
+    /// mention it" is not: on a model with `CL = TVCL·(1 + K·TIME)`,
+    /// `d/dt(central) = −(CL/V)·central` and `hazard = H0`, the accumulator integrates
+    /// `H0` alone, so freezing `CL` at `TIME = 0` cannot move `H` or `h` and refusing the
+    /// model would be a false refusal of a correctly-handled one. `d/dt(chz)` reading
+    /// `central` is what pulls `central` — and through its own derivative `CL` and `V` —
+    /// into the slice.
+    ///
+    /// A standard backward slice, by fixpoint over the var slots (a slot can be written
+    /// after the statement that reads it, so one pass is not enough):
+    ///
+    /// * seed `chz_slot` itself;
+    /// * a statement writing a slot already in the slice puts everything it reads in;
+    /// * an `if` whose branch `k` writes a slot in the slice puts the reads of
+    ///   conditions **`0..=k`** in — and of no later one — since branch `k` runs exactly
+    ///   when those decided it should; a needed `else` takes the whole prefix. Adding
+    ///   every condition instead over-refuses a `TIME`-reading condition that governs
+    ///   only a sibling arm the hazard never sees, and adding the needed arm's own
+    ///   condition alone under-approximates the other way (round-2 review of PR #1924);
+    /// * a name-based `Statement::Assign` / `DiffEq` — which the resolved program does
+    ///   not contain — puts *every* slot in, so an unresolved snapshot degrades to the
+    ///   syntactic answer rather than to a false accept.
+    ///
+    /// Each statement's read set is probed with [`stmts_read_slots`] one slot at a time
+    /// rather than extracted by a new walk, so there is no second reader of the bytecode
+    /// to drift from it; `n_vars_total` is tens and this runs once per model.
+    ///
+    /// **What it deliberately leaves out** is the dose-record half: the input-rate
+    /// forcings (absorption kernel, pathway fraction, route lag), `F`/`ALAG`/`D`/`R` and
+    /// the `SS=1` run-in reach the states too, but the hazard pass reads each of them at
+    /// its own dose record (#1575), so they are not frozen and have no business in a
+    /// slice of what *is*. `extract_input_rate_terms` has already lifted them out of
+    /// `stmts`, so this falls out rather than needing a rule.
+    pub(crate) fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
+        /// Every slot any statement in `stmts` writes, recursively.
+        fn writes_into(stmts: &[Statement], out: &mut Vec<usize>) {
+            for s in stmts {
+                match s {
+                    Statement::AssignBc(i, _)
+                    | Statement::AssignIdx(i, _)
+                    | Statement::DiffEqBc(i, _)
+                    | Statement::DiffEqIdx(i, _) => out.push(*i),
+                    Statement::Assign(..) | Statement::DiffEq(..) => {}
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (_, body) in branches {
+                            writes_into(body, out);
+                        }
+                        if let Some(eb) = else_body {
+                            writes_into(eb, out);
+                        }
+                    }
+                }
+            }
+        }
+        fn add(slot: usize, needed: &mut [bool], changed: &mut bool) {
+            if let Some(x) = needed.get_mut(slot) {
+                if !*x {
+                    *x = true;
+                    *changed = true;
+                }
+            }
+        }
+        fn expand(stmts: &[Statement], n: usize, needed: &mut Vec<bool>, changed: &mut bool) {
+            for s in stmts {
+                match s {
+                    Statement::AssignBc(i, _)
+                    | Statement::AssignIdx(i, _)
+                    | Statement::DiffEqBc(i, _)
+                    | Statement::DiffEqIdx(i, _) => {
+                        // A write to a slot outside the mask (`usize::MAX`, an
+                        // unresolvable name) is treated as needed: its reads go in.
+                        if !needed.get(*i).copied().unwrap_or(true) {
+                            continue;
+                        }
+                        let one = std::slice::from_ref(s);
+                        for t in 0..n {
+                            if stmts_read_slots(one, &[t]) {
+                                add(t, needed, changed);
+                            }
+                        }
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        // Control dependence, **per arm**. Branch `k` runs only when
+                        // conditions `0..k` were all false and its own is true, so a
+                        // needed write inside it is governed by conditions `0..=k` — and
+                        // by no later one. A needed write in the `else` is governed by
+                        // all of them.
+                        //
+                        // Taking the highest such arm covers every lower one
+                        // (`0..=k ⊇ 0..=j` for `j < k`), so this is one prefix, not a
+                        // union of ranges. Adding *every* condition whenever *anything*
+                        // inside is needed over-refuses: a `TIME`-reading condition on a
+                        // sibling arm that only writes a state the hazard never sees
+                        // would be pulled in (round-2 review of PR #1924). Adding only
+                        // the needed arm's own condition would under-approximate the
+                        // other way, which is a false accept — hence the prefix.
+                        let needed_write = |body: &[Statement], needed: &[bool]| -> bool {
+                            let mut written: Vec<usize> = Vec::new();
+                            writes_into(body, &mut written);
+                            written
+                                .iter()
+                                .any(|&w| needed.get(w).copied().unwrap_or(true))
+                        };
+                        let mut upto: Option<usize> = None;
+                        for (k, (_, body)) in branches.iter().enumerate() {
+                            if needed_write(body, needed) {
+                                upto = Some(k);
+                            }
+                        }
+                        if let Some(eb) = else_body {
+                            if needed_write(eb, needed) {
+                                upto = branches.len().checked_sub(1);
+                            }
+                        }
+                        if let Some(upto) = upto {
+                            for (cond, _) in branches.iter().take(upto + 1) {
+                                for t in 0..n {
+                                    if cond_reads_slots(cond, &[t]) {
+                                        add(t, needed, changed);
+                                    }
+                                }
+                            }
+                        }
+                        for (_, body) in branches {
+                            expand(body, n, needed, changed);
+                        }
+                        if let Some(eb) = else_body {
+                            expand(eb, n, needed, changed);
+                        }
+                    }
+                    // Unresolved arms cannot be attributed to a slot; the resolved
+                    // program has none (`resolve_variable_indices` rewrites every one to
+                    // `AssignBc`/`DiffEqBc`). Degrade to "everything reaches the hazard",
+                    // which is the pre-slice syntactic answer.
+                    Statement::Assign(..) | Statement::DiffEq(..) => {
+                        for t in 0..n {
+                            add(t, needed, changed);
+                        }
+                    }
+                }
+            }
+        }
+
+        let n = self.n_vars_total;
+        let mut needed = vec![false; n];
+        let mut changed = false;
+        add(chz_slot, &mut needed, &mut changed);
+        loop {
+            let mut changed = false;
+            expand(&self.stmts, n, &mut needed, &mut changed);
+            if !changed {
+                break;
+            }
+        }
+        needed
+    }
+
+    /// Does individual parameter `i` (declaration order, parallel to
+    /// [`crate::types::CompiledModel::indiv_param_names`]) lie in a
+    /// [`Self::chz_dependency_slice`] — i.e. does the RHS read it somewhere the
+    /// accumulator depends on?
+    ///
+    /// Asked by **var slot** (`state_count + i`, see [`Self::eval_rhs_g`]), which is one
+    /// slot per parameter even where two names share a PK slot (#1356, #1898), so this is
+    /// exact per parameter rather than per PK slot. Parameter slots are read and never
+    /// written, so a `true` here *is* "a statement the accumulator depends on reads it".
+    ///
+    /// Requires [`Self::has_indiv_param`] first.
+    pub(crate) fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
+        debug_assert!(
+            self.has_indiv_param(i),
+            "ask has_indiv_param first: slot state_count + {i} is an intermediate's"
+        );
+        self.has_indiv_param(i)
+            && slice
+                .get(self.state_count + i)
+                .copied()
+                .unwrap_or(/* outside the mask: assume it reaches */ true)
+    }
+
+    /// The `init(state) = …` half of [`Self::indiv_param_reaches_chz`]: does an initial
+    /// condition **of a state the accumulator depends on** read individual parameter `i`?
+    ///
+    /// The state test is what keeps this from refusing a seed the hazard cannot see —
+    /// `init(peripheral) = BASE` on a model whose accumulator reads only `central` and
+    /// whose `peripheral` never returns to it.
+    ///
+    /// Requires [`Self::has_indiv_param`] first. A seed whose state slot is outside the
+    /// mask counts as reaching, for the same reason the sibling does.
+    pub(crate) fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
+        debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
+        self.has_indiv_param(i)
+            && self.init_indiv_reads.iter().any(|(state_slot, params)| {
+                slice.get(*state_slot).copied().unwrap_or(true) && params.contains(&i)
+            })
+    }
+
+    /// Is individual parameter `i` (declaration order) in this compiled block's own
+    /// parameter list at all?
+    ///
+    /// **`CompiledModel::indiv_param_names` can be longer.** `build_ode_spec` runs on the
+    /// list as it stands when the `[odes]` block is compiled, and names are appended after
+    /// that — a `pk(... = TIME)` desugaring's `__ferx_pktime_*`, a `[scaling]` Form C
+    /// readout synthetic (#1636). Such a name is invisible to the compiled block: the RHS
+    /// could not have referenced it, nor could an `init(...)` expression, whose resolvable
+    /// names come from the same slice. It also has no var slot of its own — `state_count +
+    /// i` past the end lands on an *intermediate's* slot, so asking the accessors above
+    /// about it would return some unrelated variable's answer.
+    ///
+    /// So a caller walking `CompiledModel::indiv_param_names` must skip the indices this
+    /// returns `false` for. "The `[odes]` block does not read it" is the truth for them,
+    /// not a default.
+    pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
+        i < self.indiv_to_params_slot.len()
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -26256,6 +26737,126 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
         }
     }
     dyn_vars.iter().map(|&d| !d).collect()
+}
+
+/// Classify each individual-parameter var slot as **time-dependent** (`true`): its
+/// value changes with the `TIME` built-in, directly or through another slot that
+/// does (#1853). The `[individual_parameters]` analogue of
+/// [`compute_cov_static_mask`], and the per-parameter refinement of
+/// [`IndivParamProgram::uses_time_builtin`], which is one flag for the whole block.
+///
+/// `TIME` is the only time axis this block has: `T`, `TAD` and `TAFD` are ordinary
+/// covariates outside `[odes]` (see [`ODE_INIT_SCOPE_BUILTINS`]), and a covariate that
+/// varies within a subject is a separate refusal (#741). A direct `pk(... = TIME)`
+/// mapping is desugared into a `__ferx_pktime_* = TIME` statement upstream (#486), so it
+/// is an ordinary assignment here.
+///
+/// Same monotone fixpoint as `compute_cov_static_mask`, for the same reason (var
+/// references can be forward, so one pass is not enough), and the same branch rule: an
+/// assignment under an `if` whose condition reads `TIME` is time-dependent however
+/// time-free its own right-hand side is, because *which* value it takes depends on
+/// `TIME`. The four walks it asks — [`stmts_read_time_builtin`], [`stmts_read_slots`],
+/// [`cond_reads_time_builtin`], [`cond_reads_slots`] — are the ones the rest of the file
+/// already uses, rather than a second `Op`-by-`Op` enumeration that could drift from
+/// [`bytecode_is_dynamic`]'s.
+///
+/// Name-based `Statement::Assign` / `DiffEq` arms are skipped, exactly as
+/// `compute_cov_static_mask` skips them: the snapshot this runs on is the *resolved*
+/// program (`build_pk_param_fn` clones `stmts_owned` after `resolve_variable_indices`),
+/// where every assignment carries its slot.
+fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
+    fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
+        // The slot list the two slot-walks take, rebuilt per statement group from the
+        // current mask (`n_vars` is tens, and this runs once per model).
+        let tainted = |mask: &[bool]| -> Vec<usize> {
+            mask.iter()
+                .enumerate()
+                .filter_map(|(i, &t)| t.then_some(i))
+                .collect()
+        };
+        for s in stmts {
+            match s {
+                Statement::AssignBc(idx, _) | Statement::AssignIdx(idx, _) => {
+                    if time_vars.get(*idx).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let one = std::slice::from_ref(s);
+                    let slots = tainted(time_vars);
+                    if ctx_time || stmts_read_time_builtin(one) || stmts_read_slots(one, &slots) {
+                        if let Some(slot) = time_vars.get_mut(*idx) {
+                            *slot = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // Branch `k` fires only when conditions `0..k` were all false and its
+                    // own is true, so it is governed by **every condition up to and
+                    // including its own** — not by its own alone. An `else if` whose
+                    // condition is time-free still takes its value from `TIME` when an
+                    // earlier arm's condition reads it:
+                    //
+                    //   if (TIME < 5) { AUX = 1 } else if (SW > 0) { CL = 2 * TVCL }
+                    //
+                    // `CL` is `2·TVCL` for `TIME ≥ 5` and `TVCL` before it. The running
+                    // accumulation below is what sees that; a per-arm `ctx_time ||
+                    // cond_k` does not, and the resulting false accept is exactly what
+                    // this gate exists to prevent (round-1 review of PR #1924). The
+                    // `else` arm is governed by all of them, which is the same variable
+                    // after the loop.
+                    //
+                    // `compute_cov_static_mask` has the per-arm shape and the same hole
+                    // for its own question (an `else if` body folded to a constant
+                    // although which value it takes depends on θ/η) — filed as #1927,
+                    // deliberately not changed here.
+                    let mut governed = ctx_time;
+                    for (cond, body) in branches {
+                        let slots = tainted(time_vars);
+                        governed = governed
+                            || cond_reads_time_builtin(cond)
+                            || cond_reads_slots(cond, &slots);
+                        walk(body, governed, time_vars, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, governed, time_vars, changed);
+                    }
+                }
+                // No wildcard arm, for the reason `bytecode_is_dynamic`'s `Op` list has
+                // none: a `Statement` variant this walk cannot attribute to a slot must
+                // break the build rather than default to "assigns nothing", which is the
+                // answer that loses a `TIME` read.
+                //
+                // A name-based arm taints **everything**: the resolved program contains
+                // none (`resolve_variable_indices` rewrites every assignment to
+                // `AssignBc`), but if one ever reached here its slot is unknown, and the
+                // conservative direction is a false refusal, not a false accept.
+                Statement::Assign(..) | Statement::DiffEq(..) => {
+                    for i in 0..time_vars.len() {
+                        if !time_vars[i] {
+                            time_vars[i] = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                // `d/dt(...)` is only legal in `[odes]`; the individual-parameter program
+                // this runs on has no derivative statements to taint through.
+                Statement::DiffEqBc(..) | Statement::DiffEqIdx(..) => {}
+            }
+        }
+    }
+
+    let mut time_vars = vec![false; n_vars];
+    loop {
+        let mut changed = false;
+        walk(stmts, false, &mut time_vars, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+    time_vars
 }
 
 /// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
@@ -26573,6 +27174,46 @@ impl IndivParamProgram {
     /// contents to `pk_slots()` (#534 review #2).
     pub(crate) fn pk_slots_ref(&self) -> &[usize] {
         &self.pk_slot_indices
+    }
+
+    /// Which **top-level individual parameters** depend on the `TIME` built-in, one
+    /// `bool` per entry of [`crate::types::CompiledModel::indiv_param_names`] and in
+    /// that order (#1853).
+    ///
+    /// The per-parameter refinement of [`Self::uses_time_builtin`]: that flag answers
+    /// "does this block read `TIME` at all", which is what the *routing* gates need
+    /// ([`compiled_model_uses_time_builtin`]), while a refusal has to name the parameter
+    /// and must not fire on a model whose only `TIME`-reading parameter is one the
+    /// engines already read at each dose record (#1575). See
+    /// [`compute_time_dependent_mask`] for the walk and for why `TIME` is the only axis.
+    ///
+    /// The slot layout contract is [`Self::n_top_level_vars`]'s: var slot `i` below that
+    /// length is `indiv_param_names[i]` (#1356, pinned by
+    /// `indiv_param_values_are_var_slot_ordered`). A slot the mask does not cover reads
+    /// `true` — a missing answer must not look like "time-free" to a gate.
+    pub(crate) fn params_reading_time(&self) -> Vec<bool> {
+        let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
+        (0..self.n_top_level_vars)
+            .map(|i| mask.get(i).copied().unwrap_or(true))
+            .collect()
+    }
+
+    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots`](Self::pk_slots),
+    /// in the same order. **One entry per resolved slot, not per parameter**: the
+    /// `pk(...)` role bindings, the spare slots the readout / `obs_scale` / `init`
+    /// readers draw (#650, #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on
+    /// the ODE layout every declared name. A name with no slot of its own is
+    /// **absent** here, where `CompiledModel::pk_indices` instead records the
+    /// placeholder `0` that aliases `CL` (#1356); a name owning two slots appears
+    /// **twice** — `pk one_cpt_iv(cl=D1, v=V)` alongside `D1 = …` yields
+    /// `[(CL, D1), (V, V), (9, D1)]`, since the modeled-dose mapping is not a role
+    /// and the #1359 one-variable-two-roles reject does not see it (review r2 #4).
+    /// `CompiledModel::pk_slot_rows` is the slot lookup built on this.
+    ///
+    /// `var_slot` is the evaluator's var slot, which for a top-level name equals its
+    /// index in `CompiledModel::indiv_param_names` (see `n_top_level_vars`).
+    pub(crate) fn pk_var_slots(&self) -> &[(usize, usize)] {
+        &self.pk_var_slots
     }
 
     /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
@@ -29204,3 +29845,7 @@ mod adaptive_dosing_tests;
 #[cfg(test)]
 #[path = "model_parser_theta_eta_linked_tests.rs"]
 mod theta_eta_linked_tests;
+
+#[cfg(test)]
+#[path = "model_parser_residual_correlation_tests.rs"]
+mod residual_correlation_tests;

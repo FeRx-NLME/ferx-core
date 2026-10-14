@@ -201,6 +201,9 @@ When `loghr` is omitted it defaults to 0 (no effect).
 > error), naming the covariate and the subject (#741). A time-varying covariate used
 > only elsewhere — e.g. on the PK parameters of a joint model whose hazard does not
 > reference it — is unaffected.
+> The same freeze on the `TIME` axis — an individual parameter that reads `TIME` and is
+> integrated by a drug-driven hazard — is refused too; see
+> [A `TIME`-dependent disposition is refused](#time-dependent-disposition) (#1853).
 
 ## Estimation
 
@@ -215,6 +218,12 @@ stencil (Shi 2021 step-size selection).
 
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
+
+`method = laplace` with `n_agq > 1` integrates the event likelihood by adaptive quadrature
+instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact marginal. After
+those three, the covariance step uses the 7-node quadrature marginal rather than the FOCEI
+objective — see [SAEM: covariance step on a non-Gaussian
+model](saem.qmd#saem-covariance-non-gaussian) (#1781).
 
 ## Joint PK-TTE {#joint-pk-tte}
 
@@ -273,13 +282,15 @@ the cumulative-hazard grid).
 an interval-censored left bound below the start of the integration contributes nothing:
 nothing has acted on the system yet, so `H = 0` and `h = h(u₀)` there, and the
 left-truncated `H(T) − H(entry)` reduces to the untruncated `H(T)`. `predict_survival()`
-reports the same values at such a grid point. Where the clock starts is worth knowing,
-because it differs from NONMEM: NONMEM integrates from the subject's first record of *any*
-`EVID`, ferx from the first dose or scored observation. An `MDV = 1` row is dropped by the
-reader, and an `EVID = 2` row only joins the timeline on a model with time-varying
-covariates (which a joint PK-TTE model routes away from the shared solve anyway) — neither
-starts the hazard clock. Put a dose or an observation record where the clock should start
-([#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)).
+reports the same values at such a grid point
+([#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)). The clock starts where
+NONMEM's does, at the subject's first record of *any* `EVID`: a dose, a scored
+observation, an `EVID = 2` row or an `EVID = 0, MDV = 1` row. So a baseline hazard
+accumulates from a covariate-marker row ahead of the first dose. Before
+[#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) the reader dropped the last
+two kinds of row (an `EVID = 2` row was kept only with time-varying covariates), and the
+clock started at the first dose or scored observation. One row is still not a record: an
+observation row whose `DV` is missing, which the reader skips under `W_MISSING_DV`.
 
 ### A time-dependent hazard keeps the single shared solve {#time-dependent-hazard}
 
@@ -294,9 +305,11 @@ from one integration of the augmented system rather than two:
   hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure
 ```
 
-Writing `TIME` in a PK equation still splits the solve, which is correct: the two halves
-then genuinely need different treatment. `__chz_*` may not be read from `[odes]` or seeded
-with `init(...)` — see
+Writing `TIME` in a PK equation still splits the solve, and on a model with a drug-driven
+hazard it is refused when that parameter is one the hazard depends on — see
+[the next section](#time-dependent-disposition) for the dependency test and for the three
+shapes it accepts. `__chz_*` may not be read from `[odes]`
+or seeded with `init(...)` — see
 [the ODE-models page](../model-file/ode-models.qmd#chz-is-not-your-rhs).
 
 The same "the accumulator is not a compartment" reading governs steady-state dosing. An
@@ -325,6 +338,66 @@ on 40 subjects. At `ode_reltol = 1e-9` ferx's `H(t)` matches NONMEM's `A(3)` to 
 relative at every event record, and the per-subject objective matches the `.phi` `OBJ` to
 6.0e-8 absolute with **no** additive constant between the two conventions
 (`tests/pktte_tdep_nonmem_anchor.rs`).
+
+### A `TIME`-dependent disposition is refused {#time-dependent-disposition}
+
+The hazard pass integrates the augmented system under **one** `$PK` snapshot, taken at
+`TIME = 0`. Since
+[#1575](https://github.com/FeRx-NLME/ferx-core/issues/1575) every *dose-record* quantity
+— absorption kernel, pathway fraction, route lag, zero-order `dur`, compartment lag, `F`,
+`D{n}`/`R{n}`, the `SS=1` run-in — is read at its own dose record instead, so a
+`TIME`-reading `MTT` or `ALAG1` is exact and keeps fitting. What is still one snapshot is
+the **disposition**: the parameters the `[odes]` RHS integrates (CL, V, …), the parameters
+the `hazard =` expression itself reads, and `init(...)`.
+
+The Gaussian half of the same objective does not freeze them — a model whose `$PK` reads
+`TIME` routes its predictions through the per-record event-driven walk, which evaluates
+`[individual_parameters]` at every record, as NONMEM's `$PK` does, while the hazard pass
+keeps the `TIME = 0` value. The two halves can therefore integrate different
+concentration curves. Measured on a 1-cpt IV model with
+`CL = TVCL · (1 + 0.05 · TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0 · exp(BETA · C)`:
+at `t = 8` the Gaussian pass predicts `central = 33.79` while the hazard pass reads
+`44.93`; at `t = 20`, `3.07` against `13.53`. `H(20)` comes out 10.1 % high and the
+exact-event `−log L` is off by 0.046 per subject. Worse, the frozen hazard is *bit-identical*
+whether the `TIME` coefficient is `0` or `0.05` — the term has no influence at all on the
+survival half it was written for.
+
+`fit()` therefore rejects such a model up front, and `predict()` / `predict_survival()` /
+`simulate()` return the same error, naming the parameter and whether the `[odes]` RHS or an
+`init(...)` seed reads it
+([#1853](https://github.com/FeRx-NLME/ferx-core/issues/1853)):
+
+```
+[event_model] on CMT=2: the ODE-accumulated (joint PK-TTE) hazard is integrated with the
+individual parameters frozen at their TIME=0 values, but `CL` reads the `TIME` built-in and
+the [odes] RHS reads it. ...
+```
+
+The refusal is narrow in three ways, so what it stops is a model whose two halves can
+disagree — narrow by *structure*, not by value (see the caveats below it):
+
+- a `TIME` read that stays inside the `[odes]` **RHS** — `d/dt(central) = … · (1 + K · TIME)`,
+  or a Weibull / Gompertz baseline hazard — is fine: the integrator resolves `TIME` at
+  every step, so nothing there is frozen;
+- a `TIME`-reading **dose-record** quantity is fine, as above;
+- a `TIME`-reading parameter the **hazard does not depend on** is fine. `hazard = H0` with
+  a time-dependent `CL` integrates a constant, so the accumulator is the same whatever
+  snapshot the hazard pass runs under; ferx cuts a dependency slice back from each
+  `d/dt(__chz_<cmt>)` row — data reads, the state dynamics behind them, the `init(...)` of
+  a state they reach, and the `if` conditions governing any of it — and refuses only what
+  lands in it. On a competing-risks model the error names the endpoint whose own hazard is
+  affected.
+
+Two cases are still refused that need not be, both because the test is structural rather
+than value-based. A `TIME`-dependent definition that a later line overwrites before
+anything reads it is followed anyway
+([#1931](https://github.com/FeRx-NLME/ferx-core/issues/1931)); and a `TIME` term that
+cancels — `CL = TVCL + 0.0 * TIME` — counts as a `TIME` read. In both the remedy is to
+delete the line or the term, which is what the model already means.
+
+Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for
+now; a per-record disposition for the hazard pass is tracked in
+[#1920](https://github.com/FeRx-NLME/ferx-core/issues/1920).
 
 ### Simulating drug-driven event times
 

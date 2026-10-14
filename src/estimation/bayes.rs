@@ -24,9 +24,7 @@ use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
 use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
-};
+use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
 use crate::types::{
     BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
     Subject,
@@ -221,7 +219,7 @@ fn subject_nll(
         for (c, slot) in nll.iter_mut().enumerate() {
             let _g = MixtureClassGuard::enter(c + 1);
             *slot = if kappas.is_empty() {
-                individual_nll_into_with_schedule(
+                individual_nll_into_with_schedule_cov(
                     model,
                     subject,
                     theta,
@@ -229,7 +227,7 @@ fn subject_nll(
                     omega,
                     sigma,
                     // Bayes holds the `block_sigma` off-diagonals fixed (#847).
-                    &model.residual_correlations,
+                    model.residual_cov_theta(theta),
                     scratch,
                     schedule,
                 )
@@ -241,14 +239,14 @@ fn subject_nll(
         return 0.5 * combine_subject(&logp, &nll).0;
     }
     if kappas.is_empty() {
-        individual_nll_into_with_schedule(
+        individual_nll_into_with_schedule_cov(
             model,
             subject,
             theta,
             eta,
             omega,
             sigma,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             scratch,
             schedule,
         )
@@ -666,7 +664,7 @@ pub fn run_bayes(
             let mut kappas: Vec<Vec<Vec<f64>>> = (0..n_subjects)
                 .map(|i| {
                     let n_occ = if n_kappa > 0 {
-                        iov_occasion_groups(&population.subjects[i]).len()
+                        crate::stats::stacked_layout::group_count(&population.subjects[i])
                     } else {
                         0
                     };
@@ -2440,7 +2438,7 @@ mod tests {
         let mut nll = [0.0f64; 2];
         for (c, slot) in nll.iter_mut().enumerate() {
             let _g = MixtureClassGuard::enter(c + 1);
-            *slot = individual_nll_into_with_schedule(
+            *slot = crate::stats::likelihood::individual_nll_into_with_schedule(
                 &model,
                 subject,
                 &params.theta,

@@ -223,6 +223,15 @@ equivalence:
 | `EVID=3`/`4` system reset | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through |
 | `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
 
+One more gap raises no warning: **where the filter starts**. The ODE path starts each
+subject at its first record of any type, as NONMEM does, and that includes an `EVID=2` row
+or an `EVID=0, MDV=1` row ahead of the first dose or observation
+([#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809)). The EKF starts at the first
+observation or dose. On a subject whose first record is such a row, and whose state changes
+before its first observation or dose (an `init()` that is not an equilibrium, a production
+term, or `TIME` in the right-hand side), the objective is then computed on a later clock
+than `IPRED`.
+
 These are **fitting** gaps, not prediction gaps. The filter runs only inside the objective, so
 `predict()` and `simulate()` on the same model go through the ordinary ODE path, which does
 apply a lag time. A model can therefore show a correct `IPRED` and a wrong objective at the

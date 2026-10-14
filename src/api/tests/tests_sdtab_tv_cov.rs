@@ -49,6 +49,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -141,6 +142,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     m.insert("WT".to_string(), 70.0);
     dose_covs.push(m);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "TVS".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
@@ -159,6 +161,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -312,6 +315,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
     assert_eq!(model.residual_correlations.len(), 1);
 
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0],
@@ -330,6 +334,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -404,6 +409,7 @@ fn test_simulate_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -484,6 +490,7 @@ fn test_simulate_honours_tv_covariates() {
         HashMap::from([("WT".to_string(), 210.0)]),
     ];
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "SIMTV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
@@ -502,6 +509,7 @@ fn test_simulate_honours_tv_covariates() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

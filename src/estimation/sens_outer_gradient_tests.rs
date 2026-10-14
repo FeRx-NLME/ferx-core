@@ -3,6 +3,7 @@ use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
 use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_interaction};
+use crate::stats::residual_error::ResidualCov;
 use crate::types::{DoseEvent, ErrorSpec, OmegaMatrix, Subject};
 use std::collections::HashMap;
 
@@ -140,6 +141,7 @@ fn subject_with_obs(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subj
     // realistic and nonzero (gradient identity holds at any obs).
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -158,6 +160,7 @@ fn subject_with_obs(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subj
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -639,6 +642,7 @@ const WARFARIN_RUV: &str = r#"
 fn ruv_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -657,6 +661,7 @@ fn ruv_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -854,6 +859,7 @@ const BLOCK_SIGMA_1CPT: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  t
 fn dense_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -872,6 +878,7 @@ fn dense_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -918,7 +925,7 @@ fn precise_ebe_corr_with(
             subject,
             &sens0,
             &params.sigma.values,
-            &params.residual_correlations,
+            model.residual_cov_at(params),
         )
         .unwrap()
         .0
@@ -937,7 +944,7 @@ fn precise_ebe_corr_with(
         // reference would silently omit the ρ coordinate's EBE-response term.
         let (rv, dv, d2v) = match &frozen_rv {
             Some(r0) => (r0.clone(), vec![0.0; r0.len()], vec![0.0; r0.len()]),
-            None => corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
+            None => corr_residual_diag(model, subject, &sens, sigma, model.residual_cov_at(params))
                 .unwrap(),
         };
         let mut grad = DVector::<f64>::from_column_slice(
@@ -1276,13 +1283,18 @@ fn cross_observation_residual_gate_follows_pairing_not_values() {
         ("one endpoint", &one_endpoint, &corr, false),
     ] {
         assert_eq!(
-            has_cross_observation_residual(&model.error_spec, s, sigma, c),
+            has_cross_observation_residual(
+                &model.error_spec,
+                s,
+                sigma,
+                ResidualCov::block_sigma(c)
+            ),
             cross,
             "{name}: predicate"
         );
         let sens = sens_of(s);
         assert_eq!(
-            corr_residual_diag(&model, s, &sens, sigma, c).is_some(),
+            corr_residual_diag(&model, s, &sens, sigma, ResidualCov::block_sigma(c)).is_some(),
             !cross,
             "{name}: corr_residual_diag must decline exactly the cross-observation subjects"
         );
@@ -1299,7 +1311,7 @@ fn cross_observation_residual_gate_follows_pairing_not_values() {
         &model.error_spec,
         &paired,
         sigma,
-        &[]
+        ResidualCov::block_sigma(&[])
     ));
 }
 
@@ -1654,6 +1666,7 @@ fn iov_ruv_2cpt_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 1, 2, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1675,6 +1688,7 @@ fn iov_ruv_2cpt_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1699,6 +1713,7 @@ fn ruv_subject_eta(
 ) -> Subject {
     let n = times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.to_vec(),
@@ -1717,6 +1732,7 @@ fn ruv_subject_eta(
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2159,6 +2175,7 @@ fn reset_subject_outer(model: &CompiledModel, theta: &[f64], eta_ref: &[f64], id
     let obs_times = vec![2.0, 4.0, 8.0, 60.0, 122.0, 126.0, 150.0];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: vec![
             DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0),
@@ -2180,6 +2197,7 @@ fn reset_subject_outer(model: &CompiledModel, theta: &[f64], eta_ref: &[f64], id
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2232,6 +2250,7 @@ fn population_packed_gradient_ode_ss_reset_matches_fd() {
     let obs_times = vec![2.0, 8.0, 20.0, 62.0, 70.0, 90.0];
     let n = obs_times.len();
     let mut s = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0),
@@ -2253,6 +2272,7 @@ fn population_packed_gradient_ode_ss_reset_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2662,6 +2682,7 @@ fn tvcov_subject_outer(
         m
     };
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: vec![dose],
         obs_times: obs_times.to_vec(),
@@ -2680,6 +2701,7 @@ fn tvcov_subject_outer(
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2843,6 +2865,7 @@ fn population_packed_gradient_init_matches_fd() {
     let make = |id: &str, times: &[f64]| -> Subject {
         let n = times.len();
         let mut s = Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -2861,6 +2884,7 @@ fn population_packed_gradient_init_matches_fd() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2956,6 +2980,7 @@ fn population_packed_gradient_lagtime_matches_fd() {
     let build = |times: &[f64]| -> Subject {
         let n = times.len();
         let mut s = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -2974,6 +2999,7 @@ fn population_packed_gradient_lagtime_matches_fd() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3101,6 +3127,7 @@ fn frem_outer_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let pk_times = [1.0, 6.0, 24.0];
     let n = pk_times.len() + 1;
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: pk_times
@@ -3123,6 +3150,7 @@ fn frem_outer_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: pk_times
             .iter()
             .map(|_| 0u16)
@@ -3682,6 +3710,7 @@ fn iov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -3703,6 +3732,7 @@ fn iov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -4014,6 +4044,7 @@ fn iov_ruv_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
     let occasions = vec![1u32, 1, 1, 2, 2, 2];
     let n = obs_times.len();
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -4035,6 +4066,7 @@ fn iov_ruv_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -5305,6 +5337,7 @@ fn iov_tvcov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         m
     };
     let mut subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -5326,6 +5359,7 @@ fn iov_tvcov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -6619,6 +6653,7 @@ const SS_ORAL_Q24: &str = r#"
 fn ss_oral_q24_subject() -> Subject {
     let times = vec![1.0, 4.0, 12.0, 23.0];
     Subject {
+        obs_rgroup: Vec::new(),
         id: "3".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
         obs_times: times.clone(),
@@ -6637,6 +6672,7 @@ fn ss_oral_q24_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }

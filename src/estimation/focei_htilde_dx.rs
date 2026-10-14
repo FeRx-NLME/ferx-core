@@ -90,6 +90,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::agq::analytic_score_supported;
@@ -262,7 +263,7 @@ pub(crate) fn subject_htilde_dx(
     // mirrors `sens_outer_gradient::sigma_block`'s own `correlated` branch. Computed once per
     // σ slot (not per observation, unlike the FREM override lookup) since
     // `corr_residual_rd_at_sigma` already returns the whole per-subject array.
-    let correlated = !params.residual_correlations.is_empty();
+    let correlated = model.residual_cov_at(params).is_dense();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     // `∂(R_jj, d_j)/∂ρ_k`, indexed `[k][j]` — [`rho_rd_terms`]'s own closed form
     // (`crate::stats::residual_error::dvar_drho`), not a central FD like the σ/magnitude
@@ -279,10 +280,10 @@ pub(crate) fn subject_htilde_dx(
         let frem_override_m =
             build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm);
         let corr_at_sp = correlated.then(|| {
-            corr_residual_rd_at_sigma(model, subject, &ipreds, &sp, &params.residual_correlations)
+            corr_residual_rd_at_sigma(model, subject, &ipreds, &sp, model.residual_cov_at(params))
         });
         let corr_at_sm = correlated.then(|| {
-            corr_residual_rd_at_sigma(model, subject, &ipreds, &sm, &params.residual_correlations)
+            corr_residual_rd_at_sigma(model, subject, &ipreds, &sm, model.residual_cov_at(params))
         });
         for (j, o) in sens.obs.iter().enumerate() {
             let cmt = err_keys[j];
@@ -598,8 +599,8 @@ pub(crate) fn subject_htilde_dx_iov(
     if n_eta_bsv == 0 || n_iov == 0 {
         return None;
     }
-    let k_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    let n_st = n_eta_bsv + k_occ * n_iov;
+    let k_occ = crate::stats::stacked_layout::group_count(subject);
+    let n_st = stacked_width(n_eta_bsv, n_iov, k_occ);
     let omega_iov = params.omega_iov.as_ref()?;
 
     let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
@@ -614,7 +615,7 @@ pub(crate) fn subject_htilde_dx_iov(
         || db_dx.len() != x.len()
         || b_hat.len() != n_st
         || template.mixture.is_some()
-        || !params.residual_correlations.is_empty()
+        || model.residual_cov_at(params).is_dense()
         || !analytic_score_supported(model)
     {
         return None;
@@ -767,8 +768,8 @@ pub(crate) fn subject_htilde_dx_iov(
             let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
             let mut acc = DMatrix::<f64>::zeros(n_st, n_st);
             for occ in 0..k_occ {
-                let row = n_eta_bsv + occ * n_iov + i;
-                let col = n_eta_bsv + occ * n_iov + j;
+                let row = kappa_offset(n_eta_bsv, n_iov, occ) + i;
+                let col = kappa_offset(n_eta_bsv, n_iov, occ) + j;
                 let v = l_full.column(col).into_owned();
                 let u: DVector<f64> = omega_inv.column(row).into_owned();
                 acc += omega_inv_deriv(omega_inv, &u, &v);
@@ -952,6 +953,7 @@ mod tests {
     fn fixture_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -970,6 +972,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1374,6 +1377,7 @@ mod tests {
         let occasions = vec![1u32, 1, 1, 2, 2, 2];
         let n = obs_times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1395,6 +1399,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };

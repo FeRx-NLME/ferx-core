@@ -71,6 +71,7 @@ fn static_subject() -> Subject {
     cov.insert("WT".to_string(), 72.0);
     cov.insert("CRCL".to_string(), 95.0);
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0, 12.0],
@@ -85,6 +86,7 @@ fn static_subject() -> Subject {
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         cens: vec![0, 0, 0, 0],
         occasions: vec![],
         obs_l2: Vec::new(),
@@ -152,7 +154,7 @@ fn central_fd_theta_grad(
             subject,
             &tp,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             eta,
             &mut scratch,
         );
@@ -162,7 +164,7 @@ fn central_fd_theta_grad(
             subject,
             &tp,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             eta,
             &mut scratch,
         );
@@ -338,7 +340,7 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
         &subject,
         &theta,
         &sigma_values,
-        &model.residual_correlations,
+        model.residual_cov_theta(&theta),
         &eta,
         &mut scratch,
     );
@@ -351,7 +353,7 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
             &subject,
             &tp,
             &sigma_values,
-            &model.residual_correlations,
+            model.residual_cov_theta(&theta),
             &eta,
             &mut scratch,
         );
@@ -1490,6 +1492,7 @@ fn dcm_two_kappa_subject() -> Subject {
     cov.insert("SEX".to_string(), 1.0);
     let dose = |t: f64| DoseEvent::new(t, 100.0, 1, 100.0 / 3.0, false, 0.0);
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![dose(0.0), dose(24.0), dose(48.0)],
         obs_times: vec![3.5, 6.0, 27.5, 30.0, 51.5, 54.0],
@@ -1504,6 +1507,7 @@ fn dcm_two_kappa_subject() -> Subject {
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 2, 2, 3, 3],
         obs_l2: Vec::new(),
@@ -2011,6 +2015,7 @@ fn dcm_iov_chunked_init_impulse_serves_a_many_occasion_subject() {
     }
     let n = obs_times.len();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses,
         obs_times,
@@ -2025,6 +2030,7 @@ fn dcm_iov_chunked_init_impulse_serves_a_many_occasion_subject() {
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),

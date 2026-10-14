@@ -1196,12 +1196,7 @@ fn write_predictions_csv<W: Write>(
             // to the input CSV and to the sdtab, which is also raw); `obs_times`
             // may be the internal shifted timeline for stacked reset occasions.
             // Falls back to `obs_times` when no raw vector was recorded.
-            row.push_str(&fmt_f64(
-                subj.obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subj.obs_times[j]),
-            ));
+            row.push_str(&fmt_f64(subj.readout_time(j)));
             row.push(',');
             row.push_str(&fmt_f64(subj.observations[j]));
             row.push(',');
@@ -2570,6 +2565,7 @@ mod tests {
         let mut subjects = Vec::new();
         for id in ids {
             subjects.push(Subject {
+                obs_rgroup: Vec::new(),
                 id: (*id).to_string(),
                 doses: vec![],
                 obs_times: (0..n_obs_each).map(|j| j as f64).collect(),
@@ -2588,6 +2584,7 @@ mod tests {
                 obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             });

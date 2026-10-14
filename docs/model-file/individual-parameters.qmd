@@ -316,6 +316,15 @@ the same `TIME` event clock drives ODE right-hand sides
 (`tests/time_origin.rs::ode_time_builtin_*`) and `[derived]` columns
 (`tests/derived_output.rs::derived_time_builtin_echoes_per_observation_time`).
 
+One exception, refused rather than approximated: a parameter that reads `TIME` and is
+integrated by an **ODE-accumulated (drug-driven) hazard** — the `[odes]` RHS or an
+`init(...)` seed of a joint PK-TTE model. The hazard pass takes a single `$PK` snapshot at
+`TIME = 0`, so that parameter would be frozen there while the predictions above read it at
+every record. `fit()` rejects the model naming the parameter
+([#1853](https://github.com/FeRx-NLME/ferx-core/issues/1853)); see
+[TTE models](../estimation/tte.qmd#time-dependent-disposition). A `TIME`-reading dose
+quantity (`MTT`, `ALAG1`, …) is read at its own dose record and is unaffected.
+
 #### Analytic gradient & SE check against NONMEM (#486)
 
 On closed-form (non-IOV) 1-/2-/3-cpt models, a `TIME`-switched structural

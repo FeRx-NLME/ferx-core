@@ -21,12 +21,10 @@ use crate::sim::adaptive::{
     DoseLedgerEntry, MonitorSpec,
 };
 use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
+    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
+    foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -710,7 +708,33 @@ pub(crate) fn compute_subject_results(
             // yet supported on the IOV path (tracked as follow-up), so they stay empty.
             // For all other subjects: compute_predictions_with_states returns both ipred
             // and the per-obs compartment state vector in one pass.
-            let (ipred, compartment_states) = if !kappas.is_empty() {
+            //
+            // An IOV subject's linearization is built once, here, and shared by IPRED,
+            // CWRES and the OFV contribution below — the same `[η, κ₁…κ_K]` system the
+            // fit's marginal scored (#1948).
+            let omega_iov = (!kappas.is_empty()).then(|| {
+                params
+                    .omega_iov
+                    .as_ref()
+                    .expect("omega_iov present when kappas non-empty")
+            });
+            let iov_lin = omega_iov.and_then(|omega_iov| {
+                iov_linearization(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta,
+                    h,
+                    &params.omega,
+                    kappas,
+                    omega_iov,
+                )
+            });
+            let (ipred, compartment_states) = if let Some(lin) = &iov_lin {
+                (lin.ipreds.clone(), vec![])
+            } else if !kappas.is_empty() {
+                // κ shape mismatch (never produced by the EBE pipeline): the OFV below
+                // is the marginal's sentinel and CWRES is NaN; IPRED is still f(η̂, κ̂).
                 let kappa_slices: Vec<Vec<f64>> =
                     kappas.iter().map(|k| k.as_slice().to_vec()).collect();
                 let iov_ipred = crate::pk::predict_iov(
@@ -787,50 +811,83 @@ pub(crate) fn compute_subject_results(
             // fit, the population prediction f(η=0) under FOCE — which is what
             // NONMEM's `CWRES` does (pinned in `compute_cwres`'s doc comment).
             // Additive error keeps the linearized `f0` (bit-identical: `R` does
-            // not depend on the prediction).
+            // not depend on the prediction). An IOV subject's FOCE `R` is at η = 0 *and*
+            // κ = 0, read from the marginal's own helper so the two cannot part.
+            let iov_pop_preds = match &iov_lin {
+                Some(lin) if !interaction => population_variance_preds_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    lin.n_eta,
+                    lin.n_iov,
+                    lin.n_occasions,
+                ),
+                _ => None,
+            };
             let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
                 None
             } else if interaction {
                 Some(ipred.as_slice())
+            } else if iov_lin.is_some() {
+                iov_pop_preds.as_deref()
             } else {
                 Some(pred.as_slice())
             };
-            let cwres = compute_cwres(
-                subject,
-                &ipred,
-                eta,
-                h,
-                &params.omega,
-                &params.sigma.values,
-                &model.error_spec,
-                &params.residual_correlations,
-                frem_r_override.as_deref(),
-                model.residual_error_eta,
-                ruv_mult.as_deref(),
-                r_preds,
-                model.bloq_in_force(),
-            );
+            // Under IOV, CWRES linearizes over b = [η, κ₁…κ_K] with
+            // Σ_b = blkdiag(Ω, Ω_IOV × K), as NONMEM's does (#1948); `b̂` leads with η̂,
+            // so the IIV-on-RUV read of `b̂[residual_error_eta]` is unchanged.
+            let cwres = match (&iov_lin, kappas.is_empty()) {
+                (None, false) => vec![f64::NAN; subject.observations.len()],
+                (lin, _) => {
+                    let (b_hat, h_b, omega_b) = match lin {
+                        Some(lin) => (&lin.b_hat, &lin.h_full, &lin.sigma_b),
+                        None => (eta, h, &params.omega),
+                    };
+                    compute_cwres_cov(
+                        subject,
+                        &ipred,
+                        b_hat,
+                        h_b,
+                        omega_b,
+                        &params.sigma.values,
+                        &model.error_spec,
+                        model.residual_cov_at(params),
+                        frem_r_override.as_deref(),
+                        model.residual_error_eta,
+                        ruv_mult.as_deref(),
+                        r_preds,
+                        model.bloq_in_force(),
+                    )
+                }
+            };
 
             // OFV contribution
             let ofv_i = if !kappas.is_empty() {
-                let omega_iov = params
-                    .omega_iov
-                    .as_ref()
-                    .expect("omega_iov present when kappas non-empty");
-                foce_subject_nll_iov(
-                    model,
-                    subject,
-                    &params.theta,
-                    eta,
-                    h,
-                    &params.omega,
-                    &params.sigma.values,
-                    interaction,
-                    kappas,
-                    omega_iov,
-                )
+                match &iov_lin {
+                    Some(lin) => foce_subject_nll_iov_linearized(
+                        model,
+                        subject,
+                        &params.theta,
+                        &params.sigma.values,
+                        interaction,
+                        lin,
+                    ),
+                    // A κ shape mismatch: the marginal's own refusal (its sentinel).
+                    None => foce_subject_nll_iov(
+                        model,
+                        subject,
+                        &params.theta,
+                        eta,
+                        h,
+                        &params.omega,
+                        &params.sigma.values,
+                        interaction,
+                        kappas,
+                        omega_iov.expect("kappas non-empty"),
+                    ),
+                }
             } else {
-                foce_subject_nll(
+                foce_subject_nll_cov(
                     model,
                     subject,
                     &params.theta,
@@ -838,7 +895,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
-                    &params.residual_correlations,
+                    model.residual_cov_at(params),
                     interaction,
                 )
             };
@@ -934,39 +991,81 @@ pub(crate) fn kappa_weight_typicals(
         .collect()
 }
 
-/// Kappa shrinkage pooled across all subject-occasion pairs.
+/// The informed κ̂ vectors of `kappas_per_subject`: each subject's groups filtered by
+/// `informed` (parallel per subject, from `iov_group_informed`), with the group's
+/// position in that subject's own list kept. A group with no mask entry is kept.
+fn informed_kappas<'a>(
+    kappas_per_subject: &'a [Vec<DVector<f64>>],
+    informed: &'a [Vec<bool>],
+) -> impl Iterator<Item = (usize, &'a DVector<f64>)> + 'a {
+    kappas_per_subject
+        .iter()
+        .enumerate()
+        .flat_map(move |(i, occ_kappas)| {
+            let mask = informed.get(i);
+            occ_kappas
+                .iter()
+                .enumerate()
+                .filter(move |(g, _)| mask.and_then(|m| m.get(*g)).copied().unwrap_or(true))
+        })
+}
+
+/// `1 - sqrt(mean(κ̂²)) / sqrt(var)` over `kappas` for kappa `k`; NaN when `var` is
+/// non-positive or fewer than two vectors are pooled.
+fn kappa_shrinkage_over(kappas: &[&DVector<f64>], var: f64, k: usize) -> f64 {
+    let n = kappas.len();
+    if var <= 0.0 || n < 2 {
+        return f64::NAN;
+    }
+    let ms = kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+    1.0 - ms.sqrt() / var.sqrt()
+}
+
+/// Kappa shrinkage pooled across the informed subject-occasion pairs.
 ///
 /// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
-/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
-/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
-/// two (subject, occasion) observations are available.
+/// runs over every (subject, occasion group) pair that `informed` marks — a group no
+/// observation can read has κ̂ = 0 (the prior mode) and would push the shrinkage up
+/// while leaving the objective unchanged (#1911). A subject with no informed group
+/// contributes nothing. Returns NaN for a given kappa when the corresponding diagonal
+/// of `omega_iov` is non-positive or when fewer than two informed pairs remain.
 pub(crate) fn compute_kappa_shrinkage(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<f64> {
     let n_kappa = omega_iov.nrows();
     if n_kappa == 0 {
         return vec![];
     }
-    // Flatten all per-subject per-occasion kappa vectors into one iterator.
-    let all_kappas: Vec<&DVector<f64>> = kappas_per_subject
-        .iter()
-        .flat_map(|occ_kappas| occ_kappas.iter())
+    let all_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+        .map(|(_, kv)| kv)
         .collect();
-    let n = all_kappas.len();
-    if n < 2 {
-        return vec![f64::NAN; n_kappa];
-    }
     (0..n_kappa)
-        .map(|k| {
-            let var = omega_iov[(k, k)];
-            if var <= 0.0 {
-                return f64::NAN;
-            }
-            let ms = all_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-            1.0 - ms.sqrt() / var.sqrt()
-        })
+        .map(|k| kappa_shrinkage_over(&all_kappas, omega_iov[(k, k)], k))
         .collect()
+}
+
+/// `(shrinkage_kappa, shrinkage_kappa_by_occ)` of a fit over `population`: both pooled
+/// over the groups `iov_group_informed` marks, so the console, `format_summary`, the
+/// `.fitrx` bundle and `FitResult` all read one informed rule (#1911). A compartment-free
+/// `model` carries no state between records, so there only a group's own observations
+/// inform it.
+pub(crate) fn kappa_shrinkages(
+    model: &CompiledModel,
+    population: &Population,
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let informed: Vec<Vec<bool>> = population
+        .subjects
+        .iter()
+        .map(|s| crate::stats::likelihood::iov_group_informed(s, !model.is_algebraic()))
+        .collect();
+    (
+        compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
+        compute_kappa_shrinkage_by_occ(kappas_per_subject, &informed, omega_iov),
+    )
 }
 
 /// Kappa shrinkage broken out by occasion index.
@@ -974,7 +1073,9 @@ pub(crate) fn compute_kappa_shrinkage(
 /// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
 /// **0-based position within each subject's own occasion list** — i.e. the
 /// order in which distinct OCC values were first encountered in that subject's
-/// rows (matching `split_obs_by_occasion`).
+/// rows (matching `split_obs_by_occasion`). Only the groups `informed` marks enter a
+/// slot, as for [`compute_kappa_shrinkage`]; a slot with fewer than two informed pairs
+/// is NaN.
 ///
 /// **Important limitation for unbalanced designs:** `occ_idx` is a position
 /// index, *not* the raw OCC column value.  When subjects have different OCC
@@ -989,6 +1090,7 @@ pub(crate) fn compute_kappa_shrinkage(
 /// or no kappa parameters exist.
 pub(crate) fn compute_kappa_shrinkage_by_occ(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<Vec<f64>> {
     let n_kappa = omega_iov.nrows();
@@ -1006,20 +1108,12 @@ pub(crate) fn compute_kappa_shrinkage_by_occ(
     }
     (0..n_occ)
         .map(|occ_idx| {
-            let occ_kappas: Vec<&DVector<f64>> = kappas_per_subject
-                .iter()
-                .filter_map(|occ_vecs| occ_vecs.get(occ_idx))
+            let occ_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+                .filter(|(g, _)| *g == occ_idx)
+                .map(|(_, kv)| kv)
                 .collect();
-            let n = occ_kappas.len();
             (0..n_kappa)
-                .map(|k| {
-                    let var = omega_iov[(k, k)];
-                    if var <= 0.0 || n < 2 {
-                        return f64::NAN;
-                    }
-                    let ms = occ_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-                    1.0 - ms.sqrt() / var.sqrt()
-                })
+                .map(|k| kappa_shrinkage_over(&occ_kappas, omega_iov[(k, k)], k))
                 .collect()
         })
         .collect()

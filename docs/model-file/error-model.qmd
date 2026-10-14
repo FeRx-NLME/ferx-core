@@ -433,7 +433,11 @@ That stays your call, because both conventions are real:
   `DV = logit(p)` with `weight = 1/sqrt(N)`): **estimate** it. The
   $p(1-p)$ factor was never divided out, and sigma absorbs it —
   $1/\sqrt{p(1-p)} \approx 2.04$ at $p \approx 0.4$, which is most of a published
-  σ of 2.466.
+  σ of 2.466. That analysis (Bracis et al. 2026, Case Study 2) is an anchor:
+  `tests/mbma_canakinumab_case_study.rs` reproduces its published objective and
+  NONMEM's FOCE-I fit of the same model. Its data may not be redistributed, so
+  the nightly slow-test job downloads them; to run it locally, fetch them with
+  `python3 tools/mbma_canakinumab_fetch.py`.
 
 `weight =` does not silently fix or free sigma; it just makes the weighting
 explicit so the two cases are distinguishable in the model file.
@@ -491,6 +495,10 @@ The same modifier rides an IOV `kappa` declaration, where it weights the
 `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM` declares
 `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
 [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
+
+The visits of one arm can also be given correlated residuals —
+`correlation cs(RHO) by ARM` or `ar1(RHO)`, with the weights on both sides of
+the correlation. See [Within-group residual correlation](residual-correlation.qmd).
 
 ### Simulating an arm that is not in the data
 
