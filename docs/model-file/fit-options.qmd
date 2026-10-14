@@ -348,6 +348,16 @@ subject's own observation design:
 Empirical-CDF probabilities at 0 or 1 are clamped to `[1/(2K), 1 − 1/(2K)]` before
 `Φ⁻¹`, matching the `npde`-package convention, so the scores stay finite.
 
+For a `kappa` (IOV) model the reference draws one κ ~ N(0, Ω~IOV~) per occasion
+group, so it needs the subjects' occasion labels. The post-fit step sees the labels
+the fit used, whether read from `iov_column` or derived by `iov_occasion = dose |
+time(...)`. A caller computing NPDE **after** the fit with
+`stats::npde::compute_npde_npd` on a re-read population passes the fit's rule as its
+`iov_occasion` argument (`FitResult::iov_occasion`); without it a rule-derived model's
+population has no labels and its reference is built at κ = 0 (#1980).
+`compute_npde_npd_diag` reports a subject left without a label as
+`W_IOV_NO_OCCASIONS`.
+
 **Under a correctly specified model, NPDE follows a standard normal distribution.**
 On the warfarin example (`examples/warfarin.ferx`, `data/warfarin.csv`), a converged
 FOCEI fit with `npde_nsim = 1000` gives the expected mean-zero, unit-variance

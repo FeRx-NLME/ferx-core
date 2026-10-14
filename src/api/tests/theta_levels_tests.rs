@@ -1632,9 +1632,10 @@ mod from_fit {
         .err()
         .expect("simulate_with_options_diag");
         assert_run_refusal(&err.to_string(), "simulate_with_options_diag");
-        let err = crate::stats::npde::compute_npde_npd(&fit.model, &never, &params, 20, Some(1))
-            .err()
-            .expect("compute_npde_npd");
+        let err =
+            crate::stats::npde::compute_npde_npd(&fit.model, &never, &params, 20, Some(1), None)
+                .err()
+                .expect("compute_npde_npd");
         assert_run_refusal(&err.to_string(), "compute_npde_npd");
 
         let err = crate::api::fit(&fit.model, &never, &params, &FitOptions::default())
@@ -1779,6 +1780,7 @@ mod from_fit {
             &unbound.default_params,
             20,
             Some(1),
+            None,
         ) {
             assert!(!e.to_string().contains("is bound, but"), "{e}");
         }
@@ -1873,7 +1875,8 @@ mod from_fit {
             ),
             cell(
                 "compute_npde_npd",
-                crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1)).map(|_| ()),
+                crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1), None)
+                    .map(|_| ()),
             ),
         ]
     }
@@ -1884,7 +1887,7 @@ mod from_fit {
         crate::api::predict(model, pop, &params).unwrap_or_else(|e| panic!("{what}: {e}"));
         crate::api::simulate_with_options_diag(model, pop, &params, 1, &Default::default())
             .unwrap_or_else(|e| panic!("{what}: {e}"));
-        crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1))
+        crate::stats::npde::compute_npde_npd(model, pop, &params, 20, Some(1), None)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
         let fatal: Vec<_> = crate::api::check_model_data(model, pop)
             .into_iter()

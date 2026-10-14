@@ -166,8 +166,8 @@ fn worst_vs_nonmem(
 #[test]
 fn npde_iov_reference_matches_nonmem() {
     let (model, pop) = anchor_model_and_data();
-    let out =
-        compute_npde_npd(&model, &pop, &model.default_params, NSIM, Some(SEED)).expect("npde");
+    let out = compute_npde_npd(&model, &pop, &model.default_params, NSIM, Some(SEED), None)
+        .expect("npde");
 
     let (npd, npde, row) = worst_vs_nonmem(&out, &pop, "npde_iov_chol.tab");
     eprintln!(
@@ -225,7 +225,7 @@ fn npde_iov_zero_omega_iov_control_diverges_from_nonmem() {
         om.chol.fill(0.0);
         om.matrix.fill(0.0);
     }
-    let out = compute_npde_npd(&model, &pop, &zero_iov, NSIM, Some(SEED)).expect("npde");
+    let out = compute_npde_npd(&model, &pop, &zero_iov, NSIM, Some(SEED), None).expect("npde");
     let (npd, npde, _) = worst_vs_nonmem(&out, &pop, "npde_iov_chol.tab");
     eprintln!("#734 zero-Ω_IOV control: worst |dNPD| = {npd:.5}, worst |dNPDE| = {npde:.5}");
     // Realised: 0.89495 and 4.38933, i.e. 2.0× and 7.8× the bounds the fixed path

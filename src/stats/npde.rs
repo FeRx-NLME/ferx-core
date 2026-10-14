@@ -50,9 +50,16 @@
 //! over-dispersed (the diagnostic understated its own spread) for exactly the
 //! models IOV was declared on. Non-IOV models keep the unchanged fast path and
 //! draw no extra randoms, so their scores are byte-identical.
+//!
+//! The occasion groups come from the population's occasion labels. A model whose
+//! occasions are derived by `iov_occasion = dose | time(...)` rather than read from
+//! an `iov_column` has none in the data, so a post-hoc caller passes that rule
+//! (`FitResult::iov_occasion`) and the labels are derived here, as `fit()` derives
+//! them (#1980). A subject still carrying no label is scored at κ = 0, which
+//! [`compute_npde_npd_diag`] reports as `W_IOV_NO_OCCASIONS`.
 
 use crate::stats::special::normal_inv_cdf;
-use crate::types::{BloqMethod, CompiledModel, ModelParameters, Population};
+use crate::types::{BloqMethod, CompiledModel, IovOccasionRule, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -114,13 +121,53 @@ pub struct SubjectNpde {
 /// An Ω or σ whose dimension is not the model's, or an Ω_IOV of the wrong
 /// dimension or on a model with no κ, is `E_PARAM_SHAPE`'s (#1764); an absent
 /// Ω_IOV is the κ = 0 fallback above.
+///
+/// # Occasions
+///
+/// `iov_occasion` is the model-side IOV occasion rule the fit ran under
+/// (`FitResult::iov_occasion`, or the model file's `[fit_options] iov_occasion`).
+/// For a `kappa` model, `Some(dose | time(...))` derives the occasion labels on a
+/// copy of `population` before the κ draw, as `fit()` does (#1980); without it a
+/// population read with no `iov_column` has no labels and its reference is built
+/// at κ = 0. `None`, `Some(Column)` or a model with no κ uses the population's
+/// labels as given. [`compute_npde_npd_diag`] also reports the subjects left
+/// without a label.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     nsim: usize,
     seed: Option<u64>,
+    iov_occasion: Option<&IovOccasionRule>,
 ) -> Result<Vec<SubjectNpde>, crate::diagnostics::EngineError> {
+    compute_npde_npd_diag(model, population, params, nsim, seed, iov_occasion)
+        .map(|(scores, _warnings)| scores)
+}
+
+/// [`compute_npde_npd`], plus its non-fatal warnings. The one warning is
+/// `W_IOV_NO_OCCASIONS`: a `kappa` model handed subjects that carry no occasion
+/// label once `iov_occasion` is applied, whose reference distribution was then
+/// simulated at κ = 0, without its inter-occasion component (#1980).
+///
+/// # Errors
+///
+/// As [`compute_npde_npd`].
+pub fn compute_npde_npd_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    nsim: usize,
+    seed: Option<u64>,
+    iov_occasion: Option<&IovOccasionRule>,
+) -> Result<(Vec<SubjectNpde>, Vec<String>), crate::diagnostics::EngineError> {
+    // A model-side occasion rule's labels first (#1980), so the checks and the κ draw
+    // below see them: `fit()` derives them on its own copy (`fitted_population`), and a
+    // post-hoc caller re-reading the data has none.
+    let derived = with_derived_occasions(model, population, iov_occasion);
+    let population: &Population = &derived;
+    let warnings: Vec<String> = no_occasion_warning(model, params, population)
+        .into_iter()
+        .collect();
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
     // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
     // whose count is not yet the bound model's, as `predict_diag` orders them.
@@ -159,7 +206,7 @@ pub fn compute_npde_npd(
     // A standalone caller (R, a script) is not on a Rayon worker, so this would run on
     // Rayon's global pool at machine width rather than the engine's declared count
     // (#1460); reached from inside `fit()`'s post-fit step it is a no-op.
-    Ok(crate::api::install_on_engine_pool(|| {
+    let scores = crate::api::install_on_engine_pool(|| {
         population
             .subjects
             .par_iter()
@@ -301,7 +348,61 @@ pub fn compute_npde_npd(
                 SubjectNpde { npd, npde }
             })
             .collect()
-    }))
+    });
+    Ok((scores, warnings))
+}
+
+/// `population` with the occasion labels a model-side `iov_occasion` rule derives
+/// (#1980), as `fit()` derives them on its own copy (`fitted_population`). Borrowed
+/// unchanged for `None`, a `Column` rule, or a model with no κ, which reads no labels.
+///
+/// `had_column = false` and a throwaway sink: the override warning is about a fit's
+/// `[fit_options]`, and the fit already raised it.
+fn with_derived_occasions<'a>(
+    model: &CompiledModel,
+    population: &'a Population,
+    rule: Option<&IovOccasionRule>,
+) -> std::borrow::Cow<'a, Population> {
+    match rule {
+        Some(rule) if model.n_kappa > 0 && *rule != IovOccasionRule::Column => {
+            let mut derived = population.clone();
+            crate::api::apply_iov_occasion_rule(&mut derived, rule, false, &mut Vec::new());
+            std::borrow::Cow::Owned(derived)
+        }
+        _ => std::borrow::Cow::Borrowed(population),
+    }
+}
+
+/// `W_IOV_NO_OCCASIONS` when an IOV model's reference distribution is about to be
+/// simulated for a subject that carries no occasion label (#1980): the κ draw is one
+/// per occasion group, so such a subject gets none and is scored at κ = 0. Not an
+/// `Err`, since a population with no occasions reads as κ = 0 in simulation too
+/// (#723). Silent when `params` carries no Ω_IOV, the documented κ = 0 fallback,
+/// which draws no κ for any subject.
+fn no_occasion_warning(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    population: &Population,
+) -> Option<String> {
+    if model.n_kappa == 0 || params.omega_iov.is_none() {
+        return None;
+    }
+    let n_unlabelled = population
+        .subjects
+        .iter()
+        .filter(|s| crate::stats::stacked_layout::group_count(s) == 0)
+        .count();
+    (n_unlabelled > 0).then(|| {
+        format!(
+            "W_IOV_NO_OCCASIONS: the model declares kappa (IOV) parameters, but {n_unlabelled} \
+             of {} subject(s) carry no occasion labels, so their NPDE/NPD reference \
+             distribution was simulated at kappa = 0, with no inter-occasion variability. \
+             Label the occasions in the data (`iov_column` in [fit_options]), or pass the \
+             model's `iov_occasion = dose | time(...)` rule to `compute_npde_npd` \
+             (`FitResult::iov_occasion`).",
+            population.subjects.len()
+        )
+    })
 }
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Rows
@@ -483,13 +584,27 @@ mod tests {
         };
         let params = model.default_params.clone();
 
-        let ok = compute_npde_npd(&model, &pop([1.0, 2.0, 2.0]), &params, 200, Some(1740))
-            .expect("listed levels only");
+        let ok = compute_npde_npd(
+            &model,
+            &pop([1.0, 2.0, 2.0]),
+            &params,
+            200,
+            Some(1740),
+            None,
+        )
+        .expect("listed levels only");
         assert_eq!(ok.len(), 3);
         assert!(ok.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
 
-        let e = compute_npde_npd(&model, &pop([1.0, 2.0, 4.0]), &params, 200, Some(1740))
-            .expect_err("an unlisted level must be refused");
+        let e = compute_npde_npd(
+            &model,
+            &pop([1.0, 2.0, 4.0]),
+            &params,
+            200,
+            Some(1740),
+            None,
+        )
+        .expect_err("an unlisted level must be refused");
         assert!(
             e.to_string().contains("`GRP` takes [4.0] in this data"),
             "{e}"
@@ -519,7 +634,8 @@ mod tests {
             exclusions: None,
             warnings: Vec::new(),
         };
-        let out = compute_npde_npd(&model, &population, &params, 1000, Some(506)).expect("npde");
+        let out =
+            compute_npde_npd(&model, &population, &params, 1000, Some(506), None).expect("npde");
         assert_eq!(out.len(), 1);
         for (j, &npd) in out[0].npd.iter().enumerate() {
             assert!(
@@ -825,7 +941,8 @@ mod tests {
         let nsim = 20_000;
         let seed = Some(734);
 
-        let with_iov = compute_npde_npd(&model, &population, &params, nsim, seed).expect("npde");
+        let with_iov =
+            compute_npde_npd(&model, &population, &params, nsim, seed, None).expect("npde");
         let sd_with = implied_reference_sd(&with_iov);
 
         // Control: Ω_IOV forced to zero. The per-occasion κ draws still happen
@@ -837,7 +954,7 @@ mod tests {
             om.matrix.fill(0.0);
         }
         let without_iov =
-            compute_npde_npd(&model, &population, &zero_iov, nsim, seed).expect("npde");
+            compute_npde_npd(&model, &population, &zero_iov, nsim, seed, None).expect("npde");
         let sd_without = implied_reference_sd(&without_iov);
 
         eprintln!(
@@ -869,12 +986,57 @@ mod tests {
         let (model, population) = iov_npde_model_and_population();
         let mut params = model.default_params.clone();
         params.omega_iov = None;
-        let out = compute_npde_npd(&model, &population, &params, 20_000, Some(734)).expect("npde");
+        let out =
+            compute_npde_npd(&model, &population, &params, 20_000, Some(734), None).expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,
             "missing Ω_IOV must fall back to κ = 0 (spread {BSV_ONLY_SD:.5}), got {sd:.5}"
         );
+    }
+
+    /// #1980, the issue's reproduction: the fixture's subject with its labels cleared, as a
+    /// population read for an `iov_occasion = dose` model without an `iov_column`. Given the
+    /// rule, the reference recovers the κ spread the labelled subject gets; without it, the
+    /// κ-less spread (the test below).
+    #[test]
+    fn npde_derives_occasions_from_the_rule_on_an_unlabelled_subject() {
+        let (model, mut population) = iov_npde_model_and_population();
+        population.subjects[0].occasions.clear();
+        population.subjects[0].dose_occasions.clear();
+        let (out, warnings) = compute_npde_npd_diag(
+            &model,
+            &population,
+            &model.default_params,
+            20_000,
+            Some(734),
+            Some(&IovOccasionRule::PerDose),
+        )
+        .expect("npde");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let sd = implied_reference_sd(&out);
+        assert!(
+            (sd / IOV_REF_SD - 1.0).abs() < 0.03,
+            "under `iov_occasion = dose` the reference spread {sd:.5} must recover \
+             sqrt(ω²_V + ω²_κ) = {IOV_REF_SD:.5}"
+        );
+    }
+
+    /// No warning for the documented κ = 0 fallback on an absent Ω_IOV: it draws no κ for
+    /// any subject, labelled or not, so an unlabelled one changes nothing.
+    #[test]
+    fn npde_no_occasion_warning_is_silent_without_omega_iov() {
+        let (model, mut population) = iov_npde_model_and_population();
+        population.subjects[0].occasions.clear();
+        population.subjects[0].dose_occasions.clear();
+        let mut params = model.default_params.clone();
+        let (_, warnings) =
+            compute_npde_npd_diag(&model, &population, &params, 20, Some(1), None).expect("npde");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        params.omega_iov = None;
+        let (_, warnings) =
+            compute_npde_npd_diag(&model, &population, &params, 20, Some(1), None).expect("npde");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// An IOV model whose data carries **no occasion labels** routes through
@@ -896,6 +1058,7 @@ mod tests {
             &model.default_params,
             20_000,
             Some(734),
+            None,
         )
         .expect("npde");
         let sd = implied_reference_sd(&out);
