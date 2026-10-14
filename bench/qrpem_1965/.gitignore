@@ -1,0 +1,4 @@
+runs/
+runs_timing/
+runs*.log
+__pycache__/
