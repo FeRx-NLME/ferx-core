@@ -4819,6 +4819,49 @@ fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> S
         .unwrap_or_default()
 }
 
+/// The `car1` negative-ρ refusal (#1081), shared by the fit-time range check (on the
+/// θ's bounds) and the simulate-time one (on its value). `what` names the offending
+/// number, e.g. "the lower bound of theta RHO is -0.2".
+fn car1_negative_rho_message(line: &str, what: &str) -> String {
+    format!(
+        "`{line}`: {what}, but `car1` correlates two rows by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a \
+         non-integer time gap Δt. Keep ρ at 0 or above. For a negative correlation between \
+         consecutive rows, use `ar1`."
+    )
+}
+
+/// The value-level `car1` range check for an entry point that scores or draws at the
+/// given parameters without `fit()`'s validation (#1974 review r1 #1): `simulate()`
+/// draws `C_jk = ρ^Δt`, which is NaN for a negative ρ at a non-integer gap, so a
+/// negative `car1` ρ would come back as NaN DVs rather than an error. Checked on the
+/// θ's value, since that is what is drawn at, whatever its bounds.
+pub(crate) fn check_residual_correlation_value(
+    model: &CompiledModel,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let v = params
+        .theta
+        .get(serial.rho_theta)
+        .copied()
+        .unwrap_or(f64::NAN);
+    if serial.kind != crate::types::ResidualSerialKind::Car1 || v >= 0.0 {
+        return Vec::new();
+    }
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .cloned()
+        .unwrap_or_default();
+    vec![Diagnostic::error(
+        "E_RESIDUAL_CORRELATION_RANGE",
+        car1_negative_rho_message(&line, &format!("theta {rho} is {v}")),
+    )]
+}
+
 /// Data-dependent admissibility of a `correlation` line (#1081).
 ///
 /// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
@@ -4923,12 +4966,7 @@ fn check_residual_correlation(
         }
     }
     if serial.kind == crate::types::ResidualSerialKind::Car1 && lo < 0.0 {
-        diags.push(range(format!(
-            "`{line}`: {}, but `car1` correlates two rows by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a \
-             non-integer time gap Δt. Keep ρ at 0 or above. For a negative correlation between \
-             consecutive rows, use `ar1`.",
-            what("lower")
-        )));
+        diags.push(range(car1_negative_rho_message(&line, &what("lower"))));
     }
     if fixed && lo.abs() >= 1.0 {
         diags.push(range(format!(

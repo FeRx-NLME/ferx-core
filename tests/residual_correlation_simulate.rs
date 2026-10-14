@@ -118,3 +118,37 @@ fn simulate_draws_the_serial_residual_correlation() {
         assert_eq!(live, 6, "two arms of three rows: six within-arm pairs");
     }
 }
+
+/// #1974 review r1 #1: `simulate()` runs no `fit()` validation, and `ρ^Δt` is NaN for
+/// a negative `ρ` at a non-integer gap (arm 2 here: 2.5 and 5). Before the fix a `car1`
+/// ρ of −0.2 returned `Ok` with NaN DVs in every row but the first. Both sides: −0.2
+/// is refused with the range message, 0.3 simulates finite rows.
+#[test]
+fn simulate_refuses_a_negative_car1_rho() {
+    let at = |rho: &str| {
+        let m = parse_model_string(&format!(
+            "[parameters]\n  theta TVY(10.0, 1.0, 100.0)\n  theta RHO({rho}) FIX\n  sigma ADD_ERR ~ 1.0 (sd)\n[individual_parameters]\n  Y0 = TVY\n[structural_model]\n  y = Y0\n[error_model]\n  DV ~ additive(ADD_ERR)\n  correlation car1(RHO) by ARM\n"
+        ))
+        .expect("model parses");
+        simulate_with_seed(&m, &population(), &m.default_params, 2, 7)
+    };
+    let err = at("-0.2").expect_err("a negative car1 ρ is refused");
+    assert_eq!(err.code(), Some("E_RESIDUAL_CORRELATION_RANGE"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(
+            "`correlation car1(RHO) by ARM`: theta RHO is -0.2, but `car1` correlates two rows \
+             by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a non-integer time gap Δt."
+        ),
+        "{msg}"
+    );
+    assert!(msg.contains("For a negative correlation between consecutive rows, use `ar1`."));
+    let ok = at("0.3").expect("a positive car1 ρ simulates");
+    assert_eq!(ok.len(), 12);
+    for r in &ok {
+        let SimOutcome::Continuous { value } = r.outcome else {
+            panic!("a Gaussian row");
+        };
+        assert!(value.is_finite(), "row at TIME {}: {value}", r.time);
+    }
+}
