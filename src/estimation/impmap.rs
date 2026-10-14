@@ -587,6 +587,13 @@ fn check_sobol_config(
     Ok(())
 }
 
+/// Whether MCEM iteration `k` (1-based) runs the cold MAP recheck under
+/// `impmap_map_recheck = period` (#1965): every `period`-th iteration, never
+/// when `period == 0`.
+fn recheck_due(k: usize, period: usize) -> bool {
+    period > 0 && k % period == 0
+}
+
 /// Shared Monte-Carlo EM core for IMP and IMPMAP. The `recenter` strategy is the
 /// only behavioural difference; `label`/`df_key` tag warnings and verbose output.
 #[allow(clippy::too_many_arguments)]
@@ -1058,7 +1065,7 @@ fn run_mcem(
                 mceta,
                 seed,
                 k,
-                map_recheck > 0 && k % map_recheck == 0,
+                recheck_due(k, map_recheck),
             );
             (e, h)
         } else {
@@ -4499,6 +4506,28 @@ mod tests {
         assert!(
             (tvka_every - tvka_final_only).abs() > TVKA_GATE_GAP,
             "per-iteration recheck must change the M-step: TVKA {tvka_every} vs final-only {tvka_final_only}"
+        );
+    }
+
+    /// The per-iteration recheck schedule (#1965) at the default period's
+    /// boundaries — the end-to-end test only exercises periods 0, 1 and 1000,
+    /// so a predicate that fired only for `period == 1` would pass it.
+    #[test]
+    fn recheck_schedule_fires_every_period_th_iteration() {
+        let fired: Vec<usize> = (1..=30).filter(|&k| recheck_due(k, 10)).collect();
+        assert_eq!(fired, vec![10, 20, 30]);
+        assert!(!recheck_due(9, 10) && recheck_due(10, 10) && !recheck_due(11, 10));
+        assert!(
+            (1..=5).all(|k| recheck_due(k, 1)),
+            "period 1 fires every iteration"
+        );
+        assert!(
+            (1..=200).all(|k| !recheck_due(k, 0)),
+            "period 0 never fires"
+        );
+        assert!(
+            !recheck_due(2, 1000),
+            "a period longer than the run never fires"
         );
     }
 
