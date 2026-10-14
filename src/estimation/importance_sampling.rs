@@ -3165,6 +3165,81 @@ mod tests {
         assert!(n_broad > 0, "fixture must exercise the broad component");
     }
 
+    /// The FREM Rao–Blackwell twin of the test above: every broad draw's PK
+    /// block is exactly `μ_pc + L_broad · z(Sobol)`, with the conditional PK
+    /// prior rebuilt here from Ω⁻¹ and the covariate deviation `d` (nonzero, so
+    /// the μ shift is live). A broad-only RNG refill in the RB loop fails here.
+    #[test]
+    fn sobol_frem_rb_broad_draws_are_the_sobol_point_through_the_broad_factor() {
+        let model = frem_rb_test_model();
+        let subject = frem_rb_test_subject();
+        let theta = [10.0, 100.0, 90.0];
+        let sigma = model.default_params.sigma.values.clone();
+        let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);
+        // A CL–WT covariance (0.3, correlation 0.2) so P_pc ≠ 0 and μ_pc moves
+        // with d; the fixture's own Ω is diagonal, which would pin μ_pc = 0.
+        let omega_matrix =
+            DMatrix::from_row_slice(3, 3, &[0.09, 0.0, 0.3, 0.0, 0.09, 0.0, 0.3, 0.0, 25.0]);
+        let omega_inv = omega_matrix.clone().try_inverse().unwrap();
+        let h = DMatrix::from_diagonal(&DVector::from_column_slice(&[50.0, 50.0, 1e4]));
+        let (pk, cov, d) = (vec![0usize, 1], vec![2usize], vec![1.5_f64]);
+        let (k, seed, nu, alpha) = (256, 21, 4.0, 0.2);
+        let draws = subject_is_draws_frem_rb(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta_hat,
+            &h,
+            &omega_inv,
+            &omega_matrix,
+            &pk,
+            &cov,
+            &d,
+            3,
+            k,
+            nu,
+            seed,
+            &mut EventPkParams::default(),
+            1.0,
+            true,
+            alpha,
+        )
+        .expect("well-formed RB partition");
+
+        // Conditional PK prior N(μ_pc, P_pp⁻¹), rebuilt independently.
+        let p_pp = submatrix(&omega_inv, &pk, &pk);
+        let p_pc = submatrix(&omega_inv, &pk, &cov);
+        let mu_pc = p_pp
+            .clone()
+            .cholesky()
+            .unwrap()
+            .solve(&(-(&p_pc * DVector::from_column_slice(&d))));
+        assert!(
+            mu_pc.iter().any(|m| m.abs() > 1e-6),
+            "fixture must make μ_pc nonzero"
+        );
+        let mix = DefensiveMixture::from_proposal(build_broad_proposal(&p_pp, 2).unwrap(), alpha);
+        let q = sobol_qmc_draws(2, k, seed, nu, true);
+        let mut n_broad = 0;
+        for idx in 0..k {
+            if !mix.selects_broad(q.u_mix.as_ref().unwrap()[idx]) {
+                continue;
+            }
+            n_broad += 1;
+            let mut want = [0.0; 2];
+            mix.broad_from_z(&q.z[idx], &mut want);
+            for (j, &i) in pk.iter().enumerate() {
+                assert_eq!(
+                    draws.etas[idx][i].to_bits(),
+                    (want[j] + mu_pc[j]).to_bits(),
+                    "broad draw {idx}, PK eta {i}: not μ_pc + L_broad · z(Sobol)"
+                );
+            }
+        }
+        assert!(n_broad > 0, "fixture must exercise the broad component");
+    }
+
     /// The point of quasi-random t draws: at equal K they integrate a smooth
     /// expectation more accurately than pseudo-random ones. For univariate
     /// t_ν, `1/(1 + t²/ν) ~ Beta(ν/2, ½)`, so `E[1/(1 + t₁²/ν)] = ν/(ν+1)` —
