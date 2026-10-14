@@ -4578,7 +4578,8 @@ const ONECPT_ODE_TVCOV: &str = r#"
   ode_abstol = 1e-11
 "#;
 
-/// #1969: a `TIME >= 24` step on CL on a non-IOV ODE model, at records whose written and
+/// #1969: a `TIME >= 24` step on CL, on the dose's `F1` and on an `init(central)` seed, on a
+/// non-IOV ODE model, at records whose written and
 /// engine times straddle 24 (a moved trough, a moved `EVID=2` row, a reset period that
 /// restarts `TIME`). The per-event seeds (`seed_tvcov_snapshots`) must read the written time,
 /// as the value path does: the dual value tracks the value prediction, which the engine clock
@@ -4604,9 +4605,12 @@ fn param_time_written_ode_provider_matches_value_and_fd() {
     CL = TVCL * exp(ETA_CL)
   }
   V = TVV * exp(ETA_V)
+  F1 = if (TIME >= 24.0) 0.5 else 1.0
+  BASE = if (TIME >= 24.0) 300.0 else 100.0
 [structural_model]
   ode(obs_cmt=central, states=[central])
 [odes]
+  init(central) = BASE
   d/dt(central) = -(CL / V) * central
 [error_model]
   DV ~ proportional(PROP_ERR)

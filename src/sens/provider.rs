@@ -5419,7 +5419,7 @@ fn effective_provider_model<'a>(
 /// [`crate::stats::likelihood::iov_occasion_groups`] order — the same assembly
 /// `predict_iov` makes, so dose `k` reads the κ of its own occasion (a dose row without an
 /// occasion label reads κ = 0, as there). Each dose is evaluated under its own record
-/// covariates at its own written time ([`Subject::param_time_at`], #1969), which is what
+/// covariates at its own written time (`Subject::param_time_at`, #1969), which is what
 /// the event-driven walk's `pk_at_dose[k]` is.
 fn dose_pk_snapshots(
     model: &CompiledModel,

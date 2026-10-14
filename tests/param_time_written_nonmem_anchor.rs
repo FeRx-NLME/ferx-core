@@ -36,13 +36,28 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ferx_core::{fit, prepare_run, FitResult, Population};
+use ferx_core::{fit, prepare_run, FitResult, Population, Subject};
 
 fn anchor(name: &str) -> String {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("nonmem_anchor");
     p.push(name);
     p.to_string_lossy().into_owned()
+}
+
+/// The TIME as written of observation `j`, pk-only row `m`, and the dose or reset row at engine
+/// time `t`, read off the `Subject` fields the reader fills (#1969).
+fn written_obs(s: &Subject, j: usize) -> f64 {
+    s.obs_raw_times[j]
+}
+fn written_pk_only(s: &Subject, m: usize) -> f64 {
+    s.pk_only_raw_times[m]
+}
+fn written_at(s: &Subject, t: f64) -> f64 {
+    s.reset_period_times
+        .iter()
+        .find(|&&(e, _)| e == t)
+        .map_or(t, |&(_, w)| w)
 }
 
 fn whitespace_rows(name: &str) -> Vec<Vec<String>> {
@@ -276,7 +291,7 @@ fn the_sdtab_parameter_columns_read_the_written_time() {
                     s.id
                 );
                 worst = worst.max((gcl - wcl).abs() / wcl.abs());
-                if pop_s.param_time_obs(j) == 24.0 && pop_s.obs_times[j] < 24.0 {
+                if written_obs(pop_s, j) == 24.0 && pop_s.obs_times[j] < 24.0 {
                     assert!(gind > 1.0, "{case}: the trough at 24 reports IND {gind}");
                     stepped_at_trough += 1;
                 }
@@ -307,7 +322,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let p = pop("moved");
     let s = &p.subjects[0];
     let j = (0..s.obs_times.len())
-        .find(|&j| s.param_time_obs(j) == 24.0)
+        .find(|&j| written_obs(s, j) == 24.0)
         .expect("moved: an observation written at 24");
     assert!(
         s.obs_times[j] < 24.0,
@@ -319,7 +334,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let p = pop("pkonly");
     let s = &p.subjects[0];
     let m = (0..s.pk_only_times.len())
-        .find(|&m| s.param_time_pk_only(m) == 24.0)
+        .find(|&m| written_pk_only(s, m) == 24.0)
         .expect("pkonly: an EVID=2 row written at 24");
     assert!(
         s.pk_only_times[m] < 24.0,
@@ -332,9 +347,9 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let s = &p.subjects[0];
     let r = *s.reset_times.last().expect("reset: an EVID=4 row");
     assert!(r >= 73.0, "reset: period 2 engine start {r}");
-    assert_eq!(s.param_time_at(r), 0.0, "reset: period 2 written start");
+    assert_eq!(written_at(s, r), 0.0, "reset: period 2 written start");
     let j = (0..s.obs_times.len())
-        .find(|&j| s.obs_times[j] > r && s.param_time_obs(j) < 24.0)
+        .find(|&j| s.obs_times[j] > r && written_obs(s, j) < 24.0)
         .expect("reset: a period-2 observation written before 24");
     assert!(s.obs_times[j] >= 24.0);
 
@@ -344,7 +359,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let d = s
         .doses
         .iter()
-        .find(|d| d.time >= 24.0 && s.param_time_at(d.time) == 0.0)
+        .find(|d| d.time >= 24.0 && written_at(s, d.time) == 0.0)
         .expect("reset_f: a period-2 dose written at 0");
     assert!(d.time >= 24.0, "reset_f: engine time {}", d.time);
 
@@ -353,28 +368,23 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let s = &p.subjects[0];
     let r = *s.reset_times.last().expect("reset_seed: an EVID=4 row");
     assert!(r >= 24.0, "reset_seed: engine time {r}");
-    assert_eq!(s.param_time_at(r), 0.0, "reset_seed: written time");
+    assert_eq!(written_at(s, r), 0.0, "reset_seed: written time");
 
     // control: every record's engine time is its written time.
     let p = pop("control");
     for s in &p.subjects {
         for j in 0..s.obs_times.len() {
-            assert_eq!(s.obs_times[j], s.param_time_obs(j), "control: obs {j}");
+            assert_eq!(s.obs_times[j], written_obs(s, j), "control: obs {j}");
         }
         for m in 0..s.pk_only_times.len() {
             assert_eq!(
                 s.pk_only_times[m],
-                s.param_time_pk_only(m),
+                written_pk_only(s, m),
                 "control: pk-only {m}"
             );
         }
         for d in &s.doses {
-            assert_eq!(
-                d.time,
-                s.param_time_at(d.time),
-                "control: dose at {}",
-                d.time
-            );
+            assert_eq!(d.time, written_at(s, d.time), "control: dose at {}", d.time);
         }
         assert!(s.reset_times.is_empty() && s.reset_period_times.is_empty());
     }

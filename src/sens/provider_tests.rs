@@ -727,7 +727,10 @@ fn time_builtin_eta_grad_matches_full() {
     }
 }
 
-/// #1969: a `TIME >= 24` step on CL, read by the closed-form per-event walk at records whose
+/// #1969: a `TIME >= 24` step on CL and on the dose's `F` (θ- and η-dependent only after the
+/// step, so a dose derivative seeded on the wrong clock is a wrong derivative), read by the
+/// closed-form per-event walk
+/// at records whose
 /// written time and engine time sit on opposite sides of 24 (a moved trough, a moved `EVID=2`
 /// row, a reset period that restarts `TIME`). Pinned three ways, each of which a dual seeder
 /// reading the engine clock fails while the value path reads the written one:
@@ -742,6 +745,7 @@ const STEP_AT_24_IV: &str = r#"
   theta TVCL(10.0, 1.0, 100.0)
   theta TVCL_LATE(4.0, 1.0, 100.0)
   theta TVV(50.0, 5.0, 500.0)
+  theta TVF_LATE(0.5, 0.01, 0.99)
   omega ETA_CL ~ 0.09
   omega ETA_V  ~ 0.09
   sigma PROP_ERR ~ 0.04
@@ -752,8 +756,9 @@ const STEP_AT_24_IV: &str = r#"
     CL = TVCL * exp(ETA_CL)
   }
   V = TVV * exp(ETA_V)
+  F = if (TIME >= 24.0) inv_logit(logit(TVF_LATE) + ETA_V) else 1.0
 [structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V, f=F)
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
@@ -765,7 +770,7 @@ fn param_time_written_tvcov_provider_matches_value_and_fd() {
         ParamTimeStraddle,
     };
     let m = parse_model_string(STEP_AT_24_IV).expect("parse");
-    let theta = [10.0, 4.0, 50.0];
+    let theta = [10.0, 4.0, 50.0, 0.5];
     let eta = [0.15, -0.10];
     for kind in [
         ParamTimeStraddle::Obs,
@@ -807,8 +812,54 @@ fn param_time_written_tvcov_provider_matches_value_and_fd() {
     }
 }
 
-/// #1969, the closed-form IOV sources (`build_iov_sources`): the same straddles under a κ on
-/// CL, two occasions. Value against `predict_iov` to the harness's 1e-9 (the stacked walk and
+/// #1969: the covariance kink bound's per-dose snapshots (`dose_pk_snapshots`) read each dose at
+/// its written time, as the event walk's `pk_at_dose` does. A `TIME >= 24` step on the lag, on
+/// the `Reset` straddle, whose doses are written at 0, 0 and 24 (engine 0, 50, 74): the lags
+/// must be 1, 1 and 2 — the engine clock gives 1, 2, 2 — on both the BSV and the IOV branch.
+#[test]
+fn param_time_written_dose_snapshots_for_the_kink_bound() {
+    use crate::types::test_helpers::{param_time_straddle_subject, ParamTimeStraddle};
+    let src = |kappa: &str, iov: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n{kappa}  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n  LAG = if (TIME >= 24.0) 2.0 else 1.0\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)\n[error_model]\n  \
+             DV ~ proportional(PROP_ERR)\n{iov}"
+        )
+    };
+    let s = param_time_straddle_subject(ParamTimeStraddle::Reset);
+    let theta = [10.0, 50.0];
+    let lags = |snaps: Vec<crate::types::PkParams>| -> Vec<f64> {
+        snaps.iter().map(|p| p.lagtime()).collect()
+    };
+
+    let bsv = parse_model_string(&src("", "")).expect("parse");
+    assert_eq!(
+        lags(dose_pk_snapshots(&bsv, &s, &theta, &[0.1], false)),
+        vec![1.0, 1.0, 2.0],
+        "BSV"
+    );
+    let iov = parse_model_string(&src(
+        "  kappa KAPPA_CL ~ 0.04\n",
+        "[fit_options]\n  iov_column = OCC\n",
+    ))
+    .expect("parse");
+    assert_eq!(
+        lags(dose_pk_snapshots(
+            &iov,
+            &s,
+            &theta,
+            &[0.1, 0.05, -0.08],
+            true
+        )),
+        vec![1.0, 1.0, 2.0],
+        "IOV"
+    );
+}
+
+/// #1969, the closed-form IOV sources (`build_iov_sources`): the same straddles (and `F` step)
+/// under a κ on CL, two occasions. Value against `predict_iov` to the harness's 1e-9 (the stacked walk and
 /// `predict_iov` differ by one ULP at some observations, measured), every block against its FD.
 #[test]
 fn param_time_written_iov_provider_matches_value_and_fd() {
@@ -832,8 +883,9 @@ fn param_time_written_iov_provider_matches_value_and_fd() {
     CL = TVCL * exp(ETA_CL + KAPPA_CL)
   }
   V = TVV * exp(ETA_V)
+  F = if (TIME >= 24.0) 0.5 else 1.0
 [structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V, f=F)
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
@@ -862,7 +914,8 @@ fn param_time_written_iov_provider_matches_value_and_fd() {
 }
 
 /// #1969, the ODE IOV provider (`seed_iov_events`): the same straddles and κ on an `[odes]`
-/// twin. The ODE dual and value integrations are separate runs, so `.re` is held to the
+/// twin, with an `F1` step read at each dose and an `init(central) = BASE` whose `BASE` steps
+/// too, so the `Reset` straddle's re-seed reads the reset row's own written time. The ODE dual and value integrations are separate runs, so `.re` is held to the
 /// harness's 1e-9, not bit identity; the straddle moves the value by more than 1e-3.
 #[test]
 fn param_time_written_ode_iov_provider_matches_value_and_fd() {
@@ -886,9 +939,12 @@ fn param_time_written_ode_iov_provider_matches_value_and_fd() {
     CL = TVCL * exp(ETA_CL + KAPPA_CL)
   }
   V = TVV * exp(ETA_V)
+  F1 = if (TIME >= 24.0) 0.5 else 1.0
+  BASE = if (TIME >= 24.0) 300.0 else 100.0
 [structural_model]
   ode(states=[central])
 [odes]
+  init(central) = BASE
   d/dt(central) = -(CL/V) * central
 [scaling]
   y = central / V

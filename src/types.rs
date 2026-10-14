@@ -978,13 +978,13 @@ pub struct Subject {
     /// The `TIME` each pk-only record was written with, parallel to `pk_only_times`
     /// (#1969). The two differ by one ULP for a row the reader moved below a co-timed
     /// dose to keep file order (#1810), and by the reset shift in a period whose `TIME`
-    /// restarts. Empty for an in-memory subject; [`Subject::param_time_pk_only`] then
+    /// restarts. Empty for an in-memory subject; `Subject::param_time_pk_only` then
     /// falls back to `pk_only_times`.
     pub pk_only_raw_times: Vec<f64>,
     /// `(engine time, TIME as written)` of every dose and reset row the reader shifted
     /// onto the monotonic timeline because a reset restarted `TIME` (#1969), ascending
     /// in engine time. Empty for a subject with no such period. Read through
-    /// [`Subject::param_time_at`]: a dose or reset row is never moved one ULP, so its
+    /// `Subject::param_time_at`: a dose or reset row is never moved one ULP, so its
     /// engine time finds its row here exactly. The written time is stored rather than
     /// recomputed as `engine − offset`, which is inexact for most decimal times
     /// (`(0.1 + 73.1) − 73.1` is `0.09999999999999432`).
@@ -1231,14 +1231,14 @@ impl Subject {
     /// `j`: the TIME as written, as NONMEM's `$PK` sees it (#1969). The same value as
     /// [`Subject::readout_time`]; the engines keep ordering and integrating on
     /// `obs_times`.
-    pub fn param_time_obs(&self, j: usize) -> f64 {
+    pub(crate) fn param_time_obs(&self, j: usize) -> f64 {
         self.readout_time(j)
     }
 
     /// The `TIME` `[individual_parameters]` reads at pk-only record `m` (EVID=2 or
     /// EVID=0/MDV=1): [`Subject::pk_only_raw_times`], falling back to the engine
     /// clock `pk_only_times` for an in-memory subject (#1969).
-    pub fn param_time_pk_only(&self, m: usize) -> f64 {
+    pub(crate) fn param_time_pk_only(&self, m: usize) -> f64 {
         written_time(&self.pk_only_times, &self.pk_only_raw_times, m)
     }
 
@@ -1248,7 +1248,7 @@ impl Subject {
     /// (a dose the adaptive engine appended, a decision time) takes the offset of the
     /// latest row at or before it. Before the first shifted row, and for a subject
     /// with none, the engine clock is the written clock.
-    pub fn param_time_at(&self, engine_t: f64) -> f64 {
+    pub(crate) fn param_time_at(&self, engine_t: f64) -> f64 {
         let table = &self.reset_period_times;
         let after = table.partition_point(|&(e, _)| e <= engine_t);
         match after.checked_sub(1).map(|i| table[i]) {
