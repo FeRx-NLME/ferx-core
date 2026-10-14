@@ -490,6 +490,9 @@ pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
     }
 }
 
+/// Largest ν for which [`chi_squared_inv_cdf`] is validated (see its docs).
+pub(crate) const CHI_SQ_INV_MAX_NU: f64 = 1000.0;
+
 /// Inverse CDF (quantile) of the χ² distribution with `nu > 0` degrees of
 /// freedom: the `x ≥ 0` with `P(ν/2, x/2) = p`.
 ///
@@ -501,6 +504,13 @@ pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
 /// a bracket that bisection falls back on. The upper half (`p > ½`) solves
 /// `Q(a, y) = 1 − p` instead of `P = p`, so the far upper tail keeps its
 /// precision where `1 − P` would cancel.
+///
+/// **Valid for `ν ≤` [`CHI_SQ_INV_MAX_NU`].** The incomplete-gamma series and
+/// continued fraction it inverts are capped at 300 iterations and need
+/// `O(√ν)` of them, so above that the residual is a truncated CDF: measured
+/// against Wilson–Hilferty, the median is right to 7e-8 at ν = 1000, drifts at
+/// ν = 1e4, and comes back as `ν + 2` at ν ≥ 3e4. Callers keep ν inside the
+/// bound (`impmap::check_sobol_config`).
 pub(crate) fn chi_squared_inv_cdf(nu: f64, p: f64) -> f64 {
     if p <= 0.0 {
         return 0.0;
@@ -1406,6 +1416,30 @@ mod tests {
             let want = 0.5 * (lo + hi);
             let got = chi_squared_inv_cdf(4.0, p);
             assert_relative_eq!(got, want, max_relative = 1e-6);
+        }
+    }
+
+    /// Large ν, against an oracle outside the gamma functions: Wilson–Hilferty,
+    /// whose relative error falls as O(1/ν). Measured at p ∈ {0.01, 0.5, 0.99}:
+    /// worst 2.2e-4 at ν = 100 and 5.3e-6 at ν = 1000 — which is WH's own error
+    /// (it shrinks 100× per 10× in ν at the median: 6.9e-6 → 6.9e-8), so each
+    /// bound leaves ~2× headroom over the oracle. At ν = 1e4 the median already
+    /// strays from that trend (4.4e-7 against an expected ~7e-10), which is
+    /// why `CHI_SQ_INV_MAX_NU` is 1000.
+    #[test]
+    fn chi_squared_inv_cdf_matches_wilson_hilferty_at_large_nu() {
+        for &(nu, tol) in &[(100.0_f64, 5e-4_f64), (CHI_SQ_INV_MAX_NU, 1.2e-5)] {
+            for &p in &[0.01_f64, 0.5, 0.99] {
+                let z = normal_inv_cdf(p);
+                let c = 2.0 / (9.0 * nu);
+                let wh = nu * (1.0 - c + z * c.sqrt()).powi(3);
+                let got = chi_squared_inv_cdf(nu, p);
+                let rel = (got - wh).abs() / wh;
+                assert!(
+                    rel.is_finite() && rel < tol,
+                    "nu={nu} p={p}: got {got}, WH {wh} (rel {rel:e})"
+                );
+            }
         }
     }
 

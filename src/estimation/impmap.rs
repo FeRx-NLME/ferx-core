@@ -508,16 +508,51 @@ pub fn run_imp(
     )
 }
 
-/// A quasi-random draw spends up to `n_eta + 2` Sobol coordinates (normals,
-/// Student-t scale, mixture component); refuse a model the direction-number
-/// table cannot cover instead of letting `Sobol::new` panic mid-fit (#1965).
-fn check_sobol_dims(label: &str, n_eta: usize, use_sobol: bool) -> Result<(), String> {
+/// Refuse a Sobol configuration the quasi-random sampler cannot serve, instead
+/// of letting `Sobol::new` panic or drawing from a wrong t (#1965):
+///
+/// - a draw spends `n_eta` coordinates on the normals, one more on the
+///   Student-t scale when ν is finite, and one more on the mixture component
+///   when the defensive mixture is on — at most `SOBOL_MAX_DIMS` in total;
+/// - the t scale comes from `chi_squared_inv_cdf`, validated only up to
+///   `CHI_SQ_INV_MAX_NU`; a t with more degrees of freedom is a normal for
+///   every practical purpose, so the message points there.
+fn check_sobol_config(
+    label: &str,
+    df_key: &str,
+    n_eta: usize,
+    use_sobol: bool,
+    nu: f64,
+    mixture: bool,
+) -> Result<(), String> {
     use crate::estimation::importance_sampling::SOBOL_MAX_DIMS;
-    if use_sobol && n_eta + 2 > SOBOL_MAX_DIMS {
+    use crate::stats::special::CHI_SQ_INV_MAX_NU;
+    if !use_sobol {
+        return Ok(());
+    }
+    let dims = n_eta + usize::from(nu.is_finite()) + usize::from(mixture);
+    if dims > SOBOL_MAX_DIMS {
         return Err(format!(
-            "{label}: Sobol draws support at most {} random effects (this model has {n_eta}); \
-             turn off `impmap_sobol` / `imp_sobol`.",
-            SOBOL_MAX_DIMS - 2
+            "{label}: Sobol draws need {dims} quasi-random coordinates here ({n_eta} random \
+             effects{}{}) but support at most {SOBOL_MAX_DIMS}; turn off `impmap_sobol` / \
+             `imp_sobol`.",
+            if nu.is_finite() {
+                " + the Student-t scale"
+            } else {
+                ""
+            },
+            if mixture {
+                " + the defensive-mixture component"
+            } else {
+                ""
+            },
+        ));
+    }
+    if nu.is_finite() && nu > CHI_SQ_INV_MAX_NU {
+        return Err(format!(
+            "{label}: Sobol draws support a Student-t proposal with at most \
+             {CHI_SQ_INV_MAX_NU} degrees of freedom (`{df_key}` = {nu}); a t that wide is \
+             a normal in practice — set `{df_key} = normal`."
         ));
     }
     Ok(())
@@ -552,7 +587,14 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
-    check_sobol_dims(label, n_eta, use_sobol)?;
+    check_sobol_config(
+        label,
+        df_key,
+        n_eta,
+        use_sobol,
+        nu,
+        options.imp_defensive_alpha > 0.0,
+    )?;
     // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
     // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
     // mixture core, which reuses this function's option resolution via the same
@@ -4223,21 +4265,47 @@ mod tests {
         );
     }
 
-    /// The Sobol table covers `SOBOL_MAX_DIMS` coordinates and a draw needs
-    /// up to `n_eta + 2`, so 998 ETAs is the last admissible model (#1965).
-    /// The message names the limit, the model's count and the switch to flip.
+    /// The Sobol config guard (#1965), each boundary on its own: the
+    /// coordinate count is exactly `n_eta` + (t) + (mixture), so every
+    /// proposal form is admitted up to the table's 1000 coordinates and refused
+    /// one beyond; and the t degrees of freedom stop at `CHI_SQ_INV_MAX_NU`.
+    /// The messages name the count, the limit and the switch to flip.
     #[test]
-    fn sobol_dimension_guard_admits_the_table_and_refuses_beyond() {
-        assert!(check_sobol_dims("IMPMAP", 998, true).is_ok());
-        let e = check_sobol_dims("IMPMAP", 999, true).unwrap_err();
+    fn sobol_config_guard_counts_the_coordinates_each_form_uses() {
+        let inf = f64::INFINITY;
+        for (t, mix, n_ok) in [
+            (false, false, 1000),
+            (true, false, 999),
+            (false, true, 999),
+            (true, true, 998),
+        ] {
+            let nu = if t { 4.0 } else { inf };
+            let tag = format!("t={t} mixture={mix}");
+            assert!(
+                check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok, true, nu, mix).is_ok(),
+                "{tag}"
+            );
+            let e = check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok + 1, true, nu, mix)
+                .unwrap_err();
+            assert!(
+                e.contains("1001") && e.contains("1000") && e.contains("impmap_sobol"),
+                "{tag}: {e}"
+            );
+        }
         assert!(
-            e.contains("998") && e.contains("999") && e.contains("impmap_sobol"),
-            "{e}"
-        );
-        assert!(
-            check_sobol_dims("IMPMAP", 5000, false).is_ok(),
+            check_sobol_config("IMPMAP", "impmap_proposal_df", 5000, false, 4.0, true).is_ok(),
             "no limit without Sobol"
         );
+
+        let nu_max = crate::stats::special::CHI_SQ_INV_MAX_NU;
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max, false).is_ok());
+        let e =
+            check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max * 2.0, false).unwrap_err();
+        assert!(
+            e.contains("imp_proposal_df = normal") && e.contains("2000"),
+            "{e}"
+        );
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, false, 1e9, false).is_ok());
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),

@@ -83,9 +83,9 @@ fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
 }
 
 /// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
-/// up to `n_eta + 2` coordinates (normals, t scale, mixture component), so the
-/// samplers' callers refuse a model above `SOBOL_MAX_DIMS - 2` ETAs up front
-/// rather than let `Sobol::new` panic.
+/// `n_eta` coordinates plus one for a Student-t scale and one for a mixture
+/// component; `impmap::check_sobol_config` refuses a configuration that needs
+/// more, up front, rather than let `Sobol::new` panic.
 pub(crate) const SOBOL_MAX_DIMS: usize = 1000;
 
 /// Joe–Kuo D6 direction numbers for up to [`SOBOL_MAX_DIMS`] dimensions, parsed
@@ -1229,7 +1229,8 @@ pub(crate) fn subject_is_draws_frem_rb(
     // analogue of N(0, Ω) in the full-dimensional sampler — so the broad density
     // at any η_p equals `log_prior` below. `defensive_alpha == 0` (or a non-PD
     // P_pp) leaves the legacy single-proposal RB sampler and its RNG stream
-    // untouched. Sobol QMC is disabled while the mixture is active.
+    // untouched. Under Sobol a dedicated quasi-random coordinate picks the
+    // component (#1965), as in the full-dimensional sampler.
     let mixture = if defensive_alpha > 0.0 {
         build_broad_proposal(&p_pp, np)
             .map(|broad| DefensiveMixture::from_proposal(broad, defensive_alpha))
