@@ -5041,13 +5041,18 @@ fn car1_negative_rho_message(line: &str, what: &str) -> String {
     )
 }
 
-/// The value-level `car1` range check for an entry point that scores or draws at the
-/// given parameters without `fit()`'s validation (#1974 review r1 #1): `simulate()`
-/// draws `C_jk = ρ^Δt`, which is NaN for a negative ρ at a non-integer gap, so a
-/// negative `car1` ρ would come back as NaN DVs rather than an error. Checked on the
-/// θ's value, since that is what is drawn at, whatever its bounds.
+/// The value-level range check for an entry point that draws at the given parameters
+/// without `fit()`'s validation (#1974 review r1 #1, #1976): `simulate()` draws from the
+/// `R` the line states at θ's value, so every value `fit()`'s range check refuses for a
+/// `FIX`ed ρ is refused here too, with the same message — a negative `car1` ρ (NaN
+/// DVs, `ρ^Δt` at a non-integer gap), `|ρ| ≥ 1` for any kind, and a `cs` ρ at or
+/// below `−1/(n−1)` for the largest block. Past either edge `R` is indefinite and the
+/// PSD-safe square root in `correlated_residual_draw` would silently draw from a
+/// different matrix. Checked on the θ's value, since that is what is drawn at,
+/// whatever its bounds; the free-ρ rail does not apply, as nothing is searched.
 pub(crate) fn check_residual_correlation_value(
     model: &CompiledModel,
+    population: &Population,
     params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
@@ -5059,84 +5064,46 @@ pub(crate) fn check_residual_correlation_value(
         .get(serial.rho_theta)
         .copied()
         .unwrap_or(f64::NAN);
-    if serial.kind != crate::types::ResidualSerialKind::Car1 || v >= 0.0 {
-        return Vec::new();
-    }
     let rho = model
         .theta_names
         .get(serial.rho_theta)
         .cloned()
         .unwrap_or_default();
-    vec![Diagnostic::error(
-        "E_RESIDUAL_CORRELATION_RANGE",
-        car1_negative_rho_message(&line, &format!("theta {rho} is {v}")),
-    )]
+    residual_correlation_range(model, population, &line, RhoRange::Value(v), &|_| {
+        format!("theta {rho} is {v}")
+    })
 }
 
-/// Data-dependent admissibility of a `correlation` line (#1081).
+/// The rows of `population` that `ar1` / `car1` cannot place on one clock (#1081,
+/// #1974 review r1 #3), as data checks with no reference to θ — shared by
+/// `check_model_data` (fit, `ferx check`) and `simulate()`'s preconditions (#1976).
 ///
-/// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
-///   positive definite: compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
-///   `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
-///   negative `ρ` and a non-integer `Δt`), and a free `ρ` stays inside the rail
-///   [`RESIDUAL_CORRELATION_RAIL`]. Checked on the θ's bounds when it is free and
-///   on its value when it is `FIX`ed.
-/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
-///   of one block at the same time have no order; `car1` correlates them by
+/// * `E_RESIDUAL_CORRELATION_RESET` — a block whose rows sit on both sides of a
+///   stacked reset occasion (an EVID=3/4 record restarting TIME): its rows' TIMEs
+///   are on two clocks, so their order and the time between them are undefined.
+/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows of
+///   one block at the same time have no order; `car1` correlates them by
 ///   `ρ^0 = 1`, which makes `R` singular.
-/// * `E_RESIDUAL_CORRELATION_RESET` — under `ar1` / `car1`, a block whose rows sit
-///   on both sides of a stacked reset occasion (an EVID=3/4 record restarting TIME):
-///   its rows' TIMEs are on two clocks, so their order and the time between them are
-///   undefined (#1974 review r1 #3).
-fn check_residual_correlation(
+pub(crate) fn check_residual_correlation_data(
     model: &CompiledModel,
     population: &Population,
-    params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
         return Vec::new();
     };
-    let p = params;
-    let i = serial.rho_theta;
-    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
-    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
-    let (lo, hi) = if fixed {
-        let v = p.theta.get(i).copied().unwrap_or(f64::NAN);
-        (v, v)
-    } else {
-        (
-            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
-            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
-        )
-    };
-    let what = |side: &str| {
-        if fixed {
-            format!("theta {rho} is fixed at {lo}")
-        } else {
-            format!(
-                "the {side} bound of theta {rho} is {}",
-                if side == "lower" { lo } else { hi }
-            )
-        }
-    };
-    let mut diags = Vec::new();
-
-    // The largest block, and the first tie under a time-keyed structure.
-    let timed = matches!(
+    if !matches!(
         serial.kind,
         crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
-    );
-    let mut largest: Option<(usize, &Subject, usize)> = None;
+    ) {
+        return Vec::new();
+    }
     let mut tie: Option<(&Subject, usize, f64)> = None;
     // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
     let mut reset: Option<(&Subject, usize, usize)> = None;
     for subject in &population.subjects {
         for block in residual_blocks(model, subject) {
-            if largest.is_none_or(|(n, _, _)| block.len() > n) {
-                largest = Some((block.len(), subject, block[0]));
-            }
-            if timed && reset.is_none() {
+            if reset.is_none() {
                 // A stacked reset occasion (EVID=3/4 restarting TIME) is shifted onto
                 // the engine's monotonic `obs_times`, while the readout clock keeps the
                 // TIME as written, so the two differ by one offset per segment.
@@ -5149,7 +5116,7 @@ fn check_residual_correlation(
                     reset = Some((subject, a, b));
                 }
             }
-            if timed && tie.is_none() {
+            if tie.is_none() {
                 let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
                 times.sort_by(f64::total_cmp);
                 if let Some(w) = times.windows(2).find(|w| w[0] == w[1]) {
@@ -5159,6 +5126,7 @@ fn check_residual_correlation(
         }
     }
 
+    let mut diags = Vec::new();
     if let Some((subject, a, b)) = reset {
         diags.push(Diagnostic::error(
             "E_RESIDUAL_CORRELATION_RESET",
@@ -5194,14 +5162,61 @@ fn check_residual_correlation(
             ),
         ));
     }
+    diags
+}
 
-    let range = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+/// What `residual_correlation_range` checks ρ's range on.
+#[derive(Clone, Copy)]
+enum RhoRange {
+    /// A free θ, searched within `[lo, hi]`: the rail applies.
+    Bounds(f64, f64),
+    /// A single value — a `FIX`ed θ at fit time, or the value simulated at.
+    Value(f64),
+}
+
+/// `E_RESIDUAL_CORRELATION_RANGE` (#1081): ρ's range must keep every block's `R`
+/// positive definite — compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
+/// `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
+/// negative `ρ` and a non-integer `Δt`) — and a free `ρ` stays inside the rail
+/// [`RESIDUAL_CORRELATION_RAIL`]. `what(side)` names the offending number, e.g.
+/// "the lower bound of theta RHO is -0.2". One body for fit (bounds, or the value of
+/// a `FIX`ed θ) and simulate (the value drawn at), so the two refuse the same values
+/// with the same text (#1976).
+fn residual_correlation_range(
+    model: &CompiledModel,
+    population: &Population,
+    line: &str,
+    range: RhoRange,
+    what: &dyn Fn(&str) -> String,
+) -> Vec<Diagnostic> {
+    let Some(serial) = &model.residual_serial else {
+        return Vec::new();
+    };
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .cloned()
+        .unwrap_or_default();
+    let (lo, hi) = match range {
+        RhoRange::Bounds(lo, hi) => (lo, hi),
+        RhoRange::Value(v) => (v, v),
+    };
+    let err = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+    let mut diags = Vec::new();
     // Positive definiteness at the most demanding block.
     if serial.kind == crate::types::ResidualSerialKind::Cs {
+        let mut largest: Option<(usize, &Subject, usize)> = None;
+        for subject in &population.subjects {
+            for block in residual_blocks(model, subject) {
+                if largest.is_none_or(|(n, _, _)| block.len() > n) {
+                    largest = Some((block.len(), subject, block[0]));
+                }
+            }
+        }
         if let Some((n, subject, row)) = largest.filter(|(n, _, _)| *n >= 2) {
             let floor = -1.0 / (n as f64 - 1.0);
             if lo <= floor {
-                diags.push(range(format!(
+                diags.push(err(format!(
                     "`{line}`: {}, but subject {} has {n} rows in the block {}, and compound \
                      symmetry over {n} rows is a valid covariance only for ρ in \
                      (−1/({n}−1), 1) = ({floor:.4}, 1). Keep ρ above {floor:.4}.",
@@ -5212,27 +5227,72 @@ fn check_residual_correlation(
             }
         }
     }
-    if serial.kind == crate::types::ResidualSerialKind::Car1 && lo < 0.0 {
-        diags.push(range(car1_negative_rho_message(&line, &what("lower"))));
+    if serial.kind == crate::types::ResidualSerialKind::Car1 && (lo < 0.0 || lo.is_nan()) {
+        diags.push(err(car1_negative_rho_message(line, &what("lower"))));
     }
-    if fixed && lo.abs() >= 1.0 {
-        diags.push(range(format!(
-            "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
-            what("lower")
-        )));
-    } else if !fixed {
-        for (side, v) in [("lower", lo), ("upper", hi)] {
-            if v.abs() > RESIDUAL_CORRELATION_RAIL {
-                diags.push(range(format!(
-                    "`{line}`: {}. A free correlation is kept within ±{RESIDUAL_CORRELATION_RAIL}, \
-                     because as |ρ| approaches 1 the rows of a block become collinear and R \
-                     numerically singular. Bound theta {rho} within ±{RESIDUAL_CORRELATION_RAIL}, \
-                     or FIX it to hold a value closer to ±1.",
-                    what(side)
+    match range {
+        RhoRange::Value(_) => {
+            if lo.abs() >= 1.0 || lo.is_nan() {
+                diags.push(err(format!(
+                    "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
+                    what("lower")
                 )));
             }
         }
+        RhoRange::Bounds(..) => {
+            for (side, v) in [("lower", lo), ("upper", hi)] {
+                if v.abs() > RESIDUAL_CORRELATION_RAIL {
+                    diags.push(err(format!(
+                        "`{line}`: {}. A free correlation is kept within \
+                         ±{RESIDUAL_CORRELATION_RAIL}, because as |ρ| approaches 1 the rows of a \
+                         block become collinear and R numerically singular. Bound theta {rho} \
+                         within ±{RESIDUAL_CORRELATION_RAIL}, or FIX it to hold a value closer to \
+                         ±1.",
+                        what(side)
+                    )));
+                }
+            }
+        }
     }
+    diags
+}
+
+/// Data-dependent admissibility of a `correlation` line (#1081): the data checks of
+/// [`check_residual_correlation_data`] (`E_RESIDUAL_CORRELATION_RESET` / `_TIES`),
+/// then `E_RESIDUAL_CORRELATION_RANGE` on the θ's bounds when it is free and on its
+/// value when it is `FIX`ed.
+fn check_residual_correlation(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let p = params;
+    let i = serial.rho_theta;
+    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
+    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
+    let range = if fixed {
+        RhoRange::Value(p.theta.get(i).copied().unwrap_or(f64::NAN))
+    } else {
+        RhoRange::Bounds(
+            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
+            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
+        )
+    };
+    let what = |side: &str| match range {
+        RhoRange::Value(v) => format!("theta {rho} is fixed at {v}"),
+        RhoRange::Bounds(lo, hi) => format!(
+            "the {side} bound of theta {rho} is {}",
+            if side == "lower" { lo } else { hi }
+        ),
+    };
+    let mut diags = check_residual_correlation_data(model, population);
+    diags.extend(residual_correlation_range(
+        model, population, &line, range, &what,
+    ));
     diags
 }
 

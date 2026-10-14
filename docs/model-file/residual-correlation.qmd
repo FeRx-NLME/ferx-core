@@ -102,6 +102,11 @@ occasion column to `by`, or use `cs` (`E_RESIDUAL_CORRELATION_RESET`). A line un
 which every block is a single row couples nothing; `ρ` is then not in the
 likelihood and ferx says so (`W_RESIDUAL_CORRELATION_INERT`).
 
+`simulate()` refuses the same inputs with the same codes (#1976): `ρ` is checked
+on the value it draws at, as a `FIX`ed one is at fit time (so the ±0.995 rail
+does not apply), and the `TIES` and `RESET` data checks run on the population it
+is handed.
+
 ## Scope
 
 The line is fitted by `method = foce` and `focei` only. Refused, each with
