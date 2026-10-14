@@ -373,6 +373,14 @@ column minus `TVC`'s is study 2's level. That carries the levels' sum but not th
 reference, so sum-to-zero is refused and `ref` binds; `auto` takes `ref`. The
 refusal names the contrast that binds.
 
+Another level block counts as it will be coded (#1963). In
+`E0 = TVE0 * (1 + 0.01 * TIME * TIME) + B2 + PLACEBO + ETA_E0`, with
+`theta B2[OCC]` over three arms, B2 under sum-to-zero or `ref` carries none of
+the levels' mean, so `PLACEBO[STUDY]` binds as it would without B2, exactly as
+for B2 written out as θ of that coding. Under `contrast = none` B2's levels add up
+to a constant, which carries the mean, and `PLACEBO` is refused. A block that
+absorbs a random effect itself counts with every level.
+
 ##### When no single expression reads both
 
 Where no single expression collects the two, the binder **measures** instead
