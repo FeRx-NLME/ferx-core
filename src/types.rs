@@ -6863,6 +6863,32 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `covariance step:` + `parameters` arm far below would otherwise claim only by
         // accident of wording.
         (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_non_stationary_estimate") {
+        // #1781: `R` needed an eigenvalue floor at a SAEM / IMP / IMPMAP / VI estimate, which
+        // that method never optimised the objective of. Two forms, one token: `S⁻¹` replaced
+        // the requested estimator (degraded but present — `CovarianceRegularized`, and *not*
+        // `REGULARIZED_PREFIX`, so the #1512 strictness gate on the eigen-floor does not fire
+        // on a matrix that was never floored), or `S` was unavailable as well and no SEs were
+        // produced. Matched on its token, ahead of the prose arms: both forms say "covariance
+        // step" and "not positive definite", which the `CovarianceFailed` prose arm below would
+        // otherwise claim for the success form too.
+        if lower.contains("covariance step failed") {
+            (WarningSeverity::Critical, WarningCode::CovarianceFailed)
+        } else {
+            (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
+        }
+    } else if lower.contains("w_cov_quadrature_objective") {
+        // #1781: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model had its R and S taken
+        // on the quadrature marginal instead of the FOCEI objective. A route note like the
+        // salvage one above: the matrix is complete and nothing was floored. Its own token,
+        // ahead of the prose arms, because the message says "covariance step" and "FOCEI".
+        (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_quadrature_declined") {
+        // #1781: the same fit where the quadrature could not be used (mixture, IOV, grid), so
+        // the standard errors are the FOCEI objective's curvature at a point that objective
+        // need not minimise. Present but unreliable — a warning on the covariance route, not
+        // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the

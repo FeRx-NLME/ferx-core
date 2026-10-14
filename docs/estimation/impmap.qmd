@@ -190,6 +190,14 @@ Per iteration ≈ one MAP inner loop (parallel over subjects) plus
 Total cost is roughly `impmap_iterations ×` the cost of a single `imp`
 evaluation. Everything is parallelized over subjects via the shared Rayon pool.
 
+## Standard errors on a non-Gaussian model
+
+With a TTE, `[binary_model]` or CTMM endpoint, the covariance step after `impmap` differentiates
+the 7-node quadrature marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective,
+whose minimum can sit far from the `impmap` estimate on such a model (#1781). See
+[SAEM: covariance step on a non-Gaussian model](saem.qmd#saem-covariance-non-gaussian) for
+when it applies, the measured effect, and the warnings it carries.
+
 ## Not yet supported
 
 - **IOV (`[iov]` / `kappa`)** — the κ sufficient statistics and Ω_iov update are

@@ -146,6 +146,7 @@ jobs:
             --test one_snapshot_dose_reads_survival \
             --test pktte_prestart_entry \
             --test pktte_tdep_nonmem_anchor \
+            --test sampler_covariance_non_gaussian \
             --test ss_chz_nonmem_anchor \
             --test survival_time_dependent_pk \
             --test tte_convergence \
