@@ -8560,7 +8560,10 @@ pub struct FitOptions {
     /// with NONMEM (which has no defensive mixture); set a small positive value
     /// (e.g. `0.1`) to enable the rescue for weakly-identified models. For an
     /// IMPMAP stage the option may also be written as `impmap_defensive_alpha`
-    /// (an alias for this same field). Enabling the mixture disables Sobol QMC and
+    /// (an alias for this same field). It combines with Sobol QMC
+    /// (`impmap_sobol` / `imp_sobol`): a dedicated quasi-random coordinate picks
+    /// each draw's component, so the broad fraction is stratified — within one
+    /// draw of `alpha·K` when K is a power of two (#1965). Enabling the mixture
     /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
     /// flags fewer subjects).
     pub imp_defensive_alpha: f64,

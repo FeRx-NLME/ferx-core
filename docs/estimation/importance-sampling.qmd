@@ -285,7 +285,9 @@ Practical notes:
   `impmap_sobol` / `imp_sobol` on, a dedicated quasi-random coordinate picks
   each draw's component, so the broad fraction is stratified (within one draw
   of αK when K is a power of two) instead of binomial, and both components take their normals from the
-  same Sobol point.
+  same Sobol point. Under `imp_sobol` the Student-t proposal is limited to
+  `imp_proposal_df ≤ 1000` (use `normal` beyond that) and a draw to 1000
+  quasi-random coordinates; both are checked when the fit starts.
 - For an IMPMAP stage the option may also be written `impmap_defensive_alpha`
   (an alias for the same field).
 

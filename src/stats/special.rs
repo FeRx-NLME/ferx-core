@@ -1443,6 +1443,33 @@ mod tests {
         }
     }
 
+    /// The production clamp at the two ends of the validated ν range, against
+    /// R 4.5.3's `qchisq` — an independent implementation, not the gamma
+    /// routines this quantile inverts. Upper-tail references use the tail the
+    /// function actually receives (`1 − (1 − t)` in f64: 9.992e-16 for 1e-15,
+    /// 9.99978e-13 for 1e-12), passed to `qchisq(..., lower.tail = FALSE)`.
+    /// Measured worst relative error: 7.0e-14 (ν = 1000, p = 1 − 1e-12); bound 1e-12.
+    #[test]
+    fn chi_squared_inv_cdf_matches_r_qchisq_at_the_clamp() {
+        // (ν, p as passed, R reference)
+        let cases: [(f64, f64, f64); 6] = [
+            (1000.0, 1e-15, 685.059_891_527_132_44),
+            (1000.0, 1e-12, 716.949_478_789_497_68),
+            (1000.0, 1.0 - 1e-15, 1_397.577_036_679_521_4),
+            (1000.0, 1.0 - 1e-12, 1_347.620_221_764_733_3),
+            (100.0, 1e-15, 24.916_472_003_682_532),
+            (100.0, 1.0 - 1e-15, 256.637_541_548_863_11),
+        ];
+        for (nu, p, want) in cases {
+            let got = chi_squared_inv_cdf(nu, p);
+            let rel = (got - want).abs() / want;
+            assert!(
+                rel.is_finite() && rel < 1e-12,
+                "nu={nu} p={p}: got {got}, R {want} (rel {rel:e})"
+            );
+        }
+    }
+
     #[test]
     fn chi_squared_inv_cdf_round_trips_through_the_cdf() {
         // Includes fractional and large ν (the IS proposal takes any ν ≥ 1).
