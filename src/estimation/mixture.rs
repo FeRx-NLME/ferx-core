@@ -1629,7 +1629,7 @@ mod tests {
                         h,
                         &cp.omega,
                         &cp.sigma.values,
-                        cp.residual_cov(),
+                        model.residual_cov_at(&cp),
                         interaction,
                     ),
                 }

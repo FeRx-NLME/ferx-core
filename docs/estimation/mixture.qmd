@@ -176,11 +176,44 @@ every parameter. At the NONMEM finals of `tests/nonmem/mixture_iv_cov.ctl`
 | `V` | 0.1861 | 0.2119 | 0.1704 |
 | `p(1)` | 0.1026 | 0.1226 | 0.1142 |
 
-The `r` column matches NONMEM's `MATRIX=R` to 0.15 %. The `MATRIX=S` and default
-`$COVARIANCE` reference runs for `s` and `rsr`
-(`tests/nonmem/mixture_iv_cov_{s,rsr}.ctl`) are pending, and
-`tests/mixture_cov_s_nonmem.rs` anchors against them once their output is
-committed.
+##### Against NONMEM: a different score convention
+
+NONMEM 7.5.1 at the same point (`MAXEVAL=0`,
+`tests/nonmem/mixture_iv_cov_{s,rsr,r0}.ctl`) gives:
+
+| SE | `MATRIX=R` | `MATRIX=S` | default ($R^{-1}SR^{-1}$) |
+|---|---|---|---|
+| `TVCL1` | 0.1053 | 0.1324 | 0.0847 |
+| `TVCL2` | 0.2542 | 0.2937 | 0.2241 |
+| `V` | 0.1861 | 0.2136 | 0.1687 |
+| `p(1)` | 0.1025 | 0.1088 | 0.1012 |
+
+`r` agrees to 0.45 % (`TVCL1`; the other three to 0.05 %), but `s` differs by up
+to 14 % (`TVCL2`) and `rsr` by up to 36 %. That is not a mixture defect. The two
+engines differentiate different objectives: NONMEM's score is the *total*
+derivative of $-2\log L_i$, with η̂ re-estimated at every perturbed parameter
+vector, while ferx holds η̂ and its prediction Jacobian at the estimates — for a
+mixture and for a single-population fit alike.
+
+`tests/nonmem/mixture_iv_cov_score_oracle.py` settles which is which. It computes
+each subject's FOCEI $-2\log L_i$ in closed form, outside both engines (it
+reproduces NONMEM's objective, 301.582018, to 4e-8), and forms $S$ from central
+differences under each convention:
+
+| `s` SE | NONMEM | oracle, η̂ re-estimated | oracle, η̂ held | ferx |
+|---|---|---|---|---|
+| `TVCL1` | 0.13238 | 0.13237 | 0.13403 | 0.13403 |
+| `TVCL2` | 0.29366 | 0.29366 | 0.25211 | 0.25211 |
+| `V` | 0.21364 | 0.21364 | 0.21193 | 0.21193 |
+| `p(1)` | 0.10881 | 0.10881 | 0.12260 | 0.12260 |
+
+Each engine matches its own column to better than 4e-6. On the
+single-population twin of this model (`--single`: $CL = TVCL\,e^{\eta}$, same
+data) the same split appears, $\operatorname{SE}(TVCL)$ = 0.0538 re-estimated
+against 0.0626 held, and ferx reports 0.0626. So until ferx's score carries the
+EBE response, expect `s` and `rsr` to differ from NONMEM's by this
+finite-sample amount on any FOCE/FOCEI model. The two conventions agree
+asymptotically. `tests/mixture_cov_s_nonmem.rs` pins both halves.
 
 ## Inter-occasion variability under a mixture
 
