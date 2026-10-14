@@ -3090,10 +3090,16 @@ mod tests {
             let mut rng = StdRng::seed_from_u64(seed);
             let n_broad = (0..k)
                 .filter(|&idx| {
-                    matches!(
-                        draw_inputs(idx, Some(&q), Some(&m), Some(&chi), nu, &mut rng, &mut z),
-                        DrawInputs::Broad
-                    )
+                    let kind =
+                        draw_inputs(idx, Some(&q), Some(&m), Some(&chi), nu, &mut rng, &mut z);
+                    // Both components take their normals from the same Sobol
+                    // point — broad draws included.
+                    assert_eq!(
+                        z.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        q.z[idx].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "seed {seed} draw {idx}: normals are not the Sobol point's"
+                    );
+                    matches!(kind, DrawInputs::Broad)
                 })
                 .count();
             assert!(
@@ -3101,6 +3107,62 @@ mod tests {
                 "seed {seed}: {n_broad} broad draws, want 102.4 ± 1"
             );
         }
+    }
+
+    /// In the full-dimensional sampler, every broad (defensive) draw is exactly
+    /// `L_broad · z` for the Sobol point's normals — sampler-level, so a loop
+    /// that refilled `z` from the RNG for broad draws only would fail here even
+    /// though the component count and determinism checks would not see it.
+    #[test]
+    fn sobol_broad_draws_are_the_sobol_point_through_the_broad_factor() {
+        let model = frem_rb_test_model();
+        let subject = frem_rb_test_subject();
+        let theta = [10.0, 100.0, 90.0];
+        let sigma = model.default_params.sigma.values.clone();
+        let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);
+        let omega_matrix = model.default_params.omega.matrix.clone();
+        let omega_inv = omega_matrix.clone().try_inverse().unwrap();
+        let log_det_omega = omega_matrix.determinant().ln();
+        let h = DMatrix::from_diagonal(&DVector::from_column_slice(&[50.0, 50.0, 1e4]));
+        let (k, seed, nu) = (256, 21, 4.0);
+        let mix = DefensiveMixture::new(&omega_inv, 3, 0.2).expect("PD Ω⁻¹ → mixture");
+        let draws = subject_is_draws(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta_hat,
+            &h,
+            &omega_inv,
+            log_det_omega,
+            3,
+            k,
+            nu,
+            seed,
+            &mut EventPkParams::default(),
+            1.0,
+            true,
+            Some(&mix),
+        );
+        let q = sobol_qmc_draws(3, k, seed, nu, true);
+        let mut n_broad = 0;
+        for idx in 0..k {
+            if !mix.selects_broad(q.u_mix.as_ref().unwrap()[idx]) {
+                continue;
+            }
+            n_broad += 1;
+            let mut want = [0.0; 3];
+            mix.broad_from_z(&q.z[idx], &mut want);
+            assert_eq!(
+                draws.etas[idx]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "broad draw {idx} is not L_broad · z(Sobol)"
+            );
+        }
+        assert!(n_broad > 0, "fixture must exercise the broad component");
     }
 
     /// The point of quasi-random t draws: at equal K they integrate a smooth
