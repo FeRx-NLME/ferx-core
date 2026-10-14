@@ -1,0 +1,17 @@
+# ferx twin of nonmem_anchor/reset_clock_cat_control.ctl (#1978): the cat fixture with the
+# time term removed, so nothing reads the clock. NONMEM's optimum otherwise
+# (results/reset_clock_cat.ext), evaluated once (maxiter = 0) by
+# tests/reset_clock_nonmem_anchor.rs. Must agree with NONMEM on main and after any fix.
+[parameters]
+  theta TH0(-1.0125653067216978, -10.0, 10.0)
+  omega ETA_I ~ 0.21416994409132303
+
+[binary_model]
+  cmt   = 1
+  logit = TH0 + ETA_I
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false
