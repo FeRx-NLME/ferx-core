@@ -1220,13 +1220,7 @@ fn serial_pairs(
     if obs_rgroup.len() != n {
         return None;
     }
-    let time = |j: usize| -> f64 {
-        obs_raw_times
-            .get(j)
-            .or_else(|| obs_times.get(j))
-            .copied()
-            .unwrap_or(0.0)
-    };
+    let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
     let mut pos = vec![0usize; n];
     if serial.kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
