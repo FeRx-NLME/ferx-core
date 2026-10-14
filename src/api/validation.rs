@@ -3922,6 +3922,47 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
+/// Whether `model` is a transit / inverse-Gaussian **closed form carrying no ODE twin** —
+/// the one family whose flip-flop regime has nothing to reroute to, and so the only one that
+/// can silently return an identically-zero **dose-driven contribution** (not necessarily an
+/// identically-zero profile: a baseline, readout or log transform layered on afterwards
+/// survives the clamp — see [`SimulatedFlipFlopTally`]).
+///
+/// A twin-*carrying* model is rerouted per evaluation by
+/// [`crate::pk::effective_model_for_eval`] and is correct in both regimes (it is only
+/// *warned* about, #776); a non-absorption model has no flip-flop regime at all. One
+/// predicate for the three gates that share it — the η = 0 refusal
+/// ([`check_absorption_flip_flop_no_twin`]), the fit-end EBE warning
+/// ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) and the
+/// simulated-η tally ([`SimulatedFlipFlopTally`], #1823) — so a family added to one
+/// is added to all three rather than to whichever copy the author happened to read.
+pub(crate) fn twinless_absorption_closed_form(model: &CompiledModel) -> bool {
+    matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && model.absorption_ode_equivalent.is_none()
+}
+
+/// The tilting abscissa and the ODE rewrite's forcing function for `model`'s absorption
+/// family — the two strings every flip-flop message interpolates, in one place so a
+/// re-worded domain cannot reach one message and not another.
+fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'static str) {
+    match model.pk_model {
+        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
+        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
+    }
+}
+
+/// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
+/// 1-cpt model, which has a single disposition exponential and so no such edge.
+fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
+    if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
+        ", or with coincident disposition eigenvalues"
+    } else {
+        ""
+    }
+}
+
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
@@ -3945,11 +3986,7 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     theta: &[f64],
 ) -> Option<String> {
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) || model.absorption_ode_equivalent.is_some()
-    {
+    if !twinless_absorption_closed_form(model) {
         return None;
     }
     // Model-family-specific domain / ODE-forcing wording (the tilting abscissa and the
@@ -3999,15 +4036,8 @@ pub(crate) fn uncertainty_draws_skipped_warning(
     skipped: &[usize],
     n: usize,
 ) -> String {
-    let (domain, ode_fn) = match model.pk_model {
-        PkModel::OneCptIg | PkModel::TwoCptIg => ("1/(2·MAT·CV²)", "igd()"),
-        _ => ("transit rate KTR = (n+1)/mtt", "transit()"),
-    };
-    let confluent = if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
-        ", or with coincident disposition eigenvalues"
-    } else {
-        ""
-    };
+    let (domain, ode_fn) = absorption_flip_flop_wording(model);
+    let confluent = absorption_confluent_clause(model);
     let list = skipped
         .iter()
         .map(|k| k.to_string())
@@ -4025,6 +4055,215 @@ pub(crate) fn uncertainty_draws_skipped_warning(
         model_name = model.pk_model.canonical_name(),
         decline = twin_decline_clause(model),
     )
+}
+
+/// Per-run tally of **dosed** simulated individuals whose **sampled η** entered the
+/// flip-flop regime of a twin-less transit / IG closed form, where the whole dose-driven
+/// concentration is clamped to zero (#1823).
+///
+/// The three gates that existed before all sample a *fixed* η: the entry-point refusal
+/// ([`check_absorption_flip_flop_no_twin`]) evaluates η = 0 typical values, the fit-end
+/// warning ([`crate::api::postfit::absorption_flip_flop_ebe_warning`], #785) evaluates the
+/// fitted EBEs, and the uncertainty skip ([`uncertainty_draws_skipped_warning`], #786 /
+/// #1485) evaluates each *draw's* η = 0 θ. None of them sees the individual
+/// `simulate()` draws from N(0, Ω) whose own η pushes `ke` to or past the tilting
+/// abscissa. For such an individual [`crate::pk::effective_model_for_eval`] has no twin to
+/// reroute to and returns the closed form, which clamps — so the individual contributes
+/// finite, plottable rows carrying nothing from the doses the subject was given, and every
+/// summary computed over them (a VPC band, a prediction interval, a mean) describes an
+/// **undosed** subject. Counting them is the only channel that says so.
+///
+/// "Undosed", not "drug-free": an `[initial_conditions] init(central) = BASE` baseline is
+/// itself drug, and it survives the clamp (it is layered on afterwards), so such a subject's
+/// rows carry its decay. What is zero is the **dose-driven** contribution, which is exactly
+/// what the dose-free twin in the tests measures (#1823 review r5).
+///
+/// The message says that and stops. It does **not** say the clamp *moved* anything, because
+/// for a few degenerate designs it did not — an absorption `lagtime` past the last
+/// observation, or `f = 0`, leaves the rows where they already were. Those are
+/// individual-parameter expressions, so excluding them needs the predictor; the two
+/// structural halves that can be excluded — no positive dose, and no dose strictly before
+/// an observation — are ([`observe`](Self::observe), #1823 review r2 / r3 / r4), and the
+/// message names that eligibility rather than claiming every dosed individual is counted.
+///
+/// **The count says nothing about what those rows contain**, deliberately. Four things run
+/// on the closed form's output *after* the clamp (`pk/mod.rs`, in order):
+/// [`crate::pk::add_analytical_init`], [`crate::pk::apply_analytic_readout`],
+/// [`crate::pk::apply_log_transform`] and `apply_frem_prediction_override`. Whether any of
+/// them leaves a clamped row at `0.0` is a question about the *value* the model's own
+/// expressions produce, not about its structure: measured on #1823 review r2, the Form-C
+/// readouts `y = central/V` and `y = central/V + 2.5` are indistinguishable structurally
+/// (`analytic_readout.is_some()` for both) and give 27 zero rows and 0 zero rows
+/// respectively. A structural predicate that tried to answer it would be a second copy of
+/// the predictor, wrong on whichever models its approximation did not cover — so the
+/// message states the clamp, which is certain, and tells the reader that searching for a
+/// zero row will not find these individuals.
+///
+/// [`observe`](Self::observe) is two cheap field tests for every model outside this family,
+/// which is every model but a twin-less transit / IG closed form; the `total` denominator is
+/// therefore counted only for that family, and a tally that never observed one reports
+/// nothing.
+///
+/// Deliberately **not** `Copy` / `Clone`: it is an accumulator passed as `&mut` through the
+/// simulate chokepoint, and a copy taken by accident would drop every count written to it.
+#[derive(Debug, Default)]
+pub(crate) struct SimulatedFlipFlopTally {
+    /// Individuals (subject × replicate × uncertainty draw) whose sampled η crossed.
+    crossed: usize,
+    /// Dosed individuals simulated in all — the denominator `crossed` is reported against.
+    total: usize,
+}
+
+impl SimulatedFlipFlopTally {
+    /// Record one simulated individual, evaluated at the `η` slice the row emitter is about
+    /// to predict with (`n_eta + n_kappa` long, the κ tail zeroed by the caller).
+    ///
+    /// The predicate is [`crate::pk::absorption_flip_flop_at`] — the same one
+    /// `effective_model_for_eval` routes on — not `ipred == 0.0`, in both directions: a
+    /// zero prediction has other causes (an observation before the first dose), and a
+    /// clamped individual is frequently not zero at all (see the type's own docs). The
+    /// question here is specifically whether the closed form's domain was left.
+    ///
+    /// Returns without counting for a subject carrying no positive dose amount: there is no
+    /// dose-driven term for the clamp to remove, so the individual is not affected.
+    pub(crate) fn observe(
+        &mut self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        if !twinless_absorption_closed_form(model) {
+            return;
+        }
+        // A subject with no dose has no dose-driven term for the clamp to take away, so
+        // nothing was lost and there is nothing to report about it — its rows are the same
+        // with the clamp and without it, and an ODE rewrite would produce the same rows. Counting it would inflate *both* sides of the ratio and attach a
+        // message about a lost drug contribution to a placebo arm (#1823 review r2).
+        // Measured there: an `AMT = 0` second subject contributed its crossers to a count
+        // of 27 while all 900 of its rows were already zero.
+        //
+        // The dose must also land **strictly before** an observation, or no returned row
+        // could have carried the drug either way (#1823 review r3; measured there: obs at
+        // t = 1, 2, 3 with the dose at t = 100 predicted `[0, 0, 0]` with the dose and
+        // `[0, 0, 0]` without it, at a crossing η *and* at η = 0).
+        //
+        // `<`, not `<=`, and the reason is this family specifically (review r4): a transit
+        // or IG absorption contributes **exactly** zero central concentration at elapsed
+        // time zero — nothing has transited yet — so a dose landing on the last
+        // observation reaches it with nothing, whatever the event ordering does. Measured:
+        // with the dose moved to the last observation the prediction is bit-identical to
+        // the dose-free twin at η = 0 (last row exactly `0.0`) on both the transit and the
+        // IG fixture, while moving it `1e-9` earlier gives `1.67e-39` — small, but not
+        // zero, so the strict test is on the right side of the boundary. (`<=` would be
+        // correct for an IV bolus, which jumps instantaneously; this family is oral.)
+        //
+        // Both halves read dose and observation **times**, which are data — this is still
+        // a structural test, not a guess at the predictor.
+        //
+        // The two clocks are directly comparable here: `obs_times` is the internal monotonic
+        // clock, which diverges from the raw data TIME only across an EVID=3/4 reset, and
+        // `check_absorption_closed_form_support` refuses a reset on any transit / IG closed
+        // form before a simulation starts. So a counted subject has no stacked occasions.
+        //
+        // What it deliberately does **not** cover: a `lagtime` that pushes absorption past
+        // the last observation, or `f = 0`. Such an individual is still counted, and the
+        // message stays true for it — nothing from its doses reaches its rows, and since
+        // review r9 the message names "because the dose never arrived" as the alternative
+        // cause rather than attributing those rows to the clamp (measured there: lag = 50
+        // against observations at t = 1, 2, 3 predicts `[0, 0, 0]` at a crossing η *and* at
+        // η = 0, so the domain guard is never even reached). The claim that was *not* safe —
+        // that the clamp moved anything — came out of the message in review r3.
+        //
+        // **Open option** (r9): the lag is reachable from the `pk` snapshot computed below,
+        // so comparing `dose.time + lag` here instead of `dose.time` would move the count's
+        // *scope* to match its claim and let the message drop that disclaimer. That is not
+        // the "needs the predictor" objection of review r2 — it reads an individual
+        // parameter, not an arbitrary expression's value — but a per-compartment `ALAGn` and
+        // the `dose_attr_map` layout make it more than a one-line change, and `f = 0` would
+        // want the same treatment. Deferred deliberately, not overlooked.
+        let last_obs = subject
+            .obs_times
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !subject
+            .doses
+            .iter()
+            .any(|d| d.amt > 0.0 && d.time < last_obs)
+        {
+            return;
+        }
+        // A twin-less transit / IG closed form takes no IOV (rejected by
+        // `check_absorption_closed_form_support`), so `eta` is the BSV vector the
+        // prediction uses. Guard the length anyway so an unexpected shape is skipped
+        // rather than read past the end inside `pk_param_fn`.
+        if eta.len() != model.n_eta + model.n_kappa {
+            return;
+        }
+        self.total += 1;
+        // An individual whose parameters are not finite is not a measurement of the closed
+        // form's domain at all, and must not be reported as a **crossing** (#1823 review r7).
+        //
+        // It stays in the *denominator*, which the message calls the individuals "dosed
+        // before one of their observations" — an overflowed draw is one of those, and
+        // dropping it from both sides would make the reported share larger than the
+        // population it was measured over (#1823 review r8). Only `crossed` is gated.
+        //
+        // [`crate::pk::absorption_flip_flop_at`]'s own contract already says so — it returns
+        // `false` "for invalid parameters — there the closed form's `0` is a deliberate
+        // optimiser penalty, not a flip-flop to reroute to the ODE twin" — but it enforces
+        // that with positivity tests only (`cl > 0.0 && v1 > 0.0`), and `f64::INFINITY > 0.0`
+        // is `true`. So an overflowed draw reaches the comparison. Measured: at η = 710 a
+        // lognormal `CL` is `inf`, so `!(inf < KTR)` is `true`; with η on `V` as well
+        // `cl / v1` is `NaN` and `!(NaN < KTR)` is `true` too. Either way the individual was
+        // counted, and the message then attributed it to "disposition rate ≥ {the abscissa}"
+        // and recommended an ODE "valid in both regimes" — which would receive the same
+        // non-finite parameters.
+        //
+        // Enforced here rather than in the predicate: that predicate also decides **routing**
+        // for twin-*carrying* models ([`crate::pk::effective_model_for_eval`]), where sending
+        // a non-finite subject to the ODE twin is existing behaviour and a separate question.
+        // This is about what the tally claims. The extra `pk_param_fn` call lands only on a
+        // twin-less transit / IG model with an eligible dose, next to the predicate's own.
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        if !pk.values.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        if crate::pk::absorption_flip_flop_at(model, subject, theta, eta) {
+            self.crossed += 1;
+        }
+    }
+
+    /// The one `W_SIMULATED_FLIP_FLOP` warning this run owes its caller, or `None` when no
+    /// simulated individual crossed (the common case, and every non-absorption model).
+    pub(crate) fn warning(&self, model: &CompiledModel) -> Option<String> {
+        if self.crossed == 0 {
+            return None;
+        }
+        let (domain, ode_fn) = absorption_flip_flop_wording(model);
+        let confluent = absorption_confluent_clause(model);
+        Some(format!(
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
+             their observations were evaluated at an η inside the flip-flop regime \
+             (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
+             closed form has no solution and clamps its dose-driven concentration to zero. \
+             None of their rows carries any contribution from the doses the subject was \
+             given — by that clamp, or, for an individual whose absorption never reaches an \
+             observation (a `lagtime` past it, or `f = 0`), because the dose never arrived. \
+             Those rows are still returned and still summarised, so every VPC band, \
+             prediction interval or mean computed over them describes an undosed subject. \
+             Whether they read as a literal `ipred = 0` depends on what this model layers \
+             on the closed form's output afterwards, so searching the output for a zero row \
+             will not reliably find them. \
+             Rewrite the model as an explicit ODE `{ode_fn}` model, which reroutes per \
+             individual and is valid in both regimes.{decline}",
+            k = self.crossed,
+            n = self.total,
+            model_name = model.pk_model.canonical_name(),
+            decline = twin_decline_clause(model),
+        ))
+    }
 }
 
 /// The refusal `simulate_with_uncertainty_diag` returns when **every** one of its `n > 0`

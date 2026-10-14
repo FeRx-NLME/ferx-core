@@ -338,6 +338,126 @@ with the flip-flop error `simulate()` gives at that θ, `E_TRANSIT_FLIP_FLOP`
 (`E_IG_FLIP_FLOP`), and so is a run in which every draw is skipped. Writing the model as an explicit ODE
 `transit()` / `igd()` model avoids the skip altogether.
 
+A draw that *survives* can still contain individuals in that regime, because the
+skip is decided at the draw's typical (η = 0) parameters. Those are counted
+separately; see
+[Individuals in the flip-flop regime](#simulated-flip-flop).
+
+## Individuals in the flip-flop regime {#simulated-flip-flop}
+
+The checks above all read a **fixed** η: every entry point refuses a model whose
+typical (η = 0) parameters are in the flip-flop regime of a twin-less transit /
+inverse-Gaussian closed form, and `simulate_with_uncertainty()` skips a
+*parameter draw* whose own typical values land there. Neither sees an individual
+whose **sampled η** pushes `ke` to or past the tilting abscissa — `KTR =
+(n+1)/mtt` for transit, `1/(2·MAT·CV²)` for inverse-Gaussian.
+
+A twin-*carrying* model reroutes such an individual to its exact ODE twin, which
+is valid in both regimes, and nothing is lost. A twin-less one has nothing to
+reroute to: the closed form clamps, and that individual's **entire dose-driven
+concentration becomes zero** — none of its rows carries any contribution from the
+doses the subject was given. The rows are still returned and still plotted, and
+they are not necessarily zeros (see below) — nor necessarily finite, if an
+η-dependent `obs_scale` goes non-positive for that draw (see the table).
+
+They are *undosed*, which is not the same as drug-free: an `[initial_conditions]`
+baseline is itself drug and survives the clamp, so those rows carry its decay.
+
+The `_diag` entry points report this as one per-run count
+([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
+
+```
+W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals dosed before one of their
+observations were evaluated at an η inside the flip-flop regime (disposition rate
+≥ transit rate KTR = (n+1)/mtt), where the twin-less one_cpt_transit closed form
+has no solution and clamps its dose-driven concentration to zero. None of their
+rows carries any contribution from the doses the subject was given — by that
+clamp, or, for an individual whose absorption never reaches an observation (a
+`lagtime` past it, or `f = 0`), because the dose never arrived. Those rows are
+still returned and still summarised, so every VPC band, prediction interval or
+mean computed over them describes an undosed subject. Whether they read as a
+literal `ipred = 0` depends on what this model layers on the closed form's output
+afterwards, so searching the output for a zero row will not reliably find them.
+Rewrite the model as an explicit ODE `transit()` model, which reroutes per
+individual and is valid in both regimes.
+```
+
+### Why looking for a zero row will not find them
+
+The clamp removes the closed form's **dose-driven** term. Five steps then run on
+that output, in this order (`pk/mod.rs`) — four of which can lift a clamped row
+off zero, and one of which cannot:
+
+| Step | What it does to a clamped (zero) prediction |
+|---|---|
+| `add_analytical_init` — `[initial_conditions] init(central) = ...` | adds the baseline's decay, so the row is the baseline alone |
+| `apply_analytic_readout` — Form-C `[scaling] y = <expr>` | whatever `<expr>` evaluates to at a zero state |
+| `apply_scaling` — Form-A/B `[scaling] obs_scale = <expr>` | divides, so a zero stays zero — **unless** the evaluated scale is non-positive or non-finite, which replaces the row with `NaN` |
+| `apply_log_transform` — `log(DV) ~ additive(...)` / `DV ~ log_additive(...)` | `ln` of the internal floor, a large negative number |
+| `apply_frem_prediction_override` — FREM `FREMTYPE > 0` rows | replaced by `theta + eta` (from code reading; not measured) |
+
+Whether a clamped row ends up at `0.0` — or at `NaN` — is therefore a question
+about the values the model's own expressions produce, not about its structure.
+Measured on `obs_scale = 1 - ETA_CL`: a crossing draw at η = 0.6 gives
+`[0, 0, 0]`, and at η = 2 the scale is −1 and the rows are `[NaN, NaN, NaN]`.
+Both are counted — the tally's own finiteness guard reads the **PK parameters**,
+not the evaluated scale. Two Form-C
+readouts make the point: measured at ω²~CL~ = 0.09 / n_sim = 300 / seed 7, the
+same 27 clamped individuals give **27** zero rows under `y = central/V` and
+**0** under `y = central/V + 2.5`.
+
+So the warning does not say what the rows contain — it says nothing from the
+subject's doses reaches them (they are *undosed*, not drug-free: the baseline in
+the second row of the table above is itself drug), and that **searching the
+output for a zero row will not reliably find them**. The count is the reliable channel. Measured on an
+`[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero
+row between them.
+
+The count is of **timing-eligible crossers**: an individual is not counted unless
+its subject carries a dose of positive amount **strictly before one of its
+observations**: without that, no returned row
+could have carried the dose either way, so nothing was lost and an ODE rewrite
+would produce the same rows. The count's denominator is those eligible individuals,
+and the warning says so rather than claiming every dosed individual is counted.
+
+Strictly before, not at or before: a transit or IG absorption contributes exactly
+zero central concentration at elapsed time zero, so a dose landing *on* an
+observation reaches it with nothing. Measured — with the dose moved to the last
+observation, the prediction is bit-identical to the same subject with `AMT = 0`
+at η = 0, on both the transit and the IG fixture; moving it `1e-9` earlier gives
+`1.67e-39`, small but not zero.
+
+Two designs that *are* still counted, because excluding them would need the
+predictor rather than the data: an absorption `lagtime` that pushes absorption
+past the last observation, and `f = 0`. Both are individual-parameter
+expressions, evaluated per individual. The warning stays accurate for them — it
+says nothing from their doses reaches those rows, which is true, and it names
+"because the dose never arrived" as the alternative cause rather than
+attributing those rows to the clamp. It also deliberately does not claim the
+clamp *moved* anything.
+
+### What it does to a VPC
+
+Those rows are **not** dropped, so every summary taken over them — a VPC band, a
+prediction interval, a mean — describes an undosed subject.
+
+How much that biases the result is **fixture-dependent**, and in the degenerate
+cases above (a `lagtime` past the last observation, `f = 0`) it does not bias it
+at all: those rows were already undosed, and an ODE rewrite would reproduce them.
+The count tells you how many individuals are in that state; whether it matters is
+a question about your model. On the fixture measured here it matters a great deal.
+Measured on
+the #1823 fixture (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`,
+ω²~CL~ = 0.09), 260 of 4000 simulated individuals were clamped — 6.5%, against
+the 5.9% that P(η ≥ ln 1.6) predicts for this boundary. On the matching
+`simulate_with_uncertainty()` run the 5th percentile of the first subject's
+IPRED at t = 3 read **0.0000**, against 0.0322 on the same model with its twin.
+
+Rewrite the model as an explicit ODE `transit()` / `igd()` model: that reroutes
+per individual, so nothing is clamped. `simulate()` and `simulate_with_seed()`
+return rows only and so stay silent — use `simulate_with_options_diag()` or
+`simulate_with_uncertainty_diag()` when the count matters (a VPC, for example).
+
 ## Result Types
 
 ```rust
