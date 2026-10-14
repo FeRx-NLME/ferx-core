@@ -34,6 +34,7 @@ use super::sens_outer_gradient::{mixed_eta_theta, subject_natural_gradient, Poin
 use crate::estimation::parameterization::{theta_packs_log, unpack_params};
 use crate::estimation::sens_outer_gradient::prepare;
 use crate::sens::provider::{subject_sensitivities_cov, SubjectSens};
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -475,20 +476,16 @@ fn iov_stack(
     }
     let iov = params.omega_iov.as_ref()?;
     let (ne, nk) = (model.n_eta, model.n_kappa);
-    let occasions = crate::stats::likelihood::iov_occasion_groups(subject).len();
-    let d = ne + occasions * nk;
+    let occasions = crate::stats::stacked_layout::group_count(subject);
+    let d = stacked_width(ne, nk, occasions);
     if b.len() != d || iov.dim() != nk || params.omega.dim() != ne {
         return None;
     }
-    let mut matrix = DMatrix::zeros(d, d);
-    matrix
-        .view_mut((0, 0), (ne, ne))
-        .copy_from(&params.omega.matrix);
-    for k in 0..occasions {
-        matrix
-            .view_mut((ne + k * nk, ne + k * nk), (nk, nk))
-            .copy_from(&iov.matrix);
-    }
+    let matrix = crate::stats::stacked_layout::block_diag_stack(
+        &params.omega.matrix,
+        &iov.matrix,
+        occasions,
+    );
     let inv = crate::estimation::importance_sampling::build_joint_omega_inv(
         &params.omega.inv,
         &iov.inv,
@@ -503,7 +500,7 @@ fn iov_stack(
     for (r, c) in omega_entries(iov.diagonal, nk) {
         let mut e = DMatrix::zeros(d, d);
         for k in 0..occasions {
-            let off = ne + k * nk;
+            let off = kappa_offset(ne, nk, k);
             e[(off + r, off + c)] = 1.0;
             e[(off + c, off + r)] = 1.0;
         }
@@ -2523,6 +2520,7 @@ mod tests {
             .collect();
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "ode-cov".into(),
             doses: (0..occasions)
                 .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
@@ -2544,6 +2542,7 @@ mod tests {
                 .collect(),
             dose_occasions: (1..=occasions).map(|k| k as u32).collect(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
             obs_records: vec![],
@@ -3025,6 +3024,7 @@ mod tests {
     fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         let n = times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -3042,6 +3042,7 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
             // Declared unconditionally since Phase 4.0 — the `#[cfg(feature = "survival")]`
@@ -6312,6 +6313,7 @@ mod tests {
         let base_times = vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0];
         let n = base_times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: base_times,
@@ -6329,6 +6331,7 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
             obs_records: vec![],
@@ -6632,6 +6635,7 @@ mod tests {
         let n = base_times.len();
         let eta_true = [0.12, -0.08, 0.10];
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "tv".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: base_times,
@@ -6649,6 +6653,7 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
             obs_records: vec![],
@@ -6720,6 +6725,7 @@ mod tests {
         let base_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 16.0, 20.0, 24.0];
         let n = base_times.len();
         let mut subject = Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -6740,6 +6746,7 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: vec![1, 1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
             obs_records: vec![],

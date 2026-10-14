@@ -256,11 +256,7 @@ pub fn predict_diag(
                     id: subject.id.clone(),
                     // Raw data TIME (matches sdtab / input); `obs_times` may be the
                     // internal shifted clock for stacked reset occasions.
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
+                    time: subject.readout_time(j),
                     pred,
                 }
             }));

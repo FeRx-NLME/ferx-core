@@ -52,6 +52,7 @@ fn subject(covariates: Vec<(&str, f64)>, obs_covariates: Vec<Vec<(&str, f64)>>) 
         v.into_iter().map(|(k, x)| (k.to_string(), x)).collect()
     };
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![],
         obs_times,
@@ -70,6 +71,7 @@ fn subject(covariates: Vec<(&str, f64)>, obs_covariates: Vec<Vec<(&str, f64)>>) 
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
     }

@@ -9,7 +9,7 @@
 //! `try_joint_pktte_shared_solve` admitted it to — a question about resets and covariates,
 //! not about where its `TENTRY` falls.
 //!
-//! Three arms, and they are **not** symmetric:
+//! Four arms, and they are **not** symmetric:
 //!
 //!   * **A1** — a dose, a PK observation and the event. Qualifies for the share, so this is
 //!     the arm that was red: `TENTRY = 5` returned the sentinel while `TENTRY = 0` returned
@@ -19,13 +19,17 @@
 //!     It is the **control**: it pins that the fix did not move the arm that was already
 //!     right, and it is what makes "both engines agree" a statement about two engines.
 //!
-//!   * **A5** — A1 plus an `MDV=1` row at `t = 5`. The reader drops such a row outright
-//!     (`datareader.rs`, the observation arm is `else if evid == 0 && mdv == 0`, and the
-//!     only other non-dose arm needs `EVID=2` *and* time-varying covariates), so it never
-//!     reaches `obs_times`, `pk_only_times` or `obs_records` and cannot move the
-//!     integration start. Asserted **bit-identically** against A1, because a dropped row
-//!     leaves a bit-identical `Population`. This is a *reader* claim — it is the one the
-//!     docs sentence in `docs/estimation/tte.qmd` makes — not a test of the fix.
+//!   * **A5** — A1 plus an `MDV=1` row at `t = 5`. Since #1809 that row is a record: the
+//!     reader keeps its time in `pk_only_times`, so it starts the integration, and with it
+//!     the hazard clock, as NONMEM's first record of any `EVID` does. Before the dose at 10
+//!     there is no drug, so `h = H0` on `[5, 10]`, and the objective rises over A1 by
+//!     exactly `2 · H0 · 5`, a closed form. A5 with an `EVID=2` row in place of the
+//!     `MDV=1` row is the same record and must score bit-identically. Before #1809 the
+//!     reader dropped the row, and A5 was bit-identical to A1.
+//!   * **A6** — A1 plus an `EVID=3` reset at 25, after the event, with and without A5's
+//!     record. The reset sends it to the dedicated engine, and the same closed form must
+//!     hold there. A4 cannot carry this check, because its reset at 15 zeroes the
+//!     accumulated hazard before the event.
 //!
 //! The population is loaded through the **routed** `read_population_for`, not
 //! `read_nonmem_csv`: since #1199 the model-blind reader builds no event records at all, so
@@ -77,11 +81,35 @@ fn arm_a4(entry: f64) -> String {
     )
 }
 
-/// A5: A1 plus an `MDV=1` row at `t = 5`, which the reader drops entirely.
+/// A5: A1 plus an `EVID=0, MDV=1` row at `t = 5`.
 fn arm_a5(entry: f64) -> String {
+    arm_a5_evid(entry, 0)
+}
+
+/// A6: A1 plus an `EVID=3` reset at 25, *after* the event, and optionally the `EVID=0,
+/// MDV=1` record at `t = 5`. The reset makes `try_joint_pktte_shared_solve` decline, so
+/// this arm runs the dedicated engine. Unlike A4's reset at 15, it cannot zero the hazard
+/// accumulated before the event, so the record's `[5, 10]` window reaches `H(20)`.
+fn arm_a6(record: bool) -> String {
+    let record_row = if record {
+        "1,5,.,0,.,2,0,1,0,0,0\n"
+    } else {
+        ""
+    };
+    format!(
+        "{HEADER}{record_row}\
+         1,10,.,1,100,1,0,1,0,0,0\n\
+         1,12,5,0,.,2,0,0,0,0,0\n\
+         1,20,1,0,0,3,0,0,0,0,0\n\
+         1,25,.,3,0,1,0,1,0,0,0\n"
+    )
+}
+
+/// A5 with the record at `t = 5` written with `EVID = evid` (`0` with `MDV=1`, or `2`).
+fn arm_a5_evid(entry: f64, evid: u32) -> String {
     format!(
         "{HEADER}\
-         1,5,.,0,.,2,0,1,0,0,0\n\
+         1,5,.,{evid},.,2,0,1,0,0,0\n\
          1,10,.,1,100,1,0,1,0,0,0\n\
          1,12,5,0,.,2,0,0,0,0,0\n\
          1,20,1,0,0,3,0,0,0,0,{entry}\n"
@@ -182,22 +210,69 @@ fn prestart_entry_matches_no_entry_on_the_dedicated_engine() {
     );
 }
 
-/// An `MDV=1` row before the first dose does not start the hazard clock — the reader drops
-/// it, so the objective is *bit-identical* to the same dataset without it. Pins the reader
-/// claim the `docs/estimation/tte.qmd` sentence makes; it does not exercise the fix.
+/// An `MDV=1` row before the first dose is a record, so it starts the hazard clock (#1809).
+/// NONMEM integrates from the subject's first record of any `EVID`. Before the fix the reader
+/// dropped the row and the objective was bit-identical to A1, the claim
+/// `docs/estimation/tte.qmd` used to make.
+///
+/// Closed form, computed outside both engines: no drug is present before the dose at 10, so
+/// `h = H0 = 0.02` on `[5, 10]`, and `H(20)` gains `0.02 · 5 = 0.1`. The event is exact, so
+/// the objective (`-2 log L`) gains `2 · 0.1 = 0.2`. The pre-#1809 behaviour, `ΔOFV = 0`,
+/// is on the other side of the bound by the whole 0.2.
 #[test]
-fn mdv_one_row_before_the_first_dose_changes_nothing() {
+fn mdv_one_row_before_the_first_dose_starts_the_clock() {
     for entry in [0.0_f64, 5.0] {
         let (with_row, without) = (ofv(&arm_a5(entry)), ofv(&arm_a1(entry)));
         assert!(
             with_row.is_finite() && without.is_finite(),
             "A5/A1 objectives must be finite at TENTRY={entry}: {with_row}, {without}"
         );
+        // Not the `1e20` sentinel either: both sides are near the A1 objective.
+        assert!(
+            (without - A1_OFV).abs() < 1.0 && (with_row - A1_OFV).abs() < 1.0,
+            "TENTRY={entry}: an objective was repelled ({with_row}, {without}; A1 {A1_OFV})"
+        );
+        // Measured on Linux x86_64 at the model's `ode_reltol = 1e-9`: ΔOFV − 0.2 = −4.6e-10
+        // at both TENTRY values. The bound is ~200x that.
+        let delta = with_row - without;
+        assert!(
+            (delta - 0.2).abs() < 1e-7,
+            "TENTRY={entry}: the MDV=1 record at 5 must start the clock: want ΔOFV = 2·H0·5 \
+             = 0.2 over A1, got {delta} ({with_row} vs {without})"
+        );
+        // An EVID=2 row in its place is the same record: the reader builds the same subject.
+        let evid2 = ofv(&arm_a5_evid(entry, 2));
         assert_eq!(
+            evid2.to_bits(),
             with_row.to_bits(),
-            without.to_bits(),
-            "TENTRY={entry}: a dropped MDV=1 row must leave the objective bit-identical \
-             ({with_row} vs {without})"
+            "TENTRY={entry}: an EVID=2 and an EVID=0/MDV=1 row at 5 must score identically \
+             ({evid2} vs {with_row})"
         );
     }
+}
+
+/// The same clock on the dedicated two-solve engine (A6). Its reset at 25 makes
+/// `try_joint_pktte_shared_solve` decline, so the record at 5 reaches the
+/// `ode_dense_solve_states` start instead of the shared solve's. The share arm passing alone
+/// would leave this engine's start unchecked. The closed form is unchanged: `h = H0` on
+/// `[5, 10]`, ΔOFV = 0.2.
+///
+/// A4 cannot carry this check, and a first version of this test tried: its reset at 15
+/// zeroes every state, the `__chz` accumulator included, so the `[5, 10]` window is wiped
+/// before the event at 20. ΔOFV there is 0 by construction (measured −4.0e-10), which is
+/// the old behaviour's answer too.
+#[test]
+fn mdv_one_row_before_the_first_dose_starts_the_dedicated_engine_clock() {
+    let (with_row, without) = (ofv(&arm_a6(true)), ofv(&arm_a6(false)));
+    assert!(
+        with_row.is_finite() && without.is_finite() && (with_row - without).abs() < 1.0,
+        "A6 objectives must be finite and not repelled: {with_row}, {without}"
+    );
+    // Measured on Linux x86_64: ΔOFV − 0.2 = −4.6e-10, as on the shared engine.
+    let delta = with_row - without;
+    assert!(
+        (delta - 0.2).abs() < 1e-7,
+        "dedicated engine: the MDV=1 record at 5 must start the clock: want ΔOFV = 0.2, got \
+         {delta} ({with_row} vs {without})"
+    );
 }

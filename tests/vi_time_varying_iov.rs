@@ -175,6 +175,7 @@ fn design() -> Population {
             }
             let n_obs = obs_times.len();
             Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", s + 1),
                 doses,
                 obs_times,
@@ -193,6 +194,7 @@ fn design() -> Population {
                 obs_l2: Vec::new(),
                 dose_occasions,
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }

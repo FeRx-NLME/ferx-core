@@ -56,6 +56,7 @@ fn subject(id: &str, scale: f64) -> Subject {
         .map(|t| scale * 10.0 * (-0.1f64 * t).exp())
         .collect();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -74,6 +75,7 @@ fn subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }

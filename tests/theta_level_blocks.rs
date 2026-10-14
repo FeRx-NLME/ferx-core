@@ -1882,6 +1882,121 @@ fn mbma_placebo_stays_within() {
     }
 }
 
+/// `mbma_placebo` with one extra arm per study (a new `OCC`) reported only as an
+/// `MDV=1` row at an existing visit — the study's second, `TIME = 2` (or 4 for study 4)
+/// — listed after that study's last record. The reader moves the visit's first
+/// observation a ULP below the row's time (#1810), and returns the data with the rows
+/// and a temp dir holding it.
+fn mbma_placebo_with_mdv_rows() -> (tempfile::TempDir, PathBuf) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
+    let data = std::fs::read_to_string(root.join("mbma_placebo.csv")).unwrap();
+    let mut lines: Vec<&str> = data.lines().collect();
+    let header = lines.remove(0);
+    let mut out = format!("{header}\n");
+    let mut i = 0;
+    while i < lines.len() {
+        let id = lines[i].split(',').next().unwrap().to_string();
+        let block: Vec<&str> = lines[i..]
+            .iter()
+            .take_while(|l| l.split(',').next() == Some(id.as_str()))
+            .copied()
+            .collect();
+        i += block.len();
+        // Columns: ID, STUDY, OCC, TIME, DV, MDV, NARM, SE, DOSE.
+        let field = |l: &str, k: usize| l.split(',').nth(k).unwrap().parse::<f64>().unwrap();
+        let occ = block.iter().map(|l| field(l, 2)).fold(0.0, f64::max) + 1.0;
+        let study = field(block[0], 1);
+        let mut visits: Vec<f64> = block.iter().map(|l| field(l, 3)).collect();
+        visits.sort_by(f64::total_cmp);
+        visits.dedup();
+        for l in &block {
+            out.push_str(l);
+            out.push('\n');
+        }
+        out.push_str(&format!("{id},{study},{occ},{},0,1,100,1,0\n", visits[1]));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mbma_placebo_mdv.csv");
+    std::fs::write(&path, out).unwrap();
+    (dir, path)
+}
+
+/// #1959 end to end, binding only. The `MDV=1` rows of [`mbma_placebo_with_mdv_rows`]
+/// add no level cell: the same 24 labels and θ as the shipped data. The straddle is
+/// asserted: the rows do move observations.
+///
+/// Mutation — a level `TIME` read off the engine clock: 30 labels, one
+/// `TIME=1.9999999999999998` (or `3.9999999999999996`) per study (measured on
+/// `207b8e65`).
+#[test]
+fn mbma_placebo_mdv_rows_add_no_level_cell() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
+    let model_path = root.join("mbma_placebo.ferx");
+    let (_dir, mdv_path) = mbma_placebo_with_mdv_rows();
+    let (base, _) = read_composable(&model_path, &root.join("mbma_placebo.csv"), true);
+    let (with_rows, pop) = read_composable(&model_path, &mdv_path, true);
+    let moved = pop
+        .subjects
+        .iter()
+        .flat_map(|s| s.obs_times.iter().zip(&s.obs_raw_times))
+        .filter(|(t, raw)| t != raw)
+        .count();
+    assert_eq!(moved, 6, "one moved observation per study");
+    assert_eq!(
+        with_rows.bindings.levels["PLACEBO"].labels,
+        base.bindings.levels["PLACEBO"].labels
+    );
+    assert_eq!(with_rows.bindings.levels["PLACEBO"].labels.len(), 24);
+    assert_eq!(with_rows.model.theta_names, base.model.theta_names);
+}
+
+/// #1959 end to end, fitted: the `MDV=1` rows leave the fit where it was — the same θ
+/// layout and the same objective, to [`MDV_ROWS_OFV_TOL`]. Before the fix the fit with
+/// the rows had 30 parameters and an objective of 93.9567 against 97.0700.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn mbma_placebo_mdv_rows_fit_the_same() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
+    let model = root.join("mbma_placebo.ferx");
+    let (_dir, mdv_path) = mbma_placebo_with_mdv_rows();
+    let fit = |data: &std::path::Path| {
+        let prep = ferx_core::prepare_run(model.to_str().unwrap(), Some(data.to_str().unwrap()))
+            .expect("prepare");
+        let opts = ferx_core::types::FitOptions {
+            verbose: false,
+            run_covariance_step: false,
+            ..prep.parsed.fit_options.clone()
+        };
+        let f = ferx_core::fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .expect("fit");
+        (prep.parsed.model.theta_names.clone(), f.ofv)
+    };
+    let (names, ofv) = fit(&root.join("mbma_placebo.csv"));
+    let (names_rows, ofv_rows) = fit(&mdv_path);
+    assert_eq!(names_rows, names);
+    assert!(ofv.is_finite() && ofv_rows.is_finite(), "{ofv} {ofv_rows}");
+    eprintln!("mbma_placebo OFV {ofv:.10}, with MDV=1 rows {ofv_rows:.10}");
+    assert!(
+        (ofv_rows - ofv).abs() <= MDV_ROWS_OFV_TOL,
+        "{ofv_rows} vs {ofv}"
+    );
+}
+
+/// The objective gap [`mbma_placebo_mdv_rows_fit_the_same`] allows. Measured 3.53e-8
+/// (97.0700361594 vs 97.0700361241, Linux aarch64 and native macOS arm64 alike, at
+/// `ec81e47c` + this fix): the moved observations sit a ULP off their written time
+/// and the empty arm adds a kappa with no record, so the optimizer's path is not
+/// bit-identical. 1e-6 is 28× that, and 3e6× below the 3.11 the phantom cells cost.
+const MDV_ROWS_OFV_TOL: f64 = 1e-6;
+
 /// #1890 end to end: `mbma_placebo` as shipped (`sum_to_zero_within`, 6 studies × 4
 /// visits, 18 free levels, 6 dependent), fitted with the covariance step and SIR with
 /// the draws kept, and its own `covariance_matrix` / `sir_resamples_packed` handed to

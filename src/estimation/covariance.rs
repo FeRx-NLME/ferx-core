@@ -491,22 +491,33 @@ pub(crate) fn assemble_score_cross_product(
             crate::estimation::outer_optimizer::reconverge_this_eval(options, 0),
         )
     });
+    // A mixture's subject marginal is `−log Σₖ pᵢₖ e^{−nllᵢₖ}`, not one class's nll
+    // (#1956). Scoring it through the single-population path below ran every subject
+    // under the rayon worker's default `MIXNUM = 1` with the base Ω/Σ, so the
+    // class-2-only θ and the mixing θ had identically-zero score columns: `s` was
+    // refused as singular and `rsr` silently lost those coordinates. The mixture path
+    // computes its own per-class modes at `x̂`, so `eta_hats` / `h_matrices` /
+    // `kappas` (the MIXEST class's) are not read for it.
+    let mixture = model.mixture.as_ref().map(|_| {
+        crate::estimation::mixture::MixtureScoreContext::new(
+            model, population, template, x_hat, options,
+        )
+    });
 
     // Per-subject scores in parallel (mirrors `build_gn_system`).
     //
-    // The score cross-product evaluates the per-subject gradient directly at x̂.
-    // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
-    // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
-    // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
-    // `tᵢ` term, in −logL units; in −2logL units this contributes `2·tᵢ` to the
-    // gradient) so the score matches how NONMEM differences the individual objective with
-    // its conditional estimate responding to θ. This is what makes the FOCEI
-    // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
-    // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
-    // carries (it holds the model sensitivities `a` fixed at the linearization).
-    // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
-    // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
-    // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
+    // Convention: each row is the **fixed-mode** score, the per-subject gradient at x̂
+    // with η̂, `H` and κ̂ held at their x̂ values (`fixed_ebe_subject_score`). The FOCEI
+    // EBE-response term `tᵢ = ½·∂log|H̃|/∂η̂·dη̂/dθ` it adds back is identically zero
+    // today (#338 Part A removed the θ block; the ω/σ blocks are #1817), so S carries
+    // neither that term nor the θ-dependence of the held prediction Jacobian. The
+    // FD-built R reconverges η̂ at every stencil point and is unaffected. NONMEM's
+    // `MATRIX=S` differentiates the total `−2LLᵢ(x)`, η̂ re-estimated at every
+    // perturbed x. The held score is biased at the MLE (`Σᵢ gᵢ ≠ 0`), so the two S
+    // differ by a convention gap that more subjects do not close — measured on
+    // `mixture_iv` and its one-population twin in `tests/mixture_cov_s_nonmem.rs`.
+    // Closing it is #1817's territory. FOCE (`!interaction`) uses the Sheiner–Beal
+    // gradient, which has no `log|H̃|` term, so `tᵢ` is not called for it.
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
         .into_par_iter()
@@ -524,6 +535,11 @@ pub(crate) fn assemble_score_cross_product(
             } else {
                 &[]
             };
+            if let Some(context) = &mixture {
+                let score = context.score(model, population, i, options);
+                report();
+                return Ok(score);
+            }
             if let Some(context) = &quadrature {
                 // The subject score has NLL units already and cannot contain the
                 // optimizer's population-level EBE penalty. Never square a failed row.
@@ -532,7 +548,7 @@ pub(crate) fn assemble_score_cross_product(
                 report();
                 return score;
             }
-            let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+            let gi = fixed_ebe_subject_score(
                 x_hat,
                 template,
                 model,
@@ -544,25 +560,6 @@ pub(crate) fn assemble_score_cross_product(
                 bounds,
                 options,
             );
-            if options.interaction {
-                if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
-                    None,
-                    x_hat,
-                    template,
-                    model,
-                    population,
-                    i,
-                    &eta_hats[i],
-                    &h_matrices[i],
-                    kap_i,
-                    bounds,
-                    options,
-                ) {
-                    for (g, t) in gi.iter_mut().zip(ti.iter()) {
-                        *g += *t;
-                    }
-                }
-            }
             report();
             Ok(gi)
         })
@@ -581,6 +578,40 @@ pub(crate) fn assemble_score_cross_product(
         );
     }
     Ok(s)
+}
+
+/// One subject's single-population score `∂nllᵢ/∂x` at fixed modes (η̂, `H`, κ̂) — the
+/// row `assemble_score_cross_product` squares into S, and (#1956) each class's term
+/// of a mixture subject's score. `subject_nll_pop_grad` (closed form or central FD),
+/// plus the FOCEI `log|H̃|` EBE-response term `tᵢ`, which is identically zero today
+/// (#338 Part A); see the convention comment in `assemble_score_cross_product`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fixed_ebe_subject_score(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+        x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds, options,
+    );
+    if options.interaction {
+        if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
+            None, x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds,
+            options,
+        ) {
+            for (g, t) in gi.iter_mut().zip(ti.iter()) {
+                *g += *t;
+            }
+        }
+    }
+    gi
 }
 
 /// **Every** clause that kept this fit off the exact analytic covariance R-matrix (#520 C2).
@@ -812,7 +843,7 @@ pub(super) fn analytic_cov_assembly(
         .map(|(i, (subject, eta_hat))| {
             let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
                 let kap = kappas.get(i)?;
-                if kap.len() != crate::stats::likelihood::iov_occasion_groups(subject).len()
+                if kap.len() != crate::stats::stacked_layout::group_count(subject)
                     || kap.iter().any(|k| k.len() != model.n_kappa)
                 {
                     return None;

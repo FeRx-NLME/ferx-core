@@ -1116,13 +1116,19 @@ impl NamedMlpMapper {
     /// can typically `.expect(...)` the result.
     ///
     /// **The zero-fill is not the guard against a bad input name.** Silently
-    /// substituting `0.0` degenerates the network to a constant — a typo'd input, or
-    /// `inputs = [TIME]` (a reserved column, not a covariate), would otherwise produce a
-    /// plausible-looking fit that learned nothing. What prevents that is
-    /// `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs only
-    /// because the parser registers them in `referenced_covariates` — that registration
-    /// exists for this reason as much as for time-varying covariates. Keep the two
-    /// together: dropping the registration re-opens *both* failure modes silently.
+    /// substituting `0.0` degenerates the network to a constant — a typo'd input would
+    /// otherwise produce a plausible-looking fit that learned nothing. What prevents
+    /// that is `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs
+    /// only because the parser registers them in `referenced_covariates` — that
+    /// registration exists for this reason as much as for time-varying covariates.
+    /// Keep the two together: dropping the registration re-opens that failure silently.
+    ///
+    /// `inputs = [TIME]` is **not** refused by that check on a model-aware file read:
+    /// every column the model references is read, with or without `[covariates]`
+    /// (#1936), so a `TIME` header arrives as a per-record covariate and the network
+    /// sees it. Only an in-memory population lacking `TIME`, or a model-free
+    /// `read_nonmem_csv*` one, is refused. Whether NN `TIME` should be refused on
+    /// every path is open (#1942).
     pub fn forward_raw(
         &self,
         weights: &[f64],

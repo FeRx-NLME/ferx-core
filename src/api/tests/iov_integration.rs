@@ -29,6 +29,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -118,6 +119,7 @@ fn make_iov_population() -> Population {
     let subjects: Vec<Subject> = subject_data
         .iter()
         .map(|(id, obs)| Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -139,6 +141,7 @@ fn make_iov_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -648,6 +651,39 @@ fn test_apply_iov_occasion_per_dose() {
     }
 }
 
+// #1876: a derived rule labels pk-only rows too, and overwrites the column's labels
+// (stale 9s here) as it does for observations and doses. The row at 3.5⁻ is one the
+// reader moved below a co-timed dose (#1810): it governs (2, 3.5⁻], so it lands in the
+// earlier occasion under both rules, as a #614-moved observation does. The row at 3.5
+// itself straddles that edge. Under `PerDose` the times are deliberately unsorted.
+#[test]
+fn test_apply_iov_occasion_labels_pk_only_rows() {
+    let edge = 3.5f64;
+    for (rule, times, want) in [
+        (
+            IovOccasionRule::TimeWindows(vec![edge]),
+            vec![2.0, edge.next_down(), edge, 5.0],
+            vec![0u32, 0, 1, 1],
+        ),
+        (
+            IovOccasionRule::PerDose,
+            vec![5.0, edge.next_down(), -1.0, edge],
+            vec![1, 0, 0, 1],
+        ),
+    ] {
+        let mut pop = make_iov_population();
+        for s in &mut pop.subjects {
+            s.pk_only_occasions = vec![9; times.len()];
+            s.pk_only_covariates = vec![HashMap::new(); times.len()];
+            s.pk_only_times = times.clone();
+        }
+        super::apply_iov_occasion_rule(&mut pop, &rule, true, &mut Vec::new());
+        for s in &pop.subjects {
+            assert_eq!(s.pk_only_occasions, want, "{rule:?}");
+        }
+    }
+}
+
 // When both iov_column and a DSL rule are set, the DSL rule wins and a single
 // override warning is emitted.
 #[test]
@@ -821,6 +857,32 @@ fn test_iov_occasion_degenerate_single_occasion_errors() {
         msg.contains("single occasion") || msg.contains("unidentifiable"),
         "unexpected error: {msg}"
     );
+}
+
+// #1876: a pk-only row past the breakpoint lands in a second occasion of its own, and
+// `iov_occasion_groups` gives that occasion a κ. But it lies after every observation and
+// dose, so its κ informs nothing, and the observations still share one occasion: the
+// single-occasion check must count observations and doses only, and still error.
+#[test]
+fn test_iov_occasion_single_occasion_errors_despite_a_later_pk_only_row() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for s in &mut pop.subjects {
+        s.pk_only_times = vec![150.0];
+        s.pk_only_covariates = vec![HashMap::new()];
+    }
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+    // The straddle: the rule does put the row in an occasion of its own, which gets a group.
+    let mut derived = pop.clone();
+    super::apply_iov_occasion_rule(&mut derived, &opts.iov_occasion, false, &mut Vec::new());
+    for s in &derived.subjects {
+        assert_eq!(s.pk_only_occasions, vec![1u32]);
+        assert_eq!(crate::stats::likelihood::iov_occasion_groups(s).len(), 2);
+    }
+    let msg = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("a pk-only row after every observation must not make kappa identifiable");
+    assert!(msg.contains("single occasion"), "unexpected error: {msg}");
 }
 
 // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
@@ -1067,6 +1129,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1085,6 +1148,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1149,6 +1213,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -1167,6 +1232,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1294,6 +1360,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1312,6 +1379,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1394,6 +1462,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1412,6 +1481,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1483,6 +1553,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1501,6 +1572,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1580,6 +1652,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1598,6 +1671,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1675,6 +1749,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
     // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
     // uses to pin the estimation-side dense `R`.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
@@ -1696,6 +1771,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1866,7 +1942,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
-        &model.default_params.residual_correlations,
+        model.residual_cov_at(&model.default_params),
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),
@@ -2038,6 +2114,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     // One subject with an explicit zero-order infusion into the depot (cmt 1):
     // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
@@ -2056,6 +2133,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2185,4 +2263,200 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
         r.ipred.is_finite()
             && matches!(&r.outcome, SimOutcome::Continuous { value } if value.is_finite())
     }));
+}
+
+// An EVID=3/4 reset row is a record too: the rule must label it by the same
+// partition as the observations and doses, overwriting a column label left on
+// it and filling an empty one. The resets straddle the at-or-before edge — one
+// inside occasion 0, one co-timed with the dose at 3.5 that opens occasion 1.
+#[test]
+fn test_apply_iov_occasion_rule_labels_reset_rows() {
+    for rule in [
+        IovOccasionRule::PerDose,
+        IovOccasionRule::TimeWindows(vec![3.5]),
+    ] {
+        for stale in [vec![7u32, 7], Vec::new()] {
+            let mut pop = make_iov_population();
+            for s in &mut pop.subjects {
+                s.reset_times = vec![2.0, 3.5];
+                s.reset_occasions = stale.clone();
+            }
+            let mut warnings = Vec::new();
+            super::apply_iov_occasion_rule(&mut pop, &rule, !stale.is_empty(), &mut warnings);
+            for s in &pop.subjects {
+                assert_eq!(
+                    s.reset_occasions,
+                    vec![0u32, 1],
+                    "{rule:?} with reset labels {stale:?}: a reset row takes the occasion \
+                     its time falls in, and one co-timed with a dose takes the occasion \
+                     that dose opens",
+                );
+            }
+        }
+    }
+}
+
+/// A two-period crossover whose second period opens with a reset at t = 12 that re-seeds
+/// `init(central) = BASE`. KAPPA_B is in BASE and CL, so the occasion the reset row runs
+/// under moves the objective, and a reset under an unshared label differs from one sharing
+/// period 2's κ. TVBASE matches the 100 mg dose, so the re-seed is half the post-reset
+/// signal, and the residue it replaces is live.
+fn reset_crossover_model() -> CompiledModel {
+    crate::parser::model_parser::parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVBASE(100.0, 0.01, 1000.0)
+  omega ETA_CL ~ 0.04
+  kappa KAPPA_B ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_B)
+  V    = TVV
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#,
+    )
+    .expect("the reset crossover model must parse")
+}
+
+/// Dataset labels: OCC 1 in period 1, 2 from the reset row on. `reset_label` is the reset
+/// row's own OCC, the one value the cases below vary.
+fn reset_crossover_population(reset_label: Option<u32>) -> Population {
+    let factors: [(f64, f64); 6] = [
+        (1.0, 1.3),
+        (1.2, 0.8),
+        (0.9, 1.1),
+        (1.1, 0.7),
+        (0.8, 1.25),
+        (1.05, 0.9),
+    ];
+    let subjects = factors
+        .iter()
+        .enumerate()
+        .map(|(i, &(cl_f, b_f))| {
+            let mut obs_times = Vec::new();
+            let mut observations = Vec::new();
+            for (t0, bmult) in [(0.0, 1.0), (12.0, b_f)] {
+                for t in [1.0, 2.0, 4.0, 8.0] {
+                    obs_times.push(t0 + t);
+                    // rough concentrations so the objective has signal; data, not a truth
+                    observations.push((2.0 + 2.0 * bmult) * (-0.1 * cl_f * t).exp());
+                }
+            }
+            Subject {
+                id: (i + 1).to_string(),
+                doses: vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                obs_times,
+                obs_raw_times: Vec::new(),
+                observations,
+                obs_cmts: vec![1; 8],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                pk_only_occasions: Vec::new(),
+                reset_times: vec![12.0],
+                reset_covariates: Vec::new(),
+                cens: vec![0; 8],
+                occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
+                obs_l2: Vec::new(),
+                obs_rgroup: Vec::new(),
+                dose_occasions: vec![1, 2],
+                reset_occasions: reset_label.into_iter().collect(),
+                fremtype: Vec::new(),
+                obs_records: vec![],
+            }
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+// A derived `iov_occasion` rule must label a reset row by the partition it derives,
+// as it does the observations and doses. Before the fix it never wrote
+// `reset_occasions`: with no column the label stayed empty and the reset fell back to
+// the record before it (period 1); over an `iov_column` it kept the dataset's label,
+// which under the rule's 0/1 renumbering names no κ group. Oracle: the column fit whose
+// reset row carries its period's label. The derived fits share every input with it and
+// differ only in how the labels are produced, so the OFVs are bit-identical (as in
+// `test_iov_occasion_dsl_matches_column_fit`).
+#[test]
+fn test_iov_occasion_rule_labels_reset_rows_in_fit() {
+    let model = reset_crossover_model();
+    let ofv = |pop: &Population, rule: IovOccasionRule| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            iov_occasion: rule,
+            ..FitOptions::default()
+        }
+        .quiet();
+        let r = fit(&model, pop, &model.default_params, &opts).expect("the fit runs");
+        assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+        r.ofv
+    };
+    let reference = ofv(
+        &reset_crossover_population(Some(2)),
+        IovOccasionRule::Column,
+    );
+
+    // Each pre-fix state is one reset label on the column path, and each must move the
+    // objective, or the bit-identities below could not tell the fix from the defect.
+    for (label, what) in [
+        (None, "fallback to the previous record"),
+        (Some(3), "a label with no κ group"),
+    ] {
+        let wrong = ofv(&reset_crossover_population(label), IovOccasionRule::Column);
+        assert_ne!(
+            wrong.to_bits(),
+            reference.to_bits(),
+            "the reset row's occasion must move the objective ({what}: {wrong} vs {reference})",
+        );
+    }
+
+    let mut unlabelled = reset_crossover_population(None);
+    for s in &mut unlabelled.subjects {
+        s.occasions.clear();
+        s.dose_occasions.clear();
+    }
+    let labelled = reset_crossover_population(Some(2));
+    for (pop, over) in [(&unlabelled, "no column"), (&labelled, "an iov_column")] {
+        for rule in [
+            IovOccasionRule::PerDose,
+            IovOccasionRule::TimeWindows(vec![12.0]),
+        ] {
+            let got = ofv(pop, rule.clone());
+            assert_eq!(
+                got.to_bits(),
+                reference.to_bits(),
+                "{rule:?} over {over}: OFV {got} must be bit-identical to the column fit \
+                 {reference} whose reset row carries period 2's label",
+            );
+        }
+    }
 }

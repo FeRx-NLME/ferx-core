@@ -966,16 +966,19 @@ pub struct Subject {
     /// Per-observation covariate snapshot (LOCF), parallel to `obs_times`.
     /// Same fallback semantics as `dose_covariates`.
     pub obs_covariates: Vec<HashMap<String, f64>>,
-    /// Times of EVID=2 "other event" rows (typically covariate-change
-    /// markers). Only populated when the subject has time-varying
-    /// covariates — for time-constant covariates these rows are no-ops
-    /// (NONMEM-equivalent: $PK runs but with the same values).
-    /// The event-driven propagators see them as a third event kind that
-    /// does not mutate compartment amounts but does refresh the
+    /// Times of the non-dose records that are not scored: EVID=2 "other event"
+    /// rows (typically covariate-change markers) and EVID=0/MDV=1 rows. Kept
+    /// for every subject, time-varying covariates or not: a record is where
+    /// NONMEM starts the system when it precedes the first dose and
+    /// observation, and `subject_integration_start` reads it from here
+    /// (#1809). The event-driven propagators see them as a third event kind
+    /// that does not mutate compartment amounts but does refresh the
     /// piecewise-constant rate matrix from the row's covariate values.
     pub pk_only_times: Vec<f64>,
-    /// Per-EVID-2 covariate snapshot (LOCF), parallel to `pk_only_times`.
-    /// Empty when no TV covariates.
+    /// Per-pk-only-record covariate snapshot (LOCF), parallel to
+    /// `pk_only_times`. Empty when no TV covariates (NONMEM-equivalent: `$PK`
+    /// runs at the record but with the same values), and then
+    /// [`Subject::pk_only_cov`] falls back to the subject-static map.
     pub pk_only_covariates: Vec<HashMap<String, f64>>,
     /// Times of system-reset events (NONMEM EVID=3 "reset" and EVID=4
     /// "reset + dose"). At each of these times every compartment amount is
@@ -1010,6 +1013,12 @@ pub struct Subject {
     /// the total and unbound rows of one blood draw explicitly rather than
     /// relying on co-temporal row order (#827).
     pub obs_l2: Vec<i64>,
+    /// Residual block per observation row (parallel to `obs_times`) under a
+    /// `correlation … by COL` line (#1081): rows sharing a value correlate, `0`
+    /// marks a row in no block. Assigned from the `by` column(s) by
+    /// `assign_residual_groups` when a population is prepared for such a model;
+    /// empty otherwise.
+    pub obs_rgroup: Vec<u32>,
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
@@ -1022,6 +1031,17 @@ pub struct Subject {
     /// multiplier (42.0, against 14.0 for the preceding record's). Without this the
     /// occasion has to be guessed from a neighbouring record (#1133).
     pub reset_occasions: Vec<u32>,
+    /// Occasion index per pk-only record (EVID=2, or EVID=0/MDV=1; parallel to
+    /// `pk_only_times`). Empty when no IOV column is present in the data.
+    ///
+    /// A pk-only row is a data record, so NONMEM runs `$PK` at it under that row's own
+    /// `OCC`, and under the end-of-interval rule that snapshot governs the interval
+    /// ending at the row. Measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: an `EVID=2` row
+    /// carrying `OCC = 2` between `OCC = 1` records moves the objective away from both
+    /// κ = 0 and the preceding record's occasion (#1876). A subject assembled in memory
+    /// without this falls back to the preceding record's occasion, as
+    /// `reset_occasions` does.
+    pub pk_only_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.
     /// Empty when FREMTYPE column is absent from the data.
@@ -1035,6 +1055,36 @@ pub struct Subject {
     /// (Track D) endpoints, so it must be present on the default build. Only the
     /// TTE `Event` variant it can hold stays behind the `survival` feature.
     pub obs_records: Vec<ObsRecord>,
+}
+
+/// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
+/// the engine clock `obs_times[j]` for an in-memory subject that carries no raw
+/// times. [`Subject::readout_time`] over a subject's own vectors; the slice form
+/// is for callers that are handed the vectors, not the subject.
+pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -> f64 {
+    obs_raw_times
+        .get(j)
+        .copied()
+        .unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
+}
+
+/// Whether observations `j` and `k` are one instant, so the engines see both at the
+/// same time and a key or a pairing on "the same time" should join them: the same
+/// engine time, up to the one ULP the reader moves a record below a co-timed one to
+/// keep file order (#614, #1810).
+///
+/// The exact engine clock parts a moved observation from its co-timed twin (#1959).
+/// The written time joins two stacked-reset periods that restart `TIME`, which the
+/// engines run at different times. With the one-ULP tolerance the engine clock is
+/// enough on its own: the reader moves a record by exactly one ULP and never twice,
+/// and a reset shifts a later period past the earlier one's last time plus a gap, so
+/// two records within one ULP on the engine clock were written at one time. An
+/// extra "same written time" clause rejected no input the reader can produce (#1964
+/// review, finding 3).
+pub(crate) fn same_instant(obs_times: &[f64], j: usize, k: usize) -> bool {
+    let at = |i: usize| obs_times.get(i).copied().unwrap_or(0.0);
+    let (a, b) = (at(j), at(k));
+    a == b || a.next_down() == b || b.next_down() == a
 }
 
 impl Subject {
@@ -1153,15 +1203,19 @@ impl Subject {
     /// `$ERROR` sees"). A `[scaling]` Form C readout is the `$ERROR` twin — it is
     /// anchored against NONMEM's `$ERROR` in
     /// `tests/scaling_time_readout_nonmem_anchor.rs` — so it reads the same clock
-    /// (#1028). The two differ only for subjects with stacked reset occasions
-    /// whose data TIME restarts, where `obs_times` is the shifted integrator
-    /// timeline; the integrator itself keeps using `obs_times`, exactly as
-    /// NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    /// (#1028). The two differ for subjects with stacked reset occasions whose
+    /// data TIME restarts, where `obs_times` is the shifted integrator timeline,
+    /// and by one ULP for an observation the reader moved below a co-timed record
+    /// to keep file order (#614, #1810); the integrator itself keeps using
+    /// `obs_times`, exactly as NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    /// A level key or a message that names a record's time reads this (#1959).
     pub fn readout_time(&self, j: usize) -> f64 {
-        self.obs_raw_times
-            .get(j)
-            .copied()
-            .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
+        written_time(&self.obs_times, &self.obs_raw_times, j)
+    }
+
+    /// Whether observations `j` and `k` are one instant: see [`same_instant`].
+    pub(crate) fn same_instant(&self, j: usize, k: usize) -> bool {
+        same_instant(&self.obs_times, j, k)
     }
 
     /// Time after dose at observation `j`, from the data alone — no lag time,
@@ -1281,9 +1335,10 @@ impl Subject {
         }
     }
 
-    /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
-    /// the others — for time-constant covariates this returns the
-    /// subject-static map.
+    /// Covariate snapshot at pk-only record index `m` (an EVID=2 or
+    /// EVID=0/MDV=1 row). Same fallback as the others — for time-constant
+    /// covariates this returns the subject-static map, and since #1809 such a
+    /// subject routinely carries `pk_only_times` with no snapshots.
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
         self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }
@@ -2171,6 +2226,52 @@ pub struct ResidualCorrelation {
     pub sigma_i: usize,
     pub sigma_j: usize,
     pub rho: f64,
+}
+
+/// The correlation structure of a `correlation <kind>(RHO) by COL` line (#1081).
+///
+/// Named after nlme's `corCompSymm` / `corAR1` / `corCAR1`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualSerialKind {
+    /// Compound symmetry: every pair of rows in a block correlates by `ρ`.
+    Cs,
+    /// First-order autoregressive on the time-ordered rows of a block: rows `a`
+    /// and `b` positions apart correlate by `ρ^a−b`, whatever the time between them.
+    Ar1,
+    /// Continuous-time first-order autoregressive (nlme's `corCAR1`): rows at data
+    /// times `t_a` and `t_b` correlate by `ρ^|t_a − t_b|`, so the correlation decays
+    /// with the time between them, not with how many rows lie in between.
+    Car1,
+}
+
+impl ResidualSerialKind {
+    /// The spelling the model file uses (`cs`, `ar1`, `car1`).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ResidualSerialKind::Cs => "cs",
+            ResidualSerialKind::Ar1 => "ar1",
+            ResidualSerialKind::Car1 => "car1",
+        }
+    }
+}
+
+/// Within-group residual correlation declared by `correlation <kind>(RHO) by COL`
+/// in `[error_model]` (#1081).
+///
+/// The rows of one subject that share a value of the `by` column(s) form one
+/// residual block, with `R_jk = C_jk(ρ) · Σ_s c_{j,s} c_{k,s} σ_s²` off the
+/// diagonal: `c` are the same magnitude- and `weight =`-scaled sigma loadings the
+/// diagonal uses, so a weighted additive endpoint gets `R = σ² · W C W`. Rows in
+/// different blocks, or of different subjects, are independent. `ρ` is the
+/// ordinary θ `rho_theta`, so bounds, `FIX`, priors, SE and SIR apply to it
+/// unchanged; the model reads it nowhere else.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ResidualSerial {
+    pub kind: ResidualSerialKind,
+    /// Index of `ρ` in θ.
+    pub rho_theta: usize,
+    /// The data columns whose combined value, within `ID`, names a block.
+    pub by: Vec<String>,
 }
 
 /// Spread of a user-declared parameter prior (#254).
@@ -4007,6 +4108,11 @@ pub struct CompiledModel {
     /// endpoint rows. This covers NONMEM `$SIGMA BLOCK` combined-error models
     /// and paired multi-endpoint records such as total/unbound assays.
     pub residual_correlations: Vec<ResidualCorrelation>,
+    /// Within-group residual correlation from a `correlation <kind>(RHO) by COL`
+    /// line (#1081). `None` for every model without one, and for one whose `ρ`
+    /// θ is `FIX`ed at 0 (the parser drops the line, as it drops a `FIX` zero
+    /// `block_sigma` off-diagonal).
+    pub residual_serial: Option<ResidualSerial>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
     /// Number of between-subject variability (BSV) ETAs.
@@ -5147,6 +5253,97 @@ impl CompiledModel {
             .collect()
     }
 
+    /// `(pk_slot, name index)` for every individual parameter that owns a PK slot —
+    /// **the slot lookup that cannot return a placeholder** (#1899). The name index
+    /// is into [`indiv_param_names`](Self::indiv_param_names).
+    ///
+    /// `pk_indices` cannot serve as one. On an analytical model a name that no
+    /// `pk(...)` role binds and no readout reads gets the placeholder `0`, which is
+    /// `CL`'s slot (#1356), so a `pk_indices` scan read forwards answers `CL`'s value
+    /// for that name and read backwards answers that name for `CL`. Both misreads
+    /// were live: the closed-form log-normal sensitivity fallback keyed `∂p/∂η` rows
+    /// by slot and let an intermediate's row overwrite `CL`'s, and
+    /// `suggest_start::find_theta_for_slot` wrote NCA's clearance estimate onto an
+    /// intermediate's θ.
+    ///
+    /// The rows come from the individual-parameter program's resolved
+    /// `(pk_slot, var_slot)` pairs, which exist only for a name with a slot of its
+    /// own: a role binding, a spare readout / `obs_scale` / `init` slot (#650,
+    /// #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on the ODE layout every
+    /// declared name. Order is the program's (analytical: alphabetical by PK name),
+    /// so it matches `IndivParamProgram::pk_slots` row for row — which is what lets
+    /// the sensitivity fallback hand its caller the same `(rows, slots)` shape the
+    /// program path does.
+    ///
+    /// **Each slot appears at most once, but a name may appear more than once.** The
+    /// one-variable-two-roles reject (#1359) is about two `pk(...)` *roles*, and the
+    /// modeled-dose mapping is not a role: `pk one_cpt_iv(cl=D1, v=V)` alongside
+    /// `D1 = …` parses, and its rows are `[(CL, D1), (V, V), (9, D1)]` — three rows
+    /// for two declared names, measured. So a `find` by slot is unambiguous where a
+    /// `position` over `pk_indices` was not, and that is the property the two
+    /// consumers rely on; `rows.len()` is **not** bounded by `pk_indices.len()`. What
+    /// bounds it for the sensitivity fallback is
+    /// `sens::provider::closed_form_slot_count_supported`, which caps the program's
+    /// own pair list — of which these rows are a subset — at the `const_dispatch!`
+    /// table width.
+    ///
+    /// Falls back to `pk_indices` — placeholder and all — for a hand-built
+    /// `CompiledModel` carrying no program (test fixtures, `generate_data`), where
+    /// every entry is a real slot by construction. Every parsed model has a program.
+    pub(crate) fn pk_slot_rows(&self) -> Vec<(usize, usize)> {
+        match self.indiv_param_partials.indiv_param_program.as_ref() {
+            Some(prog) => {
+                // A top-level name's var slot is its `indiv_param_names` index, and
+                // the `tv` / `sel_flat` vectors a consumer pairs a row with are that
+                // long, so a pair pointing past them must not be indexed.
+                //
+                // No in-tree model reaches it: every PK role, modeled-dose and
+                // readout-spare mapping resolves to a top-level name (an `if`/`else`
+                // assignment that one of those blocks reads is promoted to one,
+                // #357/#1900/#1904). Measured — deleting the filter leaves the whole
+                // `--lib` suite green — so this is a guard, not a behaviour. The
+                // `debug_assert` is the point of it: a future mapping that broke the
+                // invariant would otherwise lose a gradient row silently, which is
+                // the #1899 failure mode again, so it fails the test suite loudly
+                // and only release builds fall back to dropping the row.
+                debug_assert!(
+                    prog.pk_var_slots()
+                        .iter()
+                        .all(|&(_, i)| i < self.indiv_param_names.len()),
+                    "pk_var_slots must point at top-level names: {:?} vs {} names",
+                    prog.pk_var_slots(),
+                    self.indiv_param_names.len()
+                );
+                prog.pk_var_slots()
+                    .iter()
+                    .copied()
+                    .filter(|&(_, i)| i < self.indiv_param_names.len())
+                    .collect()
+            }
+            None => self
+                .pk_indices
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, slot)| (slot, i))
+                .collect(),
+        }
+    }
+
+    /// The [`indiv_param_names`](Self::indiv_param_names) index whose **own** PK slot
+    /// is `pk_slot`, or `None` when no parameter owns that slot.
+    ///
+    /// The inverse direction of [`pk_slot_rows`](Self::pk_slot_rows), and the
+    /// placeholder-free replacement for `pk_indices.iter().position(|&s| s == slot)`:
+    /// that scan returns the first *declared* name whose entry equals the slot, so an
+    /// unbound intermediate declared above `CL` answers for `PK_IDX_CL` (#1899).
+    pub(crate) fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize> {
+        self.pk_slot_rows()
+            .into_iter()
+            .find(|&(slot, _)| slot == pk_slot)
+            .map(|(_, i)| i)
+    }
+
     /// Returns true when the model routes a compartment lag time to
     /// [`PK_IDX_LAGTIME`]. Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-
@@ -5300,6 +5497,54 @@ impl CompiledModel {
     /// infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
         self.pk_indices.contains(&PK_IDX_F) || self.has_indexed_dose_attr(DoseAttr::F, None)
+    }
+
+    /// The residual covariance structure of the parameter set `params` — its live
+    /// `block_sigma` correlations (#847) and, under a `correlation` line, the `ρ`
+    /// its θ carries (#1081). What every dense-`R` builder is handed when it
+    /// scores those parameters.
+    pub(crate) fn residual_cov_at<'a>(
+        &'a self,
+        params: &'a ModelParameters,
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        self.residual_cov_with(&params.residual_correlations, &params.theta)
+    }
+
+    /// The residual covariance structure at θ `theta` with the **declared**
+    /// `block_sigma` correlations — for the estimators that hold those at the
+    /// declaration (SAEM, HMC, VI, AGQ, IMP; #847). A `correlation` line's `ρ` is
+    /// a θ, so it is read from `theta` like any other θ: there is no declared `ρ`
+    /// to fall back on, and no form of this function that omits `theta` (#1081).
+    pub(crate) fn residual_cov_theta<'a>(
+        &'a self,
+        theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        self.residual_cov_with(&self.residual_correlations, theta)
+    }
+
+    fn residual_cov_with<'a>(
+        &'a self,
+        pairs: &'a [ResidualCorrelation],
+        theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        let serial = self.residual_serial.as_ref().map(|s| {
+            crate::stats::residual_error::SerialCov {
+                kind: s.kind,
+                // An out-of-range index cannot come from the parser; NaN makes
+                // the `R` it builds fail its factorisation loudly rather than
+                // score independent residuals.
+                rho: theta.get(s.rho_theta).copied().unwrap_or(f64::NAN),
+            }
+        });
+        crate::stats::residual_error::ResidualCov { pairs, serial }
+    }
+
+    /// Can this model's residual covariance `R` couple two observation rows? The
+    /// one "take the dense-`R` path" question (#1081); see `ResidualCov::is_dense`.
+    /// Structural: true for a `block_sigma` off-diagonal or a `correlation` line,
+    /// whatever value either holds.
+    pub(crate) fn residual_is_dense(&self) -> bool {
+        self.residual_cov_theta(&[]).is_dense()
     }
 
     /// Residual variance for one observation, dispatching on its compartment.
@@ -6639,6 +6884,23 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // prose arm below claims. Same `(Critical, Convergence)` verdict the
         // prose arm gives, reached deterministically.
         (WarningSeverity::Critical, WarningCode::Convergence)
+    } else if lower.contains("w_no_feasible_eval") {
+        // #1617: not one of the outer optimizer's trials was feasible — every one was
+        // rejected by the EBE convergence guard or returned a non-finite objective — so
+        // the verdict was demoted and the estimates reported are the ones the fit started
+        // from. Same `(Critical, Convergence)` as the generic non-convergence line it
+        // accompanies: a run that never scored the real objective is exactly the case
+        // `require_converged` exists to reject.
+        //
+        // Matched on its `W_` token and placed with the other token arms, ahead of every
+        // prose one. The message says "did not converge" nowhere — it says "no OFV was
+        // ever minimised" — so the prose `convergence` arm below does **not** claim it,
+        // and without this arm it would fall through to the `general` bucket at `Warning`
+        // severity. Its non-finite arm also lists the same candidate causes
+        // `W_NONFINITE_OBJECTIVE` does ("infusion duration", "residual variance", …),
+        // which is prose a later edit could grow into a phrase one of the arms below
+        // claims.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_per_cmt_unmatched") {
         // #1405: a declared per-CMT `[scaling]` / `[error_model]` / `y[CMT=N]` entry
         // that no observation matched. Matched on its `W_` token and placed with the
@@ -7008,8 +7270,9 @@ pub struct FitResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kappa_weight_typical: Vec<Option<f64>>,
     pub se_kappa: Option<Vec<f64>>,
-    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over all
-    /// subject-occasion pairs.  Empty when `n_kappa == 0`.
+    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over the
+    /// subject-occasion pairs an observation informs — an occasion group no observation
+    /// can read (κ̂ = 0, the prior mode) is left out (#1911). Empty when `n_kappa == 0`.
     pub shrinkage_kappa: Vec<f64>,
     /// Per-occasion kappa shrinkage: `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`.
     /// `occ_idx` is the 0-based position within each subject's own occasion list
@@ -7017,6 +7280,7 @@ pub struct FitResult {
     /// **not** the raw OCC column value.  For unbalanced designs where subjects
     /// have different OCC sequences, a given `occ_idx` may map to different OCC
     /// values across subjects — use `shrinkage_kappa` (pooled) in that case.
+    /// Only informed groups enter a slot; one fewer than two subjects inform is `NaN`.
     /// Empty when `n_kappa == 0` or only one occasion is present.
     pub shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     /// Per-subject, per-occasion kappa EBEs.
@@ -7779,7 +8043,7 @@ pub struct FitOptions {
     /// Which covariance estimator to assemble, mirroring NONMEM `$COV MATRIX=`.
     /// Default [`CovarianceMethod::Hessian`] (`R⁻¹`). [`CovarianceMethod::CrossProduct`]
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
-    /// score cross-product `S`; currently supported for FOCEI and IOV fits.
+    /// score cross-product `S`; currently supported for FOCEI, FOCE, IOV and mixture fits.
     pub covariance_method: CovarianceMethod,
     /// Whether `covariance_method` was set explicitly rather than left at its
     /// default. Exists only so the high-dimension routing guard (#1064) can

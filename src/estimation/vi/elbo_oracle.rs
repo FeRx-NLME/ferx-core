@@ -98,6 +98,7 @@ fn linear_gaussian_model() -> CompiledModel {
 /// sets `dv_pre_logged`, so `fit()` must not transform them again.
 fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
@@ -116,6 +117,7 @@ fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -466,7 +468,7 @@ fn ltbs_data_term_is_quadratic_below_unit_predictions() {
                 &subj,
                 &template.theta,
                 &template.sigma.values,
-                &template.residual_correlations,
+                model.residual_cov_at(&template),
                 &[e],
                 &mut scratch,
             )
@@ -539,6 +541,7 @@ fn linear_gaussian_iov_model() -> CompiledModel {
 /// per occasion.
 fn iov_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         // A **single** bolus, deliberately. A second dose would make the concentration a
         // sum of two exponentials, and `log(Σ exp)` is not affine in `z` — the affineness
@@ -562,6 +565,7 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -872,7 +876,7 @@ fn fixed_eta_nll_agrees_with_the_conditional_mode_objective_under_ltbs() {
             &subj,
             &template.theta,
             &template.sigma.values,
-            &template.residual_correlations,
+            model.residual_cov_at(&template),
             &[eta],
             &mut scratch,
         );

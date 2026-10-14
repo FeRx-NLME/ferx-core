@@ -38,6 +38,7 @@ fn template_population(n: usize) -> Population {
     let times = [0.5_f64, 1.0, 2.0, 4.0, 8.0, 12.0];
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("{i}"),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
@@ -56,6 +57,7 @@ fn template_population(n: usize) -> Population {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: vec![],
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })

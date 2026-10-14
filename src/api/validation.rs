@@ -65,9 +65,11 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 ///
 /// Unresolved names that read as random effects get their own `E_ETA_NOT_DECLARED`
 /// diagnostic, pushed first so [`first_error`](crate::diagnostics::first_error) — which is what `fit()` reports —
-/// surfaces the actionable message instead of "covariate not found in data". The
-/// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
-/// historical `Err(String)` for the names that remain.
+/// surfaces the actionable message instead of "covariate not found in data". Of the
+/// names that remain, one that is an exact header of the file the population was
+/// read from gets its own `E_MISSING_COVARIATE` text — the column is in the data,
+/// the reader did not take it (#1936); every other name keeps the message text
+/// byte-for-byte identical to the historical `Err(String)`.
 ///
 /// "Carries" means the *predictor* can resolve the name, which is a slightly wider
 /// test than membership in `Population::covariate_names`. A CSV-read population
@@ -111,10 +113,53 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         );
     }
 
-    if plain.is_empty() {
-        return diags;
-    }
+    // A name that is an exact header of the file this population was read from is
+    // not missing from the data: the reader that built the population did not take
+    // it as a covariate. A model-aware read takes every column the model
+    // references (#1936), so this is reachable only from a model-free
+    // `read_nonmem_csv*` population handed to `fit()`. It gets its own message;
+    // the historical text below keeps every other name byte-for-byte. An in-memory
+    // population (`input_columns` empty) and a case-differing spelling stay there.
+    let (unread, plain): (Vec<&str>, Vec<&str>) = plain
+        .iter()
+        .partition(|n| population.input_columns.iter().any(|h| h == *n));
 
+    if !plain.is_empty() {
+        diags.push(missing_covariate_diagnostic(population, &plain));
+    }
+    if !unread.is_empty() {
+        diags.push(unread_column_diagnostic(&unread));
+    }
+    diags
+}
+
+/// `E_MISSING_COVARIATE` for columns the data has but the population's reader did
+/// not read as covariates (#1936). Never says "not found in data" (it was found),
+/// and never names `[covariates]`: the caller read the data without the model, so
+/// a model-file remedy would not reach the read that dropped the column.
+fn unread_column_diagnostic(unread: &[&str]) -> Diagnostic {
+    Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references column(s) that are in the data but were not read as \
+             covariates: {}. A read that does not know the model takes only the \
+             covariate columns it is given, or, auto-detecting, every column except the \
+             record columns (ID, TIME, DV, AMT, CMT, ...) and the `iov_column`. Read the \
+             data with the model (`read_population_with` / `read_population_for`), which \
+             reads every column the model references, or add the column(s) to \
+             `covariate_columns`.",
+            unread.join(", "),
+        ),
+    )
+    .with_suggestion(format!(
+        "read the data with `read_population_with`, or add {} to `covariate_columns`",
+        unread.join(", ")
+    ))
+}
+
+/// The historical `E_MISSING_COVARIATE`, byte-for-byte: `plain` are names the data
+/// does not have under that exact spelling.
+fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diagnostic {
     let available = if population.covariate_names.is_empty() {
         "(none)".to_string()
     } else {
@@ -151,20 +196,17 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
             },
         )
     };
-    diags.push(
-        Diagnostic::error(
-            "E_MISSING_COVARIATE",
-            format!(
-                "Model references covariate(s) not found in data (case-sensitive): {}. \
-                 Available covariate columns: {}.{}",
-                plain.join(", "),
-                available,
-                builtin_hint,
-            ),
-        )
-        .with_suggestion(format!("available covariate columns: {}", available)),
-    );
-    diags
+    Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references covariate(s) not found in data (case-sensitive): {}. \
+             Available covariate columns: {}.{}",
+            plain.join(", "),
+            available,
+            builtin_hint,
+        ),
+    )
+    .with_suggestion(format!("available covariate columns: {}", available))
 }
 
 /// Whether `population` carries the covariate `name` in the sense
@@ -836,7 +878,9 @@ pub(crate) fn check_residual_magnitude(
                 if m.is_finite() && m > 0.0 {
                     continue;
                 }
-                let time = subj.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                // The written TIME, which the magnitude itself is evaluated at
+                // (`ruv_obs_mult`) and the user can find in the data (#1959).
+                let time = subj.readout_time(j);
                 // The upper half of a row is the `power(...)` exponent per slot
                 // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
                 // a different mistake from a vanishing multiplier.
@@ -1005,8 +1049,10 @@ pub(crate) fn check_theta_gather_indices(
         for subj in &population.subjects {
             // Observation rows first — a level is a property of an observation —
             // then dose rows, which read the individual parameters too.
+            // An observation's TIME as written (#1959). A dose stores no written
+            // time: its engine time differs from it only after a stacked reset.
             let rows = (0..subj.obs_times.len())
-                .map(|j| (subj.obs_times[j], subj.obs_cov(j)))
+                .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
                 .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
@@ -1071,8 +1117,10 @@ pub(crate) fn check_kappa_weights(
             .unwrap_or("<kappa>");
         for subj in &population.subjects {
             for j in 0..subj.obs_times.len() {
-                let time = subj.obs_times[j];
-                let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                // Evaluated at the engine clock, as the individual parameters it is
+                // desugared into are; reported at the TIME as written (#1959).
+                let w = (weight.eval)(theta, subj.obs_cov(j), subj.obs_times[j]);
+                let time = subj.readout_time(j);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
                         "E_KAPPA_WEIGHT_NONPOSITIVE",
@@ -1625,6 +1673,20 @@ pub fn check_model_data_rule(
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
+    check_model_data_rule_at(model, population, iov_rule, &model.default_params)
+}
+
+/// [`check_model_data_rule`] at the parameter set a fit starts from. The one check
+/// that reads parameters, a `correlation` line's admissible ρ (#1081), reads
+/// `params`' θ bounds and `FIX` flags: `fit()` passes its `init_params`, which a
+/// caller (ferx-r, `--inits-from-nca`) may have replaced — the reason
+/// `check_variance_init_rails` reads them too (#1229).
+pub(crate) fn check_model_data_rule_at(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
@@ -1640,6 +1702,7 @@ pub fn check_model_data_rule(
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));
+    diags.extend(check_residual_correlation(model, population, params));
     // Errors only; the within-occasion-variation *warning* is a separate walk,
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
@@ -1791,8 +1854,10 @@ fn check_iov_occasions(
 
 /// Derive each subject's IOV occasion labels from a model-side rule
 /// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
-/// `Subject::occasions` (parallel to `obs_times`) and `Subject::dose_occasions`
-/// (parallel to `doses`). This is the DSL alternative to a dataset occasion
+/// `Subject::occasions` (parallel to `obs_times`), `Subject::dose_occasions`
+/// (parallel to `doses`), `Subject::pk_only_occasions` (parallel to
+/// `pk_only_times`, #1876) and `Subject::reset_occasions` (parallel to
+/// `reset_times`, #1944). This is the DSL alternative to a dataset occasion
 /// column; downstream grouping (`split_obs_by_occasion`) is identical either way.
 ///
 /// When `had_column` is true the model *also* set `iov_column`; the DSL rule wins
@@ -1835,6 +1900,22 @@ pub(crate) fn apply_iov_occasion_rule(
                 // land in a different occasion than its co-timed samples (#757).
                 s.occasions = s.obs_times.iter().map(|&t| window_occ(edges, t)).collect();
                 s.dose_occasions = s.doses.iter().map(|d| window_occ(edges, d.time)).collect();
+                // A pk-only row on the same clock (#1876). One the reader moved a ULP below
+                // an edge (#1810) lands in the earlier window, as a #614-moved observation
+                // does: that window holds the whole interval the row governs.
+                s.pk_only_occasions = s
+                    .pk_only_times
+                    .iter()
+                    .map(|&t| window_occ(edges, t))
+                    .collect();
+                // A reset row is a record too, and `reset_times` is on the same clock.
+                // Left alone, it kept the dataset's labels under `iov_column`, or stayed
+                // empty and fell back to the record before the reset.
+                s.reset_occasions = s
+                    .reset_times
+                    .iter()
+                    .map(|&t| window_occ(edges, t))
+                    .collect();
             }
             IovOccasionRule::PerDose => {
                 // Each distinct administration *time* opens a new occasion. Doses
@@ -1879,6 +1960,20 @@ pub(crate) fn apply_iov_occasion_rule(
                         }
                         j.saturating_sub(1) as u32
                     })
+                    .collect();
+                // A pk-only row by the same rule (#1876). Searched rather than walked, so
+                // an in-memory subject's unsorted `pk_only_times` still maps correctly.
+                s.pk_only_occasions = s
+                    .pk_only_times
+                    .iter()
+                    .map(|&t| dose_times.partition_point(|&d| d <= t).saturating_sub(1) as u32)
+                    .collect();
+                // A reset row by the same rule. At-or-before puts an EVID=4 row, or an
+                // EVID=3 row co-timed with a dose, in the occasion that dose opens.
+                s.reset_occasions = s
+                    .reset_times
+                    .iter()
+                    .map(|&t| dose_times.partition_point(|&d| d <= t).saturating_sub(1) as u32)
                     .collect();
             }
         }
@@ -4528,7 +4623,11 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
-    if !model.residual_correlations.is_empty() {
+    diags.extend(residual_correlation_scope(model, options, &chain));
+
+    // A `correlation` line is dense too, but it has its own scope check above and
+    // the parser refuses it next to `block_sigma`, so what is left is block_sigma.
+    if model.residual_is_dense() && model.residual_serial.is_none() {
         for &m in &chain {
             if !matches!(
                 m,
@@ -4818,6 +4917,350 @@ const OMEGA_REGULARIZATION_FLOOR: f64 = 1e-8;
 /// * `ferx gam --no-fit` and `[fit_options] maxiter = 0` are documented as
 ///   "compute EBEs at initial parameter values only (equivalent to NONMEM
 ///   MAXEVAL=0)".
+/// `ρ` of a `correlation` line is free to move only below this in magnitude
+/// (#1081): the rail `block_sigma` puts on its Fisher-z (`RHO_Z_BOUND`), for the
+/// same reason — as `|ρ| → 1` the rows of a block become collinear and `R`
+/// numerically singular. A `FIX`ed `ρ` is held where the user puts it.
+pub(crate) const RESIDUAL_CORRELATION_RAIL: f64 = 0.995;
+
+/// The `correlation <kind>(RHO) by COL` line as the user wrote it (#1081).
+pub(crate) fn residual_correlation_line(model: &CompiledModel) -> Option<String> {
+    let serial = model.residual_serial.as_ref()?;
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .map(String::as_str)
+        .unwrap_or("?");
+    Some(format!(
+        "correlation {}({rho}) by {}",
+        serial.kind.keyword(),
+        serial.by.join(", ")
+    ))
+}
+
+/// Phase-1 scope of a `correlation` line (#1081): FOCE and FOCEI only, and none
+/// of the features whose objective does not take the dense `R` or whose analytic
+/// θ path has no `∂R/∂ρ`. One code, `E_RESIDUAL_CORRELATION_SCOPE`, naming the
+/// offending method or feature.
+fn residual_correlation_scope(
+    model: &CompiledModel,
+    options: &FitOptions,
+    chain: &[EstimationMethod],
+) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let scoped = |what: String, why: &str| {
+        Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_SCOPE",
+            format!(
+                "`{line}` is not supported with {what}. A residual correlation is fitted by \
+                 method = foce and focei only.{why}"
+            ),
+        )
+        .with_block("fit_options")
+    };
+    let scope = |what: String| scoped(what, "");
+    let mut diags = Vec::new();
+    if let Some(m) = chain
+        .iter()
+        .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+    {
+        diags.push(scope(format!("method = {}", m.label().to_lowercase())));
+    } else if options.n_agq > 1 {
+        diags.push(scope(format!("n_agq = {}", options.n_agq)));
+    }
+    if model.n_kappa > 0 {
+        diags.push(scoped(
+            "inter-occasion random effects (kappa)".to_string(),
+            " A kappa intercept loaded by the residual weight on the same grouping is the same \
+             covariance as `cs` with ρ ≥ 0, so the two are not identifiable together; fit one or \
+             the other (#1082).",
+        ));
+    }
+    if matches!(model.bloq_in_force(), BloqMethod::M3) {
+        diags.push(scope("bloq_method = m3".to_string()));
+    }
+    if model.frem_config.is_some() {
+        diags.push(scope("FREM covariate pseudo-observations".to_string()));
+    }
+    if model.has_non_gaussian() {
+        diags.push(scope(
+            "a time-to-event, binary, categorical or Markov endpoint".to_string(),
+        ));
+    }
+    if model.mixture.is_some() {
+        diags.push(scope("a mixture model".to_string()));
+    }
+    if model.is_sde() {
+        diags.push(scope("an SDE ([diffusion]) model".to_string()));
+    }
+    diags
+}
+
+/// The rows of each residual block of `subject`, block keys in first-row order.
+fn residual_blocks(model: &CompiledModel, subject: &Subject) -> Vec<Vec<usize>> {
+    let groups = crate::stats::residual_error::residual_groups(model, subject);
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    for (j, &g) in groups.iter().enumerate() {
+        if g == 0 {
+            continue;
+        }
+        let g = g as usize;
+        if blocks.len() < g {
+            blocks.resize(g, Vec::new());
+        }
+        blocks[g - 1].push(j);
+    }
+    blocks
+}
+
+/// `COL=value` of a block, from its first row.
+fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> String {
+    let cov = subject.obs_cov(row);
+    model
+        .residual_serial
+        .as_ref()
+        .map(|s| {
+            s.by.iter()
+                .map(|c| format!("{c}={}", cov.get(c).copied().unwrap_or(f64::NAN)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// The `car1` negative-ρ refusal (#1081), shared by the fit-time range check (on the
+/// θ's bounds) and the simulate-time one (on its value). `what` names the offending
+/// number, e.g. "the lower bound of theta RHO is -0.2".
+fn car1_negative_rho_message(line: &str, what: &str) -> String {
+    format!(
+        "`{line}`: {what}, but `car1` correlates two rows by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a \
+         non-integer time gap Δt. Keep ρ at 0 or above. For a negative correlation between \
+         consecutive rows, use `ar1`."
+    )
+}
+
+/// The value-level `car1` range check for an entry point that scores or draws at the
+/// given parameters without `fit()`'s validation (#1974 review r1 #1): `simulate()`
+/// draws `C_jk = ρ^Δt`, which is NaN for a negative ρ at a non-integer gap, so a
+/// negative `car1` ρ would come back as NaN DVs rather than an error. Checked on the
+/// θ's value, since that is what is drawn at, whatever its bounds.
+pub(crate) fn check_residual_correlation_value(
+    model: &CompiledModel,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let v = params
+        .theta
+        .get(serial.rho_theta)
+        .copied()
+        .unwrap_or(f64::NAN);
+    if serial.kind != crate::types::ResidualSerialKind::Car1 || v >= 0.0 {
+        return Vec::new();
+    }
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .cloned()
+        .unwrap_or_default();
+    vec![Diagnostic::error(
+        "E_RESIDUAL_CORRELATION_RANGE",
+        car1_negative_rho_message(&line, &format!("theta {rho} is {v}")),
+    )]
+}
+
+/// Data-dependent admissibility of a `correlation` line (#1081).
+///
+/// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
+///   positive definite: compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
+///   `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
+///   negative `ρ` and a non-integer `Δt`), and a free `ρ` stays inside the rail
+///   [`RESIDUAL_CORRELATION_RAIL`]. Checked on the θ's bounds when it is free and
+///   on its value when it is `FIX`ed.
+/// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
+///   of one block at the same time have no order; `car1` correlates them by
+///   `ρ^0 = 1`, which makes `R` singular.
+/// * `E_RESIDUAL_CORRELATION_RESET` — under `ar1` / `car1`, a block whose rows sit
+///   on both sides of a stacked reset occasion (an EVID=3/4 record restarting TIME):
+///   its rows' TIMEs are on two clocks, so their order and the time between them are
+///   undefined (#1974 review r1 #3).
+fn check_residual_correlation(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let p = params;
+    let i = serial.rho_theta;
+    let rho = model.theta_names.get(i).cloned().unwrap_or_default();
+    let fixed = p.theta_fixed.get(i).copied().unwrap_or(false);
+    let (lo, hi) = if fixed {
+        let v = p.theta.get(i).copied().unwrap_or(f64::NAN);
+        (v, v)
+    } else {
+        (
+            p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY),
+            p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY),
+        )
+    };
+    let what = |side: &str| {
+        if fixed {
+            format!("theta {rho} is fixed at {lo}")
+        } else {
+            format!(
+                "the {side} bound of theta {rho} is {}",
+                if side == "lower" { lo } else { hi }
+            )
+        }
+    };
+    let mut diags = Vec::new();
+
+    // The largest block, and the first tie under a time-keyed structure.
+    let timed = matches!(
+        serial.kind,
+        crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
+    );
+    let mut largest: Option<(usize, &Subject, usize)> = None;
+    let mut tie: Option<(&Subject, usize, f64)> = None;
+    // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
+    let mut reset: Option<(&Subject, usize, usize)> = None;
+    for subject in &population.subjects {
+        for block in residual_blocks(model, subject) {
+            if largest.is_none_or(|(n, _, _)| block.len() > n) {
+                largest = Some((block.len(), subject, block[0]));
+            }
+            if timed && reset.is_none() {
+                // A stacked reset occasion (EVID=3/4 restarting TIME) is shifted onto
+                // the engine's monotonic `obs_times`, while the readout clock keeps the
+                // TIME as written, so the two differ by one offset per segment.
+                let offset = |j: usize| subject.obs_times[j] - subject.readout_time(j);
+                let (a, o) = (block[0], offset(block[0]));
+                if let Some(&b) = block
+                    .iter()
+                    .find(|&&b| (offset(b) - o).abs() > 1e-9 * (1.0 + subject.obs_times[b].abs()))
+                {
+                    reset = Some((subject, a, b));
+                }
+            }
+            if timed && tie.is_none() {
+                let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
+                times.sort_by(f64::total_cmp);
+                if let Some(w) = times.windows(2).find(|w| w[0] == w[1]) {
+                    tie = Some((subject, block[0], w[0]));
+                }
+            }
+        }
+    }
+
+    if let Some((subject, a, b)) = reset {
+        diags.push(Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_RESET",
+            format!(
+                "`{line}`: subject {} has rows at TIME {} and TIME {} in the block {} on either \
+                 side of a TIME reset (an EVID=3/4 record that restarts TIME). `{}` reads the \
+                 time between two rows of a block, and across a reset it is undefined. Add the \
+                 occasion column to `by` so that each occasion is its own block, or use `cs`.",
+                subject.id,
+                subject.readout_time(a),
+                subject.readout_time(b),
+                residual_block_key(model, subject, a),
+                serial.kind.keyword()
+            ),
+        ));
+    }
+
+    if let Some((subject, row, t)) = tie {
+        let why = if serial.kind == crate::types::ResidualSerialKind::Car1 {
+            "`car1` correlates two rows by ρ^|Δt|, so tied rows correlate perfectly (ρ^0 = 1) \
+             and R is singular."
+        } else {
+            "`ar1` orders a block's rows by TIME, so tied rows have no order and no lag between \
+             them."
+        };
+        diags.push(Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_TIES",
+            format!(
+                "`{line}`: subject {} has two rows at TIME {t} in the block {}. {why} Give them \
+                 distinct times, or use `cs`.",
+                subject.id,
+                residual_block_key(model, subject, row)
+            ),
+        ));
+    }
+
+    let range = |msg: String| Diagnostic::error("E_RESIDUAL_CORRELATION_RANGE", msg);
+    // Positive definiteness at the most demanding block.
+    if serial.kind == crate::types::ResidualSerialKind::Cs {
+        if let Some((n, subject, row)) = largest.filter(|(n, _, _)| *n >= 2) {
+            let floor = -1.0 / (n as f64 - 1.0);
+            if lo <= floor {
+                diags.push(range(format!(
+                    "`{line}`: {}, but subject {} has {n} rows in the block {}, and compound \
+                     symmetry over {n} rows is a valid covariance only for ρ in \
+                     (−1/({n}−1), 1) = ({floor:.4}, 1). Keep ρ above {floor:.4}.",
+                    what("lower"),
+                    subject.id,
+                    residual_block_key(model, subject, row)
+                )));
+            }
+        }
+    }
+    if serial.kind == crate::types::ResidualSerialKind::Car1 && lo < 0.0 {
+        diags.push(range(car1_negative_rho_message(&line, &what("lower"))));
+    }
+    if fixed && lo.abs() >= 1.0 {
+        diags.push(range(format!(
+            "`{line}`: {}; a correlation must lie strictly between −1 and 1.",
+            what("lower")
+        )));
+    } else if !fixed {
+        for (side, v) in [("lower", lo), ("upper", hi)] {
+            if v.abs() > RESIDUAL_CORRELATION_RAIL {
+                diags.push(range(format!(
+                    "`{line}`: {}. A free correlation is kept within ±{RESIDUAL_CORRELATION_RAIL}, \
+                     because as |ρ| approaches 1 the rows of a block become collinear and R \
+                     numerically singular. Bound theta {rho} within ±{RESIDUAL_CORRELATION_RAIL}, \
+                     or FIX it to hold a value closer to ±1.",
+                    what(side)
+                )));
+            }
+        }
+    }
+    diags
+}
+
+/// `W_RESIDUAL_CORRELATION_INERT` (#1081): a `correlation` line under which no
+/// block holds two observations couples nothing, so its `ρ` is not in the
+/// likelihood at all.
+fn residual_correlation_inert(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let coupled = population
+        .subjects
+        .iter()
+        .any(|s| residual_blocks(model, s).iter().any(|b| b.len() >= 2));
+    if coupled {
+        return Vec::new();
+    }
+    vec![Diagnostic::warning(
+        "W_RESIDUAL_CORRELATION_INERT",
+        &format!(
+            "`{line}`: no block holds more than one observation (one row per group), so no two \
+             rows are correlated and ρ does not enter the likelihood: it cannot be estimated and \
+             stays at its initial value. Check that the `by` column(s) group the rows you meant \
+             to correlate."
+        ),
+    )]
+}
+
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
@@ -6075,6 +6518,7 @@ pub fn check_model_data_warnings(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(residual_correlation_inert(model, population));
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
@@ -6757,20 +7201,17 @@ pub fn check_model_data_warnings(
                     .collect();
                 // Group observation indices by (time, occasion) and flag any group
                 // where a row structurally shares a correlation with ≥2 others —
-                // the case where greedy row-order pairing is ambiguous.
+                // the case where greedy row-order pairing is ambiguous. "Time" is
+                // the instant the residual pairing itself uses (`same_instant`).
                 let n = s.obs_times.len();
-                let key = |j: usize| {
-                    (
-                        s.obs_times.get(j).copied().unwrap_or(0.0).to_bits(),
-                        s.occasions.get(j).copied().unwrap_or(0),
-                    )
-                };
+                let occ = |j: usize| s.occasions.get(j).copied().unwrap_or(0);
+                let together = |j: usize, k: usize| s.same_instant(j, k) && occ(j) == occ(k);
                 (0..n).any(|j| {
                     if loads.get(j).is_none_or(|l| l.is_empty()) {
                         return false;
                     }
                     let degree = (0..n)
-                        .filter(|&k| k != j && key(k) == key(j))
+                        .filter(|&k| k != j && together(j, k))
                         .filter(|&k| {
                             loads
                                 .get(k)
@@ -6961,6 +7402,10 @@ mod additive_init_scale_tests;
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
 mod residual_magnitude_tests;
+
+#[cfg(test)]
+#[path = "tests/residual_correlation_tests.rs"]
+mod residual_correlation_tests;
 
 #[cfg(test)]
 #[path = "tests/kappa_weight_tests.rs"]

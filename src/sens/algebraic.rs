@@ -56,6 +56,7 @@ use super::provider::{obs_sens_from_dual2, ObsGrad, ObsSens, SubjectSens};
 use crate::parser::model_parser::{
     compiled_model_uses_time_builtin, IndivParamProgram, ModelTimeGuard, OdeOutputProgram,
 };
+use crate::stats::stacked_layout::StackedLayout;
 use crate::types::{CompiledModel, Subject};
 
 /// Widest `(θ, η)` axis count the dispatch ladders below instantiate.
@@ -311,7 +312,7 @@ const _: () = assert!(
 //
 // The axis layout is the stacked one every IOV provider uses: θ on `0..n_theta`,
 // η_bsv on `n_theta..n_theta+n_eta`, and occasion group `g`'s κ block at
-// `n_theta + n_eta + g·n_kappa`. Widths are bucketed (`ODE_IOV_WIDTH_BUCKETS`)
+// `n_theta + n_eta + g·n_kappa` (`StackedLayout::kappa_offset`, shifted by `n_theta`). Widths are bucketed (`ODE_IOV_WIDTH_BUCKETS`)
 // because the stacked count grows with the number of occasions — an MBMA study
 // with many treatment arms is exactly that case — and monomorphising every width
 // to 96 is the compile-cost trap #971 measured.
@@ -320,32 +321,27 @@ const _: () = assert!(
 /// label (κ held at 0, matching `pk::predict_iov`).
 type ObsGroups = Vec<Option<usize>>;
 
-/// Per-observation occasion groups and the stacked-η width, or `None` when the
-/// subject's labelling does not fit the stacked convention.
+/// Per-observation occasion groups and the subject's stacked layout, or `None` when
+/// the subject's labelling does not fit the stacked convention.
 fn iov_layout(
     model: &CompiledModel,
     subject: &Subject,
     stacked_eta: &[f64],
-) -> Option<(ObsGroups, usize)> {
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    if occ_groups.is_empty() {
+) -> Option<(ObsGroups, StackedLayout)> {
+    let layout = StackedLayout::of(model, subject);
+    if layout.n_groups() == 0 || stacked_eta.len() != layout.n_stacked() {
         return None;
     }
-    let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
-    if stacked_eta.len() != n_stacked {
-        return None;
-    }
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
     // An unlabelled observation is legitimate (production holds its κ at 0); an
     // observation whose label is not a known group is not, and declining beats
     // guessing which block its κ derivatives belong in.
     let groups = (0..subject.obs_times.len())
         .map(|j| match subject.occasions.get(j) {
-            Some(occ) => occ_to_k.get(occ).copied().map(Some),
+            Some(&occ) => layout.group_of(occ).map(Some),
             None => Some(None),
         })
         .collect::<Option<ObsGroups>>()?;
-    Some((groups, n_stacked))
+    Some((groups, layout))
 }
 
 /// Widest stacked `(θ, η_bsv, κ…)` axis count these IOV walks admit. Shares the
@@ -415,7 +411,8 @@ fn run_obs_iov<const M: usize>(
     let (prog_indiv, prog_out) = iov_programs(model)?;
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
-    let (groups, n_stacked) = iov_layout(model, subject, stacked_eta)?;
+    let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
+    let n_stacked = layout.n_stacked();
     let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
     let n_rows = prog_indiv.pk_slots_ref().len();
     let uses_time = compiled_model_uses_time_builtin(model);
@@ -426,10 +423,8 @@ fn run_obs_iov<const M: usize>(
         // The occasion's combined effect: `[η_bsv, κ_g]`, or `[η_bsv, 0…]` for an
         // unlabelled observation — the same two cases `predict_iov` distinguishes.
         let combined = match group {
-            Some(g) => {
-                crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g)
-            }
-            None => crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa),
+            Some(g) => layout.combined_effect(stacked_eta, g),
+            None => layout.combined_pk_only(stacked_eta),
         };
         let cov = subject.obs_cov(j);
         let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
@@ -447,7 +442,7 @@ fn run_obs_iov<const M: usize>(
         // Combined column `c` → stacked axis. η_bsv is shared across occasions;
         // κ lands in this group's block, or is dropped when the row carries no
         // occasion (its κ is held at 0, so it has no derivative).
-        let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+        let kappa_base = group.map(|g| n_theta + layout.kappa_offset(g));
         let axis = |c: usize| -> Option<usize> {
             let ax = if c < n_eta {
                 n_theta + c
@@ -514,7 +509,8 @@ fn run_obs_grad_iov<const N: usize>(
     let (prog_indiv, prog_out) = iov_programs(model)?;
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
-    let (groups, n_stacked) = iov_layout(model, subject, stacked_eta)?;
+    let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
+    let n_stacked = layout.n_stacked();
     let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
     let n_rows = prog_indiv.pk_slots_ref().len();
     let uses_time = compiled_model_uses_time_builtin(model);
@@ -523,10 +519,8 @@ fn run_obs_grad_iov<const N: usize>(
     let mut out: Vec<ObsGrad> = Vec::with_capacity(subject.obs_times.len());
     for (j, &group) in groups.iter().enumerate() {
         let combined = match group {
-            Some(g) => {
-                crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g)
-            }
-            None => crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa),
+            Some(g) => layout.combined_effect(stacked_eta, g),
+            None => layout.combined_pk_only(stacked_eta),
         };
         let cov = subject.obs_cov(j);
         let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
@@ -541,7 +535,7 @@ fn run_obs_grad_iov<const N: usize>(
             )?
         };
         // Inner axes are the stacked η alone — no θ block, no Hessian.
-        let kappa_base = group.map(|g| n_eta + g * n_kappa);
+        let kappa_base = group.map(|g| layout.kappa_offset(g));
         let axis = |c: usize| -> Option<usize> {
             let ax = if c < n_eta {
                 c

@@ -639,6 +639,7 @@ pub fn run_model_simulate_with_overrides(
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("{}", i),
             doses: vec![DoseEvent::new(
                 0.0,
@@ -668,6 +669,7 @@ pub fn run_model_simulate_with_overrides(
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
             // horizon (overwritten by the draw). Empty when the model has no TTE
@@ -1012,10 +1014,14 @@ fn build_init_params(parsed: &ParsedModel) -> ModelParameters {
     parsed.model.default_params.clone()
 }
 
-/// Covariates referenced by the model but missing from the `[covariates]`
-/// declaration. These are still read (leniently) so the model works; the parser
-/// has already warned that they ought to be declared.
-fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+/// Every data column the model itself reads — the one owner of "what a
+/// model-aware read must take from the CSV" (#1936). Passed to the reader as
+/// `extra` on **both** the `[covariates]` path and the no-block path, so a model
+/// reading a role column or its `iov_column` (NONMEM's `$PK` spelling of
+/// `IF (OCC.EQ.2)`) reads the same columns whether or not it declares anything.
+/// Before #1936 only the declared path passed them: an unrelated
+/// `[covariates] WT` line turned `E_MISSING_COVARIATE` on `OCC` into a working fit.
+pub(crate) fn referenced_columns(model: &CompiledModel) -> Vec<String> {
     model
         .referenced_covariates
         .iter()
@@ -1023,8 +1029,17 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
         // `bind_theta_levels` after the read, never present in the CSV — asking
         // the reader for it would fail on a column the user never wrote.
         .filter(|c| !crate::parser::model_parser::is_level_index_column(c))
-        .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
+        .collect()
+}
+
+/// Covariates referenced by the model but missing from the `[covariates]`
+/// declaration. These are still read (leniently) so the model works; the parser
+/// has already warned that they ought to be declared.
+fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+    referenced_columns(model)
+        .into_iter()
+        .filter(|c| !decls.iter().any(|d| &d.name == c))
         .collect()
 }
 
@@ -1349,7 +1364,8 @@ pub fn read_population_with(
 /// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
 /// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path` when the fit
 /// recorded no model file to take the reader settings from. The same reader call
-/// as [`read_population_for`] with no covariate declarations and no row filter, so
+/// as [`read_population_for`] with no covariate declarations and no row filter
+/// (but the same model-referenced columns, #1936), so
 /// the endpoint's rows come back as event records, not as Gaussian observations
 /// (#1199). With a model file, [`read_population_as_fitted`] is the reader.
 pub(crate) fn read_population_routed_by(
@@ -1362,7 +1378,9 @@ pub(crate) fn read_population_routed_by(
         data_path,
         None,
         None,
-        &[],
+        // The same columns `read_population_for` reads for this model (#1936), so
+        // a reload's `covariate_names` match the fit's (`PopulationFingerprint`).
+        &referenced_columns(model),
         iov_column,
         None,
         &obs_routing_for(model, MissingDvPolicy::Skip),
@@ -1377,7 +1395,9 @@ pub(crate) fn read_population_routed_by(
 /// reader (validates declared columns exist + are numeric, builds the table, and
 /// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
 /// it falls back to the lenient reader with `fallback_columns` (the legacy
-/// `covariate_columns` argument, or `None` for auto-detect).
+/// `covariate_columns` argument, or `None` for auto-detect). Either way every
+/// column the model references is read, including a record column or the
+/// `iov_column` that auto-detection would skip (#1936).
 ///
 /// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
 /// automatically routed to `subject.obs_records` instead of the Gaussian parallel
@@ -1460,7 +1480,8 @@ fn read_population_for_policy(
     let routing = obs_routing_for(model, missing_dv);
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
-        None => (None, Vec::new()),
+        // No block: still read every column the model references (#1936).
+        None => (None, referenced_columns(model)),
     };
     read_nonmem_csv_routed(
         Path::new(data_path),

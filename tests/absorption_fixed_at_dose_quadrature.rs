@@ -131,6 +131,7 @@ fn subject() -> Subject {
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     let n = OBS.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: DOSES
             .iter()
@@ -152,6 +153,7 @@ fn subject() -> Subject {
         obs_l2: vec![],
         dose_occasions: DOSES.iter().map(|&(_, o, _)| o).collect(),
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
     }

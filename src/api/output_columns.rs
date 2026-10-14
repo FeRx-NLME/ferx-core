@@ -154,17 +154,13 @@ pub(crate) fn compute_extra_output_columns(
             .get(si)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-        let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
-        for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-            occ_to_k.insert(*occ_id, k);
-        }
+        let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
         let combined_for = |occ_id: u32| -> Vec<f64> {
             let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
             c.extend_from_slice(eta_hat);
             if model.n_kappa > 0 {
-                match occ_to_k.get(&occ_id) {
-                    Some(&k) if k < subj_kappas.len() => {
+                match layout.group_of(occ_id) {
+                    Some(k) if k < subj_kappas.len() => {
                         c.extend_from_slice(subj_kappas[k].as_slice())
                     }
                     _ => c.extend(std::iter::repeat_n(0.0, model.n_kappa)),
@@ -269,13 +265,7 @@ pub(crate) fn compute_extra_output_columns(
         // For subjects with no resets (the common case) n_sessions=1, session_obs[0]
         // holds all observation indices, session_shift[0]=0, and obs_session[j]=0
         // for every j — zero overhead, identical downstream behaviour.
-        let raw_time_of = |j: usize| -> f64 {
-            subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or(subject.obs_times[j])
-        };
+        let raw_time_of = |j: usize| -> f64 { subject.readout_time(j) };
         let n_sessions = subject.reset_times.len() + 1;
         let (session_obs, session_shift): (Vec<Vec<usize>>, Vec<f64>) = {
             let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_sessions];

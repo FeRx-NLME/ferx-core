@@ -19,12 +19,10 @@ use crate::sim::adaptive::{
     AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
     DoseLedgerEntry, MonitorSpec,
 };
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
+use crate::stats::likelihood::{build_frem_r_override, foce_subject_nll_iov};
 use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
+    compute_iwres_with_correlations, compute_r_matrix_with_correlations_cov,
+    compute_r_matrix_with_correlations_scaled_cov, iwres_autocorrelation,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -502,6 +500,9 @@ fn check_simulate_preconditions(
     // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
     validate_iov_simulatable(model, params)?;
     check_param_shape(model, &ParamBlock::all_of(params))?;
+    first_error(&super::validation::check_residual_correlation_value(
+        model, params,
+    ))?;
     first_error(&check_modeled_dose_rates(model, population))?;
     first_error(&check_dose_compartments(model, population))?;
     first_error(&check_absorption_closed_form_support_diags(
@@ -819,11 +820,7 @@ fn simulate_inner<R: rand::Rng>(
 /// which may be the shifted clock for stacked reset occasions. Shared by every
 /// simulation row emitter so the static and reactive paths cannot drift.
 pub(crate) fn obs_row_time(subject: &Subject, j: usize) -> f64 {
-    subject
-        .obs_raw_times
-        .get(j)
-        .copied()
-        .unwrap_or(subject.obs_times[j])
+    subject.readout_time(j)
 }
 
 fn emit_subject_rows<R: rand::Rng>(
@@ -862,8 +859,8 @@ fn emit_subject_rows<R: rand::Rng>(
         // exact order `predict_iov` indexes its `kappas` argument by. Empty when
         // the subject carries no occasion labels, in which case `predict_iov`
         // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
-        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+        let n_groups = crate::stats::stacked_layout::group_count(subject);
+        let kappas: Vec<Vec<f64>> = (0..n_groups)
             .map(|_| {
                 let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
                 (&omega_iov.chol * DVector::from_column_slice(&z))
@@ -906,7 +903,7 @@ fn emit_subject_rows<R: rand::Rng>(
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     // The **live** correlations (#847), resolved once in `draw_correlations`.
     let draw_correlations = draw_correlations(model, params);
-    if !draw_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+    if draw_correlations.is_dense() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
             model,
             subject,
@@ -931,7 +928,7 @@ fn emit_subject_rows<R: rand::Rng>(
                 j,
                 ipred,
                 &params.sigma.values,
-                draw_correlations,
+                draw_correlations.pairs,
                 ruv_scale,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
             );
@@ -985,8 +982,8 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
-/// The `block_sigma` correlations a residual draw under `params` must use
-/// (#847, #1733). `params` is the fitted (or drawn) vector, so reading
+/// The residual covariance structure — today the `block_sigma` correlations — a
+/// residual draw under `params` must use (#847, #1733, #1081). `params` is the fitted (or drawn) vector, so reading
 /// `model.residual_correlations` would draw residuals at the declared rho while
 /// using the fitted sigmas — exactly the mismatch that would make a VPC or an
 /// NPDE of an estimated `block_sigma` fail to reproduce it. Prefer the parameter
@@ -998,11 +995,11 @@ fn emit_subject_rows<R: rand::Rng>(
 pub(crate) fn draw_correlations<'a>(
     model: &'a CompiledModel,
     params: &'a ModelParameters,
-) -> &'a [crate::types::ResidualCorrelation] {
-    if params.residual_correlations.is_empty() {
-        &model.residual_correlations
+) -> crate::stats::residual_error::ResidualCov<'a> {
+    if model.residual_cov_at(params).is_dense() {
+        model.residual_cov_at(params)
     } else {
-        &params.residual_correlations
+        model.residual_cov_theta(&params.theta)
     }
 }
 
@@ -1023,7 +1020,7 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     subject: &Subject,
     sigma_values: &[f64],
     /* live correlations, resolved by the caller */
-    correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -1031,8 +1028,11 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
     rng: &mut R,
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
+    // A `correlation` line's blocks are the subject's `obs_rgroup`: assigned once per
+    // call by `simulate_inner_with_draw`, and by `fitted_population` for NPDE (#1081).
+    let obs_rgroup: &[u32] = &subject.obs_rgroup;
     let mut r = match ruv_mult {
-        Some(mult) => compute_r_matrix_with_correlations_scaled(
+        Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
             ipreds,
             err_keys.as_ref(),
@@ -1040,11 +1040,12 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
-            correlations,
+            residual_cov,
             mult,
         ),
-        None => compute_r_matrix_with_correlations(
+        None => compute_r_matrix_with_correlations_cov(
             &model.error_spec,
             ipreds,
             err_keys.as_ref(),
@@ -1052,8 +1053,9 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            obs_rgroup,
             sigma_values,
-            correlations,
+            residual_cov,
         ),
     };
     if ruv_scale != 1.0 {
@@ -1099,7 +1101,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     subject: &Subject,
     params: &ModelParameters,
     /* live correlations, resolved by the caller */
-    correlations: &[crate::types::ResidualCorrelation],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -1113,7 +1115,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
         model,
         subject,
         &params.sigma.values,
-        correlations,
+        residual_cov,
         ipreds,
         ruv_scale,
         ruv_mult,
@@ -1163,6 +1165,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // Every precondition below is an `Err`, never a panic (#898), and every
     // `simulate*` entry point returns it as is.
     check_simulate_preconditions(model, population, params)?;
+    // `simulate()` takes the caller's population as given, so a `correlation` line's
+    // residual blocks are read off its `by` columns here, once per call rather than
+    // once per replicate (#1081). A fitted population carries them already.
+    let with_blocks = crate::stats::residual_error::with_residual_blocks(model, population);
+    let population: &Population = &with_blocks;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()

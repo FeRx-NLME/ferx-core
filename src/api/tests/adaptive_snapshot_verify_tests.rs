@@ -57,6 +57,7 @@ fn tv_subject() -> Subject {
     let base = HashMap::from([("CRCL".to_string(), 100.0)]);
     let lo = HashMap::from([("CRCL".to_string(), 50.0)]);
     Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
         obs_times: vec![6.0, 24.0],
@@ -75,6 +76,7 @@ fn tv_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -451,6 +453,7 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
         .collect();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
         obs_times: decisions.clone(),
@@ -469,6 +472,7 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
