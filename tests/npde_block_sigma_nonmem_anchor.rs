@@ -195,7 +195,8 @@ fn worst_vs_nonmem(ferx: &[SubjectNpde], pop: &Population, table: &str, n_rows: 
 
 fn run(arm: &str, rho: f64, n_rows: usize) -> Worst {
     let (model, pop) = load(arm);
-    let out = compute_npde_npd(&model, &pop, &at_rho(&model, rho), NSIM, Some(SEED)).expect("npde");
+    let out =
+        compute_npde_npd(&model, &pop, &at_rho(&model, rho), NSIM, Some(SEED), None).expect("npde");
     let w = worst_vs_nonmem(&out, &pop, &format!("npde_block_sigma_{arm}.tab"), n_rows);
     eprintln!("#1733 arm {arm} at rho {rho}: {w:?}");
     w

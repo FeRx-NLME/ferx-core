@@ -650,7 +650,8 @@ fn compute_npde_npd_assigns_blocks_on_a_caller_population() {
         "precondition"
     );
     let run = |p: &Population| {
-        crate::stats::npde::compute_npde_npd(&m, p, &m.default_params, 200, Some(7)).expect("runs")
+        crate::stats::npde::compute_npde_npd(&m, p, &m.default_params, 200, Some(7), None)
+            .expect("runs")
     };
     let given = run(&pop);
     let values: Vec<f64> = given

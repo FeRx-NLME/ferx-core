@@ -1204,12 +1204,24 @@ fn compute_npde_npd_shapes_finite_and_reproducible() {
     let pop = tiny_population();
     let nsim = 200;
 
-    let a =
-        crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, nsim, Some(7))
-            .expect("npde");
-    let b =
-        crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, nsim, Some(7))
-            .expect("npde");
+    let a = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        nsim,
+        Some(7),
+        None,
+    )
+    .expect("npde");
+    let b = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        nsim,
+        Some(7),
+        None,
+    )
+    .expect("npde");
 
     assert_eq!(a.len(), pop.subjects.len());
     for (sn, subj) in a.iter().zip(pop.subjects.iter()) {

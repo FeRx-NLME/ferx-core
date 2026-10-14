@@ -2532,6 +2532,9 @@ fn fit_inner(
             &result.params,
             options.npde_nsim,
             options.npde_seed,
+            // `population` already carries the labels a derived `iov_occasion` rule gives
+            // (`fitted_population`), so there is no rule to apply here (#1980).
+            None,
         )
         .map_err(|e| e.to_string())?;
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
