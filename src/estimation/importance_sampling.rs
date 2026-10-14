@@ -65,14 +65,12 @@ fn inv_normal_cdf(u: f64) -> f64 {
 /// [`sobol_qmc_draws`] append the Student-t and mixture coordinates without
 /// moving the normal-proposal draws.
 fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
-    use sobol::params::JoeKuoD6;
     use sobol::Sobol;
 
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
     let shift: Vec<f64> = (0..dim).map(|_| rng.random::<f64>()).collect();
 
-    let params = JoeKuoD6::minimal(); // supports up to 100 dims
-    Sobol::<f64>::new(dim, &params)
+    Sobol::<f64>::new(dim, sobol_params())
         .take(k_samples)
         .map(|point| {
             point
@@ -82,6 +80,22 @@ fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
                 .collect()
         })
         .collect()
+}
+
+/// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
+/// up to `n_eta + 2` coordinates (normals, t scale, mixture component), so the
+/// samplers' callers refuse a model above `SOBOL_MAX_DIMS - 2` ETAs up front
+/// rather than let `Sobol::new` panic.
+pub(crate) const SOBOL_MAX_DIMS: usize = 1000;
+
+/// Joe–Kuo D6 direction numbers for up to [`SOBOL_MAX_DIMS`] dimensions, parsed
+/// once. `JoeKuoD6::standard()` decompresses and parses its table on every
+/// call, and the samplers run once per subject per iteration. The 1000-row
+/// table is the 100-row `minimal()` table extended, so the first 100
+/// coordinates — every pre-#1965 Sobol draw — are unchanged.
+fn sobol_params() -> &'static sobol::params::JoeKuoD6 {
+    static PARAMS: std::sync::OnceLock<sobol::params::JoeKuoD6> = std::sync::OnceLock::new();
+    PARAMS.get_or_init(sobol::params::JoeKuoD6::standard)
 }
 
 /// Quasi-random inputs for one subject's `K` importance draws (#1965): every
@@ -2902,6 +2916,120 @@ mod tests {
     /// Plain MVN carries no extra coordinates, and adding the t and mixture
     /// coordinates leaves the normals bit-identical — so `impmap_sobol` on an
     /// MVN proposal draws exactly what it drew before #1965.
+    /// The pre-#1965 MVN Sobol sampler, copied verbatim (minus the clamp
+    /// wrapper, inlined) so the bit-identity claim is checked against the *old*
+    /// algorithm and not against the helper that replaced it: the 100-row
+    /// `minimal()` table, the same seeded Cranley–Patterson shift, the same
+    /// probit. If `sobol_uniforms`, `sobol_params` or `sobol_qmc_draws` drift,
+    /// this copy does not.
+    fn pre_1965_sobol_normal_draws(d: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+        use sobol::params::JoeKuoD6;
+        use sobol::Sobol;
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
+        let shift: Vec<f64> = (0..d).map(|_| rng.random::<f64>()).collect();
+        let params = JoeKuoD6::minimal();
+        Sobol::<f64>::new(d, &params)
+            .take(k_samples)
+            .map(|point| {
+                point
+                    .iter()
+                    .zip(shift.iter())
+                    .map(|(&u, &s)| {
+                        crate::stats::special::normal_inv_cdf(
+                            ((u + s) % 1.0).clamp(1e-15, 1.0 - 1e-15),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// MVN Sobol draws are bit-identical to the pre-#1965 sampler, at a small
+    /// dimension and at the old table's full 100-dimension width (which also
+    /// pins that the 1000-row `standard()` table extends the 100-row one).
+    #[test]
+    fn mvn_sobol_draws_match_the_pre_1965_sampler() {
+        for (d, k, seed) in [(3usize, 300usize, 42u64), (100, 64, 7)] {
+            let want = pre_1965_sobol_normal_draws(d, k, seed);
+            let got = sobol_qmc_draws(d, k, seed, f64::INFINITY, false).z;
+            let bits = |m: &Vec<Vec<f64>>| -> Vec<Vec<u64>> {
+                m.iter()
+                    .map(|r| r.iter().map(|x| x.to_bits()).collect())
+                    .collect()
+            };
+            assert_eq!(bits(&got), bits(&want), "d = {d}: MVN Sobol draws moved");
+        }
+    }
+
+    /// Without Sobol, `draw_inputs` must consume the pseudo-random stream in the
+    /// pre-#1965 order — component uniform (only with a mixture), then the d
+    /// normals, then the χ² (only on the narrow branch of a t proposal) — since
+    /// that order is what keeps every seeded non-Sobol fit unchanged. The oracle
+    /// replays that order by hand from an identically seeded RNG, for each
+    /// proposal form, and compares bits.
+    #[test]
+    fn pseudo_random_draws_keep_the_pre_1965_stream_order() {
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0, 1.0]));
+        let mix = DefensiveMixture::new(&omega_inv, 3, 0.3).expect("PD Ω⁻¹ → mixture");
+        let d = 3;
+        for (nu, with_mix) in [
+            (f64::INFINITY, false),
+            (5.0, false),
+            (f64::INFINITY, true),
+            (5.0, true),
+        ] {
+            let chi = nu.is_finite().then(|| ChiSquared::new(nu).unwrap());
+            let mixture = with_mix.then_some(&mix);
+            let mut rng = StdRng::seed_from_u64(99);
+            let mut oracle = StdRng::seed_from_u64(99);
+            let mut z = vec![0.0; d];
+            let mut n_broad = 0;
+            for idx in 0..200 {
+                let got = draw_inputs(idx, None, mixture, chi.as_ref(), nu, &mut rng, &mut z);
+                let broad = with_mix && oracle.random::<f64>() < 0.3;
+                let zw: Vec<f64> = (0..d).map(|_| StandardNormal.sample(&mut oracle)).collect();
+                assert_eq!(
+                    z.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    zw.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "nu={nu} mix={with_mix} draw {idx}: normals moved"
+                );
+                match got {
+                    DrawInputs::Broad => {
+                        assert!(broad, "nu={nu} mix={with_mix} draw {idx}: wrong component");
+                        n_broad += 1;
+                    }
+                    DrawInputs::Narrow { t_scale } => {
+                        assert!(!broad, "nu={nu} mix={with_mix} draw {idx}: wrong component");
+                        let want = match &chi {
+                            Some(c) => (nu / c.sample(&mut oracle).max(1e-300)).sqrt(),
+                            None => 1.0,
+                        };
+                        assert_eq!(
+                            t_scale.to_bits(),
+                            want.to_bits(),
+                            "nu={nu} mix={with_mix} draw {idx}: t scale"
+                        );
+                    }
+                }
+            }
+            // Both components were exercised whenever the mixture is on.
+            assert_eq!(
+                n_broad > 0,
+                with_mix,
+                "nu={nu} mix={with_mix}: {n_broad} broad draws"
+            );
+        }
+    }
+
+    /// The guard in `impmap::check_sobol_dims` admits `SOBOL_MAX_DIMS`
+    /// coordinates; the table must actually provide them.
+    #[test]
+    fn sobol_params_cover_the_admitted_dimension() {
+        let pts = sobol_uniforms(SOBOL_MAX_DIMS, 2, 1);
+        assert_eq!(pts[1].len(), SOBOL_MAX_DIMS);
+        assert!(pts[1].iter().all(|u| (0.0..1.0).contains(u)));
+    }
+
     #[test]
     fn sobol_qmc_draws_layout_keeps_the_normals_first() {
         let (d, k, seed) = (3, 128, 5);

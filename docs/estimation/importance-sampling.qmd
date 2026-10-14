@@ -284,7 +284,7 @@ Practical notes:
 - **Sobol QMC still applies** while the mixture is active (#1965): with
   `impmap_sobol` / `imp_sobol` on, a dedicated quasi-random coordinate picks
   each draw's component, so the broad fraction is stratified (within one draw
-  of αK) instead of binomial, and both components take their normals from the
+  of αK when K is a power of two) instead of binomial, and both components take their normals from the
   same Sobol point.
 - For an IMPMAP stage the option may also be written `impmap_defensive_alpha`
   (an alias for the same field).

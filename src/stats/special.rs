@@ -1362,6 +1362,53 @@ mod tests {
         assert_eq!(chi_squared_inv_cdf(4.0, 1.0), f64::INFINITY);
     }
 
+    /// Independent tail oracles at the production clamp (`p` ∈ [1e-15,
+    /// 1 − 1e-15], see `importance_sampling::sobol_qmc_draws`), not routed
+    /// through the gamma functions the quantile itself inverts.
+    ///
+    /// Lower tail: `P(a, y) = y^a / Γ(a+1) · (1 − a·y/(a+1) + O(y²))`, so
+    /// `y₀ = (p·Γ(a+1))^{1/a}` and one correction `y = y₀·(1 + y₀/(a+1))`
+    /// leave an O(y²) relative error — below 1e-9 for every case here (largest
+    /// y is 1.6e-4 at ν = 7.3, p = 1e-15). Upper tail for ν = 4: the χ²₄
+    /// survival is exactly `e^{−x/2}(1 + x/2)`, solved here by bisection on its
+    /// logarithm.
+    #[test]
+    fn chi_squared_inv_cdf_matches_independent_tail_oracles() {
+        for &nu in &[1.0_f64, 1.5, 4.0, 7.3] {
+            for &p in &[1e-15_f64, 1e-12] {
+                let a = 0.5 * nu;
+                let y0 = (p * ln_gamma(a + 1.0).exp()).powf(1.0 / a);
+                let want = 2.0 * y0 * (1.0 + y0 / (a + 1.0));
+                let got = chi_squared_inv_cdf(nu, p);
+                assert!(got.is_finite() && got > 0.0, "nu={nu} p={p}: {got}");
+                let rel = (got - want).abs() / want;
+                assert!(
+                    rel < 1e-6,
+                    "nu={nu} p={p}: got {got}, want {want} (rel {rel:e})"
+                );
+            }
+        }
+        for &tail in &[1e-15_f64, 1e-12, 1e-6] {
+            // Target the tail the quantile actually receives: `1 − 1e-15` is not
+            // representable (f64 spacing near 1 is 1.1e-16), so `1 − p` comes
+            // back as 9.992e-16 — a 0.08% tail shift that moves x by 0.0016.
+            let p = 1.0 - tail;
+            let target = (1.0 - p).ln();
+            let (mut lo, mut hi) = (0.0_f64, 400.0_f64);
+            for _ in 0..200 {
+                let mid = 0.5 * (lo + hi);
+                if -0.5 * mid + (0.5 * mid).ln_1p() > target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let want = 0.5 * (lo + hi);
+            let got = chi_squared_inv_cdf(4.0, p);
+            assert_relative_eq!(got, want, max_relative = 1e-6);
+        }
+    }
+
     #[test]
     fn chi_squared_inv_cdf_round_trips_through_the_cdf() {
         // Includes fractional and large ν (the IS proposal takes any ν ≥ 1).

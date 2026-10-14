@@ -192,8 +192,9 @@ random number a draw uses comes from that point:
 
 - the normal vector;
 - for the default Student-t proposal, the χ² scale variable;
-- with `imp_defensive_alpha > 0`, the choice of mixture component, which also
-  makes the defensive fraction exact rather than binomial.
+- with `imp_defensive_alpha > 0`, the choice of mixture component, which
+  stratifies the defensive fraction instead of drawing it binomially (within one
+  draw of αK when K is a power of two; low-discrepancy otherwise).
 
 So it works with every proposal form. (Before #1965 it applied only to
 `impmap_proposal_df = normal` and was ignored, with a warning, otherwise.)
@@ -221,8 +222,9 @@ each fit's estimates:
 | sparse 2-cpt IV, N = 300 (3, block) | 300 | 0.012 | 0.015 |
 | 3-cpt IV (6) | 100 | 0.016 | 0.007 |
 
-At K = 100, Sobol matched pseudo-random draws at K = 300 or more, at the same
-cost per sample. At K ≥ 300 the two tied.
+At K = 100, Sobol cut the spread 2–44× against pseudo-random draws at the same
+K and cost per sample; on warfarin it beat pseudo-random K = 1000. At K ≥ 300 on
+the normal proposal the two tied.
 
 On the default t₄ proposal the gain is larger and also holds at K = 300 and on
 the 6-ETA model:

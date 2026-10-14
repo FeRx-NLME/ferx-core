@@ -62,8 +62,11 @@ estimates (θ, Ω, σ):
 
 How to read the table:
 
-- **At K = 100:** Sobol matches or beats pseudo-random draws at K = 300 on
-  sparse_combined and three_cpt_iv. On warfarin it beats K = 1000.
+- **At K = 100:** Sobol cuts the −2LL spread 2.4× (three_cpt_iv), 4.9×
+  (sparse_combined) and 44× (warfarin) against pseudo-random draws at the same
+  K. On the *parameters* it matches pseudo-random K = 300 on sparse_combined
+  (0.018 vs 0.017), but not on the −2LL (0.020 vs 0.012); on warfarin it beats
+  K = 1000 on both.
 - **Cost:** wall time is roughly linear in K and Sobol costs the same per
   sample (`timing.md`). That is roughly a 3× cut in samples for the same
   precision at low K.
@@ -127,7 +130,7 @@ common evaluator:
 | sparse_combined | 300 | 0.0099 | **0.0050** | 0.011 | **0.0063** |
 
 Unlike the normal proposal, the gain on t₄ holds at K = 300 and on the 6-η
-model: 2–60× on the −2LL and 1.5–4× on the parameters. The per-iteration jitter
+model: 1.2–60× on the −2LL and 1.5–4× on the parameters. The per-iteration jitter
 also drops (`summary.md`, tail jitter column).
 
 The new binary reproduces every seeded non-Sobol and MVN-Sobol fit of the

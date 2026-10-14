@@ -508,6 +508,21 @@ pub fn run_imp(
     )
 }
 
+/// A quasi-random draw spends up to `n_eta + 2` Sobol coordinates (normals,
+/// Student-t scale, mixture component); refuse a model the direction-number
+/// table cannot cover instead of letting `Sobol::new` panic mid-fit (#1965).
+fn check_sobol_dims(label: &str, n_eta: usize, use_sobol: bool) -> Result<(), String> {
+    use crate::estimation::importance_sampling::SOBOL_MAX_DIMS;
+    if use_sobol && n_eta + 2 > SOBOL_MAX_DIMS {
+        return Err(format!(
+            "{label}: Sobol draws support at most {} random effects (this model has {n_eta}); \
+             turn off `impmap_sobol` / `imp_sobol`.",
+            SOBOL_MAX_DIMS - 2
+        ));
+    }
+    Ok(())
+}
+
 /// Shared Monte-Carlo EM core for IMP and IMPMAP. The `recenter` strategy is the
 /// only behavioural difference; `label`/`df_key` tag warnings and verbose output.
 #[allow(clippy::too_many_arguments)]
@@ -537,6 +552,7 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
+    check_sobol_dims(label, n_eta, use_sobol)?;
     // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
     // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
     // mixture core, which reuses this function's option resolution via the same
@@ -4204,6 +4220,23 @@ mod tests {
             "MCETA restarts must not return a worse mode: {} vs {}",
             multi.nll,
             baseline.nll
+        );
+    }
+
+    /// The Sobol table covers `SOBOL_MAX_DIMS` coordinates and a draw needs
+    /// up to `n_eta + 2`, so 998 ETAs is the last admissible model (#1965).
+    /// The message names the limit, the model's count and the switch to flip.
+    #[test]
+    fn sobol_dimension_guard_admits_the_table_and_refuses_beyond() {
+        assert!(check_sobol_dims("IMPMAP", 998, true).is_ok());
+        let e = check_sobol_dims("IMPMAP", 999, true).unwrap_err();
+        assert!(
+            e.contains("998") && e.contains("999") && e.contains("impmap_sobol"),
+            "{e}"
+        );
+        assert!(
+            check_sobol_dims("IMPMAP", 5000, false).is_ok(),
+            "no limit without Sobol"
         );
     }
 

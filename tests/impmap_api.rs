@@ -259,6 +259,33 @@ fn imp_sobol_changes_the_imp_estimator() {
     assert_ne!(run(true), run(false), "imp_sobol had no effect on IMP");
 }
 
+/// `imp_sobol` is documented as estimator-only: an `imp_eval_only` stage keeps
+/// its pseudo-random sampler, so the evaluated −2LL is bit-identical with the
+/// flag on or off.
+#[test]
+fn imp_sobol_leaves_imp_eval_only_unchanged() {
+    let (model, population, base) = warfarin_setup();
+    let run = |sobol: bool| {
+        let mut opts = base.clone();
+        opts.method = EstimationMethod::Imp;
+        opts.imp_eval_only = true;
+        opts.imp_sobol = sobol;
+        opts.imp_samples = 200;
+        fit(&model, &population, &model.default_params, &opts)
+            .expect("fit must succeed")
+            .importance_sampling
+            .expect("imp_eval_only reports an IS result")
+            .minus2_log_likelihood
+    };
+    let (on, off) = (run(true), run(false));
+    assert!(on.is_finite());
+    assert_eq!(
+        on.to_bits(),
+        off.to_bits(),
+        "imp_sobol changed an eval-only −2LL: {on} vs {off}"
+    );
+}
+
 #[test]
 fn focei_then_impmap_chain_runs() {
     let (model, population, mut opts) = warfarin_setup();
