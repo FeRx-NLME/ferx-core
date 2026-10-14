@@ -26394,6 +26394,14 @@ fn e6_model_bodies() -> Vec<(&'static str, &'static str)> {
              \x20 KA   = TVKA * (WT / 70)^0.75\n",
         ),
         (
+            // A literal-left subtraction compiles to `E, c, RSub` (#1996): the lift has
+            // to read `RSub` as a two-operand op to find the subtree at all.
+            "literal_left_subtraction_inside_an_eta_statement",
+            "  CL = TVCL * (1 - (WT / 70)^0.75) * exp(ETA_CL)\n\
+             \x20 V  = TVV * exp(ETA_V)\n\
+             \x20 KA = TVKA\n",
+        ),
+        (
             "reassignment_after_an_eta_write",
             "  BMI = WT / (HT / 100)^2\n\
              \x20 CL  = TVCL * BMI * exp(ETA_CL)\n\
@@ -26714,6 +26722,42 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
     // The synthetic slot is the tail of `writes`, so the cache entry's `vals` stays
     // parallel to it.
     assert_eq!(split.writes.last().copied(), Some(program.n_vars));
+}
+
+/// `1 − (WT/70)^0.75` compiles to `…, PushConst(1), RSub` (#1996), so the lift must
+/// read `RSub` as the two-operand op it is: classify it as unary in `ip_op_pops` and
+/// the postfix walk no longer reduces to one root, the statement lifts nothing, and
+/// every value test still passes on the unlifted program. Pin that the lift happens
+/// and carries the `RSub`; the zoo entry gives it the split/unsplit parity tests.
+#[test]
+fn a_literal_left_subtraction_is_lifted_out_of_an_eta_statement() {
+    let body = e6_model_bodies()
+        .into_iter()
+        .find(|(n, _)| *n == "literal_left_subtraction_inside_an_eta_statement")
+        .map(|(_, b)| b)
+        .expect("zoo entry");
+    let model = parse_model_string(&e6_model_text(body)).expect("parse");
+    let program = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    let split = split_ip_eta_independent_prefix(
+        &program.stmts,
+        program.n_vars,
+        model.n_theta,
+        model.referenced_covariates.len(),
+    )
+    .expect("this shape hoists");
+    assert_eq!(split.n_subexpr, 1, "lifted sub-expressions");
+    let lifted_rsub = split.prefix.iter().any(|st| match st {
+        Statement::AssignBc(slot, bc) => {
+            *slot >= program.n_vars && bc.ops.iter().any(|o| matches!(o, Op::RSub))
+        }
+        _ => false,
+    });
+    assert!(lifted_rsub, "the lifted subtree carries the RSub");
+    assert_eq!(count_pow_ops(&split.suffix), 0, "the power left with it");
 }
 
 /// A slot an earlier **suffix** statement wrote is tainted, and a subtree reading
