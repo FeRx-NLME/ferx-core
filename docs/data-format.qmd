@@ -343,10 +343,13 @@ whatever the file said. Ties that carry an `SS=1` dose or a reset are unaffected
 both replace the state at the tie. Measured against NONMEM 7.6.0 on #1810's seven
 tie cases, on an `[odes]` model and on `ADVAN1`.
 
-The order is kept inside the engines only. Everything that reads an observation's
-time as data still reads the `TIME` you wrote: a `TIME`-keyed level block's cells, the
-`(time, occasion)` grouping of `block_sigma` residual pairs, the `TIME` in sdtab and in
-data-check messages ([#1959](https://github.com/FeRx-NLME/ferx-core/issues/1959)).
+The move is one ULP. These read the `TIME` you wrote, not the moved one: a
+`TIME`-keyed level block's cells, the `(time, occasion)` grouping of `block_sigma`
+residual pairs, the `TIME` in sdtab, `predict()` and `simulate()`, and the time named in
+data-check messages ([#1959](https://github.com/FeRx-NLME/ferx-core/issues/1959)). The
+`TIME` an `[individual_parameters]` expression reads (and a kappa `weight`) is still
+the moved one, so a step such as `if (TIME >= 24)` takes the earlier branch for a
+trough written at 24 and listed before a dose at 24.
 
 ## System Resets (EVID=3 / EVID=4)
 

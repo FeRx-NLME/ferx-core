@@ -97,7 +97,7 @@ whole block at zero. Bounds apply to the free coefficients, not to a derived
 negative sum, which can lie outside them. Free coefficients are named after
 their combination, so estimates report as
 `PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time as written
-in the data, the `TIME` NONMEM's `$PRED` sees: an `MDV=1` or `EVID=2` row
+in the data, the `TIME` NONMEM's `$PRED` sees: a dose, `MDV=1` or `EVID=2` row
 co-timed with an observation adds no level, and after an `EVID=3`/`4` reset that
 restarts `TIME` the later period shares the earlier period's levels. Anything
 else is a covariate column, which the reader loads automatically.

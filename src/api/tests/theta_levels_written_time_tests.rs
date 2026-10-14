@@ -14,15 +14,17 @@ use crate::types::ParsedModel;
 #[derive(Clone, Copy, Debug)]
 enum Extra {
     None,
-    /// After the observation at `TIME = 2`: the reader moves the observation (#1810).
+    /// After the observation at `TIME = 2`: the reader moves the observation (#1810
+    /// for a row with no observation, #614 for a dose).
     After(&'static str),
     /// Before it: nothing moves.
     Before(&'static str),
 }
 
-/// The co-timed rows, as `EVID,AMT,CMT,MDV`: an `MDV=1` observation row and an
-/// `EVID=2` other-type event.
-const KINDS: [&str; 2] = ["0,.,1,1", "2,.,1,1"];
+/// The co-timed rows, as `EVID,AMT,CMT,MDV`: an `MDV=1` observation row, an `EVID=2`
+/// other-type event, and a dose — the trough drawn before a dose at the same time, the
+/// commonest move on real data.
+const KINDS: [&str; 3] = ["0,.,1,1", "2,.,1,1", "1,100,1,1"];
 
 const HEADER: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n";
 
@@ -215,7 +217,7 @@ fn the_misindex_message_reads_the_written_time_on_a_stacked_reset_subject() {
 /// reader actually moved.
 ///
 /// Mutations — compare `obs_times` exactly (the pre-fix test): the moved replicate
-/// stops resolving. Drop the engine-clock clause: the reset subject resolves.
+/// stops resolving. Compare the written times instead: the reset subject resolves.
 #[test]
 fn same_instant_tolerates_the_move_and_not_a_reset() {
     let text = no_eta_model();
