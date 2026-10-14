@@ -4487,11 +4487,24 @@ mod tests {
         // M-step from the global mode and TVKA moves; this arm pins the
         // per-iteration gate (deleting it leaves TVKA equal to the arm above).
         let (every, tvka_every) = run(1);
-        // Measured: TVKA 1.003 (every iteration) vs 0.797 (final only) — the
+        // Period 2 fires at k = 2 only (the second of two iterations). Unlike
+        // periods 1 and 1000 it depends on the iteration index production
+        // passes: with `k` replaced by a constant 1 it never fires, and TVKA
+        // falls back to the final-only arm's.
+        let (every2, tvka_every2) = run(2);
+        // Measured: TVKA 1.003 (period 1), 1.004 (period 2) vs 0.797 (final only) — the
         // flipped subject drags the closed-form mu-ref shift; 0.1 is ~2× under
         // the 0.21 gap.
         const TVKA_GATE_GAP: f64 = 0.1;
-        for d in [off, final_only, every, tvka_final_only, tvka_every] {
+        for d in [
+            off,
+            final_only,
+            every,
+            every2,
+            tvka_final_only,
+            tvka_every,
+            tvka_every2,
+        ] {
             assert!(d.is_finite());
         }
         assert!(
@@ -4506,6 +4519,11 @@ mod tests {
         assert!(
             (tvka_every - tvka_final_only).abs() > TVKA_GATE_GAP,
             "per-iteration recheck must change the M-step: TVKA {tvka_every} vs final-only {tvka_final_only}"
+        );
+        assert!(every2.abs() < 0.3, "period-2 recheck: Δη_KA = {every2}");
+        assert!(
+            (tvka_every2 - tvka_final_only).abs() > TVKA_GATE_GAP,
+            "period-2 recheck must fire at k = 2 and change the M-step: TVKA {tvka_every2} vs final-only {tvka_final_only}"
         );
     }
 
