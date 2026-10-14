@@ -1049,11 +1049,14 @@ pub(crate) fn check_theta_gather_indices(
         for subj in &population.subjects {
             // Observation rows first — a level is a property of an observation —
             // then dose rows, which read the individual parameters too.
-            // An observation's TIME as written (#1959). A dose stores no written
-            // time: its engine time differs from it only after a stacked reset.
+            // Each row's TIME as written (#1959, #1969): a dose in a reset period that
+            // restarts TIME runs at a shifted engine time the file does not hold.
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
-                .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
+                .chain(
+                    (0..subj.doses.len())
+                        .map(|d| (subj.param_time_at(subj.doses[d].time), subj.dose_cov(d))),
+                );
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
                     diags.push(
@@ -2706,7 +2709,8 @@ pub(crate) fn check_dose_compartments(
 pub(crate) struct DoseSnapshot<'a> {
     /// The `$PK` values the engine resolves at this dose record — a `PkParams::values`.
     pub values: &'a [f64],
-    /// The dose record's time, as the engine passes it to `$PK`.
+    /// The dose record's TIME as written, which is also the TIME its `$PK` reads (#1969).
+    /// Differs from the engine's `DoseEvent::time` in a reset period that restarts TIME.
     pub time: f64,
     /// 0-based index of the dose.
     pub index: usize,
@@ -2796,7 +2800,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
         .enumerate()
         .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
-            time: subject.doses[k].time,
+            time: subject.param_time_at(subject.doses[k].time),
             index: k,
         })
         .collect()

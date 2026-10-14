@@ -6,7 +6,9 @@
 //! data does not hold. Each test asserts the written time and refuses the moved one,
 //! so a message that reads `obs_times` dies on either assertion.
 
-use super::validation::{check_kappa_weights, check_model_data, check_theta_gather_indices};
+use super::validation::{
+    check_dose_attr_finiteness, check_kappa_weights, check_model_data, check_theta_gather_indices,
+};
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
 use crate::types::{DoseEvent, Population, Subject};
 use std::collections::HashMap;
@@ -143,4 +145,96 @@ fn the_kappa_weight_check_evaluates_a_time_reading_weight_at_the_written_time() 
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, "E_KAPPA_WEIGHT_NONPOSITIVE");
     names_the_written_time(&diags[0].message, "evaluates to 0 at subject `1`, TIME 2 —");
+}
+
+/// A subject whose second dose sits in a reset period that restarts `TIME` (#1969): written
+/// at 24.3, it runs at `24.3 + 73.1` on the engine clock, a time the file does not hold.
+/// `dose_values` are the `column` values at the two doses; the observation carries `obs_value`.
+fn reset_period_dose(column: &str, obs_value: f64, dose_values: [Option<f64>; 2]) -> Population {
+    let snap = |v: Option<f64>| -> HashMap<String, f64> {
+        v.map(|v| HashMap::from([(column.to_string(), v)]))
+            .unwrap_or_default()
+    };
+    let (reset, engine) = (73.1, 24.3 + 73.1);
+    let subject = Subject {
+        id: "1".to_string(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(engine, 100.0, 1, 0.0, false, 0.0),
+        ],
+        reset_times: vec![reset],
+        reset_period_times: vec![(reset, 0.0), (engine, 24.3)],
+        obs_times: vec![1.0],
+        obs_raw_times: vec![1.0],
+        observations: vec![9.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        covariates: snap(Some(obs_value)),
+        dose_covariates: dose_values.iter().map(|&v| snap(v)).collect(),
+        obs_covariates: vec![snap(Some(obs_value))],
+        occasions: vec![1],
+        dose_occasions: vec![1, 1],
+        ..Default::default()
+    };
+    Population {
+        subjects: vec![subject],
+        covariate_names: vec![column.to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// The engine time of the reset-period dose, as a message reading it would print it.
+fn shifted_dose_time() -> String {
+    format!("{}", 24.3 + 73.1)
+}
+
+/// `E_THETA_GATHER_INDEX_MISSING` on a reset-period dose names its TIME as written (#1969
+/// review r1, finding 1).
+///
+/// Mutation — the dose rows' time read off `doses[d].time`: it names the shifted time.
+#[test]
+fn the_gather_index_check_names_a_reset_period_dose_at_its_written_time() {
+    let model = parse_full_model(
+        "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta PLACEBO[4](0.5, -10.0, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL + PLACEBO[PLA_IDX]\n  V  = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+         DV ~ proportional(PROP_ERR)\n",
+    )
+    .unwrap()
+    .model;
+    let pop = reset_period_dose("PLA_IDX", 1.0, [Some(1.0), None]);
+    let diags = check_theta_gather_indices(&model, &pop);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E_THETA_GATHER_INDEX_MISSING");
+    let msg = &diags[0].message;
+    assert!(msg.contains("value at TIME 24.3."), "{msg}");
+    assert!(!msg.contains(&shifted_dose_time()), "{msg}");
+}
+
+/// `E_DOSE_ATTR_NONFINITE` on a reset-period dose names it at its TIME as written, the
+/// TIME its `F` was evaluated at (`DoseSnapshot::time`, #1969 review r1, finding 1).
+///
+/// Mutation — `DoseSnapshot::time` read off `doses[k].time`: it names the shifted time.
+#[test]
+fn the_dose_attribute_check_names_a_reset_period_dose_at_its_written_time() {
+    let model = parse_full_model(
+        "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  F  = exp(X)\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V, f=F)\n[error_model]\n  \
+         DV ~ proportional(PROP_ERR)\n[covariates]\n  X continuous\n",
+    )
+    .unwrap()
+    .model;
+    let pop = reset_period_dose("X", 0.0, [Some(0.0), Some(1000.0)]);
+    let diags = check_dose_attr_finiteness(&model, &pop);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E_DOSE_ATTR_NONFINITE");
+    let msg = &diags[0].message;
+    assert!(msg.contains("(subject 1, dose 2 at TIME=24.3)"), "{msg}");
+    assert!(!msg.contains(&shifted_dose_time()), "{msg}");
 }
