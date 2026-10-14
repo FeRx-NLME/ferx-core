@@ -36,6 +36,31 @@ fn fixture_etas(n_subjects: usize, n_eta: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
+/// The production log target the sampler hands `draw`: `−Σᵢ individual_nll`
+/// at the model's default σ.
+fn nll_target<'a>(
+    model: &'a CompiledModel,
+    pop: &'a Population,
+    omega: &'a OmegaMatrix,
+) -> impl FnMut(&[f64], &[Vec<f64>]) -> f64 + 'a {
+    move |theta: &[f64], etas: &[Vec<f64>]| {
+        -pop.subjects
+            .iter()
+            .zip(etas)
+            .map(|(s, e)| {
+                crate::stats::likelihood::individual_nll(
+                    model,
+                    s,
+                    theta,
+                    e,
+                    omega,
+                    &model.default_params.sigma.values,
+                )
+            })
+            .sum::<f64>()
+    }
+}
+
 /// A dense, positive-definite Ω, so the cross terms of Ω⁻¹ between member
 /// and non-member etas are live in the conditional.
 fn dense_omega(n: usize, names: Vec<String>) -> OmegaMatrix {
@@ -233,9 +258,18 @@ fn a_moved_draw_holds_every_individual_parameter() {
     let upper = vec![f64::INFINITY; theta.len()];
     let mut rng = StdRng::seed_from_u64(7);
     let theta0 = theta.clone();
-    let out = d.draw(
-        &mut theta, &mut etas, &omega, &lower, &upper, &pop, &mut rng,
-    );
+    let out = d
+        .draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &lower,
+            &upper,
+            &pop,
+            &mut rng,
+            &mut nll_target(&model, &pop, &omega),
+        )
+        .0;
     assert_eq!(out, DrawOutcome::Moved);
     let wt = theta_idx(&model, "THETA_WT");
     assert!(theta[wt] != theta0[wt], "the exponent was drawn");
@@ -271,30 +305,36 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
 
     let mut theta = params.theta.clone();
     let mut etas = etas0.clone();
-    let out = d.draw(
-        &mut theta,
-        &mut etas,
-        &omega,
-        &open_lower,
-        &tight_upper,
-        &pop,
-        &mut StdRng::seed_from_u64(3),
-    );
+    let out = d
+        .draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &open_lower,
+            &tight_upper,
+            &pop,
+            &mut StdRng::seed_from_u64(3),
+            &mut nll_target(&model, &pop, &omega),
+        )
+        .0;
     assert_eq!(out, DrawOutcome::RejectedOutOfBounds);
     assert_eq!(theta, params.theta, "θ unchanged on reject");
     assert_eq!(etas, etas0, "η unchanged on reject");
 
     let mut theta = params.theta.clone();
     let mut etas = etas0.clone();
-    let out = d.draw(
-        &mut theta,
-        &mut etas,
-        &omega,
-        &open_lower,
-        &open_upper,
-        &pop,
-        &mut StdRng::seed_from_u64(3),
-    );
+    let out = d
+        .draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &open_lower,
+            &open_upper,
+            &pop,
+            &mut StdRng::seed_from_u64(3),
+            &mut nll_target(&model, &pop, &omega),
+        )
+        .0;
     assert_eq!(
         out,
         DrawOutcome::Moved,
@@ -440,15 +480,18 @@ fn reference_valued_covariates_send_their_exponents_back_to_the_random_walk() {
     let open = vec![f64::INFINITY; theta.len()];
     let neg = vec![f64::NEG_INFINITY; theta.len()];
     let before = theta.clone();
-    let out = d.draw(
-        &mut theta,
-        &mut etas,
-        &omega,
-        &neg,
-        &open,
-        &pop,
-        &mut StdRng::seed_from_u64(11),
-    );
+    let out = d
+        .draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &neg,
+            &open,
+            &pop,
+            &mut StdRng::seed_from_u64(11),
+            &mut nll_target(&model, &pop, &omega),
+        )
+        .0;
     assert_eq!(out, DrawOutcome::Moved);
     let tvcl = theta_idx(&model, "TVCL");
     assert_ne!(theta[tvcl], before[tvcl], "TVCL moved");
@@ -501,11 +544,9 @@ fn affinity_is_proven_from_the_expression_form() {
     let mut got = log_form(&e, &free).expect("affine");
     got.sort_unstable();
     assert_eq!(got, vec![(0, true), (1, false), (2, false)]);
-    // sqrt(θ0) and θ0·θ0 are log-affine.
-    assert_eq!(
-        log_form(&E::UnaryFn("sqrt".into(), th(0)), &free),
-        Some(vec![(0, true)])
-    );
+    // sqrt(θ0) is refused — the evaluator clamps its argument at 0 — while
+    // θ0·θ0 is log-affine.
+    assert_eq!(log_form(&E::UnaryFn("sqrt".into(), th(0)), &free), None);
     assert_eq!(
         log_form(&E::BinOp(th(0), BinOp::Mul, th(0)), &free),
         Some(vec![(0, true)])
@@ -569,4 +610,105 @@ fn run_bayes_samples_every_theta_when_the_covariates_are_at_reference() {
         let s = b.summaries.iter().find(|s| s.name == name).expect(name);
         assert!(s.q025 >= 0.01 && s.q975 <= 5.0, "{name} left its bounds");
     }
+}
+
+/// The DSL `log` is `ln(max(x, 1e-30))`, so `log(exp(θ·c))` is flat below the
+/// floor, not linear (codex review of #1951, round 2). The walker refuses any
+/// theta-dependent `log`; the unfloored control in the same test is admitted.
+#[test]
+fn a_floored_log_of_theta_is_not_admitted_but_the_unfloored_form_is() {
+    let base = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx")
+        .expect("model text")
+        .replace("THETA_WT(0.6, 0.01, 5.0)", "THETA_WT(0.6, -200.0, 200.0)");
+    assert!(
+        base.contains("THETA_WT(0.6, -200.0, 200.0)"),
+        "precondition"
+    );
+    let control = base.replace("(WT / 70)^THETA_WT", "exp(THETA_WT * (WT / 70))");
+    let floored = base.replace("(WT / 70)^THETA_WT", "exp(log(exp(THETA_WT * (WT / 70))))");
+    let (_m, pop) = cov_model();
+    let m_c = crate::parser::model_parser::parse_model_string(&control).expect("parses");
+    let d_c = MuDesign::build(&m_c, &pop, &m_c.default_params, true).expect("design");
+    assert!(
+        has_coord(&d_c, &m_c, "THETA_WT"),
+        "control: exp(θ·c) is linear in θ"
+    );
+    let m_f = crate::parser::model_parser::parse_model_string(&floored).expect("parses");
+    assert!(
+        m_f.covariate_mu_refs.iter().any(|c| c.eta_name == "ETA_CL"),
+        "precondition: still a recorded covariate mu-reference"
+    );
+    let d_f = MuDesign::build(&m_f, &pop, &m_f.default_params, true).expect("anchors cover");
+    assert!(
+        !has_coord(&d_f, &m_f, "THETA_WT"),
+        "log is clamped in the evaluator: not a linear coefficient"
+    );
+}
+
+/// The move is corrected by Metropolis–Hastings on the real likelihood, so a
+/// wrong belief about a typical value costs acceptance, never exactness. With
+/// `CL = TVCL·(WT/70)^TVCL·…` the ETA_CL group is refused (TVCL on two
+/// scales) but TVCL stays a log anchor, and re-centring only `ln TVCL` moves
+/// the real CL (codex review of #1951, round 2: by 0.086 on seed 11). The
+/// correction sees it: `log α` is far from 0. On the affine control in the
+/// same test `log α` is 0 to rounding — the move is the exact Gibbs draw.
+#[test]
+fn the_conjugate_move_is_corrected_on_the_real_likelihood() {
+    let affine = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("model text");
+    let a = "CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)";
+    assert!(affine.contains(a), "precondition: the CL line");
+    let bad = affine.replace(
+        a,
+        "CL = TVCL * (WT / 70)^TVCL * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)",
+    );
+    let (_m, pop) = cov_model();
+    let worst_log_alpha = |src: &str| -> (f64, usize) {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let d = MuDesign::build(&model, &pop, &model.default_params, true).expect("design");
+        assert!(
+            has_coord(&d, &model, "TVCL"),
+            "precondition: TVCL is conjugate"
+        );
+        let omega = dense_omega(model.n_eta, model.eta_names.clone());
+        let theta0 = model.default_params.theta.clone();
+        let etas0 = fixture_etas(pop.subjects.len(), model.n_eta);
+        let open_lo = vec![f64::NEG_INFINITY; theta0.len()];
+        let open_hi = vec![f64::INFINITY; theta0.len()];
+        let mut worst = 0.0_f64;
+        let mut rejected = 0;
+        for seed in 0..20u64 {
+            let mut theta = theta0.clone();
+            let mut etas = etas0.clone();
+            let (out, la) = d.draw(
+                &mut theta,
+                &mut etas,
+                &omega,
+                &open_lo,
+                &open_hi,
+                &pop,
+                &mut StdRng::seed_from_u64(seed),
+                &mut nll_target(&model, &pop, &omega),
+            );
+            assert!(la.is_finite(), "seed {seed}: log α {la}");
+            worst = worst.max(la.abs());
+            if out == DrawOutcome::RejectedMetropolis {
+                rejected += 1;
+                assert_eq!(theta, theta0, "a rejected draw changes nothing");
+                assert_eq!(etas, etas0);
+            }
+        }
+        (worst, rejected)
+    };
+    let (ctrl, ctrl_rej) = worst_log_alpha(&affine);
+    let (bad_la, bad_rej) = worst_log_alpha(&bad);
+    // Measured (Linux): control 5.4e-12, 0 of 20 rejected; the TVCL-exponent
+    // model up to 5.3e4, 11 of 20 rejected. Without the correction all 11
+    // would have moved the real CL with nothing to account for it.
+    assert!(ctrl < 1e-8, "affine design: |log α| {ctrl:e} should be ~0");
+    assert_eq!(ctrl_rej, 0);
+    assert!(
+        bad_la > 0.05,
+        "the correction must see the moved CL: |log α| {bad_la}"
+    );
+    assert!(bad_rej > 0, "and reject some draws");
 }

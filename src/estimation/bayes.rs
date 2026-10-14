@@ -635,9 +635,9 @@ fn impose_omega_structure(
 ///   2. Ω block — conjugate inverse-Wishart draw from `S = Σ ηᵢηᵢᵀ`, with the
 ///      structural `free_mask` / fixed entries re-imposed;
 ///   2c. Ω_iov block (IOV) — conjugate inverse-Wishart draw from `Σᵢ Σₖ κᵢₖκᵢₖᵀ`;
-///   2b. mu-ref θ block — exact Gaussian full conditional of the typical
-///      values and the linear covariate coefficients (`MuDesign`, when every η
-///      is covered); 3. remaining (θ, σ) — componentwise + adaptive joint
+///   2b. mu-ref θ block — Gaussian full conditional of the typical values and
+///      the linear covariate coefficients as an MH proposal, corrected on the
+///      real likelihood (`MuDesign`, when every η is covered); 3. remaining (θ, σ) — componentwise + adaptive joint
 ///      Metropolis, objective `Σᵢ individual_nll` (η, Ω, κ held fixed), with
 ///      out-of-bounds θ proposals rejected.
 ///
@@ -1301,12 +1301,33 @@ pub fn run_bayes(
                 // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
                 // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N); with
                 // covariate coefficients that enter log P_i linearly it is the
-                // Gaussian regression conditional of `MuDesign`. The draw holds
-                // every individual parameter fixed and re-centres η, so only the
-                // η-prior moves. A draw outside a θ bound is rejected (an exact
-                // MH step against the truncated conditional), where the old
+                // Gaussian regression conditional of `MuDesign`. The draw is a
+                // proposal: it re-centres η to hold every design φ_i, and is
+                // accepted by Metropolis–Hastings on the real target
+                // (`−Σ subject_nll`, the same likelihood every block scores), so
+                // it is exact for any typical value; on an affine design whose
+                // data depend on θ only through φ, the ratio is 1 and it is the
+                // Gibbs draw. A draw outside a θ bound is rejected, where the old
                 // move clamped it. This is what makes the chains mix.
                 if let Some(design) = mu_design.as_ref() {
+                    let mut log_target = |th: &[f64], es: &[Vec<f64>]| -> f64 {
+                        -(0..n_subjects)
+                            .map(|i| {
+                                subject_nll(
+                                    model,
+                                    &population.subjects[i],
+                                    th,
+                                    &es[i],
+                                    &kappas[i],
+                                    &omega_cur,
+                                    omega_iov_cur.as_ref(),
+                                    &sigma,
+                                    &mut scratch,
+                                    schedules[i].as_ref(),
+                                )
+                            })
+                            .sum::<f64>()
+                    };
                     design.draw(
                         &mut theta,
                         &mut etas,
@@ -1315,6 +1336,7 @@ pub fn run_bayes(
                         &init_params.theta_upper,
                         population,
                         &mut rng,
+                        &mut log_target,
                     );
                 }
 

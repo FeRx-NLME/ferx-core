@@ -23,19 +23,33 @@
 //! (the mean written relative to the current point, since `φ_i − c_i = X_i β_cur + η_i`).
 //! With `X_i = I` this is the historical move `μ ~ N(μ_old + η̄, Ω/N)`.
 //!
-//! The draw holds every `φ_i` fixed and re-centres `η_i ← φ_i − μ_i(θ_new)`, so
-//! the data likelihood is untouched and only the η prior moves. That is exact
-//! only when the data depend on the group's thetas through the `φ_i` alone —
-//! covariates constant within a subject, no free theta read elsewhere, no eta
-//! read by a second typical value — which is precisely
-//! `CovariateMuGroup::needs_data_term == false`; a group that fails it (or is
-//! not affine in any coordinates) is left to the random-walk block.
+//! **The Gaussian is a proposal, corrected by Metropolis–Hastings on the real
+//! likelihood** ([`MuDesign::draw`]). The draw re-centres
+//! `η_i ← η_i − (μ_i(θ_new) − μ_i(θ_old))` to hold every design `φ_i`, then
+//! accepts with the full target/proposal ratio, scored with the same per-subject
+//! likelihood every other Gibbs block uses. That makes the move exact for any
+//! typical value, whatever this module believes about it. When the belief is
+//! right, the ratio is 1 and the move is the exact Gibbs draw. The belief is
+//! that the design is affine and that the data depend on its thetas only
+//! through the `φ_i`: covariates constant within a subject, no free theta read
+//! elsewhere, no eta read by a second typical value
+//! (`CovariateMuGroup::needs_data_term == false`).
 //!
-//! **Bounds.** A draw that lands outside `[theta_lower, theta_upper]` is
-//! rejected and the chain stays put. That is an exact Metropolis–Hastings step,
-//! not an approximation: the proposal is the untruncated conditional, the
-//! target is that conditional times the indicator of the box, so the
-//! acceptance ratio is the indicator itself.
+//! An earlier version trusted the belief and accepted every draw. Two review
+//! rounds on #1951 found inputs where it was false:
+//!
+//! - an odd term, `(θ − θ₀)³`, that a numerical probe took for affine;
+//! - `log(exp(θ·c))`, which the clamped DSL `log` makes piecewise;
+//! - an anchor θ that also appears in its own exponent.
+//!
+//! Proving exactness form by form kept growing, so the correction now carries
+//! correctness. The structural affinity check below only keeps the proposal
+//! good, so that the acceptance stays near 1. It also decides which coefficients
+//! leave the random walk.
+//!
+//! **Bounds.** A draw that lands outside `[theta_lower, theta_upper]` has zero
+//! target and is rejected before the likelihood is evaluated; the chain stays
+//! put.
 
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupMember};
 use crate::parser::model_parser::{BinOp, Expression};
@@ -115,6 +129,8 @@ pub(crate) enum DrawOutcome {
     Moved,
     /// The draw fell outside a bound and was rejected; nothing changed.
     RejectedOutOfBounds,
+    /// The Metropolis–Hastings correction rejected the draw; nothing changed.
+    RejectedMetropolis,
     /// The conditional could not be formed (a non-PD Ω or precision, or a
     /// non-finite μ); nothing changed.
     Skipped,
@@ -339,6 +355,7 @@ impl<'m> MuDesign<'m> {
 
     /// One draw of `β` from its full conditional, as a full natural theta
     /// vector (no bound check, no re-centring).
+    #[cfg(test)]
     pub(crate) fn sample_theta(
         &self,
         theta: &[f64],
@@ -358,9 +375,30 @@ impl<'m> MuDesign<'m> {
         Some(self.theta_at(theta, &beta_new))
     }
 
-    /// The Gibbs move: draw `β`, reject it if any drawn theta leaves its
-    /// bounds, otherwise set `theta` and re-centre every `η_i` so each `φ_i`
-    /// is unchanged.
+    /// The move: propose `β'` from the Gaussian conditional, re-centre every
+    /// `η_i` so its design `φ_i` is unchanged, and accept with the
+    /// Metropolis–Hastings ratio on the **real** target.
+    ///
+    /// `log_target(θ, η)` is the log posterior density of the whole state up
+    /// to a constant, without the flat prior on `β` — in production
+    /// `−Σᵢ subject_nll`, the same likelihood every other block scores. The
+    /// proposal is `q(β' | s) = N(β'; m(s), P⁻¹)`, and the reverse proposal is
+    /// the same formula at the proposed state, so
+    ///
+    /// ```text
+    ///   log α = log_target(s') − log_target(s) + log q(β | s') − log q(β' | s)
+    /// ```
+    ///
+    /// The re-centring is a shear `η' = η − (μ(β') − μ(β))` with unit Jacobian,
+    /// and applying it from `s'` with `β` returns `s`, so this is a valid MH
+    /// step for **any** typical value — exactness does not rest on the
+    /// structural affinity proof (codex review of #1951, round 2). When the
+    /// design is genuinely affine and the data depend on its thetas only
+    /// through the `φ_i`, the two ratios cancel and `log α = 0` up to rounding:
+    /// the move is the exact Gibbs draw. A draw outside a bound has zero
+    /// target and is rejected before the target is evaluated.
+    ///
+    /// Returns the outcome and `log α` (`NaN` when no ratio was formed).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw(
         &self,
@@ -371,34 +409,68 @@ impl<'m> MuDesign<'m> {
         upper: &[f64],
         population: &Population,
         rng: &mut impl Rng,
-    ) -> DrawOutcome {
-        let Some(theta_new) = self.sample_theta(theta, etas, omega, rng) else {
-            return DrawOutcome::Skipped;
+        log_target: &mut dyn FnMut(&[f64], &[Vec<f64>]) -> f64,
+    ) -> (DrawOutcome, f64) {
+        let Some((mean, prec)) = self.conditional(theta, etas, omega) else {
+            return (DrawOutcome::Skipped, f64::NAN);
         };
+        let Some(chol) = Cholesky::new(prec.clone()) else {
+            return (DrawOutcome::Skipped, f64::NAN);
+        };
+        let l = chol.l();
+        let z = DVector::from_iterator(
+            mean.len(),
+            (0..mean.len()).map(|_| rng.sample(StandardNormal)),
+        );
+        // v = L⁻ᵀ z has covariance (L Lᵀ)⁻¹ = P⁻¹.
+        let Some(v) = l.transpose().solve_upper_triangular(&z) else {
+            return (DrawOutcome::Skipped, f64::NAN);
+        };
+        let beta_old = DVector::from_vec(self.beta(theta));
+        let beta_new = &mean + &v;
+        let theta_new = self.theta_at(theta, beta_new.as_slice());
         if !self
             .coords
             .iter()
             .all(|c| within_bounds(theta_new[c.theta_idx], c.theta_idx, lower, upper))
         {
-            return DrawOutcome::RejectedOutOfBounds;
+            return (DrawOutcome::RejectedOutOfBounds, f64::NAN);
         }
-        let mut deltas: Vec<Vec<f64>> = Vec::with_capacity(etas.len());
-        for s in &population.subjects {
+        let mut etas_new: Vec<Vec<f64>> = Vec::with_capacity(etas.len());
+        for (s, eta) in population.subjects.iter().zip(etas.iter()) {
             let old = self.mus(theta, s);
             let new = self.mus(&theta_new, s);
-            let d: Vec<f64> = new.iter().zip(&old).map(|(n, o)| n - o).collect();
-            if d.iter().any(|v| !v.is_finite()) {
-                return DrawOutcome::Skipped;
+            let e: Vec<f64> = eta
+                .iter()
+                .zip(new.iter().zip(&old))
+                .map(|(e, (n, o))| e - (n - o))
+                .collect();
+            if e.iter().any(|v| !v.is_finite()) {
+                return (DrawOutcome::Skipped, f64::NAN);
             }
-            deltas.push(d);
+            etas_new.push(e);
         }
-        for (eta, d) in etas.iter_mut().zip(&deltas) {
-            for (e, dj) in eta.iter_mut().zip(d) {
-                *e -= dj;
-            }
+        let Some((mean_rev, _)) = self.conditional(&theta_new, &etas_new, omega) else {
+            return (DrawOutcome::Skipped, f64::NAN);
+        };
+        let quad = |x: &DVector<f64>, m: &DVector<f64>| {
+            let d = x - m;
+            (d.transpose() * &prec * &d)[(0, 0)]
+        };
+        // log q(β | s') − log q(β' | s); P and its normaliser are shared.
+        let log_q_ratio = -0.5 * quad(&beta_old, &mean_rev) + 0.5 * quad(&beta_new, &mean);
+        let log_alpha = log_target(&theta_new, &etas_new) - log_target(theta, etas) + log_q_ratio;
+        if !log_alpha.is_finite() && log_alpha != f64::INFINITY {
+            return (DrawOutcome::RejectedMetropolis, log_alpha);
+        }
+        if log_alpha < 0.0 && rng.random::<f64>().ln() >= log_alpha {
+            return (DrawOutcome::RejectedMetropolis, log_alpha);
+        }
+        for (eta, e) in etas.iter_mut().zip(etas_new) {
+            *eta = e;
         }
         theta.copy_from_slice(&theta_new);
-        DrawOutcome::Moved
+        (DrawOutcome::Moved, log_alpha)
     }
 }
 
@@ -461,7 +533,8 @@ fn is_const(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> bool {
 /// The coordinates in which `e` itself is **affine**, by structure: a sum of
 /// constant multiples of free thetas (natural scale) and of logs of
 /// log-affine factors. `None` for anything else — a power or product of two
-/// theta-dependent terms, a conditional, a level gather, an NN output.
+/// theta-dependent terms, a clamped function (`log`, `ln`, `sqrt`) of a
+/// theta-dependent argument, a conditional, a level gather, an NN output.
 fn lin_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
     if is_const(e, is_free) {
         return Some(Vec::new());
@@ -475,14 +548,16 @@ fn lin_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
         Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) if is_const(b, is_free) => {
             lin_form(a, is_free)
         }
-        Expression::UnaryFn(f, a) if f == "log" || f == "ln" => log_form(a, is_free),
+        // No `log`/`ln` of a theta-dependent argument: the evaluator computes
+        // `ln(max(x, 1e-30))`, so `log(exp(θ·c))` is `max(θ·c, ln 1e-30)` —
+        // flat below the floor, not affine (codex review of #1951, round 2).
         _ => None,
     }
 }
 
 /// The coordinates in which `ln(e)` is affine, by structure: a product or
 /// quotient of free thetas (log scale), constants, constant powers of such
-/// factors (`sqrt` included), `exp` of an affine term, and a constant base raised to an affine
+/// factors, `exp` of an affine term, and a constant base raised to an affine
 /// exponent — `TVCL * (WT/70)^THETA_WT * exp(THETA_SEX * SEX)`.
 fn log_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
     if is_const(e, is_free) {
@@ -496,7 +571,7 @@ fn log_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
         Expression::Power(base, exp) if is_const(base, is_free) => lin_form(exp, is_free),
         Expression::Power(base, exp) if is_const(exp, is_free) => log_form(base, is_free),
         Expression::UnaryFn(f, a) if f == "exp" => lin_form(a, is_free),
-        Expression::UnaryFn(f, a) if f == "sqrt" => log_form(a, is_free),
+        // No `sqrt` either: the evaluator clamps its argument at 0.
         _ => None,
     }
 }
