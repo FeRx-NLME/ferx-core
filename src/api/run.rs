@@ -761,6 +761,11 @@ pub fn run_model_simulate_with_overrides(
             seed: Some(sim_spec.seed),
             match_method: None,
             horizon: sim_spec.horizon,
+            // The template subjects carry no occasion labels, so a derived rule is the
+            // only way an IOV model's κ is drawn here (#1955). Without one, the
+            // `W_IOV_NO_OCCASIONS` this raises never reaches the caller: `fit()` below
+            // refuses the unlabelled population with `E_IOV_MISSING_OCC`.
+            iov_occasion: Some(parsed.fit_options.iov_occasion.clone()),
         },
     )
     .map_err(|e| format!("simulation failed: {e}"))?;
@@ -991,6 +996,9 @@ pub fn run_model_simulate_with_overrides(
         }
     }
     rebuild_warnings_structured(&mut result);
+    // The labels the fit derived on its own copy, onto the population returned for sdtab,
+    // as the data path does: without them `OCC` is not written (#1979 review).
+    derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
 }
 

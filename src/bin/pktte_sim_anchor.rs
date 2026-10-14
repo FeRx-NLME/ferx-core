@@ -109,6 +109,7 @@ fn main() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect("ferx joint PK-TTE simulation must succeed");

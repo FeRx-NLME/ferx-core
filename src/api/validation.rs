@@ -1980,6 +1980,69 @@ pub(crate) fn apply_iov_occasion_rule(
     }
 }
 
+/// `population` with the occasion labels a model-side `iov_occasion` rule derives, as
+/// `fit()` derives them on its own copy (`fitted_population`). The one derivation for every
+/// entry point that is handed the rule rather than fitting: simulation (#1955) and post-hoc
+/// NPDE (#1980). Borrowed unchanged for `None`, a `Column` rule, or a model with no κ, which
+/// reads no labels.
+///
+/// `had_column = false` and a throwaway sink: the override warning is about a fit's
+/// `[fit_options]`, which these entry points either do not have or have already fitted under.
+pub(crate) fn with_derived_occasions<'a>(
+    model: &CompiledModel,
+    population: &'a Population,
+    rule: Option<&IovOccasionRule>,
+) -> std::borrow::Cow<'a, Population> {
+    match rule {
+        Some(rule) if model.n_kappa > 0 && *rule != IovOccasionRule::Column => {
+            let mut derived = population.clone();
+            apply_iov_occasion_rule(&mut derived, rule, false, &mut Vec::new());
+            std::borrow::Cow::Owned(derived)
+        }
+        _ => std::borrow::Cow::Borrowed(population),
+    }
+}
+
+/// `W_IOV_NO_OCCASIONS` when an IOV model is about to draw κ for a subject that carries no
+/// occasion label once [`with_derived_occasions`] has run (#1955, #1980). The κ draw is one
+/// per occasion group, so such a subject gets none and every record runs at κ = 0. That is
+/// deliberate for a population with no occasions (NONMEM `$SIM` reads `OCC = 0` as
+/// `KAPPA = 0`, #723), so it is a warning rather than an `Err`.
+///
+/// Silent when `has_omega_iov` is false: the documented κ = 0 fallback on an absent Ω_IOV
+/// draws no κ for any subject, labelled or not, so an unlabelled one changes nothing. That
+/// one gate also covers a model with no κ: every caller refuses an Ω_IOV handed to one
+/// (`check_param_shape`), so a second `n_kappa == 0` test would reject only the inputs this
+/// one already does, and no test could tell the two apart.
+///
+/// The count is shared; the two clauses are the caller's, because they differ by entry
+/// point. `effect` completes "so …" with what ran at κ = 0, and `remedy` is the closing
+/// sentence: only the caller knows where its rule comes from, and whether its population
+/// has a data column to label (`ferx --simulate`'s `[simulation]` design has none).
+pub(crate) fn no_occasion_warning(
+    has_omega_iov: bool,
+    population: &Population,
+    effect: &str,
+    remedy: &str,
+) -> Option<String> {
+    if !has_omega_iov {
+        return None;
+    }
+    let n_unlabelled = population
+        .subjects
+        .iter()
+        .filter(|s| crate::stats::stacked_layout::group_count(s) == 0)
+        .count();
+    (n_unlabelled > 0).then(|| {
+        format!(
+            "W_IOV_NO_OCCASIONS: the model declares kappa (IOV) parameters, but {n_unlabelled} \
+             of {} subject(s) carry no occasion labels, so {effect} at kappa = 0, with no \
+             inter-occasion variability. {remedy}",
+            population.subjects.len()
+        )
+    })
+}
+
 /// Built-in absorption input-rate models (e.g. `transit()`) are integrated
 /// through the standard ODE prediction paths. Two combinations are not yet
 /// supported and are rejected here — loudly — rather than silently mis-modeled:

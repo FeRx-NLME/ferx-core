@@ -6993,6 +6993,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("w_iov_no_occasions") {
+        // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
+        // A simulated subject handled specially, like the arm above; matched on its token
+        // so no prose arm has to stay clear of its wording.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted

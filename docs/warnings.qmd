@@ -344,7 +344,7 @@ covariance step that followed produced usable standard errors.
 | `multi_start` | Info | Multi-start note. | Inspect which start won. |
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
-| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
+| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). Also `W_IOV_NO_OCCASIONS`: a `kappa` model simulated subjects that carry no occasion label at κ = 0, with no inter-occasion variability, from `simulate_with_options_diag` and `simulate_with_uncertainty_diag` (#1955), or simulated their NPDE/NPD reference distribution that way, from `compute_npde_npd_diag` (#1980). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. For `W_IOV_NO_OCCASIONS`, label the occasions in the data (`iov_column`) or pass the model's `iov_occasion` rule; see [IOV: Simulation](model-file/iov.qmd#simulation). |
 
 ### Absorption diagnostics {#codes-absorption}
 

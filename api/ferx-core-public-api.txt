@@ -57,6 +57,7 @@ pub ferx_core::api::RunOverrides::inits_from_nca: core::option::Option<ferx_core
 pub ferx_core::api::RunOverrides::threads: core::option::Option<usize>
 pub struct ferx_core::api::SimulateOptions
 pub ferx_core::api::SimulateOptions::horizon: core::option::Option<f64>
+pub ferx_core::api::SimulateOptions::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::api::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::api::SimulateUncertaintyOptions
@@ -5015,6 +5016,7 @@ pub ferx_core::SigmaVector::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::SigmaVector::values: alloc::vec::Vec<f64>
 pub struct ferx_core::SimulateOptions
 pub ferx_core::SimulateOptions::horizon: core::option::Option<f64>
+pub ferx_core::SimulateOptions::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::SimulateUncertaintyOptions

@@ -173,6 +173,7 @@ fn sim_opts() -> SimulateOptions {
         seed: Some(42),
         match_method: None,
         horizon: None,
+        iov_occasion: None,
     }
 }
 
