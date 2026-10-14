@@ -379,15 +379,24 @@ impl<'m> MuDesign<'m> {
     /// `η_i` so its design `φ_i` is unchanged, and accept with the
     /// Metropolis–Hastings ratio on the **real** target.
     ///
-    /// `log_target(θ, η)` is the log posterior density of the whole state up
-    /// to a constant, without the flat prior on `β` — in production
-    /// `−Σᵢ subject_nll`, the same likelihood every other block scores. The
-    /// proposal is `q(β' | s) = N(β'; m(s), P⁻¹)`, and the reverse proposal is
-    /// the same formula at the proposed state, so
+    /// `subject_nlls(θ, η)` returns the per-subject negative log-likelihood at
+    /// a state, in subject order; the log target of the whole state up to a
+    /// constant, without the flat prior on `β`, is minus their sum — the same
+    /// likelihood every other block scores. The proposal is
+    /// `q(β' | s) = N(β'; m(s), P⁻¹)`, and the reverse proposal is the same
+    /// formula at the proposed state, so
     ///
     /// ```text
     ///   log α = log_target(s') − log_target(s) + log q(β | s') − log q(β' | s)
     /// ```
+    ///
+    /// The **current** state's term is not recomputed: `nll` carries it in, and
+    /// a `Moved` draw carries the proposed state's vector back out, so the
+    /// caller's cached baseline stays exact without a second pass over the
+    /// population. The move costs one population likelihood sweep, not two, and
+    /// the caller needs no refresh after it — three sweeps per MCMC sweep down
+    /// to two, with bit-identical draws, since the term dropped was a second
+    /// evaluation of a state the caller had already evaluated.
     ///
     /// The re-centring is a shear `η' = η − (μ(β') − μ(β))` with unit Jacobian,
     /// and applying it from `s'` with `β` returns `s`, so this is a valid MH
@@ -409,7 +418,8 @@ impl<'m> MuDesign<'m> {
         upper: &[f64],
         population: &Population,
         rng: &mut impl Rng,
-        log_target: &mut dyn FnMut(&[f64], &[Vec<f64>]) -> f64,
+        nll: &mut [f64],
+        subject_nlls: &mut dyn FnMut(&[f64], &[Vec<f64>]) -> Vec<f64>,
     ) -> (DrawOutcome, f64) {
         let Some((mean, prec)) = self.conditional(theta, etas, omega) else {
             return (DrawOutcome::Skipped, f64::NAN);
@@ -459,7 +469,11 @@ impl<'m> MuDesign<'m> {
         };
         // log q(β | s') − log q(β' | s); P and its normaliser are shared.
         let log_q_ratio = -0.5 * quad(&beta_old, &mean_rev) + 0.5 * quad(&beta_new, &mean);
-        let log_alpha = log_target(&theta_new, &etas_new) - log_target(theta, etas) + log_q_ratio;
+        // −Σ nll(s') + Σ nll(s): the caller's cached baseline is the second
+        // term, so only the proposal is evaluated here.
+        let nll_new = subject_nlls(&theta_new, &etas_new);
+        debug_assert_eq!(nll_new.len(), nll.len(), "one NLL per subject");
+        let log_alpha = nll.iter().sum::<f64>() - nll_new.iter().sum::<f64>() + log_q_ratio;
         if !log_alpha.is_finite() && log_alpha != f64::INFINITY {
             return (DrawOutcome::RejectedMetropolis, log_alpha);
         }
@@ -470,6 +484,7 @@ impl<'m> MuDesign<'m> {
             *eta = e;
         }
         theta.copy_from_slice(&theta_new);
+        nll.copy_from_slice(&nll_new);
         (DrawOutcome::Moved, log_alpha)
     }
 }

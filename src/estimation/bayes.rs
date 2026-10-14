@@ -19,7 +19,7 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
-use crate::estimation::bayes_mu_design::{within_bounds, MuDesign};
+use crate::estimation::bayes_mu_design::{within_bounds, DrawOutcome, MuDesign};
 use crate::estimation::mixture::combine_subject;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps_componentwise, mh_steps_with_proposal};
@@ -309,6 +309,139 @@ fn ebe_start_etas(ebes: &[DVector<f64>], n_subjects: usize, n_eta: usize) -> Vec
             _ => vec![0.0; n_eta],
         })
         .collect()
+}
+
+/// What one chain hands back: its recorded draws, the per-subject η sum and
+/// the count behind it, its post-warmup HMC divergences, and how its conjugate
+/// mu-reference draws fared.
+///
+/// Named rather than written inline so the `chain_outputs` binding stays one
+/// line: spelled out, rustfmt wraps the annotation and re-indents the whole
+/// per-chain closure, which turns a 340-line change into a 1,600-line diff.
+type ChainOutput = (Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64, ConjugateTally);
+
+/// Acceptance below this, over the whole run, and the conjugate mu-reference
+/// move is reported rather than left silent. Not a correctness threshold: the
+/// move is Metropolis-corrected, so every rejection is a valid step of the
+/// chain. It is the point at which the move has stopped *doing* anything and
+/// the thetas it owns are mixing like the random walk it replaced.
+const CONJUGATE_ACCEPT_REPORT_THRESHOLD: f64 = 0.5;
+
+/// How the conjugate mu-reference move fared, summed over the **sampling**
+/// sweeps of every chain.
+///
+/// Warmup is excluded deliberately. Early sweeps sit far from the mode with a
+/// half-adapted Ω, so a coefficient that passes near a declared bound is
+/// rejected there and never again; counting those would fire this report on a
+/// fit whose sampling phase is healthy, which is the one phase the posterior is
+/// read from.
+///
+/// The move's exactness does not rest on the structural affinity proof in
+/// `bayes_mu_design` — the Metropolis correction makes it valid for any typical
+/// value, and a design the proof does not recognise simply accepts less often.
+/// That makes the acceptance rate the **only** observable that distinguishes "the
+/// conjugate move is drawing the typical values" from "it proposes and is
+/// rejected every sweep, and those thetas are back on the random walk the move
+/// exists to replace". Without this tally that distinction is invisible, in a
+/// run and in a regression.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConjugateTally {
+    moved: u64,
+    /// The draw left a declared `theta_lower` / `theta_upper` box.
+    rejected_out_of_bounds: u64,
+    /// The Metropolis ratio rejected it.
+    rejected_metropolis: u64,
+    /// No conditional could be formed (non-PD Ω or precision, non-finite μ).
+    skipped: u64,
+}
+
+impl ConjugateTally {
+    fn record(&mut self, outcome: DrawOutcome) {
+        let slot = match outcome {
+            DrawOutcome::Moved => &mut self.moved,
+            DrawOutcome::RejectedOutOfBounds => &mut self.rejected_out_of_bounds,
+            DrawOutcome::RejectedMetropolis => &mut self.rejected_metropolis,
+            DrawOutcome::Skipped => &mut self.skipped,
+        };
+        *slot += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.moved += other.moved;
+        self.rejected_out_of_bounds += other.rejected_out_of_bounds;
+        self.rejected_metropolis += other.rejected_metropolis;
+        self.skipped += other.skipped;
+    }
+
+    fn total(&self) -> u64 {
+        self.moved + self.rejected_out_of_bounds + self.rejected_metropolis + self.skipped
+    }
+
+    /// `None` when the move never ran (no design, or a mixture model).
+    fn accept_rate(&self) -> Option<f64> {
+        match self.total() {
+            0 => None,
+            n => Some(self.moved as f64 / n as f64),
+        }
+    }
+}
+
+/// The low-acceptance report for the conjugate mu-reference move, or `None`
+/// when it ran and accepted often enough (or never ran at all).
+///
+/// The dominant rejection reason picks the advice, because the three have
+/// nothing in common: a bound is the user's own declaration, a Metropolis
+/// rejection says the Gaussian conditional is a poor proposal for this typical
+/// value, and a skip says the conditional could not be formed at all.
+fn conjugate_accept_warning(tally: ConjugateTally) -> Option<String> {
+    let rate = tally.accept_rate()?;
+    if rate >= CONJUGATE_ACCEPT_REPORT_THRESHOLD {
+        return None;
+    }
+    // Counts, not a bare percentage: at 49.6% a rounded "50%" reads as the
+    // threshold itself, and the warning looks like a bug in its own gate.
+    let mut w = format!(
+        "Bayes: the conjugate mu-reference theta move accepted {} of {} draws ({:.0}%).",
+        tally.moved,
+        tally.total(),
+        100.0 * rate
+    );
+    // `max_by_key` keeps the LAST of several equal maxima, so this order is the
+    // tie-break, and it reads backwards: a tie goes to the LAST arm. Ordered so
+    // that bounds beats Metropolis beats skipped, since "widen the bound" is the
+    // one of the three the user can act on directly. A tie means two causes are
+    // equally live and either sentence is true; what matters is that the pick is
+    // fixed rather than incidental.
+    let worst = [
+        (tally.skipped, 's'),
+        (tally.rejected_metropolis, 'm'),
+        (tally.rejected_out_of_bounds, 'b'),
+    ]
+    .into_iter()
+    .max_by_key(|&(n, _)| n)
+    .map(|(_, tag)| tag)
+    .unwrap_or('m');
+    w.push_str(match worst {
+        'b' => {
+            " Most draws left a declared theta_lower / theta_upper box, so the bound, not the \
+             data, is setting those estimates; widen it if it was a guard rather than a \
+             constraint."
+        }
+        's' => {
+            " Most sweeps could not form the conditional at all (a non-positive-definite Omega \
+             or a non-finite typical value), so the move contributed nothing."
+        }
+        _ => {
+            " Most draws were rejected by the Metropolis correction, which means the Gaussian \
+             conditional is a poor proposal for this typical value — the chain is still valid, \
+             but those thetas mix no better than the random walk."
+        }
+    });
+    w.push_str(
+        " Sampling stays exact either way: every rejection is a valid step, so this reports \
+         lost efficiency, not a wrong posterior.",
+    );
+    Some(w)
 }
 
 /// What samples the parameter with the worst split-R̂, for the
@@ -893,7 +1026,7 @@ pub fn run_bayes(
         vec![vec![0.0; n_eta]; n_subjects]
     };
 
-    let chain_outputs: Vec<Option<(Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64)>> = (0..n_chains)
+    let chain_outputs: Vec<Option<ChainOutput>> = (0..n_chains)
         .into_par_iter()
         .map(|chain| {
             let mut rng =
@@ -906,6 +1039,7 @@ pub fn run_bayes(
                 (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
             let mut eta_record_count = 0u64;
             let mut n_divergent_total = 0u64;
+            let mut conj_tally = ConjugateTally::default();
 
             // Chain state.
             let mut theta = init_params.theta.clone();
@@ -1297,6 +1431,37 @@ pub fn run_bayes(
                     }
                 }
 
+                // Refresh the cached per-subject NLL. Blocks 2/2c drew a new Ω /
+                // Ω_iov, so the cached `nll` still carries the pre-draw η-prior,
+                // κ-prior and log|Ω| terms. Two consumers need it exact:
+                //
+                // - block 2b scores its Metropolis ratio against it (it evaluates
+                //   only the *proposed* state, and keeps `nll` in step itself —
+                //   see `MuDesign::draw`);
+                // - block 3 likewise recomputes only the *proposal* NLL, so a
+                //   stale baseline leaves those terms uncancelled — a constant
+                //   per-sweep offset δ on every θ/σ accept that biases σ and
+                //   non-mu-ref θ.
+                //
+                // (Unconditional when either runs: cheaper to always refresh than
+                // to track which of the earlier blocks fired.)
+                if n_pop > 0 || mu_design.is_some() {
+                    for i in 0..n_subjects {
+                        nll[i] = subject_nll(
+                            model,
+                            &population.subjects[i],
+                            &theta,
+                            &etas[i],
+                            &kappas[i],
+                            &omega_cur,
+                            omega_iov_cur.as_ref(),
+                            &sigma,
+                            &mut scratch,
+                            schedules[i].as_ref(),
+                        );
+                    }
+                }
+
                 // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
                 // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
                 // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N); with
@@ -1310,8 +1475,8 @@ pub fn run_bayes(
                 // Gibbs draw. A draw outside a θ bound is rejected, where the old
                 // move clamped it. This is what makes the chains mix.
                 if let Some(design) = mu_design.as_ref() {
-                    let mut log_target = |th: &[f64], es: &[Vec<f64>]| -> f64 {
-                        -(0..n_subjects)
+                    let mut subject_nlls = |th: &[f64], es: &[Vec<f64>]| -> Vec<f64> {
+                        (0..n_subjects)
                             .map(|i| {
                                 subject_nll(
                                     model,
@@ -1326,9 +1491,9 @@ pub fn run_bayes(
                                     schedules[i].as_ref(),
                                 )
                             })
-                            .sum::<f64>()
+                            .collect()
                     };
-                    design.draw(
+                    let (outcome, _log_alpha) = design.draw(
                         &mut theta,
                         &mut etas,
                         &omega_cur,
@@ -1336,33 +1501,11 @@ pub fn run_bayes(
                         &init_params.theta_upper,
                         population,
                         &mut rng,
-                        &mut log_target,
+                        &mut nll,
+                        &mut subject_nlls,
                     );
-                }
-
-                // Refresh the cached per-subject NLL before the (θ,σ) block uses it
-                // as the Metropolis baseline. Blocks 2/2c/2b drew a new Ω / Ω_iov and
-                // (for mu-ref) re-centered (θ, η), so the cached `nll` still carries
-                // the pre-draw / pre-recenter η-prior, κ-prior, and log|Ω| terms.
-                // Block 3 recomputes only the *proposal* NLL, so a stale baseline
-                // leaves those terms uncancelled — a constant per-sweep offset δ on
-                // every θ/σ accept that biases σ and non-mu-ref θ. Recompute so the
-                // ratio is exact. (Unconditional when block 3 runs: cheaper to always
-                // refresh than to track which of the three blocks fired.)
-                if n_pop > 0 {
-                    for i in 0..n_subjects {
-                        nll[i] = subject_nll(
-                            model,
-                            &population.subjects[i],
-                            &theta,
-                            &etas[i],
-                            &kappas[i],
-                            &omega_cur,
-                            omega_iov_cur.as_ref(),
-                            &sigma,
-                            &mut scratch,
-                            schedules[i].as_ref(),
-                        );
+                    if sweep >= n_warmup {
+                        conj_tally.record(outcome);
                     }
                 }
 
@@ -1655,7 +1798,13 @@ pub fn run_bayes(
                 }
             }
 
-            Some((chain_draws, eta_sum, eta_record_count, n_divergent_total))
+            Some((
+                chain_draws,
+                eta_sum,
+                eta_record_count,
+                n_divergent_total,
+                conj_tally,
+            ))
         })
         .collect();
 
@@ -1670,8 +1819,11 @@ pub fn run_bayes(
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
     let mut eta_record_count = 0u64;
     let mut n_divergent_total = 0u64;
+    let mut conj_tally = ConjugateTally::default();
     for output in chain_outputs {
-        let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent)) = output else {
+        let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent, chain_conj)) =
+            output
+        else {
             return Err("cancelled by user".to_string());
         };
         draws_by_chain.push(chain_draws);
@@ -1680,6 +1832,7 @@ pub fn run_bayes(
         }
         eta_record_count += chain_eta_count;
         n_divergent_total += chain_divergent;
+        conj_tally.merge(chain_conj);
     }
 
     if verbose {
@@ -1923,6 +2076,9 @@ pub fn run_bayes(
              separate the classes more strongly in the initial estimates (#985)."
                 .to_string(),
         );
+    }
+    if let Some(w) = conjugate_accept_warning(conj_tally) {
+        warnings.push(w);
     }
     if partial_mu_ref {
         warnings.push(
@@ -3357,6 +3513,147 @@ mod tests {
             "{w}"
         );
         assert!(!w.contains("To let the conjugate move draw it"), "{w}");
+    }
+
+    /// `record` files each outcome in its own slot, `merge` is additive across
+    /// chains, and `accept_rate` is `moved / total`. Every variant is exercised
+    /// with a distinct count, so a mis-wired `match` arm swaps two numbers that
+    /// cannot be confused.
+    #[test]
+    fn conjugate_tally_counts_each_outcome_separately() {
+        let mut a = ConjugateTally::default();
+        assert_eq!(a.total(), 0);
+        assert_eq!(a.accept_rate(), None, "a move that never ran has no rate");
+        for _ in 0..6 {
+            a.record(DrawOutcome::Moved);
+        }
+        a.record(DrawOutcome::RejectedOutOfBounds);
+        for _ in 0..2 {
+            a.record(DrawOutcome::RejectedMetropolis);
+        }
+        for _ in 0..3 {
+            a.record(DrawOutcome::Skipped);
+        }
+        assert_eq!(
+            a,
+            ConjugateTally {
+                moved: 6,
+                rejected_out_of_bounds: 1,
+                rejected_metropolis: 2,
+                skipped: 3,
+            }
+        );
+        assert_eq!(a.total(), 12);
+        assert_eq!(a.accept_rate(), Some(0.5));
+
+        let mut b = ConjugateTally::default();
+        b.record(DrawOutcome::Moved);
+        b.merge(a);
+        assert_eq!(b.total(), 13);
+        assert_eq!(b.moved, 7);
+        assert_eq!(b.rejected_out_of_bounds, 1);
+        assert_eq!(b.rejected_metropolis, 2);
+        assert_eq!(b.skipped, 3);
+    }
+
+    /// Both sides of the two gates that decide whether the conjugate move is
+    /// reported at all: it never ran, and it ran but accepted often enough.
+    /// Split across two tests, a gate stuck on one branch still passes half.
+    #[test]
+    fn conjugate_accept_warning_is_silent_when_there_is_nothing_to_report() {
+        assert_eq!(
+            conjugate_accept_warning(ConjugateTally::default()),
+            None,
+            "no design, no draws, no warning"
+        );
+        // Exactly at the threshold is "often enough": the constant is the point
+        // below which the move has stopped doing anything.
+        let at = ConjugateTally {
+            moved: 50,
+            rejected_metropolis: 50,
+            ..Default::default()
+        };
+        assert_eq!(at.accept_rate(), Some(CONJUGATE_ACCEPT_REPORT_THRESHOLD));
+        assert_eq!(conjugate_accept_warning(at), None, "{at:?}");
+        // One draw either way straddles it.
+        let below = ConjugateTally {
+            moved: 49,
+            rejected_metropolis: 51,
+            ..Default::default()
+        };
+        assert!(conjugate_accept_warning(below).is_some(), "{below:?}");
+    }
+
+    /// Every sentence of the report, and the branch that selects it. Each of
+    /// the three advice sentences is asserted verbatim and against the other
+    /// two, so deleting any one of them fails here.
+    #[test]
+    fn conjugate_accept_warning_names_the_dominant_rejection() {
+        const EXACT: &str = " Sampling stays exact either way: every rejection is a valid step, \
+                              so this reports lost efficiency, not a wrong posterior.";
+        const BOUNDS: &str = " Most draws left a declared theta_lower / theta_upper box, so the \
+                               bound, not the data, is setting those estimates; widen it if it \
+                               was a guard rather than a constraint.";
+        const METROPOLIS: &str =
+            " Most draws were rejected by the Metropolis correction, which means the Gaussian \
+             conditional is a poor proposal for this typical value — the chain is still valid, \
+             but those thetas mix no better than the random walk.";
+        const SKIPPED: &str =
+            " Most sweeps could not form the conditional at all (a non-positive-definite Omega \
+             or a non-finite typical value), so the move contributed nothing.";
+
+        let w = conjugate_accept_warning(ConjugateTally {
+            moved: 10,
+            rejected_out_of_bounds: 90,
+            ..Default::default()
+        })
+        .expect("below the threshold");
+        assert!(
+            w.starts_with(
+                "Bayes: the conjugate mu-reference theta move accepted 10 of 100 draws (10%)."
+            ),
+            "{w}"
+        );
+        assert!(w.contains(BOUNDS), "{w}");
+        assert!(!w.contains(METROPOLIS) && !w.contains(SKIPPED), "{w}");
+        assert!(w.ends_with(EXACT), "{w}");
+
+        let w = conjugate_accept_warning(ConjugateTally {
+            moved: 1,
+            rejected_out_of_bounds: 2,
+            rejected_metropolis: 7,
+            ..Default::default()
+        })
+        .expect("below the threshold");
+        assert!(w.contains(METROPOLIS), "{w}");
+        assert!(!w.contains(BOUNDS) && !w.contains(SKIPPED), "{w}");
+        assert!(w.ends_with(EXACT), "{w}");
+
+        let w = conjugate_accept_warning(ConjugateTally {
+            moved: 1,
+            rejected_metropolis: 2,
+            skipped: 7,
+            ..Default::default()
+        })
+        .expect("below the threshold");
+        assert!(w.contains(SKIPPED), "{w}");
+        assert!(!w.contains(BOUNDS) && !w.contains(METROPOLIS), "{w}");
+        assert!(w.ends_with(EXACT), "{w}");
+
+        // A tie is a reachable input, so the pick is pinned rather than left to
+        // whichever arm the iterator happened to visit last.
+        let w = conjugate_accept_warning(ConjugateTally {
+            moved: 1,
+            rejected_out_of_bounds: 5,
+            rejected_metropolis: 5,
+            ..Default::default()
+        })
+        .expect("below the threshold");
+        assert!(
+            w.contains(BOUNDS),
+            "a bounds/Metropolis tie reports bounds: {w}"
+        );
+        assert!(!w.contains(METROPOLIS), "{w}");
     }
 
     #[test]

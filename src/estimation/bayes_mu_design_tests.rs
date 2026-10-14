@@ -42,9 +42,9 @@ fn nll_target<'a>(
     model: &'a CompiledModel,
     pop: &'a Population,
     omega: &'a OmegaMatrix,
-) -> impl FnMut(&[f64], &[Vec<f64>]) -> f64 + 'a {
+) -> impl FnMut(&[f64], &[Vec<f64>]) -> Vec<f64> + 'a {
     move |theta: &[f64], etas: &[Vec<f64>]| {
-        -pop.subjects
+        pop.subjects
             .iter()
             .zip(etas)
             .map(|(s, e)| {
@@ -57,8 +57,20 @@ fn nll_target<'a>(
                     &model.default_params.sigma.values,
                 )
             })
-            .sum::<f64>()
+            .collect()
     }
+}
+
+/// The per-subject NLL baseline [`MuDesign::draw`] takes in, at the state the
+/// draw starts from.
+fn nll_baseline(
+    model: &CompiledModel,
+    pop: &Population,
+    omega: &OmegaMatrix,
+    theta: &[f64],
+    etas: &[Vec<f64>],
+) -> Vec<f64> {
+    nll_target(model, pop, omega)(theta, etas)
 }
 
 /// A dense, positive-definite Ω, so the cross terms of Ω⁻¹ between member
@@ -258,6 +270,7 @@ fn a_moved_draw_holds_every_individual_parameter() {
     let upper = vec![f64::INFINITY; theta.len()];
     let mut rng = StdRng::seed_from_u64(7);
     let theta0 = theta.clone();
+    let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
     let out = d
         .draw(
             &mut theta,
@@ -267,6 +280,7 @@ fn a_moved_draw_holds_every_individual_parameter() {
             &upper,
             &pop,
             &mut rng,
+            &mut nll,
             &mut nll_target(&model, &pop, &omega),
         )
         .0;
@@ -284,6 +298,70 @@ fn a_moved_draw_holds_every_individual_parameter() {
     // Measured (Linux): exactly 0. A missed or partial re-centring (only the
     // first group member, say) moves φ by the drawn shift, O(0.01–0.1).
     assert!(worst < 1e-12, "φ moved by {worst:e}");
+
+    // The move owns the caller's NLL cache: `draw` evaluates the proposal and,
+    // on a move, hands that vector back instead of leaving the caller to
+    // recompute it. Bit-equality, not a tolerance — it is the same function at
+    // the same state, and anything else is a stale baseline silently biasing
+    // the (θ, σ) block's Metropolis ratio for the rest of the sweep.
+    assert_eq!(
+        nll,
+        nll_baseline(&model, &pop, &omega, &theta, &etas),
+        "the returned NLL baseline is the proposed state's"
+    );
+}
+
+/// `draw` scores its Metropolis ratio against the per-subject NLL it is
+/// **handed**, not one it recomputes: perturbing the baseline by δ must move
+/// `log α` by exactly δ.
+///
+/// The regression this exists to catch is the caller and the move disagreeing
+/// about which state the cached baseline describes — a refresh moved to the
+/// wrong side of the block, or a gate that skips it. A `draw` that quietly
+/// recomputed the current state would be immune to the perturbation and is
+/// what this kills; it is also the only unit-level hold on the contract, since
+/// the placement of that refresh inside `run_bayes` is an argument, not an
+/// assertion.
+#[test]
+fn the_draw_scores_against_the_baseline_it_is_given() {
+    let (model, pop) = cov_model();
+    let params = &model.default_params;
+    let d = MuDesign::build(&model, &pop, params, true).expect("design");
+    let omega = dense_omega(model.n_eta, model.eta_names.clone());
+    let etas0 = fixture_etas(pop.subjects.len(), model.n_eta);
+    let lo = vec![f64::NEG_INFINITY; params.theta.len()];
+    let hi = vec![f64::INFINITY; params.theta.len()];
+    const DELTA: f64 = 0.125; // exact in binary, so the comparison is exact.
+
+    let run = |bump: f64| {
+        let mut theta = params.theta.clone();
+        let mut etas = etas0.clone();
+        let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
+        nll[0] += bump;
+        d.draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &lo,
+            &hi,
+            &pop,
+            &mut StdRng::seed_from_u64(21),
+            &mut nll,
+            &mut nll_target(&model, &pop, &omega),
+        )
+        .1
+    };
+
+    let base = run(0.0);
+    let bumped = run(DELTA);
+    assert!(base.is_finite() && bumped.is_finite(), "{base} / {bumped}");
+    // log α = Σ nll_given − Σ nll(proposal) + log q-ratio, so +δ on the given
+    // baseline is +δ on log α. Measured: exactly DELTA.
+    assert!(
+        (bumped - base - DELTA).abs() < 1e-12,
+        "log α moved by {} for a baseline bump of {DELTA}",
+        bumped - base
+    );
 }
 
 /// A draw outside a bound is rejected and changes nothing — and the same
@@ -305,6 +383,8 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
 
     let mut theta = params.theta.clone();
     let mut etas = etas0.clone();
+    let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
+    let nll0 = nll.clone();
     let out = d
         .draw(
             &mut theta,
@@ -314,15 +394,21 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
             &tight_upper,
             &pop,
             &mut StdRng::seed_from_u64(3),
+            &mut nll,
             &mut nll_target(&model, &pop, &omega),
         )
         .0;
     assert_eq!(out, DrawOutcome::RejectedOutOfBounds);
     assert_eq!(theta, params.theta, "θ unchanged on reject");
     assert_eq!(etas, etas0, "η unchanged on reject");
+    assert_eq!(
+        nll, nll0,
+        "the caller's NLL baseline is unchanged on reject"
+    );
 
     let mut theta = params.theta.clone();
     let mut etas = etas0.clone();
+    let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
     let out = d
         .draw(
             &mut theta,
@@ -332,6 +418,7 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
             &open_upper,
             &pop,
             &mut StdRng::seed_from_u64(3),
+            &mut nll,
             &mut nll_target(&model, &pop, &omega),
         )
         .0;
@@ -480,6 +567,7 @@ fn reference_valued_covariates_send_their_exponents_back_to_the_random_walk() {
     let open = vec![f64::INFINITY; theta.len()];
     let neg = vec![f64::NEG_INFINITY; theta.len()];
     let before = theta.clone();
+    let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
     let out = d
         .draw(
             &mut theta,
@@ -489,6 +577,7 @@ fn reference_valued_covariates_send_their_exponents_back_to_the_random_walk() {
             &open,
             &pop,
             &mut StdRng::seed_from_u64(11),
+            &mut nll,
             &mut nll_target(&model, &pop, &omega),
         )
         .0;
@@ -679,6 +768,7 @@ fn the_conjugate_move_is_corrected_on_the_real_likelihood() {
         for seed in 0..20u64 {
             let mut theta = theta0.clone();
             let mut etas = etas0.clone();
+            let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
             let (out, la) = d.draw(
                 &mut theta,
                 &mut etas,
@@ -687,6 +777,7 @@ fn the_conjugate_move_is_corrected_on_the_real_likelihood() {
                 &open_hi,
                 &pop,
                 &mut StdRng::seed_from_u64(seed),
+                &mut nll,
                 &mut nll_target(&model, &pop, &omega),
             );
             assert!(la.is_finite(), "seed {seed}: log α {la}");
