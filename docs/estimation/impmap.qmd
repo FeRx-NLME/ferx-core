@@ -192,7 +192,8 @@ other one, and the M-step then fits θ around the wrong mode. Typical causes are
 flip-flop absorption and a weakly identified KA or V.
 
 `impmap_map_recheck = N` (default `10`) handles this: every N iterations each
-subject is also solved from a cold start (η = 0), and the better of the two
+subject is also solved from a cold start (η = 0; for FREM the covariate ETAs
+start at their data-implied values), and the better of the two
 modes is kept. The final EBE pass, which feeds the reported Laplace OFV, the
 sdtab and the covariance step, always rechecks. Set `0` to switch it off.
 
@@ -211,7 +212,11 @@ objective units worse than its global one:
   a sparse N = 300 design, the recheck left the result unchanged at 0–12% extra
   wall time.
 - **Compared with `impmap_mceta`.** `impmap_mceta` remains the heavier tool for
-  posteriors with more than two modes, where η = 0 is not in the right basin.
+  posteriors with more than two modes, where the cold start is not in the right
+  basin.
+- **Mixture models** (`[mixture]`) do not use the recheck yet: their per-class
+  MAP solves keep the single warm start, and the final marginal pass is a cold
+  solve.
 
 ## Quasi-random draws (`impmap_sobol`)
 

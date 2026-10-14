@@ -138,7 +138,8 @@ Phase 0 binary to the printed digit (`bitid.py runs runs_bitid`; 9 fits).
 
 ## Phase 1a: cold MAP recheck (`impmap_map_recheck`)
 
-The Phase 1a binary re-solves each subject's MAP from η = 0 every N iterations,
+The Phase 1a binary re-solves each subject's MAP from a cold start (η = 0; FREM covariate ETAs
+at their data-implied values) every N iterations,
 and always for the final EBEs, keeping the better mode. Results on
 `two_cpt_oral_cov` (K = 300, 10 seeds; run `run_phase1a.sh`):
 

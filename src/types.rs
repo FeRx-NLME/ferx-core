@@ -8557,9 +8557,10 @@ pub struct FitOptions {
     /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
     pub impmap_mceta: usize,
     /// Every this many IMPMAP iterations, also solve each subject's MAP from a
-    /// cold start (η = 0) and keep it when its NLL beats the warm-started mode;
-    /// the final EBE pass always rechecks. Rescues a subject whose warm start
-    /// is stuck in a local mode (#1965). `0` disables it.
+    /// cold start (η = 0; FREM covariate ETAs at their data-implied values) and
+    /// keep it when its NLL beats the warm-started mode; the final EBE pass
+    /// always rechecks. Rescues a subject whose warm start is stuck in a local
+    /// mode (#1965). `0` disables it. Not applied to `[mixture]` models yet.
     pub impmap_map_recheck: usize,
     /// Use Sobol quasi-random sequences for IMPMAP's IS draws instead of
     /// pseudo-random. Applies to every proposal form — MVN, Student-t, and the

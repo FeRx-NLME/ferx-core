@@ -4432,6 +4432,7 @@ fn test_impmap_options_parse_and_validate() {
         "impmap_seed = 77".to_string(),
         "impmap_low_ess_threshold = 0.2".to_string(),
         "impmap_mceta = 3".to_string(),
+        "impmap_map_recheck = 4".to_string(),
         "covariance = false".to_string(),
     ])
     .expect("parse must succeed");
@@ -4443,6 +4444,9 @@ fn test_impmap_options_parse_and_validate() {
     assert_eq!(opts.impmap_seed, Some(77));
     assert_eq!(opts.impmap_low_ess_threshold, 0.2);
     assert_eq!(opts.impmap_mceta, 3);
+    // #1965: the cold MAP recheck parses onto its own field; its default is on.
+    assert_eq!(opts.impmap_map_recheck, 4);
+    assert_eq!(FitOptions::default().impmap_map_recheck, 10);
     assert!(
         !opts.impmap_sobol && !opts.imp_sobol,
         "Sobol is opt-in for both methods"

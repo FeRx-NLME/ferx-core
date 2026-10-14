@@ -347,7 +347,8 @@ fn find_ebe_multistart(
     // Cold recheck (#1965): a warm start inherits last iteration's basin, so a
     // subject whose MAP once landed in a local mode stays there — the
     // mode-centred proposal never samples the other one and the M-step fits
-    // around the wrong mode. A cold solve from η = 0 is the cheapest escape;
+    // around the wrong mode. A cold solve (`find_ebe` with no warm start: η = 0,
+    // FREM covariate ETAs at their data-implied values) is the cheapest escape;
     // the strict `<` keeps the warm mode on a tie.
     if cold_recheck && warm.is_some() {
         let cold = find_ebe(
@@ -398,7 +399,8 @@ fn find_ebe_multistart(
 /// cold-start) and then `mceta` additional random starting points drawn from
 /// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
 /// degrades to a single warm-start — identical to the previous behaviour.
-/// `cold_recheck` adds one more candidate, the cold start from η = 0
+/// `cold_recheck` adds one more candidate, the canonical cold start (η = 0;
+/// FREM covariate ETAs at their data-implied values)
 /// (`impmap_map_recheck`, #1965).
 ///
 /// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
