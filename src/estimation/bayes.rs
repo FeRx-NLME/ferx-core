@@ -2442,8 +2442,11 @@ mod tests {
             .expect("warfarin_iov data loads");
 
         let mut opts = FitOptions::default();
-        opts.bayes_warmup = 600;
-        opts.bayes_iters = 600;
+        // 300 + 300 (was 600 + 600): the test pins the IOV wiring, not mixing,
+        // and #1626's per-subject η kernel roughly doubled the per-sweep cost.
+        // Halving the sweeps keeps this test's per-PR time where it was.
+        opts.bayes_warmup = 300;
+        opts.bayes_iters = 300;
         opts.bayes_chains = 2;
         opts.bayes_seed = Some(1);
         opts.saem_n_mh_steps = 6;
