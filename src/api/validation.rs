@@ -3667,6 +3667,195 @@ pub(crate) fn check_survival_tv_covariates(
     None
 }
 
+/// Reject a model whose **ODE-accumulated hazard integrates a `TIME`-dependent
+/// disposition** — currently silently frozen at `TIME = 0` (#1853), the `TIME` axis of
+/// the freeze [`check_survival_tv_covariates`] refuses on the covariate axis (#741).
+///
+/// `survival::ode_cumhaz_hazard` (the TTE objective's dedicated engine and
+/// `predict_survival`) and `survival::draw_ode_tte_latent` (`simulate()`'s event times)
+/// take one `$PK` snapshot, `(model.pk_param_fn)(…, 0.0)`, and integrate the whole
+/// timeline under it. Since #1575 every *dose-record* quantity is read at its own dose
+/// record instead, so what remains frozen is the disposition the `[odes]` RHS integrates
+/// (CL, V and the like), the parameters the hazard expression itself reads, and `init()`.
+///
+/// Meanwhile a subject of such a model declines the #570 one-solve share
+/// (`model_uses_time_anywhere`) and takes its *Gaussian* predictions from the per-record
+/// event-driven walk, which evaluates `$PK` at every record. So the two halves of one
+/// objective can read two different concentration curves. Measured on a 1-cpt IV model
+/// with `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0·exp(BETA·C)`
+/// (`tests/survival_time_dependent_pk.rs`): at `t = 8` the Gaussian pass predicts
+/// `central = 33.790` — the per-record convention, to 10 significant figures against a
+/// closed form computed outside both engines — while the hazard pass reads `44.933`; at
+/// `t = 20`, `3.065` against `13.534`. `H(20)` is 10.1 % high, and the exact-event
+/// `−log L` is off by 0.046 per subject. The frozen hazard is also *bit-identical* across
+/// `KT = 0` and `KT = 0.05`: the `TIME` coefficient has no influence at all on the
+/// survival term it was written for.
+///
+/// Until a per-record disposition reaches the hazard pass (#1920), refuse rather than
+/// silently mis-fit. **The granularity is per parameter and per endpoint** — not per
+/// block, and not per model — so the refusal fires only where freezing *that* parameter
+/// can reach *that* accumulator, which rules out two shapes a "does the RHS mention it"
+/// test would have refused —
+///
+/// * a quantity the hazard pass already reads at each dose record (`MTT`, `ALAG1`,
+///   `F`, `D{n}`/`R{n}`, …; #1575), and
+/// * a parameter the accumulator does not depend on — `CL` on a model whose
+///   `hazard = H0` integrates a constant, or an `init()` of a state the hazard never
+///   sees (round-1 review of PR #1924).
+///
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] is where that
+/// lives; `tests/one_snapshot_dose_reads_survival.rs` is the #1575 fixture that must stay
+/// fittable.
+///
+/// **Both halves are structural, not value-based**, which is where the remaining
+/// over-refusals live: a parameter whose `TIME` term cancels (`CL = TVCL + 0.0 * TIME`)
+/// reads `TIME` as far as the mask is concerned, and the slice follows a read whether or
+/// not the value it carries matters. Deciding either would mean constant-folding the
+/// program, and the direction of the error is a loud refusal whose remedy — delete the
+/// term — is right for the model anyway.
+///
+/// **One more documented over-refusal (#1931):** both analyses are flow-insensitive
+/// with respect to *kills*, so a `TIME`-dependent definition that a later unconditional
+/// assignment discards is still followed, and a model carrying such a dead store is
+/// refused although its effective `$PK` is time-free. The direction is the safe one — a
+/// loud error whose remedy, deleting the dead line, is right for the model anyway — and a
+/// kill-aware pass can produce a false *accept* if it mistakes a conditional write for a
+/// kill, which is the silent class this check exists to stop. Pinned, with its live twin,
+/// by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
+///
+/// Returns `None` for every model with no `OdeAccumulated` hazard, and for every model
+/// none of whose `TIME`-dependent individual parameters can reach one. `fit()` and every
+/// predict / simulate entry point surface the message as an `Err`, as they do for #741.
+///
+/// **Not wired into `predict_categorical`**, although #741's check is. The two have
+/// different mechanisms: #741 refuses there because the *logit predictor itself* is
+/// evaluated at a frozen snapshot, while the freeze here is read only by
+/// `survival::ode_cumhaz_hazard` and `survival::draw_ode_tte_latent`, which that entry
+/// point never calls. A call there would refuse a categorical prediction whose own answer
+/// is unaffected, and no test could kill it.
+///
+/// **Not a complete guard on the low-level public surface, by the same boundary #741
+/// draws.** `stats::likelihood::individual_nll*` and `survival::simulate_tte` are `pub`
+/// and reach the frozen snapshot directly, and neither this check nor
+/// [`check_survival_tv_covariates`] runs there: both are validation at the documented
+/// entry points, and `individual_nll` is called per subject per objective evaluation, so a
+/// model-level walk inside it would run millions of times to answer a question that
+/// cannot change during a fit. Widening the guard to that surface is one decision
+/// covering both checks (#1926), not something to do for one of them.
+///
+/// **One gate, not two.** A `crate::parser::model_parser::compiled_model_uses_time_builtin`
+/// fast exit in front of the loop would be free and would read as the load-bearing
+/// narrow-vs-wide choice (asking `pk::model_uses_time_anywhere` instead must not refuse a
+/// `TIME`-reading `[odes]` RHS, which the integrator clock honours, #610). Measured: it is
+/// neither. Swapping the narrow flag for the wide one left all seven unit tests green,
+/// because `params_reading_time` already answers all-`false` for such a model — two
+/// predicates rejecting the same inputs, so the test pinning either could not fail. The
+/// mask is the gate; `.min()?` on the endpoint list is the cheap discriminator in front
+/// of it.
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    // Every `OdeAccumulated` endpoint with its own accumulator slot, in CMT order: the
+    // message must name the endpoint whose hazard actually depends on the parameter, not
+    // merely the lowest-numbered one (round-1 review of PR #1924). Deterministic in both
+    // loops — CMT order outside, declaration order inside. No such endpoint is the cheap
+    // exit for every other model.
+    let mut ode_hazards: Vec<(usize, usize)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, e)| match e {
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            } => Some((*cmt, *chz_state)),
+            _ => None,
+        })
+        .collect();
+    ode_hazards.sort_unstable();
+    let first_cmt = ode_hazards.first().map(|&(cmt, _)| cmt)?;
+    // **Fail closed from here.** Both analyses below need metadata the parser always
+    // attaches, and "this model cannot be analysed" must not read as "nothing is frozen"
+    // (round-3 review of PR #1924): `CompiledModel::indiv_param_partials` is a `pub`
+    // field and `IndivParamPartials::empty()` is public API, and `OdeSpec`'s fields are
+    // `pub` too, so a hand-assembled or hand-edited model can present a working
+    // `pk_param_fn` and `[odes]` RHS with the metadata stripped — and would have kept the
+    // silent freeze this check exists to stop. A `.ferx` file cannot reach either arm.
+    //
+    // What this cannot defend against is metadata that is *present but stale* — a
+    // `pk_param_fn`, `OdeSpec::rhs` or `init_fn` replaced while the parser's snapshot of
+    // the same program is kept. That is the crate's standing invariant, not this check's:
+    // the snapshots exist because `sens/` evaluates them over `Dual2` as the exact
+    // derivative of those very closures (the `*_g_dual_matches_fd` parity tests are the
+    // statement of it), so a model whose snapshot and closure disagree has a wrong
+    // gradient before it has a wrong refusal. No check can compare a closure against a
+    // program; the parser builds them together, which is the only reason either is
+    // trustworthy.
+    let unanalysable = |what: &str, how: &str| -> Option<String> {
+        Some(format!(
+            "[event_model] on CMT={first_cmt}: this model carries an ODE-accumulated \
+             (joint PK-TTE) hazard, whose pass integrates the individual parameters \
+             frozen at their TIME=0 values, but it has no {what}, so whether that freeze \
+             applies cannot be determined (#1853). Every model parsed from a `.ferx` file \
+             carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
+             through `parse_model_string` / `parse_model_file`{how}."
+        ))
+    };
+    let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
+        return unanalysable(
+            "compiled `[odes]` program (`OdeSpec::rhs_program`)",
+            ", or drop the ODE-accumulated hazard",
+        );
+    };
+    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+        return unanalysable(
+            "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
+            " rather than replacing that field with `IndivParamPartials::empty()`",
+        );
+    };
+    let reads_time = program.params_reading_time();
+    // No `TIME`-dependent parameter ⇒ nothing is frozen, and no slice has to be built.
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
+    for (cmt, chz_state) in ode_hazards {
+        // What this accumulator's value depends on. Built per endpoint, because two
+        // hazards on one model can read different states.
+        let slice = rhs.chz_dependency_slice(chz_state);
+        for (i, name) in model.indiv_param_names.iter().enumerate() {
+            if !reads_time.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // `indiv_param_names` can be longer than the `[odes]` block's own parameter
+            // list (a `pk(... = TIME)` desugaring's synthetic, a `[scaling]` Form C
+            // readout synthetic — both appended after `build_ode_spec` has run). The
+            // compiled block cannot read such a name, so it is not frozen by this
+            // snapshot; skipping it is the answer, not a bail-out.
+            if !rhs.has_indiv_param(i) {
+                continue;
+            }
+            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
+            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
+            let site = match (in_rhs, in_init) {
+                (true, true) => "the [odes] RHS and an init(...) seed read",
+                (true, false) => "the [odes] RHS reads",
+                (false, true) => "an [odes] init(...) seed reads",
+                // The parameter cannot affect this accumulator — a dose-record quantity
+                // (#1575), or a part of the system the hazard does not depend on.
+                (false, false) => continue,
+            };
+            return Some(format!(
+                "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                 integrated with the individual parameters frozen at their TIME=0 values, but \
+                 `{name}` reads the `TIME` built-in and {site} it. A TIME-dependent \
+                 disposition on a drug-driven hazard is not yet supported (#1853): the Gaussian \
+                 predictions evaluate `[individual_parameters]` at every record while the hazard \
+                 pass keeps the TIME=0 value. Hold `{name}` constant in TIME for now."
+            ));
+        }
+    }
+    None
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state

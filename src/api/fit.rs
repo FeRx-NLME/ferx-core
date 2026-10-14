@@ -770,6 +770,14 @@ fn fit_unstamped(
     if let Some(e) = check_survival_tv_covariates(model, population) {
         return Err(e);
     }
+    // The `TIME` axis of the same freeze: an ODE-accumulated hazard integrates the
+    // disposition at its TIME=0 snapshot while the Gaussian half reads `$PK` at every
+    // record, so a TIME-dependent CL/V/init would put the two halves of the objective on
+    // different concentration curves (#1853).
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_survival_time_dependent_pk(model) {
+        return Err(e);
+    }
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
