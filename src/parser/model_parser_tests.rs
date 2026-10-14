@@ -16761,6 +16761,258 @@ fn bytecode_g_f64_bit_identical() {
     );
 }
 
+// ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
+//
+// For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
+// applies a pushed constant / covariate / `TIME` / variable straight to the stack
+// top, and the compiler emits a literal-left `c ⊕ E` with the literal on top
+// (`Op::RSub` for `c - E`). The oracle below is the by-value evaluation those
+// paths replaced, so each fused path is checked against the semantics it must
+// keep — including `Op::Div`'s `|b| < 1e-30 → 0` guard on both the stack and the
+// fused side.
+
+type Dm = crate::sens::dual_mixed::DualMixed<2, 3>;
+
+/// By-value reference: every operand a full `DualMixed`, constants lifted to a
+/// zero jet, the `Op::Div` guard applied — what `eval_bytecode_g` computed before
+/// operand fusion.
+fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
+    match e {
+        Expression::Literal(v) => Dm::constant(*v),
+        Expression::VariableIdx(i) => vars[*i],
+        Expression::CovariateIdx(i) => Dm::constant(covs[*i]),
+        Expression::Time => Dm::constant(time),
+        Expression::BinOp(l, op, r) => {
+            let (a, b) = (
+                dm_reference(l, vars, covs, time),
+                dm_reference(r, vars, covs, time),
+            );
+            match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div if b.value.abs() < 1e-30 => Dm::constant(0.0),
+                BinOp::Div => a / b,
+                BinOp::Mod => unreachable!("not used by these fixtures"),
+            }
+        }
+        Expression::UnaryFn(name, arg) if name == "exp" => {
+            dm_reference(arg, vars, covs, time).exp()
+        }
+        Expression::Conditional(c, t, f) => {
+            let Condition::Compare(l, CmpOp::Gt, r) = c.as_ref() else {
+                unreachable!("only `>` is used by these fixtures")
+            };
+            if dm_reference(l, vars, covs, time).value > dm_reference(r, vars, covs, time).value {
+                dm_reference(t, vars, covs, time)
+            } else {
+                dm_reference(f, vars, covs, time)
+            }
+        }
+        other => unreachable!("not used by these fixtures: {other:?}"),
+    }
+}
+
+/// Live jets on every slot: x, y on second-order axes 0/1, z on first-order axis
+/// 2, and slot 3 an exact zero that still carries a jet (the divide guard's input).
+fn dm_vars() -> Vec<Dm> {
+    let x = Dm::var(1.3, 0);
+    let y = Dm::var(0.7, 1);
+    let z = Dm::var(2.1, 2);
+    vec![
+        x * y + z,
+        y.exp() * x,
+        z * x - y,
+        z * (y - Dm::constant(0.7)),
+    ]
+}
+
+fn assert_dm_matches_reference(e: &Expression) {
+    let vars = dm_vars();
+    let covs = [0.45];
+    let time = 3.25;
+    let want = dm_reference(e, &vars, &covs, time);
+    let bc = compile_bytecode(e);
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let mut stack: Vec<Dm> = Vec::new();
+    let got = {
+        let _t = ModelTimeGuard::enter(time);
+        eval_bytecode_g::<Dm>(&bc, &[], &[], &covs, &vars, &nn, &mut stack)
+    };
+    // `==` rather than bits: a scalar operand skips terms that are exact zeros, so
+    // only the sign of a zero entry may differ (`+0.0 == −0.0`).
+    assert!(
+        got.value == want.value,
+        "value {e:?}: {} vs {}",
+        got.value,
+        want.value
+    );
+    for i in 0..3 {
+        assert!(
+            got.grad[i] == want.grad[i],
+            "grad[{i}] {e:?}: {} vs {}",
+            got.grad[i],
+            want.grad[i]
+        );
+    }
+    for r in 0..2 {
+        for c in 0..3 {
+            assert!(
+                got.hess[r][c] == want.hess[r][c],
+                "hess[{r}][{c}] {e:?}: {} vs {}",
+                got.hess[r][c],
+                want.hess[r][c]
+            );
+        }
+    }
+}
+
+#[test]
+fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
+    let x = || varidx(0);
+    let y = || varidx(1);
+    let z = || varidx(2);
+    let zero = || varidx(3);
+    let cov = || Expression::CovariateIdx(0);
+    let exprs = [
+        // Constant right operand, every arithmetic op (fused scalar path), and the
+        // divide guard on a zero literal.
+        binop(BinOp::Add, x(), lit(2.0)),
+        binop(BinOp::Sub, x(), lit(2.0)),
+        binop(BinOp::Mul, x(), lit(-2.5)),
+        binop(BinOp::Div, x(), lit(4.0)),
+        binop(BinOp::Div, x(), lit(0.0)),
+        // Constant left operand: swapped `+`/`*`, `RSub`, unary minus; `c / E`
+        // keeps its order and takes the stack path.
+        binop(BinOp::Add, lit(2.0), x()),
+        binop(BinOp::Mul, lit(-2.5), x()),
+        binop(BinOp::Sub, lit(2.0), x()),
+        binop(BinOp::Sub, lit(0.0), x()),
+        binop(BinOp::Div, lit(2.0), x()),
+        // Covariate and `TIME` right operands (fused scalar path).
+        binop(BinOp::Mul, x(), cov()),
+        binop(BinOp::Sub, x(), Expression::Time),
+        binop(BinOp::Div, x(), cov()),
+        // Variable right operand (fused by-reference path), incl. the guard on a
+        // variable that is exactly zero.
+        binop(BinOp::Add, x(), y()),
+        binop(BinOp::Sub, x(), y()),
+        binop(BinOp::Mul, x(), z()),
+        binop(BinOp::Div, x(), y()),
+        binop(BinOp::Div, x(), zero()),
+        // Both operands computed (stack path), incl. the guard on a computed zero.
+        binop(
+            BinOp::Mul,
+            binop(BinOp::Add, x(), y()),
+            binop(BinOp::Sub, y(), z()),
+        ),
+        binop(BinOp::Div, unary("exp", x()), binop(BinOp::Sub, y(), y())),
+        binop(BinOp::Div, unary("exp", x()), binop(BinOp::Add, y(), z())),
+        // The busulfan `FTIME` shape, `1 + DROP·exp(−SHAPE·t)`, and an ODE-RHS term.
+        binop(
+            BinOp::Add,
+            lit(1.0),
+            binop(
+                BinOp::Mul,
+                x(),
+                unary(
+                    "exp",
+                    binop(
+                        BinOp::Mul,
+                        binop(BinOp::Sub, lit(0.0), y()),
+                        Expression::Time,
+                    ),
+                ),
+            ),
+        ),
+        binop(
+            BinOp::Add,
+            binop(
+                BinOp::Mul,
+                binop(BinOp::Sub, lit(0.0), binop(BinOp::Div, x(), y())),
+                z(),
+            ),
+            binop(BinOp::Mul, binop(BinOp::Div, y(), z()), x()),
+        ),
+        // Fusion inside both arms of a conditional (jump targets).
+        cond(
+            cmp(x(), CmpOp::Gt, lit(1.0)),
+            binop(BinOp::Sub, lit(2.0), y()),
+            binop(BinOp::Mul, y(), lit(3.0)),
+        ),
+        cond(
+            cmp(x(), CmpOp::Gt, lit(100.0)),
+            binop(BinOp::Sub, lit(2.0), y()),
+            binop(BinOp::Mul, y(), lit(3.0)),
+        ),
+    ];
+    for e in &exprs {
+        assert_dm_matches_reference(e);
+    }
+}
+
+/// The compiler puts a literal-left operand on top of the stack, which is what
+/// lets `eval_bytecode_g` fuse it. Without the swap every `c + E`, `c * E` and
+/// unary minus would still be correct but would silently fall back to building a
+/// constant jet — so pin the emitted order, for both a swapped and an unswapped
+/// shape.
+#[test]
+fn literal_left_operand_compiles_to_the_top_of_the_stack() {
+    let ops = |e: &Expression| format!("{:?}", compile_bytecode(e).ops);
+    assert_eq!(
+        ops(&binop(BinOp::Sub, lit(0.0), varidx(0))),
+        "[PushVar(0), PushConst(0), RSub]"
+    );
+    assert_eq!(
+        ops(&binop(BinOp::Add, lit(2.0), varidx(0))),
+        "[PushVar(0), PushConst(0), Add]"
+    );
+    assert_eq!(
+        ops(&binop(BinOp::Mul, lit(2.0), varidx(0))),
+        "[PushVar(0), PushConst(0), Mul]"
+    );
+    // Not swapped: `/` is not commutative, and a literal on both sides has nothing
+    // to gain.
+    assert_eq!(
+        ops(&binop(BinOp::Div, lit(2.0), varidx(0))),
+        "[PushConst(0), PushVar(0), Div]"
+    );
+    assert_eq!(
+        ops(&binop(BinOp::Sub, lit(2.0), lit(3.0))),
+        "[PushConst(0), PushConst(1), Sub]"
+    );
+}
+
+/// The swap and `RSub` must leave every `f64` result bit-identical, on both the
+/// scalar VM (against the AST evaluator) and the generic one.
+#[test]
+fn literal_left_operand_order_keeps_f64_bit_identical() {
+    let vars = [1.7_f64, -0.0, 0.0, 3.0e-31];
+    let exprs = [
+        binop(BinOp::Add, lit(2.0), varidx(0)),
+        binop(BinOp::Mul, lit(-2.5), varidx(0)),
+        binop(BinOp::Sub, lit(2.0), varidx(0)),
+        binop(BinOp::Sub, lit(0.0), varidx(0)),
+        binop(BinOp::Sub, lit(0.0), varidx(1)),
+        binop(BinOp::Sub, lit(0.0), varidx(2)),
+        binop(BinOp::Mul, lit(-1.0), varidx(2)),
+        binop(
+            BinOp::Div,
+            varidx(0),
+            binop(BinOp::Sub, lit(0.0), varidx(3)),
+        ),
+        binop(BinOp::Div, lit(1.0), binop(BinOp::Sub, lit(0.0), varidx(1))),
+        unary(
+            "exp",
+            binop(BinOp::Sub, lit(0.0), binop(BinOp::Mul, lit(0.5), varidx(0))),
+        ),
+    ];
+    for e in &exprs {
+        bc_vs_ast(e.clone(), &vars, &[], &[], &[]);
+        bc_g_f64_matches(e, &vars);
+    }
+}
+
 #[test]
 fn eval_statements_g_matches_f64_and_fd() {
     use crate::sens::dual2::Dual2;
