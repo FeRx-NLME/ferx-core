@@ -16779,7 +16779,8 @@ type Dm = crate::sens::dual_mixed::DualMixed<2, 3>;
 fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
     match e {
         Expression::Literal(v) => Dm::constant(*v),
-        Expression::VariableIdx(i) => vars[*i],
+        // Out of range reads as 0, as `Op::PushVar` does.
+        Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(Dm::constant(0.0)),
         Expression::CovariateIdx(i) => Dm::constant(covs[*i]),
         Expression::Time => Dm::constant(time),
         Expression::BinOp(l, op, r) => {
@@ -16814,16 +16815,31 @@ fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
 }
 
 /// Live jets on every slot: x, y on second-order axes 0/1, z on first-order axis
-/// 2, and slot 3 an exact zero that still carries a jet (the divide guard's input).
+/// 2; slot 3 an exact zero that still carries a jet (the divide guard's input);
+/// slot 4 with `−0.0` jet entries and slot 5 with an infinite gradient, where the
+/// zero terms a constant operand contributes change bits (`−0.0 + 0.0 = +0.0`,
+/// `∞ · 0 = NaN`).
 fn dm_vars() -> Vec<Dm> {
     let x = Dm::var(1.3, 0);
     let y = Dm::var(0.7, 1);
     let z = Dm::var(2.1, 2);
+    let signed_zero = Dm {
+        value: 2.0,
+        grad: [-0.0, 1.5, -0.0],
+        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0]],
+    };
+    let infinite = Dm {
+        value: 1.0,
+        grad: [f64::INFINITY, -2.0, 0.0],
+        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0]],
+    };
     vec![
         x * y + z,
         y.exp() * x,
         z * x - y,
         z * (y - Dm::constant(0.7)),
+        signed_zero,
+        infinite,
     ]
 }
 
@@ -16839,18 +16855,18 @@ fn assert_dm_matches_reference(e: &Expression) {
         let _t = ModelTimeGuard::enter(time);
         eval_bytecode_g::<Dm>(&bc, &[], &[], &covs, &vars, &nn, &mut stack)
     };
-    // `==` rather than bits: a scalar operand skips terms that are exact zeros, so
-    // only the sign of a zero entry may differ (`+0.0 == −0.0`).
+    // Bit for bit, any `NaN` matching any `NaN`.
+    let eq = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
     assert!(
-        got.value == want.value,
+        eq(got.value, want.value),
         "value {e:?}: {} vs {}",
         got.value,
         want.value
     );
     for i in 0..3 {
         assert!(
-            got.grad[i] == want.grad[i],
-            "grad[{i}] {e:?}: {} vs {}",
+            eq(got.grad[i], want.grad[i]),
+            "grad[{i}] {e:?}: {:?} vs {:?}",
             got.grad[i],
             want.grad[i]
         );
@@ -16858,8 +16874,8 @@ fn assert_dm_matches_reference(e: &Expression) {
     for r in 0..2 {
         for c in 0..3 {
             assert!(
-                got.hess[r][c] == want.hess[r][c],
-                "hess[{r}][{c}] {e:?}: {} vs {}",
+                eq(got.hess[r][c], want.hess[r][c]),
+                "hess[{r}][{c}] {e:?}: {:?} vs {:?}",
                 got.hess[r][c],
                 want.hess[r][c]
             );
@@ -16934,6 +16950,21 @@ fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
             ),
             binop(BinOp::Mul, binop(BinOp::Div, y(), z()), x()),
         ),
+        // Signed-zero and infinite jets through every fused scalar form, both operand
+        // orders: these differ from a shortcut `value ∘ c` in sign or `NaN`.
+        binop(BinOp::Add, varidx(4), lit(1.0)),
+        binop(BinOp::Sub, lit(1.0), varidx(4)),
+        binop(BinOp::Mul, varidx(4), lit(-0.0)),
+        binop(BinOp::Mul, lit(-0.0), varidx(4)),
+        binop(BinOp::Mul, varidx(5), lit(0.0)),
+        binop(BinOp::Mul, lit(0.0), varidx(5)),
+        binop(BinOp::Div, varidx(5), lit(2.0)),
+        binop(BinOp::Sub, varidx(5), lit(2.0)),
+        binop(BinOp::Mul, varidx(5), x()),
+        binop(BinOp::Mul, x(), varidx(5)),
+        // An out-of-range variable reads as 0 on the fused path too.
+        binop(BinOp::Mul, x(), varidx(99)),
+        binop(BinOp::Add, x(), varidx(99)),
         // Fusion inside both arms of a conditional (jump targets).
         cond(
             cmp(x(), CmpOp::Gt, lit(1.0)),

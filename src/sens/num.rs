@@ -19,6 +19,8 @@ pub trait PkNum:
     + Mul<Output = Self>
     + Div<Output = Self>
     + Neg<Output = Self>
+    // The bytecode VM's in-place arithmetic; crate-private (see `vm`).
+    + vm::VmArith
 {
     /// Whether this type carries a second-order (Hessian) jet. `false` for `f64` and the
     /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
@@ -73,75 +75,6 @@ pub trait PkNum:
     /// therefore inert on the prediction path and only ever fires on a dual instantiation
     /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
     fn jets_finite(self) -> bool;
-
-    // ── In-place arithmetic for the bytecode VM ─────────────────────────────
-    //
-    // `eval_bytecode_g` keeps its operands on a `Vec<T>` stack. For the outer
-    // `DualMixed<NA, N>` type a value is several KB (`N + NA·N + 1` doubles), so
-    // the by-value `pop, pop, push(a ∘ b)` shape spent about a third of a
-    // busulfan ODE+IOV FOCEI fit in `memmove`/`memset` — moving operands and
-    // materialising all-zero jets for constants. These update the left operand
-    // where it sits on the stack and take the right one by reference (or as a
-    // bare `f64` when it is a constant, covariate or `TIME`).
-    //
-    // Each default is the by-value operator it replaces, so `f64` and `Dual1` are
-    // unchanged bit for bit; `DualMixed` overrides them with loops that use the
-    // same per-entry formulas. A scalar operand there skips the terms that a
-    // constant jet contributes as exact zeros, which can differ from the
-    // by-value form only in the sign of a zero jet entry, or in a jet that the
-    // by-value form turned into `NaN` (`inf · 0`) while the value was already
-    // non-finite.
-
-    /// `self = self + rhs`.
-    #[inline]
-    fn add_in(&mut self, rhs: &Self) {
-        *self = *self + *rhs;
-    }
-    /// `self = self - rhs`.
-    #[inline]
-    fn sub_in(&mut self, rhs: &Self) {
-        *self = *self - *rhs;
-    }
-    /// `self = rhs - self` (the bytecode `Op::RSub`).
-    #[inline]
-    fn rsub_in(&mut self, rhs: &Self) {
-        *self = *rhs - *self;
-    }
-    /// `self = self * rhs`.
-    #[inline]
-    fn mul_in(&mut self, rhs: &Self) {
-        *self = *self * *rhs;
-    }
-    /// `self = self / rhs` (no zero guard — the caller owns it).
-    #[inline]
-    fn div_in(&mut self, rhs: &Self) {
-        *self = *self / *rhs;
-    }
-    /// `self = self + c` for a constant `c`.
-    #[inline]
-    fn add_scalar_in(&mut self, c: f64) {
-        *self = *self + Self::from_f64(c);
-    }
-    /// `self = self - c` for a constant `c`.
-    #[inline]
-    fn sub_scalar_in(&mut self, c: f64) {
-        *self = *self - Self::from_f64(c);
-    }
-    /// `self = c - self` for a constant `c`.
-    #[inline]
-    fn rsub_scalar_in(&mut self, c: f64) {
-        *self = Self::from_f64(c) - *self;
-    }
-    /// `self = self * c` for a constant `c`.
-    #[inline]
-    fn mul_scalar_in(&mut self, c: f64) {
-        *self = *self * Self::from_f64(c);
-    }
-    /// `self = self / c` for a constant `c` (no zero guard — the caller owns it).
-    #[inline]
-    fn div_scalar_in(&mut self, c: f64) {
-        *self = *self / Self::from_f64(c);
-    }
 }
 
 impl PkNum for f64 {
@@ -218,11 +151,8 @@ impl PkNum for f64 {
 /// NaN-flooring body. The scalar `f64` impl stays hand-written (its bodies are
 /// inline formulas, not delegation).
 macro_rules! impl_pknum_delegate {
-    // `extra` carries trait methods a type overrides beyond the shared delegation
-    // (`DualMixed`'s in-place arithmetic); the rest take the trait defaults.
-    ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr $(, extra = { $($extra:item)* })?) => {
+    ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
-            $($($extra)*)?
             const SECOND_ORDER: bool = $so;
             #[inline]
             fn from_f64(x: f64) -> Self {
@@ -298,49 +228,150 @@ macro_rules! impl_pknum_delegate {
 }
 
 impl_pknum_delegate!(Dual1<const N: usize>, second_order = false);
-// `DualMixed` overrides the in-place arithmetic with its own loops (see the trait).
-impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true, extra = {
-    #[inline]
-    fn add_in(&mut self, rhs: &Self) {
-        DualMixed::add_in(self, rhs)
+impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true);
+
+/// In-place arithmetic for the generic bytecode VM (`eval_bytecode_g`).
+///
+/// The VM keeps its operands on a `Vec<T>` stack. For the outer `DualMixed<NA, N>`
+/// type a value is several KB (`N + NA·N + 1` doubles), so the by-value
+/// `pop, pop, push(a ∘ b)` shape spent about a third of a busulfan ODE+IOV FOCEI fit
+/// in `memmove`/`memset` — moving operands and materialising all-zero jets for
+/// constants. These update the left operand where it sits on the stack and take the
+/// right one by reference, or as a bare `f64` when it is a constant, covariate or
+/// `TIME`.
+///
+/// **Every method is bit-identical to the by-value operator it replaces**, the scalar
+/// ones included: they evaluate the formula the operator would apply to a
+/// `from_f64(c)` operand term by term — `x·0.0`, `+ 0.0` and all — just without
+/// building that operand. So signed zeros and `inf · 0 = NaN` come out exactly as
+/// before. `f64` and `Dual1` (small enough that moves are cheap) use the operators
+/// themselves; `DualMixed` writes the same formulas as in-place loops.
+///
+/// A supertrait of [`PkNum`] so every `T: PkNum` the VM is instantiated at has it,
+/// and in a crate-private module so it is not public API: nothing outside the VM
+/// calls it, and outside crates cannot name it (which also seals `PkNum` — no type
+/// outside ferx-core implements it).
+pub(crate) mod vm {
+    use super::{Dual1, DualMixed};
+
+    pub trait VmArith: Sized {
+        /// `self = self + rhs`.
+        fn add_in(&mut self, rhs: &Self);
+        /// `self = self - rhs`.
+        fn sub_in(&mut self, rhs: &Self);
+        /// `self = rhs - self` (the bytecode `RSub`).
+        fn rsub_in(&mut self, rhs: &Self);
+        /// `self = self * rhs`.
+        fn mul_in(&mut self, rhs: &Self);
+        /// `self = self / rhs` (no zero guard — the caller owns it).
+        fn div_in(&mut self, rhs: &Self);
+        /// `self = self + from_f64(c)`.
+        fn add_scalar_in(&mut self, c: f64);
+        /// `self = self - from_f64(c)`.
+        fn sub_scalar_in(&mut self, c: f64);
+        /// `self = from_f64(c) - self`.
+        fn rsub_scalar_in(&mut self, c: f64);
+        /// `self = self * from_f64(c)`.
+        fn mul_scalar_in(&mut self, c: f64);
+        /// `self = self / from_f64(c)` (no zero guard — the caller owns it).
+        fn div_scalar_in(&mut self, c: f64);
     }
-    #[inline]
-    fn sub_in(&mut self, rhs: &Self) {
-        DualMixed::sub_in(self, rhs)
+
+    /// `VmArith` as the by-value operators, for types small enough that moving them
+    /// costs nothing worth saving.
+    macro_rules! impl_vm_by_value {
+        ($ty:ty, $lift:expr $(, $c:ident)*) => {
+            impl<$(const $c: usize),*> VmArith for $ty {
+                #[inline]
+                fn add_in(&mut self, rhs: &Self) {
+                    *self = *self + *rhs;
+                }
+                #[inline]
+                fn sub_in(&mut self, rhs: &Self) {
+                    *self = *self - *rhs;
+                }
+                #[inline]
+                fn rsub_in(&mut self, rhs: &Self) {
+                    *self = *rhs - *self;
+                }
+                #[inline]
+                fn mul_in(&mut self, rhs: &Self) {
+                    *self = *self * *rhs;
+                }
+                #[inline]
+                fn div_in(&mut self, rhs: &Self) {
+                    *self = *self / *rhs;
+                }
+                #[inline]
+                fn add_scalar_in(&mut self, c: f64) {
+                    *self = *self + $lift(c);
+                }
+                #[inline]
+                fn sub_scalar_in(&mut self, c: f64) {
+                    *self = *self - $lift(c);
+                }
+                #[inline]
+                fn rsub_scalar_in(&mut self, c: f64) {
+                    *self = $lift(c) - *self;
+                }
+                #[inline]
+                fn mul_scalar_in(&mut self, c: f64) {
+                    *self = *self * $lift(c);
+                }
+                #[inline]
+                fn div_scalar_in(&mut self, c: f64) {
+                    *self = *self / $lift(c);
+                }
+            }
+        };
     }
-    #[inline]
-    fn rsub_in(&mut self, rhs: &Self) {
-        DualMixed::rsub_in(self, rhs)
+
+    impl_vm_by_value!(f64, |c: f64| c);
+    impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, N);
+
+    impl<const NA: usize, const N: usize> VmArith for DualMixed<NA, N> {
+        #[inline]
+        fn add_in(&mut self, rhs: &Self) {
+            DualMixed::add_in(self, rhs)
+        }
+        #[inline]
+        fn sub_in(&mut self, rhs: &Self) {
+            DualMixed::sub_in(self, rhs)
+        }
+        #[inline]
+        fn rsub_in(&mut self, rhs: &Self) {
+            DualMixed::rsub_in(self, rhs)
+        }
+        #[inline]
+        fn mul_in(&mut self, rhs: &Self) {
+            DualMixed::mul_in(self, rhs)
+        }
+        #[inline]
+        fn div_in(&mut self, rhs: &Self) {
+            DualMixed::div_in(self, rhs)
+        }
+        #[inline]
+        fn add_scalar_in(&mut self, c: f64) {
+            DualMixed::add_scalar_in(self, c)
+        }
+        #[inline]
+        fn sub_scalar_in(&mut self, c: f64) {
+            DualMixed::sub_scalar_in(self, c)
+        }
+        #[inline]
+        fn rsub_scalar_in(&mut self, c: f64) {
+            DualMixed::rsub_scalar_in(self, c)
+        }
+        #[inline]
+        fn mul_scalar_in(&mut self, c: f64) {
+            DualMixed::mul_scalar_in(self, c)
+        }
+        #[inline]
+        fn div_scalar_in(&mut self, c: f64) {
+            DualMixed::div_scalar_in(self, c)
+        }
     }
-    #[inline]
-    fn mul_in(&mut self, rhs: &Self) {
-        DualMixed::mul_in(self, rhs)
-    }
-    #[inline]
-    fn div_in(&mut self, rhs: &Self) {
-        DualMixed::div_in(self, rhs)
-    }
-    #[inline]
-    fn add_scalar_in(&mut self, c: f64) {
-        DualMixed::add_scalar_in(self, c)
-    }
-    #[inline]
-    fn sub_scalar_in(&mut self, c: f64) {
-        DualMixed::sub_scalar_in(self, c)
-    }
-    #[inline]
-    fn rsub_scalar_in(&mut self, c: f64) {
-        DualMixed::rsub_scalar_in(self, c)
-    }
-    #[inline]
-    fn mul_scalar_in(&mut self, c: f64) {
-        DualMixed::mul_scalar_in(self, c)
-    }
-    #[inline]
-    fn div_scalar_in(&mut self, c: f64) {
-        DualMixed::div_scalar_in(self, c)
-    }
-});
+}
 
 #[cfg(test)]
 mod tests {

@@ -25144,10 +25144,13 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         }
         // A literal-left `c ⊕ E` is emitted with the literal as the *top* operand,
         // so the dual evaluator's fused constant path (`eval_bytecode_g`) applies it
-        // in place rather than materialising a full constant jet. `+` and `*` are
-        // exactly commutative in IEEE arithmetic and `c - E` becomes `RSub`, so every
-        // f64 result is unchanged; the swap only reorders evaluation of two pure
-        // operands.
+        // in place rather than materialising a full constant jet. `c - E` becomes
+        // `RSub`; `c + E` and `c * E` keep their op, which is exact for f64 and dual
+        // alike: IEEE `+` and `×` are commutative, and with one operand a constant the
+        // dual product's Hessian entry sums the same four terms in either order —
+        // three of them zero products, and adding zeros to `x` gives `x` (an all-`−0`
+        // sum is `−0`, a `NaN` term is `NaN`) whatever the order. So every result is
+        // unchanged; the swap only reorders evaluation of two pure operands.
         Expression::BinOp(lhs, op @ (BinOp::Add | BinOp::Mul | BinOp::Sub), rhs)
             if matches!(lhs.as_ref(), Expression::Literal(_))
                 && !matches!(rhs.as_ref(), Expression::Literal(_)) =>
@@ -25669,39 +25672,20 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                 };
                 push!(v);
             }
-            // Both operands already on the stack: combine into the lower slot in
-            // place and drop the top. The by-value arms below only run on a stack
-            // underflow, which `debug_assert!`s in `pop!`.
-            Op::Add | Op::Sub | Op::RSub | Op::Mul | Op::Div if stack.len() >= 2 => {
-                let n = stack.len();
-                let (lo, hi) = stack.split_at_mut(n - 1);
-                apply_binary_in(&mut lo[n - 2], ops[pc], &hi[0]);
-                stack.truncate(n - 1);
-            }
-            Op::Add => {
-                let b = pop!();
-                let a = pop!();
-                push!(a + b);
-            }
-            Op::Sub => {
-                let b = pop!();
-                let a = pop!();
-                push!(a - b);
-            }
-            Op::RSub => {
-                let b = pop!();
-                let a = pop!();
-                push!(b - a);
-            }
-            Op::Mul => {
-                let b = pop!();
-                let a = pop!();
-                push!(a * b);
-            }
-            Op::Div => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.val().abs() < 1e-30 { k(0.0) } else { a / b });
+            // Both operands already on the stack: combine into the lower slot in place
+            // and drop the top. The slice pattern cannot underflow; a malformed
+            // program with fewer than two operands takes the by-value shape, where
+            // `pop!` asserts in debug and reads 0 in release, as it always did.
+            Op::Add | Op::Sub | Op::RSub | Op::Mul | Op::Div => {
+                if let [.., a, b] = stack.as_mut_slice() {
+                    apply_binary_in(a, ops[pc], b);
+                    stack.pop();
+                } else {
+                    let b = pop!();
+                    let mut a = pop!();
+                    apply_binary_in(&mut a, ops[pc], &b);
+                    push!(a);
+                }
             }
             Op::Pow => {
                 let e = pop!();
