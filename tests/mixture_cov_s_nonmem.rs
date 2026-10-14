@@ -33,8 +33,11 @@
 //! by the single-population path this fix reuses per class) holds the mode and its
 //! prediction Jacobian at `x̂`: the EBE-response term is the documented zero of
 //! `subject_eta_response_correction` (#338 Part A, the ω/σ blocks deferred to #1817).
-//! At the MLE both conventions are unbiased, so the gap is a finite-sample one — but
-//! on 30 subjects it is 14 % on `SE(TVCL2)`.
+//! The held score is biased, so the gap is a convention difference that more subjects
+//! do not remove: at this point the re-estimated `Σᵢ gᵢ` on TVCL2 is 3e-4 and the held
+//! one 16.2, a mean per-subject shift of 0.539 against a mean `|gᵢ|` of 0.466 (the
+//! oracle below prints both). Replicating the subjects scales `Σᵢ gᵢ`, `S` and `R`
+//! alike, so the SE ratios stay put. The gap on `SE(TVCL2)` is 14 %.
 //!
 //! `tests/nonmem/mixture_iv_cov_score_oracle.py` computes the per-subject mixture
 //! `−2LLᵢ` in closed form, outside both engines, and forms `S = Σ gᵢgᵢᵀ` from central

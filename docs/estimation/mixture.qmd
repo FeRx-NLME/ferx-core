@@ -218,11 +218,24 @@ NONMEM 7.5.1 at OBJ 350.266132), $\operatorname{SE}(TVCL)$ is:
 | `s` | 0.05379 | 0.05379 | 0.06262 | 0.06262 |
 | `rsr` | 0.18892 | 0.18865 | 0.16537 | 0.16537 |
 
-So the gap is 16 % on `s` and 12 % on `rsr`, while `r` agrees to 0.07 %. Until
-ferx's score carries the EBE response, expect `s` and `rsr` to differ from
-NONMEM's by this finite-sample amount on any FOCE/FOCEI model. The two
-conventions agree asymptotically. `tests/mixture_cov_s_nonmem.rs` pins both
-halves, for the mixture and for its twin.
+So the gap is 16 % on `s` and 12 % on `rsr`, while `r` agrees to 0.07 %.
+
+More subjects do not close it, because the held score is biased. At the MLE
+the total score sums to zero over subjects; the held one does not. Holding η̂
+is exact for the conditional part of $-2\log L_i$, which is stationary in η at
+the mode, but it drops the dependence of the FOCEI $\log|\tilde H|$ term on η̂
+and on the prediction Jacobian. On the twin, the re-estimated
+$\sum_i g_i$ on `TVCL` is $-4\times10^{-4}$ and the held one 33.2: every
+subject's score shifts by 1.105 on average (sd 0.669), against a mean $|g_i|$
+of 3.05. On the mixture, $\sum_i g_i$ on `TVCL2` is $3\times10^{-4}$
+re-estimated and 16.2 held. Replicating the subjects scales $\sum_i g_i$, $S$
+and $R$ alike, so the SE ratios do not move. The oracle prints these sums on
+every run.
+
+Until ferx's score carries the EBE response (#1817), expect `s` and `rsr` to
+differ from NONMEM's on any FOCE/FOCEI model, by an amount that depends on the
+model rather than on the number of subjects. `tests/mixture_cov_s_nonmem.rs`
+pins both halves, for the mixture and for its twin.
 
 ## Inter-occasion variability under a mixture
 

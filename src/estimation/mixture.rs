@@ -124,10 +124,11 @@ pub fn mixture_ofv(
     mixture_ofv_with_modes(model, population, params, options, warm).0
 }
 
-/// Every class's inner modes at one mixture evaluation, `[class][subject]` — the
-/// per-class counterparts of [`MixtureEval::etas_by_class`] that `MixtureEval` keeps
-/// only for the MIXEST class. The covariance step's per-subject mixture score (#1956)
-/// differentiates every class's `nll_ik` at its own fixed modes, so it needs them all.
+/// Every class's inner modes at one mixture evaluation, `[class][subject]`: the
+/// per-class H and κ̂ that `MixtureEval` keeps only for the MIXEST class (its
+/// [`MixtureEval::etas_by_class`] already holds every class). The covariance step's
+/// per-subject mixture score (#1956) differentiates every class's `nll_ik` at its own
+/// fixed modes, so it needs them all.
 pub(crate) struct MixtureClassModes {
     /// Inner Hessian / linearization `H` per class per subject.
     pub(crate) h_mats: Vec<Vec<DMatrix<f64>>>,
@@ -471,7 +472,8 @@ struct ClassScoreView {
 /// on the −logL scale (S's scale; [`mixture_gradient`] is the same sum ×2 over
 /// subjects). Each `∂nllᵢₖ/∂x` is the single-population fixed-mode score
 /// (`covariance::fixed_ebe_subject_score`, so the closed-form-vs-FD dispatch and the
-/// FOCEI `tᵢ` convention are the ones every other S uses) evaluated under
+/// fixed-mode convention, η̂/H/κ̂ held at `x̂`, are the ones every other S uses; see
+/// the convention comment in `covariance::assemble_score_cross_product`) evaluated under
 /// `MIXNUM = k`, with class `k`'s own η̂/H/κ̂ and Ω/Σ, then routed onto the mixture
 /// layout by `route_class_gradient` — the routing the outer gradient uses. The modes
 /// come from one cold `mixture_ofv` at `x̂` and the covariance inner tolerance, the
@@ -573,6 +575,9 @@ impl MixtureScoreContext {
             }
             // MIXNUM = cls+1 on this (worker) thread for the class's predictions.
             let _guard = MixtureClassGuard::enter(cls + 1);
+            // Asymmetry (#1973): the class kernel here is the single-population S's,
+            // not `mixture_gradient`'s `per_subject_packed_gradients`; only the routing
+            // is shared, so a kernel change moves one of S and the outer gradient.
             let g_c = crate::estimation::covariance::fixed_ebe_subject_score(
                 &view.x,
                 &view.template,
@@ -1841,7 +1846,8 @@ mod tests {
         // The S path's per-class modes are reconverged at `cov_inner_tol`, like the R
         // path's (`mixture_covariance_uses_cov_inner_tol_not_fit_tol`): an absurdly
         // loose fit tol with a tight explicit cov tol must give the same S as a tight
-        // fit tol.
+        // fit tol. Measured worst 0 (bit-identical, macOS arm64); modes at the fit tol
+        // instead give S[0,0] 0.1357 vs 0.5454.
         use crate::estimation::covariance::assemble_score_cross_product;
         use crate::estimation::parameterization::{pack_params, pack_with_bounds};
         let model = crate::parser::model_parser::parse_model_string(MIX_COV_MODEL).unwrap();
@@ -1874,16 +1880,20 @@ mod tests {
         };
         let reference = run(1e-8, None);
         let probe = run(1.0, Some(1e-8));
+        let mut worst = 0.0f64;
         for j in 0..free.len() {
             for k in 0..free.len() {
                 let (r, p) = (reference[(j, k)], probe[(j, k)]);
+                assert!(r.is_finite() && p.is_finite(), "S[{j},{k}]: {r} / {p}");
                 let rel = (r - p).abs() / r.abs().max(p.abs()).max(1e-9);
                 assert!(
                     rel < 1e-6,
                     "S[{j},{k}] depends on the fit inner_tol: ref {r} vs probe {p}"
                 );
+                worst = worst.max(rel);
             }
         }
+        eprintln!("S at cov_inner_tol vs tight fit tol: worst rel {worst:.3e} (bound 1e-6)");
     }
 
     #[test]

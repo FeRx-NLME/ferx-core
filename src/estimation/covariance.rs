@@ -506,19 +506,18 @@ pub(crate) fn assemble_score_cross_product(
 
     // Per-subject scores in parallel (mirrors `build_gn_system`).
     //
-    // The score cross-product evaluates the per-subject gradient directly at x̂.
-    // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
-    // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
-    // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
-    // `tᵢ` term, in −logL units; in −2logL units this contributes `2·tᵢ` to the
-    // gradient) so the score matches how NONMEM differences the individual objective with
-    // its conditional estimate responding to θ. This is what makes the FOCEI
-    // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
-    // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
-    // carries (it holds the model sensitivities `a` fixed at the linearization).
-    // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
-    // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
-    // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
+    // Convention: each row is the **fixed-mode** score, the per-subject gradient at x̂
+    // with η̂, `H` and κ̂ held at their x̂ values (`fixed_ebe_subject_score`). The FOCEI
+    // EBE-response term `tᵢ = ½·∂log|H̃|/∂η̂·dη̂/dθ` it adds back is identically zero
+    // today (#338 Part A removed the θ block; the ω/σ blocks are #1817), so S carries
+    // neither that term nor the θ-dependence of the held prediction Jacobian. The
+    // FD-built R reconverges η̂ at every stencil point and is unaffected. NONMEM's
+    // `MATRIX=S` differentiates the total `−2LLᵢ(x)`, η̂ re-estimated at every
+    // perturbed x. The held score is biased at the MLE (`Σᵢ gᵢ ≠ 0`), so the two S
+    // differ by a convention gap that more subjects do not close — measured on
+    // `mixture_iv` and its one-population twin in `tests/mixture_cov_s_nonmem.rs`.
+    // Closing it is #1817's territory. FOCE (`!interaction`) uses the Sheiner–Beal
+    // gradient, which has no `log|H̃|` term, so `tᵢ` is not called for it.
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
         .into_par_iter()
@@ -584,8 +583,8 @@ pub(crate) fn assemble_score_cross_product(
 /// One subject's single-population score `∂nllᵢ/∂x` at fixed modes (η̂, `H`, κ̂) — the
 /// row `assemble_score_cross_product` squares into S, and (#1956) each class's term
 /// of a mixture subject's score. `subject_nll_pop_grad` (closed form or central FD),
-/// plus the FOCEI `log|H̃|` EBE-response term `tᵢ`; see the convention comment in
-/// `assemble_score_cross_product`.
+/// plus the FOCEI `log|H̃|` EBE-response term `tᵢ`, which is identically zero today
+/// (#338 Part A); see the convention comment in `assemble_score_cross_product`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fixed_ebe_subject_score(
     x: &[f64],

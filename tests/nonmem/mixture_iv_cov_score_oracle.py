@@ -12,6 +12,11 @@ gradients under three score conventions:
 `--single` runs the one-population twin (CL = TVCL*exp(ETA), V = TVV) on the same data
 at its MLE, to show the convention is not mixture-specific.
 
+Each run also prints sum_i g_i per convention and the per-subject shift g_conv - g_reopt
+(mean, population sd). The total score sums to zero at the MLE; the held ones do not
+(twin: sum g = 33.2 on TVCL, a mean shift of 1.105 per subject against a mean
+|g_reopt| of 3.05), so the held score is biased and the gap does not shrink with N.
+
     uv run --with numpy python tests/nonmem/mixture_iv_cov_score_oracle.py
     uv run --with numpy python tests/nonmem/mixture_iv_cov_score_oracle.py --single
 
@@ -101,10 +106,21 @@ def report(x0, subj_nll, conventions):
         r[:, j] = (grad(total, xp) - grad(total, xm)) / (2 * h)
     r_inv = np.linalg.inv(0.5 * (r + r.T))
     print(f"{'R':>16} SE:", np.sqrt(np.diag(r_inv)))
+    scores = {}
     for conv in conventions:
-        s = sum(np.outer(gi, gi) for gi in (grad(lambda x: subj_nll(x, i, conv), x0) for i in range(len(SUBJECTS))))
+        gs = np.array([grad(lambda x: subj_nll(x, i, conv), x0) for i in range(len(SUBJECTS))])
+        scores[conv] = gs
+        s = gs.T @ gs
         print(f"{'S ' + conv:>16} SE:", np.sqrt(np.diag(np.linalg.inv(s))))
         print(f"{'RSR ' + conv:>16} SE:", np.sqrt(np.diag(r_inv @ s @ r_inv)))
+    # At the MLE the total score sums to zero; a held score that does not is biased,
+    # and replicating the subjects scales sum g, S and R alike, so the SE ratio stays.
+    print("mean |g reopt|:", np.abs(scores["reopt"]).mean(axis=0))
+    for conv in conventions:
+        print(f"{'sum g ' + conv:>16}:", scores[conv].sum(axis=0))
+        if conv != "reopt":
+            d = scores[conv] - scores["reopt"]
+            print(f"{'g ' + conv + ' - reopt':>16}: mean", d.mean(axis=0), "sd", d.std(axis=0))
 
 
 def mixture():
