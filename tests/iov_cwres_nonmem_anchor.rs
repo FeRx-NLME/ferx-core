@@ -74,6 +74,8 @@ const IPRED_TOL: f64 = 1e-6;
 const EBE_TOL: f64 = 2e-6;
 const OFV_TOL: f64 = 5e-6;
 const PRED_TOL: f64 = 1e-9;
+/// The fit's OFV against the sum of the sdtab's per-subject contributions (see the use).
+const OFV_SUM_TOL: f64 = 1e-9;
 
 /// One `EVID = 0` row of a NONMEM table.
 struct NmRow {
@@ -188,6 +190,18 @@ fn assert_matches_nonmem(label: &str, r: &FitResult, tab: &str, nm_ofv: f64) {
     assert!(
         r.ofv.is_finite() && d_ofv < OFV_TOL,
         "{label}: OFV {} vs NONMEM {nm_ofv}",
+        r.ofv
+    );
+    // The fit's objective and the post-fit pass's per-subject OFV are two evaluations of
+    // the same marginal at the same point. They agree to the bit on macOS arm64 and Linux
+    // x86_64 (the MEASURE line's two bit patterns), so `OFV_SUM_TOL` leaves room only for
+    // summation order. Scoring the post-fit FOCE subjects as FOCEI misses by 6.84
+    // (578.764 vs 585.600, macOS arm64), 6.8e9× the bound.
+    let d_ofv_sum = (ofv_i - r.ofv).abs();
+    assert!(
+        ofv_i.is_finite() && d_ofv_sum < OFV_SUM_TOL,
+        "{label}: sum of per-subject OFV {ofv_i} vs the fit's {} ({d_ofv_sum:e}): the \
+         post-fit pass is not scoring the objective's marginal",
         r.ofv
     );
     assert!(d_ebe < EBE_TOL, "{label}: EBEs off NONMEM by {d_ebe:e}");

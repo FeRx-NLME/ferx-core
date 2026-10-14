@@ -19,6 +19,8 @@
 //!   `κ̂ = 0` there, so `H_κ·κ̂ = 0` and the `f0` half is a no-op.
 //!
 //! `matches_the_stacked_recipe` checks the whole object, both halves live, FOCEI and FOCE.
+//! `a_kappa_shape_mismatch_is_refused` pins what the post-fit pass does when it cannot build
+//! the linearization at all.
 
 use super::postfit::compute_subject_results;
 use crate::parser::model_parser::parse_model_string;
@@ -283,5 +285,63 @@ fn rtilde_carries_the_iov_variance() {
             "interaction={interaction}: CWRES off the recipe by {d:e}: R-tilde is missing \
              H_kappa * Omega_IOV * H_kappa'"
         );
+    }
+}
+
+/// One κ for the two-occasion subject. The EBE pipeline never produces this, so
+/// `iov_linearization` returns `None` and each consumer refuses on its own terms:
+/// - CWRES is `NaN` on every row, since there is no `[η, κ₁, κ₂]` system to linearize over;
+/// - the OFV contribution is the marginal's sentinel, `2 × 1e20`;
+/// - IPRED still comes from `predict_iov` at `(η̂, κ̂₁)`. Occasion 1's rows depend on κ₁ alone,
+///   so they must equal the closed form.
+#[test]
+fn a_kappa_shape_mismatch_is_refused() {
+    let c = case(0.04);
+    let (eta, kappa1) = (0.15, -0.2);
+    let eta_hats = vec![DVector::from_element(1, eta)];
+    let h_eta = vec![DMatrix::zeros(OBS.len(), 1)];
+    let kappas = vec![vec![DVector::from_element(1, kappa1)]];
+    // Occasion 2's κ is irrelevant to occasion 1's rows; 0.0 is a placeholder.
+    let (f, _) = closed_form(&c.params.theta, [eta, kappa1, 0.0]);
+    for interaction in [true, false] {
+        let (subjects, _) = compute_subject_results(
+            &c.model,
+            &c.pop,
+            &c.params,
+            &eta_hats,
+            &h_eta,
+            &kappas,
+            interaction,
+            None,
+            false,
+        );
+        let s = &subjects[0];
+        assert_eq!(
+            s.cwres.len(),
+            OBS.len(),
+            "interaction={interaction}: CWRES rows"
+        );
+        assert!(
+            s.cwres.iter().all(|x| x.is_nan()),
+            "interaction={interaction}: CWRES {:?} must be NaN without a linearization",
+            s.cwres
+        );
+        assert_eq!(
+            s.ofv_contribution, 2e20,
+            "interaction={interaction}: OFV contribution must be the marginal's sentinel"
+        );
+        assert!(
+            s.ipred.iter().all(|x| x.is_finite()),
+            "interaction={interaction}: IPRED {:?}",
+            s.ipred
+        );
+        for (j, &(_, occ, _)) in OBS.iter().enumerate().filter(|(_, o)| o.1 == 1) {
+            let (got, want) = (s.ipred[j], f[j]);
+            assert!(
+                (got - want).abs() < 1e-12 * want.abs(),
+                "interaction={interaction}: occasion-{occ} IPRED row {j}: ferx {got} vs closed \
+                 form {want}"
+            );
+        }
     }
 }
