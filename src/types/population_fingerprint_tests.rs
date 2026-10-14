@@ -530,31 +530,52 @@ fn the_fingerprint_round_trips_through_json() {
 
 /// Review r1 #1, both sides of the gate in one test: a fit that derives its occasion
 /// labels leaves the population's `occasions` / `dose_occasions` /
-/// `pk_only_occasions` out — on the stamping side and on the comparing side — and
-/// a fit that reads them from a column keeps them in. Every other field is still
-/// compared under a derived rule.
+/// `pk_only_occasions` / `reset_occasions` out — on the stamping side and on the
+/// comparing side — and a fit that reads them from a column keeps them in. Every
+/// other field is still compared under a derived rule.
 ///
-/// Mutations — ignore the flag (always hash the labels): the derived cell differs;
-/// always leave them out: the column cell passes; flag only the stamping side:
-/// the derived cell differs.
+/// Each label vector is relabelled on its own, so the gate is pinned per vector: with
+/// all four changed at once, a vector hashed under neither flag would still leave the
+/// column cell differing through the other three. `reset_occasions` is #1944's: the
+/// derived rule rewrites it since then, and `run_covariance` refused the population
+/// `run_model_with_data` returned while it was hashed.
+///
+/// Mutations — ignore the flag for any one vector (always hash it): that vector's
+/// derived cell differs; leave any one vector out always: that vector's column cell
+/// passes; flag only the stamping side: every derived cell differs.
 #[test]
 fn derived_occasion_labels_are_left_out_only_when_the_fit_derives_them() {
     let base = population(vec![subject()]);
-    let mut relabelled = base.clone();
-    relabelled.subjects[0].occasions = vec![0, 0];
-    relabelled.subjects[0].dose_occasions = vec![0, 1];
-    relabelled.subjects[0].pk_only_occasions = vec![0];
-
+    let relabellings: [(&str, fn(&mut Subject)); 4] = [
+        ("occasions", |s| s.occasions = vec![0, 0]),
+        ("dose_occasions", |s| s.dose_occasions = vec![0, 1]),
+        ("pk_only_occasions", |s| s.pk_only_occasions = vec![0]),
+        ("reset_occasions", |s| s.reset_occasions = vec![0]),
+    ];
     let derived = PopulationFingerprint::of_with(&base, true);
-    assert_eq!(derived.first_difference(&relabelled), None, "derived rule");
     let column = PopulationFingerprint::of_with(&base, false);
-    assert!(
-        matches!(
-            column.first_difference(&relabelled),
-            Some(Difference::Records { .. })
-        ),
-        "column rule"
-    );
+    for (name, relabel) in relabellings {
+        let mut one = base.clone();
+        relabel(&mut one.subjects[0]);
+        assert_eq!(
+            derived.first_difference(&one),
+            None,
+            "{name}: derived rule leaves it out"
+        );
+        assert!(
+            matches!(
+                column.first_difference(&one),
+                Some(Difference::Records { .. } | Difference::Doses { .. })
+            ),
+            "{name}: column rule keeps it, got {:?}",
+            column.first_difference(&one)
+        );
+    }
+
+    let mut relabelled = base.clone();
+    for (_, relabel) in relabellings {
+        relabel(&mut relabelled.subjects[0]);
+    }
 
     let mut other = relabelled.clone();
     other.subjects[0].observations[0] = 9.0;

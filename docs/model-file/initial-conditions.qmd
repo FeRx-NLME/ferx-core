@@ -123,7 +123,9 @@ above — numerically equivalent, and still allocation-free.
     **reset row's own data items** — `$PK` runs at that row, so a covariate-driven baseline
     restarts on that row's values, not the preceding record's and not the following one's
     (#1133). With an `iov_column` this covers the row's `OCC` too: a reset that opens a new
-    occasion re-seeds under that occasion's κ. Anchored against NONMEM 7.6.0 in
+    occasion re-seeds under that occasion's κ. The same holds when `iov_occasion = dose` or
+    `time(...)` derives the occasions, since the rule labels the reset row as well
+    (`nonmem_anchor/iov_rule_reset_{A,B}.ctl`). Anchored against NONMEM 7.6.0 in
     `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl` — including a reset that is the
     subject's first event (H), a reset with a separate dose row at the same time (G), and the
     occasion question in isolation (J).
