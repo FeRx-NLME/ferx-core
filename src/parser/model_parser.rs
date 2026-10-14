@@ -18180,6 +18180,7 @@ struct CorrelationDecl {
 const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
     ("cs", crate::types::ResidualSerialKind::Cs),
     ("ar1", crate::types::ResidualSerialKind::Ar1),
+    ("car1", crate::types::ResidualSerialKind::Car1),
 ];
 
 /// Take the `correlation …` line (#1081) out of an `[error_model]` block and

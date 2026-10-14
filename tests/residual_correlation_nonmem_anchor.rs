@@ -1,20 +1,24 @@
-//! NONMEM anchor for a within-group residual correlation, `correlation cs|ar1(RHO)
-//! by ARM` (#1081).
+//! NONMEM anchor for a within-group residual correlation, `correlation
+//! cs|ar1|car1(RHO) by ARM` (#1081).
 //!
 //! ## The object
 //!
 //! The naproxen MBMA (Boucher & Bennetts 2018, `examples/mbma_naproxen.ferx`) on the
 //! natural DV scale, each arm's reported SE as a residual `weight =`, and the rows of
-//! one arm correlated: `R_arm = σ² · W C(ρ) W`, `C` compound-symmetric or AR(1) over
-//! the arm's visits. 18 studies (`ID`), 36 arms, 2–5 visits per arm at irregular
-//! times, so every block size from 2 to 5 is exercised and the AR(1) lags go to 4.
+//! one arm correlated: `R_arm = σ² · W C(ρ) W`, `C` compound-symmetric, AR(1) over
+//! the arm's visits, or continuous-time AR(1) over its visit *times*
+//! (`C_jk = ρ^|t_j − t_k|`). 18 studies (`ID`), 36 arms, 2–5 visits per arm at
+//! irregular times, so every block size from 2 to 5 is exercised, the AR(1) lags go
+//! to 4, and the `car1` gaps are not the visit lags (week 0, 2, 12 is lag 1 and 2
+//! but Δt 2 and 12).
 //!
 //! ## The NONMEM spelling (`nonmem_anchor/residual_correlation/*.ctl`)
 //!
 //! NONMEM has no residual-correlation record, so the same `R` is built by hand:
 //! `L2 = ARM` makes `EPS(1..5)` one shared vector per arm (`$SIGMA 1 FIX` ×5), and
 //! the row at visit `j` carries `RES = Σₖ Lⱼₖ(ρ)·EPS(k)`, `L` the Cholesky factor of
-//! the arm's correlation matrix in closed form. `ρ = THETA(8)`. The model is linear
+//! the arm's correlation matrix in closed form. `ρ = THETA(8)`; for `car1` the
+//! factor reads the arm's visit times `T1..T5` from the data. The model is linear
 //! in η with an additive error, so FOCE is the exact marginal, and a pure-Python
 //! closed form (`oracle.py`, in the anchor directory) agrees with NONMEM to
 //! ≤ 2e-13 on every evaluation probe below.
@@ -48,6 +52,8 @@ const PROBES: &[(&str, &str, f64, f64)] = &[
     ("cs_m02", "cs", -0.2, -109.372_389_054_464_69),
     ("ar1_p05", "ar1", 0.5, -202.052_628_693_591_57),
     ("ar1_m04", "ar1", -0.4, -121.386_775_569_796_82),
+    ("car_p08", "car1", 0.8, -181.691_383_296_860_49),
+    ("car_p03", "car1", 0.3, -176.591_803_240_544_78),
 ];
 
 /// Worst realised `|ferx − NONMEM|` over [`PROBES`]: 2.806e-9 (`ar1_m04`; macOS
@@ -148,12 +154,14 @@ fn cs_equals_an_arm_kappa_intercept() {
     assert!((cs - PROBES[1].3).abs() < PROBE_TOL);
 }
 
-/// NONMEM's estimates (`cs_est` / `ar1_est`, `METHOD=1`, every θ and ω free, ρ
-/// started at 0.3): `(kind, OBJ, ρ̂, SE(ρ̂) from $COV MATRIX=R)`. Both minimisations
-/// report `MINIMIZATION SUCCESSFUL`.
+/// NONMEM's estimates (`cs_est` / `ar1_est` / `car_est`, `METHOD=1`, every θ and ω
+/// free, ρ started at 0.3 — `car1` at 0.5): `(kind, OBJ, ρ̂, SE(ρ̂) from $COV
+/// MATRIX=R)`. All three minimisations report `MINIMIZATION SUCCESSFUL`. `car1`'s ρ̂
+/// is per week (the data `TIME` unit).
 const ESTIMATES: &[(&str, f64, f64, f64)] = &[
     ("cs", -199.734_575_047_940_30, 0.509_450, 0.077_591_7),
     ("ar1", -205.932_727_647_201_43, 0.597_282, 0.063_339_4),
+    ("car1", -195.027_166_348_762_39, 0.813_375, 0.037_248_6),
 ];
 
 /// The twin with every θ and ω free and ρ started where NONMEM started it, and
@@ -166,7 +174,12 @@ fn free_twin(kind: &str) -> String {
         .map(|l| {
             let t = l.trim_start();
             if t.starts_with("theta RHO(") {
-                "  theta RHO(0.3, -0.24, 0.99)".to_string()
+                // `car1` needs ρ ≥ 0, and starts where NONMEM's `car_est` did.
+                if kind == "car1" {
+                    "  theta RHO(0.5, 0.0, 0.99)".to_string()
+                } else {
+                    "  theta RHO(0.3, -0.24, 0.99)".to_string()
+                }
             } else if t.starts_with("theta ") || t.starts_with("omega ") {
                 l.trim_end().trim_end_matches("FIX").trim_end().to_string()
             } else {
@@ -397,6 +410,8 @@ const COMB_PROBES: &[(&str, &str, f64, f64)] = &[
     ("comb_cs_p05", "cs", 0.5, -189.777_337_517_105_99),
     ("comb_ar1_m04", "ar1", -0.4, -130.742_944_153_769_29),
     ("comb_ar1_p05", "ar1", 0.5, -189.944_415_907_175_34),
+    ("comb_car_p03", "car1", 0.3, -164.480_733_697_776_77),
+    ("comb_car_p08", "car1", 0.8, -179.360_463_309_165_65),
 ];
 
 /// Worst realised `|ferx − NONMEM|` over [`COMB_PROBES`]: 6.2e-8 (`comb_cs_p05`,

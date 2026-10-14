@@ -1,6 +1,6 @@
-//! Validation of a `correlation cs|ar1(RHO) by COL` line (#1081): the phase-1 scope
-//! (`E_RESIDUAL_CORRELATION_SCOPE`), the data-dependent range of ρ
-//! (`E_RESIDUAL_CORRELATION_RANGE`), tied times under `ar1`
+//! Validation of a `correlation cs|ar1|car1(RHO) by COL` line (#1081): the phase-1
+//! scope (`E_RESIDUAL_CORRELATION_SCOPE`), the data-dependent range of ρ
+//! (`E_RESIDUAL_CORRELATION_RANGE`), tied times under `ar1` / `car1`
 //! (`E_RESIDUAL_CORRELATION_TIES`) and a line that couples nothing
 //! (`W_RESIDUAL_CORRELATION_INERT`). Every sentence of every message is asserted, and
 //! every gate from both sides in one test.
@@ -354,6 +354,91 @@ fn ar1_refuses_tied_times_within_a_block() {
         with_code(&cs, "E_RESIDUAL_CORRELATION_TIES").is_empty(),
         "{cs:#?}"
     );
+}
+
+/// `car1` and a tie: `ρ^0 = 1` makes the two rows perfectly correlated, which is the
+/// `car1` reason, not `ar1`'s "no order". Both sides: the tie split across two blocks
+/// is accepted.
+#[test]
+fn car1_refuses_tied_times_within_a_block() {
+    let tied = population(&[&[(1.0, 0.0), (1.0, 2.0), (1.0, 2.0)]]);
+    let msg = one(
+        &check_model_data(&model("car1", "(0.3, 0.0, 0.95)"), &tied),
+        "E_RESIDUAL_CORRELATION_TIES",
+    )
+    .to_string();
+    assert!(
+        msg.contains(
+            "`correlation car1(RHO) by ARM`: subject S1 has two rows at TIME 2 in the block ARM=1."
+        ),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(
+            "`car1` correlates two rows by ρ^|Δt|, so tied rows correlate perfectly (ρ^0 = 1) \
+             and R is singular."
+        ),
+        "{msg}"
+    );
+    assert!(!msg.contains("`ar1` orders"), "{msg}");
+    assert!(
+        msg.contains("Give them distinct times, or use `cs`."),
+        "{msg}"
+    );
+    let split = population(&[&[(1.0, 0.0), (1.0, 2.0), (2.0, 2.0)]]);
+    let ok = check_model_data(&model("car1", "(0.3, 0.0, 0.95)"), &split);
+    assert!(
+        with_code(&ok, "E_RESIDUAL_CORRELATION_TIES").is_empty(),
+        "{ok:#?}"
+    );
+}
+
+/// `car1` needs ρ ≥ 0: a free lower bound of −0.2 and a `FIX` at −0.2 are refused
+/// with the reason and the `ar1` alternative; a lower bound of 0 and a `FIX` at 0.5
+/// are accepted, and `ar1` at the same −0.2 is accepted (the rule is `car1`'s).
+#[test]
+fn car1_range_refuses_a_negative_rho() {
+    let pop = population(&[&[(1.0, 0.0), (1.0, 1.5), (1.0, 4.0)]]);
+    let msg = one(
+        &check_model_data(&model("car1", "(0.3, -0.2, 0.95)"), &pop),
+        "E_RESIDUAL_CORRELATION_RANGE",
+    )
+    .to_string();
+    assert!(
+        msg.contains(
+            "`correlation car1(RHO) by ARM`: the lower bound of theta RHO is -0.2, but `car1` \
+             correlates two rows by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a non-integer time gap Δt."
+        ),
+        "{msg}"
+    );
+    assert!(msg.contains("Keep ρ at 0 or above."), "{msg}");
+    assert!(
+        msg.contains("For a negative correlation between consecutive rows, use `ar1`."),
+        "{msg}"
+    );
+    let fixed = one(
+        &check_model_data(&model("car1", "(-0.2) FIX"), &pop),
+        "E_RESIDUAL_CORRELATION_RANGE",
+    )
+    .to_string();
+    assert!(
+        fixed.contains("theta RHO is fixed at -0.2, but `car1` correlates"),
+        "{fixed}"
+    );
+    for ok in [
+        check_model_data(&model("car1", "(0.3, 0.0, 0.95)"), &pop),
+        check_model_data(&model("car1", "(0.5) FIX"), &pop),
+        check_model_data(&model("ar1", "(0.3, -0.2, 0.95)"), &pop),
+    ] {
+        assert!(
+            with_code(&ok, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
+            "{ok:#?}"
+        );
+    }
+    // The ±0.995 rail still binds a free `car1` ρ.
+    let rail = check_model_data(&model("car1", "(0.3, 0.0, 0.999)"), &pop);
+    assert!(one(&rail, "E_RESIDUAL_CORRELATION_RANGE")
+        .contains("the upper bound of theta RHO is 0.999."));
 }
 
 // ── inert ───────────────────────────────────────────────────────────────────

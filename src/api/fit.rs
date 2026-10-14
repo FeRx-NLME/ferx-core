@@ -289,6 +289,12 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
                 " The structural model may be missing dynamics, or the grouping may not \
                  cover the rows that are dependent."
             }
+            crate::types::ResidualSerialKind::Car1 => {
+                " `car1` decays the correlation with the time between rows; if it follows \
+                 the visit order instead, `ar1` models that. Otherwise the structural model \
+                 may be missing dynamics, or the grouping may not cover the rows that are \
+                 dependent."
+            }
         };
         Some(format!(
             "Positive autocorrelation remains {what}: the within-group correlation does \

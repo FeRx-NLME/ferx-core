@@ -29,6 +29,7 @@ fn a_correlation_line_compiles_to_its_structure() {
     for (kind, want) in [
         ("cs", ResidualSerialKind::Cs),
         ("AR1", ResidualSerialKind::Ar1),
+        ("car1", ResidualSerialKind::Car1),
     ] {
         let m = parse_model_string(&text(
             RHO,
@@ -97,11 +98,12 @@ fn rho_fixed_at_zero_drops_the_line() {
 fn an_unknown_structure_lists_the_supported_ones() {
     let e = err(
         RHO,
-        "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation car1(RHO) by ARM",
+        "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation car2(RHO) by ARM",
     );
     assert_eq!(
         e,
-        "[error_model] `correlation car1(…)`: unknown structure `car1`. Supported: `cs`, `ar1`."
+        "[error_model] `correlation car2(…)`: unknown structure `car2`. Supported: `cs`, `ar1`, \
+         `car1`."
     );
 }
 
@@ -119,7 +121,7 @@ fn a_malformed_line_shows_the_expected_form() {
             format!(
                 "[error_model]: cannot read `{bad}`. Expected `correlation <structure>(THETA) by \
                  COLUMN`, e.g. `correlation cs(RHO) by ARM`, where <structure> is one of: `cs`, \
-                 `ar1`."
+                 `ar1`, `car1`."
             )
         );
     }

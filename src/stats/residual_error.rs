@@ -1199,10 +1199,12 @@ pub(crate) fn assign_residual_groups(
 
 /// The row pairs a `correlation <kind>(RHO) by COL` line couples (#1081), as
 /// `(j, k, C_jk)` with `j < k`: every two rows sharing a nonzero `obs_rgroup`,
-/// with `C_jk = ρ` under `cs` and `ρ^|p_j − p_k|` under `ar1`, `p` being a row's
+/// with `C_jk = ρ` under `cs`, `ρ^|p_j − p_k|` under `ar1`, `p` being a row's
 /// position among its block's rows in time order (the data `TIME`, ties broken by
-/// row order — validation refuses a tie). A pair with `C_jk = 0` is left out, so
-/// `ρ = 0` writes nothing and `R` keeps the bits of the independent model.
+/// row order — validation refuses a tie), and `ρ^|t_j − t_k|` under `car1`, `t`
+/// the data `TIME` itself (validation refuses a tie, which would make `C_jk = 1`,
+/// and a negative `ρ`). A pair with `C_jk = 0` is left out, so `ρ = 0` writes
+/// nothing and `R` keeps the bits of the independent model.
 ///
 /// `None` when `obs_rgroup` is not parallel to the observations: a population
 /// that was never given its residual blocks (`assign_residual_groups`). The
@@ -1262,6 +1264,9 @@ fn serial_pairs(
                 crate::types::ResidualSerialKind::Cs => serial.rho,
                 crate::types::ResidualSerialKind::Ar1 => {
                     serial.rho.powi(pos[j].abs_diff(pos[k]) as i32)
+                }
+                crate::types::ResidualSerialKind::Car1 => {
+                    serial.rho.powf((time(j) - time(k)).abs())
                 }
             };
             if c != 0.0 {

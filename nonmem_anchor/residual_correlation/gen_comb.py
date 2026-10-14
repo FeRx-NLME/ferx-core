@@ -9,7 +9,7 @@ from gen_ctl import CHOL, TH, OM
 SDP = 0.03
 
 def ctl(struct, rho):
-    lo, hi = {'cs': (-0.24, 0.99), 'ar1': (-0.99, 0.99)}[struct]
+    lo, hi = {'cs': (-0.24, 0.99), 'ar1': (-0.99, 0.99), 'car': (0.001, 0.999)}[struct]
     th = '\n'.join(f'  {v} FIX' for v in TH)
     return f"""$PROBLEM ferx #1081 naproxen MBMA, combined error, within-arm correlation {struct} rho={rho} EVAL FOCEI
 ; Data: napx1081.csv. R_jk = C_jk (f_j f_k THETA(9)^2 + WPSE_j WPSE_k)
@@ -38,7 +38,7 @@ $TABLE ID ARM TIME DV IPRED L2 VIS ONEHEADER NOAPPEND NOPRINT FORMAT=s1PE23.16 F
 """
 
 RUNS = [('cs', 0.0, 'comb_cs_r0'), ('cs', 0.5, 'comb_cs_p05'), ('ar1', -0.4, 'comb_ar1_m04'),
-        ('ar1', 0.5, 'comb_ar1_p05')]
+        ('ar1', 0.5, 'comb_ar1_p05'), ('car', 0.3, 'comb_car_p03'), ('car', 0.8, 'comb_car_p08')]
 if __name__ == '__main__':
     base = os.path.dirname(os.path.abspath(__file__))
     for struct, rho, name in RUNS:

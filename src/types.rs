@@ -2196,7 +2196,7 @@ pub struct ResidualCorrelation {
 
 /// The correlation structure of a `correlation <kind>(RHO) by COL` line (#1081).
 ///
-/// Named after nlme's `corCompSymm` / `corAR1`.
+/// Named after nlme's `corCompSymm` / `corAR1` / `corCAR1`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidualSerialKind {
     /// Compound symmetry: every pair of rows in a block correlates by `ρ`.
@@ -2204,14 +2204,19 @@ pub enum ResidualSerialKind {
     /// First-order autoregressive on the time-ordered rows of a block: rows `a`
     /// and `b` positions apart correlate by `ρ^a−b`, whatever the time between them.
     Ar1,
+    /// Continuous-time first-order autoregressive (nlme's `corCAR1`): rows at data
+    /// times `t_a` and `t_b` correlate by `ρ^|t_a − t_b|`, so the correlation decays
+    /// with the time between them, not with how many rows lie in between.
+    Car1,
 }
 
 impl ResidualSerialKind {
-    /// The spelling the model file uses (`cs`, `ar1`).
+    /// The spelling the model file uses (`cs`, `ar1`, `car1`).
     pub fn keyword(self) -> &'static str {
         match self {
             ResidualSerialKind::Cs => "cs",
             ResidualSerialKind::Ar1 => "ar1",
+            ResidualSerialKind::Car1 => "car1",
         }
     }
 }

@@ -3592,10 +3592,11 @@ mod frozen_ebe_variance {
     /// #1081 T6: the inner η-gradient on the dense path under a `correlation` line,
     /// against central FD of the individual NLL — conditional (the `∂R/∂η` trace
     /// term, through the serial `∂R/∂f`) and frozen. Combined error, so the serial
-    /// off-diagonal moves with `f`; two arms of 3 and 2 rows, interleaved.
+    /// off-diagonal moves with `f`; two arms of 3 and 2 rows, interleaved, at time
+    /// gaps 1.5, 6 and 3, so `car1`'s `ρ^Δt` differs from `ar1`'s `ρ^lag`.
     #[test]
     fn serial_residual_inner_gradient_matches_fd() {
-        for kind in ["cs", "ar1"] {
+        for kind in ["cs", "ar1", "car1"] {
             let model = crate::parser::model_parser::parse_model_string(&format!(
                 "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  theta RHO(0.6, -0.4, 0.95) FIX\n  omega ETA_CL ~ 0.09 FIX\n  sigma PROP_ERR ~ 0.2 (sd) FIX\n  sigma ADD_ERR ~ 1.0 (sd) FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n",
             ))
