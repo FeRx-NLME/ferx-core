@@ -4873,6 +4873,10 @@ pub(crate) fn check_residual_correlation_value(
 /// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
 ///   of one block at the same time have no order; `car1` correlates them by
 ///   `ρ^0 = 1`, which makes `R` singular.
+/// * `E_RESIDUAL_CORRELATION_RESET` — under `ar1` / `car1`, a block whose rows sit
+///   on both sides of a stacked reset occasion (an EVID=3/4 record restarting TIME):
+///   its rows' TIMEs are on two clocks, so their order and the time between them are
+///   undefined (#1974 review r1 #3).
 fn check_residual_correlation(
     model: &CompiledModel,
     population: &Population,
@@ -4914,10 +4918,25 @@ fn check_residual_correlation(
     );
     let mut largest: Option<(usize, &Subject, usize)> = None;
     let mut tie: Option<(&Subject, usize, f64)> = None;
+    // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
+    let mut reset: Option<(&Subject, usize, usize)> = None;
     for subject in &population.subjects {
         for block in residual_blocks(model, subject) {
             if largest.is_none_or(|(n, _, _)| block.len() > n) {
                 largest = Some((block.len(), subject, block[0]));
+            }
+            if timed && reset.is_none() {
+                // A stacked reset occasion (EVID=3/4 restarting TIME) is shifted onto
+                // the engine's monotonic `obs_times`, while the readout clock keeps the
+                // TIME as written, so the two differ by one offset per segment.
+                let offset = |j: usize| subject.obs_times[j] - subject.readout_time(j);
+                let (a, o) = (block[0], offset(block[0]));
+                if let Some(&b) = block
+                    .iter()
+                    .find(|&&b| (offset(b) - o).abs() > 1e-9 * (1.0 + subject.obs_times[b].abs()))
+                {
+                    reset = Some((subject, a, b));
+                }
             }
             if timed && tie.is_none() {
                 let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
@@ -4927,6 +4946,23 @@ fn check_residual_correlation(
                 }
             }
         }
+    }
+
+    if let Some((subject, a, b)) = reset {
+        diags.push(Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_RESET",
+            format!(
+                "`{line}`: subject {} has rows at TIME {} and TIME {} in the block {} on either \
+                 side of a TIME reset (an EVID=3/4 record that restarts TIME). `{}` reads the \
+                 time between two rows of a block, and across a reset it is undefined. Add the \
+                 occasion column to `by` so that each occasion is its own block, or use `cs`.",
+                subject.id,
+                subject.readout_time(a),
+                subject.readout_time(b),
+                residual_block_key(model, subject, a),
+                serial.kind.keyword()
+            ),
+        ));
     }
 
     if let Some((subject, row, t)) = tie {

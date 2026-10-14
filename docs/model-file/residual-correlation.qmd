@@ -95,7 +95,10 @@ and is refused: bound it. A `car1` θ with a lower bound of 0 is estimated on th
 log scale, like any θ bounded below by 0, so it stays positive. Two rows of one
 block at the same `TIME` are refused under `ar1`, where they have no order, and
 under `car1`, where they correlate by `ρ⁰ = 1` and make `R` singular
-(`E_RESIDUAL_CORRELATION_TIES`). A line under
+(`E_RESIDUAL_CORRELATION_TIES`). Under both, a block may not span a stacked reset
+occasion (an `EVID=3/4` record that restarts `TIME`): its rows' times are then on
+two clocks, so their order and the time between them are undefined. Add the
+occasion column to `by`, or use `cs` (`E_RESIDUAL_CORRELATION_RESET`). A line under
 which every block is a single row couples nothing; `ρ` is then not in the
 likelihood and ferx says so (`W_RESIDUAL_CORRELATION_INERT`).
 

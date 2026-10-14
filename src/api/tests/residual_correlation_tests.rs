@@ -393,6 +393,65 @@ fn car1_refuses_tied_times_within_a_block() {
     );
 }
 
+/// #1974 review r1 #3: a block spanning a stacked reset occasion. The datareader
+/// shifts a TIME-restarting EVID=3/4 segment onto a monotonic `obs_times` and keeps
+/// the written TIME as the readout clock, so occasion 2 here (written 1, 3, 13) sits
+/// 100 after occasion 1 (written 0, 2, 12). The written TIMEs are distinct, so no
+/// tie hides the case. Refused under `ar1` and `car1`, with each sentence asserted;
+/// accepted under `cs` (no time read) and when ARM splits the occasions.
+#[test]
+fn time_keyed_structures_refuse_a_block_across_a_time_reset() {
+    let written = [0.0, 2.0, 12.0, 1.0, 3.0, 13.0];
+    let shifted = [0.0, 2.0, 12.0, 113.0, 115.0, 125.0];
+    let pop_with = |arms: [f64; 6]| {
+        let mut pop = population(&[&arms.iter().map(|&a| (a, 0.0)).collect::<Vec<_>>()]);
+        pop.subjects[0].obs_times = shifted.to_vec();
+        pop.subjects[0].obs_raw_times = written.to_vec();
+        pop
+    };
+    let spanning = pop_with([1.0; 6]);
+    for (kind, rho) in [("ar1", "(0.3, -0.4, 0.95)"), ("car1", "(0.3, 0.0, 0.95)")] {
+        let msg = one(
+            &check_model_data(&model(kind, rho), &spanning),
+            "E_RESIDUAL_CORRELATION_RESET",
+        )
+        .to_string();
+        assert!(
+            msg.contains(&format!(
+                "`correlation {kind}(RHO) by ARM`: subject S1 has rows at TIME 0 and TIME 1 in \
+                 the block ARM=1 on either side of a TIME reset (an EVID=3/4 record that \
+                 restarts TIME)."
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "`{kind}` reads the time between two rows of a block, and across a reset it is \
+                 undefined."
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "Add the occasion column to `by` so that each occasion is its own block, or use \
+                 `cs`."
+            ),
+            "{msg}"
+        );
+        let split = pop_with([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        let ok = check_model_data(&model(kind, rho), &split);
+        assert!(
+            with_code(&ok, "E_RESIDUAL_CORRELATION_RESET").is_empty(),
+            "{kind}: {ok:#?}"
+        );
+    }
+    let cs = check_model_data(&model("cs", "(0.3, -0.4, 0.95)"), &spanning);
+    assert!(
+        with_code(&cs, "E_RESIDUAL_CORRELATION_RESET").is_empty(),
+        "{cs:#?}"
+    );
+}
+
 /// `car1` needs ρ ≥ 0: a free lower bound of −0.2 and a `FIX` at −0.2 are refused
 /// with the reason and the `ar1` alternative; a lower bound of 0 and a `FIX` at 0.5
 /// are accepted, and `ar1` at the same −0.2 is accepted (the rule is `car1`'s).
