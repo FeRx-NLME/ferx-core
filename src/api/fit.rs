@@ -752,9 +752,7 @@ fn fit_unstamped(
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
-    if let Some(e) = check_analytic_readout_support(model, population) {
-        return Err(e);
-    }
+    first_error(&check_analytic_readout_support(model, population)).map_err(|e| e.to_string())?;
     // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
     // gap-time — require time-sorted records and do not support interval-censored /
     // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
@@ -767,9 +765,7 @@ fn fit_unstamped(
     // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
     // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
     #[cfg(feature = "survival")]
-    if let Some(e) = check_survival_tv_covariates(model, population) {
-        return Err(e);
-    }
+    first_error(&check_survival_tv_covariates(model, population)).map_err(|e| e.to_string())?;
     // The `TIME` axis of the same freeze: an ODE-accumulated hazard integrates the
     // disposition at its TIME=0 snapshot while the Gaussian half reads `$PK` at every
     // record, so a TIME-dependent CL/V/init would put the two halves of the objective on

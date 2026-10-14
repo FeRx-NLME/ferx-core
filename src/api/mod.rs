@@ -42,6 +42,7 @@ pub(crate) use validation::{
 // ── production submodules (peeled from this file) ──
 mod adaptive;
 mod covariate_stats;
+mod entry_refusals;
 mod fit;
 mod levels;
 mod output_columns;
@@ -57,6 +58,7 @@ pub use adaptive::{
 };
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+pub(crate) use entry_refusals::{adaptive_spec, adaptive_unsupported_diag};
 pub use fit::{fit, fit_from_files};
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
@@ -372,6 +374,10 @@ mod survival_time_dependent_pk_tests;
 #[cfg(test)]
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
+// #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(test)]
+#[path = "tests/entry_refusal_codes_tests.rs"]
+mod entry_refusal_codes_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]

@@ -43,15 +43,15 @@ use std::time::Instant;
 /// lookup misses and `variance_at` returns `NaN`, silently corrupting the assay
 /// draw. The combination has no coherent meaning today, so reject it loudly rather
 /// than emit NaN observations.
-pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), String> {
+pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
     if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
-        return Err(
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("error_model"),
             "adaptive-dosing simulation does not support a covariate-selected `[error_model]` \
              (`if (COV …) { … } else { … }`): the assay keys residual error by the monitored \
              compartment, but a selected error model keys endpoints by covariate branch. Use a \
-             single-endpoint error model for the monitored signal."
-                .to_string(),
-        );
+             single-endpoint error model for the monitored signal.",
+        ));
     }
     Ok(())
 }
@@ -69,7 +69,7 @@ fn check_adaptive_model_data(
     population: &Population,
 ) -> Result<(), EngineError> {
     first_error(&check_simulation_data(model, population))?;
-    Ok(reject_selected_error_for_adaptive(model)?)
+    reject_selected_error_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
@@ -91,23 +91,26 @@ fn check_adaptive_model_data(
 pub(crate) fn reject_unsupported_adaptive(
     model: &CompiledModel,
     _population: &Population,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
     if model.is_sde() {
-        return Err(
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("diffusion"),
             "adaptive-dosing simulation does not support stochastic (`[diffusion]` / SDE) \
              models: the reactive integrator is deterministic and would silently drop the \
-             process-noise term. Use the deterministic ODE model for adaptive dosing."
-                .to_string(),
-        );
+             process-noise term. Use the deterministic ODE model for adaptive dosing.",
+        ));
     }
     // The controller's `Dv` readings draw assay noise one row at a time
     // (`assay_resid_var`), which carries no between-row term: repeated readings in
     // one block would come out independent (#1081).
     if let Some(line) = crate::api::validation::residual_correlation_line(model) {
-        return Err(format!(
-            "adaptive-dosing simulation does not support `{line}`: the controller draws its \
-             assay noise one reading at a time, so readings in one block would be \
-             independent. Drop the line for the adaptive simulation."
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("error_model"),
+            format!(
+                "adaptive-dosing simulation does not support `{line}`: the controller draws its \
+                 assay noise one reading at a time, so readings in one block would be \
+                 independent. Drop the line for the adaptive simulation."
+            ),
         ));
     }
     // Time-varying covariates (and `TIME`-in-PK, #700), IOV (#701), and system-reset
@@ -261,9 +264,11 @@ where
     C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
 {
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
-        "simulate_adaptive requires an ODE model (the reactive driver runs on the ODE \
-         engine); this model has no [odes] block"
-            .to_string()
+        super::entry_refusals::adaptive_unsupported(
+            None,
+            "simulate_adaptive requires an ODE model (the reactive driver runs on the ODE \
+             engine); this model has no [odes] block",
+        )
     })?;
 
     // First the data checks every simulate entry point runs: a model covariate
@@ -286,11 +291,11 @@ where
     // defaults to empty), so reject it rather than return a silent no-op — the
     // same "never a silent wrong answer" contract as the other preconditions.
     if opts.decision_times.is_empty() {
-        return Err("simulate_adaptive requires a non-empty decision schedule \
+        return Err(super::entry_refusals::adaptive_options(
+            "simulate_adaptive requires a non-empty decision schedule \
              (`AdaptiveSimulateOptions::decision_times`); with no decision times the controller \
-             is never consulted and no dose is ever issued"
-            .to_string()
-            .into());
+             is never consulted and no dose is ever issued",
+        ));
     }
 
     // Programmatic path: cmt-based monitors (no compiled `observe` expression) and
@@ -411,7 +416,8 @@ where
     // `validate_increasing_finite`; guard the programmatic `simulate_adaptive` path
     // here too, at the shared funnel, with the *same* validator (finite + strictly
     // ascending ⇒ no duplicates) so the two paths cannot drift.
-    crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")?;
+    crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")
+        .map_err(super::entry_refusals::adaptive_options)?;
 
     use rand::SeedableRng;
 
@@ -468,7 +474,8 @@ where
                 .iter()
                 .any(|s| crate::pk::subject_needs_per_event_pk(model, s) || s.has_resets()))
     {
-        return Err(
+        return Err(super::entry_refusals::adaptive_unsupported(
+            None,
             "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
              TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) subjects. For a drifting \
              covariate or a per-occasion κ the exposure metric integrates its dense grid from a \
@@ -477,10 +484,8 @@ where
              trapezoid grid carries no node at the reset instant, so the one window straddling \
              the reset would integrate that discontinuity inaccurately. Drop `auc_target` (all \
              other outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-node-aware AUC."
-                .to_string()
-                .into(),
-        );
+             #700/#701/#716 for a per-event, reset-node-aware AUC.",
+        ));
     }
 
     // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
@@ -1197,20 +1202,16 @@ pub fn simulate_adaptive_from_spec(
     // monitored signal; an `opts` that *also* sets them is ambiguous (two
     // schedules, two monitors) — reject it rather than silently pick one.
     if !opts.decision_times.is_empty() {
-        return Err(
+        return Err(super::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its decision schedule from the \
-             [adaptive_dosing] block's `at`; leave `opts.decision_times` empty"
-                .to_string()
-                .into(),
-        );
+             [adaptive_dosing] block's `at`; leave `opts.decision_times` empty",
+        ));
     }
     if !opts.monitors.is_empty() {
-        return Err(
+        return Err(super::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its monitor from the [adaptive_dosing] \
-             block's `observe`; leave `opts.monitors` empty"
-                .to_string()
-                .into(),
-        );
+             block's `observe`; leave `opts.monitors` empty",
+        ));
     }
 
     // Compile the block against the model: the `observe` expression, the single
@@ -1219,7 +1220,7 @@ pub fn simulate_adaptive_from_spec(
     // the reactive driver runs on the ODE engine, so an analytical model is rejected
     // here rather than allowed to silently produce nothing.
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
-        .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
+        .map_err(|d| EngineError::from_diagnostic(d).in_context("simulate_adaptive_from_spec"))?;
     // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
     // model's selector) must be present too, not just the `observe` signal (#658) —
     // and a weighted κ / weighted residual must resolve to a positive weight before
@@ -1246,13 +1247,20 @@ pub fn simulate_adaptive_from_spec(
         } else {
             population.covariate_names.join(", ")
         };
-        return Err(format!(
-            "simulate_adaptive_from_spec: [adaptive_dosing] `observe` references covariate(s) \
-             not found in data (case-sensitive): {}. Available covariate columns: {}.",
-            missing.join(", "),
-            available
+        // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
+        return Err(EngineError::from_diagnostic(
+            Diagnostic::error(
+                "E_MISSING_COVARIATE",
+                format!(
+                    "[adaptive_dosing] `observe` references covariate(s) not found in data \
+                     (case-sensitive): {}. Available covariate columns: {}.",
+                    missing.join(", "),
+                    available
+                ),
+            )
+            .with_block("adaptive_dosing"),
         )
-        .into());
+        .in_context("simulate_adaptive_from_spec"));
     }
     let ode = model
         .ode_spec

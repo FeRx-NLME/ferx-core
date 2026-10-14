@@ -137,7 +137,8 @@ pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
     horizon: Option<f64>,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
+    use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
 
     // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
@@ -177,13 +178,12 @@ pub(crate) fn validate_tte_simulatable(
         match horizon {
             Some(h) if h.is_finite() && h > 0.0 => {}
             _ => {
-                return Err(
+                return Err(simulate_horizon(
                     "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
                      positive administrative horizon: set `[simulation] horizon` (or \
                      `SimulateOptions.horizon`). The recurrent event stream is generated up to \
-                     that horizon."
-                        .to_string(),
-                );
+                     that horizon.",
+                ));
             }
         }
         for subject in &population.subjects {
@@ -211,27 +211,27 @@ pub(crate) fn validate_tte_simulatable(
                 continue;
             }
             if rtte_cmts.len() > 1 {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation supports one recurrent stream per subject, but subject '{}' \
                      has RTTE endpoints on multiple CMTs ({:?}); multi-cause RTTE simulation is a \
                      later slice",
                     subject.id, rtte_cmts
-                ));
+                )));
             }
             if has_single_tte_sibling {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation does not support an RTTE cause combined with a competing \
                      single-event TTE cause on subject '{}'; simulate them separately",
                     subject.id
-                ));
+                )));
             }
             if !subject.reset_times.is_empty() {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
                      hazard clock mid-stream; selective per-state reset is a later slice); subject \
                      '{}' has resets",
                     subject.id
-                ));
+                )));
             }
         }
     }
@@ -258,12 +258,10 @@ pub(crate) fn validate_tte_simulatable(
     match horizon {
         Some(h) if h.is_finite() && h > 0.0 => {}
         _ => {
-            return Err(
+            return Err(simulate_horizon(
                 "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
                  administrative horizon: set `[simulation] horizon` (or `SimulateOptions.horizon`). \
-                 A drug-driven hazard can vanish, so there is no implicit observation window."
-                    .to_string(),
-            );
+                 A drug-driven hazard can vanish, so there is no implicit observation window."));
         }
     }
     for subject in &population.subjects {
@@ -275,24 +273,24 @@ pub(crate) fn validate_tte_simulatable(
             continue;
         }
         if !subject.reset_times.is_empty() {
-            return Err(format!(
+            return Err(tte_not_simulatable(format!(
                 "ODE-accumulated TTE simulation does not support EVID=3/4 resets (a full reset \
                  zeros the cumulative hazard mid-flight; selective per-state reset is a later \
                  slice); subject '{}' has resets",
                 subject.id
-            ));
+            )));
         }
         if let Some(ObsRecord::Event { entry_time, .. }) = subject
             .obs_records
             .iter()
             .find(|r| matches!(r, ObsRecord::Event { cmt, entry_time, .. } if is_ode_tte(cmt) && *entry_time > 0.0))
         {
-            return Err(format!(
+            return Err(tte_not_simulatable(format!(
                 "ODE-accumulated TTE simulation does not support left truncation \
                  (entry_time={entry_time} for subject '{}'); conditional sampling past entry is \
                  a deferred follow-up",
                 subject.id
-            ));
+            )));
         }
     }
     Ok(())
@@ -311,14 +309,17 @@ pub(crate) fn validate_tte_simulatable(
 pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
     if model.n_kappa > 0 && params.omega_iov.is_none() {
-        return Err(format!(
+        // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
+        // message stays #1019's, which names the remedy a rebuilt parameter set needs.
+        let message = format!(
             "model declares {} kappa (IOV) but the supplied parameters carry no omega_iov; \
              simulation draws one kappa vector per occasion from it. Rebuild the parameters \
              with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
             model.n_kappa
-        ));
+        );
+        return first_error(&[Diagnostic::error("E_PARAM_SHAPE", message)]);
     }
     Ok(())
 }
@@ -517,7 +518,7 @@ fn check_simulate_preconditions(
         model, population, theta,
     ))?;
     #[cfg(feature = "survival")]
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
     // snapshot for its event times (#1853; as fit() does).
     #[cfg(feature = "survival")]
@@ -615,7 +616,9 @@ pub fn simulate_with_options_diag(
     // subject at or before entry (#522 review).
     if let Some(h) = opts.horizon {
         if !h.is_finite() || h <= 0.0 {
-            return Err(format!("SimulateOptions.horizon must be finite and > 0 (got {h})").into());
+            return Err(super::entry_refusals::simulate_horizon(format!(
+                "SimulateOptions.horizon must be finite and > 0 (got {h})"
+            )));
         }
         // A horizon below a subject's TTE entry_time would censor it before it
         // entered observation (a row with time = h < entry_time). The
@@ -628,13 +631,12 @@ pub fn simulate_with_options_diag(
                     continue;
                 };
                 if *entry_time > h {
-                    return Err(format!(
+                    return Err(super::entry_refusals::simulate_horizon(format!(
                         "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
                          ({entry_time}); the administrative horizon must be ≥ every \
                          subject's entry time",
                         subject.id
-                    )
-                    .into());
+                    )));
                 }
             }
         }
@@ -698,23 +700,20 @@ pub fn simulate_with_options_diag(
     };
 
     if population.subjects.is_empty() {
-        return Err(
-            "propensity-score matching requires a non-empty observed population"
-                .to_string()
-                .into(),
-        );
+        return Err(super::entry_refusals::propensity_input(
+            "propensity-score matching requires a non-empty observed population",
+        ));
     }
     if let Some(s) = population
         .subjects
         .iter()
         .find(|s| s.observations.is_empty())
     {
-        return Err(format!(
+        return Err(super::entry_refusals::propensity_input(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
             s.id
-        )
-        .into());
+        )));
     }
     // A `DV = .` design template read by `read_population_for_simulation` (#957)
     // has rows but NaN observations, so the emptiness check above no longer
@@ -728,14 +727,13 @@ pub fn simulate_with_options_diag(
         .iter()
         .find(|s| s.observations.iter().any(|v| !v.is_finite()))
     {
-        return Err(format!(
+        return Err(super::entry_refusals::propensity_input(format!(
             "propensity-score matching requires finite observations for every subject \
              (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
              design template carries NaN placeholders — match against the observed dataset \
              instead",
             s.id
-        )
-        .into());
+        )));
     }
 
     // Fitted (posthoc) BSV etas depend only on the observed data + params, so
@@ -1199,13 +1197,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
-        return Err(
+        return Err(super::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
              discrete-state trajectory has no simulation path, so the Gaussian emitter would \
-             produce meaningless all-zero observations. CTMM simulation is a later slice."
-                .to_string()
-                .into(),
-        );
+             produce meaningless all-zero observations. CTMM simulation is a later slice.",
+        ));
     }
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,

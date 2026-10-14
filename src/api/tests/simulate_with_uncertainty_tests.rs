@@ -240,6 +240,21 @@ fn parse_binary_lp_cov_model() -> CompiledModel {
     parse_model_string(M).expect("binary + covariate-in-logit model parses")
 }
 
+/// The one refusal `check_survival_tv_covariates` returns for this input, asserted to carry
+/// `E_ENDPOINT_TV_COVARIATE` on the endpoint's own `block` (#1774); returns its message.
+/// Mutation — key the code or the block on anything but the endpoint arm (e.g. `event_model`
+/// for all four) and the binary / CTMM callers die naming the block.
+#[cfg(feature = "survival")]
+pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -> String {
+    let diags = check_survival_tv_covariates(model, pop);
+    assert_eq!(diags.len(), 1, "one refusal: {diags:?}");
+    let d = &diags[0];
+    assert!(d.is_error(), "{d:?}");
+    assert_eq!(d.code, "E_ENDPOINT_TV_COVARIATE", "{d:?}");
+    assert_eq!(d.block.as_deref(), Some(block), "{d:?}");
+    d.message.clone()
+}
+
 /// #741 analogue for the binary endpoint: a time-varying covariate in the `logit`
 /// predictor is rejected at fit setup — it would otherwise be silently frozen at the
 /// baseline snapshot (the bug the PR-807 review caught; the `types.rs` doc had claimed
@@ -255,8 +270,15 @@ fn binary_logit_time_varying_covariate_is_rejected() {
             HashMap::from([("X".to_string(), 2.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("a time-varying X in the logit must be rejected up front");
+    let msg = tv_refusal(&model, &pop, "binary_model");
+    assert_eq!(
+        msg,
+        "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
+         time-varying for subject `S1`. Time-varying covariates on the predictor are not yet \
+         supported — it is evaluated at the baseline covariate value, so the fit would silently \
+         use the wrong log-odds (#741). Use a time-constant (baseline) covariate for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("[binary_model]"), "must name the block: {msg}");
     assert!(msg.contains('X'), "must name the covariate: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
@@ -269,7 +291,7 @@ fn binary_logit_time_varying_covariate_is_rejected() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop_ok).is_none(),
+        check_survival_tv_covariates(&model, &pop_ok).is_empty(),
         "a constant logit covariate must not be rejected"
     );
 }
@@ -285,8 +307,16 @@ fn analytic_hazard_time_varying_covariate_is_rejected() {
             HashMap::from([("CRCL".to_string(), 60.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("a time-varying CRCL on the hazard must be rejected up front");
+    let msg = tv_refusal(&model, &pop, "event_model");
+    assert_eq!(
+        msg,
+        "[event_model] on CMT=2: the survival hazard references covariate `CRCL`, which is \
+         time-varying for subject `S1`. Time-varying covariates on a hazard are not yet \
+         supported — the analytic hazard is evaluated at the baseline covariate value, so the \
+         fit would silently use the wrong hazard (#741). Use a time-constant (baseline) \
+         covariate on the hazard for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("CRCL"), "must name the covariate: {msg}");
     assert!(msg.contains("S1"), "must name the subject: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
@@ -304,7 +334,7 @@ fn analytic_hazard_constant_covariate_is_accepted() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop).is_none(),
+        check_survival_tv_covariates(&model, &pop).is_empty(),
         "a constant hazard covariate must not be rejected"
     );
 }
@@ -324,7 +354,7 @@ fn analytic_hazard_ignores_tv_covariate_it_does_not_reference() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop).is_none(),
+        check_survival_tv_covariates(&model, &pop).is_empty(),
         "a time-varying covariate the hazard does not reference must not be rejected"
     );
 }
@@ -351,10 +381,57 @@ fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
             HashMap::from([("WT".to_string(), 90.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("ODE-accumulated hazard + any TV covariate must be rejected");
+    let msg = tv_refusal(&model, &pop, "event_model");
+    assert_eq!(
+        msg,
+        "[event_model] on CMT=2: the ODE-accumulated (joint PK-TTE) hazard is integrated with \
+         covariates frozen at their t=0 baseline, but covariate `WT` is time-varying for \
+         subject `S9`. Time-varying covariates on a drug-driven hazard are not yet supported \
+         (#741). Hold the covariate constant within each subject for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("WT"), "must name the covariate: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
+}
+
+/// The CTMM text (#759): a time-varying covariate on a transition intensity is refused on
+/// `markov_model` with the same code as the three survival texts above (#1774), and a
+/// constant one is accepted. No test pinned this text before; mutation — delete any of
+/// its sentences and the `assert_eq!` dies.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_intensity_time_varying_covariate_is_rejected() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n\
+         [markov_model]\n  type   = ctmm\n  cmt    = 2\n  states = [awake=0, asleep=1]\n  \
+         transition awake  -> asleep = exp(LQ01) * WT / 70\n  \
+         transition asleep -> awake  = exp(LQ10)\n",
+    )
+    .expect("CTMM + covariate-on-intensity model parses");
+    let snaps = |wt2: f64| {
+        vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), wt2)]),
+        ]
+    };
+    let msg = tv_refusal(
+        &model,
+        &tte_cov_snapshot_pop("S3", snaps(90.0)),
+        "markov_model",
+    );
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=2: a transition intensity references covariate `WT`, which is \
+         time-varying for subject `S3`. Time-varying covariates on the generator are not yet \
+         supported — the generator is evaluated at the baseline covariate value \
+         (time-homogeneous CTMM), so the fit would silently use the wrong intensity (#741). A \
+         drug-driven Q(t) is Phase 6; use a time-constant (baseline) covariate for now."
+    );
+    assert!(
+        check_survival_tv_covariates(&model, &tte_cov_snapshot_pop("S3", snaps(70.0))).is_empty(),
+        "a constant intensity covariate must not be rejected"
+    );
 }
 
 fn tiny_population() -> Population {
