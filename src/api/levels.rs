@@ -154,9 +154,52 @@ fn bind_levels_on_data(
     // contrast, so the verdict is the contrast resolution's.
     let measured = measure_levels(&base, model_text, &decls, &discovered, with_occasions)?;
 
+    // Two passes (#1963). A block's certificate counts every other block as it
+    // will be coded, so the blocks that absorb no random effect — whose
+    // resolution never reads the certificate — resolve first, independently;
+    // then each absorbing block, against those. Another absorbing block counts
+    // raw, every level: two absorbing blocks that each depend on the other's
+    // coding keep the conservative verdict. No second-pass block reads another
+    // second-pass block's result, so the outcome does not depend on the order
+    // the blocks are declared in.
+    let absorbing: Vec<bool> = decls
+        .iter()
+        .zip(&measured)
+        .map(|(decl, m)| !absorbed(decl, with_occasions, &m.spanned).is_empty())
+        .collect();
+    let mut resolved: Vec<Option<Result<(LevelContrast, Vec<usize>), String>>> =
+        vec![None; decls.len()];
+    for (i, ((decl, levels), m)) in decls.iter().zip(&discovered).zip(&measured).enumerate() {
+        if !absorbing[i] {
+            resolved[i] = Some(resolve_contrast(decl, levels, m, with_occasions, None));
+        }
+    }
+    let first_pass: Vec<Coded> = (0..decls.len())
+        .filter_map(|i| match &resolved[i] {
+            Some(Ok((contrast, groups))) => Some(Coded {
+                decl: &decls[i],
+                levels: &discovered[i],
+                contrast: *contrast,
+                groups: groups.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    for (i, ((decl, levels), m)) in decls.iter().zip(&discovered).zip(&measured).enumerate() {
+        if absorbing[i] {
+            resolved[i] = Some(resolve_contrast(
+                decl,
+                levels,
+                m,
+                with_occasions,
+                Some(&first_pass),
+            ));
+        }
+    }
+
     let mut bindings = LevelBindings::new();
-    for ((decl, levels), m) in decls.iter().zip(&discovered).zip(&measured) {
-        let (contrast, groups) = resolve_contrast(decl, levels, m, with_occasions)?;
+    for ((decl, levels), r) in decls.iter().zip(&discovered).zip(resolved) {
+        let (contrast, groups) = r.expect("both passes resolve every block")?;
         let binding = LevelBinding {
             labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
             groups,
@@ -2274,8 +2317,30 @@ enum Carried {
     Identified,
 }
 
+/// Another level block as the certificate counts it (#1963): resolved to
+/// `contrast` over `groups`, so among the other θ it contributes the
+/// directions that contrast leaves, not every level.
+struct Coded<'a> {
+    decl: &'a LevelBlockDecl,
+    levels: &'a [Level],
+    contrast: LevelContrast,
+    groups: Vec<usize>,
+}
+
 /// The certificate behind [`Carried`], for random effect `name` (`kappa`
 /// when it is one) of `decl` under `contrast`.
+///
+/// Another level block's θ are other θ too, and count as that block will be
+/// coded (#1963): each block in `others` — the blocks that absorb nothing,
+/// already resolved — by its contrast, from its raw level columns on the
+/// `none` model through its coding, the chain rule `∂y/∂β = ∂y/∂θ_level · C`
+/// this block's own coding applies. That is exact for a block that enters
+/// linearly; for one read through a nonlinear funnel it is the Jacobian at
+/// the probe point, the same approximation the own-block coding makes. A
+/// block not in `others` — one that absorbs a random effect itself — counts
+/// raw, every level, as under `none`: its own coding is not known yet, and
+/// raw can only refuse more.
+#[allow(clippy::too_many_arguments)]
 fn carried(
     model: &CompiledModel,
     decl: &LevelBlockDecl,
@@ -2284,6 +2349,7 @@ fn carried(
     name: &str,
     kappa: bool,
     contrast: LevelContrast,
+    others: &[Coded],
 ) -> Carried {
     let index = match kappa {
         false => model.eta_names.iter().position(|n| n == name),
@@ -2296,13 +2362,22 @@ fn carried(
         return Carried::Held;
     }
     let level_thetas = free_level_thetas(model, decl, levels);
-    let in_block: Vec<usize> = level_thetas.iter().flatten().copied().collect();
+    // The θ that enter coded: this block's, and every block's in `others`.
+    let other_levels: Vec<Vec<Option<usize>>> = others
+        .iter()
+        .map(|o| free_level_thetas(model, o.decl, o.levels))
+        .collect();
+    let coded: Vec<usize> = level_thetas
+        .iter()
+        .chain(other_levels.iter().flatten())
+        .flatten()
+        .copied()
+        .collect();
     let p = &model.default_params;
     let other_thetas: Vec<usize> = (0..model.n_theta)
-        .filter(|k| !p.theta_fixed.get(*k).copied().unwrap_or(false) && !in_block.contains(k))
+        .filter(|k| !p.theta_fixed.get(*k).copied().unwrap_or(false) && !coded.contains(k))
         .collect();
     let groups = assign_groups(decl, levels, contrast);
-    let column = level_index_column(decl.name());
     let lens: Vec<usize> = population
         .subjects
         .iter()
@@ -2360,6 +2435,52 @@ fn carried(
             diff_col(&all, h, &|d, th, _, _| th[k] += d)
         };
 
+        // A block's level columns (a `FIX` level moves nothing), coded by its
+        // contrast over its groups: under `none` every level, under `ref` the
+        // first level of each group dropped, under sum-to-zero each level but
+        // its group's last taken against that last one. `None` when anything
+        // is non-finite.
+        let coded_cols = |decl: &LevelBlockDecl,
+                          thetas: &[Option<usize>],
+                          groups: &[usize],
+                          contrast: LevelContrast|
+         -> Option<Vec<Pieces>> {
+            let column = level_index_column(decl.name());
+            let mut level_cols: Vec<Pieces> = Vec::with_capacity(thetas.len());
+            for (i, k) in thetas.iter().enumerate() {
+                let readers: Vec<usize> = all
+                    .iter()
+                    .copied()
+                    .filter(|&s| {
+                        indices_read(&population.subjects[s], &column).contains(&((i + 1) as f64))
+                    })
+                    .collect();
+                let col = match *k {
+                    Some(k) => {
+                        let h = SPAN_STEP * theta[k].abs().max(1.0);
+                        diff_col(&readers, h, &|d, th, _, _| th[k] += d)?
+                    }
+                    None => Pieces::new(),
+                };
+                level_cols.push(col);
+            }
+            let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
+            let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
+            let mut out = Vec::new();
+            for i in 0..level_cols.len() {
+                match contrast {
+                    LevelContrast::Unconstrained => out.push(level_cols[i].clone()),
+                    LevelContrast::Ref if !first(i) => out.push(level_cols[i].clone()),
+                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
+                        let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
+                        out.push(pieces_minus(&level_cols[i], &level_cols[j]));
+                    }
+                    _ => {}
+                }
+            }
+            Some(out)
+        };
+
         let mut cols: Vec<Pieces> = Vec::new();
         for &k in &other_thetas {
             let Some(c) = theta_col(k) else {
@@ -2367,45 +2488,17 @@ fn carried(
             };
             cols.push(c);
         }
-        let n_other = cols.len();
-        // The block's level columns (a `FIX` level moves nothing), coded by
-        // `contrast` over `groups`: under `ref` the first level of each group
-        // is dropped, under sum-to-zero each level but its group's last is
-        // taken against that last one.
-        let mut level_cols: Vec<Pieces> = Vec::with_capacity(levels.len());
-        for (i, k) in level_thetas.iter().enumerate() {
-            let readers: Vec<usize> = all
-                .iter()
-                .copied()
-                .filter(|&s| {
-                    indices_read(&population.subjects[s], &column).contains(&((i + 1) as f64))
-                })
-                .collect();
-            let col = match k {
-                Some(k) => {
-                    let h = SPAN_STEP * theta[*k].abs().max(1.0);
-                    let k = *k;
-                    match diff_col(&readers, h, &|d, th, _, _| th[k] += d) {
-                        Some(c) => c,
-                        None => return Carried::Held,
-                    }
-                }
-                None => Pieces::new(),
+        for (o, thetas) in others.iter().zip(&other_levels) {
+            let Some(c) = coded_cols(o.decl, thetas, &o.groups, o.contrast) else {
+                return Carried::Held;
             };
-            level_cols.push(col);
+            cols.extend(c);
         }
-        let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
-        let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
-        for i in 0..level_cols.len() {
-            match contrast {
-                LevelContrast::Ref if !first(i) => cols.push(level_cols[i].clone()),
-                LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
-                    let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
-                    cols.push(pieces_minus(&level_cols[i], &level_cols[j]));
-                }
-                _ => {}
-            }
-        }
+        let n_other = cols.len();
+        let Some(own_coded) = coded_cols(decl, &level_thetas, &groups, contrast) else {
+            return Carried::Held;
+        };
+        cols.extend(own_coded);
 
         // Per unit of each random effect: its column. A unit is a subject for
         // an η, an occasion group of a subject for a κ.
@@ -2506,6 +2599,8 @@ struct Certificate<'a> {
     population: &'a Population,
     name: &'a str,
     kappa: bool,
+    /// The blocks that absorb nothing, as they resolved (#1963).
+    others: &'a [Coded<'a>],
     seen: std::cell::RefCell<Vec<(LevelContrast, Carried)>>,
 }
 
@@ -2524,6 +2619,7 @@ impl Certificate<'_> {
                 self.name,
                 self.kappa,
                 contrast,
+                self.others,
             ),
         };
         self.seen.borrow_mut().push((contrast, verdict));
@@ -2771,11 +2867,16 @@ fn dead_levels_message(
 /// the nested block's explicit global contrasts follow the same certificate.
 /// Two absorbed random effects have no rescue either: within leaves each unit's
 /// mean to one of them, and the levels reproduce the other.
+///
+/// `others` is `None` for a block that absorbs nothing, which
+/// [`bind_levels_on_data`] resolves first and which never reads the
+/// certificate; for an absorbing block, the blocks resolved that way (#1963).
 fn resolve_contrast(
     decl: &LevelBlockDecl,
     levels: &[Level],
     measured: &Measured,
     population: &Population,
+    others: Option<&[Coded]>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
     let nested = decl.columns().len() >= 2;
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
@@ -2803,6 +2904,13 @@ fn resolve_contrast(
     }
     // Whether a contrast leaves the absorbed random effect a direction no other
     // θ carries (#1840): measured only when a branch below would refuse.
+    // A block resolved in the first pass absorbs nothing, so it never gets
+    // here: were it to, its verdict would read the other blocks before they
+    // resolve, and the passes would depend on declaration order.
+    debug_assert!(
+        absorbed.is_none() || others.is_some(),
+        "{block}: a block resolved in the first pass measured a certificate"
+    );
     let certificate = absorbed.as_ref().map(|found| Certificate {
         model: measured.model.as_deref(),
         decl,
@@ -2810,6 +2918,7 @@ fn resolve_contrast(
         population,
         name: found.name(),
         kappa: found.kappa(),
+        others: others.unwrap_or(&[]),
         seen: Default::default(),
     });
     let identified = |c: LevelContrast| certificate.as_ref().is_some_and(|k| k.identified(c));
