@@ -387,6 +387,28 @@ fn decorrelated_positive_message_under_ar1_is_exact() {
     );
 }
 
+/// Under `car1` the advice names the one structure that differs from it — `ar1`,
+/// which decays with the visit order rather than the time — and then the other two
+/// causes. Exact, so deleting either sentence reddens it.
+#[test]
+fn decorrelated_positive_message_under_car1_is_exact() {
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.3,
+        "correlation car1(RHO) by ARM",
+        crate::types::ResidualSerialKind::Car1,
+    )
+    .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         car1(RHO) by ARM` (Durbin-Watson = 1.30): the within-group correlation does not \
+         explain it. `car1` decays the correlation with the time between rows; if it \
+         follows the visit order instead, `ar1` models that. Otherwise the structural \
+         model may be missing dynamics, or the grouping may not cover the rows that are \
+         dependent."
+    );
+}
+
 #[test]
 fn decorrelated_negative_message_is_exact() {
     let msg =

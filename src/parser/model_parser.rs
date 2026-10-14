@@ -18197,7 +18197,7 @@ fn error_model_semicolon_hint(lines: &[String]) -> Option<String> {
 /// A `correlation <kind>(RHO) by COL[, COL…]` line of `[error_model]` (#1081),
 /// as written: names not yet resolved.
 struct CorrelationDecl {
-    /// `cs` / `ar1`, lowercased.
+    /// `cs` / `ar1` / `car1`, lowercased.
     kind_name: String,
     kind: crate::types::ResidualSerialKind,
     /// The θ named as `ρ`.
@@ -18209,6 +18209,7 @@ struct CorrelationDecl {
 const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
     ("cs", crate::types::ResidualSerialKind::Cs),
     ("ar1", crate::types::ResidualSerialKind::Ar1),
+    ("car1", crate::types::ResidualSerialKind::Car1),
 ];
 
 /// Take the `correlation …` line (#1081) out of an `[error_model]` block and

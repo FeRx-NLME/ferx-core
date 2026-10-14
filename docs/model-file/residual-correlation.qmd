@@ -19,7 +19,7 @@ them as independent overstates how much the data know. A `correlation` line in
 
 [error_model]
   DV ~ additive(ADD_ERR) weight = WPSE
-  correlation cs(RHO) by ARM         # or ar1(RHO)
+  correlation cs(RHO) by ARM         # or ar1(RHO), car1(RHO)
 ```
 
 ## What it means
@@ -42,9 +42,9 @@ independent; a block never spans two subjects.
 For one arm with visits at `t = 0, 2, 12`:
 
 ```
-cs:   C = [[1, ρ, ρ],         ar1:  C = [[1,  ρ,  ρ²],
-           [ρ, 1, ρ],                    [ρ,  1,  ρ ],
-           [ρ, ρ, 1]]                    [ρ², ρ,  1 ]]
+cs:   C = [[1, ρ, ρ],      ar1:  C = [[1,  ρ,  ρ²],    car1:  C = [[1,   ρ²,  ρ¹²],
+           [ρ, 1, ρ],                 [ρ,  1,  ρ ],                [ρ²,  1,   ρ¹⁰],
+           [ρ, ρ, 1]]                 [ρ², ρ,  1 ]]                [ρ¹², ρ¹⁰, 1  ]]
 ```
 
 - `cs` — **compound symmetry** (nlme's `corCompSymm`): every two rows of a block
@@ -52,6 +52,11 @@ cs:   C = [[1, ρ, ρ],         ar1:  C = [[1,  ρ,  ρ²],
 - `ar1` — **first-order autoregressive** (nlme's `corAR1`): rows `a` positions
   apart in the block's **time order** correlate by `ρ^a`, whatever the time
   between them. The order is the data's `TIME`, not the row order of the file.
+- `car1` — **continuous-time first-order autoregressive** (nlme's `corCAR1`): rows
+  at times `t_a` and `t_b` correlate by `ρ^|t_a − t_b|`, so the correlation decays
+  with the time between them, in the units of the data's `TIME`. `ρ` is the
+  correlation of two rows one time unit apart. On a regular visit grid one unit
+  apart, `car1` is `ar1`; on irregular visits they differ.
 
 With a combined error, both the proportional and the additive component
 correlate by the same `C`: `R_jk = C_jk (f_j f_k σ_p² + w_j w_k σ_a²)`.
@@ -63,7 +68,7 @@ correlation <structure>(THETA) by COLUMN
 correlation <structure>(THETA) by (COLUMN1, COLUMN2)
 ```
 
-- `<structure>` is `cs` or `ar1`. At most one `correlation` line per model.
+- `<structure>` is `cs`, `ar1` or `car1`. At most one `correlation` line per model.
 - The argument is a θ declared in `[parameters]`, and **only** the `correlation`
   line may read it: a θ that also appears in a model expression is refused, since
   its gradient would then split across two channels.
@@ -81,12 +86,19 @@ Admissible values are checked against the data before the fit
 |---|---|---|
 | `cs` | `(−1/(n_max − 1), 1)`, `n_max` the largest block | compound symmetry over `n` rows is a valid covariance only there |
 | `ar1` | `(−1, 1)` | |
-| either, `ρ` free | also within ±0.995 | as `|ρ| → 1` the rows of a block become collinear and `R` numerically singular |
+| `car1` | `[0, 1)` | `ρ^Δt` is undefined for a negative `ρ` and a non-integer `Δt`; for a negative correlation between consecutive rows use `ar1` |
+| any, `ρ` free | also within ±0.995 | as `|ρ| → 1` the rows of a block become collinear and `R` numerically singular |
 
 A free `ρ` is checked on its θ **bounds**, a `FIX`ed one on its value, so `FIX`
 lifts the ±0.995 rail. An unbounded θ keeps the default upper bound of `1e9`
-and is refused: bound it. Under `ar1`, two rows of one block at the same `TIME`
-have no order and are refused (`E_RESIDUAL_CORRELATION_TIES`). A line under
+and is refused: bound it. A `car1` θ with a lower bound of 0 is estimated on the
+log scale, like any θ bounded below by 0, so it stays positive. Two rows of one
+block at the same `TIME` are refused under `ar1`, where they have no order, and
+under `car1`, where they correlate by `ρ⁰ = 1` and make `R` singular
+(`E_RESIDUAL_CORRELATION_TIES`). Under both, a block may not span a stacked reset
+occasion (an `EVID=3/4` record that restarts `TIME`): its rows' times are then on
+two clocks, so their order and the time between them are undefined. Add the
+occasion column to `by`, or use `cs` (`E_RESIDUAL_CORRELATION_RESET`). A line under
 which every block is a single row couples nothing; `ρ` is then not in the
 likelihood and ferx says so (`W_RESIDUAL_CORRELATION_INERT`).
 
@@ -133,6 +145,11 @@ it.
 - **`ar1`** is for serial dependence: the correlation decays with the number of
   visits between two rows. On the naproxen data it fits 6 OFV points better than
   `cs` for the same one parameter.
+- **`car1`** is serial dependence that decays with elapsed time rather than visit
+  count, which is what irregularly spaced MBMA timepoints call for in principle.
+  Which of the two fits better is an empirical question: on the naproxen data
+  (visits between week 0 and week 13) `ar1` fits 10.9 OFV points better than
+  `car1`, for the same one parameter.
 - A `factor()` effect on the visit absorbs mean structure, not residual
   dependence; it is not a substitute.
 
@@ -150,7 +167,8 @@ naproxen data at NONMEM's optima:
 | `ar1` | 0.94 | 1.69 — silent |
 
 Compound symmetry correlates every two visits of an arm equally, and what is left
-is the decay with distance that `ar1` carries. The `IWRES` column is unchanged
+is the decay with distance that `ar1` carries. Under `car1` a warning names `ar1`
+as the alternative that decays with the visit order instead of the time. The `IWRES` column is unchanged
 (per-row standardised).
 
 A `by` column that no model expression reads is a required data column but is not
@@ -178,11 +196,16 @@ per arm at irregular times), at fixed parameters:
 | `cs`, ρ = −0.2 | −109.372389054 | −109.372389053 | 1.6e-9 |
 | `ar1`, ρ = 0.5 | −202.052628694 | −202.052628695 | 9.7e-10 |
 | `ar1`, ρ = −0.4 | −121.386775570 | −121.386775567 | 2.8e-9 |
+| `car1`, ρ = 0.8 | −181.691383297 | −181.691383296 | 1.2e-9 |
+| `car1`, ρ = 0.3 | −176.591803241 | −176.591803240 | 1.0e-9 |
+
+For `car1` the NONMEM factor reads each arm's visit times from the data,
+`L_jk = ρ^(t_j − t_k) · √(1 − ρ^(2(t_k − t_(k−1))))`.
 
 With a combined error (`combined(PROP_ERR, ADD_ERR) weight = WPSE`, proportional SD
 0.03), where `R` depends on the prediction and FOCEI's inner search sees the
-correlation's `∂R/∂f`, four probes (`cs` ρ = 0, 0.5; `ar1` ρ = −0.4, 0.5) agree with
-NONMEM's `METHOD=1 INTER` to 6.2e-8 at worst.
+correlation's `∂R/∂f`, six probes (`cs` ρ = 0, 0.5; `ar1` ρ = −0.4, 0.5; `car1`
+ρ = 0.3, 0.8) agree with NONMEM's `METHOD=1 INTER` to 6.2e-8 at worst.
 
 Estimated, every θ and ω free (`METHOD=1`, `$COV MATRIX=R`); ferx on Linux aarch64, the
 reference platform for fit numbers:
@@ -191,8 +214,10 @@ reference platform for fit numbers:
 |---|---|---|---|---|
 | `cs` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
 | `ar1` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
+| `car1` | −195.027166 | 0.813375 (0.037249) | −195.027165 | 0.813378 (0.037137) |
 
-against −173.508 for independent residuals: 26 and 32 OFV points for one
-parameter. The control streams, results and an independent closed-form oracle are
+against −173.508 for independent residuals: 26, 32 and 22 OFV points for one
+parameter. `car1`'s ρ̂ is per week, the data's `TIME` unit, started at 0.5 with a
+lower bound of 0. The control streams, results and an independent closed-form oracle are
 in `nonmem_anchor/residual_correlation/`; the tests are
 `tests/residual_correlation_nonmem_anchor.rs`.

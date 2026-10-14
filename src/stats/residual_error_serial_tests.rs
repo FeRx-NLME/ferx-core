@@ -1,4 +1,4 @@
-//! `correlation cs|ar1(RHO) by COL` — the serial residual blocks of #1081.
+//! `correlation cs|ar1|car1(RHO) by COL` — the serial residual blocks of #1081.
 //!
 //! One subject, two arms of three visits each, the rows **interleaved and out of
 //! time order** so that block membership and the AR(1) time order are both read
@@ -55,6 +55,7 @@ fn closed_form_c(kind: ResidualSerialKind, rho: f64, j: usize, k: usize) -> f64 
     match kind {
         ResidualSerialKind::Cs => rho,
         ResidualSerialKind::Ar1 => rho.powi((positions()[j] - positions()[k]).abs()),
+        ResidualSerialKind::Car1 => rho.powf((ROWS[j].1 - ROWS[k].1).abs()),
     }
 }
 
@@ -74,14 +75,25 @@ fn scaled_r(kind: ResidualSerialKind, rho: f64) -> DMatrix<f64> {
     )
 }
 
-/// T1: every entry of `R` equals `C_jk(ρ) · (f_j f_k σ_p² + w_j w_k σ_a²)`, for both
-/// structures and both signs of ρ. Dies on: an off-diagonal without the weight
-/// (unscaled loadings), a block spanning the two arms, AR(1) lags taken in row
-/// order instead of time order, CS read as AR(1) or the reverse.
+/// T1: every entry of `R` equals `C_jk(ρ) · (f_j f_k σ_p² + w_j w_k σ_a²)`, for
+/// every structure and both signs of ρ (`car1`: two positive ρ, its admissible
+/// range). Dies on: an off-diagonal without the weight (unscaled loadings), a block
+/// spanning the two arms, AR(1) lags taken in row order instead of time order, CS
+/// read as AR(1) or the reverse, `car1` lags taken as visit positions instead of
+/// time gaps (the visits are irregular: 0, 2, 12 and 0, 1, 5).
 #[test]
 fn serial_r_matches_the_closed_form() {
-    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1] {
-        for rho in [0.6, -0.3] {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
+        let rhos = if kind == ResidualSerialKind::Car1 {
+            [0.6, 0.3]
+        } else {
+            [0.6, -0.3]
+        };
+        for rho in rhos {
             let r = scaled_r(kind, rho);
             for j in 0..6 {
                 for k in 0..6 {
@@ -101,6 +113,11 @@ fn serial_r_matches_the_closed_form() {
     let r = scaled_r(ResidualSerialKind::Ar1, 0.6);
     let base04 = IPREDS[0] * IPREDS[4] * 0.04 + WEIGHTS[0] * WEIGHTS[4] * 2.25;
     assert_relative_eq!(r[(0, 4)], 0.6 * base04, max_relative = 1e-13);
+    // And `car1` straddles `ar1` on that pair: one visit apart but 10 time units,
+    // so ρ^10, not ρ^1 — by hand, not through `closed_form_c`.
+    assert_eq!((ROWS[0].1 - ROWS[4].1).abs(), 10.0);
+    let r = scaled_r(ResidualSerialKind::Car1, 0.6);
+    assert_relative_eq!(r[(0, 4)], 0.6f64.powi(10) * base04, max_relative = 1e-13);
 }
 
 /// A 2×2 by hand: additive SD 1, weights (1, 2), ρ = 0.5 ⇒ `R = [[1, 1], [1, 4]]`.
@@ -129,7 +146,11 @@ fn serial_r_two_by_two_by_hand() {
 #[test]
 fn serial_r_at_rho_zero_is_the_independent_r_bit_for_bit() {
     let none = ResidualCov::block_sigma(&[]);
-    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1] {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
         let scaled = |c| {
             compute_r_matrix_with_correlations_scaled_cov(
                 &spec(),
@@ -216,13 +237,17 @@ fn unit_weight_is_no_weight_on_an_additive_endpoint() {
 }
 
 /// T5: `∂R/∂f` and `∂²R/∂f²` against central differences of the `R` builder,
-/// bare and scaled, both structures. Combined error, so the proportional slot's
+/// bare and scaled, every structure. Combined error, so the proportional slot's
 /// slope loading is live — an additive-only fixture has `∂R/∂f ≡ 0` off the
 /// diagonal and could not see a missing serial term.
 #[test]
 fn serial_dr_and_d2r_match_finite_differences() {
     let n = 6;
-    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1] {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
         for scaled in [false, true] {
             let m = mult();
             let mopt = scaled.then_some(m.as_slice());

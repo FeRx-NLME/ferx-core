@@ -2526,6 +2526,7 @@ pub ferx_core::types::RateMode::ModeledDuration
 pub ferx_core::types::RateMode::ModeledRate
 pub enum ferx_core::types::ResidualSerialKind
 pub ferx_core::types::ResidualSerialKind::Ar1
+pub ferx_core::types::ResidualSerialKind::Car1
 pub ferx_core::types::ResidualSerialKind::Cs
 impl ferx_core::ResidualSerialKind
 pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
@@ -3888,6 +3889,7 @@ pub ferx_core::RateMode::ModeledDuration
 pub ferx_core::RateMode::ModeledRate
 pub enum ferx_core::ResidualSerialKind
 pub ferx_core::ResidualSerialKind::Ar1
+pub ferx_core::ResidualSerialKind::Car1
 pub ferx_core::ResidualSerialKind::Cs
 impl ferx_core::ResidualSerialKind
 pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str

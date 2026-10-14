@@ -6359,12 +6359,21 @@ mod outer_fd_fallback {
     /// correctly. Both sides asserted here, then the population gradient's ρ component
     /// against a central difference of the population objective. Dies if
     /// `has_cross_observation_residual` ignores the serial source: the paired subject
-    /// then takes the analytic gradient and reports `∂/∂ρ = 0`.
+    /// then takes the analytic gradient and reports `∂/∂ρ = 0`. Run for `cs` (ρ packed
+    /// on the linear scale, its lower bound negative) and `car1` (lower bound 0, so ρ
+    /// is log-packed and the FD step is on `log ρ`), whose `R` reads ρ through
+    /// `ρ^|Δt|` at the fixture's non-integer gaps.
     #[test]
     fn serial_rho_routes_paired_subjects_to_reconverged_fd() {
-        let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta RHO(0.4, -0.4, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(RHO) by ARM\n[fit_options]\n  method = focei\n",
-        )
+        for (kind, lower) in [("cs", "-0.4"), ("car1", "0.0")] {
+            serial_rho_routes_paired_subjects_case(kind, lower);
+        }
+    }
+
+    fn serial_rho_routes_paired_subjects_case(kind: &str, lower: &str) {
+        let model = crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta RHO(0.4, {lower}, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n",
+        ))
         .expect("model parses");
         let subject = |id: &str, arms: [f64; 6], scale: f64| {
             let mut s = Subject {
@@ -6417,7 +6426,7 @@ mod outer_fd_fallback {
                 true
             )
             .is_none(),
-            "a subject with a multi-row block must decline the analytic gradient"
+            "{kind}: a subject with a multi-row block must decline the analytic gradient"
         );
         assert!(
             subject_analytic_outer_gradient(
@@ -6429,7 +6438,7 @@ mod outer_fd_fallback {
                 true
             )
             .is_some(),
-            "a subject of singleton blocks must stay analytic"
+            "{kind}: a subject of singleton blocks must stay analytic"
         );
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         let g = population_gradient_sens_mixed(
@@ -6444,8 +6453,12 @@ mod outer_fd_fallback {
             OuterTrial::unknown(),
             &log,
         );
-        assert_eq!(log.declined_indices(), vec![0]);
-        // ρ is θ index 2, packed on the linear scale (its lower bound is negative).
+        assert_eq!(log.declined_indices(), vec![0], "{kind}");
+        // ρ is θ index 2: linear-packed under `cs`, log-packed under `car1`.
+        assert_eq!(
+            crate::estimation::parameterization::theta_packs_log(template.theta_lower[2]),
+            kind == "car1"
+        );
         let k = 2;
         let h = 1e-5;
         let ofv_at = |dx: f64| {
@@ -6457,11 +6470,18 @@ mod outer_fd_fallback {
                 .sum::<f64>()
         };
         let fd = (ofv_at(h) - ofv_at(-h)) / (2.0 * h);
-        assert!(g[k].is_finite() && fd.is_finite(), "g {} fd {fd}", g[k]);
-        assert!(fd.abs() > 1e-2, "fixture: ρ moves the objective ({fd})");
+        assert!(
+            g[k].is_finite() && fd.is_finite(),
+            "{kind}: g {} fd {fd}",
+            g[k]
+        );
+        assert!(
+            fd.abs() > 1e-2,
+            "{kind}: fixture: ρ moves the objective ({fd})"
+        );
         assert!(
             (g[k] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
-            "∂OFV/∂ρ: assembled {} vs FD {fd}",
+            "{kind}: ∂OFV/∂ρ: assembled {} vs FD {fd}",
             g[k]
         );
     }

@@ -4841,15 +4841,64 @@ fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> S
         .unwrap_or_default()
 }
 
+/// The `car1` negative-ρ refusal (#1081), shared by the fit-time range check (on the
+/// θ's bounds) and the simulate-time one (on its value). `what` names the offending
+/// number, e.g. "the lower bound of theta RHO is -0.2".
+fn car1_negative_rho_message(line: &str, what: &str) -> String {
+    format!(
+        "`{line}`: {what}, but `car1` correlates two rows by ρ^Δt, and ρ^Δt needs ρ ≥ 0 for a \
+         non-integer time gap Δt. Keep ρ at 0 or above. For a negative correlation between \
+         consecutive rows, use `ar1`."
+    )
+}
+
+/// The value-level `car1` range check for an entry point that scores or draws at the
+/// given parameters without `fit()`'s validation (#1974 review r1 #1): `simulate()`
+/// draws `C_jk = ρ^Δt`, which is NaN for a negative ρ at a non-integer gap, so a
+/// negative `car1` ρ would come back as NaN DVs rather than an error. Checked on the
+/// θ's value, since that is what is drawn at, whatever its bounds.
+pub(crate) fn check_residual_correlation_value(
+    model: &CompiledModel,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    else {
+        return Vec::new();
+    };
+    let v = params
+        .theta
+        .get(serial.rho_theta)
+        .copied()
+        .unwrap_or(f64::NAN);
+    if serial.kind != crate::types::ResidualSerialKind::Car1 || v >= 0.0 {
+        return Vec::new();
+    }
+    let rho = model
+        .theta_names
+        .get(serial.rho_theta)
+        .cloned()
+        .unwrap_or_default();
+    vec![Diagnostic::error(
+        "E_RESIDUAL_CORRELATION_RANGE",
+        car1_negative_rho_message(&line, &format!("theta {rho} is {v}")),
+    )]
+}
+
 /// Data-dependent admissibility of a `correlation` line (#1081).
 ///
 /// * `E_RESIDUAL_CORRELATION_RANGE` — `ρ`'s range must keep every block's `R`
 ///   positive definite: compound symmetry over `n` rows needs `ρ > −1/(n−1)`,
-///   `ar1` needs `|ρ| < 1`, and a free `ρ` stays inside the rail
+///   `ar1` needs `|ρ| < 1`, `car1` needs `0 ≤ ρ < 1` (`ρ^Δt` is undefined for a
+///   negative `ρ` and a non-integer `Δt`), and a free `ρ` stays inside the rail
 ///   [`RESIDUAL_CORRELATION_RAIL`]. Checked on the θ's bounds when it is free and
 ///   on its value when it is `FIX`ed.
 /// * `E_RESIDUAL_CORRELATION_TIES` — `ar1` orders a block by `TIME`, so two rows
-///   of one block at the same time have no order.
+///   of one block at the same time have no order; `car1` correlates them by
+///   `ρ^0 = 1`, which makes `R` singular.
+/// * `E_RESIDUAL_CORRELATION_RESET` — under `ar1` / `car1`, a block whose rows sit
+///   on both sides of a stacked reset occasion (an EVID=3/4 record restarting TIME):
+///   its rows' TIMEs are on two clocks, so their order and the time between them are
+///   undefined (#1974 review r1 #3).
 fn check_residual_correlation(
     model: &CompiledModel,
     population: &Population,
@@ -4884,15 +4933,34 @@ fn check_residual_correlation(
     };
     let mut diags = Vec::new();
 
-    // The largest block, and the first tie under `ar1`.
+    // The largest block, and the first tie under a time-keyed structure.
+    let timed = matches!(
+        serial.kind,
+        crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
+    );
     let mut largest: Option<(usize, &Subject, usize)> = None;
     let mut tie: Option<(&Subject, usize, f64)> = None;
+    // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
+    let mut reset: Option<(&Subject, usize, usize)> = None;
     for subject in &population.subjects {
         for block in residual_blocks(model, subject) {
             if largest.is_none_or(|(n, _, _)| block.len() > n) {
                 largest = Some((block.len(), subject, block[0]));
             }
-            if serial.kind == crate::types::ResidualSerialKind::Ar1 && tie.is_none() {
+            if timed && reset.is_none() {
+                // A stacked reset occasion (EVID=3/4 restarting TIME) is shifted onto
+                // the engine's monotonic `obs_times`, while the readout clock keeps the
+                // TIME as written, so the two differ by one offset per segment.
+                let offset = |j: usize| subject.obs_times[j] - subject.readout_time(j);
+                let (a, o) = (block[0], offset(block[0]));
+                if let Some(&b) = block
+                    .iter()
+                    .find(|&&b| (offset(b) - o).abs() > 1e-9 * (1.0 + subject.obs_times[b].abs()))
+                {
+                    reset = Some((subject, a, b));
+                }
+            }
+            if timed && tie.is_none() {
                 let mut times: Vec<f64> = block.iter().map(|&j| subject.readout_time(j)).collect();
                 times.sort_by(f64::total_cmp);
                 if let Some(w) = times.windows(2).find(|w| w[0] == w[1]) {
@@ -4902,13 +4970,36 @@ fn check_residual_correlation(
         }
     }
 
+    if let Some((subject, a, b)) = reset {
+        diags.push(Diagnostic::error(
+            "E_RESIDUAL_CORRELATION_RESET",
+            format!(
+                "`{line}`: subject {} has rows at TIME {} and TIME {} in the block {} on either \
+                 side of a TIME reset (an EVID=3/4 record that restarts TIME). `{}` reads the \
+                 time between two rows of a block, and across a reset it is undefined. Add the \
+                 occasion column to `by` so that each occasion is its own block, or use `cs`.",
+                subject.id,
+                subject.readout_time(a),
+                subject.readout_time(b),
+                residual_block_key(model, subject, a),
+                serial.kind.keyword()
+            ),
+        ));
+    }
+
     if let Some((subject, row, t)) = tie {
+        let why = if serial.kind == crate::types::ResidualSerialKind::Car1 {
+            "`car1` correlates two rows by ρ^|Δt|, so tied rows correlate perfectly (ρ^0 = 1) \
+             and R is singular."
+        } else {
+            "`ar1` orders a block's rows by TIME, so tied rows have no order and no lag between \
+             them."
+        };
         diags.push(Diagnostic::error(
             "E_RESIDUAL_CORRELATION_TIES",
             format!(
-                "`{line}`: subject {} has two rows at TIME {t} in the block {}. `ar1` orders a \
-                 block's rows by TIME, so tied rows have no order and no lag between them. Give \
-                 them distinct times, or use `cs`.",
+                "`{line}`: subject {} has two rows at TIME {t} in the block {}. {why} Give them \
+                 distinct times, or use `cs`.",
                 subject.id,
                 residual_block_key(model, subject, row)
             ),
@@ -4931,6 +5022,9 @@ fn check_residual_correlation(
                 )));
             }
         }
+    }
+    if serial.kind == crate::types::ResidualSerialKind::Car1 && lo < 0.0 {
+        diags.push(range(car1_negative_rho_message(&line, &what("lower"))));
     }
     if fixed && lo.abs() >= 1.0 {
         diags.push(range(format!(

@@ -1,20 +1,24 @@
-//! NONMEM anchor for a within-group residual correlation, `correlation cs|ar1(RHO)
-//! by ARM` (#1081).
+//! NONMEM anchor for a within-group residual correlation, `correlation
+//! cs|ar1|car1(RHO) by ARM` (#1081).
 //!
 //! ## The object
 //!
 //! The naproxen MBMA (Boucher & Bennetts 2018, `examples/mbma_naproxen.ferx`) on the
 //! natural DV scale, each arm's reported SE as a residual `weight =`, and the rows of
-//! one arm correlated: `R_arm = σ² · W C(ρ) W`, `C` compound-symmetric or AR(1) over
-//! the arm's visits. 18 studies (`ID`), 36 arms, 2–5 visits per arm at irregular
-//! times, so every block size from 2 to 5 is exercised and the AR(1) lags go to 4.
+//! one arm correlated: `R_arm = σ² · W C(ρ) W`, `C` compound-symmetric, AR(1) over
+//! the arm's visits, or continuous-time AR(1) over its visit *times*
+//! (`C_jk = ρ^|t_j − t_k|`). 18 studies (`ID`), 36 arms, 2–5 visits per arm at
+//! irregular times, so every block size from 2 to 5 is exercised, the AR(1) lags go
+//! to 4, and the `car1` gaps are not the visit lags (week 0, 2, 12 is lag 1 and 2
+//! but Δt 2 and 12).
 //!
 //! ## The NONMEM spelling (`nonmem_anchor/residual_correlation/*.ctl`)
 //!
 //! NONMEM has no residual-correlation record, so the same `R` is built by hand:
 //! `L2 = ARM` makes `EPS(1..5)` one shared vector per arm (`$SIGMA 1 FIX` ×5), and
 //! the row at visit `j` carries `RES = Σₖ Lⱼₖ(ρ)·EPS(k)`, `L` the Cholesky factor of
-//! the arm's correlation matrix in closed form. `ρ = THETA(8)`. The model is linear
+//! the arm's correlation matrix in closed form. `ρ = THETA(8)`; for `car1` the
+//! factor reads the arm's visit times `T1..T5` from the data. The model is linear
 //! in η with an additive error, so FOCE is the exact marginal, and a pure-Python
 //! closed form (`oracle.py`, in the anchor directory) agrees with NONMEM to
 //! ≤ 2e-13 on every evaluation probe below.
@@ -48,6 +52,8 @@ const PROBES: &[(&str, &str, f64, f64)] = &[
     ("cs_m02", "cs", -0.2, -109.372_389_054_464_69),
     ("ar1_p05", "ar1", 0.5, -202.052_628_693_591_57),
     ("ar1_m04", "ar1", -0.4, -121.386_775_569_796_82),
+    ("car_p08", "car1", 0.8, -181.691_383_296_860_49),
+    ("car_p03", "car1", 0.3, -176.591_803_240_544_78),
 ];
 
 /// Worst realised `|ferx − NONMEM|` over [`PROBES`]: 2.806e-9 (`ar1_m04`; macOS
@@ -148,12 +154,14 @@ fn cs_equals_an_arm_kappa_intercept() {
     assert!((cs - PROBES[1].3).abs() < PROBE_TOL);
 }
 
-/// NONMEM's estimates (`cs_est` / `ar1_est`, `METHOD=1`, every θ and ω free, ρ
-/// started at 0.3): `(kind, OBJ, ρ̂, SE(ρ̂) from $COV MATRIX=R)`. Both minimisations
-/// report `MINIMIZATION SUCCESSFUL`.
+/// NONMEM's estimates (`cs_est` / `ar1_est` / `car_est`, `METHOD=1`, every θ and ω
+/// free, ρ started at 0.3 — `car1` at 0.5): `(kind, OBJ, ρ̂, SE(ρ̂) from $COV
+/// MATRIX=R)`. All three minimisations report `MINIMIZATION SUCCESSFUL`. `car1`'s ρ̂
+/// is per week (the data `TIME` unit).
 const ESTIMATES: &[(&str, f64, f64, f64)] = &[
     ("cs", -199.734_575_047_940_30, 0.509_450, 0.077_591_7),
     ("ar1", -205.932_727_647_201_43, 0.597_282, 0.063_339_4),
+    ("car1", -195.027_166_348_762_39, 0.813_375, 0.037_248_6),
 ];
 
 /// The twin with every θ and ω free and ρ started where NONMEM started it, and
@@ -166,7 +174,12 @@ fn free_twin(kind: &str) -> String {
         .map(|l| {
             let t = l.trim_start();
             if t.starts_with("theta RHO(") {
-                "  theta RHO(0.3, -0.24, 0.99)".to_string()
+                // `car1` needs ρ ≥ 0, and starts where NONMEM's `car_est` did.
+                if kind == "car1" {
+                    "  theta RHO(0.5, 0.0, 0.99)".to_string()
+                } else {
+                    "  theta RHO(0.3, -0.24, 0.99)".to_string()
+                }
             } else if t.starts_with("theta ") || t.starts_with("omega ") {
                 l.trim_end().trim_end_matches("FIX").trim_end().to_string()
             } else {
@@ -185,8 +198,17 @@ fn free_twin(kind: &str) -> String {
 
 /// Bands from the realised error. Linux aarch64 (the reference platform):
 /// `cs` |ΔOFV| 1.2e-5, |Δρ̂| 6.1e-5, SE 0.05%; `ar1` |ΔOFV| 1e-6, |Δρ̂| 6e-6,
-/// SE 0.1%. macOS arm64: `cs` 1e-6 / 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
-/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% — ≥ 8× the worst of either platform.
+/// SE 0.1%; `car1` |ΔOFV| 1e-6, |Δρ̂| 3e-6, SE 0.30%. macOS arm64: `cs` 1e-6 /
+/// 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
+/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% (`car1` 2.5%) — ≥ 8× the worst realised error.
+/// `car1`'s SE sits 0.30% from NONMEM's, and a shared 1% bound would leave it 3.3×
+/// headroom. The gap is ferx's covariance step, not the likelihood and not ρ's log
+/// packing (#1974 review r1 #2, macOS arm64): the same −0.30% at NONMEM's own optimum
+/// (`covariance_at_the_nonmem_optimum_gives_its_se_of_rho`); log-packing `cs`/`ar1`'s ρ
+/// moves their SE by < 0.04%; and a central-FD Hessian of ferx's own OFV over all 10
+/// (θ, ω²) at NONMEM's optimum gives NONMEM's SE to ~1e-4 for all three kinds. The
+/// covariance step runs low on all three (`cs` −0.06%, `ar1` −0.11%, `car1` −0.30%);
+/// that is #1975.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -205,7 +227,8 @@ fn residual_correlation_fit_reaches_nonmem_estimates() {
         assert!(r.ofv.is_finite() && rho.is_finite() && se.is_finite());
         assert!((r.ofv - nm_ofv).abs() < 1e-3, "{kind}: OFV {}", r.ofv);
         assert!((rho - nm_rho).abs() < 5e-4, "{kind}: ρ̂ {rho}");
-        assert!((se - nm_se).abs() / nm_se < 0.01, "{kind}: SE(ρ̂) {se}");
+        let se_tol = if kind == "car1" { 0.025 } else { 0.01 };
+        assert!((se - nm_se).abs() / nm_se < se_tol, "{kind}: SE(ρ̂) {se}");
     }
 }
 
@@ -221,6 +244,12 @@ const AR1_EST: [f64; 10] = [
     0.557854,
 ];
 
+/// NONMEM's `car_est` optimum, same layout as [`CS_EST`].
+const CAR_EST: [f64; 10] = [
+    5.18040, 1.05510, 0.459088, 0.973999, 0.834837, 0.908636, -0.519755, 0.813375, 0.388628,
+    0.546406,
+];
+
 /// The free twin of `kind` started at a NONMEM optimum `est`.
 fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
     let names = [
@@ -232,7 +261,14 @@ fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
         "B_EMAX_TRT",
         "B_LET50_TRT",
     ];
-    let mut src = free_twin(kind).replace("theta RHO(0.3,", &format!("theta RHO({},", est[7]));
+    // `free_twin` starts ρ at 0.3, or at 0.5 under `car1`.
+    let mut src = free_twin(kind)
+        .replace("theta RHO(0.3,", &format!("theta RHO({},", est[7]))
+        .replace("theta RHO(0.5,", &format!("theta RHO({},", est[7]));
+    assert!(
+        src.contains(&format!("theta RHO({},", est[7])),
+        "{kind}: ρ moved to NONMEM's optimum"
+    );
     for (i, name) in names.iter().enumerate() {
         let decl = MODEL
             .lines()
@@ -260,24 +296,38 @@ fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
 /// T13: the covariance step at NONMEM's own optimum (one evaluation, every θ and ω
 /// free, `outer_maxiter = 0`). Covariance under a `correlation` line takes the FD
 /// Hessian route (`CovScopeDecline::ResidualCorrelations`), and SE(ρ̂) must be
-/// NONMEM's `$COV MATRIX=R` value. Realised (macOS arm64): SE 0.077541 against
-/// 0.077592, 0.07% (bound 0.5%). The objective is exact there too, so this is Tier 2.
+/// NONMEM's `$COV MATRIX=R` value. The objective is exact there too, so this is
+/// Tier 2. Realised (macOS arm64): `cs` SE 0.077541 against 0.077592, −0.07% (bound
+/// 0.5%); `car1` 0.0371379 against 0.0372486, −0.30% (bound 2.5%, the full-fit band) —
+/// the same gap the full fit shows, so the optimum is not where it comes from (#1974
+/// review r1 #2; the covariance step's bias is #1975).
 #[test]
 fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
-    let r = run(&at_optimum("cs", &CS_EST), Some(0), true);
-    assert!(
-        (r.ofv - ESTIMATES[0].1).abs() < 1e-4,
-        "at NONMEM's optimum: {}",
-        r.ofv
-    );
-    let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
-    eprintln!("SE(ρ̂) ferx {se:.6} NONMEM {:.6}", ESTIMATES[0].3);
-    assert!(se.is_finite(), "SE(ρ̂) {se}");
-    assert!(
-        (se - ESTIMATES[0].3).abs() / ESTIMATES[0].3 < 5e-3,
-        "SE(ρ̂) ferx {se} vs NONMEM {}",
-        ESTIMATES[0].3
-    );
+    for (kind, est, nm, tol) in [
+        ("cs", &CS_EST, ESTIMATES[0], 5e-3),
+        ("car1", &CAR_EST, ESTIMATES[2], 0.025),
+    ] {
+        assert_eq!(nm.0, kind);
+        let r = run(&at_optimum(kind, est), Some(0), true);
+        assert!(
+            (r.ofv - nm.1).abs() < 1e-4,
+            "{kind}: at NONMEM's optimum: {}",
+            r.ofv
+        );
+        let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
+        eprintln!(
+            "{kind}: OFV {:.9} SE(ρ̂) ferx {se:.7} NONMEM {:.7} ({:+.3}%)",
+            r.ofv,
+            nm.3,
+            100.0 * (se / nm.3 - 1.0)
+        );
+        assert!(se.is_finite(), "{kind}: SE(ρ̂) {se}");
+        assert!(
+            (se - nm.3).abs() / nm.3 < tol,
+            "{kind}: SE(ρ̂) ferx {se} vs NONMEM {}",
+            nm.3
+        );
+    }
 }
 
 /// #1081 follow-up: under a `correlation` line the Durbin–Watson statistic is taken
@@ -397,6 +447,8 @@ const COMB_PROBES: &[(&str, &str, f64, f64)] = &[
     ("comb_cs_p05", "cs", 0.5, -189.777_337_517_105_99),
     ("comb_ar1_m04", "ar1", -0.4, -130.742_944_153_769_29),
     ("comb_ar1_p05", "ar1", 0.5, -189.944_415_907_175_34),
+    ("comb_car_p03", "car1", 0.3, -164.480_733_697_776_77),
+    ("comb_car_p08", "car1", 0.8, -179.360_463_309_165_65),
 ];
 
 /// Worst realised `|ferx − NONMEM|` over [`COMB_PROBES`]: 6.2e-8 (`comb_cs_p05`,
