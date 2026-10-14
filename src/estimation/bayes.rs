@@ -19,9 +19,10 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
+use crate::estimation::bayes_mu_design::{within_bounds, DrawOutcome, MuDesign};
 use crate::estimation::mixture::combine_subject;
 use crate::estimation::outer_optimizer::OuterResult;
-use crate::estimation::saem::{mh_kappa_steps, mh_steps};
+use crate::estimation::saem::{mh_kappa_steps, mh_steps_componentwise, mh_steps_with_proposal};
 use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
@@ -176,6 +177,393 @@ const RHAT_CONVERGENCE_THRESHOLD: f64 = 1.01;
 #[inline]
 fn should_sample_kappa_block(n_kappa: usize, omega_iov: Option<&OmegaMatrix>) -> bool {
     n_kappa > 0 && omega_iov.is_some()
+}
+
+/// Target acceptance of the block random-walk η move (Roberts, Gelman &
+/// Gilks 1997).
+const ETA_BLOCK_TARGET_ACCEPT: f64 = 0.234;
+/// Bounds on an adapted η step scale (block or componentwise).
+const ETA_SCALE_MIN: f64 = 1e-4;
+const ETA_SCALE_MAX: f64 = 100.0;
+/// Ridge added to a subject's empirical η covariance before its Cholesky, so a
+/// near-singular estimate still yields a usable proposal.
+const ETA_SHAPE_RIDGE: f64 = 1e-8;
+
+/// One multiplicative Robbins–Monro-style step of an adaptive scale toward a
+/// target acceptance rate: `scale · exp(rate − target)`, clamped. Unchanged
+/// when nothing was proposed.
+fn adapt_scale(scale: f64, accepted: u64, proposed: u64, target: f64) -> f64 {
+    if proposed == 0 {
+        return scale;
+    }
+    let rate = accepted as f64 / proposed as f64;
+    (scale * (rate - target).exp()).clamp(ETA_SCALE_MIN, ETA_SCALE_MAX)
+}
+
+/// Per-subject adaptive proposal of the Metropolis η kernel (#1626).
+///
+/// The pre-#1626 kernel used one step scale for every subject and every
+/// direction, applied to `chol(Ω)` — the prior's shape. Its acceptance target
+/// was then met by shrinking the step to the most tightly identified direction
+/// of the most informative subject, and the weakly identified directions
+/// crawled. Here each subject carries
+///
+/// - its own block step scale (target 0.234),
+/// - its own per-η componentwise scales (target 0.44, SAEM's
+///   `CW_TARGET_ACCEPT`), and
+/// - from mid-warmup, its own proposal shape: the Cholesky factor of its
+///   running η covariance (Haario et al. 2001, per subject), with the block
+///   scale reset to the optimal `2.38/√d` when the shape first switches.
+///
+/// Adaptation runs in warmup only, so the sampling phase is a fixed kernel.
+#[derive(Clone)]
+struct EtaProposal {
+    scale: f64,
+    acc: u64,
+    prop: u64,
+    cw_scales: Vec<f64>,
+    cw_acc: Vec<u64>,
+    cw_prop: u64,
+    n: usize,
+    mean: Vec<f64>,
+    m2: DMatrix<f64>,
+    /// `None` until enough draws exist: the proposal is then `chol(Ω)`.
+    shape: Option<DMatrix<f64>>,
+}
+
+impl EtaProposal {
+    fn new(n_eta: usize) -> Self {
+        Self {
+            scale: 0.6,
+            acc: 0,
+            prop: 0,
+            cw_scales: vec![1.0; n_eta],
+            cw_acc: vec![0; n_eta],
+            cw_prop: 0,
+            n: 0,
+            mean: vec![0.0; n_eta],
+            m2: DMatrix::zeros(n_eta, n_eta),
+            shape: None,
+        }
+    }
+
+    /// Welford update of the running η mean and scatter.
+    fn observe(&mut self, eta: &[f64]) {
+        self.n += 1;
+        let nc = self.n as f64;
+        let d = self.mean.len();
+        let delta: Vec<f64> = (0..d).map(|j| eta[j] - self.mean[j]).collect();
+        for j in 0..d {
+            self.mean[j] += delta[j] / nc;
+        }
+        for a in 0..d {
+            for b in 0..d {
+                self.m2[(a, b)] += delta[a] * (eta[b] - self.mean[b]);
+            }
+        }
+    }
+
+    /// End of an adaptation window: move every scale toward its target, and
+    /// (when `build_shape`) rebuild the proposal shape from the running
+    /// covariance once there are more than `2·d` draws.
+    fn adapt(&mut self, build_shape: bool) {
+        self.scale = adapt_scale(self.scale, self.acc, self.prop, ETA_BLOCK_TARGET_ACCEPT);
+        for (s, &a) in self.cw_scales.iter_mut().zip(&self.cw_acc) {
+            *s = adapt_scale(
+                *s,
+                a,
+                self.cw_prop,
+                crate::estimation::saem::CW_TARGET_ACCEPT,
+            );
+        }
+        self.acc = 0;
+        self.prop = 0;
+        self.cw_acc.iter_mut().for_each(|a| *a = 0);
+        self.cw_prop = 0;
+        let d = self.mean.len();
+        if build_shape && d > 0 && self.n > 2 * d {
+            let mut cov = &self.m2 / ((self.n - 1) as f64);
+            for j in 0..d {
+                cov[(j, j)] += ETA_SHAPE_RIDGE;
+            }
+            if let Some(ch) = Cholesky::new(cov) {
+                if self.shape.is_none() {
+                    self.scale = 2.38 / (d as f64).sqrt();
+                }
+                self.shape = Some(ch.l());
+            }
+        }
+    }
+}
+
+/// The chains' starting η: each subject's EBE at the initial parameters, with
+/// a subject whose EBE is missing or non-finite started at 0 instead.
+fn ebe_start_etas(ebes: &[DVector<f64>], n_subjects: usize, n_eta: usize) -> Vec<Vec<f64>> {
+    (0..n_subjects)
+        .map(|i| match ebes.get(i) {
+            Some(e) if e.len() == n_eta && e.iter().all(|v| v.is_finite()) => {
+                e.iter().copied().collect()
+            }
+            _ => vec![0.0; n_eta],
+        })
+        .collect()
+}
+
+/// What one chain hands back: its recorded draws, the per-subject η sum and
+/// the count behind it, its post-warmup HMC divergences, and how its conjugate
+/// mu-reference draws fared.
+///
+/// Named rather than written inline so the `chain_outputs` binding stays one
+/// line: spelled out, rustfmt wraps the annotation and re-indents the whole
+/// per-chain closure, which turns a 340-line change into a 1,600-line diff.
+type ChainOutput = (Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64, ConjugateTally);
+
+/// A chain accepting below this share of its conjugate draws is reported rather
+/// than left silent. Not a correctness threshold: the move is
+/// Metropolis-corrected, so every rejection is a valid step. It is deliberately
+/// a *sensitive* one — an affine design accepts essentially every draw (measured
+/// `|log α| ≤ 5e-12`), so this is far below "healthy MH acceptance" and reads as
+/// "this move has stopped doing its job", not "this chain mixes slowly".
+const CONJUGATE_ACCEPT_REPORT_THRESHOLD: f64 = 0.5;
+
+/// How the conjugate mu-reference move fared in one chain, over its **sampling**
+/// sweeps.
+///
+/// Warmup is excluded deliberately. Early sweeps sit far from the mode with a
+/// half-adapted Ω, so a coefficient that passes near a declared bound is
+/// rejected there and never again; counting those would fire this report on a
+/// fit whose sampling phase is healthy, which is the one phase the posterior is
+/// read from.
+///
+/// The move's exactness does not rest on the structural affinity proof in
+/// `bayes_mu_design` — the Metropolis correction makes it valid for any typical
+/// value, and a design the proof does not recognise simply accepts less often.
+/// That makes the acceptance rate the **only** observable that distinguishes
+/// "the conjugate move is drawing the typical values" from "it proposes and is
+/// rejected every sweep". The second is not a slow random walk but a **frozen**
+/// coordinate: a θ this move owns is removed from `pop_coords`, so nothing else
+/// proposes it, and a chain that never accepts leaves it at its initial value
+/// for the whole run. Without this tally that distinction is invisible, in a
+/// run and in a regression.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConjugateTally {
+    moved: u64,
+    /// The draw left a declared `theta_lower` / `theta_upper` box.
+    rejected_out_of_bounds: u64,
+    /// The Metropolis ratio rejected it.
+    rejected_metropolis: u64,
+    /// No conditional could be formed (non-PD Ω or precision, non-finite μ).
+    skipped: u64,
+}
+
+impl ConjugateTally {
+    fn record(&mut self, outcome: DrawOutcome) {
+        let slot = match outcome {
+            DrawOutcome::Moved => &mut self.moved,
+            DrawOutcome::RejectedOutOfBounds => &mut self.rejected_out_of_bounds,
+            DrawOutcome::RejectedMetropolis => &mut self.rejected_metropolis,
+            DrawOutcome::Skipped => &mut self.skipped,
+        };
+        *slot += 1;
+    }
+
+    fn total(&self) -> u64 {
+        self.moved + self.rejected_out_of_bounds + self.rejected_metropolis + self.skipped
+    }
+
+    /// `None` when the move never ran in this chain (no design, or a mixture).
+    fn accept_rate(&self) -> Option<f64> {
+        match self.total() {
+            0 => None,
+            n => Some(self.moved as f64 / n as f64),
+        }
+    }
+
+    /// The largest rejection count and its tag, or `None` when nothing was
+    /// rejected.
+    ///
+    /// `max_by_key` keeps the LAST of several equal maxima, so the array order
+    /// is the tie-break and reads backwards: bounds beats Metropolis beats
+    /// skipped, because "widen the bound" is the one of the three a user can
+    /// act on directly. A tie means two causes are equally live and either
+    /// sentence is true; what matters is that the pick is fixed rather than
+    /// incidental.
+    fn largest_rejection(&self) -> Option<(u64, char)> {
+        [
+            (self.skipped, 's'),
+            (self.rejected_metropolis, 'm'),
+            (self.rejected_out_of_bounds, 'b'),
+        ]
+        .into_iter()
+        .filter(|&(n, _)| n > 0)
+        .max_by_key(|&(n, _)| n)
+    }
+}
+
+/// The low-acceptance report for the conjugate mu-reference move, or `None`
+/// when every chain that ran it accepted often enough (or none did).
+///
+/// **Judged per chain, not on the pooled total.** Pooling hides exactly the
+/// failure worth reporting: with four chains, one that accepts nothing and
+/// three that accept everything pool to 75% and say nothing, while the
+/// coordinates that move owns are frozen for a quarter of the posterior sample.
+/// Two dead chains out of four pool to exactly 50%, which this gate calls
+/// healthy. So the worst chain decides, and the message carries the pooled rate
+/// beside it so a one-chain problem is not read as a whole-run one.
+///
+/// The largest rejection category picks the advice, because the three have
+/// nothing in common: a bound is the user's own declaration, a Metropolis
+/// rejection says the Gaussian conditional is a poor proposal for this typical
+/// value, and a skip says the conditional could not be formed at all. It is
+/// reported as the largest group with its count, never as "most" — with three
+/// causes the largest can be well under half.
+fn conjugate_accept_warning(per_chain: &[ConjugateTally]) -> Option<String> {
+    let (worst_chain, worst, rate) = per_chain
+        .iter()
+        .enumerate()
+        .filter_map(|(c, t)| t.accept_rate().map(|r| (c, t, r)))
+        .min_by(|a, b| a.2.total_cmp(&b.2))?;
+    if rate >= CONJUGATE_ACCEPT_REPORT_THRESHOLD {
+        return None;
+    }
+    let ran = per_chain.iter().filter(|t| t.total() > 0).count();
+    let pooled_moved: u64 = per_chain.iter().map(|t| t.moved).sum();
+    let pooled_total: u64 = per_chain.iter().map(|t| t.total()).sum();
+    // Counts, not a bare percentage: at 49.6% a rounded "50%" reads as the
+    // threshold itself, and the warning looks like a bug in its own gate.
+    let mut w = format!(
+        "Bayes: the conjugate mu-reference theta move accepted {} of {} post-warmup draws \
+         ({:.0}%) in chain {} — its worst — and {} of {} across the {} chain(s) that ran it.",
+        worst.moved,
+        worst.total(),
+        100.0 * rate,
+        worst_chain + 1,
+        pooled_moved,
+        pooled_total,
+        ran
+    );
+    w.push_str(
+        " A theta this move draws is excluded from the random-walk (theta, sigma) block, so \
+         nothing else proposes it: where the move does not accept, those thetas do not move at \
+         all.",
+    );
+    if let Some((n, tag)) = worst.largest_rejection() {
+        w.push_str(&match tag {
+            'b' => format!(
+                " Its largest group of rejections ({n}) left a declared theta_lower / \
+                 theta_upper box. A draw from the Gaussian conditional can overshoot a bound \
+                 whose posterior is interior, so widen the bound if it was a guard rather than \
+                 a constraint."
+            ),
+            's' => format!(
+                " Its largest group ({n}) could not form the conditional at all (a \
+                 non-positive-definite Omega or a non-finite typical value), so those sweeps \
+                 contributed nothing."
+            ),
+            _ => format!(
+                " Its largest group of rejections ({n}) came from the Metropolis correction, \
+                 which means the Gaussian conditional is a poor proposal for this typical \
+                 value."
+            ),
+        });
+    }
+    w.push_str(
+        " The Metropolis step stays target-correct — every rejection is a valid step — but a \
+         coordinate that barely moves cannot deliver a usable posterior, so treat its estimate \
+         and interval as unconverged.",
+    );
+    Some(w)
+}
+
+/// What samples the parameter with the worst split-R̂, for the
+/// non-convergence warning (#1626).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WorstRhatDriver {
+    /// A θ in the random-walk (θ, σ) block. `mu_referenced`: it is a log
+    /// mu-reference anchor, so it is here only because the conjugate move is
+    /// off for the model as a whole (some η is not covered).
+    RandomWalkTheta { mu_referenced: bool },
+    /// An Ω entry, or a θ drawn by the conjugate mu-reference move: both move
+    /// only as fast as the η block lets them.
+    EtaDriven,
+    /// σ, Ω_iov, or a FIX-ed θ.
+    Other,
+}
+
+/// Classify the recorded parameter `p` (θ, then Ω's free entries from
+/// `n_theta`, then σ and Ω_iov from `sig_start`).
+fn worst_rhat_driver(
+    p: usize,
+    n_theta: usize,
+    sig_start: usize,
+    pop_coords: &[PopCoord],
+    conjugate_theta: &std::collections::HashSet<usize>,
+    mu_pairs: &[Option<usize>],
+) -> WorstRhatDriver {
+    if p < n_theta {
+        if pop_coords
+            .iter()
+            .any(|c| matches!(*c, PopCoord::Theta { idx, .. } if idx == p))
+        {
+            WorstRhatDriver::RandomWalkTheta {
+                mu_referenced: mu_pairs.contains(&Some(p)),
+            }
+        } else if conjugate_theta.contains(&p) {
+            WorstRhatDriver::EtaDriven
+        } else {
+            WorstRhatDriver::Other
+        }
+    } else if p < sig_start {
+        WorstRhatDriver::EtaDriven
+    } else {
+        WorstRhatDriver::Other
+    }
+}
+
+/// The non-convergence warning. `mh_on_hmc_capable` is true when the η block
+/// ran the Metropolis kernel on a model the HMC kernel could serve (analytical
+/// PK, no IOV, no mixture).
+fn rhat_warning(
+    max_rhat: f64,
+    worst: &str,
+    driver: WorstRhatDriver,
+    mh_on_hmc_capable: bool,
+) -> String {
+    let mut w = format!(
+        "Bayes: max split-R-hat = {max_rhat:.3} (> {RHAT_CONVERGENCE_THRESHOLD}) on {worst} — \
+         chains may not have converged."
+    );
+    match driver {
+        WorstRhatDriver::RandomWalkTheta { mu_referenced } => {
+            w.push_str(&format!(
+                " {worst} is sampled by the random-walk (theta, sigma) block, not by the \
+                 conjugate mu-reference move, and that block mixes slowly when the data pin the \
+                 parameter at fixed eta."
+            ));
+            w.push_str(if mu_referenced {
+                " It is already log mu-referenced, but the conjugate move runs only when every \
+                 eta is log mu-referenced or carries a linear covariate mu-reference; \
+                 mu-reference the remaining etas, or increase bayes_warmup / bayes_iters."
+            } else {
+                " To let the conjugate move draw it, make it a log mu-referenced typical value \
+                 (P_i = theta * exp(eta_i)) or a coefficient that enters log P_i linearly through \
+                 subject-constant covariates, such as (WT/70)^theta; otherwise increase \
+                 bayes_warmup / bayes_iters."
+            });
+        }
+        WorstRhatDriver::EtaDriven if mh_on_hmc_capable => {
+            w.push_str(&format!(
+                " {worst} moves with the random effects, which the Metropolis-Hastings eta \
+                 kernel sampled."
+            ));
+            w.push_str(
+                " This model qualifies for the HMC eta kernel: set n_leapfrog (e.g. 10) to use \
+                 it, or increase bayes_warmup / bayes_iters.",
+            );
+        }
+        _ => w.push_str(" Increase bayes_warmup / bayes_iters."),
+    }
+    w
 }
 
 /// One coordinate of the population random-walk block.
@@ -403,16 +791,19 @@ fn impose_omega_structure(
 /// Full MCMC Bayesian estimation entry point (Path A: Gibbs-within-HMC).
 ///
 /// Per sweep, per chain:
-///   1. η block — `mh_steps` (block random-walk preconditioned by `chol(Ω)`),
-///      sampling `ηᵢ | θ, Ω, σ, κ, y` for each subject;
+///   1. η block — per-subject adaptive block random walk plus componentwise
+///      sweeps (`EtaProposal`), or HMC when `n_leapfrog > 0`, sampling
+///      `ηᵢ | θ, Ω, σ, κ, y` for each subject from its EBE start;
 ///   1b. κ block (IOV models) — `mh_kappa_steps` sampling each per-occasion
 ///      `κᵢₖ | η, θ, Ω, Ω_iov, y`;
 ///   2. Ω block — conjugate inverse-Wishart draw from `S = Σ ηᵢηᵢᵀ`, with the
 ///      structural `free_mask` / fixed entries re-imposed;
 ///   2c. Ω_iov block (IOV) — conjugate inverse-Wishart draw from `Σᵢ Σₖ κᵢₖκᵢₖᵀ`;
-///   2b. mu-ref θ block — exact Gaussian full conditional (when every η is a
-///      non-fixed log mu-ref); 3. remaining (θ, σ) — componentwise + adaptive
-///      joint Metropolis, objective `Σᵢ individual_nll` (η, Ω, κ held fixed).
+///   2b. mu-ref θ block — Gaussian full conditional of the typical values and
+///      the linear covariate coefficients as an MH proposal, corrected on the
+///      real likelihood (`MuDesign`, when every η is covered); 3. remaining (θ, σ) — componentwise + adaptive joint
+///      Metropolis, objective `Σᵢ individual_nll` (η, Ω, κ held fixed), with
+///      out-of-bounds θ proposals rejected.
 ///
 /// IOV (per-occasion κ) is supported for **zero-mean kappas** (`κ ~ N(0, Ω_iov)`,
 /// the `exp(η + κ)` form); kappa mu-references are rejected.
@@ -480,20 +871,25 @@ pub fn run_bayes(
     // target by the step-scale controller, and final-estimate distance against a
     // long-run reference — and the evidence that a low count is safe rests on
     // SAEM's *componentwise* kernel carrying the dense case (issue #1466). This
-    // sampler has only the block kernel, and its quality is read as posterior
-    // mixing (R̂, ESS), which none of that measured. Lowering it here would be
-    // a change to Bayes justified by a SAEM benchmark, so it waits for its own.
+    // sampler's quality is read as posterior mixing (R̂, ESS), which none of
+    // that measured. Lowering it here would be a change to Bayes justified by a
+    // SAEM benchmark, so it waits for its own.
     let n_eta_mh =
         crate::estimation::saem::resolve_n_mh_steps_bayes(options.saem_n_mh_steps).max(1);
+    // Componentwise sweeps after each subject's block moves (#1626) — SAEM's
+    // second kernel (#1466), sized by the same rule. A single-coordinate move
+    // with its own adapted step reaches the weakly identified directions
+    // (V1, Q, V2, KA of a two-compartment oral model) that a block step sized
+    // for the tight ones cannot. Zero for a single η, where it would repeat the
+    // block move.
+    let n_cw_sweeps = crate::estimation::saem::componentwise_sweeps(n_eta_mh, n_eta);
     let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
     let verbose = options.verbose;
 
     // Mu-referenced (log) θ↔η map: mu_pairs[eta_idx] = Some(theta_idx) when that
-    // η is the log-deviation of θ (`P_i = θ·exp(η_i)`). When EVERY η is a
-    // non-fixed log mu-ref, the whole θ-mean vector is drawn from its exact
-    // Gaussian full conditional (the hierarchical-normal Gibbs move) instead of
-    // the random-walk block — without it the RW barely moves θ (the data pins θ
-    // at fixed η) and the chains do not mix.
+    // η is the log-deviation of θ (`P_i = θ·exp(η_i)`). Only the partial
+    // mu-referencing advisory reads it; the conjugate move resolves its own
+    // design below.
     let mut mu_pairs: Vec<Option<usize>> = vec![None; n_eta];
     for (ei, ename) in model.eta_names.iter().enumerate() {
         if let Some(mr) = model.mu_refs.get(ename) {
@@ -504,18 +900,21 @@ pub fn run_bayes(
             }
         }
     }
-    let full_mu_ref = n_eta > 0
-        && (0..n_eta).all(|j| match mu_pairs[j] {
-            Some(ti) => !init_params.theta_fixed.get(ti).copied().unwrap_or(false),
-            None => false,
-        });
-    let conjugate_theta: std::collections::HashSet<usize> = if full_mu_ref {
-        mu_pairs.iter().filter_map(|&o| o).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    // The conjugate Gaussian θ move requires EVERY η to be a non-fixed log
-    // mu-reference. When only some are (partial mu-referencing), the conjugate
+    // The conjugate move's design (#1626): every η needs a plain log anchor or
+    // an affine covariate mu-reference. A covariate mu-reference whose typical
+    // value is linear in log θ / θ — `TVCL·(WT/70)^θ_WT·exp(η)` — joins the
+    // move, so its coefficients are drawn jointly with the typical values from
+    // their Gaussian full conditional instead of by the random walk, which the
+    // data pin at fixed η. Groups are left out under a mixture: the
+    // class-switched typical value has not been derived for them.
+    let mu_design = MuDesign::build(model, population, init_params, model.mixture.is_none());
+    let conjugate_theta: std::collections::HashSet<usize> = mu_design
+        .as_ref()
+        .map(|d| d.theta_indices().into_iter().collect())
+        .unwrap_or_default();
+    // The conjugate Gaussian θ move requires EVERY η to be covered (a non-fixed
+    // log anchor or an affine covariate mu-reference). When only some are
+    // (partial mu-referencing), the conjugate
     // move is disabled and those θ fall back to the random-walk block, which
     // mixes poorly (the data pins θ at fixed η). Flag it so a high R̂ has an
     // actionable cause rather than looking like a generic non-convergence.
@@ -525,7 +924,7 @@ pub fn run_bayes(
             None => false,
         })
         .count();
-    let partial_mu_ref = n_log_mu_ref > 0 && !full_mu_ref;
+    let partial_mu_ref = n_log_mu_ref > 0 && mu_design.is_none();
 
     // ----- population RW coordinates (free θ not handled conjugately, then σ) -----
     let mut pop_coords: Vec<PopCoord> = Vec::new();
@@ -590,14 +989,14 @@ pub fn run_bayes(
     // `∂NLL/∂η` (no autodiff). HMC is BSV-only (kappa-unaware), so IOV models always
     // use the MH eta kernel.
     let n_leapfrog = options.saem_n_leapfrog;
-    let using_hmc = n_leapfrog > 0
-        && model.ode_spec.is_none()
+    let hmc_capable = model.ode_spec.is_none()
         && model.tv_fn.is_some()
         && n_kappa == 0
         // Mixture (#985): the η target is the class-marginal log-sum-exp, whose
         // gradient is a pmix-weighted average of per-class gradients; the HMC
         // Dual2 kernel is single-class, so use the marginal MH kernel instead.
         && model.mixture.is_none();
+    let using_hmc = n_leapfrog > 0 && hmc_capable;
     // Warn rather than silently downgrading: a user who asked for HMC gets the MH
     // kernel here, and `n_divergent = 0` would otherwise read as "HMC ran cleanly".
     let hmc_disabled_by_mixture = n_leapfrog > 0 && model.mixture.is_some();
@@ -633,7 +1032,32 @@ pub fn run_bayes(
     // including its RNG and posterior-eta accumulator; collecting an indexed
     // parallel iterator preserves chain order and therefore bitwise results
     // across Rayon worker counts.
-    let chain_outputs: Vec<Option<(Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64)>> = (0..n_chains)
+    // Start every chain's η at the subjects' empirical Bayes estimates at the
+    // initial parameters (#1626). From η = 0 a subject whose posterior has a
+    // second, negligible-mass mode (the KA ↔ distribution flip-flop of a
+    // two-compartment oral model) can fall into it during warmup, and no
+    // random-walk kernel ever climbs back out: on `two_cpt_oral_base` one
+    // subject sat at a flip-flop mode e^-19.6 below the main one for the whole
+    // run, which is the R-hat ≈ 1.2 that longer chains never moved. The EBE is
+    // the main mode. Mixture models keep η = 0: their EBE is per class.
+    let eta_start: Vec<Vec<f64>> = if model.mixture.is_none() {
+        let (ebes, _, _, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            model,
+            population,
+            init_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            None,
+            None,
+            0,
+            0,
+        );
+        ebe_start_etas(&ebes, n_subjects, n_eta)
+    } else {
+        vec![vec![0.0; n_eta]; n_subjects]
+    };
+
+    let chain_outputs: Vec<Option<ChainOutput>> = (0..n_chains)
         .into_par_iter()
         .map(|chain| {
             let mut rng =
@@ -646,6 +1070,10 @@ pub fn run_bayes(
                 (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
             let mut eta_record_count = 0u64;
             let mut n_divergent_total = 0u64;
+            let mut conj_tally = ConjugateTally::default();
+            // One-shot latch for the baseline freshness check below.
+            #[cfg(debug_assertions)]
+            let mut baseline_checked = false;
 
             // Chain state.
             let mut theta = init_params.theta.clone();
@@ -656,7 +1084,7 @@ pub fn run_bayes(
                 init_params.omega.eta_names.clone(),
                 init_params.omega.diagonal,
             );
-            let mut etas: Vec<Vec<f64>> = vec![vec![0.0; n_eta]; n_subjects];
+            let mut etas: Vec<Vec<f64>> = eta_start.clone();
 
             // IOV state: per-subject, per-occasion kappa vectors (empty when no
             // IOV, which routes `subject_nll` to the plain kernel). One occasion
@@ -704,9 +1132,15 @@ pub fn run_bayes(
             let mut rw_scales = vec![0.1_f64; n_pop];
             let mut acc_pop = vec![0u64; n_pop];
             let mut prop_pop = vec![0u64; n_pop];
+            // Global η step: the HMC leapfrog step and the mixture MH kernel.
             let mut eta_scale = 0.6_f64;
             let mut acc_eta = 0u64;
             let mut prop_eta = 0u64;
+            // Per-subject proposals of the block + componentwise MH η kernel
+            // (#1626): each subject adapts its own step, and from mid-warmup
+            // its own posterior-shaped proposal.
+            let mut eta_props: Vec<EtaProposal> =
+                (0..n_subjects).map(|_| EtaProposal::new(n_eta)).collect();
             // Cumulative η-accept counters for the progress display only (the
             // adaptation counters above are reset every window, so they read ~0 right
             // after a reset).
@@ -763,6 +1197,11 @@ pub fn run_bayes(
                             schedules[i].as_ref(),
                         )
                     })
+                    .collect();
+
+                // Componentwise proposal SD, √Ω_jj (shared by every subject).
+                let cw_sd: Vec<f64> = (0..n_eta)
+                    .map(|j| omega_cur.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt())
                     .collect();
 
                 // ---- 1. η block ----
@@ -828,7 +1267,8 @@ pub fn run_bayes(
                             let kappas_opt =
                                 omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
                             mh_scratch.begin_subject(model, &population.subjects[i], &theta, n_eta);
-                            mh_steps(
+                            let ep = &mut eta_props[i];
+                            let (na, nll_block) = mh_steps_with_proposal(
                                 &mut etas[i],
                                 nll[i],
                                 &population.subjects[i],
@@ -836,14 +1276,42 @@ pub fn run_bayes(
                                 &theta,
                                 &omega_cur,
                                 &sigma,
-                                eta_scale,
+                                ep.shape.as_ref().unwrap_or(&omega_cur.chol),
+                                ep.scale,
                                 None,
                                 &mut rng,
                                 n_eta_mh,
                                 &mut mh_scratch,
                                 schedules[i].as_ref(),
                                 kappas_opt,
-                            )
+                            );
+                            ep.acc += na as u64;
+                            ep.prop += n_eta_mh as u64;
+                            if n_cw_sweeps > 0 {
+                                let (acc_cw, _n_prop, nll_cw) = mh_steps_componentwise(
+                                    &mut etas[i],
+                                    nll_block,
+                                    &population.subjects[i],
+                                    model,
+                                    &theta,
+                                    &omega_cur,
+                                    &sigma,
+                                    &ep.cw_scales,
+                                    &cw_sd,
+                                    &mut rng,
+                                    n_cw_sweeps,
+                                    &mut mh_scratch,
+                                    schedules[i].as_ref(),
+                                    kappas_opt,
+                                );
+                                for (slot, a) in ep.cw_acc.iter_mut().zip(&acc_cw) {
+                                    *slot += *a as u64;
+                                }
+                                ep.cw_prop += n_cw_sweeps as u64;
+                                (na, nll_cw)
+                            } else {
+                                (na, nll_block)
+                            }
                         };
                         nll[i] = nll_new;
                         acc_eta += na as u64;
@@ -997,71 +1465,21 @@ pub fn run_bayes(
                     }
                 }
 
-                // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
-                // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
-                // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N). Draw the
-                // shift s = η̄ + chol(Ω/N)·z, set θ ← θ·exp(s), and re-centre
-                // η_i ← η_i − s so each individual parameter logφ_i = μ + η_i is
-                // unchanged (the data likelihood is invariant; only the η-prior
-                // moves). This is an always-accepted Gibbs move and is what makes
-                // the chains mix.
-                if full_mu_ref {
-                    let mut eta_bar = vec![0.0; n_eta];
-                    for e in &etas {
-                        for j in 0..n_eta {
-                            eta_bar[j] += e[j];
-                        }
-                    }
-                    for v in eta_bar.iter_mut() {
-                        *v /= n_subjects as f64;
-                    }
-                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
-                    let lz = &omega_cur.chol * DVector::from_column_slice(&z);
-                    let inv_sqrt_n = 1.0 / (n_subjects as f64).sqrt();
-                    let s: Vec<f64> = (0..n_eta)
-                        .map(|j| eta_bar[j] + inv_sqrt_n * lz[j])
-                        .collect();
-                    // The η re-centering must subtract the shift *actually applied* to
-                    // log θ, not the raw drawn shift `s`. When a θ bound clamps the
-                    // move, the applied log-shift is smaller than `s[j]`; subtracting
-                    // the full `s[j]` would break the logφ_i = log θ + η_i invariance,
-                    // silently changing the data likelihood with no MH correction.
-                    let mut s_applied = s.clone();
-                    for j in 0..n_eta {
-                        if let Some(ti) = mu_pairs[j] {
-                            let lo = init_params.theta_lower.get(ti).copied().unwrap_or(f64::MIN);
-                            let hi = init_params.theta_upper.get(ti).copied().unwrap_or(f64::MAX);
-                            // Clamp in log space (equivalent for positive θ) so the
-                            // applied shift is exact when no bound is active.
-                            let lo_ln = if lo > 0.0 { lo.ln() } else { f64::NEG_INFINITY };
-                            let hi_ln = if hi > 0.0 && hi.is_finite() {
-                                hi.ln()
-                            } else {
-                                f64::INFINITY
-                            };
-                            let old_ln = theta[ti].max(TINY).ln();
-                            let new_ln = (old_ln + s[j]).clamp(lo_ln, hi_ln);
-                            theta[ti] = new_ln.exp();
-                            s_applied[j] = new_ln - old_ln;
-                        }
-                    }
-                    for e in etas.iter_mut() {
-                        for j in 0..n_eta {
-                            e[j] -= s_applied[j];
-                        }
-                    }
-                }
-
-                // Refresh the cached per-subject NLL before the (θ,σ) block uses it
-                // as the Metropolis baseline. Blocks 2/2c/2b drew a new Ω / Ω_iov and
-                // (for mu-ref) re-centered (θ, η), so the cached `nll` still carries
-                // the pre-draw / pre-recenter η-prior, κ-prior, and log|Ω| terms.
-                // Block 3 recomputes only the *proposal* NLL, so a stale baseline
-                // leaves those terms uncancelled — a constant per-sweep offset δ on
-                // every θ/σ accept that biases σ and non-mu-ref θ. Recompute so the
-                // ratio is exact. (Unconditional when block 3 runs: cheaper to always
-                // refresh than to track which of the three blocks fired.)
-                if n_pop > 0 {
+                // Refresh the cached per-subject NLL. Blocks 2/2c drew a new Ω /
+                // Ω_iov, so the cached `nll` still carries the pre-draw η-prior,
+                // κ-prior and log|Ω| terms. Two consumers need it exact:
+                //
+                // - block 2b scores its Metropolis ratio against it (it evaluates
+                //   only the *proposed* state, and keeps `nll` in step itself —
+                //   see `MuDesign::draw`);
+                // - block 3 likewise recomputes only the *proposal* NLL, so a
+                //   stale baseline leaves those terms uncancelled — a constant
+                //   per-sweep offset δ on every θ/σ accept that biases σ and
+                //   non-mu-ref θ.
+                //
+                // (Unconditional when either runs: cheaper to always refresh than
+                // to track which of the earlier blocks fired.)
+                if n_pop > 0 || mu_design.is_some() {
                     for i in 0..n_subjects {
                         nll[i] = subject_nll(
                             model,
@@ -1075,6 +1493,89 @@ pub fn run_bayes(
                             &mut scratch,
                             schedules[i].as_ref(),
                         );
+                    }
+                }
+
+                // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
+                // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
+                // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N); with
+                // covariate coefficients that enter log P_i linearly it is the
+                // Gaussian regression conditional of `MuDesign`. The draw is a
+                // proposal: it re-centres η to hold every design φ_i, and is
+                // accepted by Metropolis–Hastings on the real target
+                // (`−Σ subject_nll`, the same likelihood every block scores), so
+                // it is exact for any typical value; on an affine design whose
+                // data depend on θ only through φ, the ratio is 1 and it is the
+                // Gibbs draw. A draw outside a θ bound is rejected, where the old
+                // move clamped it. This is what makes the chains mix.
+                if let Some(design) = mu_design.as_ref() {
+                    // The baseline `draw` scores against must describe the state the
+                    // chain is actually in — the refresh above, not a vector left
+                    // over from before the Ω draw. That is otherwise an argument
+                    // about block order with nothing to fail on: measured on this
+                    // branch, moving the refresh back below this block leaves all 68
+                    // bayes tests green while shifting the two-compartment covariate
+                    // OFV from −2300.345 to −2305.302 and every θ in its third digit.
+                    //
+                    // Checked once per chain, so the cost is one population pass per
+                    // chain per run, and only where `debug_assert` is live — which
+                    // includes the `ci-cov` profile the per-PR coverage jobs build
+                    // (#1248).
+                    #[cfg(debug_assertions)]
+                    if !baseline_checked {
+                        baseline_checked = true;
+                        for i in 0..n_subjects {
+                            let fresh = subject_nll(
+                                model,
+                                &population.subjects[i],
+                                &theta,
+                                &etas[i],
+                                &kappas[i],
+                                &omega_cur,
+                                omega_iov_cur.as_ref(),
+                                &sigma,
+                                &mut scratch,
+                                schedules[i].as_ref(),
+                            );
+                            debug_assert_eq!(
+                                nll[i], fresh,
+                                "subject {i}: the conjugate move was handed a stale NLL \
+                                 baseline — the refresh must run after the Omega blocks and \
+                                 before this one, for every model that has a design"
+                            );
+                        }
+                    }
+                    let mut subject_nlls = |th: &[f64], es: &[Vec<f64>]| -> Vec<f64> {
+                        (0..n_subjects)
+                            .map(|i| {
+                                subject_nll(
+                                    model,
+                                    &population.subjects[i],
+                                    th,
+                                    &es[i],
+                                    &kappas[i],
+                                    &omega_cur,
+                                    omega_iov_cur.as_ref(),
+                                    &sigma,
+                                    &mut scratch,
+                                    schedules[i].as_ref(),
+                                )
+                            })
+                            .collect()
+                    };
+                    let (outcome, _log_alpha) = design.draw(
+                        &mut theta,
+                        &mut etas,
+                        &omega_cur,
+                        &init_params.theta_lower,
+                        &init_params.theta_upper,
+                        population,
+                        &mut rng,
+                        &mut nll,
+                        &mut subject_nlls,
+                    );
+                    if sweep >= n_warmup {
+                        conj_tally.record(outcome);
                     }
                 }
 
@@ -1106,6 +1607,20 @@ pub fn run_bayes(
                             sigma[idx].max(TINY).ln()
                         };
                         let u_new = u_old + rw_scales[c] * rng.sample::<f64, _>(StandardNormal);
+                        // A θ outside its declared bounds has zero posterior
+                        // density: reject without evaluating (#1626).
+                        if is_theta {
+                            let v = if log { u_new.exp() } else { u_new };
+                            if !within_bounds(
+                                v,
+                                idx,
+                                &init_params.theta_lower,
+                                &init_params.theta_upper,
+                            ) {
+                                prop_pop[c] += 1;
+                                continue;
+                            }
+                        }
 
                         // Mutate the single coordinate in place (no full θ/σ vector
                         // clone per move) and restore it on reject.
@@ -1169,22 +1684,35 @@ pub fn run_bayes(
                                 PopCoord::Sigma { idx } => sigma_prop[idx] = up.exp(),
                             }
                         }
-                        let nll_prop: Vec<f64> = (0..n_subjects)
-                            .map(|i| {
-                                subject_nll(
-                                    model,
-                                    &population.subjects[i],
-                                    &theta_prop,
-                                    &etas[i],
-                                    &kappas[i],
-                                    &omega_cur,
-                                    omega_iov_cur.as_ref(),
-                                    &sigma_prop,
-                                    &mut scratch,
-                                    schedules[i].as_ref(),
-                                )
-                            })
-                            .collect();
+                        let in_bounds = pop_coords.iter().all(|c| match *c {
+                            PopCoord::Theta { idx, .. } => within_bounds(
+                                theta_prop[idx],
+                                idx,
+                                &init_params.theta_lower,
+                                &init_params.theta_upper,
+                            ),
+                            PopCoord::Sigma { .. } => true,
+                        });
+                        let nll_prop: Vec<f64> = if !in_bounds {
+                            Vec::new()
+                        } else {
+                            (0..n_subjects)
+                                .map(|i| {
+                                    subject_nll(
+                                        model,
+                                        &population.subjects[i],
+                                        &theta_prop,
+                                        &etas[i],
+                                        &kappas[i],
+                                        &omega_cur,
+                                        omega_iov_cur.as_ref(),
+                                        &sigma_prop,
+                                        &mut scratch,
+                                        schedules[i].as_ref(),
+                                    )
+                                })
+                                .collect()
+                        };
                         let sum_cur: f64 = nll.iter().sum();
                         let sum_prop: f64 = nll_prop.iter().sum();
                         let mut d_nlp = 0.0;
@@ -1194,7 +1722,7 @@ pub fn run_bayes(
                                 * inv_var;
                         }
                         joint_prop += 1;
-                        if rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
+                        if in_bounds && rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
                             theta = theta_prop;
                             sigma = sigma_prop;
                             nll = nll_prop;
@@ -1222,6 +1750,13 @@ pub fn run_bayes(
                                 u_m2[(i, j)] += delta[i] * delta2[j];
                             }
                         }
+                    }
+                }
+
+                // Per-subject η moments for the posterior-shaped proposal.
+                if sweep < n_warmup {
+                    for (ep, eta) in eta_props.iter_mut().zip(&etas) {
+                        ep.observe(eta);
                     }
                 }
 
@@ -1270,6 +1805,10 @@ pub fn run_bayes(
                     }
                     acc_eta = 0;
                     prop_eta = 0;
+                    let build_shape = sweep + 1 >= bootstrap_end;
+                    for ep in eta_props.iter_mut() {
+                        ep.adapt(build_shape);
+                    }
                     if prop_kappa > 0 {
                         let r = acc_kappa as f64 / prop_kappa as f64;
                         kappa_scale *= (r - 0.234).exp();
@@ -1329,7 +1868,13 @@ pub fn run_bayes(
                 }
             }
 
-            Some((chain_draws, eta_sum, eta_record_count, n_divergent_total))
+            Some((
+                chain_draws,
+                eta_sum,
+                eta_record_count,
+                n_divergent_total,
+                conj_tally,
+            ))
         })
         .collect();
 
@@ -1344,8 +1889,11 @@ pub fn run_bayes(
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
     let mut eta_record_count = 0u64;
     let mut n_divergent_total = 0u64;
+    let mut conj_tallies: Vec<ConjugateTally> = Vec::with_capacity(n_chains);
     for output in chain_outputs {
-        let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent)) = output else {
+        let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent, chain_conj)) =
+            output
+        else {
             return Err("cancelled by user".to_string());
         };
         draws_by_chain.push(chain_draws);
@@ -1354,6 +1902,7 @@ pub fn run_bayes(
         }
         eta_record_count += chain_eta_count;
         n_divergent_total += chain_divergent;
+        conj_tallies.push(chain_conj);
     }
 
     if verbose {
@@ -1546,9 +2095,29 @@ pub fn run_bayes(
 
     let mut warnings = Vec::new();
     if max_rhat > RHAT_CONVERGENCE_THRESHOLD {
-        warnings.push(format!(
-            "Bayes: max split-R-hat = {max_rhat:.3} (> {RHAT_CONVERGENCE_THRESHOLD}) — chains may \
-             not have converged; increase bayes_warmup / bayes_iters."
+        // Name the parameter that carries the worst R-hat and what samples it,
+        // so the advice is the one that can help (#1626).
+        let worst = bayes
+            .summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.rhat.is_finite())
+            .max_by(|a, b| a.1.rhat.total_cmp(&b.1.rhat))
+            .map(|(p, _)| p)
+            .unwrap_or(0);
+        let driver = worst_rhat_driver(
+            worst,
+            n_theta,
+            sig_start,
+            &pop_coords,
+            &conjugate_theta,
+            &mu_pairs,
+        );
+        warnings.push(rhat_warning(
+            max_rhat,
+            &param_names[worst],
+            driver,
+            !using_hmc && hmc_capable,
         ));
     }
     if n_chains < 2 {
@@ -1577,6 +2146,9 @@ pub fn run_bayes(
              separate the classes more strongly in the initial estimates (#985)."
                 .to_string(),
         );
+    }
+    if let Some(w) = conjugate_accept_warning(&conj_tallies) {
+        warnings.push(w);
     }
     if partial_mu_ref {
         warnings.push(
@@ -2096,8 +2668,11 @@ mod tests {
             .expect("warfarin_iov data loads");
 
         let mut opts = FitOptions::default();
-        opts.bayes_warmup = 600;
-        opts.bayes_iters = 600;
+        // 300 + 300 (was 600 + 600): the test pins the IOV wiring, not mixing,
+        // and #1626's per-subject η kernel roughly doubled the per-sweep cost.
+        // Halving the sweeps keeps this test's per-PR time where it was.
+        opts.bayes_warmup = 300;
+        opts.bayes_iters = 300;
         opts.bayes_chains = 2;
         opts.bayes_seed = Some(1);
         opts.saem_n_mh_steps = 6;
@@ -2748,5 +3323,594 @@ mod tests {
             err.contains("per-class Omega/Sigma overrides"),
             "got: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1626: η-kernel adaptation, EBE start, bounds, warning advice
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn adapt_scale_moves_toward_the_target_and_clamps() {
+        // Above target → grows; below → shrinks; by exp(rate − target).
+        let up = adapt_scale(1.0, 50, 100, 0.234);
+        assert!((up - (0.5f64 - 0.234).exp()).abs() < 1e-15, "{up}");
+        let down = adapt_scale(1.0, 0, 100, 0.234);
+        assert!((down - (-0.234f64).exp()).abs() < 1e-15, "{down}");
+        // Nothing proposed → unchanged (not a rate of 0).
+        assert_eq!(adapt_scale(0.7, 0, 0, 0.234), 0.7);
+        // Clamped at both ends.
+        assert_eq!(adapt_scale(ETA_SCALE_MAX, 100, 100, 0.234), ETA_SCALE_MAX);
+        assert_eq!(adapt_scale(ETA_SCALE_MIN, 0, 100, 0.234), ETA_SCALE_MIN);
+    }
+
+    /// Deterministic draws whose sample covariance is exactly known: the four
+    /// sign patterns of (±a, ±b) plus a correlated pair, repeated.
+    fn eta_samples() -> (Vec<[f64; 2]>, DMatrix<f64>) {
+        let base = [
+            [0.3, 0.1],
+            [-0.3, -0.1],
+            [0.3, -0.05],
+            [-0.3, 0.05],
+            [0.1, 0.2],
+            [-0.1, -0.2],
+        ];
+        let xs: Vec<[f64; 2]> = (0..60).map(|k| base[k % base.len()]).collect();
+        let n = xs.len() as f64;
+        let mean = [
+            xs.iter().map(|x| x[0]).sum::<f64>() / n,
+            xs.iter().map(|x| x[1]).sum::<f64>() / n,
+        ];
+        let mut cov = DMatrix::<f64>::zeros(2, 2);
+        for x in &xs {
+            for a in 0..2 {
+                for b in 0..2 {
+                    cov[(a, b)] += (x[a] - mean[a]) * (x[b] - mean[b]) / (n - 1.0);
+                }
+            }
+        }
+        (xs, cov)
+    }
+
+    #[test]
+    fn eta_proposal_shape_is_the_subjects_own_covariance() {
+        let (xs, cov) = eta_samples();
+        let mut ep = EtaProposal::new(2);
+        for x in &xs {
+            ep.observe(x);
+        }
+        // Before mid-warmup the proposal stays chol(Ω): no shape yet.
+        ep.adapt(false);
+        assert!(ep.shape.is_none(), "no shape before build_shape");
+        ep.adapt(true);
+        let l = ep.shape.clone().expect("shape built");
+        let llt = &l * l.transpose();
+        for a in 0..2 {
+            for b in 0..2 {
+                let want = cov[(a, b)] + if a == b { ETA_SHAPE_RIDGE } else { 0.0 };
+                assert!(
+                    (llt[(a, b)] - want).abs() < 1e-12,
+                    "LLᵀ[{a},{b}] = {} vs {want}",
+                    llt[(a, b)]
+                );
+            }
+        }
+        // The first switch resets the step to the optimal 2.38/√d …
+        assert!(
+            (ep.scale - 2.38 / 2f64.sqrt()).abs() < 1e-15,
+            "{}",
+            ep.scale
+        );
+        // … and later rebuilds keep adapting it instead of resetting again.
+        ep.acc = 0;
+        ep.prop = 100;
+        ep.adapt(true);
+        assert!(
+            (ep.scale - 2.38 / 2f64.sqrt() * (-ETA_BLOCK_TARGET_ACCEPT).exp()).abs() < 1e-12,
+            "{}",
+            ep.scale
+        );
+    }
+
+    #[test]
+    fn eta_proposal_shape_waits_for_more_than_2d_draws() {
+        let mut ep = EtaProposal::new(2);
+        for x in [[0.1, 0.2], [0.2, -0.1], [-0.3, 0.0], [0.05, 0.1]] {
+            ep.observe(&x);
+        }
+        ep.adapt(true);
+        assert!(ep.shape.is_none(), "4 draws for d = 2 is not more than 2d");
+        ep.observe(&[0.0, 0.3]);
+        ep.adapt(true);
+        assert!(ep.shape.is_some(), "5 draws is");
+    }
+
+    #[test]
+    fn eta_proposal_adapts_block_and_componentwise_scales_to_their_own_targets() {
+        let mut ep = EtaProposal::new(2);
+        ep.acc = 10;
+        ep.prop = 100;
+        ep.cw_acc = vec![90, 10];
+        ep.cw_prop = 100;
+        ep.adapt(false);
+        assert!((ep.scale - 0.6 * (0.1f64 - 0.234).exp()).abs() < 1e-15);
+        let cw = crate::estimation::saem::CW_TARGET_ACCEPT;
+        assert!((ep.cw_scales[0] - (0.9 - cw).exp()).abs() < 1e-15);
+        assert!((ep.cw_scales[1] - (0.1 - cw).exp()).abs() < 1e-15);
+        // The window's counters are spent.
+        assert_eq!((ep.acc, ep.prop, ep.cw_prop), (0, 0, 0));
+        assert_eq!(ep.cw_acc, vec![0, 0]);
+    }
+
+    #[test]
+    fn ebe_start_falls_back_to_zero_for_a_non_finite_ebe() {
+        let ebes = vec![
+            DVector::from_vec(vec![0.1, -0.2]),
+            DVector::from_vec(vec![f64::NAN, 0.3]),
+        ];
+        let got = ebe_start_etas(&ebes, 3, 2);
+        assert_eq!(got[0], vec![0.1, -0.2]);
+        assert_eq!(got[1], vec![0.0, 0.0], "non-finite EBE → 0");
+        assert_eq!(got[2], vec![0.0, 0.0], "missing EBE → 0");
+    }
+
+    #[test]
+    fn worst_rhat_driver_classifies_every_recorded_block() {
+        let pop_coords = vec![
+            PopCoord::Theta { idx: 1, log: true },
+            PopCoord::Sigma { idx: 0 },
+        ];
+        let conj: std::collections::HashSet<usize> = [0usize].into_iter().collect();
+        // θ0 conjugate, θ1 random walk, θ2 FIX; Ω entries 3..5; σ / Ω_iov from 5.
+        let d = |p| worst_rhat_driver(p, 3, 5, &pop_coords, &conj, &[None, None]);
+        assert_eq!(d(0), WorstRhatDriver::EtaDriven);
+        assert_eq!(
+            d(1),
+            WorstRhatDriver::RandomWalkTheta {
+                mu_referenced: false
+            }
+        );
+        // θ1 anchoring an η (the conjugate move being off model-wide).
+        assert_eq!(
+            worst_rhat_driver(1, 3, 5, &pop_coords, &conj, &[None, Some(1)]),
+            WorstRhatDriver::RandomWalkTheta {
+                mu_referenced: true
+            }
+        );
+        assert_eq!(d(2), WorstRhatDriver::Other);
+        assert_eq!(d(3), WorstRhatDriver::EtaDriven);
+        assert_eq!(d(4), WorstRhatDriver::EtaDriven);
+        assert_eq!(d(5), WorstRhatDriver::Other);
+    }
+
+    /// Every sentence of the warning, and both sides of the n_leapfrog gate
+    /// in one test (AGENTS.md: a gate stuck on either branch must redden it).
+    #[test]
+    fn rhat_warning_names_the_parameter_and_its_kernel() {
+        hmc_gate_closed_side();
+        let w = rhat_warning(1.2, "OMEGA(2,2)", WorstRhatDriver::EtaDriven, true);
+        assert!(
+            w.starts_with(
+                "Bayes: max split-R-hat = 1.200 (> 1.01) on OMEGA(2,2) — chains may not have \
+                 converged."
+            ),
+            "{w}"
+        );
+        assert!(
+            w.contains(
+                " OMEGA(2,2) moves with the random effects, which the Metropolis-Hastings eta \
+                 kernel sampled. "
+            ),
+            "{w}"
+        );
+        assert!(
+            w.ends_with(
+                " This model qualifies for the HMC eta kernel: set n_leapfrog (e.g. 10) to use \
+                 it, or increase bayes_warmup / bayes_iters."
+            ),
+            "{w}"
+        );
+        assert!(!w.contains("random-walk (theta, sigma) block"), "{w}");
+    }
+
+    /// The closed side of the HMC-advice gate (HMC ran, or cannot serve).
+    fn hmc_gate_closed_side() {
+        let w = rhat_warning(1.2, "OMEGA(2,2)", WorstRhatDriver::EtaDriven, false);
+        assert!(!w.contains("n_leapfrog"), "{w}");
+        assert!(!w.contains("Metropolis-Hastings"), "{w}");
+        assert!(w.ends_with(" Increase bayes_warmup / bayes_iters."), "{w}");
+    }
+
+    /// Both sides of the `mu_referenced` gate in one test.
+    #[test]
+    fn rhat_warning_says_when_a_random_walk_theta_is_worst() {
+        mu_referenced_gate_open_side();
+        let w = rhat_warning(
+            2.4,
+            "THETA_CRCL",
+            WorstRhatDriver::RandomWalkTheta {
+                mu_referenced: false,
+            },
+            true,
+        );
+        assert!(
+            w.contains("on THETA_CRCL — chains may not have converged."),
+            "{w}"
+        );
+        assert!(
+            w.contains(
+                " THETA_CRCL is sampled by the random-walk (theta, sigma) block, not by the \
+                 conjugate mu-reference move, and that block mixes slowly when the data pin the \
+                 parameter at fixed eta."
+            ),
+            "{w}"
+        );
+        assert!(
+            w.ends_with(
+                " To let the conjugate move draw it, make it a log mu-referenced typical value \
+                 (P_i = theta * exp(eta_i)) or a coefficient that enters log P_i linearly through \
+                 subject-constant covariates, such as (WT/70)^theta; otherwise increase \
+                 bayes_warmup / bayes_iters."
+            ),
+            "{w}"
+        );
+        // A θ problem is not an η-kernel problem: no HMC advice even when HMC
+        // would be available.
+        assert!(!w.contains("n_leapfrog"), "{w}");
+        assert!(!w.contains("already log mu-referenced"), "{w}");
+    }
+
+    /// The other side of the `mu_referenced` gate: a θ that already anchors an
+    /// η is not told to become one.
+    fn mu_referenced_gate_open_side() {
+        let w = rhat_warning(
+            1.9,
+            "TVCL",
+            WorstRhatDriver::RandomWalkTheta {
+                mu_referenced: true,
+            },
+            true,
+        );
+        assert!(
+            w.contains(" TVCL is sampled by the random-walk (theta, sigma) block"),
+            "{w}"
+        );
+        assert!(
+            w.ends_with(
+                " It is already log mu-referenced, but the conjugate move runs only when every \
+                 eta is log mu-referenced or carries a linear covariate mu-reference; \
+                 mu-reference the remaining etas, or increase bayes_warmup / bayes_iters."
+            ),
+            "{w}"
+        );
+        assert!(!w.contains("To let the conjugate move draw it"), "{w}");
+    }
+
+    /// `record` files each outcome in its own slot, `total` sums them and
+    /// `accept_rate` is `moved / total`. Every variant is exercised with a
+    /// distinct count, so a mis-wired `match` arm swaps two numbers that cannot
+    /// be confused.
+    #[test]
+    fn conjugate_tally_counts_each_outcome_separately() {
+        let mut a = ConjugateTally::default();
+        assert_eq!(a.total(), 0);
+        assert_eq!(a.accept_rate(), None, "a move that never ran has no rate");
+        assert_eq!(a.largest_rejection(), None, "nothing rejected");
+        for _ in 0..6 {
+            a.record(DrawOutcome::Moved);
+        }
+        a.record(DrawOutcome::RejectedOutOfBounds);
+        for _ in 0..2 {
+            a.record(DrawOutcome::RejectedMetropolis);
+        }
+        for _ in 0..3 {
+            a.record(DrawOutcome::Skipped);
+        }
+        assert_eq!(
+            a,
+            ConjugateTally {
+                moved: 6,
+                rejected_out_of_bounds: 1,
+                rejected_metropolis: 2,
+                skipped: 3,
+            }
+        );
+        assert_eq!(a.total(), 12);
+        assert_eq!(a.accept_rate(), Some(0.5));
+        assert_eq!(a.largest_rejection(), Some((3, 's')));
+
+        // A perfect chain has no largest rejection at all, which is what keeps
+        // the cause sentence off a report that cannot name one.
+        let mut perfect = ConjugateTally::default();
+        perfect.record(DrawOutcome::Moved);
+        assert_eq!(perfect.accept_rate(), Some(1.0));
+        assert_eq!(perfect.largest_rejection(), None);
+    }
+
+    /// The tie-break of [`ConjugateTally::largest_rejection`], in both
+    /// directions and three-way, since it is decided by array order and a
+    /// reordering is invisible to every strict-maximum case.
+    #[test]
+    fn the_largest_rejection_tie_break_is_bounds_then_metropolis_then_skipped() {
+        let t = |b, m, sk| ConjugateTally {
+            moved: 1,
+            rejected_out_of_bounds: b,
+            rejected_metropolis: m,
+            skipped: sk,
+        };
+        assert_eq!(t(5, 5, 0).largest_rejection(), Some((5, 'b')));
+        assert_eq!(t(5, 0, 5).largest_rejection(), Some((5, 'b')));
+        assert_eq!(t(0, 5, 5).largest_rejection(), Some((5, 'm')));
+        assert_eq!(t(4, 4, 4).largest_rejection(), Some((4, 'b')));
+        // A strict maximum is unaffected by the order.
+        assert_eq!(t(1, 2, 9).largest_rejection(), Some((9, 's')));
+        assert_eq!(t(9, 2, 1).largest_rejection(), Some((9, 'b')));
+        assert_eq!(t(1, 9, 2).largest_rejection(), Some((9, 'm')));
+    }
+
+    /// Both sides of the two gates that decide whether the conjugate move is
+    /// reported at all: it never ran, and it ran but accepted often enough.
+    /// Split across two tests, a gate stuck on one branch still passes half.
+    #[test]
+    fn conjugate_accept_warning_is_silent_when_there_is_nothing_to_report() {
+        assert_eq!(conjugate_accept_warning(&[]), None, "no chains at all");
+        assert_eq!(
+            conjugate_accept_warning(&[ConjugateTally::default(); 4]),
+            None,
+            "no design, no draws, no warning"
+        );
+        let perfect = ConjugateTally {
+            moved: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            conjugate_accept_warning(&[perfect; 4]),
+            None,
+            "an affine design accepts everything"
+        );
+        // Exactly at the threshold is "often enough": the constant is the point
+        // below which the move has stopped doing its job.
+        let at = ConjugateTally {
+            moved: 50,
+            rejected_metropolis: 50,
+            ..Default::default()
+        };
+        assert_eq!(at.accept_rate(), Some(CONJUGATE_ACCEPT_REPORT_THRESHOLD));
+        assert_eq!(conjugate_accept_warning(&[at]), None, "{at:?}");
+        // One draw either way straddles it.
+        let below = ConjugateTally {
+            moved: 49,
+            rejected_metropolis: 51,
+            ..Default::default()
+        };
+        assert!(conjugate_accept_warning(&[below]).is_some(), "{below:?}");
+    }
+
+    /// The report is decided by the **worst chain**, not by the pooled total,
+    /// which is the whole reason this is not one merged tally: a dead chain
+    /// beside healthy ones pools to a comfortable rate and says nothing, while
+    /// the thetas that move owns sit frozen for its share of the sample.
+    #[test]
+    fn conjugate_accept_warning_is_decided_by_the_worst_chain() {
+        let dead = ConjugateTally {
+            moved: 0,
+            rejected_metropolis: 100,
+            ..Default::default()
+        };
+        let healthy = ConjugateTally {
+            moved: 100,
+            ..Default::default()
+        };
+
+        // One dead chain in four pools to 75%, two to exactly 50% — both of
+        // which the gate calls healthy when applied to the pool.
+        for dead_chains in 1..=2 {
+            let mut chains = vec![healthy; 4];
+            for c in chains.iter_mut().take(dead_chains) {
+                *c = dead;
+            }
+            let pooled: u64 = chains.iter().map(|t| t.moved).sum();
+            assert!(
+                pooled as f64 / 400.0 >= CONJUGATE_ACCEPT_REPORT_THRESHOLD,
+                "precondition: pooling must look healthy with {dead_chains} dead"
+            );
+            let w = conjugate_accept_warning(&chains)
+                .unwrap_or_else(|| panic!("{dead_chains} dead chain(s) must be reported"));
+            assert!(
+                w.contains("accepted 0 of 100 post-warmup draws (0%) in chain 1 — its worst —"),
+                "{w}"
+            );
+            assert!(
+                w.contains(&format!(
+                    "and {pooled} of 400 across the 4 chain(s) that ran it."
+                )),
+                "{w}"
+            );
+        }
+
+        // A chain the move never ran in has no rate, so it is not the worst
+        // chain and it is not counted in the pool either.
+        let w = conjugate_accept_warning(&[ConjugateTally::default(), dead, healthy])
+            .expect("the dead chain is still reported");
+        assert!(w.contains("in chain 2 — its worst —"), "{w}");
+        assert!(
+            w.contains("and 100 of 200 across the 2 chain(s) that ran it."),
+            "{w}"
+        );
+    }
+
+    /// Every sentence of the report, and the branch that selects it. Each of
+    /// the three cause sentences is asserted verbatim and against the other
+    /// two, so deleting any one of them fails here; so do the two sentences
+    /// that are always present.
+    #[test]
+    fn conjugate_accept_warning_names_the_largest_rejection() {
+        const FROZEN: &str = " A theta this move draws is excluded from the random-walk \
+                               (theta, sigma) block, so nothing else proposes it: where the \
+                               move does not accept, those thetas do not move at all.";
+        const CORRECT: &str = " The Metropolis step stays target-correct — every rejection is \
+                                a valid step — but a coordinate that barely moves cannot \
+                                deliver a usable posterior, so treat its estimate and interval \
+                                as unconverged.";
+        const BOUNDS: &str = " Its largest group of rejections (90) left a declared \
+                               theta_lower / theta_upper box. A draw from the Gaussian \
+                               conditional can overshoot a bound whose posterior is interior, \
+                               so widen the bound if it was a guard rather than a constraint.";
+        const METROPOLIS: &str = " Its largest group of rejections (7) came from the Metropolis \
+                                   correction, which means the Gaussian conditional is a poor \
+                                   proposal for this typical value.";
+        const SKIPPED: &str = " Its largest group (7) could not form the conditional at all (a \
+                                non-positive-definite Omega or a non-finite typical value), so \
+                                those sweeps contributed nothing.";
+
+        let w = conjugate_accept_warning(&[ConjugateTally {
+            moved: 10,
+            rejected_out_of_bounds: 90,
+            ..Default::default()
+        }])
+        .expect("below the threshold");
+        assert!(
+            w.starts_with(
+                "Bayes: the conjugate mu-reference theta move accepted 10 of 100 post-warmup \
+                 draws (10%) in chain 1 — its worst — and 10 of 100 across the 1 chain(s) that \
+                 ran it."
+            ),
+            "{w}"
+        );
+        assert!(w.contains(FROZEN), "{w}");
+        assert!(w.contains(BOUNDS), "{w}");
+        assert!(
+            !w.contains("came from the Metropolis") && !w.contains("could not form"),
+            "{w}"
+        );
+        assert!(w.ends_with(CORRECT), "{w}");
+
+        let w = conjugate_accept_warning(&[ConjugateTally {
+            moved: 1,
+            rejected_out_of_bounds: 2,
+            rejected_metropolis: 7,
+            ..Default::default()
+        }])
+        .expect("below the threshold");
+        assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
+        assert!(w.contains(METROPOLIS), "{w}");
+        assert!(
+            !w.contains("left a declared") && !w.contains("could not form"),
+            "{w}"
+        );
+
+        let w = conjugate_accept_warning(&[ConjugateTally {
+            moved: 1,
+            rejected_metropolis: 2,
+            skipped: 7,
+            ..Default::default()
+        }])
+        .expect("below the threshold");
+        assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
+        assert!(w.contains(SKIPPED), "{w}");
+        assert!(
+            !w.contains("left a declared") && !w.contains("came from the Metropolis"),
+            "{w}"
+        );
+    }
+
+    /// The largest rejection group is reported as the largest, never as "most":
+    /// with three causes it can be a small minority of the draws, and the first
+    /// wording of this message ("Most draws left a declared ... box") was
+    /// simply false there. 18 of 100 is the counter-example.
+    #[test]
+    fn a_fragmented_rejection_is_not_reported_as_a_majority() {
+        let w = conjugate_accept_warning(&[ConjugateTally {
+            moved: 49,
+            rejected_out_of_bounds: 18,
+            rejected_metropolis: 17,
+            skipped: 16,
+        }])
+        .expect("49% is below the threshold");
+        assert!(
+            w.contains("Its largest group of rejections (18) left a declared"),
+            "{w}"
+        );
+        assert!(
+            !w.to_lowercase().contains("most "),
+            "no majority claim: {w}"
+        );
+    }
+
+    #[test]
+    fn rhat_warning_falls_back_to_longer_chains_for_sigma() {
+        let w = rhat_warning(1.05, "PROP_ERR", WorstRhatDriver::Other, true);
+        assert_eq!(
+            w,
+            "Bayes: max split-R-hat = 1.050 (> 1.01) on PROP_ERR — chains may not have \
+             converged. Increase bayes_warmup / bayes_iters."
+        );
+    }
+
+    /// The random-walk (θ, σ) block keeps every θ inside its declared bounds
+    /// (#1626): before, neither its componentwise nor its joint move compared
+    /// against them. TVV of the bioavailability model is a non-mu-referenced
+    /// θ (random walk), its posterior sits near 50, and the bounds here cut
+    /// through it on both sides.
+    #[test]
+    fn run_bayes_random_walk_theta_respects_its_bounds() {
+        use std::path::Path;
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/bioavailability.ferx",
+        ))
+        .expect("bioavailability model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/bioavailability_oral.csv"), None, None)
+            .expect("bioavailability data loads");
+        let mut params = model.default_params.clone();
+        let tvv = params.theta_names.iter().position(|n| n == "TVV").unwrap();
+        let (lo, hi) = (46.0, 49.0);
+        params.theta[tvv] = 47.5;
+        params.theta_lower[tvv] = lo;
+        params.theta_upper[tvv] = hi;
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 200;
+        opts.bayes_iters = 200;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 4;
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("bayes runs");
+        let b = res.bayes.as_ref().expect("BayesResult present");
+        let s = b.summaries.iter().find(|s| s.name == "TVV").expect("TVV");
+        assert!(s.q025.is_finite() && s.q975.is_finite());
+        assert!(
+            s.q025 >= lo,
+            "TVV q025 {} below the lower bound {lo}",
+            s.q025
+        );
+        assert!(
+            s.q975 <= hi,
+            "TVV q975 {} above the upper bound {hi}",
+            s.q975
+        );
+
+        // The same short run has not converged, so it is also the wiring check
+        // of the warning: it names the parameter that carries the max R-hat,
+        // and says how that parameter is sampled.
+        assert!(
+            b.max_rhat > RHAT_CONVERGENCE_THRESHOLD,
+            "precondition: {}",
+            b.max_rhat
+        );
+        let worst = b
+            .summaries
+            .iter()
+            .max_by(|a, b| a.rhat.total_cmp(&b.rhat))
+            .expect("summaries");
+        let w = res
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("Bayes: max split-R-hat"))
+            .expect("non-convergence warning");
+        assert!(w.contains(&format!(" on {} — ", worst.name)), "{w}");
+        // Measured: the worst is TVCL, a log mu-reference left to the random
+        // walk because ETA_F (logit) is not covered.
+        assert_eq!(worst.name, "TVCL", "{w}");
+        assert!(w.contains("It is already log mu-referenced"), "{w}");
     }
 }

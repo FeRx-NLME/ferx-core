@@ -112,6 +112,16 @@ impl GroupMember<'_> {
         }
     }
 
+    /// The eta-free typical value `A(θ, covariates)`, locals inlined.
+    pub(crate) fn typical(&self) -> &crate::parser::model_parser::Expression {
+        &self.spec.typical
+    }
+
+    /// The thetas this member's typical value reads, by name.
+    pub fn theta_names(&self) -> &[String] {
+        &self.spec.theta_names
+    }
+
     /// [`Self::mu`] over the population.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<f64> {
         population
