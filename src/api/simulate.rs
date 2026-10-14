@@ -497,8 +497,13 @@ fn check_simulate_preconditions(
     // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
     validate_iov_simulatable(model, params)?;
     check_param_shape(model, &ParamBlock::all_of(params))?;
+    // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES), then
+    // ρ's range at the value drawn at.
+    first_error(&super::validation::check_residual_correlation_data(
+        model, population,
+    ))?;
     first_error(&super::validation::check_residual_correlation_value(
-        model, params,
+        model, population, params,
     ))?;
     first_error(&check_modeled_dose_rates(model, population))?;
     first_error(&check_dose_compartments(model, population))?;
