@@ -132,6 +132,7 @@ fn subject(id: &str, observations: Vec<f64>) -> Subject {
         cens: vec![0; 3],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
+        obs_rgroup: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
         fremtype: Vec::new(),
