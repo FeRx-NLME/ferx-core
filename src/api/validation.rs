@@ -1117,10 +1117,10 @@ pub(crate) fn check_kappa_weights(
             .unwrap_or("<kappa>");
         for subj in &population.subjects {
             for j in 0..subj.obs_times.len() {
-                // Evaluated at the engine clock, as the individual parameters it is
-                // desugared into are; reported at the TIME as written (#1959).
-                let w = (weight.eval)(theta, subj.obs_cov(j), subj.obs_times[j]);
-                let time = subj.readout_time(j);
+                // Evaluated and reported at the TIME as written, as the individual
+                // parameters it is desugared into read it (#1959, #1969).
+                let time = subj.param_time_obs(j);
+                let w = (weight.eval)(theta, subj.obs_cov(j), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
                         "E_KAPPA_WEIGHT_NONPOSITIVE",
@@ -1141,7 +1141,7 @@ pub(crate) fn check_kappa_weights(
             // rebuilt at every dose event), and a dose-only occasion has no
             // observation to have caught it above.
             for d in 0..subj.doses.len() {
-                let time = subj.doses[d].time;
+                let time = subj.param_time_at(subj.doses[d].time);
                 let w = (weight.eval)(theta, subj.dose_cov(d), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
@@ -1192,8 +1192,7 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
             for (occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
                 let mut seen: Option<f64> = None;
                 for &j in &obs_idx {
-                    let time = subj.obs_times.get(j).copied().unwrap_or(0.0);
-                    let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                    let w = (weight.eval)(theta, subj.obs_cov(j), subj.param_time_obs(j));
                     match seen {
                         None => seen = Some(w),
                         Some(prev) if (prev - w).abs() > 1e-9 * prev.abs().max(1.0) => {

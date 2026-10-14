@@ -380,7 +380,7 @@ fn fill_iov_record_params(
             theta,
             &combined_for(occ),
             subject.dose_cov(d),
-            subject.doses[d].time,
+            subject.param_time_at(subject.doses[d].time),
         )
     }));
     obs.reserve_exact(subject.obs_times.len());
@@ -391,7 +391,7 @@ fn fill_iov_record_params(
             theta,
             &combined_for(occ),
             subject.obs_cov(j),
-            subject.obs_times[j],
+            subject.param_time_obs(j),
         )
     }));
     pk_only.reserve_exact(subject.pk_only_times.len());
@@ -403,7 +403,7 @@ fn fill_iov_record_params(
             theta,
             &combined_for(occ),
             subject.pk_only_cov(m),
-            subject.pk_only_times[m],
+            subject.param_time_pk_only(m),
         )
     }));
 }
@@ -550,12 +550,7 @@ pub fn apply_analytic_readout(
     for (i, pred) in preds.iter_mut().enumerate() {
         let obs_pk;
         let pk_i: &PkParams = if per_obs {
-            obs_pk = (model.pk_param_fn)(
-                theta,
-                eta,
-                subject.obs_cov(i),
-                subject.obs_times.get(i).copied().unwrap_or(0.0),
-            );
+            obs_pk = (model.pk_param_fn)(theta, eta, subject.obs_cov(i), subject.param_time_obs(i));
             &obs_pk
         } else {
             &static_pk
@@ -1057,7 +1052,7 @@ fn fill_dose_pk_params(
                         theta,
                         eta,
                         subject.dose_cov(k),
-                        subject.doses[k].time,
+                        subject.param_time_at(subject.doses[k].time),
                     )
                 });
             }
@@ -1151,7 +1146,13 @@ pub fn compute_event_pk_params_into(
         fill_dose_pk_params(model, subject, theta, eta, None, &mut out.dose);
         for j in 0..subject.obs_times.len() {
             push_pk_in_place(&mut out.obs, || {
-                pk_params_at_time(model, theta, eta, subject.obs_cov(j), subject.obs_times[j])
+                pk_params_at_time(
+                    model,
+                    theta,
+                    eta,
+                    subject.obs_cov(j),
+                    subject.param_time_obs(j),
+                )
             });
         }
         for m in 0..subject.pk_only_times.len() {
@@ -1161,7 +1162,7 @@ pub fn compute_event_pk_params_into(
                     theta,
                     eta,
                     subject.pk_only_cov(m),
-                    subject.pk_only_times[m],
+                    subject.param_time_pk_only(m),
                 )
             });
         }
@@ -1175,7 +1176,7 @@ pub fn compute_event_pk_params_into(
                     theta,
                     eta,
                     subject.reset_cov(r),
-                    subject.reset_times[r],
+                    subject.param_time_at(subject.reset_times[r]),
                 )
             });
         }
@@ -1320,7 +1321,7 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.dose_cov(k),
-            t,
+            subject.param_time_at(t),
         ));
     }
     for j in 0..subject.obs_times.len() {
@@ -1330,7 +1331,7 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.obs_cov(j),
-            t,
+            subject.param_time_obs(j),
         ));
     }
     for m in 0..subject.pk_only_times.len() {
@@ -1340,7 +1341,7 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.pk_only_cov(m),
-            t,
+            subject.param_time_pk_only(m),
         ));
     }
     // EVID=3/4 rows are records (#1133): the reset re-seeds `[odes] init(...)` from the
@@ -1353,7 +1354,7 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.reset_cov(r),
-            t,
+            subject.param_time_at(t),
         ));
     }
     out
@@ -1553,7 +1554,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
         // full individual-parameter program once per reset per eta evaluation.
         reset_params.reserve_exact(subject.reset_times.len());
         reset_params.extend((0..subject.reset_times.len()).map(|r| {
-            let t = subject.reset_times[r];
+            let t = subject.param_time_at(subject.reset_times[r]);
             let combined = match reset_row_occasion(subject, r) {
                 Some(occ) => combined_for(occ),
                 None => bsv_only_combined.clone(),

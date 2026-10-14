@@ -641,6 +641,8 @@ fn data_fingerprint(data: &Population) -> String {
             dose_covariates,
             obs_covariates,
             pk_only_times,
+            pk_only_raw_times,
+            reset_period_times,
             pk_only_covariates,
             reset_times,
             reset_covariates,
@@ -675,6 +677,16 @@ fn data_fingerprint(data: &Population) -> String {
         // moves only for data whose fits #1876 can change.
         if !pk_only_occasions.is_empty() {
             let _ = writeln!(buf, "pk_only_occasions={pk_only_occasions:?}");
+        }
+        // The written TIME of pk-only, dose and reset rows (#1969), only where it differs
+        // from the engine clock already hashed above: a moved pk-only row, a reset
+        // period that restarts TIME. Everywhere else it adds nothing, and the digest of
+        // data whose fits #1969 cannot change stays put.
+        if pk_only_raw_times != pk_only_times && !pk_only_raw_times.is_empty() {
+            let _ = writeln!(buf, "pk_only_raw_times={pk_only_raw_times:?}");
+        }
+        if !reset_period_times.is_empty() {
+            let _ = writeln!(buf, "reset_period_times={reset_period_times:?}");
         }
         let _ = writeln!(buf, "fremtype={fremtype:?}");
         let _ = writeln!(buf, "obs_records={obs_records:?}");

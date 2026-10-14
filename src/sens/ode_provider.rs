@@ -2643,7 +2643,9 @@ fn seed_tvcov_snapshots<T: Clone>(
     // well as the covariate snapshot, so two events with identical covariates at
     // different times must NOT share a seed — fold the event time into the cache key
     // (`key_time`). Non-TIME models leave it out, so TV-cov dedup is unchanged (#486
-    // risk: dedup-cache key collision).
+    // risk: dedup-cache key collision). The time is the one the seed reads, the TIME as
+    // written (#1969), so two records sharing it and their covariates share one seed,
+    // and a different covariate snapshot still keys its own.
     let mut cache: HashMap<(Vec<(String, u64)>, Option<u64>), Vec<T>> = HashMap::new();
     let mut seed_for = |cov: &HashMap<String, f64>, time: f64| -> Option<Vec<T>> {
         let key = (snapshot_key(cov), key_time.then(|| time.to_bits()));
@@ -2655,20 +2657,30 @@ fn seed_tvcov_snapshots<T: Clone>(
         Some(v)
     };
     let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
-        .map(|k| seed_for(subject.dose_cov(k), subject.doses[k].time))
+        .map(|k| {
+            seed_for(
+                subject.dose_cov(k),
+                subject.param_time_at(subject.doses[k].time),
+            )
+        })
         .collect::<Option<_>>()?;
     let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
-        .map(|j| seed_for(subject.obs_cov(j), subject.obs_times[j]))
+        .map(|j| seed_for(subject.obs_cov(j), subject.param_time_obs(j)))
         .collect::<Option<_>>()?;
     let pk_at_pk_only: Vec<Vec<T>> = (0..subject.pk_only_times.len())
-        .map(|m| seed_for(subject.pk_only_cov(m), subject.pk_only_times[m]))
+        .map(|m| seed_for(subject.pk_only_cov(m), subject.param_time_pk_only(m)))
         .collect::<Option<_>>()?;
     // EVID=3/4 rows are records too (#1133): the reset re-seeds `init(...)` from the reset
     // row's own snapshot, so the twin needs that snapshot's jet — `∂init/∂(θ,η)` is
     // evaluated at whichever snapshot the value path used, and mirroring a stale one
     // differentiates a different function than the one predicted.
     let pk_at_reset: Vec<Vec<T>> = (0..subject.reset_times.len())
-        .map(|r| seed_for(subject.reset_cov(r), subject.reset_times[r]))
+        .map(|r| {
+            seed_for(
+                subject.reset_cov(r),
+                subject.param_time_at(subject.reset_times[r]),
+            )
+        })
         .collect::<Option<_>>()?;
     Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
 }
@@ -3229,13 +3241,17 @@ fn seed_iov_events<T: Clone>(
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
                 let g = *occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?;
-                seed_group_cov(g, subject.dose_cov(d), subject.doses[d].time)
+                seed_group_cov(
+                    g,
+                    subject.dose_cov(d),
+                    subject.param_time_at(subject.doses[d].time),
+                )
             })
             .collect::<Option<_>>()?;
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| {
                 let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
-                seed_group_cov(g, subject.obs_cov(j), subject.obs_times[j])
+                seed_group_cov(g, subject.obs_cov(j), subject.param_time_obs(j))
             })
             .collect::<Option<_>>()?;
         // A pk-only row under its own occasion's group (#1876), as production's
@@ -3243,7 +3259,7 @@ fn seed_iov_events<T: Clone>(
         // the κ = 0 seeder, which is production's `combined_for(u32::MAX)` there too.
         let pk_at_pk_only = (0..subject.pk_only_times.len())
             .map(|m| {
-                let t = subject.pk_only_times[m];
+                let t = subject.param_time_pk_only(m);
                 match pk_only_group(m) {
                     Some(g) => seed_group_cov(g, subject.pk_only_cov(m), t),
                     None => seed_pk_only_cov(subject.pk_only_cov(m), t),
@@ -3260,7 +3276,7 @@ fn seed_iov_events<T: Clone>(
         // take an occasion from, which is `predict_iov`'s fallback too.
         let pk_at_reset = (0..subject.reset_times.len())
             .map(|r| {
-                let t = subject.reset_times[r];
+                let t = subject.param_time_at(subject.reset_times[r]);
                 match crate::pk::reset_row_occasion(subject, r)
                     .and_then(|occ| occ_to_k.get(&occ).copied())
                 {

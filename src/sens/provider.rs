@@ -2249,7 +2249,7 @@ fn build_iov_sources(
             let g = layout.group_of(occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
-            let t = subject.doses[d].time;
+            let t = subject.param_time_at(subject.doses[d].time);
             let pk = (model.pk_param_fn)(theta, &combined, cov, t);
             let cd = cd_at(t, &combined, cov)?;
             dose_src[d] = sources.len();
@@ -2260,7 +2260,7 @@ fn build_iov_sources(
             let g = layout.group_of(occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
-            let t = subject.obs_times[j];
+            let t = subject.param_time_obs(j);
             let pk = (model.pk_param_fn)(theta, &combined, cov, t);
             let cd = cd_at(t, &combined, cov)?;
             obs_src[j] = sources.len();
@@ -2270,7 +2270,7 @@ fn build_iov_sources(
             let g = pk_only_group(m);
             let combined = g.map_or_else(|| combined_pk_only.clone(), combined_for);
             let cov = subject.pk_only_cov(m);
-            let t = subject.pk_only_times[m];
+            let t = subject.param_time_pk_only(m);
             let pk = (model.pk_param_fn)(theta, &combined, cov, t);
             let cd = cd_at(t, &combined, cov)?;
             pkonly_src[m] = sources.len();
@@ -4009,13 +4009,18 @@ pub fn subject_sensitivities_tvcov(
         tvcov_param_derivs_at(model, prog, cov, theta, eta)
     };
     let pd_dose: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.doses.len())
-        .map(|k| pd_at(subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| {
+            pd_at(
+                subject.param_time_at(subject.doses[k].time),
+                subject.dose_cov(k),
+            )
+        })
         .collect::<Option<Vec<_>>>()?;
     let pd_obs: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.obs_times.len())
-        .map(|j| pd_at(subject.obs_times[j], subject.obs_cov(j)))
+        .map(|j| pd_at(subject.param_time_obs(j), subject.obs_cov(j)))
         .collect::<Option<Vec<_>>>()?;
     let pd_pk_only: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.pk_only_times.len())
-        .map(|m| pd_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .map(|m| pd_at(subject.param_time_pk_only(m), subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
     // The per-event f64 PK values, once per subject under the same per-event time guard —
     // shared by every chunk's `PkDual` seeding, the modeled-dose window resolution and the
@@ -4028,13 +4033,18 @@ pub fn subject_sensitivities_tvcov(
         (model.pk_param_fn)(theta, eta, cov, time)
     };
     let pk_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
-        .map(|k| pk_at(subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| {
+            pk_at(
+                subject.param_time_at(subject.doses[k].time),
+                subject.dose_cov(k),
+            )
+        })
         .collect();
     let pk_obs: Vec<crate::types::PkParams> = (0..subject.obs_times.len())
-        .map(|j| pk_at(subject.obs_times[j], subject.obs_cov(j)))
+        .map(|j| pk_at(subject.param_time_obs(j), subject.obs_cov(j)))
         .collect();
     let pk_pk_only: Vec<crate::types::PkParams> = (0..subject.pk_only_times.len())
-        .map(|m| pk_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .map(|m| pk_at(subject.param_time_pk_only(m), subject.pk_only_cov(m)))
         .collect();
 
     // The θ columns are seeded in chunks of at most `MAX_TVCOV_AXES - n_eta`, each chunk
@@ -4520,13 +4530,18 @@ fn run_obs_grad_tvcov<const N: usize>(
         tvcov_eta_rows_at::<N>(model, prog, cov, theta, eta)
     };
     let rows_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| rows_at(subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| {
+            rows_at(
+                subject.param_time_at(subject.doses[k].time),
+                subject.dose_cov(k),
+            )
+        })
         .collect::<Option<Vec<_>>>()?;
     let rows_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| rows_at(subject.obs_times[j], subject.obs_cov(j)))
+        .map(|j| rows_at(subject.param_time_obs(j), subject.obs_cov(j)))
         .collect::<Option<Vec<_>>>()?;
     let rows_pk_only: Vec<Vec<Dual1<N>>> = (0..subject.pk_only_times.len())
-        .map(|m| rows_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .map(|m| rows_at(subject.param_time_pk_only(m), subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
     // One f64 `$PK` evaluation per event for the *values* — the same closure production
@@ -4540,7 +4555,12 @@ fn run_obs_grad_tvcov<const N: usize>(
         (model.pk_param_fn)(theta, eta, cov, time)
     };
     let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
-        .map(|k| pk_at(subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| {
+            pk_at(
+                subject.param_time_at(subject.doses[k].time),
+                subject.dose_cov(k),
+            )
+        })
         .collect();
 
     let mk = |rows: &[Dual1<N>], pk: &crate::types::PkParams| -> PkDual<Dual1<N>> {
@@ -4572,7 +4592,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         .map(|j| {
             mk(
                 &rows_obs[j],
-                &pk_at(subject.obs_times[j], subject.obs_cov(j)),
+                &pk_at(subject.param_time_obs(j), subject.obs_cov(j)),
             )
         })
         .collect();
@@ -4580,7 +4600,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         .map(|m| {
             mk(
                 &rows_pk_only[m],
-                &pk_at(subject.pk_only_times[m], subject.pk_only_cov(m)),
+                &pk_at(subject.param_time_pk_only(m), subject.pk_only_cov(m)),
             )
         })
         .collect();
@@ -4651,7 +4671,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         (0..subject.obs_times.len())
             .map(|j| {
                 let cov = subject.obs_cov(j);
-                let t = subject.obs_times[j];
+                let t = subject.param_time_obs(j);
                 let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
                 let pk = (model.pk_param_fn)(theta, eta, cov, t);
                 let extras: Vec<(usize, Dual1<N>)> = ro_slots
@@ -5399,7 +5419,8 @@ fn effective_provider_model<'a>(
 /// [`crate::stats::likelihood::iov_occasion_groups`] order — the same assembly
 /// `predict_iov` makes, so dose `k` reads the κ of its own occasion (a dose row without an
 /// occasion label reads κ = 0, as there). Each dose is evaluated under its own record
-/// covariates at its own time, which is what the event-driven walk's `pk_at_dose[k]` is.
+/// covariates at its own written time ([`Subject::param_time_at`], #1969), which is what
+/// the event-driven walk's `pk_at_dose[k]` is.
 fn dose_pk_snapshots(
     model: &CompiledModel,
     subject: &Subject,
@@ -5412,7 +5433,9 @@ fn dose_pk_snapshots(
             .doses
             .iter()
             .enumerate()
-            .map(|(k, d)| (model.pk_param_fn)(theta, b, subject.dose_cov(k), d.time))
+            .map(|(k, d)| {
+                (model.pk_param_fn)(theta, b, subject.dose_cov(k), subject.param_time_at(d.time))
+            })
             .collect();
     }
     let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
@@ -5432,7 +5455,12 @@ fn dose_pk_snapshots(
                 }
                 _ => combined.extend(std::iter::repeat_n(0.0, n_kappa)),
             }
-            (model.pk_param_fn)(theta, &combined, subject.dose_cov(k), d.time)
+            (model.pk_param_fn)(
+                theta,
+                &combined,
+                subject.dose_cov(k),
+                subject.param_time_at(d.time),
+            )
         })
         .collect()
 }
