@@ -40,11 +40,12 @@
 //! | fixture | NONMEM written | ferx main | NONMEM shifted | ΔOFV (ferx − NONMEM) |
 //! |---|---|---|---|---|
 //! | `ode` (`[odes]` reads `TIME`) | −1442.1814208 | 6205.4986098 | 6205.4986098 | 7647.68 |
-//! | `cat` (`[binary_model]` reads `TIME`) | 779.5259695 | 914.1577007 | 914.1576675 | 134.63 |
+//! | `cat` (`[binary_model]` reads `TIME`) | 779.5259695 | 914.1576717 | 914.1576675 | 134.63 |
 //! | `tte` (`hazard` reads `TIME`, η = 0) | 4032.7939587 | 4271.4439361 | 4271.4439368 | 238.65 |
 //!
-//! With the time term removed (`control`), ferx and NONMEM agree to 4.1e-8 (ode), 7.8e-5
-//! (cat) and 4.5e-7 (tte).
+//! ferx on Linux aarch64; macOS arm64 differs only in the cat cell's 8th significant figure
+//! (finite-difference Laplace). With the time term removed (`control`), ferx and NONMEM
+//! agree to 4.7e-8 (ode), 6.6e-5 (cat) and 4.5e-7 (tte).
 //!
 //! The `*_reads_the_engine_clock` tests pin that measurement on main: they fail once the
 //! clock is fixed, and are then replaced by the `*_matches_nonmem_written` tests, `#[ignore]`d
@@ -122,10 +123,11 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
     r.ofv
 }
 
-/// The ferx-vs-NONMEM bound per fixture. Measured on main (macOS arm64), worst over each
-/// fixture's control and running-clock cells: ode 4.4e-8, cat 7.8e-5 (the binary
-/// endpoint's finite-difference Laplace), tte 6.2e-7. Each bound sits ~10× above its
-/// measurement. The clock gaps they separate are 134 to 7648.
+/// The ferx-vs-NONMEM bound per fixture. Measured on main, worst over each fixture's
+/// control and running-clock cells, Linux aarch64 (`tools/linux-test.sh`) / macOS arm64:
+/// ode 4.9e-8 / 4.4e-8, cat 6.6e-5 / 7.8e-5 (the binary endpoint's finite-difference
+/// Laplace), tte 6.2e-7 / 6.2e-7. Each bound sits ≥ 10× above both. The clock gaps they
+/// separate are 134 to 7648.
 const OFV_TOL_ODE: f64 = 5e-7;
 const OFV_TOL_CAT: f64 = 1e-3;
 const OFV_TOL_TTE: f64 = 5e-6;
