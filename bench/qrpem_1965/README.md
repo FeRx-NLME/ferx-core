@@ -111,6 +111,28 @@ How to read the table:
 - **What does not help.** The defensive mixture (which samples from the prior)
   and more iterations do not help.
 
+## Phase 1b: Sobol on the default t₄ proposal
+
+The Phase 1b binary makes `impmap_sobol` drive the Student-t scale (and the
+defensive mixture) as well. Arm `impmap_t4_sobol` vs `impmap_t4`, 10 seeds, same
+common evaluator:
+
+| model | K | t₄ −2LL SD | t₄ + Sobol −2LL SD | t₄ param SD | t₄ + Sobol param SD |
+|---|---|---|---|---|---|
+| warfarin | 100 | 2.9e-4 | **1.9e-5** | 1.9e-4 | **8.3e-5** |
+| warfarin | 300 | 4.2e-5 | **6.7e-7** | 1.0e-4 | **4.5e-5** |
+| three_cpt_iv | 100 | 0.011 | **0.0023** | 0.0036 | 0.0024 |
+| three_cpt_iv | 300 | 0.0034 | **0.0007** | 0.0020 | **0.0011** |
+| sparse_combined | 100 | 0.014 | 0.011 | 0.018 | **0.0047** |
+| sparse_combined | 300 | 0.0099 | **0.0050** | 0.011 | **0.0063** |
+
+Unlike the normal proposal, the gain on t₄ holds at K = 300 and on the 6-η
+model: 2–60× on the −2LL and 1.5–4× on the parameters. The per-iteration jitter
+also drops (`summary.md`, tail jitter column).
+
+The new binary reproduces every seeded non-Sobol and MVN-Sobol fit of the
+Phase 0 binary to the printed digit (`bitid.py runs runs_bitid`; 9 fits).
+
 ## Other observations
 
 - **Normal vs t₄ proposal.** The per-iteration IS objective jitters 3–10× more

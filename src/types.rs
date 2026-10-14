@@ -8511,9 +8511,14 @@ pub struct FitOptions {
     /// Number of additional random starting points for per-subject MAP
     /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
     pub impmap_mceta: usize,
-    /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
-    /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
+    /// Use Sobol quasi-random sequences for IMPMAP's IS draws instead of
+    /// pseudo-random. Applies to every proposal form — MVN, Student-t, and the
+    /// defensive mixture (#1965). Default false.
     pub impmap_sobol: bool,
+    /// Estimating IMP's counterpart of [`Self::impmap_sobol`]: Sobol
+    /// quasi-random draws for the MCEM E-step (#1965). Does not affect
+    /// `imp_eval_only`, which stays pseudo-random. Default false.
+    pub imp_sobol: bool,
     /// FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically,
     /// sample only the PK ETAs) in IMP/IMPMAP importance sampling. Default `true`
     /// — strongly recommended, since brute-force sampling of the near-singular
@@ -8915,6 +8920,7 @@ impl Default for FitOptions {
             impmap_trace: false,
             impmap_mceta: 0,
             impmap_sobol: false,
+            imp_sobol: false,
             frem_rao_blackwell: true,
             imp_auto: true,
             impmap_auto: true,
@@ -10315,6 +10321,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",
+            "imp_sobol",
             "inner_maxiter",
             "inner_tol",
             "iscale_min",

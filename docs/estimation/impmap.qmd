@@ -183,6 +183,66 @@ The default is `0` (single warm-start, matching previous behaviour).
 `(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws)
 dominates, the total wall-time increase is typically 15–40%.
 
+## Quasi-random draws (`impmap_sobol`)
+
+`impmap_sobol = true` builds every importance sample from one point of a Sobol
+sequence (Cranley–Patterson randomized by `impmap_seed`), instead of the
+pseudo-random stream. This is the sampling idea behind Phoenix's QRPEM. Every
+random number a draw uses comes from that point:
+
+- the normal vector;
+- for the default Student-t proposal, the χ² scale variable;
+- with `imp_defensive_alpha > 0`, the choice of mixture component, which also
+  makes the defensive fraction exact rather than binomial.
+
+So it works with every proposal form. (Before #1965 it applied only to
+`impmap_proposal_df = normal` and was ignored, with a warning, otherwise.)
+Estimating `imp` has the same switch as `imp_sobol`.
+
+```
+[fit_options]
+  method         = impmap
+  impmap_sobol   = true
+  impmap_samples = 100
+```
+
+**When it helps: few random effects and small K.** Quasi-random integration
+error falls faster than pseudo-random error only in low dimension, so the gain
+shrinks as the number of ETAs grows and disappears once K is large enough.
+
+The #1965 benchmark compared normal proposals over 10 seeds. It reports the
+spread across seeds of a common large-K importance-sampled −2LL computed at
+each fit's estimates:
+
+| model (ETAs) | K | pseudo-random SD | Sobol SD |
+|---|---|---|---|
+| warfarin (3) | 100 | 1.0e-4 | 2.3e-6 |
+| sparse 2-cpt IV, N = 300 (3, block) | 100 | 0.096 | 0.020 |
+| sparse 2-cpt IV, N = 300 (3, block) | 300 | 0.012 | 0.015 |
+| 3-cpt IV (6) | 100 | 0.016 | 0.007 |
+
+At K = 100, Sobol matched pseudo-random draws at K = 300 or more, at the same
+cost per sample. At K ≥ 300 the two tied.
+
+On the default t₄ proposal the gain is larger and also holds at K = 300 and on
+the 6-ETA model:
+
+| model (ETAs) | K | t₄ SD | t₄ + Sobol SD |
+|---|---|---|---|
+| warfarin (3) | 300 | 4.2e-5 | 6.7e-7 |
+| sparse 2-cpt IV (3, block) | 300 | 0.0099 | 0.0050 |
+| 3-cpt IV (6) | 300 | 0.0034 | 0.0007 |
+
+Scripts and full tables are in `bench/qrpem_1965/` in the repository.
+
+**What it does not fix.** Sobol reduces integration noise only. On a model whose
+spread across seeds comes from a subject's MAP sitting in the wrong mode, it
+changes nothing; use [`impmap_mceta`](#multi-start-map-impmap_mceta) for that.
+In the same benchmark on `two_cpt_oral_cov`:
+
+- every IMPMAP arm, Sobol or not, at any K, spread about 1.7 across seeds;
+- `impmap_mceta = 3` brought that down to 0.004.
+
 ## Cost
 
 Per iteration ≈ one MAP inner loop (parallel over subjects) plus

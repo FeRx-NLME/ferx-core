@@ -56,34 +56,123 @@ fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
-/// Generate `k_samples` quasi-random N(0,1) vectors of dimension `d` using
-/// Sobol sequences with Cranley-Patterson randomization.
+/// `k_samples` Sobol points of dimension `dim`, Cranley-Patterson randomized
+/// (every coordinate shifted mod 1 by one seeded uniform vector).
 ///
-/// Returns a Vec of k_samples vectors, each of length d.
-fn sobol_normal_draws(d: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+/// A Sobol coordinate does not depend on how many dimensions follow it, and the
+/// shift draws its uniforms in coordinate order, so the first `d` coordinates of
+/// a `dim > d` call equal a `d`-dimensional call bit for bit. That is what lets
+/// [`sobol_qmc_draws`] append the Student-t and mixture coordinates without
+/// moving the normal-proposal draws.
+fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
     use sobol::params::JoeKuoD6;
     use sobol::Sobol;
 
-    // Cranley-Patterson rotation: shift Sobol points by a uniform random vector
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
-    let shift: Vec<f64> = (0..d).map(|_| rng.random::<f64>()).collect();
+    let shift: Vec<f64> = (0..dim).map(|_| rng.random::<f64>()).collect();
 
     let params = JoeKuoD6::minimal(); // supports up to 100 dims
-    let sobol_seq = Sobol::<f64>::new(d, &params);
-
-    sobol_seq
+    Sobol::<f64>::new(dim, &params)
         .take(k_samples)
         .map(|point| {
             point
                 .iter()
                 .zip(shift.iter())
-                .map(|(&u, &s)| {
-                    let u_shifted = (u + s) % 1.0;
-                    inv_normal_cdf(u_shifted)
-                })
+                .map(|(&u, &s)| (u + s) % 1.0)
                 .collect()
         })
         .collect()
+}
+
+/// Quasi-random inputs for one subject's `K` importance draws (#1965): every
+/// random number a draw consumes comes from one Sobol point, so the point set's
+/// low discrepancy carries through to the whole draw — the normal vector, the
+/// Student-t scale and the defensive-mixture component alike.
+///
+/// Coordinates, in order: `d` normals, then the χ²_ν mixing variable when the
+/// proposal is a Student-t, then the component selector when a defensive
+/// mixture is active. Normals first keeps the plain-MVN case identical to the
+/// pre-#1965 normal-only sampler.
+struct QmcDraws {
+    /// `K × d` standard-normal vectors.
+    z: Vec<Vec<f64>>,
+    /// `K` χ²_ν draws for the t scale `√(ν/χ²)`; `None` for an MVN proposal.
+    chi_sq: Option<Vec<f64>>,
+    /// `K` uniforms; a draw comes from the broad component when `u < α`.
+    /// `None` without a defensive mixture.
+    u_mix: Option<Vec<f64>>,
+}
+
+/// What one importance draw is built from.
+enum DrawInputs {
+    /// From the defensive component: `z` holds the normals for
+    /// [`DefensiveMixture::broad_from_z`].
+    Broad,
+    /// From the mode-centred proposal: `z` holds the normals and `t_scale` the
+    /// Student-t factor `√(ν/χ²)` (exactly `1.0` for an MVN proposal).
+    Narrow { t_scale: f64 },
+}
+
+/// The random inputs of draw `idx`, from the Sobol point set when `qmc` is set
+/// and from `rng` otherwise. This is the one place every sampler in this module
+/// takes its draws from, so the pseudo-random stream order — component
+/// uniform, then the normals, then the χ² — is defined once: it reproduces the
+/// pre-#1965 per-site loops exactly, and with it every seeded result.
+#[allow(clippy::too_many_arguments)]
+fn draw_inputs(
+    idx: usize,
+    qmc: Option<&QmcDraws>,
+    mixture: Option<&DefensiveMixture>,
+    chi_sq: Option<&ChiSquared<f64>>,
+    nu: f64,
+    rng: &mut StdRng,
+    z: &mut [f64],
+) -> DrawInputs {
+    let from_broad = match (mixture, qmc) {
+        (Some(m), Some(q)) => m.selects_broad(q.u_mix.as_ref().expect("u_mix with a mixture")[idx]),
+        (Some(m), None) => m.draws_broad(rng),
+        (None, _) => false,
+    };
+    match qmc {
+        Some(q) => z.copy_from_slice(&q.z[idx]),
+        None => {
+            for zi in z.iter_mut() {
+                *zi = StandardNormal.sample(rng);
+            }
+        }
+    }
+    if from_broad {
+        return DrawInputs::Broad;
+    }
+    let t_scale = match (chi_sq, qmc) {
+        (None, _) => 1.0,
+        (Some(_), Some(q)) => {
+            let c = q.chi_sq.as_ref().expect("chi_sq with a t proposal")[idx];
+            (nu / c.max(1e-300)).sqrt()
+        }
+        (Some(c), None) => (nu / c.sample(rng).max(1e-300)).sqrt(),
+    };
+    DrawInputs::Narrow { t_scale }
+}
+
+fn sobol_qmc_draws(d: usize, k_samples: usize, seed: u64, nu: f64, mixture: bool) -> QmcDraws {
+    let t = nu.is_finite();
+    let dim = d + usize::from(t) + usize::from(mixture);
+    let points = sobol_uniforms(dim, k_samples, seed);
+    let z = points
+        .iter()
+        .map(|p| p[..d].iter().map(|&u| inv_normal_cdf(u)).collect())
+        .collect();
+    // Same open-interval clamp as the normals, so a shifted coordinate of
+    // exactly 0 cannot produce a zero χ² (an infinite t scale).
+    let chi_sq = t.then(|| {
+        points
+            .iter()
+            .map(|p| crate::stats::special::chi_squared_inv_cdf(nu, p[d].clamp(1e-15, 1.0 - 1e-15)))
+            .collect()
+    });
+    let u_mix = mixture.then(|| points.iter().map(|p| p[dim - 1]).collect());
+    QmcDraws { z, chi_sq, u_mix }
 }
 
 /// Estimate `−2 log L` by importance sampling. See module docstring for the
@@ -798,7 +887,6 @@ fn subject_is_estimate(
     // issue #528. `mixture == None` reproduces the single-proposal estimator
     // exactly. The broad component is built once by the caller and shared.
 
-    let normal = StandardNormal;
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
 
     // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
@@ -820,26 +908,26 @@ fn subject_is_estimate(
     let mut eta_sample = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    for _ in 0..k_samples {
-        let from_broad = mixture.is_some_and(|m| m.draws_broad(&mut rng));
-        if from_broad {
+    for sample_idx in 0..k_samples {
+        match draw_inputs(
+            sample_idx,
+            None,
+            mixture,
+            Some(&chi_sq),
+            nu,
+            &mut rng,
+            &mut z,
+        ) {
             // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            mixture.expect("mixture set when from_broad").sample_broad(
-                &mut rng,
-                &mut z,
-                &mut eta_sample,
-            );
-        } else {
-            // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
-            for zi in z.iter_mut() {
-                *zi = normal.sample(&mut rng);
-            }
-            let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-            let scale = (nu / c).sqrt() * iscale;
-            // L_Σ z via the precomputed factor.
-            proposal.apply_l_sigma(&z, &mut eta_sample, scale);
-            for (j, e) in eta_sample.iter_mut().enumerate() {
-                *e += eta_hat[j];
+            DrawInputs::Broad => mixture
+                .expect("mixture set when from_broad")
+                .broad_from_z(&z, &mut eta_sample),
+            // η = η̂ + iscale·sqrt(ν/c) · L_Σ z, via the precomputed factor.
+            DrawInputs::Narrow { t_scale } => {
+                proposal.apply_l_sigma(&z, &mut eta_sample, t_scale * iscale);
+                for (j, e) in eta_sample.iter_mut().enumerate() {
+                    *e += eta_hat[j];
+                }
             }
         }
 
@@ -1171,17 +1259,12 @@ pub(crate) fn subject_is_draws_frem_rb(
             - half_np * (nu * std::f64::consts::PI).ln()
     };
 
-    let normal = StandardNormal;
     let chi_sq = if mvn {
         None
     } else {
         Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
     };
-    let sobol_draws = if use_sobol && mvn && mixture.is_none() {
-        Some(sobol_normal_draws(np, k_samples, seed))
-    } else {
-        None
-    };
+    let qmc = use_sobol.then(|| sobol_qmc_draws(np, k_samples, seed, nu, mixture.is_some()));
 
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
     let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
@@ -1191,29 +1274,28 @@ pub(crate) fn subject_is_draws_frem_rb(
     let mut diff_q = vec![0.0_f64; np];
 
     for s_idx in 0..k_samples {
-        let from_broad = mixture.as_ref().is_some_and(|m| m.draws_broad(&mut rng));
-        if from_broad {
-            // Defensive draw η_p ~ N(μ_pc, P_pp⁻¹): the conditional PK prior.
-            let m = mixture.as_ref().expect("mixture set when from_broad");
-            m.sample_broad(&mut rng, &mut z, &mut eta_p);
-            for (j, e) in eta_p.iter_mut().enumerate() {
-                *e += mu_pc[j];
-            }
-        } else {
-            if let Some(ref qr) = sobol_draws {
-                z.copy_from_slice(&qr[s_idx]);
-            } else {
-                for zi in z.iter_mut() {
-                    *zi = normal.sample(&mut rng);
+        match draw_inputs(
+            s_idx,
+            qmc.as_ref(),
+            mixture.as_ref(),
+            chi_sq.as_ref(),
+            nu,
+            &mut rng,
+            &mut z,
+        ) {
+            DrawInputs::Broad => {
+                // Defensive draw η_p ~ N(μ_pc, P_pp⁻¹): the conditional PK prior.
+                let m = mixture.as_ref().expect("mixture set when from_broad");
+                m.broad_from_z(&z, &mut eta_p);
+                for (j, e) in eta_p.iter_mut().enumerate() {
+                    *e += mu_pc[j];
                 }
             }
-            let scale = match &chi_sq {
-                Some(c) => (nu / c.sample(&mut rng).max(1e-300)).sqrt() * iscale,
-                None => iscale,
-            };
-            proposal.apply_l_sigma(&z, &mut eta_p, scale);
-            for (j, e) in eta_p.iter_mut().enumerate() {
-                *e += eta_hat_pk[j];
+            DrawInputs::Narrow { t_scale } => {
+                proposal.apply_l_sigma(&z, &mut eta_p, t_scale * iscale);
+                for (j, e) in eta_p.iter_mut().enumerate() {
+                    *e += eta_hat_pk[j];
+                }
             }
         }
 
@@ -1335,9 +1417,9 @@ pub(crate) fn subject_is_draws_frem_rb(
 /// `iscale` scales the proposal standard deviation: Σ_prop = iscale² · H⁻¹.
 /// Use 1.0 for unscaled (default). NONMEM ISCALE range is typically [0.1, 10.0].
 ///
-/// `use_sobol`: when `true` **and** the proposal is MVN (ν = ∞), replace
-/// pseudo-random N(0,I) draws with Sobol quasi-random sequences
-/// (Cranley-Patterson randomized).  Falls back to pseudo-random for Student-t.
+/// `use_sobol`: when `true`, every sample is built from one Sobol point
+/// (Cranley-Patterson randomized) instead of the pseudo-random stream — for an
+/// MVN or Student-t proposal, with or without the defensive mixture (#1965).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws(
     model: &CompiledModel,
@@ -1386,10 +1468,10 @@ pub(crate) fn subject_is_draws(
     // to keep the population estimates identifiable. `mixture == None` reproduces
     // the pre-#528 single-proposal sampler exactly. The broad component (which
     // depends only on Ω) is built once by the caller and shared across subjects.
-    // Quasi-random (Sobol) draws are disabled when the mixture is active — the
-    // branch structure breaks the QMC sequence.
+    // Under Sobol the component is chosen by a dedicated quasi-random coordinate,
+    // so the α fraction is stratified across the point set rather than broken
+    // out of it.
 
-    let normal = StandardNormal;
     // Student-t scale mixing variable; unused for the MVN branch.
     let chi_sq = if mvn {
         None
@@ -1418,44 +1500,30 @@ pub(crate) fn subject_is_draws(
     let mut z = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    // Pre-generate Sobol quasi-random draws if requested and MVN. Disabled when
-    // the defensive mixture is active (the per-sample component branch breaks
-    // the quasi-random sequence).
-    let sobol_draws = if use_sobol && mvn && mixture.is_none() {
-        Some(sobol_normal_draws(d, k_samples, seed))
-    } else {
-        None
-    };
+    // Quasi-random draws (#1965) supply every random number of every sample —
+    // normals, the t scale and the mixture component — from one Sobol point.
+    let qmc = use_sobol.then(|| sobol_qmc_draws(d, k_samples, seed, nu, mixture.is_some()));
 
     for sample_idx in 0..k_samples {
         let mut eta_sample = vec![0.0_f64; d];
-        let from_broad = mixture.is_some_and(|m| m.draws_broad(&mut rng));
-        if from_broad {
+        match draw_inputs(
+            sample_idx,
+            qmc.as_ref(),
+            mixture,
+            chi_sq.as_ref(),
+            nu,
+            &mut rng,
+            &mut z,
+        ) {
             // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            mixture.expect("mixture set when from_broad").sample_broad(
-                &mut rng,
-                &mut z,
-                &mut eta_sample,
-            );
-        } else {
-            if let Some(ref qr) = sobol_draws {
-                // Sobol quasi-random N(0,I) draws (MVN only)
-                z.copy_from_slice(&qr[sample_idx]);
-            } else {
-                for zi in z.iter_mut() {
-                    *zi = normal.sample(&mut rng);
+            DrawInputs::Broad => mixture
+                .expect("mixture set when from_broad")
+                .broad_from_z(&z, &mut eta_sample),
+            DrawInputs::Narrow { t_scale } => {
+                proposal.apply_l_sigma(&z, &mut eta_sample, t_scale * iscale);
+                for (j, e) in eta_sample.iter_mut().enumerate() {
+                    *e += eta_hat[j];
                 }
-            }
-            let scale = match &chi_sq {
-                Some(c) => {
-                    let cc: f64 = c.sample(&mut rng).max(1e-300);
-                    (nu / cc).sqrt() * iscale
-                }
-                None => iscale,
-            };
-            proposal.apply_l_sigma(&z, &mut eta_sample, scale);
-            for (j, e) in eta_sample.iter_mut().enumerate() {
-                *e += eta_hat[j];
             }
         }
 
@@ -2136,16 +2204,19 @@ impl DefensiveMixture {
     /// one uniform from `rng` — kept on the `Option` so callers preserve the
     /// legacy (no-mixture) RNG stream by short-circuiting before any draw.
     fn draws_broad(&self, rng: &mut StdRng) -> bool {
-        rng.random::<f64>() < self.alpha
+        self.selects_broad(rng.random::<f64>())
     }
 
-    /// Draw `η ~ q_broad` into `out` (centred at 0; the FREM RB caller shifts to
-    /// μ afterwards), using scratch buffer `z`.
-    fn sample_broad(&self, rng: &mut StdRng, z: &mut [f64], out: &mut [f64]) {
-        let normal = StandardNormal;
-        for zi in z.iter_mut() {
-            *zi = normal.sample(rng);
-        }
+    /// The component rule itself, for a uniform `u` from either source: the
+    /// pseudo-random stream above, or a Sobol coordinate (#1965).
+    fn selects_broad(&self, u: f64) -> bool {
+        u < self.alpha
+    }
+
+    /// `η ~ q_broad` from a standard-normal `z` (pseudo- or quasi-random, see
+    /// [`draw_inputs`]): `η = L_broad · z`, centred at 0 — the FREM RB caller
+    /// shifts to μ afterwards.
+    fn broad_from_z(&self, z: &[f64], out: &mut [f64]) {
         self.broad.apply_l_sigma(z, out, 1.0);
     }
 
@@ -2505,19 +2576,14 @@ mod tests {
         let (log_q_narrow, log_q_broad) = (-3.0, -1.0);
         let expected = logsumexp2(0.75_f64.ln() + log_q_narrow, 0.25_f64.ln() + log_q_broad);
         assert!((m.log_q(log_q_narrow, log_q_broad) - expected).abs() < 1e-12);
-        // draws_broad consumes one uniform and decides by the α threshold; with a
-        // fixed seed the outcome is deterministic. sample_broad maps N(0,I)→N(0,Ω):
-        // a unit input on dim 0 ⇒ sd 0.5 (Ω = diag(0.25, 1/9)).
-        let mut rng = StdRng::seed_from_u64(7);
-        let _ = m.draws_broad(&mut rng);
-        let mut z = [1.0_f64, 0.0];
+        // The component rule is `u < α`, whichever source the uniform came from.
+        assert!(m.selects_broad(0.2499) && !m.selects_broad(0.25));
+        // broad_from_z maps N(0,I)→N(0,Ω): a unit input on dim 0 ⇒ sd 0.5
+        // (Ω = diag(0.25, 1/9)).
+        let z = [1.0_f64, 0.0];
         let mut out = [0.0_f64; 2];
-        // sample_broad refills z from rng; force the factor check via apply_l_sigma.
-        m.broad.apply_l_sigma(&z, &mut out, 1.0);
+        m.broad_from_z(&z, &mut out);
         assert!((out[0].abs() - 0.5).abs() < 1e-12);
-        // Exercise the rng path too (just assert it writes finite values).
-        m.sample_broad(&mut rng, &mut z, &mut out);
-        assert!(out.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -2811,13 +2877,248 @@ mod tests {
     fn sobol_draws_have_correct_shape_and_near_zero_mean() {
         let d = 5;
         let k = 1000;
-        let draws = sobol_normal_draws(d, k, 42);
+        let draws = sobol_qmc_draws(d, k, 42, f64::INFINITY, false).z;
         assert_eq!(draws.len(), k);
         assert_eq!(draws[0].len(), d);
         // Mean of each dimension should be near zero for a large sample
         for dim in 0..d {
             let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
             assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
+        }
+    }
+
+    /// #1965 appends the Student-t and mixture coordinates *after* the normals.
+    /// That only leaves the MVN sampler unchanged if a Sobol coordinate (and its
+    /// Cranley-Patterson shift) does not depend on how many coordinates follow.
+    #[test]
+    fn sobol_uniforms_prefix_does_not_depend_on_dimension() {
+        let short = sobol_uniforms(3, 257, 9);
+        let long = sobol_uniforms(5, 257, 9);
+        for (a, b) in short.iter().zip(long.iter()) {
+            assert_eq!(a[..], b[..3], "appending coordinates moved the first three");
+        }
+    }
+
+    /// Plain MVN carries no extra coordinates, and adding the t and mixture
+    /// coordinates leaves the normals bit-identical — so `impmap_sobol` on an
+    /// MVN proposal draws exactly what it drew before #1965.
+    #[test]
+    fn sobol_qmc_draws_layout_keeps_the_normals_first() {
+        let (d, k, seed) = (3, 128, 5);
+        let mvn = sobol_qmc_draws(d, k, seed, f64::INFINITY, false);
+        assert!(mvn.chi_sq.is_none() && mvn.u_mix.is_none());
+        let want: Vec<Vec<f64>> = sobol_uniforms(d, k, seed)
+            .iter()
+            .map(|p| p.iter().map(|&u| inv_normal_cdf(u)).collect())
+            .collect();
+        assert_eq!(mvn.z, want);
+
+        let full = sobol_qmc_draws(d, k, seed, 4.0, true);
+        assert_eq!(
+            full.z, mvn.z,
+            "t/mixture coordinates must follow the normals"
+        );
+        assert_eq!(full.chi_sq.as_ref().map(Vec::len), Some(k));
+        assert_eq!(full.u_mix.as_ref().map(Vec::len), Some(k));
+    }
+
+    /// The χ² coordinate must have the χ²_ν marginal. A Sobol coordinate is a
+    /// (0,1)-sequence, so over K = 2^m points its empirical CDF is within ~1/K of
+    /// uniform; mapping through the exact quantile must keep that, measured as
+    /// the Kolmogorov distance against `P(ν/2, x/2)`. A wrong ν, a flipped tail
+    /// or a pseudo-random fallback (KS ~ 1/√K ≈ 0.03) all fail the bound.
+    #[test]
+    fn sobol_chi_sq_coordinate_has_the_chi_sq_marginal() {
+        let (k, nu) = (1024, 4.0);
+        let mut chi = sobol_qmc_draws(2, k, 3, nu, false)
+            .chi_sq
+            .expect("t proposal");
+        chi.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut ks = 0.0_f64;
+        for (i, &x) in chi.iter().enumerate() {
+            let f = crate::stats::special::regularized_gamma_p(0.5 * nu, 0.5 * x);
+            ks = ks
+                .max((f - i as f64 / k as f64).abs())
+                .max((f - (i + 1) as f64 / k as f64).abs());
+        }
+        assert!(ks.is_finite() && ks < 2.0 / k as f64, "KS distance {ks}");
+    }
+
+    /// The mixture coordinate stratifies the defensive fraction: over K = 2^m
+    /// points the broad count is within one of αK, not the ±√(Kα(1−α)) ≈ 10
+    /// of independent Bernoulli draws.
+    #[test]
+    fn sobol_mixture_selector_stratifies_the_defensive_fraction() {
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0]));
+        let m = DefensiveMixture::new(&omega_inv, 2, 0.1).expect("PD Ω⁻¹ → mixture");
+        let (k, nu) = (1024, 4.0);
+        let chi = ChiSquared::new(nu).unwrap();
+        let mut z = vec![0.0; 2];
+        for seed in 0..8 {
+            // Through `draw_inputs`, so a Sobol path that took its component
+            // uniform from the RNG instead (binomial spread, ±10) fails here.
+            let q = sobol_qmc_draws(2, k, seed, nu, true);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let n_broad = (0..k)
+                .filter(|&idx| {
+                    matches!(
+                        draw_inputs(idx, Some(&q), Some(&m), Some(&chi), nu, &mut rng, &mut z),
+                        DrawInputs::Broad
+                    )
+                })
+                .count();
+            assert!(
+                (n_broad as f64 - 0.1 * k as f64).abs() <= 1.0,
+                "seed {seed}: {n_broad} broad draws, want 102.4 ± 1"
+            );
+        }
+    }
+
+    /// The point of quasi-random t draws: at equal K they integrate a smooth
+    /// expectation more accurately than pseudo-random ones. For univariate
+    /// t_ν, `1/(1 + t²/ν) ~ Beta(ν/2, ½)`, so `E[1/(1 + t₁²/ν)] = ν/(ν+1)` —
+    /// an *even* function, so it depends on the χ² coordinate as much as on the
+    /// normals (an odd one, e.g. `Φ(t) − ½`, is integrated well by symmetric
+    /// normals whatever the scale, and could not see a pseudo-random χ²).
+    /// Both arms go through [`draw_inputs`]. Measured on 16 seeds at K = 1024,
+    /// ν = 4: Sobol RMS error 3.5e-4, pseudo-random 6.4e-3 — an 18× gap; the
+    /// bound asks for 5×.
+    #[test]
+    fn sobol_t_draws_integrate_more_accurately_than_pseudo_random() {
+        let (d, k, nu) = (2usize, 1024usize, 4.0);
+        let chi = ChiSquared::new(nu).unwrap();
+        let mut z = vec![0.0; d];
+        let f = |z: &[f64], t_scale: f64| 1.0 / (1.0 + (t_scale * z[0]).powi(2) / nu);
+        let target = nu / (nu + 1.0);
+        let (mut se_qmc, mut se_prng) = (0.0_f64, 0.0_f64);
+        let mut second_moment = 0.0_f64;
+        for seed in 0..16u64 {
+            let q = sobol_qmc_draws(d, k, seed, nu, false);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut m_q, mut m_p) = (0.0, 0.0);
+            for idx in 0..k {
+                let DrawInputs::Narrow { t_scale } =
+                    draw_inputs(idx, Some(&q), None, Some(&chi), nu, &mut rng, &mut z)
+                else {
+                    panic!("no mixture ⇒ narrow")
+                };
+                // The scale is the Sobol χ² coordinate's, exactly.
+                let c = q.chi_sq.as_ref().unwrap()[idx];
+                assert_eq!(t_scale, (nu / c.max(1e-300)).sqrt());
+                m_q += f(&z, t_scale);
+                second_moment += (t_scale * z[0]).powi(2);
+                let DrawInputs::Narrow { t_scale } =
+                    draw_inputs(idx, None, None, Some(&chi), nu, &mut rng, &mut z)
+                else {
+                    panic!("no mixture ⇒ narrow")
+                };
+                m_p += f(&z, t_scale);
+            }
+            se_qmc += (m_q / k as f64 - target).powi(2);
+            se_prng += (m_p / k as f64 - target).powi(2);
+        }
+        let (rms_qmc, rms_prng) = ((se_qmc / 16.0).sqrt(), (se_prng / 16.0).sqrt());
+        assert!(rms_qmc.is_finite() && rms_prng.is_finite());
+        assert!(
+            rms_qmc * 5.0 < rms_prng,
+            "Sobol RMS {rms_qmc:e} vs pseudo-random {rms_prng:e}"
+        );
+        // The scale itself: E[t²] = ν/(ν−2) = 2 for ν = 4; measured 1.979. The
+        // bound is loose because t₄ is heavy-tailed; it still catches a missing
+        // (E = 1) or inverted √(ν/χ²) scale.
+        let m2 = second_moment / (16 * k) as f64;
+        assert!((m2 - 2.0).abs() < 0.2, "E[t²] = {m2}, want 2");
+    }
+
+    /// Before #1965 both samplers silently fell back to pseudo-random draws for
+    /// a Student-t proposal or an active defensive mixture. Each combination
+    /// must now change the draws when Sobol is switched on — the MVN-only arm is
+    /// the control that already did, so a re-introduced `mvn && no-mixture` gate
+    /// reddens exactly the other three.
+    #[test]
+    fn sobol_reaches_every_proposal_form_in_both_samplers() {
+        let model = frem_rb_test_model();
+        let subject = frem_rb_test_subject();
+        let theta = [10.0, 100.0, 90.0];
+        let sigma = model.default_params.sigma.values.clone();
+        let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);
+        let omega_matrix = model.default_params.omega.matrix.clone();
+        let omega_inv = omega_matrix.clone().try_inverse().unwrap();
+        let log_det_omega = omega_matrix.determinant().ln();
+        let h = DMatrix::from_diagonal(&DVector::from_column_slice(&[50.0, 50.0, 1e4]));
+        let (k, seed) = (64, 21);
+        let mix = DefensiveMixture::new(&omega_inv, 3, 0.2).expect("PD Ω⁻¹ → mixture");
+
+        for (nu, alpha) in [
+            (f64::INFINITY, 0.0),
+            (4.0, 0.0),
+            (f64::INFINITY, 0.2),
+            (4.0, 0.2),
+        ] {
+            let label = format!("nu={nu} alpha={alpha}");
+            let full = |sobol: bool| {
+                let mixture = (alpha > 0.0).then_some(&mix);
+                subject_is_draws(
+                    &model,
+                    &subject,
+                    &theta,
+                    &sigma,
+                    &eta_hat,
+                    &h,
+                    &omega_inv,
+                    log_det_omega,
+                    3,
+                    k,
+                    nu,
+                    seed,
+                    &mut EventPkParams::default(),
+                    1.0,
+                    sobol,
+                    mixture,
+                )
+                .etas
+            };
+            assert_ne!(
+                full(true),
+                full(false),
+                "full-dimensional sampler, {label}: Sobol had no effect"
+            );
+            assert_eq!(
+                full(true),
+                full(true),
+                "full-dimensional sampler, {label}: not deterministic"
+            );
+
+            let rb = |sobol: bool| {
+                subject_is_draws_frem_rb(
+                    &model,
+                    &subject,
+                    &theta,
+                    &sigma,
+                    &eta_hat,
+                    &h,
+                    &omega_inv,
+                    &omega_matrix,
+                    &[0, 1],
+                    &[2],
+                    &[0.0],
+                    3,
+                    k,
+                    nu,
+                    seed,
+                    &mut EventPkParams::default(),
+                    1.0,
+                    sobol,
+                    alpha,
+                )
+                .expect("well-formed RB partition")
+                .etas
+            };
+            assert_ne!(
+                rb(true),
+                rb(false),
+                "FREM RB sampler, {label}: Sobol had no effect"
+            );
         }
     }
 
@@ -2928,17 +3229,10 @@ mod tests {
         }
     }
 
-    /// Issue #406 follow-up: the RB path used to hard-code `iscale = 1.0`,
-    /// skipping the per-subject adaptive-ISCALE pilot search the full-dimensional
-    /// path gets. When the inner-loop Hessian overstates the PK conditional
-    /// curvature (plausible for sparse-data subjects — a poor `h_pp` estimate),
-    /// a fixed narrow proposal collapses ESS. `find_optimal_iscale_frem_rb`
-    /// should find a wider scale that recovers ESS, and never do worse than the
-    /// fixed-1.0 baseline.
-    #[test]
-    fn find_optimal_iscale_frem_rb_recovers_ess_from_overconfident_hessian() {
-        let model = frem_rb_test_model();
-        let subject = Subject {
+    /// The one-subject dataset paired with [`frem_rb_test_model`]: two PK
+    /// observations and the FREM covariate record (WT = 90).
+    fn frem_rb_test_subject() -> Subject {
+        Subject {
             obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -2961,7 +3255,20 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
-        };
+        }
+    }
+
+    /// Issue #406 follow-up: the RB path used to hard-code `iscale = 1.0`,
+    /// skipping the per-subject adaptive-ISCALE pilot search the full-dimensional
+    /// path gets. When the inner-loop Hessian overstates the PK conditional
+    /// curvature (plausible for sparse-data subjects — a poor `h_pp` estimate),
+    /// a fixed narrow proposal collapses ESS. `find_optimal_iscale_frem_rb`
+    /// should find a wider scale that recovers ESS, and never do worse than the
+    /// fixed-1.0 baseline.
+    #[test]
+    fn find_optimal_iscale_frem_rb_recovers_ess_from_overconfident_hessian() {
+        let model = frem_rb_test_model();
+        let subject = frem_rb_test_subject();
 
         let theta = [10.0, 100.0, 90.0];
         let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);

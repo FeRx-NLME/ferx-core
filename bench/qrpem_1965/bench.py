@@ -61,6 +61,11 @@ def arm_options(arm, seed, k):
     if arm == "impmap_t4":
         return IMPMAP_COMMON + [f"impmap_samples = {k}", "impmap_proposal_df = 4",
                                 f"impmap_seed = {seed}"]
+    # Phase 1b (needs a binary with quasi-random t draws): Sobol on the
+    # default Student-t proposal.
+    if arm == "impmap_t4_sobol":
+        return IMPMAP_COMMON + [f"impmap_samples = {k}", "impmap_proposal_df = 4",
+                                "impmap_sobol = true", f"impmap_seed = {seed}"]
     # Diagnostic arms for the two_cpt_oral_cov plateau (not part of the
     # quasi-random comparison): is the cross-seed spread a MAP-mode / proposal
     # coverage problem, or plain slow EM?

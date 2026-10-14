@@ -451,11 +451,7 @@ pub fn run_impmap(
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
-    // Sobol quasi-random draws are only implemented for the multivariate-normal
-    // (`impmap_proposal_df = normal`) proposal; the Student-t default makes the
-    // option a silent no-op, so flag the mismatch rather than ignore it.
-    let use_sobol = options.impmap_sobol && nu.is_infinite();
-    let mut result = run_mcem(
+    run_mcem(
         model,
         population,
         init_params,
@@ -471,31 +467,12 @@ pub fn run_impmap(
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
         options.impmap_mceta,
-        use_sobol,
+        // Sobol now drives every proposal form — MVN, Student-t, and the
+        // defensive mixture (#1965) — so there is no combination to warn about.
+        options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
-    )?;
-    if options.impmap_sobol && !use_sobol {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
-             (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
-             proposal — set `impmap_proposal_df = normal` to use them."
-                .to_string(),
-        );
-    }
-    // Sobol is also silently disabled when the defensive mixture is active: the
-    // broad/narrow per-sample branch breaks the quasi-random sequence, so the
-    // sampler falls back to plain Monte Carlo. Surface that rather than ignore it
-    // (issue #528).
-    if use_sobol && options.imp_defensive_alpha > 0.0 {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the defensive mixture is active \
-             (`imp_defensive_alpha > 0`). Quasi-random draws are disabled when sampling from the \
-             broad/narrow mixture — set `imp_defensive_alpha = 0` to use Sobol draws."
-                .to_string(),
-        );
-    }
-    Ok(result)
+    )
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
@@ -524,8 +501,8 @@ pub fn run_imp(
         options.imp_averaging,
         options.imp_seed.unwrap_or(12345),
         options.imp_low_ess_threshold,
-        0,     // mceta: no multi-start MAP for IMP
-        false, // use_sobol: IMP has no Sobol option
+        0, // mceta: no multi-start MAP for IMP
+        options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
     )

@@ -211,29 +211,52 @@ fn impmap_estimates_mu_ref_param_with_negligible_iiv() {
     assert!(tvka.is_finite() && tvka > 0.0);
 }
 
-/// `impmap_sobol` only applies to the multivariate-normal proposal; with the
-/// Student-t default it is a silent no-op, so IMPMAP must warn rather than ignore
-/// the request. Setting `impmap_proposal_df = normal` clears the warning.
+/// `impmap_sobol` reaches every proposal form (#1965): before, a Student-t
+/// proposal or an active defensive mixture silently fell back to pseudo-random
+/// draws (and warned). Each combination must now change the estimates when
+/// Sobol is switched on, with no "ignored" warning.
 #[test]
-fn impmap_warns_when_sobol_requested_with_t_proposal() {
+fn impmap_sobol_applies_to_every_proposal_form() {
     let (model, population, base) = warfarin_setup();
-    let warns = |df: f64| -> bool {
+    let run = |df: f64, alpha: f64, sobol: bool| {
         let mut opts = base.clone();
         opts.method = EstimationMethod::Impmap;
-        opts.impmap_sobol = true;
+        opts.impmap_sobol = sobol;
         opts.impmap_proposal_df = df;
+        opts.imp_defensive_alpha = alpha;
         opts.impmap_iterations = 3;
+        fit(&model, &population, &model.default_params, &opts).expect("fit must succeed")
+    };
+    for (df, alpha) in [(f64::INFINITY, 0.0), (4.0, 0.0), (4.0, 0.1)] {
+        let on = run(df, alpha, true);
+        let off = run(df, alpha, false);
+        assert_ne!(
+            on.theta, off.theta,
+            "df={df} alpha={alpha}: impmap_sobol had no effect on the estimates"
+        );
+        assert!(
+            !on.warnings.iter().any(|w| w.contains("impmap_sobol")),
+            "df={df} alpha={alpha}: unexpected sobol warning {:?}",
+            on.warnings
+        );
+    }
+}
+
+/// `imp_sobol` is estimating IMP's switch for the same quasi-random E-step.
+#[test]
+fn imp_sobol_changes_the_imp_estimator() {
+    let (model, population, base) = warfarin_setup();
+    let run = |sobol: bool| {
+        let mut opts = base.clone();
+        opts.method = EstimationMethod::Imp;
+        opts.imp_sobol = sobol;
+        opts.imp_iterations = 3;
+        opts.imp_samples = 200;
         fit(&model, &population, &model.default_params, &opts)
             .expect("fit must succeed")
-            .warnings
-            .iter()
-            .any(|w| w.contains("impmap_sobol") && w.contains("ignored"))
+            .theta
     };
-    assert!(warns(4.0), "Student-t proposal + sobol must warn");
-    assert!(
-        !warns(f64::INFINITY),
-        "MVN proposal + sobol must not warn (Sobol is used)"
-    );
+    assert_ne!(run(true), run(false), "imp_sobol had no effect on IMP");
 }
 
 #[test]
