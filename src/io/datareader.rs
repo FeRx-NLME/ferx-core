@@ -2400,6 +2400,9 @@ fn parse_subject(
     let mut obs_rec: Vec<usize> = Vec::new();
     // The same for each pk-only record, parallel to `pk_only_times` (#1810).
     let mut pk_only_rec: Vec<usize> = Vec::new();
+    // The TIME each pk-only record was written with, parallel to `pk_only_times`
+    // (#1969): the #1810 pass below moves an engine time, never this.
+    let mut pk_only_raw_times: Vec<f64> = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
@@ -2545,6 +2548,9 @@ fn parse_subject(
     // event time emitted so far.
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
+    // `(engine time, TIME as written)` of every dose and reset row once `time_offset`
+    // is non-zero: `Subject::reset_period_times` (#1969).
+    let mut reset_period_times: Vec<(f64, f64)> = Vec::new();
 
     // Only string-valued covariate filters (IGNORE(C.EQ.C)) read the raw-cell
     // map; numeric-only filters never touch it, so skip the per-row allocation.
@@ -2871,6 +2877,11 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
+            // reads (#1969). Doses below do the same.
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             // A reset row is a data record: NONMEM runs `$PK` at it, so an
             // `[odes] init(...)` re-seeded here is evaluated with THIS row's
             // covariates (#1133). `locf_state` was refreshed from this row at the
@@ -2947,6 +2958,9 @@ fn parse_subject(
             )?;
 
             doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -2997,6 +3011,9 @@ fn parse_subject(
                         doses.push(dose_for_rate_mode(
                             addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
+                        if time_offset != 0.0 {
+                            reset_period_times.push((addl_time, raw_time + (k as f64) * ii));
+                        }
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
@@ -3335,6 +3352,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            pk_only_raw_times.push(raw_time);
             pk_only_rec.push(row_seq);
             if any_tv {
                 pk_only_covariates.push(locf_state.clone());
@@ -3501,6 +3519,12 @@ fn parse_subject(
         }
     }
 
+    // ADDL trains extend past later rows of their period, so the table is filled out
+    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
+    // reset and a dose at one `(engine, written)` pair, kept once.
+    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    reset_period_times.dedup();
+
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
@@ -3527,6 +3551,8 @@ fn parse_subject(
             dose_covariates: sorted_dose_cov,
             obs_covariates,
             pk_only_times,
+            pk_only_raw_times,
+            reset_period_times,
             pk_only_covariates,
             reset_times,
             reset_covariates,

@@ -98,6 +98,8 @@ fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
         dose_covariates: doses.iter().map(|&(_, _, w)| wt(w)).collect(),
         obs_covariates: obs.iter().map(|&(_, _, w)| wt(w)).collect(),
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],

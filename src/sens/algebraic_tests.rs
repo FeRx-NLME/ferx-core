@@ -63,6 +63,8 @@ fn subject(covariates: Vec<(&str, f64)>, obs_covariates: Vec<Vec<(&str, f64)>>) 
         dose_covariates: vec![],
         obs_covariates: obs_covariates.into_iter().map(to_map).collect(),
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),

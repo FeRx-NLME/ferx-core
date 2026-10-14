@@ -236,6 +236,8 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
             HashMap::from([("WT".to_string(), 210.0)]),
         ],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
