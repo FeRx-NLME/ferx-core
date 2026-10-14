@@ -421,6 +421,20 @@ impl<'m> MuDesign<'m> {
         nll: &mut [f64],
         subject_nlls: &mut dyn FnMut(&[f64], &[Vec<f64>]) -> Vec<f64>,
     ) -> (DrawOutcome, f64) {
+        // Checked before a single RNG draw or mutation, not at the point of
+        // use: `conditional` would silently `zip`-truncate a short `etas`, and
+        // a short `nll` would panic in `copy_from_slice` *after* θ and η were
+        // already committed — a partial move, which no `DrawOutcome` describes.
+        debug_assert_eq!(
+            etas.len(),
+            population.subjects.len(),
+            "one eta vector per subject"
+        );
+        debug_assert_eq!(
+            nll.len(),
+            population.subjects.len(),
+            "one cached NLL per subject"
+        );
         let Some((mean, prec)) = self.conditional(theta, etas, omega) else {
             return (DrawOutcome::Skipped, f64::NAN);
         };
@@ -472,7 +486,7 @@ impl<'m> MuDesign<'m> {
         // −Σ nll(s') + Σ nll(s): the caller's cached baseline is the second
         // term, so only the proposal is evaluated here.
         let nll_new = subject_nlls(&theta_new, &etas_new);
-        debug_assert_eq!(nll_new.len(), nll.len(), "one NLL per subject");
+        debug_assert_eq!(nll_new.len(), nll.len(), "one proposed NLL per subject");
         let log_alpha = nll.iter().sum::<f64>() - nll_new.iter().sum::<f64>() + log_q_ratio;
         if !log_alpha.is_finite() && log_alpha != f64::INFINITY {
             return (DrawOutcome::RejectedMetropolis, log_alpha);

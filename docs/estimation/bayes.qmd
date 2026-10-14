@@ -145,13 +145,19 @@ its bounds. The posteriors are comparable whenever the data dominate. A
 coefficient the data barely inform will show the difference.
 
 **Acceptance is reported.** Because rejection is harmless to correctness, a
-move that is rejected every sweep looks exactly like one that is working: the
-posterior is right either way, and the thetas it owns quietly mix at
-random-walk speed. The fit therefore warns when the move accepted fewer than
-half its draws over the run, and names which of the three outcomes dominated
-— a draw outside a declared bound, a Metropolis rejection, or a conditional
-that could not be formed at all. On a recognised linear form with no active
-bound the rate is 100%.
+move that is rejected every sweep looks exactly like one that is working. It
+is not: a θ this move draws is taken out of the random-walk (θ, σ) block, so
+nothing else proposes it, and a chain that never accepts leaves that θ at its
+initial value for the whole run. The fit therefore warns when the move
+accepted fewer than half of its post-warmup draws, and names the largest group
+of rejections — a draw outside a declared bound, a Metropolis rejection, or a
+conditional that could not be formed at all.
+
+The rate is judged **per chain**, and the chain with the worst rate decides.
+Pooling would hide the case worth reporting: one dead chain among four pools
+to 75% and says nothing, while a quarter of the posterior sample holds a
+frozen coordinate. On a recognised linear form with no active bound every
+chain accepts every draw.
 
 Mixture models draw only the plain typical values.
 

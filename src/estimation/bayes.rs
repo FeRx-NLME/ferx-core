@@ -320,15 +320,16 @@ fn ebe_start_etas(ebes: &[DVector<f64>], n_subjects: usize, n_eta: usize) -> Vec
 /// per-chain closure, which turns a 340-line change into a 1,600-line diff.
 type ChainOutput = (Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64, ConjugateTally);
 
-/// Acceptance below this, over the whole run, and the conjugate mu-reference
-/// move is reported rather than left silent. Not a correctness threshold: the
-/// move is Metropolis-corrected, so every rejection is a valid step of the
-/// chain. It is the point at which the move has stopped *doing* anything and
-/// the thetas it owns are mixing like the random walk it replaced.
+/// A chain accepting below this share of its conjugate draws is reported rather
+/// than left silent. Not a correctness threshold: the move is
+/// Metropolis-corrected, so every rejection is a valid step. It is deliberately
+/// a *sensitive* one — an affine design accepts essentially every draw (measured
+/// `|log α| ≤ 5e-12`), so this is far below "healthy MH acceptance" and reads as
+/// "this move has stopped doing its job", not "this chain mixes slowly".
 const CONJUGATE_ACCEPT_REPORT_THRESHOLD: f64 = 0.5;
 
-/// How the conjugate mu-reference move fared, summed over the **sampling**
-/// sweeps of every chain.
+/// How the conjugate mu-reference move fared in one chain, over its **sampling**
+/// sweeps.
 ///
 /// Warmup is excluded deliberately. Early sweeps sit far from the mode with a
 /// half-adapted Ω, so a coefficient that passes near a declared bound is
@@ -339,10 +340,12 @@ const CONJUGATE_ACCEPT_REPORT_THRESHOLD: f64 = 0.5;
 /// The move's exactness does not rest on the structural affinity proof in
 /// `bayes_mu_design` — the Metropolis correction makes it valid for any typical
 /// value, and a design the proof does not recognise simply accepts less often.
-/// That makes the acceptance rate the **only** observable that distinguishes "the
-/// conjugate move is drawing the typical values" from "it proposes and is
-/// rejected every sweep, and those thetas are back on the random walk the move
-/// exists to replace". Without this tally that distinction is invisible, in a
+/// That makes the acceptance rate the **only** observable that distinguishes
+/// "the conjugate move is drawing the typical values" from "it proposes and is
+/// rejected every sweep". The second is not a slow random walk but a **frozen**
+/// coordinate: a θ this move owns is removed from `pop_coords`, so nothing else
+/// proposes it, and a chain that never accepts leaves it at its initial value
+/// for the whole run. Without this tally that distinction is invisible, in a
 /// run and in a regression.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ConjugateTally {
@@ -366,80 +369,110 @@ impl ConjugateTally {
         *slot += 1;
     }
 
-    fn merge(&mut self, other: Self) {
-        self.moved += other.moved;
-        self.rejected_out_of_bounds += other.rejected_out_of_bounds;
-        self.rejected_metropolis += other.rejected_metropolis;
-        self.skipped += other.skipped;
-    }
-
     fn total(&self) -> u64 {
         self.moved + self.rejected_out_of_bounds + self.rejected_metropolis + self.skipped
     }
 
-    /// `None` when the move never ran (no design, or a mixture model).
+    /// `None` when the move never ran in this chain (no design, or a mixture).
     fn accept_rate(&self) -> Option<f64> {
         match self.total() {
             0 => None,
             n => Some(self.moved as f64 / n as f64),
         }
     }
+
+    /// The largest rejection count and its tag, or `None` when nothing was
+    /// rejected.
+    ///
+    /// `max_by_key` keeps the LAST of several equal maxima, so the array order
+    /// is the tie-break and reads backwards: bounds beats Metropolis beats
+    /// skipped, because "widen the bound" is the one of the three a user can
+    /// act on directly. A tie means two causes are equally live and either
+    /// sentence is true; what matters is that the pick is fixed rather than
+    /// incidental.
+    fn largest_rejection(&self) -> Option<(u64, char)> {
+        [
+            (self.skipped, 's'),
+            (self.rejected_metropolis, 'm'),
+            (self.rejected_out_of_bounds, 'b'),
+        ]
+        .into_iter()
+        .filter(|&(n, _)| n > 0)
+        .max_by_key(|&(n, _)| n)
+    }
 }
 
 /// The low-acceptance report for the conjugate mu-reference move, or `None`
-/// when it ran and accepted often enough (or never ran at all).
+/// when every chain that ran it accepted often enough (or none did).
 ///
-/// The dominant rejection reason picks the advice, because the three have
+/// **Judged per chain, not on the pooled total.** Pooling hides exactly the
+/// failure worth reporting: with four chains, one that accepts nothing and
+/// three that accept everything pool to 75% and say nothing, while the
+/// coordinates that move owns are frozen for a quarter of the posterior sample.
+/// Two dead chains out of four pool to exactly 50%, which this gate calls
+/// healthy. So the worst chain decides, and the message carries the pooled rate
+/// beside it so a one-chain problem is not read as a whole-run one.
+///
+/// The largest rejection category picks the advice, because the three have
 /// nothing in common: a bound is the user's own declaration, a Metropolis
 /// rejection says the Gaussian conditional is a poor proposal for this typical
-/// value, and a skip says the conditional could not be formed at all.
-fn conjugate_accept_warning(tally: ConjugateTally) -> Option<String> {
-    let rate = tally.accept_rate()?;
+/// value, and a skip says the conditional could not be formed at all. It is
+/// reported as the largest group with its count, never as "most" — with three
+/// causes the largest can be well under half.
+fn conjugate_accept_warning(per_chain: &[ConjugateTally]) -> Option<String> {
+    let (worst_chain, worst, rate) = per_chain
+        .iter()
+        .enumerate()
+        .filter_map(|(c, t)| t.accept_rate().map(|r| (c, t, r)))
+        .min_by(|a, b| a.2.total_cmp(&b.2))?;
     if rate >= CONJUGATE_ACCEPT_REPORT_THRESHOLD {
         return None;
     }
+    let ran = per_chain.iter().filter(|t| t.total() > 0).count();
+    let pooled_moved: u64 = per_chain.iter().map(|t| t.moved).sum();
+    let pooled_total: u64 = per_chain.iter().map(|t| t.total()).sum();
     // Counts, not a bare percentage: at 49.6% a rounded "50%" reads as the
     // threshold itself, and the warning looks like a bug in its own gate.
     let mut w = format!(
-        "Bayes: the conjugate mu-reference theta move accepted {} of {} draws ({:.0}%).",
-        tally.moved,
-        tally.total(),
-        100.0 * rate
+        "Bayes: the conjugate mu-reference theta move accepted {} of {} post-warmup draws \
+         ({:.0}%) in chain {} — its worst — and {} of {} across the {} chain(s) that ran it.",
+        worst.moved,
+        worst.total(),
+        100.0 * rate,
+        worst_chain + 1,
+        pooled_moved,
+        pooled_total,
+        ran
     );
-    // `max_by_key` keeps the LAST of several equal maxima, so this order is the
-    // tie-break, and it reads backwards: a tie goes to the LAST arm. Ordered so
-    // that bounds beats Metropolis beats skipped, since "widen the bound" is the
-    // one of the three the user can act on directly. A tie means two causes are
-    // equally live and either sentence is true; what matters is that the pick is
-    // fixed rather than incidental.
-    let worst = [
-        (tally.skipped, 's'),
-        (tally.rejected_metropolis, 'm'),
-        (tally.rejected_out_of_bounds, 'b'),
-    ]
-    .into_iter()
-    .max_by_key(|&(n, _)| n)
-    .map(|(_, tag)| tag)
-    .unwrap_or('m');
-    w.push_str(match worst {
-        'b' => {
-            " Most draws left a declared theta_lower / theta_upper box, so the bound, not the \
-             data, is setting those estimates; widen it if it was a guard rather than a \
-             constraint."
-        }
-        's' => {
-            " Most sweeps could not form the conditional at all (a non-positive-definite Omega \
-             or a non-finite typical value), so the move contributed nothing."
-        }
-        _ => {
-            " Most draws were rejected by the Metropolis correction, which means the Gaussian \
-             conditional is a poor proposal for this typical value — the chain is still valid, \
-             but those thetas mix no better than the random walk."
-        }
-    });
     w.push_str(
-        " Sampling stays exact either way: every rejection is a valid step, so this reports \
-         lost efficiency, not a wrong posterior.",
+        " A theta this move draws is excluded from the random-walk (theta, sigma) block, so \
+         nothing else proposes it: where the move does not accept, those thetas do not move at \
+         all.",
+    );
+    if let Some((n, tag)) = worst.largest_rejection() {
+        w.push_str(&match tag {
+            'b' => format!(
+                " Its largest group of rejections ({n}) left a declared theta_lower / \
+                 theta_upper box. A draw from the Gaussian conditional can overshoot a bound \
+                 whose posterior is interior, so widen the bound if it was a guard rather than \
+                 a constraint."
+            ),
+            's' => format!(
+                " Its largest group ({n}) could not form the conditional at all (a \
+                 non-positive-definite Omega or a non-finite typical value), so those sweeps \
+                 contributed nothing."
+            ),
+            _ => format!(
+                " Its largest group of rejections ({n}) came from the Metropolis correction, \
+                 which means the Gaussian conditional is a poor proposal for this typical \
+                 value."
+            ),
+        });
+    }
+    w.push_str(
+        " The Metropolis step stays target-correct — every rejection is a valid step — but a \
+         coordinate that barely moves cannot deliver a usable posterior, so treat its estimate \
+         and interval as unconverged.",
     );
     Some(w)
 }
@@ -1040,6 +1073,9 @@ pub fn run_bayes(
             let mut eta_record_count = 0u64;
             let mut n_divergent_total = 0u64;
             let mut conj_tally = ConjugateTally::default();
+            // One-shot latch for the baseline freshness check below.
+            #[cfg(debug_assertions)]
+            let mut baseline_checked = false;
 
             // Chain state.
             let mut theta = init_params.theta.clone();
@@ -1475,6 +1511,42 @@ pub fn run_bayes(
                 // Gibbs draw. A draw outside a θ bound is rejected, where the old
                 // move clamped it. This is what makes the chains mix.
                 if let Some(design) = mu_design.as_ref() {
+                    // The baseline `draw` scores against must describe the state the
+                    // chain is actually in — the refresh above, not a vector left
+                    // over from before the Ω draw. That is otherwise an argument
+                    // about block order with nothing to fail on: measured on this
+                    // branch, moving the refresh back below this block leaves all 68
+                    // bayes tests green while shifting the two-compartment covariate
+                    // OFV from −2300.345 to −2305.302 and every θ in its third digit.
+                    //
+                    // Checked once per chain, so the cost is one population pass per
+                    // chain per run, and only where `debug_assert` is live — which
+                    // includes the `ci-cov` profile the per-PR coverage jobs build
+                    // (#1248).
+                    #[cfg(debug_assertions)]
+                    if !baseline_checked {
+                        baseline_checked = true;
+                        for i in 0..n_subjects {
+                            let fresh = subject_nll(
+                                model,
+                                &population.subjects[i],
+                                &theta,
+                                &etas[i],
+                                &kappas[i],
+                                &omega_cur,
+                                omega_iov_cur.as_ref(),
+                                &sigma,
+                                &mut scratch,
+                                schedules[i].as_ref(),
+                            );
+                            debug_assert_eq!(
+                                nll[i], fresh,
+                                "subject {i}: the conjugate move was handed a stale NLL \
+                                 baseline — the refresh must run after the Omega blocks and \
+                                 before this one, for every model that has a design"
+                            );
+                        }
+                    }
                     let mut subject_nlls = |th: &[f64], es: &[Vec<f64>]| -> Vec<f64> {
                         (0..n_subjects)
                             .map(|i| {
@@ -1819,7 +1891,7 @@ pub fn run_bayes(
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
     let mut eta_record_count = 0u64;
     let mut n_divergent_total = 0u64;
-    let mut conj_tally = ConjugateTally::default();
+    let mut conj_tallies: Vec<ConjugateTally> = Vec::with_capacity(n_chains);
     for output in chain_outputs {
         let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent, chain_conj)) =
             output
@@ -1832,7 +1904,7 @@ pub fn run_bayes(
         }
         eta_record_count += chain_eta_count;
         n_divergent_total += chain_divergent;
-        conj_tally.merge(chain_conj);
+        conj_tallies.push(chain_conj);
     }
 
     if verbose {
@@ -2077,7 +2149,7 @@ pub fn run_bayes(
                 .to_string(),
         );
     }
-    if let Some(w) = conjugate_accept_warning(conj_tally) {
+    if let Some(w) = conjugate_accept_warning(&conj_tallies) {
         warnings.push(w);
     }
     if partial_mu_ref {
@@ -3515,15 +3587,16 @@ mod tests {
         assert!(!w.contains("To let the conjugate move draw it"), "{w}");
     }
 
-    /// `record` files each outcome in its own slot, `merge` is additive across
-    /// chains, and `accept_rate` is `moved / total`. Every variant is exercised
-    /// with a distinct count, so a mis-wired `match` arm swaps two numbers that
-    /// cannot be confused.
+    /// `record` files each outcome in its own slot, `total` sums them and
+    /// `accept_rate` is `moved / total`. Every variant is exercised with a
+    /// distinct count, so a mis-wired `match` arm swaps two numbers that cannot
+    /// be confused.
     #[test]
     fn conjugate_tally_counts_each_outcome_separately() {
         let mut a = ConjugateTally::default();
         assert_eq!(a.total(), 0);
         assert_eq!(a.accept_rate(), None, "a move that never ran has no rate");
+        assert_eq!(a.largest_rejection(), None, "nothing rejected");
         for _ in 0..6 {
             a.record(DrawOutcome::Moved);
         }
@@ -3545,15 +3618,35 @@ mod tests {
         );
         assert_eq!(a.total(), 12);
         assert_eq!(a.accept_rate(), Some(0.5));
+        assert_eq!(a.largest_rejection(), Some((3, 's')));
 
-        let mut b = ConjugateTally::default();
-        b.record(DrawOutcome::Moved);
-        b.merge(a);
-        assert_eq!(b.total(), 13);
-        assert_eq!(b.moved, 7);
-        assert_eq!(b.rejected_out_of_bounds, 1);
-        assert_eq!(b.rejected_metropolis, 2);
-        assert_eq!(b.skipped, 3);
+        // A perfect chain has no largest rejection at all, which is what keeps
+        // the cause sentence off a report that cannot name one.
+        let mut perfect = ConjugateTally::default();
+        perfect.record(DrawOutcome::Moved);
+        assert_eq!(perfect.accept_rate(), Some(1.0));
+        assert_eq!(perfect.largest_rejection(), None);
+    }
+
+    /// The tie-break of [`ConjugateTally::largest_rejection`], in both
+    /// directions and three-way, since it is decided by array order and a
+    /// reordering is invisible to every strict-maximum case.
+    #[test]
+    fn the_largest_rejection_tie_break_is_bounds_then_metropolis_then_skipped() {
+        let t = |b, m, sk| ConjugateTally {
+            moved: 1,
+            rejected_out_of_bounds: b,
+            rejected_metropolis: m,
+            skipped: sk,
+        };
+        assert_eq!(t(5, 5, 0).largest_rejection(), Some((5, 'b')));
+        assert_eq!(t(5, 0, 5).largest_rejection(), Some((5, 'b')));
+        assert_eq!(t(0, 5, 5).largest_rejection(), Some((5, 'm')));
+        assert_eq!(t(4, 4, 4).largest_rejection(), Some((4, 'b')));
+        // A strict maximum is unaffected by the order.
+        assert_eq!(t(1, 2, 9).largest_rejection(), Some((9, 's')));
+        assert_eq!(t(9, 2, 1).largest_rejection(), Some((9, 'b')));
+        assert_eq!(t(1, 9, 2).largest_rejection(), Some((9, 'm')));
     }
 
     /// Both sides of the two gates that decide whether the conjugate move is
@@ -3561,99 +3654,188 @@ mod tests {
     /// Split across two tests, a gate stuck on one branch still passes half.
     #[test]
     fn conjugate_accept_warning_is_silent_when_there_is_nothing_to_report() {
+        assert_eq!(conjugate_accept_warning(&[]), None, "no chains at all");
         assert_eq!(
-            conjugate_accept_warning(ConjugateTally::default()),
+            conjugate_accept_warning(&[ConjugateTally::default(); 4]),
             None,
             "no design, no draws, no warning"
         );
+        let perfect = ConjugateTally {
+            moved: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            conjugate_accept_warning(&[perfect; 4]),
+            None,
+            "an affine design accepts everything"
+        );
         // Exactly at the threshold is "often enough": the constant is the point
-        // below which the move has stopped doing anything.
+        // below which the move has stopped doing its job.
         let at = ConjugateTally {
             moved: 50,
             rejected_metropolis: 50,
             ..Default::default()
         };
         assert_eq!(at.accept_rate(), Some(CONJUGATE_ACCEPT_REPORT_THRESHOLD));
-        assert_eq!(conjugate_accept_warning(at), None, "{at:?}");
+        assert_eq!(conjugate_accept_warning(&[at]), None, "{at:?}");
         // One draw either way straddles it.
         let below = ConjugateTally {
             moved: 49,
             rejected_metropolis: 51,
             ..Default::default()
         };
-        assert!(conjugate_accept_warning(below).is_some(), "{below:?}");
+        assert!(conjugate_accept_warning(&[below]).is_some(), "{below:?}");
+    }
+
+    /// The report is decided by the **worst chain**, not by the pooled total,
+    /// which is the whole reason this is not one merged tally: a dead chain
+    /// beside healthy ones pools to a comfortable rate and says nothing, while
+    /// the thetas that move owns sit frozen for its share of the sample.
+    #[test]
+    fn conjugate_accept_warning_is_decided_by_the_worst_chain() {
+        let dead = ConjugateTally {
+            moved: 0,
+            rejected_metropolis: 100,
+            ..Default::default()
+        };
+        let healthy = ConjugateTally {
+            moved: 100,
+            ..Default::default()
+        };
+
+        // One dead chain in four pools to 75%, two to exactly 50% — both of
+        // which the gate calls healthy when applied to the pool.
+        for dead_chains in 1..=2 {
+            let mut chains = vec![healthy; 4];
+            for c in chains.iter_mut().take(dead_chains) {
+                *c = dead;
+            }
+            let pooled: u64 = chains.iter().map(|t| t.moved).sum();
+            assert!(
+                pooled as f64 / 400.0 >= CONJUGATE_ACCEPT_REPORT_THRESHOLD,
+                "precondition: pooling must look healthy with {dead_chains} dead"
+            );
+            let w = conjugate_accept_warning(&chains)
+                .unwrap_or_else(|| panic!("{dead_chains} dead chain(s) must be reported"));
+            assert!(
+                w.contains("accepted 0 of 100 post-warmup draws (0%) in chain 1 — its worst —"),
+                "{w}"
+            );
+            assert!(
+                w.contains(&format!(
+                    "and {pooled} of 400 across the 4 chain(s) that ran it."
+                )),
+                "{w}"
+            );
+        }
+
+        // A chain the move never ran in has no rate, so it is not the worst
+        // chain and it is not counted in the pool either.
+        let w = conjugate_accept_warning(&[ConjugateTally::default(), dead, healthy])
+            .expect("the dead chain is still reported");
+        assert!(w.contains("in chain 2 — its worst —"), "{w}");
+        assert!(
+            w.contains("and 100 of 200 across the 2 chain(s) that ran it."),
+            "{w}"
+        );
     }
 
     /// Every sentence of the report, and the branch that selects it. Each of
-    /// the three advice sentences is asserted verbatim and against the other
-    /// two, so deleting any one of them fails here.
+    /// the three cause sentences is asserted verbatim and against the other
+    /// two, so deleting any one of them fails here; so do the two sentences
+    /// that are always present.
     #[test]
-    fn conjugate_accept_warning_names_the_dominant_rejection() {
-        const EXACT: &str = " Sampling stays exact either way: every rejection is a valid step, \
-                              so this reports lost efficiency, not a wrong posterior.";
-        const BOUNDS: &str = " Most draws left a declared theta_lower / theta_upper box, so the \
-                               bound, not the data, is setting those estimates; widen it if it \
-                               was a guard rather than a constraint.";
-        const METROPOLIS: &str =
-            " Most draws were rejected by the Metropolis correction, which means the Gaussian \
-             conditional is a poor proposal for this typical value — the chain is still valid, \
-             but those thetas mix no better than the random walk.";
-        const SKIPPED: &str =
-            " Most sweeps could not form the conditional at all (a non-positive-definite Omega \
-             or a non-finite typical value), so the move contributed nothing.";
+    fn conjugate_accept_warning_names_the_largest_rejection() {
+        const FROZEN: &str = " A theta this move draws is excluded from the random-walk \
+                               (theta, sigma) block, so nothing else proposes it: where the \
+                               move does not accept, those thetas do not move at all.";
+        const CORRECT: &str = " The Metropolis step stays target-correct — every rejection is \
+                                a valid step — but a coordinate that barely moves cannot \
+                                deliver a usable posterior, so treat its estimate and interval \
+                                as unconverged.";
+        const BOUNDS: &str = " Its largest group of rejections (90) left a declared \
+                               theta_lower / theta_upper box. A draw from the Gaussian \
+                               conditional can overshoot a bound whose posterior is interior, \
+                               so widen the bound if it was a guard rather than a constraint.";
+        const METROPOLIS: &str = " Its largest group of rejections (7) came from the Metropolis \
+                                   correction, which means the Gaussian conditional is a poor \
+                                   proposal for this typical value.";
+        const SKIPPED: &str = " Its largest group (7) could not form the conditional at all (a \
+                                non-positive-definite Omega or a non-finite typical value), so \
+                                those sweeps contributed nothing.";
 
-        let w = conjugate_accept_warning(ConjugateTally {
+        let w = conjugate_accept_warning(&[ConjugateTally {
             moved: 10,
             rejected_out_of_bounds: 90,
             ..Default::default()
-        })
+        }])
         .expect("below the threshold");
         assert!(
             w.starts_with(
-                "Bayes: the conjugate mu-reference theta move accepted 10 of 100 draws (10%)."
+                "Bayes: the conjugate mu-reference theta move accepted 10 of 100 post-warmup \
+                 draws (10%) in chain 1 — its worst — and 10 of 100 across the 1 chain(s) that \
+                 ran it."
             ),
             "{w}"
         );
+        assert!(w.contains(FROZEN), "{w}");
         assert!(w.contains(BOUNDS), "{w}");
-        assert!(!w.contains(METROPOLIS) && !w.contains(SKIPPED), "{w}");
-        assert!(w.ends_with(EXACT), "{w}");
+        assert!(
+            !w.contains("came from the Metropolis") && !w.contains("could not form"),
+            "{w}"
+        );
+        assert!(w.ends_with(CORRECT), "{w}");
 
-        let w = conjugate_accept_warning(ConjugateTally {
+        let w = conjugate_accept_warning(&[ConjugateTally {
             moved: 1,
             rejected_out_of_bounds: 2,
             rejected_metropolis: 7,
             ..Default::default()
-        })
+        }])
         .expect("below the threshold");
+        assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
         assert!(w.contains(METROPOLIS), "{w}");
-        assert!(!w.contains(BOUNDS) && !w.contains(SKIPPED), "{w}");
-        assert!(w.ends_with(EXACT), "{w}");
+        assert!(
+            !w.contains("left a declared") && !w.contains("could not form"),
+            "{w}"
+        );
 
-        let w = conjugate_accept_warning(ConjugateTally {
+        let w = conjugate_accept_warning(&[ConjugateTally {
             moved: 1,
             rejected_metropolis: 2,
             skipped: 7,
             ..Default::default()
-        })
+        }])
         .expect("below the threshold");
+        assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
         assert!(w.contains(SKIPPED), "{w}");
-        assert!(!w.contains(BOUNDS) && !w.contains(METROPOLIS), "{w}");
-        assert!(w.ends_with(EXACT), "{w}");
-
-        // A tie is a reachable input, so the pick is pinned rather than left to
-        // whichever arm the iterator happened to visit last.
-        let w = conjugate_accept_warning(ConjugateTally {
-            moved: 1,
-            rejected_out_of_bounds: 5,
-            rejected_metropolis: 5,
-            ..Default::default()
-        })
-        .expect("below the threshold");
         assert!(
-            w.contains(BOUNDS),
-            "a bounds/Metropolis tie reports bounds: {w}"
+            !w.contains("left a declared") && !w.contains("came from the Metropolis"),
+            "{w}"
         );
-        assert!(!w.contains(METROPOLIS), "{w}");
+    }
+
+    /// The largest rejection group is reported as the largest, never as "most":
+    /// with three causes it can be a small minority of the draws, and the first
+    /// wording of this message ("Most draws left a declared ... box") was
+    /// simply false there. 18 of 100 is the counter-example.
+    #[test]
+    fn a_fragmented_rejection_is_not_reported_as_a_majority() {
+        let w = conjugate_accept_warning(&[ConjugateTally {
+            moved: 49,
+            rejected_out_of_bounds: 18,
+            rejected_metropolis: 17,
+            skipped: 16,
+        }])
+        .expect("49% is below the threshold");
+        assert!(
+            w.contains("Its largest group of rejections (18) left a declared"),
+            "{w}"
+        );
+        assert!(
+            !w.to_lowercase().contains("most "),
+            "no majority claim: {w}"
+        );
     }
 
     #[test]

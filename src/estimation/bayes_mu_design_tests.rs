@@ -271,6 +271,7 @@ fn a_moved_draw_holds_every_individual_parameter() {
     let mut rng = StdRng::seed_from_u64(7);
     let theta0 = theta.clone();
     let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
+    let nll0 = nll.clone();
     let out = d
         .draw(
             &mut theta,
@@ -304,11 +305,115 @@ fn a_moved_draw_holds_every_individual_parameter() {
     // recompute it. Bit-equality, not a tolerance — it is the same function at
     // the same state, and anything else is a stale baseline silently biasing
     // the (θ, σ) block's Metropolis ratio for the rest of the sweep.
+    let fresh = nll_baseline(&model, &pop, &omega, &theta, &etas);
+    // Liveness first: without this the assertion below also passes for a `draw`
+    // that never touched the cache, since it would then still equal the state
+    // it was built from.
+    assert_ne!(
+        fresh, nll0,
+        "the moved state must have a different NLL, or the check below is vacuous"
+    );
     assert_eq!(
-        nll,
-        nll_baseline(&model, &pop, &omega, &theta, &etas),
+        nll, fresh,
         "the returned NLL baseline is the proposed state's"
     );
+}
+
+/// A Metropolis rejection leaves the caller's cache alone. `draw` evaluates the
+/// proposal into a local vector and only commits it on a move; writing it
+/// unconditionally would hand the (θ, σ) block a baseline for a state the chain
+/// is not in, which biases every later accept by a constant.
+#[test]
+fn a_metropolis_rejected_draw_leaves_the_baseline_alone() {
+    let (model, pop) = cov_model();
+    let params = &model.default_params;
+    let d = MuDesign::build(&model, &pop, params, true).expect("design");
+    let omega = dense_omega(model.n_eta, model.eta_names.clone());
+    let etas0 = fixture_etas(pop.subjects.len(), model.n_eta);
+    let lo = vec![f64::NEG_INFINITY; params.theta.len()];
+    let hi = vec![f64::INFINITY; params.theta.len()];
+
+    // A baseline far BELOW the truth makes every proposal look catastrophically
+    // worse than the current state, so the Metropolis arm is forced without
+    // touching the bounds (which would take the other reject branch).
+    let mut rejected = 0;
+    for seed in 0..12u64 {
+        let mut theta = params.theta.clone();
+        let mut etas = etas0.clone();
+        let mut nll = nll_baseline(&model, &pop, &omega, &theta, &etas);
+        for v in nll.iter_mut() {
+            *v -= 1e4;
+        }
+        let nll0 = nll.clone();
+        let (out, _) = d.draw(
+            &mut theta,
+            &mut etas,
+            &omega,
+            &lo,
+            &hi,
+            &pop,
+            &mut StdRng::seed_from_u64(seed),
+            &mut nll,
+            &mut nll_target(&model, &pop, &omega),
+        );
+        assert_eq!(out, DrawOutcome::RejectedMetropolis, "seed {seed}");
+        assert_eq!(theta, params.theta, "seed {seed}: θ unchanged");
+        assert_eq!(etas, etas0, "seed {seed}: η unchanged");
+        assert_eq!(nll, nll0, "seed {seed}: the baseline is unchanged");
+        rejected += 1;
+    }
+    assert_eq!(rejected, 12, "every seed took the Metropolis reject arm");
+}
+
+/// A `Skipped` draw leaves θ, η and the baseline exactly as they were, and
+/// costs no likelihood evaluation: every one of the five early returns runs
+/// before the first mutation.
+///
+/// Reached through a **non-finite μ**, by putting a log-anchored typical value
+/// at 0 so `β = ln θ` is −inf and the conditional's mean is not finite. The
+/// obvious route — an indefinite Ω — does not work and is worth recording:
+/// `OmegaMatrix::from_matrix` repairs the matrix it is handed, so a −1
+/// variance arrives at `conditional` already positive-definite, the draw
+/// proceeds, and the outcome is `RejectedMetropolis` (measured).
+#[test]
+fn a_skipped_draw_changes_no_state_at_all() {
+    let (model, pop) = cov_model();
+    let params = &model.default_params;
+    let d = MuDesign::build(&model, &pop, params, true).expect("design");
+    let omega = dense_omega(model.n_eta, model.eta_names.clone());
+
+    let mut theta = params.theta.clone();
+    theta[theta_idx(&model, "TVCL")] = 0.0;
+    let mut etas = fixture_etas(pop.subjects.len(), model.n_eta);
+    let theta0 = theta.clone();
+    let etas0 = etas.clone();
+    // A stand-in baseline, not a computed one: the likelihood at θ_TVCL = 0 is
+    // not finite, and a NaN would make the "unchanged" assertion vacuous
+    // (NaN != NaN fails even when nothing was written).
+    let nll0: Vec<f64> = (0..pop.subjects.len()).map(|i| 1.0 + i as f64).collect();
+    let mut nll = nll0.clone();
+    let mut calls = 0usize;
+    let mut counted = |th: &[f64], es: &[Vec<f64>]| {
+        calls += 1;
+        nll_target(&model, &pop, &omega)(th, es)
+    };
+    let (out, la) = d.draw(
+        &mut theta,
+        &mut etas,
+        &omega,
+        &vec![f64::NEG_INFINITY; params.theta.len()],
+        &vec![f64::INFINITY; params.theta.len()],
+        &pop,
+        &mut StdRng::seed_from_u64(4),
+        &mut nll,
+        &mut counted,
+    );
+    assert_eq!(out, DrawOutcome::Skipped);
+    assert!(la.is_nan(), "no ratio was formed: {la}");
+    assert_eq!(theta, theta0, "θ unchanged");
+    assert_eq!(etas, etas0, "η unchanged");
+    assert_eq!(nll, nll0, "the baseline is unchanged");
+    assert_eq!(calls, 0, "a skipped draw costs no likelihood evaluation");
 }
 
 /// `draw` scores its Metropolis ratio against the per-subject NLL it is
