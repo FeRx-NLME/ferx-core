@@ -112,16 +112,18 @@ Tuning the build for your CPU does not make ferx meaningfully faster, and it is
 not recommended. #1917 measured this from the same commit on an Apple M5 Pro and
 an AMD Ryzen 7 7840U (Zen 4), across FOCEI, SAEM and `gn_hybrid`:
 
-- `RUSTFLAGS="-C target-cpu=native"` on Apple Silicon changes nothing. The default
-  aarch64 macOS target is already tuned for Apple cores.
-- On x86_64, `-C target-cpu=x86-64-v3` was neutral on most models and up to 12 %
-  *slower* on one. `-C target-cpu=native`, which enables AVX-512 on Zen 4, was
-  2–15 % slower.
-- `codegen-units = 1` gave about 3–5 % on ODE models and nothing on analytic ones,
-  for a release build several times longer.
+- `RUSTFLAGS="-C target-cpu=native"` on Apple Silicon gave no meaningful benefit.
+  The default aarch64 macOS target is already tuned for Apple cores.
+- On x86_64, `-C target-cpu=x86-64-v3` was neutral on most models and 12 % *slower*
+  on one. `-C target-cpu=native`, which enables AVX-512 on Zen 4, was 2–15 % slower.
+- `codegen-units = 1` helped only the ODE models: about 3 % wall time on Zen 4, and
+  3–5 % fewer instructions on the Mac. It made a clean release build 41 % longer on
+  Zen 4, and much longer on the Mac.
 
-All of these builds produce bit-identical fits; only the speed differs. For a
-faster fit, give it more threads instead; see
+On each machine, the fits from these builds were bit-identical to the portable
+build of the same commit; only the speed differed. That says nothing about fits
+across operating systems, where the system math library can differ. For a faster
+fit, give it more threads instead; see
 [choosing a thread count](model-file/fit-options.qmd#choosing-a-thread-count).
 
 ### Verify the build
