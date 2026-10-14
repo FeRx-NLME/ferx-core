@@ -253,11 +253,21 @@ On the ferx-r examples `two_cpt_oral_base` and `two_cpt_oral_cov` (30 subjects,
 | cov, 1,000 (defaults) | 2.735 / 3 | 1.017 / 482 |
 | cov, 6,000 | 7.158 / 2 | 1.002 / 2,951 |
 
-Across the default seed and seeds 1–3 at the defaults, the base model gives
-1.005–1.008 (before: 1.19–2.04) and the covariate model 1.004–1.017. At 1,000
-draws per chain the 1.01 threshold sits inside the Monte Carlo noise of R̂
-itself, so one seed in four can still warn; longer chains settle it. The worst
-parameter is usually σ (`PROP_ERR`), which the random-walk block samples. The
+At the defaults, the base model gives max R̂ 1.005–1.008 across the default
+seed and seeds 1–3 (before: 1.19–2.04), and none of them warns. The covariate
+model varies more between seeds in these short runs:
+
+| seed | max R̂ / min bulk ESS |
+|---|---|
+| default | 1.017 / 482 |
+| 1 | 1.004 |
+| 2 | 1.005 |
+| 3 | 1.014 / 505 |
+
+Two of the four seeds warn. If you are warned, run longer chains. At 6,000
+draws per chain the default seed gives 1.002 with ESS 2,951 and no warning.
+The worst parameter is usually σ (`PROP_ERR`), which the random-walk block
+samples. The
 posterior means sit within 0.12 posterior SD of the FOCEI estimates for every
 θ and σ, for example:
 
