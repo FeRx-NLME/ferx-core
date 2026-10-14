@@ -2058,7 +2058,14 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// far from orthogonal (a θ read on every record against the levels'), where
 /// one pass loses the orthogonality the residual relies on. A zero or
 /// non-finite column, or one already in the span, adds no direction.
+#[cfg(test)]
 fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    orthonormal_basis_with(cols, &mut Vec::new())
+}
+
+/// [`orthonormal_basis`], pushing each nonzero finite column's remnant
+/// `‖c − P c‖ / ‖c‖` against the columns before it onto `remnants`.
+fn orthonormal_basis_with(cols: &[Vec<f64>], remnants: &mut Vec<f64>) -> Vec<Vec<f64>> {
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for c in cols {
         let c_norm = dot(c, c).sqrt();
@@ -2068,6 +2075,7 @@ fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
         let mut v = c.clone();
         project_out(&mut v, &basis);
         let n = dot(&v, &v).sqrt();
+        remnants.push(n / c_norm);
         if n > 1e-12 * c_norm {
             basis.push(v.into_iter().map(|x| x / n).collect());
         }
@@ -2122,6 +2130,9 @@ struct BlockBasis {
     dense: Vec<Vec<f64>>,
     offsets: Vec<usize>,
     n_rows: usize,
+    /// Per nonzero finite column, `‖c − P c‖ / ‖c‖` against the columns
+    /// orthonormalised before it.
+    remnants: Vec<f64>,
 }
 
 impl BlockBasis {
@@ -2131,7 +2142,11 @@ impl BlockBasis {
         for col in cols.iter().filter(|c| c.len() == 1) {
             singles[col[0].0].push(col[0].1.clone());
         }
-        let local: Vec<Vec<Vec<f64>>> = singles.iter().map(|c| orthonormal_basis(c)).collect();
+        let mut remnants: Vec<f64> = Vec::new();
+        let local: Vec<Vec<Vec<f64>>> = singles
+            .iter()
+            .map(|c| orthonormal_basis_with(c, &mut remnants))
+            .collect();
         // Each multi-subject column, projected against the local bases and the
         // dense part so far, adds a direction only when what is left is not
         // rounding of the *original* column — the test `orthonormal_basis`
@@ -2152,6 +2167,7 @@ impl BlockBasis {
             }
             project_out(&mut v, &dense);
             let n = dot(&v, &v).sqrt();
+            remnants.push(n / c_norm);
             if n > 1e-12 * c_norm {
                 dense.push(v.into_iter().map(|x| x / n).collect());
             }
@@ -2161,7 +2177,15 @@ impl BlockBasis {
             dense,
             offsets: offsets.to_vec(),
             n_rows,
+            remnants,
         }
+    }
+
+    /// How many nonzero columns kept less than [`SPAN_TOL`] of their norm
+    /// against the columns orthonormalised before them (#1977): the columns'
+    /// rank deficiency at that tolerance, whatever order they were taken in.
+    fn aliased(&self) -> usize {
+        self.remnants.iter().filter(|r| **r < SPAN_TOL).count()
     }
 
     /// `‖z − P z‖ / ‖z‖`; `None` when `z` is zero. A non-finite value comes
@@ -2218,6 +2242,19 @@ impl BlockBasis {
 /// `ref`), an identified one at least 1.4e-2 (the kappa twin of
 /// `a_coarser_random_effect_can_carry_the_mean` without `ETA_B`). [`SPAN_TOL`]
 /// sits 3.7 decades above the one and 4.2 below the other.
+///
+/// The coded block must also keep its rank against the other θ (#1977): a
+/// θ that is itself a combination of the levels carries exactly the direction
+/// the contrast under which it lies in the coded span removes — `TVB * D2`,
+/// with no weight on the reference level, under `ref` — so the certificate
+/// would otherwise name as the rescue the one contrast that aliases the model.
+/// Each coded column must keep at least [`SPAN_TOL`] of its norm against the
+/// other θ and the coded columns before it, counted on the basis the residual
+/// is measured in, beyond any deficiency the other θ have among themselves.
+/// Measured over every guard the `api::levels` tests reach (1353, macOS arm64
+/// debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
+/// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
+/// below the other.
 ///
 /// Only branches that refuse without it ask for it, so a model that binds
 /// without the certificate never pays for it. On those branches it costs the
@@ -2330,6 +2367,7 @@ fn carried(
             };
             cols.push(c);
         }
+        let n_other = cols.len();
         // The block's level columns (a `FIX` level moves nothing), coded by
         // `contrast` over `groups`: under `ref` the first level of each group
         // is dropped, under sum-to-zero each level but its group's last is
@@ -2399,8 +2437,7 @@ fn carried(
         // Whether some unit keeps a direction outside the span of `cols`. A
         // unit whose column is zero measures nothing; anything non-finite says
         // nothing either, and falls to the refusal.
-        let outside = |cols: &[Pieces]| -> Option<bool> {
-            let basis = BlockBasis::new(cols, &lens, &offsets);
+        let outside = |basis: &BlockBasis| -> Option<bool> {
             let mut outside = false;
             for z in &own {
                 match basis.residual(z) {
@@ -2411,11 +2448,24 @@ fn carried(
             }
             Some(outside)
         };
+        // #1977: the coded block must add a direction of its own for every
+        // column it has. A coded column inside the span of the other θ (and of
+        // the coded columns before it) is a θ the data cannot tell from them:
+        // `TVB * D2` is a combination of the levels with no weight on the
+        // reference, so under `ref` it is one of the coded columns' sums, and
+        // the model is aliased whatever the random effect keeps. The rank falls
+        // out of the basis the residual needs anyway; the other θ's own
+        // deficiency, if any, is not the block's and is subtracted.
+        let basis = BlockBasis::new(&cols, &lens, &offsets);
+        let others = BlockBasis::new(&cols[..n_other], &lens, &offsets);
+        if basis.aliased() > others.aliased() {
+            return Carried::Held;
+        }
         // Without the coarser random effects first: adding columns only widens
         // the span, so a unit set held without them is held with them, and the
         // usual refusal — an intercept carrying the direction — never builds
         // their one column per unit (#1961 review, F1).
-        if outside(&cols) != Some(true) {
+        if outside(&basis) != Some(true) {
             return Carried::Held;
         }
         // The random effects at a coarser-or-equal unit: the other η for an η,
@@ -2438,7 +2488,7 @@ fn carried(
             };
             cols.extend(c);
         }
-        if outside(&cols) != Some(true) {
+        if outside(&BlockBasis::new(&cols, &lens, &offsets)) != Some(true) {
             return Carried::Held;
         }
     }

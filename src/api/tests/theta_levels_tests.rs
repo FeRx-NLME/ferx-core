@@ -4546,6 +4546,15 @@ mod absorption {
         rank(&residual_sv(&xb, &DMatrix::zeros(xb.nrows(), 0))) < xb.ncols()
     }
 
+    /// Whether the block coded by `contrast` loses rank against the other θ
+    /// (#1977): `[X_o | X_B·C]` is not of full column rank beyond `X_o`'s own,
+    /// so some coded direction is a combination of the other θ. Implies
+    /// [`block_loses_rank`].
+    pub(super) fn block_aliased(j: &Jac, contrast: LevelContrast) -> bool {
+        let xb = &j.xb * coding(j, contrast);
+        rank(&residual_sv(&xb, &j.xo)) < xb.ncols()
+    }
+
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
     /// contrast exactly when the oracle does: the block absorbs the random
     /// effect under it (rank 0 against a positive baseline), or the coded block
@@ -5294,7 +5303,10 @@ mod absorption {
 
     /// Whether the binder agrees with [`joint_oracle`] on `text(contrast)` over
     /// `pop`, by T1's rule: an explicit contrast leaving a free θ is refused
-    /// exactly when the oracle absorbs something under it, and `auto` resolves
+    /// exactly when the oracle absorbs something under it, the coded block
+    /// loses rank on its own, or — where the contrast must rescue an absorbed
+    /// random effect — the coded block loses rank against the other θ
+    /// ([`block_aliased`], #1977); and `auto` resolves
     /// to a contrast that absorbs nothing — global whenever global absorbs
     /// nothing — and is refused only when every contrast absorbs. Disagreements
     /// are pushed onto `wrong`.
@@ -5318,13 +5330,24 @@ mod absorption {
         wrong: &mut Vec<String>,
     ) {
         let jac = jacobian_at(&text("none"), pop, at);
+        // The cells a contrast must rescue: the block absorbs a random effect
+        // under `none`, and the contrast is not the nested block's within-group
+        // one, which removes each unit's mean outright. There a coded block
+        // that is a combination of the other θ rescues nothing (#1977). A block
+        // that needs no rescue is not judged on its aliasing.
+        let needs_rescue = !joint_oracle(&jac, LevelContrast::Unconstrained)
+            .0
+            .is_empty();
         let mut absorbs = HashMap::new();
         for (c, token) in EXPLICIT {
             let (absorbed, free) = joint_oracle(&jac, c);
             if free == 0 {
                 continue;
             }
-            let refuse = !absorbed.is_empty() || block_loses_rank(&jac, c);
+            let rescued = needs_rescue && (jac.one_column || c != LevelContrast::SumToZeroWithin);
+            let refuse = !absorbed.is_empty()
+                || block_loses_rank(&jac, c)
+                || (rescued && block_aliased(&jac, c));
             absorbs.insert(token, refuse);
             let got = try_bind(&text(token), pop);
             if got.is_err() != refuse {
@@ -7612,82 +7635,232 @@ mod absorption {
         assert!(wrong.is_empty(), "no intercept:\n{}", wrong.join("\n"));
     }
 
-    /// T2 (#1840). Sum-to-zero and `ref` take different directions away, and
-    /// the model can carry one and not the other. `TVB * D2`, a θ on study 2's
-    /// records alone, carries the levels' sum (its level coefficients sum to 1)
-    /// but not study 1's reference level: `sum_to_zero` is refused and names
-    /// `ref`, `ref` binds, and auto takes `ref`. `TVB * (D1 - D2)` is the
-    /// mirror: it carries the reference and not the sum. On the nested block
-    /// the same split happens without a contrived θ: `TVEMAX`'s column
-    /// `TIME / (TIME + ET50)` carries the sum of the `[STUDY, TIME]` levels but
-    /// is 0 at the reference level `TIME = 0`, so global sum-to-zero is
-    /// refused and `ref` binds; auto keeps `sum_to_zero_within`. Each row's
-    /// straddle — the oracle absorbing under one of the two contrasts and not
-    /// the other — is asserted, and every row agrees with the joint oracle.
+    /// The rows of T2 (#1840, #1977) and T5's M3/M4: the absorbed `ETA_E0`
+    /// next to `ETA_B * (1 + TIME)`, a coarser random effect, and a θ that
+    /// shares a direction with it. `TVC * TIME * D2`, with `ETA_B`'s column on
+    /// study 2, carries study 2's level: that lies in the levels' sum but not
+    /// in study 1's reference level. The mirror `TVC * TIME * (D1 - D2)` carries
+    /// `D1 - D2`, which reaches the reference and not the sum. Neither θ is a
+    /// combination of the levels, so the coded block keeps its rank.
+    fn split_text(extra: &'static str) -> impl Fn(&str) -> String {
+        move |c: &str| {
+            let r = row_1836(
+                "split",
+                format!("  E0 = {NO_INTERCEPT} + {extra} + ETA_B * (1 + TIME)"),
+                false,
+            );
+            let t = with_thetas(row_text(&r)(c), &[("TVC", 0.5)]);
+            t.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  omega ETA_B ~ 0.1\n",
+            )
+        }
+    }
+
+    /// T2 (#1840, rewritten by #1977). Sum-to-zero and `ref` take different
+    /// directions away, and the model can carry one and not the other. A θ that
+    /// carries the direction through a coarser random effect leaves the other
+    /// contrast a rescue: `TVC * TIME * D2` ([`split_text`]) carries the levels'
+    /// sum and not the reference, so `sum_to_zero` is refused and names `ref`,
+    /// `ref` binds, and auto takes `ref`; its mirror carries the reference and
+    /// not the sum. A θ that carries the direction by being a combination of
+    /// the levels rescues nothing (#1977): `TVB * D2` is one of the `ref`-coded
+    /// columns' sums, `TVB * (D1 - D2)` one of the sum-to-zero-coded ones', and
+    /// on the nested block `TVEMAX`'s column `TIME / (TIME + ET50)`, zero at
+    /// the reference level `TIME = 0`, is one of the `ref`-coded columns' too.
+    /// Under the contrast #1840 bound them with, the oracle absorbs nothing and
+    /// the coded block is aliased: each is refused under both global contrasts,
+    /// the one-column rows with "under any contrast" and auto refused; the
+    /// nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
+    /// the split rows' oracle absorbs under one contrast and not the other, with
+    /// the block of full rank; the aliased rows' oracle absorbs under one and
+    /// finds the block aliased under the other — and every row agrees with the
+    /// joint oracle.
     ///
     /// Mutations — the certificate codes every contrast as sum-to-zero (the
-    /// `ref` rows refuse, the mirror's `ref` binds); auto never takes `ref`
-    /// (`TVB * D2`'s auto is refused).
+    /// `ref` split row refuses, the mirror's `ref` binds); auto never takes
+    /// `ref` (`TVC * TIME * D2`'s auto is refused); the #1977 guard deleted
+    /// (each aliased row binds under the contrast #1840 named).
     #[test]
     fn the_contrast_decides_which_direction_is_carried() {
         let pop = arms_pop_d();
-        let one = |tag: &'static str, extra: &str| {
-            row_1836(tag, format!("  E0 = {NO_INTERCEPT} + {extra}"), false)
+        let one = |extra: &str| {
+            let r = row_1836("aliased", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            move |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)])
         };
-        let cases: Vec<(Row, LevelContrast, LevelContrast, LevelContrast)> = vec![
-            // (row, refused, bound, auto)
+        let nested = |c: &str| {
+            row_text(&(
+                "nested",
+                "STUDY, TIME",
+                format!("  E0 = {NO_INTERCEPT}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            ))(c)
+        };
+        type Text = Box<dyn Fn(&str) -> String>;
+        // (tag, text, absorbed under, the other contrast, auto: `None` refused)
+        let split: Vec<(
+            &str,
+            Text,
+            LevelContrast,
+            LevelContrast,
+            Option<LevelContrast>,
+        )> = vec![
             (
-                one("TVB*D2", "TVB * D2"),
+                "TVC*TIME*D2",
+                Box::new(split_text("TVC * TIME * D2")),
                 LevelContrast::SumToZero,
                 LevelContrast::Ref,
-                LevelContrast::Ref,
+                Some(LevelContrast::Ref),
             ),
             (
-                one("TVB*(D1-D2)", "TVB * (D1 - D2)"),
+                "TVC*TIME*(D1-D2)",
+                Box::new(split_text("TVC * TIME * (D1 - D2)")),
                 LevelContrast::Ref,
                 LevelContrast::SumToZero,
+                Some(LevelContrast::SumToZero),
+            ),
+        ];
+        let aliased: Vec<(
+            &str,
+            Text,
+            LevelContrast,
+            LevelContrast,
+            Option<LevelContrast>,
+        )> = vec![
+            (
+                "TVB*D2",
+                Box::new(one("TVB * D2")),
                 LevelContrast::SumToZero,
+                LevelContrast::Ref,
+                None,
             ),
             (
-                (
-                    "nested",
-                    "STUDY, TIME",
-                    format!("  E0 = {NO_INTERCEPT}"),
-                    format!("E0 + {EMAXY}"),
-                    false,
-                ),
+                "TVB*(D1-D2)",
+                Box::new(one("TVB * (D1 - D2)")),
+                LevelContrast::Ref,
+                LevelContrast::SumToZero,
+                None,
+            ),
+            (
+                "nested",
+                Box::new(nested),
                 LevelContrast::SumToZero,
                 LevelContrast::Ref,
-                LevelContrast::SumToZeroWithin,
+                Some(LevelContrast::SumToZeroWithin),
             ),
         ];
         let token = |c: LevelContrast| EXPLICIT.iter().find(|(k, _)| *k == c).unwrap().1;
         let mut wrong = Vec::new();
-        for (r, refused, bound, auto) in &cases {
-            let text = |c: &str| with_thetas(row_text(r)(c), &[("TVB", 0.5)]);
-            let j = jacobian(&text("none"), &pop);
-            let (a_refused, _) = joint_oracle(&j, *refused);
-            let (a_bound, _) = joint_oracle(&j, *bound);
-            assert!(
-                a_refused == ["ETA_E0"] && a_bound.is_empty(),
-                "{}: the straddle — oracle absorbs {a_refused:?} under {refused:?}, \
-                 {a_bound:?} under {bound:?}",
-                r.0
-            );
-            if try_bind(&text(token(*refused)), &pop).is_ok() {
-                wrong.push(format!("{} {refused:?}: bound", r.0));
+        for (is_aliased, cases) in [(false, &split), (true, &aliased)] {
+            for (tag, text, absorbing, other, auto) in cases {
+                let j = jacobian(&text("none"), &pop);
+                let (a_absorbing, _) = joint_oracle(&j, *absorbing);
+                let (a_other, _) = joint_oracle(&j, *other);
+                assert!(
+                    a_absorbing == ["ETA_E0"]
+                        && a_other.is_empty()
+                        && (is_aliased || !block_aliased(&j, *absorbing))
+                        && block_aliased(&j, *other) == is_aliased,
+                    "{tag}: the straddle — oracle absorbs {a_absorbing:?} under {absorbing:?}, \
+                     {a_other:?} under {other:?}; aliased under {other:?}: {}",
+                    block_aliased(&j, *other)
+                );
+                if try_bind(&text(token(*absorbing)), &pop).is_ok() {
+                    wrong.push(format!("{tag} {absorbing:?}: bound"));
+                }
+                match (try_bind(&text(token(*other)), &pop), is_aliased) {
+                    (Ok((c, _)), false) if c == *other => {}
+                    (Err(e), true) if j.one_column && e.contains(ANY_CONTRAST) => {}
+                    (Err(_), true) if !j.one_column => {}
+                    (got, _) => wrong.push(format!("{tag} {other:?}: {got:?}")),
+                }
+                match (try_bind(&text(""), &pop), auto) {
+                    (Ok((c, _)), Some(want)) if c == *want => {}
+                    (Err(e), None) if e.contains(ANY_CONTRAST) => {}
+                    (got, _) => wrong.push(format!("{tag} auto: {got:?}, want {auto:?}")),
+                }
+                agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
             }
-            match try_bind(&text(token(*bound)), &pop) {
-                Ok((c, _)) if c == *bound => {}
-                got => wrong.push(format!("{} {bound:?}: {got:?}", r.0)),
-            }
-            match try_bind(&text(""), &pop) {
-                Ok((c, _)) if c == *auto => {}
-                got => wrong.push(format!("{} auto: {got:?}, want {auto:?}", r.0)),
-            }
-            agrees_with_joint_oracle(r.0, &text, &pop, &mut wrong);
         }
         assert!(wrong.is_empty(), "contrast split:\n{}", wrong.join("\n"));
+    }
+
+    /// [`arms_pop_d`] with `R1` and `R2`, the 0/1 indicators of two equal-size
+    /// regions of studies (1, 2 and 3, 4), on every record.
+    fn arms_pop_r() -> Population {
+        let mut p = arms_pop_d();
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("R1".to_string(), f64::from(u8::from(study <= 2.0)));
+                m.insert("R2".to_string(), f64::from(u8::from(study > 2.0)));
+            }
+        }
+        p
+    }
+
+    /// #1977. A hand-coded second "block" whose θ are combinations of the
+    /// levels rescues nothing. `TVB1 * (R1 - R2)`, a region effect coded
+    /// sum-to-zero over two equal-size regions, has level coefficients summing
+    /// to 0, so it lies in the span of the sum-to-zero-coded block; `TVB2 * R2`
+    /// puts no weight on study 1, so it lies in the span of the `ref`-coded one.
+    /// Before #1977 each bound under that contrast — and auto too, for the
+    /// `ref` row — as aliased models. Each is refused under every contrast
+    /// with "under any contrast". The straddle: under the contrast that bound,
+    /// the oracle absorbs nothing, and only the coded block's rank against the
+    /// other θ refuses it.
+    ///
+    /// Mutation — the #1977 guard in `carried` deleted: the sum-to-zero row
+    /// binds under `sum_to_zero` and auto, the `ref` row under `ref` and auto.
+    #[test]
+    fn an_aliased_rescue_is_refused() {
+        let pop = arms_pop_r();
+        let rows = [
+            ("TVB1*(R1-R2)", "TVB1 * (R1 - R2)", LevelContrast::SumToZero),
+            ("TVB2*R2", "TVB2 * R2", LevelContrast::Ref),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, extra, aliased_under) in rows {
+            let r = row_1836("region", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB1", 0.5), ("TVB2", 0.5)]);
+            let j = jacobian(&text("none"), &pop);
+            let (absorbed, _) = joint_oracle(&j, aliased_under);
+            assert!(
+                absorbed.is_empty() && block_aliased(&j, aliased_under),
+                "{tag}: the straddle — under {aliased_under:?} the oracle absorbs {absorbed:?}, \
+                 aliased {}",
+                block_aliased(&j, aliased_under)
+            );
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}")),
+                }
+            }
+            agrees_with_joint_oracle(tag, &text, &pop, &mut wrong);
+        }
+        // The control: two other θ aliased with each other, `TVB * TIME` and
+        // `TVC * TIME`, and with nothing of the block. That deficiency is the
+        // other θ's, not the coded block's, and the block still binds as R8s.
+        let r = row_1836(
+            "pair",
+            format!("  E0 = {NO_INTERCEPT} + TVB * TIME + TVC * TIME"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        for (c, want) in [
+            ("", LevelContrast::SumToZero),
+            ("sum_to_zero", LevelContrast::SumToZero),
+            ("ref", LevelContrast::Ref),
+        ] {
+            let got = try_bind(&text(c), &pop);
+            if got != Ok((want, 3)) {
+                wrong.push(format!("pair {c:?}: {got:?}"));
+            }
+        }
+        agrees_with_joint_oracle("pair", &text, &pop, &mut wrong);
+        assert!(wrong.is_empty(), "aliased rescue:\n{}", wrong.join("\n"));
     }
 
     /// T3 (#1840). An inconclusive point keeps the refusal. The intercept is
@@ -7829,8 +8002,8 @@ mod absorption {
     /// carries the levels' mean and reference level alike (an intercept), so
     /// the refusal holds under every contrast and says so. M2: `none` on R8s,
     /// where sum-to-zero binds. M3/M4: the contrast that loses, and the one
-    /// that binds, for `TVB * D2` (sum-to-zero refused, `ref` named) and its
-    /// mirror. M5: the kappa's `occasion` wording. M6: a contrast the
+    /// that binds, for T2's `TVC * TIME * D2` (sum-to-zero refused, `ref`
+    /// named) and its mirror. M5: the kappa's `occasion` wording. M6: a contrast the
     /// certificate identifies but that leaves no free θ is not named. "under any contrast" is
     /// asserted present in M1 and absent from M2 in one test, so either branch
     /// forced reddens it.
@@ -7871,12 +8044,10 @@ mod absorption {
         );
         lacks(&m2, &["Remove the block"]);
 
-        let m3 = refusal(
-            &format!("{NO_INTERCEPT} + TVB * D2"),
-            false,
-            "sum_to_zero",
-            &pop,
-        );
+        // M3/M4 on T2's split rows (#1977): `TVB * D2` and its mirror are
+        // aliased under the contrast this message would name.
+        let m3 = try_bind(&split_text("TVC * TIME * D2")("sum_to_zero"), &pop)
+            .expect_err("M3 sum_to_zero");
         has(
             &m3,
             &[
@@ -7889,12 +8060,7 @@ mod absorption {
                  effect keeps that direction.",
             ],
         );
-        let m4 = refusal(
-            &format!("{NO_INTERCEPT} + TVB * (D1 - D2)"),
-            false,
-            "ref",
-            &pop,
-        );
+        let m4 = try_bind(&split_text("TVC * TIME * (D1 - D2)")("ref"), &pop).expect_err("M4 ref");
         has(
             &m4,
             &[
