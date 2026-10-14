@@ -602,3 +602,180 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
         "raw {raw:?} vs whitened {want:?}"
     );
 }
+
+/// The two dense derivative families at this file's fixture, for one structure.
+fn dense_families(
+    kind: ResidualSerialKind,
+    rho: f64,
+) -> (Vec<DMatrix<f64>>, Vec<Vec<DMatrix<f64>>>) {
+    let m = mult();
+    let dr = compute_dr_df_matrices_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&m),
+    );
+    let d2 = compute_d2r_df2_matrices_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&m),
+    );
+    (dr, d2)
+}
+
+fn dc_at(kind: ResidualSerialKind, rho: f64) -> DMatrix<f64> {
+    compute_dr_df_columns_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&mult()),
+    )
+}
+
+/// #1960: the column / compact forms the dense outer gradient reads hold **every**
+/// nonzero of the dense `∂R/∂f` and `∂²R/∂f²` families — bit for bit, since both are
+/// filled by one visitor — and the dense families have exactly the row-and-column
+/// pattern those forms assume (anything outside it would be silently dropped).
+#[test]
+fn compact_derivative_forms_equal_the_dense_builders() {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
+        let (dr, d2) = dense_families(kind, 0.4);
+        let dc = dc_at(kind, 0.4);
+        let m = mult();
+        let (x, y) = compute_d2r_df2_compact_cov(
+            &spec(),
+            &IPREDS,
+            &[1; 6],
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &SIGMA,
+            cov(kind, 0.4),
+            Some(&m),
+        );
+        let n = IPREDS.len();
+        let mut off_diagonal = 0usize;
+        for a in 0..n {
+            for i in 0..n {
+                for j in 0..n {
+                    // ∂R/∂f_a from its column.
+                    let want = if i == a {
+                        dc[(j, a)]
+                    } else if j == a {
+                        dc[(i, a)]
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(dr[a][(i, j)], want, "{kind:?}: dR/df_{a} at ({i},{j})");
+                    if i != j && want != 0.0 {
+                        off_diagonal += 1;
+                    }
+                    for b in 0..n {
+                        let want = if a != b {
+                            if (i, j) == (a, b) || (i, j) == (b, a) {
+                                x[(a, b)]
+                            } else {
+                                0.0
+                            }
+                        } else if i == a {
+                            y[(j, a)]
+                        } else if j == a {
+                            y[(i, a)]
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(
+                            d2[a][b][(i, j)],
+                            want,
+                            "{kind:?}: d2R/df_{a}df_{b} ({i},{j})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(off_diagonal > 0, "{kind:?}: fixture must couple rows");
+    }
+}
+
+/// #1960: `serial_rho_derivatives` is the ρ-derivative of the builders — of `R` and of
+/// the `∂R/∂f` column form — against a Richardson central difference in ρ, for each
+/// structure (`ar1` and `car1` are the non-linear `C_jk(ρ)`), and is zero on the
+/// diagonal, which ρ never reaches.
+#[test]
+fn serial_rho_derivatives_match_fd_of_the_builders() {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
+        let rho = 0.4;
+        let (dr, ddc) = serial_rho_derivatives(
+            &spec(),
+            &IPREDS,
+            &[1; 6],
+            &times(),
+            &[],
+            &rgroup(),
+            &SIGMA,
+            cov(kind, rho),
+            Some(&mult()),
+        )
+        .expect("finite");
+        let fd = |g: &dyn Fn(f64) -> DMatrix<f64>| {
+            let h = 1e-4;
+            let d1 = (g(rho + h) - g(rho - h)) / (2.0 * h);
+            let d2 = (g(rho + h / 2.0) - g(rho - h / 2.0)) / h;
+            (4.0 * d2 - d1) / 3.0
+        };
+        let want_r = fd(&|r| scaled_r(kind, r));
+        let want_dc = fd(&|r| dc_at(kind, r));
+        let n = IPREDS.len();
+        for i in 0..n {
+            assert_eq!(dr[(i, i)], 0.0, "{kind:?}: ρ never reaches the diagonal");
+            for j in 0..n {
+                assert_relative_eq!(
+                    dr[(i, j)],
+                    want_r[(i, j)],
+                    max_relative = 1e-8,
+                    epsilon = 1e-9
+                );
+                assert_relative_eq!(
+                    ddc[(i, j)],
+                    want_dc[(i, j)],
+                    max_relative = 1e-8,
+                    epsilon = 1e-9
+                );
+            }
+        }
+        assert!(dr.iter().any(|v| v.abs() > 1e-3), "{kind:?}: live");
+        assert!(ddc.iter().any(|v| v.abs() > 1e-3), "{kind:?}: live");
+    }
+}

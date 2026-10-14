@@ -5576,6 +5576,53 @@ mod outer_fd_fallback {
         }
     }
 
+    /// #1960 straddle of [`is_structural_decline`]: a subject whose `block_sigma` pairs two
+    /// rows is a structural decline exactly when the dense assembly cannot serve it — on a
+    /// model outside `dense_outer_supported` — and never for an unpaired subject. Every
+    /// cell is asserted, so dropping either half of the predicate (the pairing, or the
+    /// dense-scope carve-out) reddens it.
+    #[test]
+    fn structural_decline_is_a_cross_row_residual_the_dense_assembly_cannot_serve() {
+        const SRC: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n";
+        let model = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
+        assert!(crate::estimation::sens_outer_gradient::dense_outer_supported(&model));
+        let mut outside = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
+        outside.n_kappa = 1; // any dense-scope exclusion; IOV is the simplest field
+        assert!(!crate::estimation::sens_outer_gradient::dense_outer_supported(&outside));
+
+        let subject = |times: &[f64]| {
+            let n = times.len();
+            let (_, analytic, _) = analytic_and_declining();
+            let mut s = analytic;
+            s.obs_times = times.to_vec();
+            s.obs_raw_times = Vec::new();
+            s.observations = vec![1.0; n];
+            s.obs_cmts = vec![1; n];
+            s.cens = vec![0; n];
+            s.occasions = vec![1; n];
+            s.obs_l2 = Vec::new();
+            s.obs_covariates = (0..n)
+                .map(|j| std::collections::HashMap::from([("FREE".into(), (j % 2) as f64)]))
+                .collect();
+            s
+        };
+        let paired = subject(&[1.0, 1.0, 4.0, 4.0]);
+        let unpaired = subject(&[1.0, 2.0, 4.0, 5.0]);
+        let params = &model.default_params;
+        for (m, name, in_dense_scope) in [(&model, "in scope", true), (&outside, "outside", false)]
+        {
+            assert_eq!(
+                is_structural_decline(m, &paired, params),
+                !in_dense_scope,
+                "paired, {name}"
+            );
+            assert!(
+                !is_structural_decline(m, &unpaired, params),
+                "unpaired, {name}"
+            );
+        }
+    }
+
     /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject
     /// whose held-EBE objective is the `1e20` sentinel contributes zero, while the
     /// unguarded reconverged gradient it used to take is large and non-zero at the very
@@ -6353,18 +6400,19 @@ mod outer_fd_fallback {
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
 
     /// T7, the routing straddle. A subject whose `ARM` holds two or more rows has an `R`
-    /// that depends on ρ directly — a channel the analytic outer gradient does not carry —
-    /// so it must decline to the reconverged FD gradient (#1536); a subject whose arms
-    /// are all singletons has an `R` free of ρ and stays analytic, with `∂/∂ρ = 0`
-    /// correctly. Both sides asserted here, then the population gradient's ρ component
-    /// against a central difference of the population objective. Dies if
-    /// `has_cross_observation_residual` ignores the serial source: the paired subject
-    /// then takes the analytic gradient and reports `∂/∂ρ = 0`. Run for `cs` (ρ packed
-    /// on the linear scale, its lower bound negative) and `car1` (lower bound 0, so ρ
-    /// is log-packed and the FD step is on `log ρ`), whose `R` reads ρ through
+    /// that depends on ρ directly, so it takes the dense assembly, whose θ block carries
+    /// `∂R/∂ρ` (#1960; before, it declined to the reconverged FD gradient, #1536); a
+    /// subject whose arms are all singletons has an `R` free of ρ and stays on the scalar
+    /// assembly, with `∂/∂ρ = 0` correctly. Both are analytic and nothing declines; then
+    /// the population gradient's ρ component is checked against a central difference of
+    /// the population objective. Dies if `has_cross_observation_residual` ignores the
+    /// serial source (the paired subject then takes the scalar assembly and reports
+    /// `∂/∂ρ = 0`) or if the dense θ block drops the direct ρ channel. Run for `cs` (ρ
+    /// packed on the linear scale, its lower bound negative) and `car1` (lower bound 0,
+    /// so ρ is log-packed and the FD step is on `log ρ`), whose `R` reads ρ through
     /// `ρ^|Δt|` at the fixture's non-integer gaps.
     #[test]
-    fn serial_rho_routes_paired_subjects_to_reconverged_fd() {
+    fn serial_rho_routes_paired_subjects_to_the_dense_assembly() {
         for (kind, lower) in [("cs", "-0.4"), ("car1", "0.0")] {
             serial_rho_routes_paired_subjects_case(kind, lower);
         }
@@ -6415,7 +6463,20 @@ mod outer_fd_fallback {
             ..FitOptions::default()
         };
         let (ehs, hms, _) = solve_at(&model, &pop, template, &x, &opts);
-        // The straddle.
+        // The straddle: cross-row on one side of the predicate, not on the other — and
+        // both analytic.
+        for (i, cross) in [(0, true), (1, false)] {
+            assert_eq!(
+                crate::stats::residual_error::has_cross_observation_residual(
+                    &model.error_spec,
+                    &pop.subjects[i],
+                    &template.sigma.values,
+                    model.residual_cov_at(template),
+                ),
+                cross,
+                "{kind}: subject {i}"
+            );
+        }
         assert!(
             subject_analytic_outer_gradient(
                 &model,
@@ -6425,8 +6486,8 @@ mod outer_fd_fallback {
                 ehs[0].as_slice(),
                 true
             )
-            .is_none(),
-            "{kind}: a subject with a multi-row block must decline the analytic gradient"
+            .is_some(),
+            "{kind}: a subject with a multi-row block takes the dense assembly"
         );
         assert!(
             subject_analytic_outer_gradient(
@@ -6453,7 +6514,10 @@ mod outer_fd_fallback {
             OuterTrial::unknown(),
             &log,
         );
-        assert_eq!(log.declined_indices(), vec![0], "{kind}");
+        assert!(
+            log.declined_indices().is_empty(),
+            "{kind}: nothing declines"
+        );
         // ρ is θ index 2: linear-packed under `cs`, log-packed under `car1`.
         assert_eq!(
             crate::estimation::parameterization::theta_packs_log(template.theta_lower[2]),
