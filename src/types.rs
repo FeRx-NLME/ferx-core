@@ -7939,6 +7939,9 @@ pub enum IovOccasionRule {
     TimeWindows(Vec<f64>),
 }
 
+/// Default period of IMPMAP's cold MAP recheck (`impmap_map_recheck`, #1965).
+const DEFAULT_IMPMAP_MAP_RECHECK: usize = 10;
+
 /// Options for fit()
 #[derive(Debug, Clone)]
 pub struct FitOptions {
@@ -8553,6 +8556,11 @@ pub struct FitOptions {
     /// Number of additional random starting points for per-subject MAP
     /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
     pub impmap_mceta: usize,
+    /// Every this many IMPMAP iterations, also solve each subject's MAP from a
+    /// cold start (η = 0) and keep it when its NLL beats the warm-started mode;
+    /// the final EBE pass always rechecks. Rescues a subject whose warm start
+    /// is stuck in a local mode (#1965). `0` disables it.
+    pub impmap_map_recheck: usize,
     /// Use Sobol quasi-random sequences for IMPMAP's IS draws instead of
     /// pseudo-random. Applies to every proposal form — MVN, Student-t, and the
     /// defensive mixture (#1965). Default false.
@@ -8964,6 +8972,7 @@ impl Default for FitOptions {
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
             impmap_mceta: 0,
+            impmap_map_recheck: DEFAULT_IMPMAP_MAP_RECHECK,
             impmap_sobol: false,
             imp_sobol: false,
             frem_rao_blackwell: true,
@@ -10387,6 +10396,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_low_ess_threshold",
             "impmap_trace",
             "impmap_mceta",
+            "impmap_map_recheck",
             "impmap_sobol",
             "iscale_min",
             "iscale_max",

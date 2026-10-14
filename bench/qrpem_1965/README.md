@@ -136,6 +136,30 @@ also drops (`summary.md`, tail jitter column).
 The new binary reproduces every seeded non-Sobol and MVN-Sobol fit of the
 Phase 0 binary to the printed digit (`bitid.py runs runs_bitid`; 9 fits).
 
+## Phase 1a: cold MAP recheck (`impmap_map_recheck`)
+
+The Phase 1a binary re-solves each subject's MAP from η = 0 every N iterations,
+and always for the final EBEs, keeping the better mode. Results on
+`two_cpt_oral_cov` (K = 300, 10 seeds; run `run_phase1a.sh`):
+
+| arm | −2LL mean | −2LL SD | serial wall s |
+|---|---|---|---|
+| impmap_prng (no recheck) | −1197.80 | 1.74 | 4.22 |
+| impmap_prng_recheck5 / 10 / 25 | −1199.632 | 0.0036 | — |
+| impmap_prng_mceta3 | −1199.632 | 0.0036 | 4.79 |
+| impmap_t4 (no recheck) | −1198.27 | 1.82 | 3.84 |
+| **impmap_t4_recheck10** | **−1199.651** | **0.0014** | 4.26 |
+
+Notes on the table:
+
+- **Identical rows.** All three periods and `mceta3` give identical per-seed
+  results: once subject 6 sits in its global mode, the trajectory forgets how it
+  got there.
+- **Models with no trapped subject.** On warfarin, three_cpt_iv and
+  sparse_combined, `impmap_t4_recheck10` leaves the across-seed −2LL unchanged.
+- **Cost.** Serial wall time rises by 0–12% (`timing.md`), against 4–28% for
+  `mceta3`. The default is 10.
+
 ## Other observations
 
 - **Normal vs t₄ proposal.** The per-iteration IS objective jitters 3–10× more

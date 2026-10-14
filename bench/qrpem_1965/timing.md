@@ -9,6 +9,7 @@
 | sparse_combined | impmap_sobol | 300 | 3 | 49.07 |
 | sparse_combined | impmap_t4 | 100 | 3 | 19.67 |
 | sparse_combined | impmap_t4 | 300 | 3 | 48.24 |
+| sparse_combined | impmap_t4_recheck10 | 300 | 3 | 54.25 |
 | sparse_combined | saem | — | 3 | 0.58 |
 | three_cpt_iv | focei | — | 1 | 0.05 |
 | three_cpt_iv | impmap_prng | 100 | 3 | 1.44 |
@@ -19,6 +20,7 @@
 | three_cpt_iv | impmap_sobol | 300 | 3 | 3.34 |
 | three_cpt_iv | impmap_t4 | 100 | 3 | 1.45 |
 | three_cpt_iv | impmap_t4 | 300 | 3 | 3.33 |
+| three_cpt_iv | impmap_t4_recheck10 | 300 | 3 | 3.73 |
 | three_cpt_iv | saem | — | 3 | 0.09 |
 | two_cpt_oral_cov | focei | — | 1 | 0.06 |
 | two_cpt_oral_cov | impmap_prng | 100 | 3 | 1.70 |
@@ -29,6 +31,7 @@
 | two_cpt_oral_cov | impmap_sobol | 300 | 3 | 4.03 |
 | two_cpt_oral_cov | impmap_t4 | 100 | 3 | 1.76 |
 | two_cpt_oral_cov | impmap_t4 | 300 | 3 | 3.84 |
+| two_cpt_oral_cov | impmap_t4_recheck10 | 300 | 3 | 4.26 |
 | two_cpt_oral_cov | saem | — | 3 | 0.12 |
 | warfarin | focei | — | 1 | 0.03 |
 | warfarin | impmap_prng | 100 | 3 | 0.53 |
@@ -39,4 +42,5 @@
 | warfarin | impmap_sobol | 300 | 3 | 1.26 |
 | warfarin | impmap_t4 | 100 | 3 | 0.64 |
 | warfarin | impmap_t4 | 300 | 3 | 1.17 |
+| warfarin | impmap_t4_recheck10 | 300 | 3 | 1.11 |
 | warfarin | saem | — | 3 | 0.02 |

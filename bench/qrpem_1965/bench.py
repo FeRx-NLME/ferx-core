@@ -47,7 +47,15 @@ IMPMAP_COMMON = [
     "impmap_auto = false",
     "impmap_iterations = 200",
     "impmap_averaging = 50",
+    # Pinned off so the Phase 0 / 1b arms mean the same thing on a binary whose
+    # default turns the Phase 1a cold recheck on; the recheck arms override it.
+    "impmap_map_recheck = 0",
 ]
+
+
+def with_recheck(period):
+    return [o for o in IMPMAP_COMMON if not o.startswith("impmap_map_recheck")] + [
+        f"impmap_map_recheck = {period}"]
 
 
 def arm_options(arm, seed, k):
@@ -79,6 +87,12 @@ def arm_options(arm, seed, k):
         return [o for o in IMPMAP_COMMON if not o.startswith("impmap_iterations")] + [
             "impmap_iterations = 600", f"impmap_samples = {k}", "impmap_proposal_df = normal",
             f"impmap_seed = {seed}"]
+    # Phase 1a: cold MAP recheck every N iterations (impmap_map_recheck = N).
+    if arm.startswith("impmap_prng_recheck") or arm.startswith("impmap_t4_recheck"):
+        period = int(arm.rsplit("recheck", 1)[1])
+        df = "normal" if arm.startswith("impmap_prng") else "4"
+        return with_recheck(period) + [f"impmap_samples = {k}", f"impmap_proposal_df = {df}",
+                                       f"impmap_seed = {seed}"]
     if arm == "saem":
         return ["method = saem", f"seed = {seed}"]
     if arm == "focei":

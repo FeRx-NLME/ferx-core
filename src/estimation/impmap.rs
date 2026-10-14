@@ -331,6 +331,7 @@ fn find_ebe_multistart(
     mceta: usize,
     omega_chol: Option<&DMatrix<f64>>,
     subj_seed: u64,
+    cold_recheck: bool,
 ) -> EbeResult {
     // Baseline: warm-start (or cold-start from η = 0).
     let mut best = find_ebe(
@@ -343,6 +344,26 @@ fn find_ebe_multistart(
         mu,
         inner_restarts,
     );
+    // Cold recheck (#1965): a warm start inherits last iteration's basin, so a
+    // subject whose MAP once landed in a local mode stays there — the
+    // mode-centred proposal never samples the other one and the M-step fits
+    // around the wrong mode. A cold solve from η = 0 is the cheapest escape;
+    // the strict `<` keeps the warm mode on a tie.
+    if cold_recheck && warm.is_some() {
+        let cold = find_ebe(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            None,
+            mu,
+            inner_restarts,
+        );
+        if cold.nll < best.nll {
+            best = cold;
+        }
+    }
     let Some(l_omega) = omega_chol else {
         return best;
     };
@@ -377,6 +398,8 @@ fn find_ebe_multistart(
 /// cold-start) and then `mceta` additional random starting points drawn from
 /// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
 /// degrades to a single warm-start — identical to the previous behaviour.
+/// `cold_recheck` adds one more candidate, the cold start from η = 0
+/// (`impmap_map_recheck`, #1965).
 ///
 /// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
 /// IMPMAP refuses IOV models.
@@ -392,6 +415,7 @@ fn run_map_multistart(
     mceta: usize,
     seed: u64,
     iteration: usize,
+    cold_recheck: bool,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
     // Cholesky of Ω for drawing random starts (computed once, outside the
     // per-subject parallel loop).
@@ -424,6 +448,7 @@ fn run_map_multistart(
                 mceta,
                 omega_chol.as_ref(),
                 subj_seed,
+                cold_recheck,
             )
         })
         .collect();
@@ -472,6 +497,7 @@ pub fn run_impmap(
         options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
+        options.impmap_map_recheck,
     )
 }
 
@@ -505,6 +531,7 @@ pub fn run_imp(
         options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
+        0, // map_recheck: IMP solves the MAP only to seed its first proposal
     )
 }
 
@@ -580,6 +607,7 @@ fn run_mcem(
     use_sobol: bool,
     collect_trace: bool,
     auto: bool,
+    map_recheck: usize,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -1028,6 +1056,7 @@ fn run_mcem(
                 mceta,
                 seed,
                 k,
+                map_recheck > 0 && k % map_recheck == 0,
             );
             (e, h)
         } else {
@@ -1698,6 +1727,10 @@ fn run_mcem(
         mceta,
         seed,
         n_iter + 1, // distinct iteration index for final EBEs
+        // The final EBEs feed the reported Laplace OFV, the sdtab and the
+        // covariance step, so a trapped mode here is a readout defect even
+        // when the estimates are right — recheck on any enabled period.
+        map_recheck > 0,
     );
     let final_kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
 
@@ -2354,6 +2387,9 @@ fn run_mcem_mixture(
                                 .wrapping_add((k as u64) << 32)
                                 .wrapping_add((c as u64) << 48)
                                 .wrapping_add(0x4D43_4554_4100u64),
+                            // The mixture MCEM has no `impmap_map_recheck` path
+                            // yet; its per-class warm starts are out of #1965's scope.
+                            false,
                         );
                         let h_post = compute_posterior_hessian(
                             model,
@@ -4233,8 +4269,9 @@ mod tests {
         let params = &model.default_params;
         let subject = &pop.subjects[0];
 
-        let baseline =
-            find_ebe_multistart(&model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7);
+        let baseline = find_ebe_multistart(
+            &model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7, false,
+        );
         let direct = find_ebe(&model, subject, params, 50, 1e-4, None, None, 0);
         assert!(
             (baseline.nll - direct.nll).abs() < 1e-12,
@@ -4256,6 +4293,7 @@ mod tests {
             4,
             Some(&chol),
             7,
+            false,
         );
         assert!(
             multi.nll <= baseline.nll + 1e-12,
@@ -4306,6 +4344,160 @@ mod tests {
             "{e}"
         );
         assert!(check_sobol_config("IMP", "imp_proposal_df", 3, false, 1e9, false).is_ok());
+    }
+
+    /// One-compartment oral with a flip-flop twin: swapping `ka` and
+    /// `ke = CL/V` while scaling `V` by `ke/ka` leaves the concentration curve
+    /// unchanged, so the noise-free subject below fits *exactly* at both
+    /// `η = 0` (ka = 1, V = 10) and the flipped `η = (0, ln 0.1, ln 0.1)`
+    /// (ka = 0.1, V = 1, CL unchanged). Only the prior separates them.
+    const FLIPFLOP_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.25
+  omega ETA_V  ~ 1.0
+  omega ETA_KA ~ 1.0
+  sigma EPS ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// `n` identical noise-free subjects on [`FLIPFLOP_MODEL`]'s typical values.
+    fn flipflop_pop(n: usize) -> Population {
+        use std::io::Write;
+        let (dose, cl, v, ka) = (100.0_f64, 1.0_f64, 10.0_f64, 1.0_f64);
+        let ke = cl / v;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+        for id in 1..=n {
+            csv.push_str(&format!("{id},0,0,100,1,1\n"));
+            for t in [0.5_f64, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 36.0] {
+                let c = dose * ka / (v * (ka - ke)) * ((-ke * t).exp() - (-ka * t).exp());
+                csv.push_str(&format!("{id},{t},{c:.8},0,0,1\n"));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), None, None).unwrap()
+    }
+
+    /// The `impmap_map_recheck` mechanism (#1965): a warm start sitting in the
+    /// flip-flop local mode stays there, and only the cold recheck recovers the
+    /// global one. Both halves are asserted so the test straddles the gate —
+    /// with the recheck dropped, the first assertion is what fails; with the
+    /// recheck firing even when disabled, the second.
+    #[test]
+    fn cold_recheck_escapes_a_warm_start_stuck_in_a_local_mode() {
+        let model = crate::parser::model_parser::parse_model_string(FLIPFLOP_MODEL).unwrap();
+        let pop = flipflop_pop(1);
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let flipped = [0.0, 0.1_f64.ln(), 0.1_f64.ln()];
+        let solve = |recheck: bool| {
+            find_ebe_multistart(
+                &model,
+                subject,
+                params,
+                200,
+                1e-8,
+                Some(&flipped),
+                None,
+                0,
+                0,
+                None,
+                7,
+                recheck,
+            )
+        };
+        let rechecked = solve(true);
+        let stuck = solve(false);
+        assert!(rechecked.nll.is_finite() && stuck.nll.is_finite());
+        // The two modes differ only by the prior, ½(ln 0.1)²·(1/ω_V + 1/ω_KA) = 5.30.
+        assert!(
+            stuck.nll - rechecked.nll > 4.0,
+            "cold recheck must recover the global mode: stuck {} vs rechecked {}",
+            stuck.nll,
+            rechecked.nll
+        );
+        assert!(
+            rechecked.eta[2].abs() < 0.2 && rechecked.eta[1].abs() < 0.2,
+            "rechecked mode should be near η = 0, got {:?}",
+            rechecked.eta
+        );
+        assert!(
+            (stuck.eta[2] - 0.1_f64.ln()).abs() < 0.3,
+            "without the recheck the warm start must stay flipped (fixture check), got {:?}",
+            stuck.eta
+        );
+    }
+
+    /// `impmap_map_recheck` end to end through `run_impmap` (#1965): a warm
+    /// start in the flip-flop local mode (as a preceding chain stage can hand
+    /// over) is only left when the option is on. Pins the wiring the unit test
+    /// above cannot see — the wrapper passing the option, the per-iteration
+    /// period gate (`impmap_map_recheck = 1` fires on every iteration) and the
+    /// final-EBE recheck — with the `0` arm as the straddle.
+    ///
+    /// Ten identical subjects, only the first warm-started flipped: with a
+    /// single subject the closed-form mu-ref shift moves θ onto the flipped
+    /// mode and re-centres η at 0, which reads as an escape that never happened.
+    /// So the assertion is subject 0's η_KA *relative to its identical peers*.
+    #[test]
+    fn impmap_map_recheck_reaches_the_reported_ebes() {
+        let model = crate::parser::model_parser::parse_model_string(FLIPFLOP_MODEL).unwrap();
+        let pop = flipflop_pop(10);
+        let mut flipped = vec![DVector::zeros(3); 10];
+        flipped[0] = DVector::from_vec(vec![0.0, 0.1_f64.ln(), 0.1_f64.ln()]);
+        let run = |recheck: usize| {
+            let mut opts = FitOptions::default();
+            opts.impmap_iterations = 2;
+            opts.impmap_averaging = 1;
+            opts.impmap_samples = 50;
+            opts.impmap_auto = false;
+            opts.impmap_map_recheck = recheck;
+            let r = run_impmap(&model, &pop, &model.default_params, Some(&flipped), &opts)
+                .expect("IMPMAP on the flip-flop fixture");
+            // Subject 0 minus an identical, never-flipped peer; and TVKA.
+            (r.eta_hats[0][2] - r.eta_hats[1][2], r.params.theta[2])
+        };
+        let (off, _) = run(0);
+        // Period 1000 never fires inside a 2-iteration run: only the final-EBE
+        // recheck can rescue subject 0, so this arm pins that path alone.
+        let (final_only, tvka_final_only) = run(1000);
+        // Period 1 fires on every iteration, so subject 0 also enters the
+        // M-step from the global mode and TVKA moves; this arm pins the
+        // per-iteration gate (deleting it leaves TVKA equal to the arm above).
+        let (every, tvka_every) = run(1);
+        // Measured: TVKA 1.003 (every iteration) vs 0.797 (final only) — the
+        // flipped subject drags the closed-form mu-ref shift; 0.1 is ~2× under
+        // the 0.21 gap.
+        const TVKA_GATE_GAP: f64 = 0.1;
+        for d in [off, final_only, every, tvka_final_only, tvka_every] {
+            assert!(d.is_finite());
+        }
+        assert!(
+            off < -1.5,
+            "recheck off: subject 0 should stay flipped (fixture check), Δη_KA = {off}"
+        );
+        assert!(
+            final_only.abs() < 0.3,
+            "final-EBE recheck: subject 0 should rejoin its peers, Δη_KA = {final_only}"
+        );
+        assert!(every.abs() < 0.3, "per-iteration recheck: Δη_KA = {every}");
+        assert!(
+            (tvka_every - tvka_final_only).abs() > TVKA_GATE_GAP,
+            "per-iteration recheck must change the M-step: TVKA {tvka_every} vs final-only {tvka_final_only}"
+        );
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),

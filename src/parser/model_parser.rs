@@ -10347,6 +10347,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
+        "impmap_map_recheck" => opts.impmap_map_recheck = parse_usize("impmap_map_recheck")?,
         "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
         "imp_sobol" => opts.imp_sobol = parse_bool("imp_sobol")?,
         "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,

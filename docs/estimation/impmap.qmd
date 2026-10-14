@@ -183,6 +183,36 @@ The default is `0` (single warm-start, matching previous behaviour).
 `(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws)
 dominates, the total wall-time increase is typically 15–40%.
 
+## Cold MAP recheck (`impmap_map_recheck`)
+
+Each iteration warm-starts every subject's MAP from the previous iteration's
+mode. That is fast, but a subject whose mode once landed in a **local** optimum
+stays there. The proposal is centred on that mode, so it never samples the
+other one, and the M-step then fits θ around the wrong mode. Typical causes are
+flip-flop absorption and a weakly identified KA or V.
+
+`impmap_map_recheck = N` (default `10`) handles this: every N iterations each
+subject is also solved from a cold start (η = 0), and the better of the two
+modes is kept. The final EBE pass, which feeds the reported Laplace OFV, the
+sdtab and the covariance step, always rechecks. Set `0` to switch it off.
+
+In the #1965 benchmark on `two_cpt_oral_cov` (10 seeds, K = 300, scored by a
+common large-K importance-sampled −2LL), subject 6 had a local mode 17.7
+objective units worse than its global one:
+
+| arm | mean −2LL | SD across seeds | serial wall time |
+|---|---|---|---|
+| no recheck (t₄) | −1198.27 | 1.82 | 3.8 s |
+| `impmap_map_recheck = 10` (t₄) | −1199.65 | 0.0014 | 4.3 s |
+| `impmap_mceta = 3` (normal) | −1199.63 | 0.0036 | 4.8 s |
+
+- **Choice of N.** Periods 5, 10 and 25 gave identical results.
+- **Models with no trapped subject.** On warfarin, the 6-ETA 3-cpt IV model and
+  a sparse N = 300 design, the recheck left the result unchanged at 0–12% extra
+  wall time.
+- **Compared with `impmap_mceta`.** `impmap_mceta` remains the heavier tool for
+  posteriors with more than two modes, where η = 0 is not in the right basin.
+
 ## Quasi-random draws (`impmap_sobol`)
 
 `impmap_sobol = true` builds every importance sample from one point of a Sobol
