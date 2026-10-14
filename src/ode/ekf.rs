@@ -747,6 +747,7 @@ mod tests {
         );
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
@@ -765,6 +766,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -989,6 +991,7 @@ mod tests {
             );
 
             let subj = Subject {
+                obs_rgroup: Vec::new(),
                 id: "1".into(),
                 doses: doses.clone(),
                 obs_times: obs_times.clone(),
@@ -1007,6 +1010,7 @@ mod tests {
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             };
@@ -1134,6 +1138,7 @@ mod tests {
         );
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
@@ -1152,6 +1157,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2132,6 +2138,7 @@ mod tests {
         let (got, was) = (run(&ss), run(&single));
 
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: ss.clone(),
             obs_times: obs_times.clone(),
@@ -2150,6 +2157,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };

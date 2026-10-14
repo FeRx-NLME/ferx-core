@@ -21,6 +21,7 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -111,6 +112,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// `reset_times[0] = 5.0` marks the boundary.
 fn two_session_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
         // Session 0 at 0,1,4 — Session 1 shifted by 5 to 5,6,9
@@ -130,6 +132,7 @@ fn two_session_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -357,6 +360,7 @@ fn derived_integral_single_session_unchanged() {
     }];
     let model = minimal_model(derived_exprs);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "SINGLE".into(),
         doses: Vec::new(),
         obs_times: vec![0.0, 1.0, 4.0],
@@ -375,6 +379,7 @@ fn derived_integral_single_session_unchanged() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

@@ -2738,7 +2738,7 @@ fn run_subject_tvcov<const M: usize>(
 fn ode_iov_subject_supported(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<(Vec<(u32, Vec<usize>)>, usize, usize)> {
+) -> Option<(crate::stats::stacked_layout::StackedLayout, usize)> {
     if !ode_iov_supported(model) {
         return None;
     }
@@ -2811,12 +2811,11 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-    let k_groups = occ_groups.len();
-    if k_groups == 0 {
+    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    if layout.n_groups() == 0 {
         return None;
     }
-    let n_stacked = model.n_eta + k_groups * model.n_kappa;
+    let n_stacked = layout.n_stacked();
     // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
     // since `K` is per subject) so an extremely many-occasion subject routes to FD rather
     // than a silent `_ => None` downgrade.
@@ -2824,7 +2823,7 @@ fn ode_iov_subject_supported(
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
-    Some((occ_groups, n_stacked, m_dim))
+    Some((layout, m_dim))
 }
 
 /// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
@@ -2843,8 +2842,8 @@ pub fn ode_subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let (occ_groups, n_stacked, m_dim) = ode_iov_subject_supported(model, subject)?;
-    if stacked_eta.len() != n_stacked {
+    let (layout, m_dim) = ode_iov_subject_supported(model, subject)?;
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     dispatch_ode_iov_axes!(
@@ -2854,7 +2853,7 @@ pub fn ode_subject_sensitivities_iov(
         subject,
         theta,
         stacked_eta,
-        &occ_groups,
+        &layout,
     )
 }
 
@@ -2870,7 +2869,8 @@ pub fn ode_subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let (occ_groups, n_stacked, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let n_stacked = layout.n_stacked();
     if stacked_eta.len() != n_stacked {
         return None;
     }
@@ -2881,7 +2881,7 @@ pub fn ode_subject_eta_grad_iov(
         subject,
         theta,
         stacked_eta,
-        &occ_groups,
+        &layout,
     )
 }
 
@@ -2889,9 +2889,9 @@ pub fn ode_subject_eta_grad_iov(
 /// `(θ, η_bsv, κ)` axes from its [`CombinedDerivs`] — the IOV analogue of
 /// [`seed_pk_dual2`]. The combined column `c` of the program maps to a stacked dual
 /// axis: η_bsv (`c < n_eta`) → shared `n_theta + c`; κ (`c ≥ n_eta`) → group `g`'s
-/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. For EVID=2 pk-only events
-/// `group` is `None`, matching production's zero-κ `combined_for(u32::MAX)`; κ columns
-/// are then dropped. Non-individual-parameter slots are seeded as constants
+/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. For a pk-only event whose
+/// occasion has no group (#1876) `group` is `None`, matching production's zero-κ
+/// `combined_for(u32::MAX)` miss; κ columns are then dropped. Non-individual-parameter slots are seeded as constants
 /// (`pk.values`), exactly as the non-IOV seeder does. `cd` rows are parallel to
 /// `model.pk_indices` (the program-eval row order shared with [`pd_from_program`]).
 fn seed_pk_dual2_iov<const M: usize>(
@@ -2904,7 +2904,8 @@ fn seed_pk_dual2_iov<const M: usize>(
     n_theta: usize,
 ) -> Vec<Dual2<M>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+    let kappa_base =
+        group.map(|g| n_theta + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(n_theta + c)
@@ -3005,7 +3006,7 @@ fn run_subject_iov<const M: usize>(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<SubjectSens> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
@@ -3013,13 +3014,12 @@ fn run_subject_iov<const M: usize>(
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
-    let k_groups = occ_groups.len();
-    let n_stacked = n_eta + k_groups * n_kappa;
+    let k_groups = layout.n_groups();
+    let n_stacked = layout.n_stacked();
     let cov = &subject.covariates;
 
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
-    let combined_for =
-        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
+    let occ_to_k = layout.occ_to_group();
+    let combined_for = |g: usize| layout.combined_effect(stacked_eta, g);
 
     // Seed an occasion group's stacked PK duals at a covariate snapshot. `n_rows`
     // matches the program eval's `model.pk_indices`-parallel rows (the convention
@@ -3051,17 +3051,16 @@ fn run_subject_iov<const M: usize>(
             n_theta,
         ))
     };
-    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
-    // closed-form provider, #598 review). Built lazily inside the closure so the common
-    // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
-    // when `seed_iov_events` actually has pk-only records to seed, or (#1133) when a reset
+    // The κ = 0 seed: a pk-only row with no κ group (`pk::pk_only_row_group` is `None`,
+    // #1876), held at κ = 0 as the closed-form provider does (#598 review). Built lazily
+    // inside the closure so the common IOV subject pays no allocation — the closure is only
+    // invoked when `seed_iov_events` has such a pk-only row to seed, or (#1133) when a reset
     // row's occasion cannot be resolved from any record, which is a record-free subject.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
      -> Option<Vec<Dual2<M>>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let combined_pk_only =
-            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let combined_pk_only = layout.combined_pk_only(stacked_eta);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
@@ -3225,6 +3224,7 @@ fn seed_iov_events<T: Clone>(
     // EVID=2 covariate breakpoints, OR a `TIME`-built-in structural parameter (the
     // switch fires per event even with static covariates, #486). Each event's time is
     // threaded to `seed_group_cov`/`seed_pk_only_cov` so `TIME` resolves per event.
+    let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, occ_to_k);
     if per_event {
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
@@ -3238,8 +3238,17 @@ fn seed_iov_events<T: Clone>(
                 seed_group_cov(g, subject.obs_cov(j), subject.obs_times[j])
             })
             .collect::<Option<_>>()?;
+        // A pk-only row under its own occasion's group (#1876), as production's
+        // `fill_iov_record_params` evaluates it; one whose occasion has no group falls to
+        // the κ = 0 seeder, which is production's `combined_for(u32::MAX)` there too.
         let pk_at_pk_only = (0..subject.pk_only_times.len())
-            .map(|m| seed_pk_only_cov(subject.pk_only_cov(m), subject.pk_only_times[m]))
+            .map(|m| {
+                let t = subject.pk_only_times[m];
+                match pk_only_group(m) {
+                    Some(g) => seed_group_cov(g, subject.pk_only_cov(m), t),
+                    None => seed_pk_only_cov(subject.pk_only_cov(m), t),
+                }
+            })
             .collect::<Option<_>>()?;
         // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
         // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
@@ -3282,12 +3291,19 @@ fn seed_iov_events<T: Clone>(
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
             .collect::<Option<_>>()?;
-        let pk_at_pk_only = if subject.pk_only_times.is_empty() {
-            Vec::new()
-        } else {
-            let seeded = seed_pk_only_cov(static_cov, 0.0)?;
-            vec![seeded; subject.pk_only_times.len()]
-        };
+        // A pk-only row reads its group's seeding (#1876); one κ = 0 seeding, built on
+        // first use, serves every row whose occasion has no group.
+        let mut ungrouped: Option<Vec<T>> = None;
+        let mut pk_at_pk_only = Vec::with_capacity(subject.pk_only_times.len());
+        for m in 0..subject.pk_only_times.len() {
+            pk_at_pk_only.push(match pk_only_group(m) {
+                Some(g) => group_dual[g].clone(),
+                None => match &ungrouped {
+                    Some(seeded) => seeded.clone(),
+                    None => ungrouped.insert(seed_pk_only_cov(static_cov, 0.0)?).clone(),
+                },
+            });
+        }
         // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
         // the reset row's own snapshot and the covariate question is vacuous — but κ is
         // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
@@ -3309,8 +3325,8 @@ fn seed_iov_events<T: Clone>(
 /// First-order (`Dual1<N>`, `N = n_stacked`) IOV seeder — the light counterpart of
 /// [`seed_pk_dual2_iov`]. Seeds only `∂p/∂(stacked-η)` (no θ axes, no Hessian): the
 /// combined column `c` maps to stacked axis `c` (η_bsv, `c < n_eta`) or
-/// `n_eta + group·n_kappa + (c − n_eta)` (κ). For EVID=2 pk-only events
-/// `group = None`, so κ columns are dropped. Reuses [`CombinedDerivs::deta`].
+/// `n_eta + group·n_kappa + (c − n_eta)` (κ). For a pk-only event whose occasion
+/// has no group (#1876) `group = None`, so κ columns are dropped. Reuses [`CombinedDerivs::deta`].
 fn seed_pk_dual1_iov<const N: usize>(
     model: &CompiledModel,
     pk: &crate::types::PkParams,
@@ -3320,7 +3336,7 @@ fn seed_pk_dual1_iov<const N: usize>(
     n_kappa: usize,
 ) -> Vec<Dual1<N>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| n_eta + g * n_kappa);
+    let kappa_base = group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(c)
@@ -3353,7 +3369,7 @@ fn run_subject_iov_eta<const N: usize>(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
-    occ_groups: &[(u32, Vec<usize>)],
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<Vec<ObsGrad>> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
@@ -3361,13 +3377,12 @@ fn run_subject_iov_eta<const N: usize>(
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
-    let k_groups = occ_groups.len();
-    let n_stacked = n_eta + k_groups * n_kappa;
+    let k_groups = layout.n_groups();
+    let n_stacked = layout.n_stacked();
     let cov = &subject.covariates;
 
-    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
-    let combined_for =
-        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
+    let occ_to_k = layout.occ_to_group();
+    let combined_for = |g: usize| layout.combined_effect(stacked_eta, g);
 
     // Per-event `TIME` seeding — the inner counterpart of the outer `run_subject_iov`
     // (#486). Same thread-local guard + per-event forcing.
@@ -3392,15 +3407,13 @@ fn run_subject_iov_eta<const N: usize>(
             n_kappa,
         ))
     };
-    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
-    // closed-form provider, #598 review). Built lazily inside the closure so the common
-    // IOV subject with no EVID=2 records pays no allocation.
+    // The inner κ = 0 seed, for the same rows as the outer one above (#1876). Built lazily
+    // inside the closure so the common IOV subject pays no allocation.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
      -> Option<Vec<Dual1<N>>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let combined_pk_only =
-            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let combined_pk_only = layout.combined_pk_only(stacked_eta);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,

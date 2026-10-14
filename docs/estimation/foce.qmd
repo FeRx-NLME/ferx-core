@@ -690,6 +690,95 @@ restarted. And a second stall is reported as a stall: you get `converged: false`
 `Outer optimization did not converge` warning, which is the honest signal and bounds the
 worst case at two optimizations.
 
+### When no evaluation is feasible {#no-feasible-evaluation}
+
+The outer optimizer can also stop having never scored the real objective at all. Every
+trial it made was rejected — by the [EBE convergence
+guard](../model-file/fit-options.qmd#parameter-scaling-and-ebe-convergence), or because the
+objective came back non-finite — and what the optimizer minimised instead was the guard's
+own rejection penalty.
+
+For a **gradient** optimizer that penalty is a quadratic bowl centred on the **midpoint of
+the declared bounds** in the packed, scaled space the optimizer works in. It has to be:
+NLopt's line search interpolates on the value and the gradient together, so a rejected trial
+has to return a value that integrates the centre-push gradient handed back with it (a flat
+wall plus a non-zero gradient fails the search outright,
+[#486](https://github.com/FeRx-NLME/ferx-core/issues/486)). An optimizer handed nothing but that penalty
+therefore walks to the box centre and stops there with NLopt `Success`, because the penalty
+really is stationary at the centre.
+
+The derivative-free `bobyqa` is handed a flat `1e20` wall instead — it asks for no gradient,
+so there is nothing to integrate — and a flat objective has no centre to walk to. So the
+midpoint is a property of the *gradient* arm specifically; what the two arms share is
+everything a reader sees. A BOBYQA run whose every trial is rejected reports
+`W_NO_FEASIBLE_EVAL`, `converged: false`, and its **starting estimates**, exactly like the
+gradient arm: the fallback below restores the point the optimizer was handed for every NLopt
+optimizer, not just the ones that would otherwise land on the midpoint.
+
+Until [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617) that came back as a *fit*. The best-seen
+restore ranked penalties only, so it landed on the centre; the final inner loop re-scored
+that point into an ordinary finite OFV; and every downstream check read a plausible number.
+On the issue's warfarin reproduction at `inner_maxiter = 5`, each θ came back at
+$\sqrt{\text{lower} \cdot \text{upper}}$ to 3e-9 (`TVCL` 0.1, `TVV` 7.071, `TVKA` 0.7071),
+each ω at 1 — the middle of the ±6 log rail — and `converged: true`, 500 OFV units from the
+optimum the same model reaches with the default inner budget.
+
+#### What the warning says {#no-feasible-evaluation-warning}
+
+A run with no feasible evaluation now reports `converged: false` with a `Critical`
+`convergence` warning carrying the `W_NO_FEASIBLE_EVAL` token, and the estimates it reports
+are the ones it started from rather than the penalty's minimum. The warning says which of
+the two ways a trial can be infeasible applied, because the remedies are not the same:
+
+| What the trace says | What to change |
+|---|---|
+| The EBE guard rejected the trials, with *N* of *M* subjects' inner loops unconverged | Raise `inner_maxiter` so the inner loop can reach the EBEs, or raise `max_unconverged_frac` (`1.0` disables the guard) to proceed with the unconverged subjects. |
+| Every trial returned a non-finite objective | The guard never came into it. Find the record or parameter that poisons the objective, as for [`W_NONFINITE_OBJECTIVE`](../warnings.qmd#non-finite-objective). |
+
+A **cancelled** run is not reported this way: its evaluations short-circuit before the
+feasible-evaluation counter advances, so its trace is infeasible by construction.
+
+#### Reading such a run {#no-feasible-evaluation-reading}
+
+A trace can be in **both** rows at once — some trials rejected by the guard, the rest
+non-finite — and then the warning reports both counts and carries both remedies, because
+neither reaches the other's trials: `inner_maxiter` does not make a `NaN` finite, and
+chasing a poisoned record does not widen the inner budget.
+
+The "increase `maxiter`" advice is withheld, on either row. A run that scored nothing has
+no fit to tighten and a longer *outer* budget buys only more rejected trials, so when the
+outer budget is exhausted the usual "increase maxiter for a tighter fit" warning does not
+appear.
+
+What *does* always accompany `W_NO_FEASIBLE_EVAL` is the generic
+`Outer optimization did not converge` line, since the run is demoted. What differs by row
+is whether `W_NONFINITE_OBJECTIVE` joins them. On the **guard-rejection** row the reported
+OFV is a real objective — the starting estimates, scored by the final inner loop — so it is
+not a sentinel and that warning does not fire; the number is simply not a minimum of
+anything. On the **non-finite** row the re-score at the starting estimates is usually
+non-finite too, and it does. Three warnings then, three different facts: the trace, the
+verdict, and the number.
+
+Finally, comparing `gradient = fd` against the default can be misleading here, because it
+also swaps the outer optimizer away from L-BFGS to the derivative-free BOBYQA
+([`gradient = fd` moves the optimizer too](optimizers.qmd#gradient-fd-moves-the-optimizer)),
+and the two then differ in two ways at once. BOBYQA never reports the midpoint, per the
+flat-wall note above; and on some models its small opening steps keep the inner loop inside
+its budget where L-BFGS's first step does not, so it finds feasible trials and the fit comes
+back looking ordinary. Both measured on [#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617)'s own
+reproductions, and they land differently:
+
+- on the two-subject fixture at `inner_maxiter = 3`, the default route reports the midpoint
+  at OFV 24.578 while `gradient = fd` reaches the optimum at −10.403 — a 35-unit gap between
+  two routes on the same model, which is what invites the reader to suspect the analytic
+  gradient when the cause is the optimizer;
+- on warfarin at `inner_maxiter = 5`, the default route reports the midpoint at 220.52 and
+  BOBYQA reports a real objective at the *initial* values, −269.95, with
+  `W_STALLED_AT_INIT`.
+
+Neither is a general escape: starve the inner loop harder and BOBYQA is rejected at every
+trial too, carrying `W_NO_FEASIBLE_EVAL` like any other route.
+
 ## Warm Starting
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.

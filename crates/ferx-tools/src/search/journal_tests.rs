@@ -366,6 +366,35 @@ fn the_fingerprint_sees_the_contents_and_not_only_the_shape() {
     }
 }
 
+/// #1876, both sides of the gate: a pk-only row's occasion moves the digest, and
+/// an empty `pk_only_occasions` (no IOV column, or no pk-only row) leaves it
+/// where it was before the field existed, so those journals still resume.
+///
+/// Mutations — drop the line: the labelled case is unmoved; write it
+/// unconditionally: the pinned digest moves.
+#[test]
+fn a_pk_only_occasion_moves_the_digest_only_when_present() {
+    let base = SearchManifest::new(&options(), &loaded_population());
+    // The digest of `loaded_population()` before #1876 added the field.
+    assert_eq!(
+        base.data_fingerprint,
+        "3bb0d1d43cb11acbb2791d9b735d06dec495226cea8cb1b1b26f9574d9450181"
+    );
+
+    let labelled = |occ: u32| {
+        let mut data = loaded_population();
+        data.subjects[0].pk_only_times = vec![2.0];
+        data.subjects[0].pk_only_covariates = vec![HashMap::new()];
+        data.subjects[0].pk_only_occasions = vec![occ];
+        SearchManifest::new(&options(), &data)
+    };
+    assert_ne!(
+        labelled(1).data_fingerprint,
+        labelled(2).data_fingerprint,
+        "a pk-only row's occasion left the fingerprint unmoved"
+    );
+}
+
 #[test]
 fn the_fingerprint_is_stable_across_repeated_construction() {
     // Covariates live in `HashMap`s, whose iteration order varies per process.

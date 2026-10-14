@@ -145,6 +145,98 @@ All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
 
+#### The `s` and `rsr` estimators
+
+`covariance_method = s` (`S⁻¹`) and `rsr` (`R⁻¹SR⁻¹`) need a per-subject score
+$g_i = \partial(-\log L_i)/\partial x$, and under a mixture that is the score of the
+**mixture marginal** $L_i = \sum_k p_{ik} L_{ik}$:
+
+$$
+g_i = \sum_k w_{ik}\left(\frac{\partial\, \mathrm{nll}_{ik}}{\partial x} - \frac{\partial \ln p_{ik}}{\partial x}\right),
+\qquad w_{ik} = \frac{p_{ik} L_{ik}}{\sum_j p_{ij} L_{ij}},
+$$
+
+where $w_{ik}$ is the subject's posterior class probability (the `PMIX` column) and
+each class's $\partial\,\mathrm{nll}_{ik}/\partial x$ is the ordinary FOCE/FOCEI
+subject score taken under that class — its typical values, its Ω/Σ overrides, and
+its own η̂ (and κ̂ under IOV). As for a single-population fit, η̂ is held at its
+value at the estimates (a fixed-mode score), so every class-specific θ and every
+mixing coefficient gets its own non-zero score column.
+
+Before #1956 the mixture score was taken from the single-population objective
+under class 1 only. The class-2 θ and the mixing-fraction columns of `S` were then
+exactly zero, so `s` was refused as singular and `rsr` reported wrong SEs for
+every parameter. At the NONMEM finals of `tests/nonmem/mixture_iv_cov.ctl`
+(evaluation-only, measured on macOS arm64), ferx now reports:
+
+| SE | `r` | `s` | `rsr` |
+|---|---|---|---|
+| `TVCL1` | 0.1058 | 0.1340 | 0.0874 |
+| `TVCL2` | 0.2543 | 0.2521 | 0.3044 |
+| `V` | 0.1861 | 0.2119 | 0.1704 |
+| `p(1)` | 0.1026 | 0.1226 | 0.1142 |
+
+##### Against NONMEM: a different score convention
+
+NONMEM 7.5.1 at the same point (`MAXEVAL=0`,
+`tests/nonmem/mixture_iv_cov_{s,rsr,r0}.ctl`) gives:
+
+| SE | `MATRIX=R` | `MATRIX=S` | default ($R^{-1}SR^{-1}$) |
+|---|---|---|---|
+| `TVCL1` | 0.1053 | 0.1324 | 0.0847 |
+| `TVCL2` | 0.2542 | 0.2937 | 0.2241 |
+| `V` | 0.1861 | 0.2136 | 0.1687 |
+| `p(1)` | 0.1025 | 0.1088 | 0.1012 |
+
+`r` agrees to 0.45 % (`TVCL1`; the other three to 0.05 %), but `s` differs by up
+to 14 % (`TVCL2`) and `rsr` by up to 36 %. That is not a mixture defect. The two
+engines differentiate different objectives: NONMEM's score is the *total*
+derivative of $-2\log L_i$, with η̂ re-estimated at every perturbed parameter
+vector, while ferx holds η̂ and its prediction Jacobian at the estimates — for a
+mixture and for a single-population fit alike.
+
+`tests/nonmem/mixture_iv_cov_score_oracle.py` settles which is which. It computes
+each subject's FOCEI $-2\log L_i$ in closed form, outside both engines (it
+reproduces NONMEM's objective, 301.582018, to 4e-8), and forms $S$ from central
+differences under each convention:
+
+| `s` SE | NONMEM | oracle, η̂ re-estimated | oracle, η̂ held | ferx |
+|---|---|---|---|---|
+| `TVCL1` | 0.13238 | 0.13237 | 0.13403 | 0.13403 |
+| `TVCL2` | 0.29366 | 0.29366 | 0.25211 | 0.25211 |
+| `V` | 0.21364 | 0.21364 | 0.21193 | 0.21193 |
+| `p(1)` | 0.10881 | 0.10881 | 0.12260 | 0.12260 |
+
+Each engine matches its own column to better than 4e-6. The same split appears
+with no mixture at all. On the single-population twin of this model
+(`tests/nonmem/single_iv_cov_{s,rsr,r0}`: $CL = TVCL\,e^{\eta}$, same data,
+NONMEM 7.5.1 at OBJ 350.266132), $\operatorname{SE}(TVCL)$ is:
+
+| `TVCL` SE | NONMEM | oracle, η̂ re-estimated | oracle, η̂ held | ferx |
+|---|---|---|---|---|
+| `r` | 0.10068 | 0.10060 | — | 0.10060 |
+| `s` | 0.05379 | 0.05379 | 0.06262 | 0.06262 |
+| `rsr` | 0.18892 | 0.18865 | 0.16537 | 0.16537 |
+
+So the gap is 16 % on `s` and 12 % on `rsr`, while `r` agrees to 0.07 %.
+
+More subjects do not close it, because the held score is biased. At the MLE
+the total score sums to zero over subjects; the held one does not. Holding η̂
+is exact for the conditional part of $-2\log L_i$, which is stationary in η at
+the mode, but it drops the dependence of the FOCEI $\log|\tilde H|$ term on η̂
+and on the prediction Jacobian. On the twin, the re-estimated
+$\sum_i g_i$ on `TVCL` is $-4\times10^{-4}$ and the held one 33.2: every
+subject's score shifts by 1.105 on average (sd 0.669), against a mean $|g_i|$
+of 3.05. On the mixture, $\sum_i g_i$ on `TVCL2` is $3\times10^{-4}$
+re-estimated and 16.2 held. Replicating the subjects scales $\sum_i g_i$, $S$
+and $R$ alike, so the SE ratios do not move. The oracle prints these sums on
+every run.
+
+Until ferx's score carries the EBE response (#1817), expect `s` and `rsr` to
+differ from NONMEM's on any FOCE/FOCEI model, by an amount that depends on the
+model rather than on the number of subjects. `tests/mixture_cov_s_nonmem.rs`
+pins both halves, for the mixture and for its twin.
+
 ## Inter-occasion variability under a mixture
 
 A mixture may carry inter-occasion variability (a `kappa` on a structural
@@ -157,6 +249,11 @@ per-class Ω/Σ override), matching NONMEM's `$OMEGA BLOCK(1) … SAME` occasion
 structure. The analytic outer gradient does not yet emit κ-slot derivatives for a
 mixture, so an IOV mixture optimises against a central-difference outer gradient;
 the covariance step runs as usual on the K-fold mixture objective.
+
+The postfit outputs use the most-probable (`MIXEST`) class's κ̂: IPRED, IWRES,
+CWRES, the per-subject OFV, κ shrinkage and the `.fitrx` `ebe_kappas`. This holds
+after a fit and also for an evaluation-only run (`maxiter = 0`, #1932), so both
+report the same diagnostics at the same parameters.
 
 ### NONMEM cross-check (`tests/nonmem/mixture_iv_iov.ctl`)
 
@@ -180,6 +277,29 @@ covariance step terminates with rounding errors and substitutes the R matrix
 for mixture + IOV covariance — whereas ferx's covariance step completes. The
 mixture SE machinery itself is anchored to `$COVARIANCE MATRIX=R` in the non-IOV
 [standard-errors](#standard-errors) comparison above.
+
+### Evaluation-only cross-check (`tests/nonmem/mixture_iv_iov_eval.ctl`)
+
+The same model and data, evaluated once at NONMEM's final estimates
+(`MAXEVAL=0 POSTHOC` against ferx's `maxiter = 0`, #1932). NONMEM tables its
+`MIXEST` class's ETAs, so this compares ferx's postfit row by row. The figures are
+the largest absolute difference over all 30 subjects (κ̂ over both occasions,
+IPRED and IWRES over all 240 observations):
+
+| Quantity | ferx vs NONMEM 7.5.1 | before #1932 |
+|---|---|---|
+| OFV | 2.1e-7 | 2.1e-7 |
+| η̂ and per-occasion κ̂ | 1.8e-7 | 0.17 (κ̂ reported as 0) |
+| IPRED | 6.8e-7 | 0.59 |
+| IWRES | 5.3e-7 | 1.29 |
+| `MIXEST` | 30 / 30 agree | 30 / 30 agree |
+
+CWRES agrees to 1.1e-7 and is asserted too. Like NONMEM, ferx linearizes it over
+every ETA, the `MIXEST` class's occasion κs included (#1948). Before that fix
+ferx linearized over η alone, and the gap was 0.41. This was an IOV effect, not a
+mixture effect: an IOV model with no mixture showed the same gap. Recomputing
+CWRES outside both engines from NONMEM's own ETAs over [η, κ₁, κ₂] reproduces
+NONMEM's column to 2.1e-10.
 
 ## SAEM under a mixture
 

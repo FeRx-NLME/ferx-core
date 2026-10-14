@@ -46,6 +46,7 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
     let params = model.default_params.clone();
 
     let make = |id: &str, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -64,6 +65,7 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1007,6 +1009,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
@@ -1027,6 +1030,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1497,6 +1501,7 @@ fn dcm_fixture() -> (CompiledModel, Population, ModelParameters) {
         cov.insert("WT".to_string(), wt);
         cov.insert("CRCL".to_string(), crcl);
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 4.0, 8.0, 12.0],
@@ -1515,6 +1520,7 @@ fn dcm_fixture() -> (CompiledModel, Population, ModelParameters) {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// for every observation, while the fix yields the per-occasion CL.
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -110,6 +111,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
 fn two_occasion_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
@@ -129,6 +131,7 @@ fn two_occasion_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     }
 }
@@ -308,6 +311,7 @@ fn tad_uses_per_dose_occasion_lag() {
     );
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![
@@ -330,6 +334,7 @@ fn tad_uses_per_dose_occasion_lag() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -412,6 +417,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
@@ -431,6 +437,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -492,6 +499,7 @@ fn negative_alag_emits_negative_lagtime_warning() {
         .model;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
@@ -511,6 +519,7 @@ fn negative_alag_emits_negative_lagtime_warning() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -566,6 +575,7 @@ fn negative_per_route_lag_emits_negative_lagtime_warning() {
         .expect("parse ok")
         .model;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -585,6 +595,7 @@ fn negative_per_route_lag_emits_negative_lagtime_warning() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -628,6 +639,7 @@ fn negative_lag_scan_skips_analytical_models() {
     assert!(model.has_lagtime() && model.ode_spec.is_none());
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -647,6 +659,7 @@ fn negative_lag_scan_skips_analytical_models() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -709,6 +722,7 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
 fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
     let n = cmts.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -728,6 +742,7 @@ fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject 
         obs_l2: l2,
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     }
 }
@@ -759,6 +774,28 @@ fn block_sigma_ambiguous_pairing_without_l2_warns() {
         diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
         "ambiguous co-temporal pairing with no L2 must warn"
     );
+}
+
+/// #1959. The ambiguity check groups rows by the instant the pairing itself uses: a
+/// total row with two unbound partners at written `TIME = 1` warns whether or not the
+/// reader moved it a ULP below 1 (#1810), and does not warn when the second partner is
+/// in a stacked-reset period that also writes `TIME = 1`.
+///
+/// Mutations — the grouping back on `obs_times` bits: the moved total has no partner
+/// and the first case is quiet. `same_instant` on the written times: the reset partner
+/// joins and the second case warns.
+#[test]
+fn block_sigma_ambiguity_groups_by_the_written_instant() {
+    let model = block_sigma_two_endpoint_model();
+    let warns = |engine: Vec<f64>| {
+        let mut s = obs_only_subject(vec![1, 2, 2], engine, Vec::new());
+        s.obs_raw_times = vec![1.0, 1.0, 1.0];
+        let diags = check_model_data_warnings(&model, &population_of(s), &model.default_params);
+        diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER")
+    };
+    assert!(warns(vec![1.0, 1.0, 1.0]), "the unmoved control");
+    assert!(warns(vec![1.0f64.next_down(), 1.0, 1.0]), "the moved total");
+    assert!(!warns(vec![1.0, 1.0, 30.0]), "a partner after a reset");
 }
 
 /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
@@ -857,6 +894,7 @@ fn ss_dose_with_analytical_init_warns() {
 
     // Subject with a steady-state dose (ss=true, ii=24).
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
@@ -876,6 +914,7 @@ fn ss_dose_with_analytical_init_warns() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -922,6 +961,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         .expect("parse ok")
         .model;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -941,6 +981,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -983,6 +1024,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -1002,6 +1044,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
@@ -1062,6 +1105,7 @@ fn combined_endpoint_model() -> CompiledModel {
 fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
     let n = dvs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -1081,6 +1125,7 @@ fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
     }
 }

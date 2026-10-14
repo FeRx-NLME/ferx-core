@@ -294,6 +294,7 @@ fn design(cov: CovariateDesign) -> Population {
             covariates.insert("WT".to_string(), cov.weight_of(s));
             covariates.insert("CRCL".to_string(), cov.crcl_of(s));
             Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", s + 1),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times,
@@ -312,6 +313,7 @@ fn design(cov: CovariateDesign) -> Population {
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 reset_occasions: vec![],
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }

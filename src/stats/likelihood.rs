@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::{residual_rd, residual_rd2};
+use crate::stats::residual_error::{residual_rd, residual_rd2, ResidualCov};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -81,7 +81,7 @@ pub fn individual_nll_into(
     sigma_values: &[f64],
     scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    individual_nll_into_with_schedule(
+    individual_nll_into_with_schedule_cov(
         model,
         subject,
         theta,
@@ -92,7 +92,7 @@ pub fn individual_nll_into(
         // wrapper (SAEM, HMC, VI, AGQ) holds ρ fixed at the declaration, so that
         // *is* their live value; FOCE/FOCEI, which estimate it (#847), call
         // `individual_nll_into_with_schedule` directly with the optimizer's ρ.
-        &model.residual_correlations,
+        model.residual_cov_theta(theta),
         scratch,
         None,
     )
@@ -503,6 +503,32 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    individual_nll_into_with_schedule_cov(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        scratch,
+        schedule,
+    )
+}
+
+/// [`individual_nll_into_with_schedule`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+pub(crate) fn individual_nll_into_with_schedule_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     let err_keys = model.error_spec.obs_keys(subject);
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut pred_recycle = Vec::new();
@@ -515,7 +541,7 @@ pub fn individual_nll_into_with_schedule(
         eta,
         omega,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         scratch,
         schedule,
         err_keys.as_ref(),
@@ -658,7 +684,7 @@ pub(crate) fn individual_nll_prepared(
         eta,
         omega,
         sigma_values,
-        &model.residual_correlations,
+        model.residual_cov_theta(theta),
         pk,
         schedule,
         &prep.err_keys,
@@ -680,7 +706,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     err_keys: &[usize],
@@ -696,7 +722,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
         eta,
         omega,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         scratch,
         schedule,
         err_keys,
@@ -776,7 +802,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     err_keys: &[usize],
@@ -852,14 +878,14 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+    if residual_cov.is_dense() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
             model,
             subject,
             &preds,
             frozen_var_preds.unwrap_or(&preds[..]),
             sigma_values,
-            residual_correlations,
+            residual_cov,
             ruv_scale,
             &p_obs,
             ruv_mult,
@@ -970,7 +996,7 @@ fn dense_residual_data_term(
     // frozen `f(η = 0)` of a non-interaction FOCE EBE search (#1722).
     var_preds: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     ruv_scale: f64,
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
@@ -983,7 +1009,7 @@ fn dense_residual_data_term(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     if ruv_scale != 1.0 {
@@ -1026,7 +1052,7 @@ pub(crate) fn obs_nll_subject_into(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
@@ -1035,7 +1061,7 @@ pub(crate) fn obs_nll_subject_into(
         subject,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         pk_scratch,
         None,
@@ -1058,7 +1084,7 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -1072,7 +1098,7 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
         &preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
     )
 }
@@ -1091,7 +1117,7 @@ pub(crate) fn obs_nll_subject_from_preds(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
 ) -> f64 {
     obs_nll_subject_from_preds_with_semantics(
@@ -1100,7 +1126,7 @@ pub(crate) fn obs_nll_subject_from_preds(
         preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         PredNllSemantics::Marginal,
     )
@@ -1121,7 +1147,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     semantics: PredNllSemantics,
 ) -> f64 {
@@ -1139,7 +1165,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if semantics != PredNllSemantics::ConditionalIov
-        && !residual_correlations.is_empty()
+        && residual_cov.is_dense()
         && !m3
         && !has_frem_rows
     {
@@ -1151,7 +1177,7 @@ fn obs_nll_subject_from_preds_with_semantics(
             preds,
             preds,
             sigma_values,
-            residual_correlations,
+            residual_cov,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -1256,7 +1282,7 @@ pub(crate) fn conditional_obs_nll_from_preds(
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
+    residual_cov: ResidualCov<'_>,
     eta: &[f64],
     iov: bool,
 ) -> f64 {
@@ -1271,7 +1297,7 @@ pub(crate) fn conditional_obs_nll_from_preds(
         preds,
         theta,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         eta,
         semantics,
     )
@@ -1377,6 +1403,11 @@ const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
 /// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
 /// to be scored at the optimizer's current value, not the model's declaration.
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
     model: &CompiledModel,
@@ -1387,6 +1418,33 @@ pub fn foce_subject_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     residual_correlations: &[ResidualCorrelation],
+    interaction: bool,
+) -> f64 {
+    foce_subject_nll_cov(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        interaction,
+    )
+}
+
+/// [`foce_subject_nll`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1569,7 +1627,7 @@ pub fn foce_subject_nll(
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
     if interaction {
-        if residual_correlations.is_empty() {
+        if !residual_cov.is_dense() {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -1585,7 +1643,7 @@ pub fn foce_subject_nll(
                 ruv_mult.as_deref(),
             )
         } else {
-            foce_subject_nll_interaction_dense(
+            foce_subject_nll_interaction_dense_cov(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1593,7 +1651,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                residual_correlations,
+                residual_cov,
                 &p_obs,
                 ruv_mult.as_deref(),
             )
@@ -1608,7 +1666,7 @@ pub fn foce_subject_nll(
         // (always ≥0). Skipped for additive error (variance is f-independent,
         // so f0 and f(η=0) give the same R) to keep that path bit-identical.
         let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
-        foce_subject_nll_standard(
+        foce_subject_nll_standard_cov(
             subject,
             &ipreds,
             eta_hat,
@@ -1616,7 +1674,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            residual_correlations,
+            residual_cov,
             model.bloq_in_force(),
             &p_obs,
             frem_r_override.as_deref(),
@@ -1701,6 +1759,46 @@ pub fn foce_subject_nll_standard(
     // path. Scales each observation's sigma loadings in R.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_standard_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(residual_correlations),
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        r_pred_override,
+        ruv_mult,
+    )
+}
+
+/// [`foce_subject_nll_standard`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+pub(crate) fn foce_subject_nll_standard_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    // When `Some`, evaluate the residual variance R at these predictions
+    // instead of the SB-linearized f0. Used to evaluate R at the population
+    // prediction f(η=0) — NONMEM's no-interaction semantics — which is always
+    // ≥0, avoiding the f0 zero-crossing pathology on oral proportional models.
+    r_pred_override: Option<&[f64]>,
+    // Per-observation custom residual magnitude (#484); `None` on the legacy
+    // path. Scales each observation's sigma loadings in R.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
@@ -1724,7 +1822,7 @@ pub fn foce_subject_nll_standard(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     for (j, v) in p_obs.iter().enumerate() {
@@ -1952,6 +2050,36 @@ pub fn foce_subject_nll_interaction_dense(
     // Per-observation custom residual magnitude (#484); `None` on the legacy path.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_interaction_dense_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(correlations),
+        p_obs,
+        ruv_mult,
+    )
+}
+
+/// [`foce_subject_nll_interaction_dense`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_interaction_dense_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    p_obs: &[f64],
+    // Per-observation custom residual magnitude (#484); `None` on the legacy path.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -1965,7 +2093,7 @@ pub fn foce_subject_nll_interaction_dense(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        correlations,
+        residual_cov,
         ruv_mult,
     );
     for (j, v) in p_obs.iter().enumerate() {
@@ -1998,7 +2126,7 @@ pub fn foce_subject_nll_interaction_dense(
 
     // B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l). Build M_k = R⁻¹ ∂R/∂η_k once per η,
     // then B_{kl} = tr(M_k M_l) = Σ_{p,q} M_k[p,q]·M_l[q,p].
-    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+    let dr = crate::stats::residual_error::compute_dr_df_matrices_cov(
         error_spec,
         ipreds,
         err_keys.as_ref(),
@@ -2006,8 +2134,9 @@ pub fn foce_subject_nll_interaction_dense(
         &subject.obs_raw_times,
         &subject.occasions,
         &subject.obs_l2,
+        &subject.obs_rgroup,
         sigma_values,
-        correlations,
+        residual_cov,
         ruv_mult,
     );
     let mut m_mats: Vec<DMatrix<f64>> = Vec::with_capacity(n_eta);
@@ -2385,7 +2514,7 @@ pub fn foce_subject_nll_iov(
     omega_iov: &OmegaMatrix,
 ) -> f64 {
     if kappas.is_empty() {
-        return foce_subject_nll(
+        return foce_subject_nll_cov(
             model,
             subject,
             theta,
@@ -2395,25 +2524,75 @@ pub fn foce_subject_nll_iov(
             sigma_values,
             // `block_sigma` + IOV is rejected up front, so an IOV model's
             // correlations are always the (empty) declaration (#847).
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             interaction,
         );
     }
 
-    let occ_groups = iov_occasion_groups(subject);
+    match iov_linearization(
+        model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
+    ) {
+        Some(lin) => {
+            foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
+        }
+        None => 1e20,
+    }
+}
+
+/// The linearization an IOV subject is scored and diagnosed on: the joint EBE
+/// `b̂ = [η̂, κ̂₁, …, κ̂_K]`, the stacked sensitivity `H_full = ∂f/∂b` at `b̂`, the
+/// block-diagonal prior `Σ_b = blkdiag(Ω, Ω_IOV × K)`, and `IPRED = f(b̂)`.
+///
+/// Built once by [`iov_linearization`] and consumed by both the IOV marginal
+/// ([`foce_subject_nll_iov`]) and the post-fit CWRES (#1948), so the residual NONMEM
+/// tables as `CWRES` linearizes over the same random effects the objective integrates
+/// — NONMEM treats an occasion κ as one more `ETA`. Before #1948 CWRES used η alone:
+/// the `H_κ·κ̂` part of `f0` stayed in the residual and `H_κ·Ω_IOV·H_κᵀ` was missing
+/// from `R̃`.
+pub(crate) struct IovLinearization {
+    /// `f(η̂, κ̂)` through the continuous per-occasion prediction (`pk::predict_iov`).
+    pub(crate) ipreds: Vec<f64>,
+    /// `[η̂, κ̂₁, …, κ̂_K]` in [`crate::stats::stacked_layout::StackedLayout`] order.
+    pub(crate) b_hat: DVector<f64>,
+    /// `[∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]`, `n_obs × n_b`.
+    pub(crate) h_full: DMatrix<f64>,
+    /// `blkdiag(Ω, Ω_IOV, …, Ω_IOV)`.
+    pub(crate) sigma_b: OmegaMatrix,
+    /// The number of occasion groups K.
+    pub(crate) n_occasions: usize,
+    /// `dim η` (the leading block of `b_hat`).
+    pub(crate) n_eta: usize,
+    /// `dim κ_k`, the order of `Ω_IOV`.
+    pub(crate) n_iov: usize,
+}
+
+/// Build the subject's [`IovLinearization`], or `None` when `kappas` does not hold
+/// exactly one width-`n_iov` vector per occasion group.
+///
+/// That mismatch never comes out of the EBE pipeline. It would silently leave the
+/// unmatched occasions' ipreds (and H columns) at 0.0, so each caller maps `None` to
+/// its own refusal: the marginal to the large finite sentinel (mirroring the guards in
+/// `individual_nll_iov`), the CWRES pass to `NaN`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn iov_linearization(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega_bsv: &OmegaMatrix,
+    kappas: &[DVector<f64>],
+    omega_iov: &OmegaMatrix,
+) -> Option<IovLinearization> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
-    // Defensive: the EBE pipeline always yields exactly one κ vector per
-    // occasion group, each of width n_iov. A mismatch would silently leave the
-    // unmatched occasions' ipreds (and H columns) at 0.0 and score the
-    // augmented marginal against wrong predictions, so bail with the large
-    // finite sentinel — mirroring the guards in `individual_nll_iov`.
-    if kappas.len() != occ_groups.len() || kappas.iter().any(|k| k.len() != n_iov) {
-        return 1e20;
+    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_iov, subject);
+    if kappas.len() != layout.n_groups() || kappas.iter().any(|k| k.len() != n_iov) {
+        return None;
     }
-    let k_occ = occ_groups.len();
-    let n_b = n_eta + k_occ * n_iov;
+    let k_occ = layout.n_groups();
+    let n_b = layout.n_stacked();
 
     // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
     // (proper cross-occasion carryover; issue #104), plus the augmented
@@ -2437,7 +2616,7 @@ pub fn foce_subject_nll_iov(
     let mut kpert = kappa_slices.clone();
     const EPS: f64 = 1e-6;
     for k in 0..k_occ {
-        let col_base = n_eta + k * n_iov;
+        let col_base = layout.kappa_offset(k);
         for ki in 0..n_iov {
             let orig = kpert[k][ki];
             let step = EPS * (1.0 + orig.abs());
@@ -2460,16 +2639,48 @@ pub fn foce_subject_nll_iov(
     }
     for (k, kap) in kappas.iter().enumerate() {
         for ki in 0..n_iov {
-            b_hat[n_eta + k * n_iov + ki] = kap[ki];
+            b_hat[layout.kappa_offset(k) + ki] = kap[ki];
         }
     }
 
     // Block-diagonal prior covariance Σ_b = blkdiag(Ω_bsv, Ω_iov × K).
     // `from_matrix` regularises if a sub-block is not PD, matching the
     // robustness of the non-IOV OmegaMatrix path; the standard/interaction
-    // FOCE routines below read only `Σ_b.matrix`.
-    let sigma_b_mat = build_block_diag_omega(&omega_bsv.matrix, &omega_iov.matrix, k_occ);
+    // FOCE routines and `compute_cwres_cov` read only `Σ_b.matrix`.
+    let sigma_b_mat = layout.prior(&omega_bsv.matrix, &omega_iov.matrix);
     let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
+
+    Some(IovLinearization {
+        ipreds,
+        b_hat,
+        h_full,
+        sigma_b,
+        n_occasions: k_occ,
+        n_eta,
+        n_iov,
+    })
+}
+
+/// [`foce_subject_nll_iov`] on an already-built [`IovLinearization`].
+pub(crate) fn foce_subject_nll_iov_linearized(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+) -> f64 {
+    let IovLinearization {
+        ipreds,
+        b_hat,
+        h_full,
+        sigma_b,
+        n_occasions: k_occ,
+        n_eta,
+        n_iov,
+    } = lin;
+    let (k_occ, n_eta, n_iov) = (*k_occ, *n_eta, *n_iov);
+    let eta_hat = &b_hat.as_slice()[..n_eta];
 
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
@@ -2488,7 +2699,7 @@ pub fn foce_subject_nll_iov(
     // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
     // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
     let p_obs_iov = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+        ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
     } else {
         Vec::new()
     };
@@ -2522,7 +2733,7 @@ pub fn foce_subject_nll_iov(
         // Additive error keeps f0 (bit-identical).
         // `kappas` has one length-`n_iov` vector per occasion (checked above).
         let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
-        foce_subject_nll_standard(
+        foce_subject_nll_standard_cov(
             subject,
             &ipreds,
             &b_hat,
@@ -2533,7 +2744,7 @@ pub fn foce_subject_nll_iov(
             // `block_sigma` + IOV is rejected up front
             // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
             // practice and the estimated-ρ threading (#847) never reaches here.
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             model.bloq_in_force(),
             &p_obs_iov,
             None,
@@ -2593,6 +2804,11 @@ pub fn foce_population_nll_iov(
 }
 
 /// Population FOCE objective: sum over all subjects
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
     model: &CompiledModel,
@@ -2605,6 +2821,33 @@ pub fn foce_population_nll(
     residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
+    foce_population_nll_cov(
+        model,
+        population,
+        theta,
+        eta_hats,
+        h_matrices,
+        omega,
+        sigma_values,
+        ResidualCov::block_sigma(residual_correlations),
+        interaction,
+    )
+}
+
+/// [`foce_population_nll`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_population_nll_cov(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
     // sum serially. A parallel `.sum()` would make the OFV depend on the
     // thread count (f64 addition is non-associative; rayon splits by worker
@@ -2614,7 +2857,7 @@ pub fn foce_population_nll(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            foce_subject_nll(
+            foce_subject_nll_cov(
                 model,
                 subject,
                 theta,
@@ -2622,7 +2865,7 @@ pub fn foce_population_nll(
                 &h_matrices[i],
                 omega,
                 sigma_values,
-                residual_correlations,
+                residual_cov,
                 interaction,
             )
         })
@@ -2651,6 +2894,14 @@ pub fn foce_population_nll(
 /// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
 /// A model with no η has `R̃` diagonal, so every recipe agrees there.
 ///
+/// Under inter-occasion variability the random effects are `b = [η, κ₁, …, κ_K]`,
+/// and the arguments are their stacked forms: `eta_hat = b̂`, `h_matrix = ∂f/∂b`
+/// and `omega = blkdiag(Ω, Ω_IOV × K)` — the system [`foce_subject_nll_iov`]
+/// integrates, which is what the fit's sdtab passes (#1948). NONMEM treats an
+/// occasion κ as one more `ETA`, so its `CWRES` linearizes over all of `b`;
+/// passing η alone leaves `H_κ·κ̂` in the residual and drops `H_κ·Ω_IOV·H_κᵀ`
+/// from `R̃`. Under FOCE without interaction `r_preds` is then `f(η = 0, κ = 0)`.
+///
 /// Rows censored **for this fit** — `CENS != 0` under `bloq_method = m3`, never
 /// under `drop`, see [`BloqMethod::is_censored_row`] — get `NaN`, since a
 /// weighted Gaussian residual is undefined when the observed value is censored,
@@ -2658,6 +2909,11 @@ pub fn foce_population_nll(
 /// ordinary observation the likelihood scored at its `DV`, so it stays in the
 /// system: gating on the raw flag instead blanked it *and* shifted every other
 /// CWRES of that subject, because the decorrelation mixes rows (#1499).
+///
+/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
+/// (#1081) is **not** applied here, so such a model is scored with independent
+/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
+/// carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -2668,6 +2924,53 @@ pub fn compute_cwres(
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
     residual_correlations: &[ResidualCorrelation],
+    frem_r_override: Option<&[Option<f64>]>,
+    // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
+    // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
+    residual_error_eta: Option<usize>,
+    // Per-observation custom residual magnitude (#484) matrix, or `None` on the
+    // legacy path. Scales each row's residual variance so sdtab CWRES matches
+    // the magnitude-aware OFV (the multiplier is f-independent, so the matrix
+    // built at `ipred` applies unchanged at the SB-linearized `f0`).
+    ruv_mult: Option<&[Vec<f64>]>,
+    // The predictions at which `R` is evaluated — `IPRED` under an interaction
+    // fit, `f(η = 0)` under FOCE — NONMEM's `CWRES`. `None` evaluates `R` at
+    // the linearized `f0`.
+    r_preds: Option<&[f64]>,
+    // How the fit scored `CENS` rows. Only `M3` makes a flagged row censored;
+    // under `Drop` the likelihood kept it as an ordinary observation and so does
+    // this (#1499).
+    bloq_method: BloqMethod,
+) -> Vec<f64> {
+    compute_cwres_cov(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        ResidualCov::block_sigma(residual_correlations),
+        frem_r_override,
+        residual_error_eta,
+        ruv_mult,
+        r_preds,
+        bloq_method,
+    )
+}
+
+/// [`compute_cwres`] over a resolved [`ResidualCov`] — the form every in-crate
+/// caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_cwres_cov(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
     frem_r_override: Option<&[Option<f64>]>,
     // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
     // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
@@ -2706,7 +3009,7 @@ pub fn compute_cwres(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        residual_correlations,
+        residual_cov,
         ruv_mult,
     );
     if let Some(overrides) = frem_r_override {
@@ -2797,15 +3100,76 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// empty observation-index list. This preserves existing stacked-kappa ordering for the
 /// common case while assigning dose-only occasions their own axes, so dose carryover into
 /// later observations can be differentiated analytically.
+///
+/// Occasions carried only by pk-only rows (`EVID=2` / `EVID=0, MDV=1`,
+/// `Subject::pk_only_occasions`) come last, in file order, also with an empty list. Such a
+/// row runs `$PK` under its own occasion (#1876) and governs the interval ending at it, so
+/// its κ moves every later prediction; NONMEM gives that occasion an `ETA` like any other.
+/// Without a group here the row would fall back to κ = 0.
 pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut groups = split_obs_by_occasion(subject);
     let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
-    for &occ in &subject.dose_occasions {
+    for &occ in subject
+        .dose_occasions
+        .iter()
+        .chain(&subject.pk_only_occasions)
+    {
         if seen.insert(occ) {
             groups.push((occ, Vec::new()));
         }
     }
     groups
+}
+
+/// Whether any scored observation can read each [`iov_occasion_groups`] entry's κ,
+/// parallel to that list (#1911).
+///
+/// A group that owns an observation is informed. A group with none — a dose-only
+/// occasion, or one only pk-only rows carry — can reach a prediction only through
+/// state carried forward in time, so:
+///
+/// - with `carries_state = false` (a compartment-free, `$PRED`-style model, whose every
+///   prediction reads its own record's parameters alone) it is never informed — the MBMA
+///   arm-visit reported only as an `MDV = 1` row;
+/// - otherwise it acts from its first record onward (a dose's carryover; the interval a
+///   pk-only row closes), so it is informed exactly when some observation sits at or
+///   after that record's time.
+///
+/// An uninformed group's κ̂ is the prior mode 0 and it leaves the objective unchanged.
+/// The time rule is conservative at a tie (an observation at the record's own time
+/// counts), so it only ever drops groups the data cannot see.
+pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<bool> {
+    let records = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .zip(&subject.dose_occasions)
+        .chain(
+            subject
+                .pk_only_times
+                .iter()
+                .copied()
+                .zip(&subject.pk_only_occasions),
+        );
+    iov_occasion_groups(subject)
+        .into_iter()
+        .map(|(occ, obs_idx)| {
+            if !obs_idx.is_empty() {
+                return true;
+            }
+            if !carries_state {
+                return false;
+            }
+            let first = records
+                .clone()
+                .filter(|&(_, &o)| o == occ)
+                .map(|(t, _)| t)
+                .fold(f64::INFINITY, f64::min);
+            // No record found (cannot happen for a group built from one) or a non-finite
+            // time: keep it, the historical behaviour.
+            !first.is_finite() || subject.obs_times.iter().any(|&t| t >= first)
+        })
+        .collect()
 }
 
 /// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
@@ -2821,10 +3185,10 @@ pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashM
 }
 
 /// The combined effect vector `[η_bsv, κ_g]` for occasion group `g`, sliced from a
-/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The **single source** of the κ-axis offset
-/// (`base = n_eta + g·n_kappa`) so the closed-form and ODE IOV providers cannot seed κ onto
-/// different axes — a change to the stacked layout now touches one place (#466 review
-/// round 2).
+/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The κ-axis offset itself is owned by
+/// `stats::stacked_layout` (`kappa_offset`, #1082); this keeps its public signature and
+/// delegates there, so the closed-form and ODE IOV providers cannot seed κ onto different
+/// axes (#466 review round 2).
 pub fn iov_combined_effect(
     stacked_eta: &[f64],
     n_eta: usize,
@@ -2833,16 +3197,19 @@ pub fn iov_combined_effect(
 ) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
-    let base = n_eta + g * n_kappa;
+    let base = crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g);
     c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
     c
 }
 
-/// The combined effect vector `[η_bsv, 0…0]` for an **EVID=2 pk-only** event — the κ=0
-/// counterpart of [`iov_combined_effect`]. Pk-only breakpoints carry no occasion, so their
-/// IOV κ block is held at zero (matching production `predict_iov`'s `combined_for(u32::MAX)`
-/// branch). Shares the stacked-η layout with [`iov_combined_effect`] so the closed-form and
-/// ODE IOV providers cannot seed the κ=0 block differently (#598 review).
+/// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
+/// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
+/// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
+/// for one with no resolvable occasion, an unlabelled in-memory row on a subject where no
+/// record carries a label (matching production `predict_iov`'s
+/// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
+/// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
+/// review).
 pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
@@ -2857,26 +3224,7 @@ pub fn build_block_diag_omega(
     omega_iov: &DMatrix<f64>,
     n_occasions: usize,
 ) -> DMatrix<f64> {
-    let n_bsv = omega_bsv.nrows();
-    let n_iov = omega_iov.nrows();
-    let n_total = n_bsv + n_occasions * n_iov;
-    let mut m = DMatrix::zeros(n_total, n_total);
-    // BSV block
-    for i in 0..n_bsv {
-        for j in 0..n_bsv {
-            m[(i, j)] = omega_bsv[(i, j)];
-        }
-    }
-    // K copies of IOV block
-    for k in 0..n_occasions {
-        let offset = n_bsv + k * n_iov;
-        for i in 0..n_iov {
-            for j in 0..n_iov {
-                m[(offset + i, offset + j)] = omega_iov[(i, j)];
-            }
-        }
-    }
-    m
+    crate::stats::stacked_layout::block_diag_stack(omega_bsv, omega_iov, n_occasions)
 }
 
 /// IOV-aware individual NLL: uses per-occasion kappas.
@@ -3107,6 +3455,7 @@ mod tests {
 
     fn make_simple_subject() -> Subject {
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -3125,6 +3474,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -3136,6 +3486,7 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,
@@ -3263,9 +3614,25 @@ mod tests {
         let mut scratch = pk::EventPkParams::default();
 
         let corr = model.residual_correlations.clone();
-        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &corr, &eta, &mut scratch);
+        let dense = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&corr),
+            &eta,
+            &mut scratch,
+        );
         model.residual_correlations.clear();
-        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let diagonal = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
 
         assert!(dense.is_finite());
         assert!(diagonal.is_finite());
@@ -3439,7 +3806,7 @@ mod tests {
             &eta,
             &omega,
             &sigma,
-            &[],
+            ResidualCov::block_sigma(&[]),
             &mut event_scratch,
             None,
             err_keys.as_ref(),
@@ -3548,15 +3915,22 @@ mod tests {
         let sigma = [0.8];
         let eta = [0.0];
 
-        let nll_weighted =
-            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &[], &eta);
+        let nll_weighted = obs_nll_subject_from_preds(
+            &weighted,
+            &natural,
+            &f,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+        );
         let nll_hand = obs_nll_subject_from_preds(
             &plain,
             &prescaled,
             &scaled_preds,
             &theta,
             &sigma,
-            &[],
+            ResidualCov::block_sigma(&[]),
             &eta,
         );
         let jacobian: f64 = w.iter().map(|wi| wi.ln()).sum();
@@ -3597,6 +3971,65 @@ mod tests {
         assert_eq!(groups[1], (2, vec![3, 4, 5]));
         assert_eq!(groups[2], (3, Vec::new()));
         assert_eq!(groups[3], (4, Vec::new()));
+    }
+
+    /// An occasion only pk-only rows carry gets a group too, after the dose-only ones and
+    /// in file order; one an observation or a dose already carries does not get a second.
+    #[test]
+    fn test_iov_occasion_groups_appends_pk_only_occ() {
+        let mut subj = make_simple_subject();
+        subj.dose_occasions = vec![1, 3];
+        subj.pk_only_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        subj.pk_only_occasions = vec![6, 2, 5, 3, 6, 1];
+        let groups = iov_occasion_groups(&subj);
+        let ids: Vec<u32> = groups.iter().map(|(occ, _)| *occ).collect();
+        assert_eq!(ids, vec![1, 2, 3, 6, 5]);
+        assert_eq!(groups[3], (6, Vec::new()));
+        assert_eq!(groups[4], (5, Vec::new()));
+    }
+
+    /// #1911: a group without observations is informed iff an observation sits at or
+    /// after its first record. Observations run t = 1..6. Groups: OCC 1, 2 (own obs);
+    /// 3 dose-only at t = 2 (carryover reaches t = 3..6 → informed); 4 dose-only at
+    /// t = 10 (after every obs → not); 5 pk-only at t = 6 (tie with the last obs → kept,
+    /// the conservative side); 6 pk-only at t = 8 and 12 (first record after the obs →
+    /// not); 7 dose at t = 9 then pk-only at t = 1 (the EARLIEST record across both
+    /// kinds decides → informed). OCC 2 also gets a dose at t = 50, after its own
+    /// observations: a group that owns an observation is informed whatever its records'
+    /// times. Under `carries_state = false` only the two observation groups remain.
+    #[test]
+    fn test_iov_group_informed_by_first_record_time() {
+        let mut subj = make_simple_subject();
+        subj.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(9.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(50.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subj.dose_occasions = vec![1, 3, 4, 7, 2];
+        subj.pk_only_times = vec![6.0, 12.0, 8.0, 1.0];
+        subj.pk_only_occasions = vec![5, 6, 6, 7];
+        let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 7, 5, 6]);
+        assert_eq!(
+            iov_group_informed(&subj, true),
+            vec![true, true, true, false, true, true, false]
+        );
+        assert_eq!(
+            iov_group_informed(&subj, false),
+            vec![true, true, false, false, false, false, false]
+        );
+    }
+
+    /// Without dose-only or pk-only groups every group owns an observation, so the mask
+    /// is all-true and the shrinkage is the historical one (the #1911 control).
+    #[test]
+    fn test_iov_group_informed_all_true_for_observation_groups() {
+        let subj = make_simple_subject();
+        for carries_state in [true, false] {
+            assert_eq!(iov_group_informed(&subj, carries_state), vec![true, true]);
+        }
     }
 
     #[test]
@@ -4240,6 +4673,7 @@ mod tests {
     #[test]
     fn compute_cwres_does_not_scale_frem_rows_by_iiv_on_ruv() {
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
@@ -4258,6 +4692,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 100],
             obs_records: vec![],
         };
@@ -4429,6 +4864,7 @@ mod tests {
         // With H = 0 the SB prediction f0 = ipred and R_tilde = R (diagonal), so
         // for additive error CWRES_j = (y_j − f_j) / (m_j·σ).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
@@ -4447,6 +4883,7 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0],
             obs_records: vec![],
         };
@@ -4536,9 +4973,25 @@ mod tests {
         let eta = vec![0.4];
         let mut scratch = pk::EventPkParams::with_capacity_for(&subj);
 
-        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let base = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
         model.residual_error_eta = Some(0);
-        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
+        let scaled = obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+            &mut scratch,
+        );
 
         let s = (2.0_f64 * 0.4).exp();
         let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
@@ -4703,7 +5156,7 @@ mod tests {
             &preds,
             &p.theta,
             &p.sigma.values,
-            &p.residual_correlations,
+            model.residual_cov_at(p),
             &eta,
         );
         assert!(

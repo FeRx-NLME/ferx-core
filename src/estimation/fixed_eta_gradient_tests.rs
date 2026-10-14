@@ -23,6 +23,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     let model = analytical_model(GradientMethod::Auto);
 
     let make_subj = |id: &str, obs: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -41,6 +42,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -150,6 +152,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -240,6 +243,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -261,6 +265,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -380,6 +385,7 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 
     // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
     let make_subj = |id: &str, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
@@ -405,6 +411,7 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -531,6 +538,7 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     .expect("cross-endpoint block_sigma ODE model parses");
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -549,6 +557,7 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1366,5 +1375,76 @@ fn fisher_entry_point_returns_the_same_gradient() {
     assert!(
         worst < 1e-6,
         "the two entry points disagree on the gradient: worst relative {worst:.3e}"
+    );
+}
+
+/// #1081 review r1 #2: on the full-FD dense path a θ perturbation must rebuild `R`
+/// at the perturbed θ, because a `correlation` line's ρ is a θ. Built at the base θ,
+/// ∂NLL/∂ρ is exactly 0. ρ (θ index 2) packs linearly (negative lower bound).
+#[test]
+fn obs_nll_subject_grad_sees_a_correlation_rho() {
+    use crate::types::{DoseEvent, Population};
+    use std::collections::HashMap;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  \
+         theta RHO(0.4, -0.4, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.2 (sd)\n  \
+         sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+         V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+         DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation ar1(RHO) by ARM\n",
+    )
+    .expect("parses");
+    let mut subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+        observations: vec![10.5, 8.0, 9.1, 6.2, 3.0],
+        obs_cmts: vec![1; 5],
+        cens: vec![0; 5],
+        obs_covariates: [1.0, 2.0, 1.0, 2.0, 1.0]
+            .iter()
+            .map(|a| HashMap::from([("ARM".to_string(), *a)]))
+            .collect(),
+        ..Default::default()
+    };
+    subject.obs_rgroup = crate::stats::residual_error::residual_groups(&model, &subject);
+    let population = Population {
+        subjects: vec![subject.clone()],
+        covariate_names: vec!["ARM".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let theta = vec![1.0f64, 10.0, 0.4];
+    let sigma_values = vec![0.2f64, 0.5];
+    let etas: Vec<Vec<f64>> = vec![vec![0.05]];
+    let (n_theta, n_sigma) = (3, 2);
+    let n = n_theta + n_sigma;
+    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas, &[]);
+    let h = 1e-6;
+    let mut tp = theta.clone();
+    tp[2] += h;
+    let want = (obs_nll_sum(&model, &population, &tp, &sigma_values, &etas, &[]) - f0) / h;
+    let mask = vec![true, true, false];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let (_, grad) = obs_nll_subject_grad(
+        &model,
+        &subject,
+        &theta,
+        &sigma_values,
+        &etas[0],
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut EventPkParams::default(),
+    );
+    assert!(want.is_finite() && grad[2].is_finite());
+    assert!(want.abs() > 1e-2, "fixture: ρ moves the objective ({want})");
+    assert!(
+        (grad[2] - want).abs() <= 1e-4 * want.abs(),
+        "∂NLL/∂ρ: {} vs FD {want}",
+        grad[2]
     );
 }

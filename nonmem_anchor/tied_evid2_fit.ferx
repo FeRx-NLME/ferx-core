@@ -1,0 +1,24 @@
+[parameters]
+  theta TVR(1.0, 0.01, 100.0)
+  theta SLOPE(10.0, 0.0, 100.0)
+  omega ETA_R ~ 0.01
+  sigma ADD ~ 1.0 (sd)
+[individual_parameters]
+  PROD = TVR * X * exp(ETA_R)
+  RO   = SLOPE * X
+[structural_model]
+  ode(states=[A])
+[odes]
+  d/dt(A) = PROD
+[scaling]
+  y = A + RO
+[covariates]
+  X continuous
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

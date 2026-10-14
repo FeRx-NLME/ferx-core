@@ -79,6 +79,7 @@ fn assert_placeholder_is_live(model: &CompiledModel, name: &str, wrong_value: f6
 /// A single observation at `t = 1`, no dose — enough for the post-fit column pass.
 fn one_obs_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
         obs_times: vec![1.0],
@@ -97,6 +98,7 @@ fn one_obs_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }

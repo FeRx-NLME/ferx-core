@@ -89,6 +89,7 @@ fn make_sde_population() -> Population {
     let subjects = dvs
         .iter()
         .map(|(id, obs)| Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
@@ -107,6 +108,7 @@ fn make_sde_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -222,6 +224,7 @@ fn sde_gn_returns_error() {
         // Minimal single-subject population (no data needed — error fires before fitting).
         use crate::types::{DoseEvent, Population, Subject};
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -240,6 +243,7 @@ fn sde_gn_returns_error() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
