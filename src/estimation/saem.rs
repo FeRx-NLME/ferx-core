@@ -122,7 +122,7 @@ pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
-const CW_TARGET_ACCEPT: f64 = 0.44;
+pub(crate) const CW_TARGET_ACCEPT: f64 = 0.44;
 
 /// Clamp on the per-subject **block** MH step scale `δ_i`, shared by both
 /// adaptation rules so the two cannot drift apart (issue #1444).
@@ -1696,8 +1696,50 @@ pub(crate) fn mh_steps(
     // must target p(η | κ, θ, data), which includes the per-occasion kappa terms.
     kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (usize, f64) {
+    mh_steps_with_proposal(
+        eta,
+        nll_current,
+        subject,
+        model,
+        theta,
+        omega,
+        sigma_values,
+        &omega.chol,
+        step_scale,
+        eta_block_scale,
+        rng,
+        n_steps,
+        scratch,
+        schedule,
+        kappas_opt,
+    )
+}
+
+/// [`mh_steps`] with the proposal's lower-triangular shape `l` supplied by the
+/// caller instead of read from `chol(Ω)`: proposals are
+/// `η + step_scale · (eta_block_scale ⊙ l·z)`. Any fixed `l` keeps the move a
+/// symmetric random walk, so the acceptance ratio is unchanged. The Bayes η
+/// block passes a per-subject posterior-shaped `l` here (#1626); SAEM passes
+/// `chol(Ω)` through [`mh_steps`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mh_steps_with_proposal(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    l: &DMatrix<f64>,
+    step_scale: f64,
+    eta_block_scale: Option<&[f64]>,
+    rng: &mut impl Rng,
+    n_steps: usize,
+    scratch: &mut MhScratch,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, f64) {
     let n_eta = eta.len();
-    let l = &omega.chol;
     let mut nll = nll_current;
     let mut n_accepted = 0;
     // Split borrow: `perturbation.gemm(.., z, ..)` needs two fields of the
