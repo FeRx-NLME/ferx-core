@@ -198,8 +198,11 @@ fn free_twin(kind: &str) -> String {
 
 /// Bands from the realised error. Linux aarch64 (the reference platform):
 /// `cs` |ΔOFV| 1.2e-5, |Δρ̂| 6.1e-5, SE 0.05%; `ar1` |ΔOFV| 1e-6, |Δρ̂| 6e-6,
-/// SE 0.1%. macOS arm64: `cs` 1e-6 / 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
-/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% — ≥ 8× the worst of either platform.
+/// SE 0.1%; `car1` |ΔOFV| 1e-6, |Δρ̂| 3e-6, SE 0.30%. macOS arm64: `cs` 1e-6 /
+/// 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
+/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% (`car1` 2.5%) — ≥ 8× the worst realised error.
+/// `car1`'s SE sits 0.30% from NONMEM's (its ρ, bounded below by 0, is the one
+/// log-packed ρ here), and a shared 1% bound would leave it 3.3× headroom.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -218,7 +221,8 @@ fn residual_correlation_fit_reaches_nonmem_estimates() {
         assert!(r.ofv.is_finite() && rho.is_finite() && se.is_finite());
         assert!((r.ofv - nm_ofv).abs() < 1e-3, "{kind}: OFV {}", r.ofv);
         assert!((rho - nm_rho).abs() < 5e-4, "{kind}: ρ̂ {rho}");
-        assert!((se - nm_se).abs() / nm_se < 0.01, "{kind}: SE(ρ̂) {se}");
+        let se_tol = if kind == "car1" { 0.025 } else { 0.01 };
+        assert!((se - nm_se).abs() / nm_se < se_tol, "{kind}: SE(ρ̂) {se}");
     }
 }
 

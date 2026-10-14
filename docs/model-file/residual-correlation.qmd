@@ -211,8 +211,10 @@ reference platform for fit numbers:
 |---|---|---|---|---|
 | `cs` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
 | `ar1` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
+| `car1` | −195.027166 | 0.813375 (0.037249) | −195.027165 | 0.813378 (0.037137) |
 
-against −173.508 for independent residuals: 26 and 32 OFV points for one
-parameter. The control streams, results and an independent closed-form oracle are
+against −173.508 for independent residuals: 26, 32 and 22 OFV points for one
+parameter. `car1`'s ρ̂ is per week, the data's `TIME` unit, started at 0.5 with a
+lower bound of 0. The control streams, results and an independent closed-form oracle are
 in `nonmem_anchor/residual_correlation/`; the tests are
 `tests/residual_correlation_nonmem_anchor.rs`.

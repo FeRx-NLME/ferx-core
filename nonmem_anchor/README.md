@@ -1214,12 +1214,14 @@ Worst `|Δ|` 2.8e-9 (the FOCE inner tolerance on η̂). `car_*` is `car1`,
 | `comb_car_p08` | 0.8 | −179.360463309 | −179.360463338 |
 
 Worst `|Δ|` 6.2e-8. Estimation (`METHOD=1`, every
-θ and ω free, ρ from 0.3, `$COV MATRIX=R`; both `MINIMIZATION SUCCESSFUL`):
+θ and ω free, ρ from 0.3 — `car_est` from 0.5 — `$COV MATRIX=R`; all three
+`MINIMIZATION SUCCESSFUL`):
 
 | | NONMEM OBJ | NONMEM ρ̂ (SE) | ferx OBJ | ferx ρ̂ (SE) |
 |---|---|---|---|---|
 | `cs_est` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
 | `ar1_est` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
+| `car_est` | −195.027166 | 0.813375 (0.037249) | −195.027165 | 0.813378 (0.037137) |
 
 ferx numbers are Linux aarch64, the reference platform (macOS arm64: −199.734574 /
 0.509408 / 0.077553 and −205.932665 / 0.597259 / 0.063279), with `outer_ftol = 1e-10`,
