@@ -1249,7 +1249,8 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
-                Some(&(_, j0)) => one_instant(subject, j0, j),
+                // One instant, so a random effect moves both alike (#1959).
+                Some(&(_, j0)) => subject.same_instant(j0, j),
                 None => {
                     seen.push((level, j));
                     true
@@ -1257,18 +1258,6 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
             }
         })
     })
-}
-
-/// Whether observations `j` and `k` of `subject` are one instant, so a random effect
-/// moves both alike: the same written time, on the same engine clock up to the one
-/// ULP the reader moves a record below a tie (#614, #1810). The written time alone
-/// would join two stacked-reset periods that restart TIME, which the engines run at
-/// different times; the engine clock alone would part a moved record from its
-/// co-timed twin (#1959).
-fn one_instant(subject: &Subject, j: usize, k: usize) -> bool {
-    let (a, b) = (subject.obs_times[j], subject.obs_times[k]);
-    subject.readout_time(j) == subject.readout_time(k)
-        && (a == b || a.next_down() == b || b.next_down() == a)
 }
 
 /// Whether every covariate in `covariates` is constant within every unit's

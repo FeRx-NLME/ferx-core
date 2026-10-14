@@ -198,6 +198,10 @@ const OUTPUT_MANDATORY: &[&str] = &[
 mod multistart_prefers_tests;
 
 #[cfg(test)]
+#[path = "tests/written_time_message_tests.rs"]
+mod written_time_message_tests;
+
+#[cfg(test)]
 #[path = "tests/indiv_param_values_tests.rs"]
 mod indiv_param_values_tests;
 

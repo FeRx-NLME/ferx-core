@@ -919,10 +919,6 @@ pub fn compute_r_diag_with_correlations(
         .collect()
 }
 
-fn observation_time_key(obs_times: &[f64], j: usize) -> u64 {
-    obs_times.get(j).copied().unwrap_or(0.0).to_bits()
-}
-
 fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
     occasions.get(j).copied().unwrap_or(0)
 }
@@ -934,10 +930,13 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
 /// id, so the user controls exactly which records form one correlated
 /// observation unit (total/unbound of a draw, replicate assays, any paired
 /// endpoints). Rows with no `L2` id (`0`, or an empty `obs_l2` when the dataset
-/// has no `L2` column) fall back to the implicit `(time, occasion)` rule.
+/// has no `L2` column) fall back to the implicit `(time, occasion)` rule, where
+/// "time" is one instant ([`crate::types::same_instant`]): an observation the
+/// reader moved a ULP below a co-timed `MDV=1` / `EVID=2` row still pairs with
+/// its co-timed twin (#1959).
 fn same_residual_block(
     obs_times: &[f64],
-    _obs_raw_times: &[f64],
+    obs_raw_times: &[f64],
     occasions: &[u32],
     obs_l2: &[i64],
     j: usize,
@@ -949,7 +948,7 @@ fn same_residual_block(
         // At least one row is explicitly grouped: pair iff same L2 id.
         return l2j == l2k;
     }
-    observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
+    crate::types::same_instant(obs_times, obs_raw_times, j, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
 
@@ -2746,6 +2745,60 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    /// #1959. A total/unbound pair written at `TIME = 2` pairs whether or not the reader
+    /// moved the first row a ULP below 2 (an observation listed before a co-timed `MDV=1`
+    /// / `EVID=2` row, #1810), and does not pair across two stacked-reset periods that
+    /// both write `TIME = 2` but run at different engine times. The unmoved pair is the
+    /// control, and the straddle is asserted: the moved engine times differ.
+    ///
+    /// Mutations — the pairing key back on `obs_times` bits: the moved pair loses its
+    /// covariance. `same_instant` without its engine-clock clause: the reset periods
+    /// pair. Without its one-ULP tolerance: the moved pair loses it.
+    #[test]
+    fn a_moved_observation_pairs_with_its_co_timed_twin_but_not_across_a_reset() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let corr = [crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let r = |engine: [f64; 2]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                &[50.0, 5.0],
+                &[1, 2],
+                &engine,
+                &[2.0, 2.0],
+                &[],
+                &[],
+                &[0.2, 0.3],
+                &corr,
+            )[(0, 1)]
+        };
+        let paired = 50.0 * 5.0 * 0.5 * 0.3 * 0.2;
+        let moved = [2.0f64.next_down(), 2.0];
+        assert_ne!(moved[0], moved[1], "the straddle");
+        assert_relative_eq!(r([2.0, 2.0]), paired, epsilon = 1e-12);
+        assert_relative_eq!(r(moved), paired, epsilon = 1e-12);
+        // Two periods after an EVID=4 reset: written 2 and 2, engine 2 and 27.
+        assert_eq!(r([2.0, 27.0]), 0.0);
     }
 
     // #827: two physical samples at the SAME subject time (replicate assays,

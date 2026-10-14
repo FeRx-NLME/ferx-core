@@ -208,15 +208,16 @@ fn the_misindex_message_reads_the_written_time_on_a_stacked_reset_subject() {
     assert!(d[0].message.contains(&record), "{}", d[0].message);
 }
 
-/// `one_instant`: two records are one instant when their written times agree and the
-/// engine clock separates them by at most the reader's one-ULP move — not when only the
-/// written times agree (a reset period that restarts `TIME`). Both sides on
-/// `resolves_observations`, which asks it of every pair sharing a level.
+/// `Subject::same_instant`: two records are one instant when their written times agree
+/// and the engine clock separates them by at most the reader's one-ULP move — not when
+/// only the written times agree (a reset period that restarts `TIME`). Both sides on
+/// `resolves_observations`, which asks it of every pair sharing a level, on data the
+/// reader actually moved.
 ///
 /// Mutations — compare `obs_times` exactly (the pre-fix test): the moved replicate
 /// stops resolving. Drop the engine-clock clause: the reset subject resolves.
 #[test]
-fn one_instant_tolerates_the_move_and_not_a_reset() {
+fn same_instant_tolerates_the_move_and_not_a_reset() {
     let text = no_eta_model();
     // Two replicates at TIME 2 with an MDV=1 row between them: the first is moved.
     let mut rows = String::from(HEADER);
@@ -232,7 +233,7 @@ fn one_instant_tolerates_the_move_and_not_a_reset() {
     let s = &pop.subjects[0];
     assert_eq!(s.obs_times[1], 2.0f64.next_down(), "{:?}", s.obs_times);
     assert_eq!(s.obs_times[2], 2.0, "{:?}", s.obs_times);
-    assert!(one_instant(s, 1, 2));
+    assert!(s.same_instant(1, 2));
     assert!(
         resolves_observations(&decl(&parsed), &pop),
         "the moved replicate"
@@ -248,7 +249,7 @@ fn one_instant_tolerates_the_move_and_not_a_reset() {
         s.obs_raw_times
     );
     assert_ne!(s.obs_times[1], s.obs_times[3]);
-    assert!(!one_instant(s, 1, 3));
+    assert!(!s.same_instant(1, 3));
     assert!(
         !resolves_observations(&decl(&parsed), &pop),
         "the reset periods"

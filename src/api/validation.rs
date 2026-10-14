@@ -878,7 +878,9 @@ pub(crate) fn check_residual_magnitude(
                 if m.is_finite() && m > 0.0 {
                     continue;
                 }
-                let time = subj.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                // The written TIME, which the magnitude itself is evaluated at
+                // (`ruv_obs_mult`) and the user can find in the data (#1959).
+                let time = subj.readout_time(j);
                 // The upper half of a row is the `power(...)` exponent per slot
                 // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
                 // a different mistake from a vanishing multiplier.
@@ -1047,8 +1049,10 @@ pub(crate) fn check_theta_gather_indices(
         for subj in &population.subjects {
             // Observation rows first — a level is a property of an observation —
             // then dose rows, which read the individual parameters too.
+            // An observation's TIME as written (#1959). A dose stores no written
+            // time: its engine time differs from it only after a stacked reset.
             let rows = (0..subj.obs_times.len())
-                .map(|j| (subj.obs_times[j], subj.obs_cov(j)))
+                .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
                 .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
@@ -1113,8 +1117,10 @@ pub(crate) fn check_kappa_weights(
             .unwrap_or("<kappa>");
         for subj in &population.subjects {
             for j in 0..subj.obs_times.len() {
-                let time = subj.obs_times[j];
-                let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                // Evaluated at the engine clock, as the individual parameters it is
+                // desugared into are; reported at the TIME as written (#1959).
+                let w = (weight.eval)(theta, subj.obs_cov(j), subj.obs_times[j]);
+                let time = subj.readout_time(j);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
                         "E_KAPPA_WEIGHT_NONPOSITIVE",
@@ -6896,20 +6902,17 @@ pub fn check_model_data_warnings(
                     .collect();
                 // Group observation indices by (time, occasion) and flag any group
                 // where a row structurally shares a correlation with ≥2 others —
-                // the case where greedy row-order pairing is ambiguous.
+                // the case where greedy row-order pairing is ambiguous. "Time" is
+                // the instant the residual pairing itself uses (`same_instant`).
                 let n = s.obs_times.len();
-                let key = |j: usize| {
-                    (
-                        s.obs_times.get(j).copied().unwrap_or(0.0).to_bits(),
-                        s.occasions.get(j).copied().unwrap_or(0),
-                    )
-                };
+                let occ = |j: usize| s.occasions.get(j).copied().unwrap_or(0);
+                let together = |j: usize, k: usize| s.same_instant(j, k) && occ(j) == occ(k);
                 (0..n).any(|j| {
                     if loads.get(j).is_none_or(|l| l.is_empty()) {
                         return false;
                     }
                     let degree = (0..n)
-                        .filter(|&k| k != j && key(k) == key(j))
+                        .filter(|&k| k != j && together(j, k))
                         .filter(|&k| {
                             loads
                                 .get(k)

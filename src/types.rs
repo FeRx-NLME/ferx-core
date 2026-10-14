@@ -1057,6 +1057,32 @@ pub struct Subject {
     pub obs_records: Vec<ObsRecord>,
 }
 
+/// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
+/// the engine clock `obs_times[j]` for an in-memory subject that carries no raw
+/// times. [`Subject::readout_time`] over a subject's own vectors; the slice form
+/// is for callers that are handed the vectors, not the subject.
+pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -> f64 {
+    obs_raw_times
+        .get(j)
+        .copied()
+        .unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
+}
+
+/// Whether observations `j` and `k` are one instant, so the engines see both at the
+/// same time and a key or a pairing on "the same time" should join them: the same
+/// written time ([`written_time`]), on the same engine clock up to the one ULP the
+/// reader moves a record below a co-timed one to keep file order (#614, #1810).
+///
+/// Neither clock alone is right. The engine clock alone parts a moved observation
+/// from its co-timed twin (#1959). The written time alone joins two stacked-reset
+/// periods that restart `TIME`, which the engines run at different times.
+pub(crate) fn same_instant(obs_times: &[f64], obs_raw_times: &[f64], j: usize, k: usize) -> bool {
+    let at = |i: usize| obs_times.get(i).copied().unwrap_or(0.0);
+    let (a, b) = (at(j), at(k));
+    written_time(obs_times, obs_raw_times, j) == written_time(obs_times, obs_raw_times, k)
+        && (a == b || a.next_down() == b || b.next_down() == a)
+}
+
 impl Subject {
     pub fn has_censored_observation(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
@@ -1173,15 +1199,19 @@ impl Subject {
     /// `$ERROR` sees"). A `[scaling]` Form C readout is the `$ERROR` twin — it is
     /// anchored against NONMEM's `$ERROR` in
     /// `tests/scaling_time_readout_nonmem_anchor.rs` — so it reads the same clock
-    /// (#1028). The two differ only for subjects with stacked reset occasions
-    /// whose data TIME restarts, where `obs_times` is the shifted integrator
-    /// timeline; the integrator itself keeps using `obs_times`, exactly as
-    /// NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    /// (#1028). The two differ for subjects with stacked reset occasions whose
+    /// data TIME restarts, where `obs_times` is the shifted integrator timeline,
+    /// and by one ULP for an observation the reader moved below a co-timed record
+    /// to keep file order (#614, #1810); the integrator itself keeps using
+    /// `obs_times`, exactly as NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    /// A level key or a message that names a record's time reads this (#1959).
     pub fn readout_time(&self, j: usize) -> f64 {
-        self.obs_raw_times
-            .get(j)
-            .copied()
-            .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
+        written_time(&self.obs_times, &self.obs_raw_times, j)
+    }
+
+    /// Whether observations `j` and `k` are one instant: see [`same_instant`].
+    pub(crate) fn same_instant(&self, j: usize, k: usize) -> bool {
+        same_instant(&self.obs_times, &self.obs_raw_times, j, k)
     }
 
     /// Time after dose at observation `j`, from the data alone — no lag time,
