@@ -265,13 +265,7 @@ pub(crate) fn compute_extra_output_columns(
         // For subjects with no resets (the common case) n_sessions=1, session_obs[0]
         // holds all observation indices, session_shift[0]=0, and obs_session[j]=0
         // for every j — zero overhead, identical downstream behaviour.
-        let raw_time_of = |j: usize| -> f64 {
-            subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or(subject.obs_times[j])
-        };
+        let raw_time_of = |j: usize| -> f64 { subject.readout_time(j) };
         let n_sessions = subject.reset_times.len() + 1;
         let (session_obs, session_shift): (Vec<Vec<usize>>, Vec<f64>) = {
             let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_sessions];

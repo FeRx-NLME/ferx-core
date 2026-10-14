@@ -776,6 +776,28 @@ fn block_sigma_ambiguous_pairing_without_l2_warns() {
     );
 }
 
+/// #1959. The ambiguity check groups rows by the instant the pairing itself uses: a
+/// total row with two unbound partners at written `TIME = 1` warns whether or not the
+/// reader moved it a ULP below 1 (#1810), and does not warn when the second partner is
+/// in a stacked-reset period that also writes `TIME = 1`.
+///
+/// Mutations — the grouping back on `obs_times` bits: the moved total has no partner
+/// and the first case is quiet. `same_instant` on the written times: the reset partner
+/// joins and the second case warns.
+#[test]
+fn block_sigma_ambiguity_groups_by_the_written_instant() {
+    let model = block_sigma_two_endpoint_model();
+    let warns = |engine: Vec<f64>| {
+        let mut s = obs_only_subject(vec![1, 2, 2], engine, Vec::new());
+        s.obs_raw_times = vec![1.0, 1.0, 1.0];
+        let diags = check_model_data_warnings(&model, &population_of(s), &model.default_params);
+        diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER")
+    };
+    assert!(warns(vec![1.0, 1.0, 1.0]), "the unmoved control");
+    assert!(warns(vec![1.0f64.next_down(), 1.0, 1.0]), "the moved total");
+    assert!(!warns(vec![1.0, 1.0, 30.0]), "a partner after a reset");
+}
+
 /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
 #[test]
 fn block_sigma_l2_grouped_pairing_does_not_warn() {

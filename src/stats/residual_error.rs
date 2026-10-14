@@ -919,10 +919,6 @@ pub fn compute_r_diag_with_correlations(
         .collect()
 }
 
-fn observation_time_key(obs_times: &[f64], j: usize) -> u64 {
-    obs_times.get(j).copied().unwrap_or(0.0).to_bits()
-}
-
 fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
     occasions.get(j).copied().unwrap_or(0)
 }
@@ -934,7 +930,10 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
 /// id, so the user controls exactly which records form one correlated
 /// observation unit (total/unbound of a draw, replicate assays, any paired
 /// endpoints). Rows with no `L2` id (`0`, or an empty `obs_l2` when the dataset
-/// has no `L2` column) fall back to the implicit `(time, occasion)` rule.
+/// has no `L2` column) fall back to the implicit `(time, occasion)` rule, where
+/// "time" is one instant ([`crate::types::same_instant`]): an observation the
+/// reader moved a ULP below a co-timed `MDV=1` / `EVID=2` row still pairs with
+/// its co-timed twin (#1959).
 fn same_residual_block(
     obs_times: &[f64],
     _obs_raw_times: &[f64],
@@ -949,7 +948,7 @@ fn same_residual_block(
         // At least one row is explicitly grouped: pair iff same L2 id.
         return l2j == l2k;
     }
-    observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
+    crate::types::same_instant(obs_times, j, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
 
@@ -1221,13 +1220,7 @@ fn serial_pairs(
     if obs_rgroup.len() != n {
         return None;
     }
-    let time = |j: usize| -> f64 {
-        obs_raw_times
-            .get(j)
-            .or_else(|| obs_times.get(j))
-            .copied()
-            .unwrap_or(0.0)
-    };
+    let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
     let mut pos = vec![0usize; n];
     if serial.kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
@@ -2746,6 +2739,128 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    /// #1959. A total/unbound pair written at `TIME = 2` pairs whether or not the reader
+    /// moved the first row a ULP below 2 (an observation listed before a co-timed `MDV=1`
+    /// / `EVID=2` row, #1810), and does not pair across two stacked-reset periods that
+    /// both write `TIME = 2` but run at different engine times. The unmoved pair is the
+    /// control, and the straddle is asserted: the moved engine times differ.
+    ///
+    /// Mutations — the pairing key back on `obs_times` bits: the moved pair loses its
+    /// covariance. `same_instant` without its one-ULP tolerance: the same. The pairing
+    /// on the written times: the reset periods pair.
+    #[test]
+    fn a_moved_observation_pairs_with_its_co_timed_twin_but_not_across_a_reset() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let corr = [crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let r = |engine: [f64; 2]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                &[50.0, 5.0],
+                &[1, 2],
+                &engine,
+                &[2.0, 2.0],
+                &[],
+                &[],
+                &[0.2, 0.3],
+                &corr,
+            )[(0, 1)]
+        };
+        let paired = 50.0 * 5.0 * 0.5 * 0.3 * 0.2;
+        let moved = [2.0f64.next_down(), 2.0];
+        assert_ne!(moved[0], moved[1], "the straddle");
+        assert_relative_eq!(r([2.0, 2.0]), paired, epsilon = 1e-12);
+        assert_relative_eq!(r(moved), paired, epsilon = 1e-12);
+        // Two periods after an EVID=4 reset: written 2 and 2, engine 2 and 27.
+        assert_eq!(r([2.0, 27.0]), 0.0);
+    }
+
+    /// #1959 through the production entry points (#1964 review, finding 1): a
+    /// free/total pair under a `block_sigma`, read from a file in which an `MDV=1` row
+    /// listed after the pair moves the total a ULP below `TIME = 2` (#1810). The
+    /// subject still has a cross-observation residual (`has_cross_observation_residual`,
+    /// which picks the dense path for FOCE, the gradients and simulate), and the dense
+    /// `R` that FOCE builds (`r_matrix_maybe_scaled`) carries the pair's covariance
+    /// bit-for-bit as on the same file without the `MDV=1` row. The straddle is asserted.
+    ///
+    /// Mutation — the pairing key back on `obs_times` bits (`same_residual_block`): the
+    /// moved subject has no cross-observation residual and `R[0,1]` is 0.
+    #[test]
+    fn a_reader_moved_pair_keeps_its_covariance_on_the_production_path() {
+        use std::io::Write as _;
+        let text = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  \
+                    omega ETA_CL ~ 0.09\n  block_sigma (S_TOT, S_UNB) = [0.04, 0.02, 0.04]\n\
+                    [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+                    [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+                    if (FREE == 0) {\n    DV ~ proportional(S_TOT)\n  } else {\n    \
+                    DV ~ proportional(S_UNB)\n  }\n[covariates]\n  FREE categorical\n";
+        let model = crate::parser::model_parser::parse_full_model(text)
+            .expect("parse")
+            .model;
+        assert!(!model.residual_correlations.is_empty());
+        let read = |mdv_row: bool| {
+            let mut csv = String::from(
+                "ID,TIME,DV,EVID,AMT,CMT,MDV,FREE\n1,0,.,1,100,1,1,0\n\
+                 1,2,8.0,0,.,1,0,0\n1,2,4.0,0,.,1,0,1\n",
+            );
+            if mdv_row {
+                csv.push_str("1,2,.,0,.,1,1,0\n");
+            }
+            csv.push_str("1,4,6.0,0,.,1,0,0\n");
+            let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+            f.write_all(csv.as_bytes()).unwrap();
+            let path = f.path().to_str().unwrap().to_string();
+            crate::api::read_population_for(&model, &None, &path, None, None, None, &[])
+                .expect("reads")
+                .0
+                .subjects
+                .remove(0)
+        };
+        let sigma = &model.default_params.sigma.values;
+        let cov = ResidualCov::block_sigma(&model.residual_correlations);
+        let r01 = |s: &Subject| {
+            assert!(
+                has_cross_observation_residual(&model.error_spec, s, sigma, cov),
+                "{:?}",
+                s.obs_times
+            );
+            let keys = model.error_spec.obs_keys(s);
+            r_matrix_maybe_scaled(
+                &model.error_spec,
+                &[8.0, 4.0, 6.0],
+                &keys,
+                s,
+                sigma,
+                cov,
+                None,
+            )[(0, 1)]
+        };
+        let (still, moved) = (read(false), read(true));
+        assert_eq!(still.obs_times, vec![2.0, 2.0, 4.0]);
+        assert_eq!(moved.obs_times[0], 2.0f64.next_down(), "the straddle");
+        let want = r01(&still);
+        assert!(want.is_finite() && want > 0.0, "{want}");
+        assert_eq!(r01(&moved).to_bits(), want.to_bits());
     }
 
     // #827: two physical samples at the SAME subject time (replicate assays,

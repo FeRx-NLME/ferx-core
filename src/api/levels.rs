@@ -937,13 +937,9 @@ pub(crate) fn level_index_finding(
             if got != Some(want as f64) {
                 return Some(LevelIndexFinding::Misindexed {
                     id: subject.id.clone(),
-                    time: Some(
-                        subject
-                            .obs_raw_times
-                            .get(j)
-                            .copied()
-                            .unwrap_or(subject.obs_times[j]),
-                    ),
+                    // The clock the label's `TIME=` reads too ([`column_value`]), so
+                    // the message names one time, not two (#1796).
+                    time: Some(subject.readout_time(j)),
                     label: level.label(decl.columns()),
                     want,
                     got,
@@ -1110,9 +1106,16 @@ fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
 }
 
 /// The value of one level column on observation row `j` of `subject`.
+///
+/// `TIME` is the time as written ([`Subject::readout_time`]), the TIME NONMEM keys
+/// `$PK`/`$PRED` on (#1959). `obs_times` is the engines' ordering clock: the reader
+/// moves a record one ULP below a tie to keep file order (#614, #1810), and a
+/// stacked-reset subject's later periods sit on a shifted clock. Keyed on that, one
+/// written time split into two cells, and a reset period's label named a time the
+/// data never holds (#1796).
 fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
     if column.eq_ignore_ascii_case(TIME_COLUMN) {
-        return subject.obs_times.get(j).copied();
+        return (j < subject.obs_times.len()).then(|| subject.readout_time(j));
     }
     subject
         .obs_covariates
@@ -1238,18 +1241,18 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
         return false;
     }
     population.subjects.iter().all(|subject| {
-        let mut seen: Vec<(Vec<f64>, f64)> = Vec::new();
+        let mut seen: Vec<(Vec<f64>, usize)> = Vec::new();
         (0..subject.obs_times.len()).all(|j| {
             let level: Vec<f64> = decl
                 .columns()
                 .iter()
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
-            let t = subject.obs_times[j];
             match seen.iter().find(|(l, _)| *l == level) {
-                Some((_, t0)) => *t0 == t,
+                // One instant, so a random effect moves both alike (#1959).
+                Some(&(_, j0)) => subject.same_instant(j0, j),
                 None => {
-                    seen.push((level, t));
+                    seen.push((level, j));
                     true
                 }
             }
@@ -2679,7 +2682,8 @@ fn dead_levels_message(
                 .map(|c| column_value(subject, c, j))
                 .collect();
             let is_listed = values.is_some_and(|v| listed_values.contains(&v.as_slice()));
-            !is_listed || subject.obs_times[j] == 0.0
+            // The message names `TIME = 0` as written (#1959).
+            !is_listed || subject.readout_time(j) == 0.0
         })
     });
     if at_time_zero {
