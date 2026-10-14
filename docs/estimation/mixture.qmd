@@ -202,12 +202,12 @@ IPRED and IWRES over all 240 observations):
 | IWRES | 5.3e-7 | 1.29 |
 | `MIXEST` | 30 / 30 agree | 30 / 30 agree |
 
-CWRES still differs, by up to 0.41, and this is not a mixture effect: ferx
-linearizes CWRES over η only, while NONMEM linearizes over every ETA, so its
-CWRES includes the occasion κs. Recomputing CWRES outside both engines from
-NONMEM's own ETAs reproduces each column over all 30 subjects: ferx's to 4.8e-7
-(the gap between the two engines' η̂ and κ̂) and NONMEM's to 2.1e-10. The gap is
-the same on an IOV model with no mixture and is tracked as #1948.
+CWRES agrees to 1.1e-7 and is asserted too. Like NONMEM, ferx linearizes it over
+every ETA, the `MIXEST` class's occasion κs included (#1948). Before that fix
+ferx linearized over η alone, and the gap was 0.41. This was an IOV effect, not a
+mixture effect: an IOV model with no mixture showed the same gap. Recomputing
+CWRES outside both engines from NONMEM's own ETAs over [η, κ₁, κ₂] reproduces
+NONMEM's column to 2.1e-10.
 
 ## SAEM under a mixture
 

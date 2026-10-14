@@ -208,12 +208,12 @@ fn read_nm_eval_tab() -> Vec<NmRow> {
 /// reports how far it lands rather than stopping at the κ̂ count. A subject with no κ̂ is
 /// compared at κ = 0, the value its postfit then used.
 ///
-/// CWRES is printed, not asserted. ferx's CWRES linearizes over η only (`compute_cwres`
-/// gets η̂, the η Jacobian and the IIV Ω), while NONMEM's linearizes over every ETA, the
-/// occasion κs included. Recomputed outside both engines from NONMEM's own tabled ETAs,
-/// over all 30 subjects, the η-only recipe reproduces ferx's column to 4.8e-7 (the gap
-/// between the two engines' η̂ and κ̂) and the [η, κ₁, κ₂] recipe reproduces NONMEM's to
-/// 2.1e-10. That is an IOV defect of its own, not #1932's: #1948.
+/// CWRES linearizes over every ETA, the occasion κs included, as NONMEM's does (#1948): the
+/// MIXEST class's `[η̂, κ̂₁, κ̂₂]`, its stacked Jacobian and `blkdiag(Ω, Ω_IOV, Ω_IOV)`.
+/// Before #1948 ferx used η alone and this gap was 4.135e-1 with #1932 fixed. Recomputed
+/// outside both engines from NONMEM's own tabled ETAs over all 30 subjects, the
+/// [η, κ₁, κ₂] recipe reproduces NONMEM's column to 2.1e-10, so what is left is the two
+/// engines' η̂ and κ̂ carried through `f0`.
 #[test]
 fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
     let pop: ferx_core::Population = read_nonmem_csv(
@@ -274,7 +274,7 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
     eprintln!(
         "#1932 eval-only vs NONMEM: subjects without κ̂ {no_kappa}/30  |dOFV| {ofv_gap:.3e}  \
          |dIPRED| {ipred_gap:.3e}  |dIWRES| {iwres_gap:.3e}  |dETA,κ| {eta_gap:.3e}  \
-         |dCWRES| {cwres_gap:.3e} (not asserted)"
+         |dCWRES| {cwres_gap:.3e}"
     );
     assert_eq!(no_kappa, 0, "every subject carries its two occasion κ̂s");
     assert!(
@@ -285,6 +285,10 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
     assert!(ipred_gap < EVAL_IPRED_TOL, "IPRED gap {ipred_gap:.3e}");
     assert!(iwres_gap < EVAL_IWRES_TOL, "IWRES gap {iwres_gap:.3e}");
     assert!(eta_gap < EVAL_ETA_TOL, "ETA / κ̂ gap {eta_gap:.3e}");
+    assert!(
+        cwres_gap < EVAL_CWRES_TOL,
+        "CWRES gap {cwres_gap:.3e}: not linearized over [eta, kappa_1, kappa_2] (#1948)"
+    );
 }
 
 // Measured on Linux x86_64 (glibc 2.28) at 45fd69b5 + this change; macOS arm64 gives the same
@@ -295,7 +299,12 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
 //   IWRES  5.349e-7 / 1.294
 //   ETA,κ  1.772e-7 / 1.688e-1
 // Each bound sits 4.7–9.3× above its realised gap and at least 1e5× below the unfixed one.
+// CWRES is measured on macOS arm64 at 48100d27 + #1948, with #1948's fix / without it, #1932's
+// fix in both:
+//   CWRES  1.140e-7 / 4.135e-1
+// Its bound sits 8.8× above the realised gap and 4e5× below the η-only one.
 const EVAL_OFV_TOL: f64 = 1e-6;
 const EVAL_IPRED_TOL: f64 = 5e-6;
 const EVAL_IWRES_TOL: f64 = 5e-6;
 const EVAL_ETA_TOL: f64 = 1e-6;
+const EVAL_CWRES_TOL: f64 = 1e-6;
