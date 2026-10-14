@@ -1766,7 +1766,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) ->
 pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub mod ferx_core::sens::jet
 pub mod ferx_core::sens::num
-pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self> + ferx_core::sens::num::vm::VmArith
+pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
 pub const ferx_core::sens::num::PkNum::SECOND_ORDER: bool
 pub fn ferx_core::sens::num::PkNum::abs(self) -> Self
 pub fn ferx_core::sens::num::PkNum::acos(self) -> Self

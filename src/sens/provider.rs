@@ -723,7 +723,7 @@ fn readout_tvcov_supported(model: &CompiledModel) -> bool {
 /// PK-slot dual vector; `ro_state` / `ro_vars` / `ro_stack` are caller-owned
 /// scratch, cleared here.
 #[inline]
-fn eval_readout_jet<T: crate::sens::num::PkNum>(
+fn eval_readout_jet<T: crate::sens::num::vm::VmNum>(
     prog: &crate::parser::model_parser::OdeOutputProgram,
     conc: T,
     params: &[T],
@@ -751,7 +751,7 @@ fn eval_readout_jet<T: crate::sens::num::PkNum>(
 /// (and `∂²y/∂pk²` on the outer width) then rides the same `pd`/`dp_deta` chain.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn apply_readout_jet<T: PkNum>(
+fn apply_readout_jet<T: crate::sens::num::vm::VmNum>(
     conc: T,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
     ro_pk_duals: Option<&[T; N_PK]>,
@@ -800,7 +800,7 @@ fn apply_readout_jet<T: PkNum>(
 /// `apply_analytic_readout` sets (a no-op read for a `TIME`-free readout).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
+fn eval_readout_at_obs<T: crate::sens::num::vm::VmNum>(
     prog: &crate::parser::model_parser::OdeOutputProgram,
     conc: T,
     source: &(crate::types::PkParams, CombinedDerivs, Option<usize>),

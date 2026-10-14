@@ -19,8 +19,6 @@ pub trait PkNum:
     + Mul<Output = Self>
     + Div<Output = Self>
     + Neg<Output = Self>
-    // The bytecode VM's in-place arithmetic; crate-private (see `vm`).
-    + vm::VmArith
 {
     /// Whether this type carries a second-order (Hessian) jet. `false` for `f64` and the
     /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
@@ -247,10 +245,9 @@ impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = 
 /// before. `f64` and `Dual1` (small enough that moves are cheap) use the operators
 /// themselves; `DualMixed` writes the same formulas as in-place loops.
 ///
-/// A supertrait of [`PkNum`] so every `T: PkNum` the VM is instantiated at has it,
-/// and in a crate-private module so it is not public API: nothing outside the VM
-/// calls it, and outside crates cannot name it (which also seals `PkNum` — no type
-/// outside ferx-core implements it).
+/// In a crate-private module, so it is not public API and does not constrain
+/// `PkNum`: the VM and the generic code that drives it bound on [`vm::VmNum`]
+/// (`PkNum + VmArith`) instead.
 pub(crate) mod vm {
     use super::{Dual1, DualMixed};
 
@@ -276,6 +273,12 @@ pub(crate) mod vm {
         /// `self = self / from_f64(c)` (no zero guard — the caller owns it).
         fn div_scalar_in(&mut self, c: f64);
     }
+
+    /// [`super::PkNum`] plus the VM's in-place arithmetic: the bound for code that runs
+    /// the bytecode VM over a generic numeric type. Kept off `PkNum` itself so `PkNum`
+    /// stays implementable outside the crate; every in-crate `PkNum` type has it.
+    pub trait VmNum: super::PkNum + VmArith {}
+    impl<T: super::PkNum + VmArith> VmNum for T {}
 
     /// `VmArith` as the by-value operators, for types small enough that moving them
     /// costs nothing worth saving.

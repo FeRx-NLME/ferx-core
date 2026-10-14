@@ -16840,6 +16840,8 @@ fn dm_vars() -> Vec<Dm> {
         z * (y - Dm::constant(0.7)),
         signed_zero,
         infinite,
+        // Exactly at `Op::Div`'s `|b| < 1e-30` cutoff, with a live jet: divides.
+        Dm::var(1e-30, 1),
     ]
 }
 
@@ -16962,6 +16964,15 @@ fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
         binop(BinOp::Sub, varidx(5), lit(2.0)),
         binop(BinOp::Mul, varidx(5), x()),
         binop(BinOp::Mul, x(), varidx(5)),
+        // `Op::Div`'s cutoff is strict: a divisor of exactly `±1e-30` divides, one
+        // just inside it reads 0 — on the literal, variable and stacked paths.
+        binop(BinOp::Div, x(), lit(1e-30)),
+        binop(BinOp::Div, x(), lit(-1e-30)),
+        binop(BinOp::Div, x(), lit(9.99e-31)),
+        binop(BinOp::Div, x(), varidx(6)),
+        binop(BinOp::Div, x(), binop(BinOp::Mul, varidx(6), y())),
+        binop(BinOp::Div, x(), binop(BinOp::Mul, varidx(6), lit(1.0))),
+        binop(BinOp::Div, x(), binop(BinOp::Sub, lit(0.0), varidx(6))),
         // An out-of-range variable reads as 0 on the fused path too.
         binop(BinOp::Mul, x(), varidx(99)),
         binop(BinOp::Add, x(), varidx(99)),

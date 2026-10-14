@@ -25512,7 +25512,7 @@ impl Op {
 /// `Op::Div`'s `|b| < 1e-30 → 0` guard — the in-place form of the by-value arms
 /// in `eval_bytecode_g`.
 #[inline]
-fn apply_binary_in<T: crate::sens::num::PkNum>(a: &mut T, op: Op, b: &T) {
+fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
     match op {
         Op::Add => a.add_in(b),
         Op::Sub => a.sub_in(b),
@@ -25527,7 +25527,7 @@ fn apply_binary_in<T: crate::sens::num::PkNum>(a: &mut T, op: Op, b: &T) {
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
 #[inline]
-fn apply_scalar_in<T: crate::sens::num::PkNum>(a: &mut T, op: Op, c: f64) {
+fn apply_scalar_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, c: f64) {
     match op {
         Op::Add => a.add_scalar_in(c),
         Op::Sub => a.sub_scalar_in(c),
@@ -25556,7 +25556,7 @@ fn apply_scalar_in<T: crate::sens::num::PkNum>(a: &mut T, op: Op, c: f64) {
 // Wired into the `Dual2`-state ODE integrator in Phase 3 of #367; until then it
 // has only test callers, so the non-test build sees it as unused.
 #[allow(dead_code)]
-fn eval_bytecode_g<T: crate::sens::num::PkNum>(
+fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
     bc: &Bytecode,
     theta: &[T],
     eta: &[T],
@@ -25959,7 +25959,7 @@ fn eval_statements_indexed_with_stack(
 /// statement-for-statement; the `eval_statements_g_*` tests pin it to that path.
 // Wired into the `Dual2`-state ODE RHS in Phase 3 of #367; test-only caller so far.
 #[allow(dead_code)]
-fn eval_statements_g<T: crate::sens::num::PkNum>(
+fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     theta: &[T],
     eta: &[T],
@@ -25994,7 +25994,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
 /// already resolved and borrowed by the caller.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-fn eval_statements_g_inner<T: crate::sens::num::PkNum>(
+fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     theta: &[T],
     eta: &[T],
@@ -26630,7 +26630,7 @@ impl OdeRhsProgram {
     /// `state_count`). Mirrors the f64 binding in the `rhs` closure
     /// statement-for-statement (issue #410, inner η-gradient).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn eval_rhs_g<T: crate::sens::num::PkNum>(
+    pub(crate) fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
         &self,
         u: &[T],
         params: &[T],
@@ -27617,7 +27617,7 @@ impl OdeOutputProgram {
     /// covariate snapshot, whose values thread in as constants (#540). `vars`/
     /// `stack` are caller-owned scratch. Only valid when
     /// [`is_dual_evaluable`](Self::is_dual_evaluable) holds.
-    pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
+    pub(crate) fn eval_output_g<T: crate::sens::num::vm::VmNum>(
         &self,
         state: &[T],
         params: &[T],

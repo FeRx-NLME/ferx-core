@@ -1918,7 +1918,10 @@ fn init_taylor_seed_at<T: crate::sens::num::PkNum>(
 /// calling it from both. `pub(crate)`: also reused by
 /// `pk::modified_release::mr_sens_dual`/`mr_eta_grad_dual` (#860 Phase A6),
 /// whose `mr_observable_g::<Dual2<M>>` result is `(θ,η)`-seeded the same way.
-pub(crate) fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: T) -> T {
+pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
+    model: &CompiledModel,
+    p: T,
+) -> T {
     // A NaN readout (e.g. a per-CMT map miss — rejected upstream by fit-time
     // `validate_per_cmt_scaling`, so unreachable in a real fit) must stay NaN as a
     // visible tripwire: neither the `ScalarScale` divisor nor the LTBS floor below
@@ -1960,7 +1963,7 @@ pub(crate) fn apply_output_transform<T: crate::sens::num::PkNum>(model: &Compile
 /// PK-param dual vector the Form-C / per-CMT program reads: `params_dual` for the
 /// static walk, the per-event `pk_at_obs[j]` snapshot for the TV-cov walk. The
 /// `ObsCmt` arm ignores it (reads the state compartment directly).
-fn resolve_obs_readout<T: crate::sens::num::PkNum>(
+fn resolve_obs_readout<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     ode: &crate::ode::OdeSpec,
     subject: &Subject,
@@ -2042,7 +2045,7 @@ fn f_bio_slot(ode: &OdeSpec, cmt: usize) -> usize {
 /// Returns one transformed prediction `T` per observation — the caller reads its
 /// `grad`/`hess` and chains with `∂p/∂(η[,θ])`. `None` on lagtime (not yet supported
 /// over the dual loop) or an integration that fails to record every observation.
-fn integrate_subject_duals<T: crate::sens::num::PkNum>(
+fn integrate_subject_duals<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     subject: &Subject,
     pk_values: &[f64],
@@ -2478,7 +2481,7 @@ pub(crate) fn seed_pk_dual2<const M: usize>(
 /// per-event PK-param duals are built by the caller, since the seeding differs by
 /// order (`seed_pk_dual2` carries the Hessian, `seed_pk_dual1` only the gradient) —
 /// the TV-cov analogue of [`integrate_subject_duals`] (#449 review #13).
-fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
+fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
@@ -3707,7 +3710,7 @@ fn later_arrival<T: crate::sens::num::PkNum>(incumbent: T, candidate: T) -> T {
 /// subset is bolus-only, so it has none).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
+fn eval_rhs_anchored<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     us: &[T],
     ps: &[T],
@@ -4001,7 +4004,7 @@ fn pk_snapshot_equal<T: crate::sens::num::PkNum>(a: &[T], b: &[T]) -> bool {
 /// rate-off saltation as the main walk's `K_INF_END` (#486). `eval_rhs_anchored` uses
 /// cycle-relative time (anchor 0), matching production for a TAD-independent RHS (#439 SS).
 #[allow(clippy::too_many_arguments)]
-fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
+fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     dose: &crate::types::DoseEvent,
@@ -4270,7 +4273,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
 /// infusion into absorption is #719 gap-2 out of scope (`has_infusion_into_input_rate` gates it to
 /// FD before the walk), and the caller's `!is_inf(d)` guard mirrors that. `dose.ii > 0` and
 /// `dose.cmt` valid are caller-guaranteed; a stray out-of-range dose returns the zero trough.
-fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
+fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     ode: &OdeSpec,
     n_states: usize,
@@ -4428,7 +4431,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
 /// Jacobian needed, mirroring how `inject_rate_saltation` itself only ever uses the bare
 /// program.
 #[allow(clippy::too_many_arguments)]
-fn extend_flow_by_dual_duration_g<T: crate::sens::num::PkNum>(
+fn extend_flow_by_dual_duration_g<T: crate::sens::num::vm::VmNum>(
     u: &mut [T],
     dt: T,
     program: &crate::parser::model_parser::OdeRhsProgram,
@@ -4482,7 +4485,7 @@ fn extend_flow_by_dual_duration_g<T: crate::sens::num::PkNum>(
 /// up-to-50-cycle dual SS loop for a lagged SS dose (#642 review #4). `inf` is `Some((rate,
 /// window))` for an infusion, `None` for a bolus (#642 review #5).
 #[allow(clippy::too_many_arguments)]
-fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
+fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     dose: &crate::types::DoseEvent,
@@ -4637,7 +4640,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
 /// `x⁺ += D·δlag + ½·(dD/dt)·δlag²` (`D = g(x⁻)−g(x⁺)`, `dD/dt = J·g(x⁻)−J·g(x⁺)`) and
 /// propagated by the event-driven integrator — exact, no finite differences (#439).
 #[allow(clippy::too_many_arguments)]
-fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
+fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     ode: &OdeSpec,
     n_states: usize,
@@ -6658,7 +6661,7 @@ fn obs_time_matches(ot: f64, t: f64) -> bool {
 /// the full outer gradient (value + grad + Hessian), `Dual1<N>` for the light inner
 /// η-gradient (value + grad only) — issue #410.
 #[allow(clippy::too_many_arguments)]
-fn integrate_g<T: crate::sens::num::PkNum>(
+fn integrate_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     subject: &Subject,
