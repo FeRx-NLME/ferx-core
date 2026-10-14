@@ -305,6 +305,31 @@ One case is declined more often than it strictly must be: an intermediate that r
 is used *only* by the hazard (`TT = TIME` … `hazard = f(TT)`) still marks the block
 non-autonomous. Write the time term in the `hazard =` expression itself to avoid it.
 
+### `TIME` after a reset that restarts it {#time-after-reset}
+
+::: {.callout-warning}
+## Known difference from NONMEM ([#1978](https://github.com/FeRx-NLME/ferx-core/issues/1978))
+
+When an `EVID=3`/`4` row restarts `TIME` (period 2 written from 0 again), ferx moves the
+period past the previous one on its internal clock, and three surfaces read that internal
+clock rather than the `TIME` as written:
+
+- `TIME` / `T` inside `[odes]`;
+- `TIME` in a `[binary_model]` linear predictor;
+- `TIME` in an `[event_model] hazard =`, both where it is integrated and at an exact event.
+
+NONMEM reads the `TIME` as written on all three. Measured with NONMEM 7.5.1: `$DES`'s `T`
+restarts at the reset row, and `$ERROR` reads the written `TIME` at a binary or TTE record.
+On the reference fixtures, ferx at NONMEM's optimum is off by 7648 (`[odes]`), 135
+(`[binary_model]`) and 239 (`hazard`) OFV. In each case ferx reproduces NONMEM run on the
+data rewritten so that `TIME` keeps running. The fixtures and the full table are in
+`nonmem_anchor/reset_clock_*` and `tests/reset_clock_nonmem_anchor.rs`.
+
+Data whose `TIME` does not restart at a reset row is unaffected, and so is a model whose
+three surfaces above do not read `TIME`. The `[individual_parameters]` half of the same
+question is [#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969).
+:::
+
 ::: {.callout-warning}
 ## Affects results from ferx 0.3.0 and earlier
 

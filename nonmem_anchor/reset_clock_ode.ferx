@@ -1,0 +1,37 @@
+# ferx twin of nonmem_anchor/reset_clock_ode.ctl (#1978): TIME read inside [odes] on data
+# whose period 2 restarts TIME at an EVID=4 row. Parameters at NONMEM's optimum
+# (results/reset_clock_ode.ext), evaluated once (maxiter = 0) by
+# tests/reset_clock_nonmem_anchor.rs.
+[parameters]
+  theta TVCL(2.0195689126298135, 0.01, 100.0)
+  theta TVV(19.683459386870894, 1.0, 500.0)
+  theta TVSLP(0.019864822143714992, -0.1, 1.0)
+  omega ETA_CL ~ 0.066401703531059314
+  omega ETA_V  ~ 0.039781865779109735
+  sigma PROP_ERR ~ 0.010505624544831033 (variance)
+  sigma ADD_ERR ~ 0.0001 (variance) FIX
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  SLP = TVSLP
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * (1.0 + SLP * TIME) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
