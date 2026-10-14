@@ -587,3 +587,108 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         discrete_rows: Vec::new(),
     }
 }
+
+/// Which record of a #1969 straddle fixture governs the interval that crosses `TIME = 24`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamTimeStraddle {
+    /// A trough written at 24, listed before the dose there: the reader moves it to `24⁻`.
+    Obs,
+    /// An `EVID=2` row written at 24, listed before the dose there: moved to `24⁻`.
+    PkOnly,
+    /// A second period that restarts `TIME` at 0, shifted onto the engine clock at 50.
+    Reset,
+}
+
+/// A subject, as the reader builds it, whose records read `TIME` on either side of 24 depending
+/// on the clock (#1969): the governing record of an interval is written on one side of 24 and
+/// runs on the other. IV bolus 100 into compartment 1 with residual drug at every later dose, and
+/// two occasions labelled so an IOV model sees both.
+///
+/// - `Obs`: doses at 0, 24; observations at 6, 12, 24 (engine `24⁻`), 30, 36.
+/// - `PkOnly`: doses at 0, 24; an `EVID=2` row at 24 (engine `24⁻`); observations at 6, 12, 30, 36.
+/// - `Reset`: period 1 dose at 0, observations at 6, 12; period 2 opens with an `EVID=4` dose at
+///   written 0 (engine 50), observations at written 6, 12, 30 (engine 56, 62, 80) and a dose at
+///   written 24 (engine 74).
+pub(crate) fn param_time_straddle_subject(kind: ParamTimeStraddle) -> Subject {
+    let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let moved = 24.0f64.next_down();
+    let mut s = Subject {
+        id: format!("{kind:?}"),
+        doses: vec![bolus(0.0), bolus(24.0)],
+        dose_occasions: vec![1, 2],
+        ..Subject::default()
+    };
+    let (engine, written, occ): (Vec<f64>, Vec<f64>, Vec<u32>) = match kind {
+        ParamTimeStraddle::Obs => (
+            vec![6.0, 12.0, moved, 30.0, 36.0],
+            vec![6.0, 12.0, 24.0, 30.0, 36.0],
+            vec![1, 1, 1, 2, 2],
+        ),
+        ParamTimeStraddle::PkOnly => {
+            s.pk_only_times = vec![moved];
+            s.pk_only_raw_times = vec![24.0];
+            s.pk_only_occasions = vec![1];
+            (
+                vec![6.0, 12.0, 30.0, 36.0],
+                vec![6.0, 12.0, 30.0, 36.0],
+                vec![1, 1, 2, 2],
+            )
+        }
+        ParamTimeStraddle::Reset => {
+            s.doses = vec![bolus(0.0), bolus(50.0), bolus(74.0)];
+            s.dose_occasions = vec![1, 2, 2];
+            s.reset_times = vec![50.0];
+            s.reset_occasions = vec![2];
+            s.reset_period_times = vec![(50.0, 0.0), (74.0, 24.0)];
+            (
+                vec![6.0, 12.0, 56.0, 62.0, 80.0],
+                vec![6.0, 12.0, 6.0, 12.0, 30.0],
+                vec![1, 1, 2, 2, 2],
+            )
+        }
+    };
+    let n = engine.len();
+    s.obs_times = engine;
+    s.obs_raw_times = written;
+    s.occasions = occ;
+    s.observations = vec![1.0; n];
+    s.obs_cmts = vec![1; n];
+    s.cens = vec![0; n];
+    s
+}
+
+/// The straddle assertion shared by the #1969 parity tests: the prediction on the written clock
+/// must differ from the one on the engine clock by far more than any parity tolerance (1e-9 on
+/// the value), or the fixture cannot tell which clock the parameters read. The weakest fixture
+/// is `PkOnly` (9.1e-3: only dose 1's residual crosses the moved interval), so the bar is 1e-3.
+pub(crate) fn assert_param_time_straddle_is_live(
+    on_written: &[f64],
+    on_engine: &[f64],
+    what: &str,
+) {
+    assert_eq!(on_written.len(), on_engine.len());
+    let worst = on_written
+        .iter()
+        .zip(on_engine)
+        .map(|(a, b)| {
+            assert!(a.is_finite() && b.is_finite(), "{what}: {a} / {b}");
+            (a - b).abs() / a.abs().max(1e-12)
+        })
+        .fold(0.0, f64::max);
+    assert!(
+        worst > 1e-3,
+        "{what}: the written and the engine clock give the same predictions \
+         (worst rel {worst:.3e}), so the fixture cannot tell which clock the parameters read"
+    );
+}
+
+/// The same subject with every written time dropped, so each record reads the engine clock:
+/// the pre-#1969 behaviour, for a test that must show the straddle moves the prediction.
+pub(crate) fn on_engine_clock(subject: &Subject) -> Subject {
+    Subject {
+        obs_raw_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        ..subject.clone()
+    }
+}

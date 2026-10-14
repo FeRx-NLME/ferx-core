@@ -96,8 +96,8 @@ fn the_gather_index_check_names_the_written_time() {
 }
 
 /// `E_KAPPA_WEIGHT_NONPOSITIVE`: a zero `weight = NARM` on the moved observation. The
-/// weight is evaluated where the individual parameters it is desugared into are, on
-/// the engine clock, and reported at the written time.
+/// weight is evaluated where the individual parameters it is desugared into are, at the
+/// written time since #1969, and reported at it.
 ///
 /// Mutation — the message's `time` read off `obs_times`: it names `MOVED`.
 #[test]
@@ -115,4 +115,32 @@ fn the_kappa_weight_check_names_the_written_time() {
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, "E_KAPPA_WEIGHT_NONPOSITIVE");
     names_the_written_time(&diags[0].message, "at subject `1`, TIME 2 —");
+}
+
+/// #1969: a kappa `weight` that reads `TIME` is evaluated at the written time, as the
+/// individual parameters it is desugared into read it. `weight = 2 - TIME` is exactly 0 at
+/// the observation written at 2, so the check fires there; on the engine clock it read
+/// `2 − 2⁻ = 4.4e-16 > 0`, and the check passed a weight the fit then divides by zero.
+///
+/// Mutation — the check's evaluation time read off `obs_times`: no diagnostic.
+#[test]
+fn the_kappa_weight_check_evaluates_a_time_reading_weight_at_the_written_time() {
+    let model = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
+         kappa KAPPA_CL ~ 0.09 weight = 2 - TIME\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V  = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+         DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n",
+    )
+    .expect("parse");
+    let pop = moved_subject("X", [1.0, 1.0, 1.0]);
+    let s = &pop.subjects[0];
+    assert!(
+        2.0 - s.obs_times[1] > 0.0 && 2.0 - s.obs_raw_times[1] == 0.0,
+        "the weight must straddle zero between the two clocks, or this tests nothing"
+    );
+    let diags = check_kappa_weights(&model, &pop);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E_KAPPA_WEIGHT_NONPOSITIVE");
+    names_the_written_time(&diags[0].message, "evaluates to 0 at subject `1`, TIME 2 —");
 }

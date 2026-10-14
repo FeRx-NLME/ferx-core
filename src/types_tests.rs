@@ -2322,6 +2322,58 @@ fn subject_has_periodic_ss_dose_requires_ss_flag_and_positive_ii() {
     assert!(!s.has_periodic_ss_dose());
 }
 
+/// #1969: the parameter time of each record kind is its TIME as written, read from the
+/// subject's own vectors, and the engine clock for an in-memory subject that carries none.
+#[test]
+fn param_time_reads_the_written_time_of_each_record_kind() {
+    use crate::types::test_helpers::{param_time_straddle_subject, ParamTimeStraddle};
+    let moved = 24.0f64.next_down();
+
+    // A moved observation and a moved pk-only row: the written 24, not the engine 24⁻.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Obs);
+    assert_eq!(s.obs_times[2], moved);
+    assert_eq!(s.param_time_obs(2), 24.0);
+    let s = param_time_straddle_subject(ParamTimeStraddle::PkOnly);
+    assert_eq!(s.pk_only_times[0], moved);
+    assert_eq!(s.param_time_pk_only(0), 24.0);
+
+    // A reset period: a row in the table reads its stored written time, exactly.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Reset);
+    assert_eq!(s.param_time_at(50.0), 0.0, "the EVID=4 row");
+    assert_eq!(s.param_time_at(74.0), 24.0, "a period-2 dose");
+    // A time with no row (a dose the adaptive engine appended) takes the offset of the
+    // latest row at or before it; before the first shifted row the clocks agree.
+    assert_eq!(s.param_time_at(60.0), 10.0);
+    assert_eq!(s.param_time_at(80.0), 30.0);
+    assert_eq!(s.param_time_at(12.0), 12.0);
+
+    // In memory, with no written times: the engine clock, for every kind.
+    let mut bare = bare_subject("1");
+    bare.obs_times = vec![moved];
+    bare.pk_only_times = vec![moved];
+    assert_eq!(bare.param_time_obs(0), moved);
+    assert_eq!(bare.param_time_pk_only(0), moved);
+    assert_eq!(bare.param_time_at(50.0), 50.0);
+}
+
+/// #1969: `param_time_at` returns the stored written time, not `engine − offset`. The
+/// subtraction is inexact for most decimal times, and a step such as `TIME >= 24.3` at a dose
+/// written 24.3 would take the earlier branch on a value one ULP short.
+#[test]
+fn param_time_at_returns_the_stored_written_time_not_a_difference() {
+    let mut s = bare_subject("1");
+    let offset = 72.1 + 1.0 - 0.1;
+    let written = 24.3;
+    let engine = written + offset;
+    assert_ne!(
+        engine - offset,
+        written,
+        "the fixture must be one where the subtraction rounds, or it tests nothing"
+    );
+    s.reset_period_times = vec![(0.1 + offset, 0.1), (engine, written)];
+    assert_eq!(s.param_time_at(engine), written);
+}
+
 #[test]
 fn subject_has_rate_defined_infusion_distinguishes_infusion_modes() {
     let mut s = bare_subject("1");

@@ -4578,6 +4578,100 @@ const ONECPT_ODE_TVCOV: &str = r#"
   ode_abstol = 1e-11
 "#;
 
+/// #1969: a `TIME >= 24` step on CL on a non-IOV ODE model, at records whose written and
+/// engine times straddle 24 (a moved trough, a moved `EVID=2` row, a reset period that
+/// restarts `TIME`). The per-event seeds (`seed_tvcov_snapshots`) must read the written time,
+/// as the value path does: the dual value tracks the value prediction, which the engine clock
+/// would move by more than 1e-3, and the outer and inner η/θ gradients match central FD.
+#[test]
+fn param_time_written_ode_provider_matches_value_and_fd() {
+    use crate::types::test_helpers::{
+        assert_param_time_straddle_is_live, on_engine_clock, param_time_straddle_subject,
+        ParamTimeStraddle,
+    };
+    const STEP_AT_24_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(4.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME >= 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(STEP_AT_24_ODE).expect("parse");
+    let theta = vec![10.0, 4.0, 50.0];
+    let eta = vec![0.15, -0.10];
+    let he = 1e-6;
+    for kind in [
+        ParamTimeStraddle::Obs,
+        ParamTimeStraddle::PkOnly,
+        ParamTimeStraddle::Reset,
+    ] {
+        let subject = param_time_straddle_subject(kind);
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "{kind:?}: the event-driven walk serves it"
+        );
+        let pred =
+            |s: &Subject, e: &[f64], th: &[f64]| compute_predictions_with_tv(&model, s, th, e);
+        let value = pred(&subject, &eta, &theta);
+        assert_param_time_straddle_is_live(
+            &value,
+            &pred(&on_engine_clock(&subject), &eta, &theta),
+            &format!("{kind:?}"),
+        );
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner");
+        for (j, obs) in sens.obs.iter().enumerate() {
+            approx::assert_relative_eq!(obs.f, value[j], max_relative = 1e-8, epsilon = 1e-10);
+            approx::assert_relative_eq!(light[j].f, value[j], max_relative = 1e-8, epsilon = 1e-10);
+            for k in 0..model.n_eta {
+                let (mut ep, mut em) = (eta.clone(), eta.clone());
+                ep[k] += he;
+                em[k] -= he;
+                let g =
+                    (pred(&subject, &ep, &theta)[j] - pred(&subject, &em, &theta)[j]) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 1e-4, epsilon = 1e-7);
+                approx::assert_relative_eq!(
+                    light[j].df_deta[k],
+                    g,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+            for m in 0..model.n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let (mut tp, mut tm) = (theta.clone(), theta.clone());
+                tp[m] += s;
+                tm[m] -= s;
+                let g = (pred(&subject, &eta, &tp)[j] - pred(&subject, &eta, &tm)[j]) / (2.0 * s);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+}
+
 /// #486: a `TIME`-switched CL on a **non-IOV ODE** model. With no TV covariates
 /// the subject routes to the event-driven TV walk purely by `uses_time_builtin`
 /// (`ode_tvcov_supported`); the full `ode_subject_sensitivities` value/∂η/∂θ (and
