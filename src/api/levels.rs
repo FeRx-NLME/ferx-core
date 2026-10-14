@@ -2294,8 +2294,8 @@ impl BlockBasis {
 /// Each coded column must keep at least [`SPAN_TOL`] of its norm against the
 /// other θ and the coded columns before it, counted on the basis the residual
 /// is measured in, beyond any deficiency the other θ have among themselves.
-/// Measured over every guard the `api::levels` tests reach (1353, macOS arm64
-/// debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
+/// Measured over every guard the `api::levels` tests reach (2334 with the
+/// two-block tests of #1963, macOS arm64 debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
 /// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
 /// below the other.
 ///
