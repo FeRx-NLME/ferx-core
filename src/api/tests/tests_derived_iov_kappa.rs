@@ -782,8 +782,8 @@ fn block_sigma_ambiguous_pairing_without_l2_warns() {
 /// in a stacked-reset period that also writes `TIME = 1`.
 ///
 /// Mutations — the grouping back on `obs_times` bits: the moved total has no partner
-/// and the first case is quiet. `same_instant` without its engine-clock clause: the
-/// reset partner joins and the second case warns.
+/// and the first case is quiet. `same_instant` on the written times: the reset partner
+/// joins and the second case warns.
 #[test]
 fn block_sigma_ambiguity_groups_by_the_written_instant() {
     let model = block_sigma_two_endpoint_model();

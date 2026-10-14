@@ -1070,17 +1070,21 @@ pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -
 
 /// Whether observations `j` and `k` are one instant, so the engines see both at the
 /// same time and a key or a pairing on "the same time" should join them: the same
-/// written time ([`written_time`]), on the same engine clock up to the one ULP the
-/// reader moves a record below a co-timed one to keep file order (#614, #1810).
+/// engine time, up to the one ULP the reader moves a record below a co-timed one to
+/// keep file order (#614, #1810).
 ///
-/// Neither clock alone is right. The engine clock alone parts a moved observation
-/// from its co-timed twin (#1959). The written time alone joins two stacked-reset
-/// periods that restart `TIME`, which the engines run at different times.
-pub(crate) fn same_instant(obs_times: &[f64], obs_raw_times: &[f64], j: usize, k: usize) -> bool {
+/// The exact engine clock parts a moved observation from its co-timed twin (#1959).
+/// The written time joins two stacked-reset periods that restart `TIME`, which the
+/// engines run at different times. With the one-ULP tolerance the engine clock is
+/// enough on its own: the reader moves a record by exactly one ULP and never twice,
+/// and a reset shifts a later period past the earlier one's last time plus a gap, so
+/// two records within one ULP on the engine clock were written at one time. An
+/// extra "same written time" clause rejected no input the reader can produce (#1964
+/// review, finding 3).
+pub(crate) fn same_instant(obs_times: &[f64], j: usize, k: usize) -> bool {
     let at = |i: usize| obs_times.get(i).copied().unwrap_or(0.0);
     let (a, b) = (at(j), at(k));
-    written_time(obs_times, obs_raw_times, j) == written_time(obs_times, obs_raw_times, k)
-        && (a == b || a.next_down() == b || b.next_down() == a)
+    a == b || a.next_down() == b || b.next_down() == a
 }
 
 impl Subject {
@@ -1211,7 +1215,7 @@ impl Subject {
 
     /// Whether observations `j` and `k` are one instant: see [`same_instant`].
     pub(crate) fn same_instant(&self, j: usize, k: usize) -> bool {
-        same_instant(&self.obs_times, &self.obs_raw_times, j, k)
+        same_instant(&self.obs_times, j, k)
     }
 
     /// Time after dose at observation `j`, from the data alone — no lag time,
