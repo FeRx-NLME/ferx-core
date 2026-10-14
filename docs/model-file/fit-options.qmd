@@ -72,6 +72,42 @@ What runs, how long, and how it is resumed or traced.
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
 
+#### Choosing a thread count
+
+The per-subject loops (FOCE/FOCEI inner EBE solves and outer gradient, the SAEM
+E-step, the Gauss–Newton population gradient, the analytic covariance assembly)
+are what `threads` spreads. More threads therefore help most when there are many
+subjects and each one is expensive (ODE models, IOV, wide `Dual2` gradients); a
+small analytic model is done in a second or two at any width.
+
+Measured on an 8-core / 16-thread AMD Ryzen 7 7840U (Zen 4), wall time, median of
+3 (#1917):
+
+| Model | `threads = 4` | `8` (physical cores) | `16` (SMT) |
+|---|---|---|---|
+| pembrolizumab FOCEI, 303 subjects | 16.9 s | 10.8 s | 9.9 s |
+| busulfan FOCEI ODE + IOV, 299 subjects | 26.9 s | 15.4 s | 13.7 s |
+
+Going from 4 to 8 threads cut wall time by 36–43 %. Going from 8 to 16, onto the
+SMT siblings of the same cores, saved a further 7–11 % but cost about 70 % more
+CPU time. So:
+
+- **The default** (available cores − 1, capped at 8) is a sensible start.
+- **For a long fit on an otherwise idle machine**, set `threads` up to the number of
+  *physical* cores. That is where most of the wall-time gain is.
+- **Threads beyond the physical cores** (SMT / hyper-threads) still shave a little
+  wall time on an idle machine, but they buy it with a lot of CPU. Avoid them when
+  the machine is shared or when several fits run side by side. There, total
+  throughput is better with each fit on fewer threads; see `PoolPlan` in the
+  [fitting API](../api/fitting.qmd#splitting-the-thread-budget-poolplan).
+- **Asymmetric CPUs** (Apple Silicon with efficiency cores, Intel P/E hybrids):
+  the slower cores can hold up the per-subject fan-out, so a count at or below the
+  number of performance cores is the safe choice. Not every chip has efficiency
+  cores (an M5 Pro reports none), so check yours rather than assuming a rule.
+
+The thread count changes speed only. For a fixed binary, estimates do not depend
+on it (#703).
+
 #### Worker reuse for repeated fits
 
 Default fits share a persistent worker pool. Unpinned fits with the same
