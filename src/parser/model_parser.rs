@@ -14247,6 +14247,14 @@ fn build_ode_spec(
             (*state_idx, params)
         })
         .collect();
+    // Lift the parameter-only subexpressions out of the RK stages. Individual
+    // parameters and `MACHEPS` are the slots that stay fixed across the calls of
+    // one integration; `build_rhs_hoist` drops any the program itself assigns.
+    let rhs_invariant_slots: Vec<usize> = (state_count..state_count + indiv_count)
+        .chain(std::iter::once(macheps_slot))
+        .collect();
+    let rhs_hoist = build_rhs_hoist(&stmts_owned, n_vars_total, &rhs_invariant_slots);
+    let rhs_hoist_f64 = rhs_hoist.clone();
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -14264,6 +14272,7 @@ fn build_ode_spec(
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
         init_indiv_reads,
+        hoist: rhs_hoist,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -14300,8 +14309,14 @@ fn build_ode_spec(
                 // second TLS lookup. RefMut::deref_mut returns a `&mut`
                 // to the struct; field reborrows are disjoint.
                 let scratch = &mut *s;
-                scratch.rhs_vars.clear();
-                scratch.rhs_vars.resize(n_vars_total, 0.0);
+                let warm = match &rhs_hoist_f64 {
+                    Some(h) => h.reset(&mut scratch.rhs_vars, n_vars_total),
+                    None => {
+                        scratch.rhs_vars.clear();
+                        scratch.rhs_vars.resize(n_vars_total, 0.0);
+                        false
+                    }
+                };
 
                 // State values from u[].
                 scratch.rhs_vars[..copy_n].copy_from_slice(&u[..copy_n]);
@@ -14361,8 +14376,21 @@ fn build_ode_spec(
                 // thread-local — not the `time_slot` the `T`/`t` aliases use.
                 // Set it to the integrator clock so `TIME` matches `T` (#610).
                 let _time_guard = ModelTimeGuard::enter(t);
+                // Lifted parameter-only values, recomputed only when an input moved.
+                let run_stmts = match &rhs_hoist_f64 {
+                    Some(h) => {
+                        h.refresh(
+                            &mut scratch.rhs_vars,
+                            warm,
+                            &mut scratch.bc_stack,
+                            rhs_lift_eval_f64,
+                        );
+                        &h.stmts
+                    }
+                    None => &stmts_owned,
+                };
                 eval_statements_indexed_with_stack(
-                    &stmts_owned,
+                    run_stmts,
                     &empty_theta,
                     &empty_eta,
                     &empty_cov,
@@ -24469,7 +24497,8 @@ struct IpSubtree {
 ///
 /// Reconstructs the expression tree from the postfix `ops` (every op has a fixed
 /// pop count, so a subtree is a contiguous op range), then walks it from the root:
-/// a hoistable subtree of weighted cost ≥ [`IP_SUBEXPR_MIN_COST`] is cut out whole,
+/// a hoistable subtree of weighted cost ≥ `min_cost` ([`IP_SUBEXPR_MIN_COST`] for
+/// `[individual_parameters]`, [`RHS_HOIST_MIN_COST`] for the ODE RHS) is cut out whole,
 /// its ops copied verbatim into a new `AssignBc(slot, …)` on a fresh slot past
 /// `n_vars`, and replaced in the parent by `PushVar(slot)`; a hoistable subtree
 /// below the floor is left in place (its children are cheaper still); a non-hoistable
@@ -24488,6 +24517,7 @@ fn ip_lift_subexprs(
     n_vars: usize,
     next_slot: &mut usize,
     lifted: &mut Vec<(usize, Bytecode)>,
+    min_cost: u32,
 ) -> Option<Bytecode> {
     let mut nodes: Vec<IpSubtree> = Vec::with_capacity(bc.ops.len());
     let mut stack: Vec<usize> = Vec::new();
@@ -24541,7 +24571,7 @@ fn ip_lift_subexprs(
     while let Some(n) = todo.pop() {
         let node = &nodes[n];
         if node.hoistable {
-            if node.cost >= IP_SUBEXPR_MIN_COST {
+            if node.cost >= min_cost {
                 picks.push(n);
             }
         } else {
@@ -24650,10 +24680,15 @@ fn split_ip_eta_independent_prefix(
             // this statement is about to overwrite is still the prefix's value.
             let mut lifted: Vec<(usize, Bytecode)> = Vec::new();
             let rewritten = match s {
-                Statement::AssignBc(idx, bc) => {
-                    ip_lift_subexprs(bc, &tainted, n_vars, &mut next_slot, &mut lifted)
-                        .map(|bc2| Statement::AssignBc(*idx, bc2))
-                }
+                Statement::AssignBc(idx, bc) => ip_lift_subexprs(
+                    bc,
+                    &tainted,
+                    n_vars,
+                    &mut next_slot,
+                    &mut lifted,
+                    IP_SUBEXPR_MIN_COST,
+                )
+                .map(|bc2| Statement::AssignBc(*idx, bc2)),
                 _ => None,
             };
             for (slot, sub) in lifted {
@@ -26207,6 +26242,361 @@ fn stmts_read_time_builtin(stmts: &[Statement]) -> bool {
     })
 }
 
+// ─── Parameter-only subexpressions of the ODE RHS ──────────────────────────
+//
+// An integrator evaluates the RHS several times per step (six RK45 stages,
+// plus rejected steps and dense output) with the individual parameters held
+// fixed, so a subexpression that reads only individual parameters — `Q/V1`
+// in `−(Q/V1)·central + (Q/V2)·peripheral`, or `CL/V` in a hand-written
+// one-compartment model — is recomputed with identical inputs every time.
+// For the outer-gradient `DualMixed` each such division is two passes over a
+// several-KB jet.
+//
+// `build_rhs_hoist` lifts every maximal such subtree (reusing E6's
+// `ip_lift_subexprs`) into a slot past the program's own variables, and
+// shares one slot between identical subtrees. The lifted values live in the
+// caller's `vars` scratch next to a snapshot of the inputs they read and a
+// per-program id; `RhsHoist::refresh` recomputes them only when that snapshot
+// stops matching the current inputs **bit for bit** (`PkNum::same_bits`, which
+// compares every jet entry of a dual too). A lifted value is a pure function
+// of those inputs, so a reused value is exactly the value a recomputation
+// would produce, and the RHS is bit-identical to the unlifted one.
+//
+// Only evaluation uses the rewritten statements. `OdeRhsProgram::stmts` stays
+// the original program, because the dependency analyses that walk it (which
+// parameter reaches which state, what the RHS reads) must see `Q` and `V1`
+// themselves, not a slot standing in for `Q/V1`.
+
+/// Minimum weighted cost ([`ip_op_cost`]) of an RHS subtree worth lifting: one
+/// binary op on two reads. Far below E6's [`IP_SUBEXPR_MIN_COST`], because an RHS
+/// cache entry is reused for every stage of every step on one parameter set,
+/// where an `[individual_parameters]` entry is reused across proposals at best.
+const RHS_HOIST_MIN_COST: u32 = 3;
+
+/// Source of [`RhsHoist::id`] values; see there.
+static RHS_HOIST_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The ODE RHS with its parameter-only subexpressions lifted out (see the
+/// section comment above).
+///
+/// Layout of the `vars` scratch it extends, past the program's own
+/// `n_vars_total` slots: the lifted values (`n_vars_total..key_base`), a
+/// snapshot of the `key_slots` they were computed from (`key_base..id_slot`),
+/// and `id_slot`.
+#[derive(Debug, Clone)]
+pub(crate) struct RhsHoist {
+    /// The RHS statements, each lifted subtree replaced by a `PushVar` of its slot.
+    stmts: Vec<Statement>,
+    /// `(slot, bytecode)` per lifted subtree, deduplicated.
+    lifted: Vec<(usize, Bytecode)>,
+    /// The program slots the lifted bytecode reads — the cache key.
+    key_slots: Vec<usize>,
+    key_base: usize,
+    id_slot: usize,
+    /// `vars.len()` while the cache is live.
+    n_ext: usize,
+    /// Marks a `vars` buffer as holding *this* program's cache. The f64 RHS
+    /// scratch is one thread-local buffer shared by every ODE model on the
+    /// thread, so a buffer whose snapshot happens to match could belong to a
+    /// different program's lifted code. Unique per build, and a finite value no
+    /// zero-filled or program-written slot will hold.
+    id: f64,
+}
+
+impl RhsHoist {
+    /// Ready `vars` for one RHS call before its states, parameters and time are
+    /// written: zero the program's own slots exactly as a fresh
+    /// `clear(); resize(n, 0)` would, and keep the tail if it holds this program's
+    /// cache. Returns whether it does.
+    #[inline]
+    fn reset<T: crate::sens::num::vm::VmNum>(&self, vars: &mut Vec<T>, n_vars: usize) -> bool {
+        let zero = T::from_f64(0.0);
+        // The id lives in the slot's value; its jet (zero) carries nothing, and
+        // lifting `self.id` to a full dual just to compare it would cost a jet-sized
+        // write per call.
+        let warm =
+            vars.len() == self.n_ext && vars[self.id_slot].val().to_bits() == self.id.to_bits();
+        if warm {
+            vars[..n_vars].fill(zero);
+        } else {
+            vars.clear();
+            vars.resize(self.n_ext, zero);
+        }
+        warm
+    }
+
+    /// Bring the lifted values up to date with the inputs now in `vars`, after
+    /// [`Self::reset`] and the caller's writes. A no-op when the tail was kept and
+    /// every key slot still matches its snapshot bit for bit.
+    #[inline]
+    fn refresh<T: crate::sens::num::vm::VmNum>(
+        &self,
+        vars: &mut [T],
+        warm: bool,
+        stack: &mut Vec<T>,
+        eval: fn(&Bytecode, &[T], &mut Vec<T>) -> T,
+    ) {
+        let hit = warm
+            && self
+                .key_slots
+                .iter()
+                .enumerate()
+                .all(|(j, &s)| vars[self.key_base + j].same_bits(&vars[s]));
+        if hit {
+            return;
+        }
+        for (slot, bc) in &self.lifted {
+            let v = eval(bc, vars, stack);
+            vars[*slot] = v;
+        }
+        for (j, &s) in self.key_slots.iter().enumerate() {
+            vars[self.key_base + j] = vars[s];
+        }
+        vars[self.id_slot] = T::from_f64(self.id);
+    }
+}
+
+/// Slots any statement in `stmts` (including `if` bodies) assigns.
+fn rhs_collect_writes(stmts: &[Statement], writes: &mut [bool]) {
+    for s in stmts {
+        match s {
+            Statement::AssignBc(i, _) | Statement::AssignIdx(i, _) => {
+                if let Some(w) = writes.get_mut(*i) {
+                    *w = true;
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    rhs_collect_writes(body, writes);
+                }
+                if let Some(body) = else_body {
+                    rhs_collect_writes(body, writes);
+                }
+            }
+            Statement::Assign(..) | Statement::DiffEq(..) | Statement::DiffEqIdx(..) => {}
+            Statement::DiffEqBc(..) => {}
+        }
+    }
+}
+
+/// Is this whole bytecode a parameter-only computation worth lifting? The root
+/// case `ip_lift_subexprs` declines (a hoistable root is E6's statement-level
+/// split's business, which the RHS does not have).
+fn rhs_whole_bc_liftable(bc: &Bytecode, tainted: &[bool]) -> bool {
+    let mut cost: u32 = 0;
+    let mut computes = false;
+    for op in &bc.ops {
+        cost = cost.saturating_add(ip_op_cost(op));
+        match *op {
+            Op::PushVar(v) => {
+                if tainted.get(v as usize).copied().unwrap_or(true) {
+                    return false;
+                }
+            }
+            Op::PushConst(_) => {}
+            // `TIME` varies along the integration; θ / η / covariates / NN outputs are
+            // not RHS inputs (an RHS reads them only through individual parameters),
+            // and a branch is left to the per-call evaluation.
+            Op::PushTime
+            | Op::PushTheta(_)
+            | Op::PushEta(_)
+            | Op::PushCov(_)
+            | Op::PushMixNum
+            | Op::PushNnOutput(..)
+            | Op::PushThetaGather(_)
+            | Op::JumpIfFalse(_)
+            | Op::Jump(_) => return false,
+            _ => computes = true,
+        }
+    }
+    computes && cost >= RHS_HOIST_MIN_COST
+}
+
+/// Rename `PushVar(from)` to `PushVar(to)` throughout `bc`.
+fn rhs_rename_slot(bc: &mut Bytecode, from: usize, to: usize) {
+    for op in &mut bc.ops {
+        if let Op::PushVar(v) = op {
+            if *v as usize == from {
+                *v = to as u32;
+            }
+        }
+    }
+}
+
+/// Dedup key for a lifted subtree: its ops and its constants' bits. Two subtrees
+/// with equal keys compute the same value from the same slots.
+fn rhs_lift_key(bc: &Bytecode) -> (String, Vec<u64>) {
+    (
+        format!("{:?}", bc.ops),
+        bc.constants.iter().map(|c| c.to_bits()).collect(),
+    )
+}
+
+struct RhsLiftState<'a> {
+    tainted: &'a [bool],
+    n_vars: usize,
+    lifted: Vec<(usize, Bytecode)>,
+    seen: HashMap<(String, Vec<u64>), usize>,
+}
+
+impl RhsLiftState<'_> {
+    /// Register a lifted subtree, returning the slot that holds its value — an
+    /// existing one when an identical subtree was lifted before.
+    fn intern(&mut self, sub: Bytecode) -> usize {
+        let key = rhs_lift_key(&sub);
+        if let Some(&slot) = self.seen.get(&key) {
+            return slot;
+        }
+        let slot = self.n_vars + self.lifted.len();
+        self.seen.insert(key, slot);
+        self.lifted.push((slot, sub));
+        slot
+    }
+
+    fn bc(&mut self, bc: &Bytecode) -> Bytecode {
+        // An RHS reads θ, η, covariates and NN outputs only through individual
+        // parameters, so these ops are not expected here; `MIXNUM` can differ
+        // between two calls on identical parameters. `ip_lift_subexprs` would lift
+        // any of them (E6 keys on them), so leave such a statement whole.
+        let foreign = bc.ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::PushTheta(_)
+                    | Op::PushEta(_)
+                    | Op::PushCov(_)
+                    | Op::PushMixNum
+                    | Op::PushNnOutput(..)
+                    | Op::PushThetaGather(_)
+            )
+        });
+        if foreign {
+            return bc.clone();
+        }
+        if rhs_whole_bc_liftable(bc, self.tainted) {
+            let slot = self.intern(bc.clone());
+            let mut out = Bytecode::new();
+            out.ops.push(Op::PushVar(slot as u32));
+            out.max_stack = compute_max_stack(&out.ops);
+            return out;
+        }
+        // `ip_lift_subexprs` numbers its lifts from `next_slot`; give it a scratch
+        // range no real slot reaches, then rename each to its interned slot.
+        const SCRATCH_BASE: usize = u32::MAX as usize / 2;
+        let mut next_slot = SCRATCH_BASE;
+        let mut subs: Vec<(usize, Bytecode)> = Vec::new();
+        let Some(mut out) = ip_lift_subexprs(
+            bc,
+            self.tainted,
+            self.n_vars,
+            &mut next_slot,
+            &mut subs,
+            RHS_HOIST_MIN_COST,
+        ) else {
+            return bc.clone();
+        };
+        for (tmp, sub) in subs {
+            let slot = self.intern(sub);
+            rhs_rename_slot(&mut out, tmp, slot);
+        }
+        out
+    }
+
+    fn stmts(&mut self, stmts: &[Statement]) -> Vec<Statement> {
+        stmts
+            .iter()
+            .map(|s| match s {
+                Statement::AssignBc(i, bc) => Statement::AssignBc(*i, self.bc(bc)),
+                Statement::DiffEqBc(i, bc) => Statement::DiffEqBc(*i, self.bc(bc)),
+                // A lifted value is a pure function of its inputs, so computing it
+                // even when the branch holding it is not taken changes nothing.
+                Statement::If {
+                    branches,
+                    else_body,
+                } => Statement::If {
+                    branches: branches
+                        .iter()
+                        .map(|(c, body)| (c.clone(), self.stmts(body)))
+                        .collect(),
+                    else_body: else_body.as_ref().map(|b| self.stmts(b)),
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Lift the parameter-only subexpressions out of a resolved RHS program (see the
+/// section comment). `invariant_slots` are the slots that hold the same value for
+/// every call on one parameter set — the individual parameters and `MACHEPS`; any
+/// of them a statement assigns is dropped. `None` when nothing is worth lifting,
+/// so such a program pays no cache bookkeeping at all.
+fn build_rhs_hoist(
+    stmts: &[Statement],
+    n_vars: usize,
+    invariant_slots: &[usize],
+) -> Option<RhsHoist> {
+    let mut writes = vec![false; n_vars];
+    rhs_collect_writes(stmts, &mut writes);
+    let mut tainted = vec![true; n_vars];
+    for &s in invariant_slots {
+        if s < n_vars && !writes[s] {
+            tainted[s] = false;
+        }
+    }
+    let mut st = RhsLiftState {
+        tainted: &tainted,
+        n_vars,
+        lifted: Vec::new(),
+        seen: HashMap::new(),
+    };
+    let out = st.stmts(stmts);
+    if st.lifted.is_empty() {
+        return None;
+    }
+    let lifted = st.lifted;
+    let mut key_slots: Vec<usize> = lifted
+        .iter()
+        .flat_map(|(_, bc)| bc.ops.iter())
+        .filter_map(|op| match *op {
+            Op::PushVar(v) => Some(v as usize),
+            _ => None,
+        })
+        .collect();
+    key_slots.sort_unstable();
+    key_slots.dedup();
+    let key_base = n_vars + lifted.len();
+    let id_slot = key_base + key_slots.len();
+    let serial = RHS_HOIST_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(RhsHoist {
+        stmts: out,
+        lifted,
+        key_slots,
+        key_base,
+        id_slot,
+        n_ext: id_slot + 1,
+        // Exponent field 0x5FE: a finite ~1e154, distinct per build.
+        id: f64::from_bits(0x5FE0_0000_0000_0000 | (serial & 0x000F_FFFF_FFFF_FFFF)),
+    })
+}
+
+/// `eval_bytecode` (the scalar VM the f64 RHS closure uses) in the shape
+/// [`RhsHoist::refresh`] takes.
+fn rhs_lift_eval_f64(bc: &Bytecode, vars: &[f64], stack: &mut Vec<f64>) -> f64 {
+    eval_bytecode(bc, &[], &[], &[], vars, &[], stack)
+}
+
+/// `eval_bytecode_g` in the shape [`RhsHoist::refresh`] takes.
+fn rhs_lift_eval_g<T: crate::sens::num::vm::VmNum>(
+    bc: &Bytecode,
+    vars: &[T],
+    stack: &mut Vec<T>,
+) -> T {
+    eval_bytecode_g::<T>(bc, &[], &[], &[], vars, &[], stack)
+}
+
 pub struct OdeRhsProgram {
     stmts: Vec<Statement>,
     n_vars_total: usize,
@@ -26248,6 +26638,10 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// The parameter-only subexpressions lifted out of the RK stages, and the
+    /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
+    /// has none worth lifting. See [`RhsHoist`].
+    hoist: Option<RhsHoist>,
     /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
     /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
@@ -26641,8 +27035,20 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
-        vars.clear();
-        vars.resize(self.n_vars_total, T::from_f64(0.0));
+        // Second-order duals evaluate the original statements. Their cache key would
+        // be a bit-for-bit comparison of every key slot's Hessian block on every call —
+        // as much memory traffic as the couple of divisions a lift saves (measured on
+        // busulfan: the `DualMixed` RHS gained ~5% self time with the lift on). For
+        // `f64` and `Dual1` the key is a handful of words and the lift pays.
+        let hoist = self.hoist.as_ref().filter(|_| !T::SECOND_ORDER);
+        let warm = match hoist {
+            Some(h) => h.reset(vars, self.n_vars_total),
+            None => {
+                vars.clear();
+                vars.resize(self.n_vars_total, T::from_f64(0.0));
+                false
+            }
+        };
         let copy_n = self.state_count.min(u.len());
         vars[..copy_n].copy_from_slice(&u[..copy_n]);
         for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
@@ -26672,7 +27078,15 @@ impl OdeRhsProgram {
         // thread-local), not the `time_slot` used by the `T`/`t` aliases; set
         // it to the integrator clock so `TIME` matches `T` (#610).
         let _time_guard = ModelTimeGuard::enter(t);
-        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack, &[]);
+        // Lifted parameter-only values, recomputed only when an input moved.
+        let stmts = match hoist {
+            Some(h) => {
+                h.refresh(vars, warm, stack, rhs_lift_eval_g::<T>);
+                &h.stmts
+            }
+            None => &self.stmts,
+        };
+        eval_statements_g::<T>(stmts, &[], &[], &[], vars, Some(du), stack, &[]);
     }
 }
 

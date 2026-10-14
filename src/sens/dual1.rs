@@ -164,6 +164,17 @@ impl<const N: usize> Dual1<N> {
         Dual1::chain1(inv, -inv2, &self.grad)
     }
 
+    /// Bit-for-bit equality of the value and every jet entry (see
+    /// `crate::sens::num::vm::VmArith::same_bits`).
+    pub(crate) fn same_bits(&self, other: &Self) -> bool {
+        self.value.to_bits() == other.value.to_bits()
+            && self
+                .grad
+                .iter()
+                .zip(&other.grad)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
     /// Whether every gradient component is finite. Does **not** look at `value` — see
     /// [`crate::sens::num::PkNum::jets_finite`] for why the two are checked apart (#1204).
     pub fn jets_finite(self) -> bool {
