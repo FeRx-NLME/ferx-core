@@ -22,6 +22,7 @@ use crate::sim::adaptive::{
 };
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
+    foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
 use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
@@ -707,7 +708,33 @@ pub(crate) fn compute_subject_results(
             // yet supported on the IOV path (tracked as follow-up), so they stay empty.
             // For all other subjects: compute_predictions_with_states returns both ipred
             // and the per-obs compartment state vector in one pass.
-            let (ipred, compartment_states) = if !kappas.is_empty() {
+            //
+            // An IOV subject's linearization is built once, here, and shared by IPRED,
+            // CWRES and the OFV contribution below — the same `[η, κ₁…κ_K]` system the
+            // fit's marginal scored (#1948).
+            let omega_iov = (!kappas.is_empty()).then(|| {
+                params
+                    .omega_iov
+                    .as_ref()
+                    .expect("omega_iov present when kappas non-empty")
+            });
+            let iov_lin = omega_iov.and_then(|omega_iov| {
+                iov_linearization(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta,
+                    h,
+                    &params.omega,
+                    kappas,
+                    omega_iov,
+                )
+            });
+            let (ipred, compartment_states) = if let Some(lin) = &iov_lin {
+                (lin.ipreds.clone(), vec![])
+            } else if !kappas.is_empty() {
+                // κ shape mismatch (never produced by the EBE pipeline): the OFV below
+                // is the marginal's sentinel and CWRES is NaN; IPRED is still f(η̂, κ̂).
                 let kappa_slices: Vec<Vec<f64>> =
                     kappas.iter().map(|k| k.as_slice().to_vec()).collect();
                 let iov_ipred = crate::pk::predict_iov(
@@ -784,48 +811,81 @@ pub(crate) fn compute_subject_results(
             // fit, the population prediction f(η=0) under FOCE — which is what
             // NONMEM's `CWRES` does (pinned in `compute_cwres`'s doc comment).
             // Additive error keeps the linearized `f0` (bit-identical: `R` does
-            // not depend on the prediction).
+            // not depend on the prediction). An IOV subject's FOCE `R` is at η = 0 *and*
+            // κ = 0, read from the marginal's own helper so the two cannot part.
+            let iov_pop_preds = match &iov_lin {
+                Some(lin) if !interaction => population_variance_preds_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    lin.n_eta,
+                    lin.n_iov,
+                    lin.n_occasions,
+                ),
+                _ => None,
+            };
             let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
                 None
             } else if interaction {
                 Some(ipred.as_slice())
+            } else if iov_lin.is_some() {
+                iov_pop_preds.as_deref()
             } else {
                 Some(pred.as_slice())
             };
-            let cwres = compute_cwres_cov(
-                subject,
-                &ipred,
-                eta,
-                h,
-                &params.omega,
-                &params.sigma.values,
-                &model.error_spec,
-                model.residual_cov_at(params),
-                frem_r_override.as_deref(),
-                model.residual_error_eta,
-                ruv_mult.as_deref(),
-                r_preds,
-                model.bloq_in_force(),
-            );
+            // Under IOV, CWRES linearizes over b = [η, κ₁…κ_K] with
+            // Σ_b = blkdiag(Ω, Ω_IOV × K), as NONMEM's does (#1948); `b̂` leads with η̂,
+            // so the IIV-on-RUV read of `b̂[residual_error_eta]` is unchanged.
+            let cwres = match (&iov_lin, kappas.is_empty()) {
+                (None, false) => vec![f64::NAN; subject.observations.len()],
+                (lin, _) => {
+                    let (b_hat, h_b, omega_b) = match lin {
+                        Some(lin) => (&lin.b_hat, &lin.h_full, &lin.sigma_b),
+                        None => (eta, h, &params.omega),
+                    };
+                    compute_cwres_cov(
+                        subject,
+                        &ipred,
+                        b_hat,
+                        h_b,
+                        omega_b,
+                        &params.sigma.values,
+                        &model.error_spec,
+                        model.residual_cov_at(params),
+                        frem_r_override.as_deref(),
+                        model.residual_error_eta,
+                        ruv_mult.as_deref(),
+                        r_preds,
+                        model.bloq_in_force(),
+                    )
+                }
+            };
 
             // OFV contribution
             let ofv_i = if !kappas.is_empty() {
-                let omega_iov = params
-                    .omega_iov
-                    .as_ref()
-                    .expect("omega_iov present when kappas non-empty");
-                foce_subject_nll_iov(
-                    model,
-                    subject,
-                    &params.theta,
-                    eta,
-                    h,
-                    &params.omega,
-                    &params.sigma.values,
-                    interaction,
-                    kappas,
-                    omega_iov,
-                )
+                match &iov_lin {
+                    Some(lin) => foce_subject_nll_iov_linearized(
+                        model,
+                        subject,
+                        &params.theta,
+                        &params.sigma.values,
+                        interaction,
+                        lin,
+                    ),
+                    // A κ shape mismatch: the marginal's own refusal (its sentinel).
+                    None => foce_subject_nll_iov(
+                        model,
+                        subject,
+                        &params.theta,
+                        eta,
+                        h,
+                        &params.omega,
+                        &params.sigma.values,
+                        interaction,
+                        kappas,
+                        omega_iov.expect("kappas non-empty"),
+                    ),
+                }
             } else {
                 foce_subject_nll_cov(
                     model,

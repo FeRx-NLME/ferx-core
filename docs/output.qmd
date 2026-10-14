@@ -78,11 +78,38 @@ $$
 $$
 where $V_j$ is the residual variance evaluated at the individual prediction.
 
-**CWRES** (Conditional Weighted Residual):
+**CWRES** (Conditional Weighted Residual, Hooker et al. 2007, NONMEM's `CWRES`):
 $$
-\text{CWRES}_j = \frac{y_j - f_{0,j}}{\sqrt{\tilde{R}_{jj}}}
+\text{CWRES} = \tilde{R}^{-1/2}\,(y - f_0)
 $$
-where $f_0 = f(\hat{\eta}) - H\hat{\eta}$ is the linearized population prediction and $\tilde{R} = H\Omega H^T + R$ is the conditional variance.
+where $f_0 = f(\hat{\eta}) - H\hat{\eta}$ is the linearized population prediction,
+$H = \partial f/\partial\eta$ at $\hat\eta$, $\tilde{R} = H\Omega H^T + R$ is its covariance, and
+$\tilde{R}^{-1/2}$ is the symmetric inverse square root. $R$ is evaluated at `IPRED` under
+FOCEI and at the population prediction under FOCE, the points the two objectives use. Rows
+censored for the fit (`bloq_method = m3`) are blank.
+
+#### CWRES under inter-occasion variability
+
+With `kappa` declared, the random effects of a subject with $K$ occasions are
+$b = [\eta, \kappa_1, \ldots, \kappa_K]$, and CWRES linearizes over all of them:
+$f_0 = f(\hat b) - H_b\hat b$ and $\tilde{R} = H_b\,\Sigma_b H_b^T + R$, with
+$\Sigma_b = \mathrm{blkdiag}(\Omega, \Omega_{\mathrm{IOV}}, \ldots, \Omega_{\mathrm{IOV}})$. This is
+the same linearization the IOV objective integrates, and it is NONMEM's convention: there an
+occasion κ is one more `ETA`. Under FOCE $R$ is evaluated at $\eta = 0$ and $\kappa = 0$.
+
+Before [#1948](https://github.com/FeRx-NLME/ferx-core/issues/1948), CWRES under IOV used η
+alone. That left $H_\kappa\hat\kappa$ in the residual and dropped
+$H_\kappa\Omega_{\mathrm{IOV}}H_\kappa^T$ from $\tilde{R}$, while `OFV`, `IPRED` and the EBEs
+already matched NONMEM. NONMEM 7.5.1 comparison on the anchor `tests/iov_cwres_nonmem_anchor.rs`
+(30 subjects × 2 occasions, 1-compartment IV, IIV and IOV on CL, proportional error, evaluated at
+one fixed point, macOS arm64):
+
+| Method | worst \|ΔCWRES\| before | worst \|ΔCWRES\| after | \|ΔOFV\| | worst \|Δη̂, κ̂\| |
+|---|---|---|---|---|
+| FOCEI | 0.426 | 9.6e-8 | 4.4e-7 | 1.1e-7 |
+| FOCE | 0.252 | 4.2e-8 | 7.9e-8 | 2.2e-7 |
+
+`OFV`, `IPRED` and the EBEs are unchanged by the fix; only `CWRES` moves.
 
 ### Example — sdtab
 

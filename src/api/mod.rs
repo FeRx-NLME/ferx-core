@@ -401,6 +401,11 @@ mod tests_sdtab_tv_cov;
 #[path = "tests/cens_under_bloq_method_tests.rs"]
 mod cens_under_bloq_method_tests;
 
+// #1948: CWRES under IOV linearizes over [η, κ₁…κ_K], as the IOV marginal does.
+#[cfg(test)]
+#[path = "tests/iov_cwres_tests.rs"]
+mod iov_cwres_tests;
+
 #[cfg(test)]
 #[path = "tests/tests_derived_session_clock.rs"]
 mod tests_derived_session_clock;

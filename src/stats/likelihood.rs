@@ -2529,17 +2529,67 @@ pub fn foce_subject_nll_iov(
         );
     }
 
+    match iov_linearization(
+        model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
+    ) {
+        Some(lin) => {
+            foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
+        }
+        None => 1e20,
+    }
+}
+
+/// The linearization an IOV subject is scored and diagnosed on: the joint EBE
+/// `b̂ = [η̂, κ̂₁, …, κ̂_K]`, the stacked sensitivity `H_full = ∂f/∂b` at `b̂`, the
+/// block-diagonal prior `Σ_b = blkdiag(Ω, Ω_IOV × K)`, and `IPRED = f(b̂)`.
+///
+/// Built once by [`iov_linearization`] and consumed by both the IOV marginal
+/// ([`foce_subject_nll_iov`]) and the post-fit CWRES (#1948), so the residual NONMEM
+/// tables as `CWRES` linearizes over the same random effects the objective integrates
+/// — NONMEM treats an occasion κ as one more `ETA`. Before #1948 CWRES used η alone:
+/// the `H_κ·κ̂` part of `f0` stayed in the residual and `H_κ·Ω_IOV·H_κᵀ` was missing
+/// from `R̃`.
+pub(crate) struct IovLinearization {
+    /// `f(η̂, κ̂)` through the continuous per-occasion prediction (`pk::predict_iov`).
+    pub(crate) ipreds: Vec<f64>,
+    /// `[η̂, κ̂₁, …, κ̂_K]` in [`crate::stats::stacked_layout::StackedLayout`] order.
+    pub(crate) b_hat: DVector<f64>,
+    /// `[∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]`, `n_obs × n_b`.
+    pub(crate) h_full: DMatrix<f64>,
+    /// `blkdiag(Ω, Ω_IOV, …, Ω_IOV)`.
+    pub(crate) sigma_b: OmegaMatrix,
+    /// The number of occasion groups K.
+    pub(crate) n_occasions: usize,
+    /// `dim η` (the leading block of `b_hat`).
+    pub(crate) n_eta: usize,
+    /// `dim κ_k`, the order of `Ω_IOV`.
+    pub(crate) n_iov: usize,
+}
+
+/// Build the subject's [`IovLinearization`], or `None` when `kappas` does not hold
+/// exactly one width-`n_iov` vector per occasion group.
+///
+/// That mismatch never comes out of the EBE pipeline. It would silently leave the
+/// unmatched occasions' ipreds (and H columns) at 0.0, so each caller maps `None` to
+/// its own refusal: the marginal to the large finite sentinel (mirroring the guards in
+/// `individual_nll_iov`), the CWRES pass to `NaN`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn iov_linearization(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega_bsv: &OmegaMatrix,
+    kappas: &[DVector<f64>],
+    omega_iov: &OmegaMatrix,
+) -> Option<IovLinearization> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
     let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_iov, subject);
-    // Defensive: the EBE pipeline always yields exactly one κ vector per
-    // occasion group, each of width n_iov. A mismatch would silently leave the
-    // unmatched occasions' ipreds (and H columns) at 0.0 and score the
-    // augmented marginal against wrong predictions, so bail with the large
-    // finite sentinel — mirroring the guards in `individual_nll_iov`.
     if kappas.len() != layout.n_groups() || kappas.iter().any(|k| k.len() != n_iov) {
-        return 1e20;
+        return None;
     }
     let k_occ = layout.n_groups();
     let n_b = layout.n_stacked();
@@ -2596,9 +2646,41 @@ pub fn foce_subject_nll_iov(
     // Block-diagonal prior covariance Σ_b = blkdiag(Ω_bsv, Ω_iov × K).
     // `from_matrix` regularises if a sub-block is not PD, matching the
     // robustness of the non-IOV OmegaMatrix path; the standard/interaction
-    // FOCE routines below read only `Σ_b.matrix`.
+    // FOCE routines and `compute_cwres_cov` read only `Σ_b.matrix`.
     let sigma_b_mat = layout.prior(&omega_bsv.matrix, &omega_iov.matrix);
     let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
+
+    Some(IovLinearization {
+        ipreds,
+        b_hat,
+        h_full,
+        sigma_b,
+        n_occasions: k_occ,
+        n_eta,
+        n_iov,
+    })
+}
+
+/// [`foce_subject_nll_iov`] on an already-built [`IovLinearization`].
+pub(crate) fn foce_subject_nll_iov_linearized(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+) -> f64 {
+    let IovLinearization {
+        ipreds,
+        b_hat,
+        h_full,
+        sigma_b,
+        n_occasions: k_occ,
+        n_eta,
+        n_iov,
+    } = lin;
+    let (k_occ, n_eta, n_iov) = (*k_occ, *n_eta, *n_iov);
+    let eta_hat = &b_hat.as_slice()[..n_eta];
 
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
@@ -2617,7 +2699,7 @@ pub fn foce_subject_nll_iov(
     // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
     // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
     let p_obs_iov = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+        ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
     } else {
         Vec::new()
     };
@@ -2811,6 +2893,14 @@ pub(crate) fn foce_population_nll_cov(
 /// 0.75 and a Cholesky decorrelation by 0.57 — differences large enough to
 /// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
 /// A model with no η has `R̃` diagonal, so every recipe agrees there.
+///
+/// Under inter-occasion variability the random effects are `b = [η, κ₁, …, κ_K]`,
+/// and the arguments are their stacked forms: `eta_hat = b̂`, `h_matrix = ∂f/∂b`
+/// and `omega = blkdiag(Ω, Ω_IOV × K)` — the system [`foce_subject_nll_iov`]
+/// integrates, which is what the fit's sdtab passes (#1948). NONMEM treats an
+/// occasion κ as one more `ETA`, so its `CWRES` linearizes over all of `b`;
+/// passing η alone leaves `H_κ·κ̂` in the residual and drops `H_κ·Ω_IOV·H_κᵀ`
+/// from `R̃`. Under FOCE without interaction `r_preds` is then `f(η = 0, κ = 0)`.
 ///
 /// Rows censored **for this fit** — `CENS != 0` under `bloq_method = m3`, never
 /// under `drop`, see [`BloqMethod::is_censored_row`] — get `NaN`, since a
