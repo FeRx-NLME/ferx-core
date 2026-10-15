@@ -5353,7 +5353,7 @@ mod tests {
         };
         let x = [0.0, 0.0];
         let opts = FitOptions::default();
-        let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, &ofv, &opts)
+        let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, None, &ofv, &opts)
             .expect("nothing cancels in a test");
 
         // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
@@ -5505,7 +5505,7 @@ mod tests {
                 let (sub, warm) = subset_population(pop, &etas, idx);
                 let ofv = |xv: &[f64]| -> f64 {
                     let (p, e, h, k) =
-                        reconverge_population(xv, model, &sub, params, &warm, &opts, tol);
+                        reconverge_population(xv, model, &sub, params, &warm, &opts, tol, false);
                     2.0 * pop_nll_opts(model, &sub, &p, &e, &h, &k, &opts)
                 };
                 let f0 = ofv(&x_hat);
@@ -5513,9 +5513,18 @@ mod tests {
                     f0.is_finite(),
                     "{label}: subset {idx:?} has a non-finite base OFV"
                 );
-                fd_ofv_stencil(n, &x_hat, &free_idx, opts.fd_hessian_step, f0, &ofv, &opts)
-                    .expect("nothing cancels in a test")
-                    .hess
+                fd_ofv_stencil(
+                    n,
+                    &x_hat,
+                    &free_idx,
+                    opts.fd_hessian_step,
+                    f0,
+                    None,
+                    &ofv,
+                    &opts,
+                )
+                .expect("nothing cancels in a test")
+                .hess
             };
 
             let all: Vec<usize> = (0..pop.subjects.len()).collect();
@@ -7042,5 +7051,138 @@ mod tests {
         assert!(subject_sensitivities_cov(&model, &subject, &theta, &eta).is_some());
         check_full_natural(&model, &subject, &model.default_params);
         check_packed(&model, &subject, &model.default_params);
+    }
+    // ── #1935: the parallel probe and base point change no number ─────────────────────────
+
+    /// #1935 moved three things off one thread — the base reconvergence at `x̂`, the step
+    /// probe's passes, and the salvage route's subset base — and made the stencil take the
+    /// probe's diagonal instead of recomputing it. None of that may move a number: `find_ebe`
+    /// is deterministic per subject and `collect()` keeps subject order, so the FD covariance
+    /// has to be bit-identical at 1 and at 4 threads (#703's reproducibility guarantee).
+    ///
+    /// One cell per route that reaches the changed code: the whole-population stencil on a
+    /// non-IOV and an IOV model (`analytic_cov_hessian = false` forces the stencil), and the
+    /// #1514 salvage route, whose subset base `f0_fd` is the third parallelised call. Each run
+    /// asserts its route, so a fixture that drifted onto the analytic path cannot pass by
+    /// never reaching the stencil.
+    #[test]
+    fn the_fd_covariance_is_bit_identical_across_thread_counts() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{CovarianceMethod, EstimationMethod, FitOptions, Population};
+
+        let plain = parse_model_string(WARFARIN).expect("parse");
+        let mut plain_params = plain.default_params.clone();
+        plain_params.theta = vec![0.2, 10.0, 1.5];
+        let plain_pop = salvage_population(&plain, &plain_params, 6);
+        let mut salvage_pop = plain_pop.clone();
+        force_per_subject_decline(&mut salvage_pop.subjects[2]);
+
+        let (iov_model, s3) = iov_cov_fixture(3, false);
+        let (_, mut s2) = iov_cov_fixture(2, false);
+        s2.id = "two-occasions".into();
+        let iov_params = iov_model.default_params.clone();
+        let iov_pop = Population {
+            subjects: vec![s2, s3],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let opts = |analytic: bool| FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            analytic_cov_hessian: analytic,
+            covariance_method: CovarianceMethod::Hessian,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let cases: [(
+            &str,
+            &CompiledModel,
+            &Population,
+            &ModelParameters,
+            FitOptions,
+        ); 3] = [
+            (
+                "non-IOV stencil",
+                &plain,
+                &plain_pop,
+                &plain_params,
+                opts(false),
+            ),
+            (
+                "IOV stencil",
+                &iov_model,
+                &iov_pop,
+                &iov_params,
+                opts(false),
+            ),
+            (
+                "salvage route",
+                &plain,
+                &salvage_pop,
+                &plain_params,
+                opts(true),
+            ),
+        ];
+
+        for (label, model, pop, params, o) in cases {
+            let x_hat = pack_params(params);
+            let etas: Vec<DVector<f64>> = pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    DVector::from_iterator(
+                        model.n_eta,
+                        find_ebe(model, s, params, 200, 1e-10, None, None, 0)
+                            .eta
+                            .iter()
+                            .copied(),
+                    )
+                })
+                .collect();
+            let n_subj = pop.subjects.len();
+            let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); n_subj];
+            let kappas = vec![vec![]; n_subj];
+
+            // The route under test, asserted rather than assumed.
+            if o.analytic_cov_hessian {
+                match analytic_cov_assembly(model, pop, params, &x_hat, &etas, &[], &o) {
+                    AnalyticCovAssembly::Partial { declined, .. } => {
+                        assert_eq!(declined, vec![2], "{label}: exactly subject 2 is salvaged")
+                    }
+                    _ => panic!("{label}: the salvage route must be taken"),
+                }
+            }
+
+            let run = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        match compute_covariance(
+                            &x_hat, params, model, pop, &etas, &h_mats, &kappas, &o,
+                        ) {
+                            CovarianceStepResult::Success(out) => out.matrix,
+                            CovarianceStepResult::Unusable(m) => panic!("{label}: {m}"),
+                            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                                panic!("{label}: {reason}")
+                            }
+                        }
+                    })
+            };
+            let one = run(1);
+            let four = run(4);
+            assert!(
+                one.iter().all(|v| v.is_finite()) && one.amax() > 0.0,
+                "{label}: the matrix must be finite and live before it is compared:\n{one}"
+            );
+            assert_eq!(one, four, "{label}: 1 and 4 threads must agree bit for bit");
+        }
     }
 }
