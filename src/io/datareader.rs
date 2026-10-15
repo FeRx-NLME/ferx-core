@@ -3410,6 +3410,8 @@ fn parse_subject(
     // The remedy is #614's: the first record moves one ULP below the tie, so every
     // engine reaches it first. Only the first record needs moving, since the later
     // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
+    // That leaves two observations one ULP apart whenever the tie holds more than one,
+    // which the ODE engines must save as two points (`ode::predictions::segment_saveat`).
     // One ULP is always enough, too: the #614 pass below moves only observations, and an
     // observation sorts last among the kinds, so a pk-only row sharing its ULP still
     // goes first.
