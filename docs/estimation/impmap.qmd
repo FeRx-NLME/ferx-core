@@ -67,7 +67,10 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
 
 1. **MAP re-center (E-step A).** Run the FOCE inner loop for every subject to get
    the conditional mode η̂ᵢ and Jacobian Jᵢ, and form the first-order-variance
-   Hessian $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$.
+   Hessian $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$. Each subject's search is
+   warm-started from its previous-iteration mode **and** re-solved from η = 0;
+   the lower individual objective wins (see
+   [Stale warm-start modes](#impmap-stale-warm-start)).
 
 2. **Importance sampling (E-step B).** Draw `K = impmap_samples` samples
    $\eta_{ik} \sim q(\hat\eta_i, H_i^{-1})$ — a Student-t by default
@@ -164,6 +167,47 @@ usual cross-engine + Monte-Carlo margin. This comparison is asserted by the gate
 companion `impmap_converges_to_focei_on_warfarin` test checks agreement with
 ferx's own FOCEI.
 
+### Two-compartment oral model with covariates {#impmap-two-cpt-cov}
+
+On `examples/two_cpt_oral_cov.ferx` with V1 given its own weight exponent
+(`THETA_WT_V1`), default IMPMAP settings, against NONMEM 7.6.0 `METHOD=IMPMAP
+INTERACTION NITER=200 ISAMPLE=300` followed by `IMP EONLY=1 ISAMPLE=3000`
+(`ADVAN4 TRANS4`, linear MU form), both on Linux (#1629):
+
+| | TVV1 | TVKA | ω²(ETA_V1) | ω²(ETA_KA) | IS −2 log L |
+|---|--:|--:|--:|--:|--:|
+| NONMEM IMPMAP | 48.27 | 1.250 | 0.1088 | 0.1783 | −1199.78 |
+| ferx IMPMAP | 48.21 | 1.248 | 0.1099 | 0.1794 | −1198.73 |
+| ferx FOCEI (= NONMEM FOCEI) | 48.56 | 1.256 | 0.1061 | 0.1750 | OFV −1199.43 |
+
+The ferx IMPMAP row's IS readout uses K = 300; an `imp_eval_only` evaluation at
+the same estimates with K = 3000 gives −1199.41. The other thetas, ω² and σ agree
+to about 1%. Before #1629 ferx IMPMAP reported −1177.62 here, with ω²(ETA_V1)
+0.176 and ω²(ETA_KA) 0.228. The next section explains why.
+
+## Stale warm-start modes {#impmap-stale-warm-start}
+
+A subject's posterior can have two modes. In a two-compartment oral model, a
+low-V1/low-KA basin can compete with the η ≈ 0 basin. Which mode is lower can
+change as the parameters move, and early MCEM iterations move them a long way.
+A MAP search warm-started from the previous iteration's mode stays in that basin
+even after it has stopped being the lower one. The proposal then sits off the
+posterior, the subject's importance-sampling likelihood is underestimated, and
+its sampled η inflate Ω.
+
+On the model above, subject 6's mode at the initial estimates is
+η_V1 ≈ −1.0, η_KA ≈ −0.8. From iteration 2 on, the η ≈ 0 mode is 8.4 objective
+units lower. Before #1629 the warm start kept the subject in the old basin for all
+200 iterations. The reported IS −2 log L read 17 units high, and the Laplace
+`ofv` and the final EBEs were off by about as much. ω²(ETA_V1) and ω²(ETA_KA)
+were inflated by 60% and 30%.
+
+Every warm-started MAP search, including the final EBE solve, is now also run
+from η = 0. A cold solve that only finds the same mode is discarded, so the warm
+start's mode is kept on ties. The extra cost is one inner solve per subject per
+iteration. FOCEI does a similar cold-versus-warm check at its final estimates
+(#833).
+
 ## Multi-start MAP (`impmap_mceta`)
 
 In high-dimensional models (e.g. FREM with many covariates, ≥ 5 ETAs) the
@@ -178,7 +222,8 @@ points drawn from N(0, Ω) and keeps the start with the lowest individual NLL:
   impmap_mceta  = 3       # 1 warm-start + 3 random starts per subject
 ```
 
-The default is `0` (single warm-start, matching previous behaviour).
+The default is `0`: the warm start plus the cold (η = 0) re-solve described
+[above](#impmap-stale-warm-start), with no random starts.
 `impmap_mceta = 3` is a good choice for FREM models. The cost is roughly
 `(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws)
 dominates, the total wall-time increase is typically 15–40%.
