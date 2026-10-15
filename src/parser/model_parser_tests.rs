@@ -31704,3 +31704,86 @@ fn rhs_hoist_taint_rule_is_unreachable_while_odes_cannot_reassign_a_parameter() 
         "{err}"
     );
 }
+
+/// `MIXNUM` can differ between two RHS calls on identical parameters — the mixture
+/// objective evaluates each class on the same subject — so a subtree reading it must
+/// never be lifted: keyed only on `KOUT`, `KOUT·MIXNUM` would replay class 1's value
+/// under class 2. The fixture keeps a liftable `KIN/KOUT` beside it so the cache is
+/// live, and runs both classes through one persistent scratch buffer.
+const HOIST_MIXNUM: &str = "
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+  RATE = KIN / KOUT
+  d/dt(response) = RATE * KOUT - (KOUT * MIXNUM) * response
+
+[error_model]
+  DV ~ additive(ADD)
+";
+
+#[test]
+fn rhs_hoist_never_lifts_a_mixnum_reader() {
+    let model = hoist_model(HOIST_MIXNUM);
+    let prog = hoist_program(&model);
+    let h = prog
+        .hoist
+        .as_ref()
+        .expect("KIN/KOUT is liftable, so the cache is live");
+    for (_, bc) in &h.lifted {
+        assert!(
+            !bc.ops.iter().any(|o| matches!(o, Op::PushMixNum)),
+            "a lifted subtree reads MIXNUM: {:?}",
+            bc.ops
+        );
+    }
+    let plain_model = hoist_model_unlifted(HOIST_MIXNUM);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(prog, &[10.0, 2.0]);
+    let u = [3.0];
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let mut seen = Vec::new();
+    for class in [1usize, 2, 1, 2] {
+        let _class = MixtureClassGuard::enter(class);
+        let mut want = [0.0];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0];
+        prog.eval_rhs_g::<f64>(
+            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+        );
+        let mut got_c = [0.0];
+        (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got_c);
+        assert!(hoist_bits_eq(got_g[0], want[0]), "class {class} eval_rhs_g");
+        assert!(
+            hoist_bits_eq(got_c[0], want[0]),
+            "class {class} f64 closure"
+        );
+        seen.push(want[0]);
+    }
+    // The two classes must actually differ, or this cannot see a stale replay.
+    assert_ne!(seen[0].to_bits(), seen[1].to_bits(), "MIXNUM must move du");
+}
