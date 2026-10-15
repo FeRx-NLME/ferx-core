@@ -32010,3 +32010,87 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
     rhs(&u, &p1, 1.0, &mut du);
     assert!(hoist_bits_eq(du[0], clean));
 }
+
+/// Every key slot must invalidate the cache on its own: move each individual
+/// parameter alone (between time-varying-parameter snapshots that is exactly what
+/// happens to `V2` while `Q` stays put), on one persistent scratch, and require
+/// parity with the unlifted program for the f64 closure, `eval_rhs_g::<f64>` and
+/// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
+#[test]
+fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    assert_eq!(prog.hoist.as_ref().unwrap().key_slots.len(), 4);
+    let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
+    let plain = hoist_program(&plain_model);
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    type D = crate::sens::dual1::Dual1<2>;
+    let base = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
+    let u = [80.0, 9.0];
+    let ud = [D::constant(80.0), D::var(9.0, 1)];
+    let t = 1.25;
+    // base, then each parameter moved alone and back, so every call after the first
+    // follows a warm buffer whose snapshot differs in exactly one slot.
+    let mut sets = vec![base];
+    for k in 0..base.len() {
+        let mut p = base;
+        p[k] *= 1.1;
+        sets.push(p);
+        sets.push(base);
+    }
+    for (c, p) in sets.iter().enumerate() {
+        let params = hoist_params::<f64>(prog, p);
+        let mut want = [0.0; 2];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            t,
+            t,
+            t,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0; 2];
+        prog.eval_rhs_g::<f64>(&u, &params, t, t, t, &mut got_g, &mut vars, &mut stack);
+        let mut got_c = [0.0; 2];
+        rhs(&u, &params, t, &mut got_c);
+        let dp: Vec<D> = p.iter().map(|&x| D::var(x, 0)).collect();
+        let dparams = hoist_params::<D>(prog, &dp);
+        let mut dwant = [D::constant(0.0); 2];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            t,
+            t,
+            D::constant(t),
+            &mut dwant,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut dgot = [D::constant(0.0); 2];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            t,
+            t,
+            D::constant(t),
+            &mut dgot,
+            &mut dvars,
+            &mut dstack,
+        );
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got_g[j], want[j]),
+                "set {c} {p:?} du[{j}] eval_rhs_g"
+            );
+            assert!(
+                hoist_bits_eq(got_c[j], want[j]),
+                "set {c} {p:?} du[{j}] f64 closure"
+            );
+            assert!(dgot[j].same_bits(&dwant[j]), "set {c} {p:?} du[{j}] Dual1");
+        }
+    }
+}
