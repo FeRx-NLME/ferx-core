@@ -310,10 +310,24 @@ fn split_mu_ref_pins(pinned: &[usize], shift: &[Option<f64>]) -> (Vec<usize>, Ve
         .partition(|&t| shift.get(t).copied().flatten().is_some())
 }
 
-/// One subject's multi-start MAP: the warm-start (or cold-start) solve plus
-/// `mceta` additional random starting points drawn from N(0, Ω) via the supplied
+/// One subject's multi-start MAP: the warm-start (or cold-start) solve, a cold
+/// re-solve from η = 0 whenever the baseline was warm-started, plus `mceta`
+/// additional random starting points drawn from N(0, Ω) via the supplied
 /// Cholesky factor. The start with the lowest NLL wins; `omega_chol = None` (or
-/// `mceta == 0`) degrades to the single warm-start solve.
+/// `mceta == 0`) degrades to the best of the warm and cold solves.
+///
+/// The cold re-solve is not optional (#1629). The MCEM loop warm-starts each
+/// iteration's MAP from the previous iteration's mode, and the parameters move
+/// far between early iterations, so a mode that was global at the initial
+/// estimates can stop being global while the warm start keeps returning it. On
+/// `two_cpt_oral_cov` one subject's iteration-1 mode is the low-V1/low-KA basin
+/// (η_V1 ≈ −1.0, η_KA ≈ −0.8); from iteration 2 on the η ≈ 0 basin is 8.4 NLL
+/// units lower, but warm-starting held the subject in the stale one for all 200
+/// iterations — the proposal sat off the posterior, the reported IS −2 log L
+/// read ~17 units high, and that subject's ηs inflated ω²_V1 and ω²_KA. This is
+/// the MCEM counterpart of FOCEI's cold-vs-warm re-solve at its final point
+/// (#833). A cold solve that only reconverges to the warm mode is rejected by
+/// the strict-improvement guard, so the warm mode is kept on ties.
 ///
 /// Shared by the single-population MAP sweep ([`run_map_multistart`]) and the
 /// mixture MCEM E-step, which runs the same multi-start *per class* inside the
@@ -343,6 +357,21 @@ fn find_ebe_multistart(
         mu,
         inner_restarts,
     );
+    if warm.is_some() {
+        let cold = find_ebe(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            None,
+            mu,
+            inner_restarts,
+        );
+        if cold.nll + 1e-9 < best.nll {
+            best = cold;
+        }
+    }
     let Some(l_omega) = omega_chol else {
         return best;
     };
@@ -374,9 +403,10 @@ fn find_ebe_multistart(
 }
 
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
-/// cold-start) and then `mceta` additional random starting points drawn from
-/// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
-/// degrades to a single warm-start — identical to the previous behaviour.
+/// cold-start), a cold re-solve when it was warm-started, and then `mceta`
+/// additional random starting points drawn from N(0, Ω). The start with the
+/// lowest NLL wins. When `mceta == 0` this degrades to the best of the warm and
+/// cold solves (see [`find_ebe_multistart`] for why the cold one is kept).
 ///
 /// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
 /// IMPMAP refuses IOV models.
@@ -4186,6 +4216,123 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("cancelled by user"), "got: {err}");
+    }
+
+    // ── Stale warm-start basin under MCEM (#1629) ──
+
+    /// `examples/two_cpt_oral_cov.ferx` with V1's own weight exponent, at the
+    /// FOCEI estimates on `data/two_cpt_oral_cov.csv`.
+    const TWO_CPT_COV_SEP: &str = r"
+[parameters]
+  theta TVCL(4.943001, 0.1, 100.0)
+  theta TVV1(48.562858, 1.0, 500.0)
+  theta TVQ(9.575645, 0.1, 100.0)
+  theta TVV2(94.166322, 1.0, 500.0)
+  theta TVKA(1.256269, 0.01, 10.0)
+  theta THETA_WT(0.729548, 0.01, 5.0)
+  theta THETA_CRCL(0.555389, 0.01, 5.0)
+  theta THETA_WT_V1(0.577427, 0.01, 5.0)
+  omega ETA_CL ~ 0.107337
+  omega ETA_V1 ~ 0.106107
+  omega ETA_Q  ~ 0.051339
+  omega ETA_V2 ~ 0.037946
+  omega ETA_KA ~ 0.174963
+  sigma PROP_ERR ~ 0.019619 (sd)
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^THETA_WT_V1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+    /// Subject 6 of `data/two_cpt_oral_cov.csv`, verbatim.
+    fn subject6_pop() -> Population {
+        use std::io::Write;
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
+6,0,.,1,250,1,0,1,71.2,129.5
+6,0.5,2.6485,0,.,1,0,0,71.2,129.5
+6,1,3.3507,0,.,1,0,0,71.2,129.5
+6,2,3.2617,0,.,1,0,0,71.2,129.5
+6,4,1.9015,0,.,1,0,0,71.2,129.5
+6,6,1.1540,0,.,1,0,0,71.2,129.5
+6,8,0.7876,0,.,1,0,0,71.2,129.5
+6,12,0.4953,0,.,1,0,0,71.2,129.5
+6,24,0.3088,0,.,1,0,0,71.2,129.5
+6,36,0.2083,0,.,1,0,0,71.2,129.5
+6,48,0.1423,0,.,1,0,0,71.2,129.5
+";
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT", "CRCL"]), None).unwrap()
+    }
+
+    /// The MCEM MAP step must not inherit a stale basin from its warm start
+    /// (#1629). Subject 6's iteration-1 mode under the default initial estimates
+    /// is the low-V1/low-KA basin; warm-starting every later iteration from it
+    /// held the subject there for a whole 200-iteration IMPMAP fit, ~8 NLL
+    /// units above its real mode, which read as a ~17-unit −2 log L gap and an
+    /// inflated ω²_V1 / ω²_KA. Warm-started from that basin at the FOCEI
+    /// estimates, `find_ebe_multistart` must return the cold-start mode.
+    ///
+    /// The first two assertions are the straddle: the warm start alone really is
+    /// trapped and the cold start really is not, so the third can only pass
+    /// through the cold re-solve (deleting it fails it). Measured: warm-only
+    /// NLL −30.886 (η_V1 −1.34, η_KA −1.12), cold −44.194 (η_V1 −0.07, η_KA
+    /// +0.17) — 13.3 apart, against the 5.0 straddle bound.
+    #[test]
+    fn find_ebe_multistart_escapes_stale_warm_basin() {
+        let model = crate::parser::model_parser::parse_model_string(TWO_CPT_COV_SEP).unwrap();
+        let pop = subject6_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        // Subject 6's η̂ held over 200 IMPMAP iterations before the fix.
+        let stale = [0.293, -1.304, 0.024, 0.323, -1.076];
+
+        let warm = find_ebe(&model, subject, params, 200, 1e-6, Some(&stale), None, 0);
+        let cold = find_ebe(&model, subject, params, 200, 1e-6, None, None, 0);
+        assert!(
+            warm.nll.is_finite() && cold.nll.is_finite(),
+            "both solves must be finite: warm {} cold {}",
+            warm.nll,
+            cold.nll
+        );
+        assert!(
+            warm.nll > cold.nll + 5.0,
+            "fixture no longer straddles the trap: the warm start from the stale basin \
+             (nll {}) must stay well above the cold mode (nll {})",
+            warm.nll,
+            cold.nll
+        );
+
+        let ms = find_ebe_multistart(
+            &model,
+            subject,
+            params,
+            200,
+            1e-6,
+            Some(&stale),
+            None,
+            0,
+            0,
+            None,
+            7,
+        );
+        assert!(
+            (ms.nll - cold.nll).abs() < 1e-9,
+            "a warm-started MAP must keep the cold-start mode when it is lower: got nll {} \
+             (warm-only {}, cold {})",
+            ms.nll,
+            warm.nll,
+            cold.nll
+        );
     }
 
     /// `find_ebe_multistart` degrades to the plain warm-start solve when no Ω
