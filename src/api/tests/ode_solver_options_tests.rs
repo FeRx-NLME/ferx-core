@@ -255,3 +255,50 @@ fn a_fits_ode_options_do_not_outlive_it() {
     assert_eq!(after.reltol, baked.reltol);
     assert_eq!(after.abstol, baked.abstol);
 }
+
+/// #852: `FitResult::ode_linear_exact` reports the path the fit actually ran, including when
+/// a caller's `FitOptions::ode_method` moves a linear model off it — the one way the parse-time
+/// verdict and the fit can disagree, and the reason the flag is read inside the armed fit.
+#[test]
+fn the_fit_reports_whether_the_exact_linear_path_ran() {
+    let linear = parse_model_string(LINEAR_SOURCE).expect("linear model parses");
+    let pop = population();
+    let ran_exact = |model: &CompiledModel, opts: &FitOptions| {
+        fit(model, &pop, &model.default_params, opts)
+            .expect("the evaluation must succeed")
+            .ode_linear_exact
+    };
+    assert!(ran_exact(&linear, &eval_opts()), "auto on a linear model");
+    let integrated = FitOptions {
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..eval_opts()
+    };
+    assert!(
+        !ran_exact(&linear, &integrated),
+        "a caller's ode_method = rk45 must take the linear model off the exact path"
+    );
+    assert!(
+        !ran_exact(&ode_model(""), &eval_opts()),
+        "the saturable fixture is integrated"
+    );
+}
+
+/// The same 1-cpt model as [`ode_model`] with plain first-order elimination — linear.
+const LINEAR_SOURCE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#;

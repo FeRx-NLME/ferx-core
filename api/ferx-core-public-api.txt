@@ -3153,6 +3153,7 @@ pub ferx_core::types::FitResult::neural_networks: alloc::vec::Vec<ferx_core::Neu
 pub ferx_core::types::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)>
+pub ferx_core::types::FitResult::ode_linear_exact: bool
 pub ferx_core::types::FitResult::ofv: f64
 pub ferx_core::types::FitResult::ofv_data: f64
 pub ferx_core::types::FitResult::ofv_prior: f64
@@ -4658,6 +4659,7 @@ pub ferx_core::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetw
 pub ferx_core::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
+pub ferx_core::FitResult::ode_linear_exact: bool
 pub ferx_core::FitResult::ofv: f64
 pub ferx_core::FitResult::ofv_data: f64
 pub ferx_core::FitResult::ofv_prior: f64
