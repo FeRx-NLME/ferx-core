@@ -281,9 +281,13 @@ Practical notes:
   weakly-identified subject that would have been listed under
   `imp_low_ess_threshold` may no longer trip it — read the low-ESS diagnostic with
   that in mind when $\alpha > 0$.
-- **Sobol QMC is disabled** while the mixture is active (the per-sample
-  broad/narrow branch breaks the quasi-random sequence); IMPMAP emits a warning
-  if you set both `impmap_sobol = true` and `imp_defensive_alpha > 0`.
+- **Sobol QMC still applies** while the mixture is active (#1965): with
+  `impmap_sobol` / `imp_sobol` on, a dedicated quasi-random coordinate picks
+  each draw's component, so the broad fraction is stratified (within one draw
+  of αK when K is a power of two) instead of binomial, and both components take their normals from the
+  same Sobol point. Under `imp_sobol` the Student-t proposal is limited to
+  `imp_proposal_df ≤ 1000` (use `normal` beyond that) and a draw to 1000
+  quasi-random coordinates; both are checked when the fit starts.
 - For an IMPMAP stage the option may also be written `impmap_defensive_alpha`
   (an alias for the same field).
 

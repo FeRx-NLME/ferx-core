@@ -451,11 +451,7 @@ pub fn run_impmap(
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
-    // Sobol quasi-random draws are only implemented for the multivariate-normal
-    // (`impmap_proposal_df = normal`) proposal; the Student-t default makes the
-    // option a silent no-op, so flag the mismatch rather than ignore it.
-    let use_sobol = options.impmap_sobol && nu.is_infinite();
-    let mut result = run_mcem(
+    run_mcem(
         model,
         population,
         init_params,
@@ -471,31 +467,12 @@ pub fn run_impmap(
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
         options.impmap_mceta,
-        use_sobol,
+        // Sobol now drives every proposal form — MVN, Student-t, and the
+        // defensive mixture (#1965) — so there is no combination to warn about.
+        options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
-    )?;
-    if options.impmap_sobol && !use_sobol {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
-             (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
-             proposal — set `impmap_proposal_df = normal` to use them."
-                .to_string(),
-        );
-    }
-    // Sobol is also silently disabled when the defensive mixture is active: the
-    // broad/narrow per-sample branch breaks the quasi-random sequence, so the
-    // sampler falls back to plain Monte Carlo. Surface that rather than ignore it
-    // (issue #528).
-    if use_sobol && options.imp_defensive_alpha > 0.0 {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the defensive mixture is active \
-             (`imp_defensive_alpha > 0`). Quasi-random draws are disabled when sampling from the \
-             broad/narrow mixture — set `imp_defensive_alpha = 0` to use Sobol draws."
-                .to_string(),
-        );
-    }
-    Ok(result)
+    )
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
@@ -524,11 +501,61 @@ pub fn run_imp(
         options.imp_averaging,
         options.imp_seed.unwrap_or(12345),
         options.imp_low_ess_threshold,
-        0,     // mceta: no multi-start MAP for IMP
-        false, // use_sobol: IMP has no Sobol option
+        0, // mceta: no multi-start MAP for IMP
+        options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
     )
+}
+
+/// Refuse a Sobol configuration the quasi-random sampler cannot serve, instead
+/// of letting `Sobol::new` panic or drawing from a wrong t (#1965):
+///
+/// - a draw spends `n_eta` coordinates on the normals, one more on the
+///   Student-t scale when ν is finite, and one more on the mixture component
+///   when the defensive mixture is on — at most `SOBOL_MAX_DIMS` in total;
+/// - the t scale comes from `chi_squared_inv_cdf`, validated only up to
+///   `CHI_SQ_INV_MAX_NU`; a t with more degrees of freedom is a normal for
+///   every practical purpose, so the message points there.
+fn check_sobol_config(
+    label: &str,
+    df_key: &str,
+    n_eta: usize,
+    use_sobol: bool,
+    nu: f64,
+    mixture: bool,
+) -> Result<(), String> {
+    use crate::estimation::importance_sampling::SOBOL_MAX_DIMS;
+    use crate::stats::special::CHI_SQ_INV_MAX_NU;
+    if !use_sobol {
+        return Ok(());
+    }
+    let dims = n_eta + usize::from(nu.is_finite()) + usize::from(mixture);
+    if dims > SOBOL_MAX_DIMS {
+        return Err(format!(
+            "{label}: Sobol draws need {dims} quasi-random coordinates here ({n_eta} random \
+             effects{}{}) but support at most {SOBOL_MAX_DIMS}; turn off `impmap_sobol` / \
+             `imp_sobol`.",
+            if nu.is_finite() {
+                " + the Student-t scale"
+            } else {
+                ""
+            },
+            if mixture {
+                " + the defensive-mixture component"
+            } else {
+                ""
+            },
+        ));
+    }
+    if nu.is_finite() && nu > CHI_SQ_INV_MAX_NU {
+        return Err(format!(
+            "{label}: Sobol draws support a Student-t proposal with at most \
+             {CHI_SQ_INV_MAX_NU} degrees of freedom (`{df_key}` = {nu}); a t that wide is \
+             a normal in practice — set `{df_key} = normal`."
+        ));
+    }
+    Ok(())
 }
 
 /// Shared Monte-Carlo EM core for IMP and IMPMAP. The `recenter` strategy is the
@@ -560,6 +587,14 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
+    check_sobol_config(
+        label,
+        df_key,
+        n_eta,
+        use_sobol,
+        nu,
+        options.imp_defensive_alpha > 0.0,
+    )?;
     // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
     // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
     // mixture core, which reuses this function's option resolution via the same
@@ -4228,6 +4263,49 @@ mod tests {
             multi.nll,
             baseline.nll
         );
+    }
+
+    /// The Sobol config guard (#1965), each boundary on its own: the
+    /// coordinate count is exactly `n_eta` + (t) + (mixture), so every
+    /// proposal form is admitted up to the table's 1000 coordinates and refused
+    /// one beyond; and the t degrees of freedom stop at `CHI_SQ_INV_MAX_NU`.
+    /// The messages name the count, the limit and the switch to flip.
+    #[test]
+    fn sobol_config_guard_counts_the_coordinates_each_form_uses() {
+        let inf = f64::INFINITY;
+        for (t, mix, n_ok) in [
+            (false, false, 1000),
+            (true, false, 999),
+            (false, true, 999),
+            (true, true, 998),
+        ] {
+            let nu = if t { 4.0 } else { inf };
+            let tag = format!("t={t} mixture={mix}");
+            assert!(
+                check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok, true, nu, mix).is_ok(),
+                "{tag}"
+            );
+            let e = check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok + 1, true, nu, mix)
+                .unwrap_err();
+            assert!(
+                e.contains("1001") && e.contains("1000") && e.contains("impmap_sobol"),
+                "{tag}: {e}"
+            );
+        }
+        assert!(
+            check_sobol_config("IMPMAP", "impmap_proposal_df", 5000, false, 4.0, true).is_ok(),
+            "no limit without Sobol"
+        );
+
+        let nu_max = crate::stats::special::CHI_SQ_INV_MAX_NU;
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max, false).is_ok());
+        let e =
+            check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max * 2.0, false).unwrap_err();
+        assert!(
+            e.contains("imp_proposal_df = normal") && e.contains("2000"),
+            "{e}"
+        );
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, false, 1e9, false).is_ok());
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),

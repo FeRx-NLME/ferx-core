@@ -4312,6 +4312,7 @@ fn test_imp_method_and_imp_options_parse() {
         "imp_proposal_df = 4.0".to_string(),
         "imp_seed = 99".to_string(),
         "imp_low_ess_threshold = 0.2".to_string(),
+        "imp_sobol = true".to_string(),
         "covariance = false".to_string(),
         "verbose = false".to_string(),
     ])
@@ -4320,6 +4321,8 @@ fn test_imp_method_and_imp_options_parse() {
         opts.methods,
         vec![EstimationMethod::FoceI, EstimationMethod::Imp]
     );
+    // #1965: `imp_sobol` lands on its own field, not IMPMAP's.
+    assert!(opts.imp_sobol && !opts.impmap_sobol);
     assert_eq!(opts.imp_samples, 500);
     assert_eq!(opts.imp_proposal_df, 4.0);
     assert_eq!(opts.imp_seed, Some(99));
@@ -4440,6 +4443,10 @@ fn test_impmap_options_parse_and_validate() {
     assert_eq!(opts.impmap_seed, Some(77));
     assert_eq!(opts.impmap_low_ess_threshold, 0.2);
     assert_eq!(opts.impmap_mceta, 3);
+    assert!(
+        !opts.impmap_sobol && !opts.imp_sobol,
+        "Sobol is opt-in for both methods"
+    );
     // All keys are method-specific to Impmap and Impmap is selected.
     assert!(opts.unsupported_keys_warnings().is_empty());
 
