@@ -1909,8 +1909,10 @@ fn value_slope_loadings(
 }
 
 /// Which rows' diagonal residual variance sits on the `MIN_VARIANCE` floor, decided by
-/// the same `variance_at_scaled` the dense `R` builders put on the diagonal (an empty
-/// `mult` row is the bare-σ `variance_at_with_correlations`). On such a row `R_mm` is
+/// the same call the dense `R` builders put on the diagonal: `variance_at_scaled` under
+/// a magnitude, else `variance_at_with_correlations` — whose legacy `(f·σ)·(f·σ)`
+/// association (with no `block_sigma` pair) differs from `variance_at_scaled`'s by an
+/// ULP, enough to flip the floor decision at the boundary. On such a row `R_mm` is
 /// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
 /// diagonal self-terms — the floor gate `ErrorSpec::dvar_df` applies on the diagonal
 /// path (#958). Off-diagonal entries are never floored and keep their terms.
@@ -1925,12 +1927,19 @@ fn floored_rows(
     (0..ipreds.len())
         .map(|j| {
             let cmt = obs_cmts.get(j).copied().unwrap_or(0);
-            let row = mult
-                .and_then(|m| m.get(j))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
-                <= MIN_VARIANCE
+            let v = match mult {
+                Some(m) => {
+                    let row = m.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                    error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
+                }
+                None => error_spec.variance_at_with_correlations(
+                    cmt,
+                    ipreds[j],
+                    sigma_values,
+                    correlations,
+                ),
+            };
+            v <= MIN_VARIANCE
         })
         .collect()
 }

@@ -881,3 +881,68 @@ fn dense_derivatives_drop_a_floored_diagonal() {
         "live row lost its diagonal terms"
     );
 }
+
+/// #1995 review round 2: the visitors' floor decision must be the `R` builder's own, to
+/// the ULP. A serial (no `block_sigma` pair) bare-σ `R` puts `variance_at`'s legacy
+/// `(f·σ)·(f·σ)` on its diagonal, which differs from `variance_at_scaled`'s
+/// `((f·f)·σ)·σ` by an ULP. At this `(f, σ)` — found by a bit scan — the legacy form is
+/// on the floor and the scaled one is not, asserted below so the fixture cannot drift
+/// off the boundary. A visitor deciding with the scaled form keeps `∂R_11/∂f_1` and
+/// `∂²R_11/∂f_1²` on a row the objective holds constant.
+#[test]
+fn dense_derivatives_floor_decision_matches_the_builder_to_the_ulp() {
+    let es = ErrorSpec::Single(crate::types::ErrorModel::Proportional);
+    let sigma = [0.0922368140484057_f64];
+    let f_edge = 1.0841658076732811e-05_f64;
+    assert!(es.variance_at_with_correlations(1, f_edge, &sigma, &[]) <= MIN_VARIANCE);
+    assert!(es.variance_at_scaled(1, f_edge, &sigma, &[], &[]) > MIN_VARIANCE);
+    let c = cov(ResidualSerialKind::Ar1, 0.4);
+    let mut f = IPREDS;
+    f[1] = f_edge;
+    let cmts = [1usize; 6];
+    let r = compute_r_matrix_with_correlations_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+    );
+    assert_eq!(r[(1, 1)], MIN_VARIANCE, "the builder floors row 1");
+    let dc = compute_dr_df_columns_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    let (_, y) = compute_d2r_df2_compact_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    assert_eq!(dc[(1, 1)], 0.0, "∂R_11/∂f_1 on a floored row");
+    assert_eq!(y[(1, 1)], 0.0, "∂²R_11/∂f_1² on a floored row");
+    assert!(
+        dc[(0, 0)] > 0.0 && y[(0, 0)] > 0.0,
+        "live row 0 keeps its terms"
+    );
+}
