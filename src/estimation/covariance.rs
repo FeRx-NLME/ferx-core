@@ -1249,6 +1249,42 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     )
 }
 
+/// Test-only record of every [`reconverge_population`] call (#1935): one population objective
+/// per call, with the population it covered and whether its subjects were re-solved in
+/// parallel. Process-global, because the calls run on rayon workers; tests run concurrently,
+/// so a test tags its subjects' ids with a unique prefix and reads back only its own entries.
+#[cfg(test)]
+pub(super) mod reconverge_log {
+    use crate::types::Population;
+    use std::sync::Mutex;
+
+    /// `(first subject id, subject count, parallel_subjects)` per call.
+    static CALLS: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
+
+    pub(in crate::estimation) fn record(pop: &Population, parallel_subjects: bool) {
+        let id = pop
+            .subjects
+            .first()
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+        CALLS
+            .lock()
+            .unwrap()
+            .push((id, pop.subjects.len(), parallel_subjects));
+    }
+
+    /// Remove and return `(subject count, parallel_subjects)` for every call whose first
+    /// subject id starts with `prefix`.
+    pub(in crate::estimation) fn take(prefix: &str) -> Vec<(usize, bool)> {
+        let mut calls = CALLS.lock().unwrap();
+        let (mine, rest): (Vec<_>, Vec<_>) = calls
+            .drain(..)
+            .partition(|(id, _, _)| id.starts_with(prefix));
+        *calls = rest;
+        mine.into_iter().map(|(_, n, p)| (n, p)).collect()
+    }
+}
+
 /// Re-solve the inner EBE loop for every subject of `pop` at the packed point `xv`,
 /// warm-started from `warm[i]`.
 ///
@@ -1256,13 +1292,23 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
 /// step; holding η̂/H fixed gives a Hessian with the wrong curvature — indefinite even on
 /// warfarin, which previously forced eigenvalue clipping (#129) and inflated the SEs.
 ///
-/// `parallel_subjects` picks the loop. Inside the stencil and the step probe it is `false`:
-/// those parallelise over perturbed POINTS, and nested parallelism is what #256 removed. At a
-/// single point evaluated on its own — the base reconvergence at `x̂` and the salvage route's
-/// subset base — there is no point loop to parallelise, so it is `true`; before #1935 those
-/// ran on one thread and were over half of a 16-thread covariance step. `find_ebe` is
-/// deterministic per subject and `collect()` keeps subject order, so both loops return the
-/// same EBEs bit for bit and `pop_nll`'s summation order is unchanged (#703).
+/// `parallel_subjects` picks the loop for the EBE re-solve, the dominant cost of a point.
+/// Inside the stencil and the step probe it is `false`: those parallelise over perturbed
+/// POINTS, and a per-point subject fork/join is what #256 removed. At a single point evaluated
+/// on its own — the base reconvergence at `x̂` and the salvage route's subset base — there is
+/// no point loop to parallelise, so it is `true`; before #1935 those ran on one thread and
+/// were over half of a 16-thread covariance step. `find_ebe` is deterministic per subject and
+/// `collect()` keeps subject order, so both loops return the same EBEs bit for bit and
+/// `pop_nll`'s summation order is unchanged (#703).
+///
+/// This flag does not reach the scoring pass that follows: `pop_nll_opts` keeps its own
+/// subject `par_iter` (size-gated by `parallelize_cheap_subject_pass` for FOCE/FOCEI,
+/// unconditional for AGQ), so at a point inside the stencil or probe that pass still nests in
+/// the point loop. That is the stencil's arrangement since #256, which the probe now shares;
+/// rayon's work-stealing runs a nested `par_iter` inline when no worker is idle.
+///
+/// Under `cfg(test)` every call is logged (`reconverge_log`), so a test can pin how many
+/// population objectives a covariance step ran and which of them reconverged in parallel.
 ///
 /// The covariance step reconverges at its own tolerance (`cov_inner_tol`), decoupled from the
 /// fit's `inner_tol`: the second-difference-of-OFV R-matrix is far more sensitive to EBE
@@ -1292,6 +1338,8 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
+    #[cfg(test)]
+    reconverge_log::record(pop, parallel_subjects);
     let params = unpack_params(xv, template);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let solve = |i: usize| {
@@ -4108,5 +4156,80 @@ mod tests {
                 );
             }
         }
+    }
+    /// #1935: a probe pass evaluates its points concurrently. Nothing numerical can see this
+    /// — a serial pass returns the same values — so the witness is overlap itself: each
+    /// evaluation waits (up to 1 s) for a second one to be in flight at the same time. A
+    /// serial pass (`par_iter` → `iter`, the pre-#1935 loop) never overlaps, every call times
+    /// out, and the assertion fails.
+    #[test]
+    fn the_step_probe_evaluates_its_pass_concurrently() {
+        use super::select_fd_step;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let opts = crate::types::FitOptions::default();
+        let active = AtomicUsize::new(0);
+        let overlapped = AtomicBool::new(false);
+        let ofv = |x: &[f64]| -> f64 {
+            active.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while active.load(Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(1) {
+                std::thread::yield_now();
+            }
+            if active.load(Ordering::SeqCst) >= 2 {
+                overlapped.store(true, Ordering::SeqCst);
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            x.iter().map(|v| v * v).sum()
+        };
+        let x_hat = [0.5f64, -1.0, 2.0];
+        let f0 = ofv(&x_hat);
+        overlapped.store(false, Ordering::SeqCst);
+        let step = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| select_fd_step(&x_hat, &[0, 1, 2], 1e-2, f0, &ofv, &opts));
+        assert_eq!(step.n_halvings, 0);
+        assert!(
+            overlapped.load(Ordering::SeqCst),
+            "no two probe points were ever in flight together: the pass ran serially"
+        );
+    }
+
+    /// A cancel stops the FD Hessian route from evaluating further points. The objective sets
+    /// the token on its first call; points already past their cancel check finish, so at most
+    /// one per worker is evaluated, against the `2·n_free = 8` of a full probe pass (or the
+    /// `2·n_free² = 32` of the whole route) a missing per-point check would let through.
+    #[test]
+    fn a_cancelled_fd_hessian_stops_evaluating_points() {
+        use super::fd_ofv_hessian;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const THREADS: usize = 2;
+        let flag = crate::cancel::CancelFlag::new();
+        let opts = crate::types::FitOptions {
+            cancel: Some(flag.clone()),
+            ..Default::default()
+        };
+        let calls = AtomicUsize::new(0);
+        let ofv = |x: &[f64]| -> f64 {
+            calls.fetch_add(1, Ordering::SeqCst);
+            flag.cancel();
+            x.iter().map(|v| v * v).sum()
+        };
+        let x_hat = [0.5f64, -1.0, 2.0, 0.25];
+        let got = rayon::ThreadPoolBuilder::new()
+            .num_threads(THREADS)
+            .build()
+            .unwrap()
+            .install(|| fd_ofv_hessian(4, &x_hat, &[0, 1, 2, 3], 1e-2, 1.0, &ofv, &opts));
+        assert!(got.is_none(), "a cancelled step must not return a Hessian");
+        let n = calls.load(Ordering::SeqCst);
+        assert!(
+            (1..=THREADS).contains(&n),
+            "{n} objective evaluations after the first call cancelled (at most {THREADS})"
+        );
     }
 }

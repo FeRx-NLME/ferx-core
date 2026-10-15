@@ -7061,8 +7061,10 @@ mod tests {
     /// has to be bit-identical at 1 and at 4 threads (#703's reproducibility guarantee).
     ///
     /// One cell per route that reaches the changed code: the whole-population stencil on a
-    /// non-IOV and an IOV model (`analytic_cov_hessian = false` forces the stencil), and the
-    /// #1514 salvage route, whose subset base `f0_fd` is the third parallelised call. Each run
+    /// non-IOV, an AGQ and an IOV model (`analytic_cov_hessian = false` forces the stencil),
+    /// and the #1514 salvage route, whose subset base `f0_fd` is the third parallelised call.
+    /// Mixture fits are not covered: their base point goes through `mixture_ofv`, which this
+    /// PR does not touch, and only their probe pass became parallel. Each run
     /// asserts its route, so a fixture that drifted onto the analytic path cannot pass by
     /// never reaching the stencil.
     #[test]
@@ -7106,13 +7108,26 @@ mod tests {
             &Population,
             &ModelParameters,
             FitOptions,
-        ); 3] = [
+        ); 4] = [
             (
                 "non-IOV stencil",
                 &plain,
                 &plain_pop,
                 &plain_params,
                 opts(false),
+            ),
+            (
+                // AGQ scores through `agq_population_nll`, whose subject `par_iter` is not
+                // size-gated, so this is the cell where the probe's point loop always nests a
+                // second parallel loop.
+                "AGQ stencil",
+                &plain,
+                &plain_pop,
+                &plain_params,
+                FitOptions {
+                    n_agq: 3,
+                    ..opts(false)
+                },
             ),
             (
                 "IOV stencil",
@@ -7184,5 +7199,124 @@ mod tests {
             );
             assert_eq!(one, four, "{label}: 1 and 4 threads must agree bit for bit");
         }
+    }
+    /// #1935 at the production call sites, not just in `fd_ofv_hessian`: the population
+    /// objectives one `compute_covariance` runs, and which of them re-solve their subjects in
+    /// parallel, read back from the `cfg(test)` log in `reconverge_population`.
+    ///
+    /// Whole-population stencil: one parallel base reconvergence at `x̂`, then `2·n_free²`
+    /// serial points — the probe's pass and the off-diagonal stencil, the diagonal not
+    /// evaluated a second time. Salvage route (#1514): the whole-population base (parallel),
+    /// the declined subject's own base `f0_fd` (parallel), then `2·n_free²` serial points over
+    /// that subject alone.
+    ///
+    /// Each production edit this exists to catch moves a count here: calling `select_fd_step`
+    /// + `fd_ofv_stencil(…, None, …)` instead of `fd_ofv_hessian` adds `2·n_free` serial
+    /// points; flipping the base point's or `f0_fd`'s `parallel_subjects` to `false` (the
+    /// pre-#1935 behaviour) moves its entry to the serial column; flipping the stencil's to
+    /// `true` reintroduces #256's per-point fork/join and empties the serial column.
+    #[test]
+    fn the_covariance_step_runs_one_parallel_base_and_2nf2_serial_points() {
+        use crate::estimation::covariance::{
+            compute_covariance, reconverge_log, CovarianceStepResult,
+        };
+        use crate::estimation::parameterization::pack_with_bounds;
+        use crate::types::{CovarianceMethod, EstimationMethod, FitOptions, Population};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta = vec![0.2, 10.0, 1.5];
+        let x_hat = pack_params(&params);
+        let nf = {
+            let packed = pack_with_bounds(&params);
+            (0..x_hat.len()).filter(|&i| !packed.fixed[i]).count()
+        };
+        assert!(
+            nf >= 3,
+            "the fixture must have a real off-diagonal block: nf = {nf}"
+        );
+
+        // Unique id prefixes: the log is process-global and tests run concurrently.
+        let tagged = |n: usize, tag: &str| -> Population {
+            let mut pop = salvage_population(&model, &params, n);
+            for (k, s) in pop.subjects.iter_mut().enumerate() {
+                s.id = format!("{tag}{k}");
+            }
+            pop
+        };
+        let whole_pop = tagged(4, "t1935-whole-");
+        let mut salvage_pop = tagged(6, "t1935-salvage-");
+        force_per_subject_decline(&mut salvage_pop.subjects[2]);
+        // The salvaged subject's subset starts with its own id, so its calls need a prefix
+        // that the whole-population calls (first id `…-0`) do not share.
+        salvage_pop.subjects[2].id = "t1935-salvage-declined".into();
+
+        let opts = |analytic: bool| FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            analytic_cov_hessian: analytic,
+            covariance_method: CovarianceMethod::Hessian,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let run = |pop: &Population, o: &FitOptions| {
+            let etas: Vec<DVector<f64>> = pop
+                .subjects
+                .iter()
+                .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+                .collect();
+            let n = pop.subjects.len();
+            let h = vec![DMatrix::zeros(model.n_eta, model.n_eta); n];
+            match compute_covariance(&x_hat, &params, &model, pop, &etas, &h, &vec![vec![]; n], o) {
+                CovarianceStepResult::Success(_) => {}
+                CovarianceStepResult::Unusable(m) => panic!("{m}"),
+                CovarianceStepResult::FailedNonPd { reason, .. } => panic!("{reason}"),
+            }
+        };
+        let tally = |calls: &[(usize, bool)], n: usize, parallel: bool| {
+            calls.iter().filter(|&&c| c == (n, parallel)).count()
+        };
+
+        run(&whole_pop, &opts(false));
+        let calls = reconverge_log::take("t1935-whole-");
+        assert_eq!(
+            tally(&calls, 4, true),
+            1,
+            "whole: one parallel base point: {calls:?}"
+        );
+        assert_eq!(
+            tally(&calls, 4, false),
+            2 * nf * nf,
+            "whole: 2·n_free² serial stencil + probe points (n_free = {nf})"
+        );
+        assert_eq!(
+            calls.len(),
+            1 + 2 * nf * nf,
+            "whole: nothing else: {calls:?}"
+        );
+
+        run(&salvage_pop, &opts(true));
+        let whole_calls = reconverge_log::take("t1935-salvage-0");
+        let subset_calls = reconverge_log::take("t1935-salvage-declined");
+        assert_eq!(
+            whole_calls,
+            vec![(6, true)],
+            "salvage: the only whole-population objective is the parallel base point"
+        );
+        assert_eq!(
+            tally(&subset_calls, 1, true),
+            1,
+            "salvage: one parallel f0_fd"
+        );
+        assert_eq!(
+            tally(&subset_calls, 1, false),
+            2 * nf * nf,
+            "salvage: 2·n_free² serial points over the declined subject (n_free = {nf})"
+        );
+        assert_eq!(
+            subset_calls.len(),
+            1 + 2 * nf * nf,
+            "salvage: {subset_calls:?}"
+        );
     }
 }
