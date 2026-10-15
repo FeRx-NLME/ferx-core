@@ -231,7 +231,7 @@ dominates, the total wall-time increase is typically 15–40%.
 ## Quasi-random draws (`impmap_sobol`)
 
 `impmap_sobol = true` builds every importance sample from one point of a Sobol
-sequence (Cranley–Patterson randomized by `impmap_seed`), instead of the
+sequence (Owen-scrambled, keyed by `impmap_seed`), instead of the
 pseudo-random stream. This is the sampling idea behind Phoenix's QRPEM. Every
 random number a draw uses comes from that point:
 
@@ -276,16 +276,31 @@ the 6-ETA model:
 
 | model (ETAs) | K | t₄ SD | t₄ + Sobol SD |
 |---|---|---|---|
-| warfarin (3) | 300 | 4.2e-5 | 6.7e-7 |
-| sparse 2-cpt IV (3, block) | 300 | 0.0099 | 0.0050 |
-| 3-cpt IV (6) | 300 | 0.0034 | 0.0007 |
+| warfarin (3) | 300 | 4.0e-5 | 2.0e-6 |
+| sparse 2-cpt IV (3, block) | 300 | 0.0099 | 0.0037 |
+| 3-cpt IV (6) | 300 | 0.0034 | 0.0004 |
+| 2-cpt oral + covariates (3) | 300 | 0.0014 | 0.0010 |
+
+The scramble matters. Until the second #1965 change, the Sobol points were
+randomized by one random shift per coordinate (Cranley–Patterson). Owen
+scrambling keeps the points' stratification under randomization, and in the same
+benchmark it cut the spread a further 1.3–2.2× against the shift on the three
+models above the warfarin noise floor. On a smooth test integrand its error fell
+6.9× from K = 256 to K = 1024, against 4.5× for the shift.
+
+**At the default settings the gain is small.** `impmap_sobol` stays off by
+default. With `impmap_auto` growing K up to 10000, the spread across 10 seeds was
+already at most 0.004 without Sobol, against a Monte Carlo error of 0.05–0.24 in
+the −2LL itself. Sobol halved it on two of the four models and slightly widened
+it on `two_cpt_oral_cov`. Turn it on when you run a fixed, small K.
 
 Scripts and full tables are in `bench/qrpem_1965/` in the repository.
 
 **What it does not fix.** Sobol reduces integration noise only. On a model whose
 spread across seeds comes from a subject's MAP sitting in the wrong mode, it
 changes nothing; use [`impmap_mceta`](#multi-start-map-impmap_mceta) for that.
-In the same benchmark on `two_cpt_oral_cov`:
+In the same benchmark on `two_cpt_oral_cov`, before the cold re-solve
+described [above](#impmap-stale-warm-start) existed:
 
 - every IMPMAP arm, Sobol or not, at any K, spread about 1.7 across seeds;
 - `impmap_mceta = 3` brought that down to 0.004.

@@ -30,7 +30,7 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-FERX = os.path.join(ROOT, "target", "release", "ferx")
+FERX = os.environ.get("FERX_BIN", os.path.join(ROOT, "target", "release", "ferx"))
 RUNS = os.environ.get("BENCH_RUNS", os.path.join(HERE, "runs"))
 THREADS = 2
 
@@ -79,11 +79,52 @@ def arm_options(arm, seed, k):
         return [o for o in IMPMAP_COMMON if not o.startswith("impmap_iterations")] + [
             "impmap_iterations = 600", f"impmap_samples = {k}", "impmap_proposal_df = normal",
             f"impmap_seed = {seed}"]
+    # Phase 2 (#1965): scrambling and common random numbers, on the default
+    # t(4) proposal. The variant is picked by the bench-only environment
+    # toggles in `arm_env`, so the [fit_options] equal the base arm's.
+    if arm in PHASE2_ENV:
+        base = "impmap_t4_sobol" if "sobol" in arm or "owen" in arm else "impmap_t4"
+        return arm_options(base, seed, k)
+    # Phase 4 (#1965): IMPMAP at its *default* settings (adaptive K, default
+    # iterations and averaging), with and without Sobol.
+    if arm == "impmap_default":
+        return ["method = impmap", f"impmap_seed = {seed}"]
+    if arm == "impmap_default_sobol":
+        return ["method = impmap", "impmap_sobol = true", f"impmap_seed = {seed}"]
     if arm == "saem":
         return ["method = saem", f"seed = {seed}"]
     if arm == "focei":
         return ["method = focei", "maxiter = 500"]
     raise ValueError(arm)
+
+
+# Phase 2 arms -> bench-only env toggles (FERX_BENCH_OWEN: Owen scrambling
+# instead of the Cranley-Patterson shift; FERX_BENCH_CRN: the same IS points
+# every iteration). The toggles existed only in the experiment binary (see
+# README, Phase 2); production code has Owen built in and none of the rest,
+# so on a current binary `impmap_t4_sobol` is the Owen arm and these arms
+# reduce to their base arm.
+PHASE2_ENV = {
+    "impmap_t4_owen": {"FERX_BENCH_OWEN": "1"},
+    "impmap_t4_crn": {"FERX_BENCH_CRN": "1"},
+    "impmap_t4_sobol_crn": {"FERX_BENCH_CRN": "1"},
+    "impmap_t4_owen_crn": {"FERX_BENCH_OWEN": "1", "FERX_BENCH_CRN": "1"},
+    # FERX_BENCH_SIR=M: θ/σ M-step on M systematic SIR resamples per subject.
+    "impmap_t4_sir10": {"FERX_BENCH_SIR": "10"},
+    "impmap_t4_sir30": {"FERX_BENCH_SIR": "30"},
+    "impmap_t4_owen_sir10": {"FERX_BENCH_OWEN": "1", "FERX_BENCH_SIR": "10"},
+    # FERX_BENCH_SIR_BURN: SIR only before the averaging window.
+    "impmap_t4_sir10_burn": {"FERX_BENCH_SIR": "10", "FERX_BENCH_SIR_BURN": "1"},
+    "impmap_t4_owen_sir10_burn": {"FERX_BENCH_OWEN": "1", "FERX_BENCH_SIR": "10",
+                                  "FERX_BENCH_SIR_BURN": "1"},
+    # FERX_BENCH_POW2: K rounded down to a power of two under Sobol (300 -> 256).
+    "impmap_t4_owen_pow2": {"FERX_BENCH_OWEN": "1", "FERX_BENCH_POW2": "1"},
+    "impmap_t4_sobol_pow2": {"FERX_BENCH_POW2": "1"},
+}
+
+
+def arm_env(arm):
+    return {**os.environ, **PHASE2_ENV.get(arm, {})}
 
 
 ARMS = ["impmap_prng", "impmap_sobol", "impmap_t4", "saem", "focei"]
@@ -113,10 +154,10 @@ def write_model(path, template_text, opts):
         f.write(body)
 
 
-def run_ferx(model_path, data_path, cwd):
+def run_ferx(model_path, data_path, cwd, env=None):
     t0 = time.time()
     p = subprocess.run([FERX, os.path.basename(model_path), "--data", data_path],
-                       cwd=cwd, capture_output=True, text=True)
+                       cwd=cwd, capture_output=True, text=True, env=env)
     wall = time.time() - t0
     with open(os.path.join(cwd, "stdout.txt"), "w") as f:
         f.write(p.stdout)
@@ -211,7 +252,8 @@ def do_fit(model, arm, k, seed):
     tmpl, data = MODELS[model]
     text = open(os.path.join(ROOT, tmpl)).read()
     write_model(os.path.join(d, "m.ferx"), text, arm_options(arm, seed, k))
-    rc, wall, err = run_ferx(os.path.join(d, "m.ferx"), os.path.join(ROOT, data), d)
+    rc, wall, err = run_ferx(os.path.join(d, "m.ferx"), os.path.join(ROOT, data), d,
+                             env=arm_env(arm))
     res = {"model": model, "arm": arm, "k": k, "seed": seed, "rc": rc, "wall_cli": wall}
     if rc == 0:
         res["fit"] = parse_fit(os.path.join(d, "m-fit.yaml"))
@@ -326,7 +368,7 @@ def cmd_report(a):
             f"{f(st.mean(jit) if jit else None)} | {st.median(walls):.2f} | {mcse:.3f} |")
     txt = "\n".join(lines)
     print(txt)
-    open(os.path.join(HERE, "summary.md"), "w").write(txt + "\n")
+    open(os.path.join(HERE, os.environ.get("BENCH_SUMMARY", "summary.md")), "w").write(txt + "\n")
 
 
 def main():
