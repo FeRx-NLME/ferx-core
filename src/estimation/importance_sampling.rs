@@ -80,6 +80,13 @@ fn owen_scramble_u32(x: u32, seed: u32) -> u32 {
     v.reverse_bits()
 }
 
+/// Maps a 32-bit integer to the centre of its 2⁻³² cell, so the result lies
+/// strictly inside (0, 1): `0 → 2⁻³³`, `u32::MAX → 1 − 2⁻³³`. The inverse-CDF
+/// transforms downstream need both endpoints excluded.
+fn u32_to_open_unit(x: u32) -> f64 {
+    (f64::from(x) + 0.5) / 4_294_967_296.0
+}
+
 /// The Owen scramble seed of each of `dim` coordinates: a function of the fit
 /// `seed` and the coordinate index only, so coordinates scramble independently
 /// and appending coordinates leaves the earlier ones alone.
@@ -113,7 +120,7 @@ fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
             point
                 .iter()
                 .zip(seeds.iter())
-                .map(|(&x, &s)| (f64::from(owen_scramble_u32(x, s)) + 0.5) / 4_294_967_296.0)
+                .map(|(&x, &s)| u32_to_open_unit(owen_scramble_u32(x, s)))
                 .collect()
         })
         .collect()
@@ -3023,13 +3030,18 @@ mod tests {
         out.sort_unstable();
         out.dedup();
         assert_eq!(out.len(), 1 << 16, "scramble collides at full width");
-        // Each coordinate has its own scramble, and the seed moves all of them.
-        let keys = owen_coordinate_seeds(100, 1);
+        // Each of the SOBOL_MAX_DIMS admitted coordinates has its own scramble,
+        // and the seed moves all of them.
+        let keys = owen_coordinate_seeds(SOBOL_MAX_DIMS, 1);
         let mut distinct = keys.clone();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 100, "coordinates share a scramble key");
-        let other = owen_coordinate_seeds(100, 2);
+        assert_eq!(
+            distinct.len(),
+            SOBOL_MAX_DIMS,
+            "coordinates share a scramble key"
+        );
+        let other = owen_coordinate_seeds(SOBOL_MAX_DIMS, 2);
         assert!(keys.iter().zip(&other).all(|(a, b)| a != b));
         assert_eq!(owen_coordinate_seeds(3, 1)[..], keys[..3]);
         // ... and different seeds scramble the points differently.
@@ -3148,13 +3160,23 @@ mod tests {
         }
     }
 
+    /// Both ends of the integer range map strictly inside (0, 1), exactly to
+    /// the centres of the first and last 2⁻³² cells.
+    #[test]
+    fn sobol_integers_map_strictly_inside_the_unit_interval() {
+        let half_cell = 2f64.powi(-33);
+        assert_eq!(u32_to_open_unit(0), half_cell);
+        assert_eq!(u32_to_open_unit(u32::MAX), 1.0 - half_cell);
+        assert!(u32_to_open_unit(0) > 0.0 && u32_to_open_unit(u32::MAX) < 1.0);
+    }
+
     /// The guard in `impmap::check_sobol_dims` admits `SOBOL_MAX_DIMS`
     /// coordinates; the table must actually provide them.
     #[test]
     fn sobol_params_cover_the_admitted_dimension() {
         let pts = sobol_uniforms(SOBOL_MAX_DIMS, 2, 1);
         assert_eq!(pts[1].len(), SOBOL_MAX_DIMS);
-        assert!(pts[1].iter().all(|u| (0.0..1.0).contains(u)));
+        assert!(pts[1].iter().all(|&u| u > 0.0 && u < 1.0));
     }
 
     #[test]
