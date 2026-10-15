@@ -13793,6 +13793,421 @@ fn iov_zero_theta_model_walks_one_empty_chunk() {
 }
 
 // ------------------------------------------------------------------------------------------
+// #1907 — the `[individual_parameters]` program past the 24-axis dispatch.
+// ------------------------------------------------------------------------------------------
+
+/// `WARFARIN_IOV` with `n_pad` extra fixed thetas `P1..P{n_pad}`, so the program's combined
+/// width `n_theta + n_eff` is `3 + n_pad + 4`: 24 at `n_pad = 17` (the last single-chunk
+/// program), 25 at `n_pad = 18`. `P_i` enters `CL`, `V` and `KA` in turn with its own
+/// coefficient `i / 10`, so every θ column carries a different derivative and a chunk that
+/// wrote a column into the wrong θ index cannot agree with FD — a pad entering as one
+/// `exp(P1 + … + PN)` factor would give every column the same value and hide exactly that.
+fn warfarin_iov_padded(n_pad: usize) -> String {
+    let mut sums = [String::new(), String::new(), String::new()];
+    for i in 1..=n_pad {
+        sums[(i - 1) % 3].push_str(&format!(" + {:.1} * P{i}", i as f64 / 10.0));
+    }
+    let pads: String = (1..=n_pad)
+        .map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n"))
+        .collect();
+    WARFARIN_IOV
+        .replacen("  omega ETA_CL ~", &format!("{pads}  omega ETA_CL ~"), 1)
+        .replacen(
+            "exp(ETA_CL + KAPPA_CL)",
+            &format!("exp(ETA_CL + KAPPA_CL{})", sums[0]),
+            1,
+        )
+        .replacen("exp(ETA_V)", &format!("exp(ETA_V{})", sums[1]), 1)
+        .replacen("exp(ETA_KA)", &format!("exp(ETA_KA{})", sums[2]), 1)
+}
+
+/// θ for [`warfarin_iov_padded`]: the warfarin values, then `P_i = ±0.02` alternating, so
+/// every pad is live (a pad at 0 would leave its `∂²p/∂η∂θ` column degenerate) while the
+/// summed exponents stay near the warfarin parameters.
+fn warfarin_iov_padded_theta(n_pad: usize) -> Vec<f64> {
+    let mut theta = vec![0.2, 10.0, 1.5];
+    theta.extend((1..=n_pad).map(|i| if i % 2 == 0 { 0.02 } else { -0.02 }));
+    theta
+}
+
+/// A 32-axis program (28 θ, 3 η, 1 κ) is served by the closed-form IOV provider and matches
+/// FD of `predict_iov` on every block. Its θ columns run in two program chunks, `0..20` and
+/// `20..28`, so the second chunk's columns are scattered at an offset — the place a wrong
+/// index would show. Before #1907 `iov_combined_derivs_dyn` returned `None` past 24 axes and
+/// this `subject_sensitivities_iov` call panicked on `expect("supported")`, while
+/// `iov_analytical_supported` (asserted here) still said yes.
+#[test]
+fn iov_program_past_the_dispatch_width_matches_fd() {
+    let n_pad = 25;
+    let model = parse_model_string(&warfarin_iov_padded(n_pad)).expect("parse padded IOV");
+    let theta = warfarin_iov_padded_theta(n_pad);
+    let n_eff = model.n_eta + model.n_kappa;
+    assert_eq!((model.n_theta, n_eff), (28, 4));
+    assert!(
+        model.n_theta > MAX_TVCOV_AXES - n_eff,
+        "fixture must need a second program chunk"
+    );
+    assert!(iov_analytical_supported(&model));
+    assert!(analytic_outer_gradient_available(&model));
+    let subject = iov_subject();
+    let stacked = [0.12, -0.08, 0.20, 0.05, -0.10];
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    // The inner η-gradient route reads the same `deta` block off the chunked builder.
+    let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("outer");
+    let eta = subject_eta_grad_iov(&model, &subject, &theta, &stacked).expect("inner");
+    for (j, (o, e)) in sens.obs.iter().zip(&eta).enumerate() {
+        assert_eq!(o.f.to_bits(), e.f.to_bits(), "obs {j}: f");
+        for (k, (a, b)) in o.df_deta.iter().zip(&e.df_deta).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-12 * a.abs().max(1.0),
+                "obs {j} η{k}: outer {a} vs inner {b}"
+            );
+        }
+    }
+}
+
+/// The 24/25 straddle, which the old dispatch put on opposite sides: `n_pad = 18` is the
+/// `n_pad = 17` model plus one more pad, evaluated with that pad at 0 so the prediction
+/// is the same function. Every shared block must then be bit-identical — the extra θ
+/// column changes how the program is chunked, never what a column holds — and the new
+/// column itself must be live (`∂f/∂P18 = 1.8 · ∂f/∂ln KA ≠ 0`), so the pair does not pass
+/// by ignoring it.
+#[test]
+fn iov_program_one_past_the_dispatch_width_matches_its_24_axis_twin() {
+    let narrow = parse_model_string(&warfarin_iov_padded(17)).expect("parse pad17");
+    let wide = parse_model_string(&warfarin_iov_padded(18)).expect("parse pad18");
+    let n_eff = narrow.n_eta + narrow.n_kappa;
+    assert_eq!(
+        narrow.n_theta + n_eff,
+        MAX_TVCOV_AXES,
+        "narrow is one chunk"
+    );
+    assert_eq!(
+        wide.n_theta + n_eff,
+        MAX_TVCOV_AXES + 1,
+        "wide is one past it"
+    );
+    let theta_narrow = warfarin_iov_padded_theta(17);
+    let mut theta_wide = theta_narrow.clone();
+    theta_wide.push(0.0);
+    let subject = iov_subject();
+    let stacked = [0.12, -0.08, 0.20, 0.05, -0.10];
+    let a = subject_sensitivities_iov(&narrow, &subject, &theta_narrow, &stacked)
+        .expect("24-axis program");
+    let b = subject_sensitivities_iov(&wide, &subject, &theta_wide, &stacked)
+        .expect("25-axis program (None before #1907)");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let (nt, ne) = (narrow.n_theta, stacked.len());
+    for (j, (x, y)) in a.obs.iter().zip(&b.obs).enumerate() {
+        assert_eq!(x.f.to_bits(), y.f.to_bits(), "obs {j}: f");
+        assert_eq!(bits(&x.df_deta), bits(&y.df_deta), "obs {j}: df_deta");
+        assert_eq!(bits(&x.d2f_deta2), bits(&y.d2f_deta2), "obs {j}: d2f_deta2");
+        assert_eq!(
+            bits(&x.df_dtheta),
+            bits(&y.df_dtheta[..nt]),
+            "obs {j}: df_dtheta"
+        );
+        for k in 0..ne {
+            assert_eq!(
+                bits(&x.d2f_deta_dtheta[k * nt..(k + 1) * nt]),
+                bits(&y.d2f_deta_dtheta[k * (nt + 1)..k * (nt + 1) + nt]),
+                "obs {j}: d2f_deta_dtheta row {k}"
+            );
+        }
+        // P18 rides KA, as does θ_KA: ∂f/∂P18 = 1.8 · TVKA · ∂f/∂TVKA.
+        let want = 1.8 * theta_narrow[2] * x.df_dtheta[2];
+        assert!(want.abs() > 1e-6, "obs {j}: fixture must make P18 live");
+        assert!(
+            (y.df_dtheta[nt] - want).abs() <= 1e-10 * want.abs(),
+            "obs {j}: ∂f/∂P18 = {} vs {want}",
+            y.df_dtheta[nt]
+        );
+    }
+}
+
+/// `iov_combined_derivs_dyn`'s blocks do not depend on how its θ columns are chunked: the
+/// 24-axis program in one chunk and the same program split unevenly (`0..7`, `7..20`) by
+/// hand give bit-identical `deta`, `dtheta`, `d2eta` and `d2eta_theta`. Forward-mode axes
+/// are independent, so this is exact; it pins the scatter of a chunk's local column `c`
+/// to the global θ index — the second chunk is where the two differ — and the η block's
+/// offset behind the chunk.
+#[test]
+fn iov_combined_derivs_are_independent_of_the_column_chunking() {
+    let model = parse_model_string(&warfarin_iov_padded(17)).expect("parse pad17");
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    let theta = warfarin_iov_padded_theta(17);
+    let (n_theta, n_eff) = (model.n_theta, model.n_eta + model.n_kappa);
+    let n_rows = prog.pk_slots_ref().len();
+    let cov = HashMap::new();
+    let combined = [0.12, -0.08, 0.20, 0.05];
+    let one = iov_combined_derivs_dyn(prog, n_theta, n_eff, n_rows, &cov, &theta, &combined)
+        .expect("24 axes is one chunk");
+    let mut split = CombinedDerivs {
+        deta: vec![vec![0.0; n_eff]; n_rows],
+        dtheta: vec![vec![0.0; n_theta]; n_rows],
+        d2eta: vec![vec![vec![0.0; n_eff]; n_eff]; n_rows],
+        d2eta_theta: vec![vec![vec![0.0; n_theta]; n_eff]; n_rows],
+    };
+    let cols: Vec<usize> = (0..n_theta).collect();
+    iov_combined_derivs_cols::<11>(
+        prog,
+        n_eff,
+        n_rows,
+        &cov,
+        &theta,
+        &combined,
+        &cols[..7],
+        &mut split,
+    );
+    iov_combined_derivs_cols::<17>(
+        prog,
+        n_eff,
+        n_rows,
+        &cov,
+        &theta,
+        &combined,
+        &cols[7..],
+        &mut split,
+    );
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for i in 0..n_rows {
+        // Non-degenerate: every row has a live θ column in each chunk.
+        assert!(
+            one.dtheta[i][..7].iter().any(|x| *x != 0.0)
+                && one.dtheta[i][7..].iter().any(|x| *x != 0.0),
+            "row {i}: a chunk has no live θ column"
+        );
+        assert_eq!(bits(&one.deta[i]), bits(&split.deta[i]), "row {i}: deta");
+        assert_eq!(
+            bits(&one.dtheta[i]),
+            bits(&split.dtheta[i]),
+            "row {i}: dtheta"
+        );
+        for a in 0..n_eff {
+            assert_eq!(
+                bits(&one.d2eta[i][a]),
+                bits(&split.d2eta[i][a]),
+                "row {i}: d2eta[{a}]"
+            );
+            assert_eq!(
+                bits(&one.d2eta_theta[i][a]),
+                bits(&split.d2eta_theta[i][a]),
+                "row {i}: d2eta_theta[{a}]"
+            );
+        }
+    }
+}
+
+/// `WARFARIN_IOV` with `n_extra` more BSV etas on `V`, for the gate's `n_eff` clause.
+fn warfarin_iov_extra_etas(n_extra: usize) -> String {
+    let omegas: String = (1..=n_extra)
+        .map(|i| format!("  omega ETA_X{i} ~ 0.01\n"))
+        .collect();
+    let sum: String = (1..=n_extra).map(|i| format!(" + ETA_X{i}")).collect();
+    WARFARIN_IOV
+        .replacen("  kappa KAPPA_CL", &format!("{omegas}  kappa KAPPA_CL"), 1)
+        .replacen("exp(ETA_V)", &format!("exp(ETA_V{sum})"), 1)
+}
+
+/// Chunking the program's θ needs room for one θ column beside the `[η_bsv, κ]` block, so
+/// the gate admits `n_eff = 23` and declines `n_eff = 24` — where `iov_combined_derivs_dyn`
+/// returns `None` — for the θ-seeded routes only. The η-only inner route seeds no θ, so it
+/// stays analytic at 24; both sides of that scoping are asserted here.
+#[test]
+fn iov_gate_needs_one_theta_column_beside_the_eta_kappa_block() {
+    let subject = iov_subject_with_occasions(1);
+    let theta = [0.2, 10.0, 1.5];
+    for (n_extra, fits) in [(19usize, true), (20, false)] {
+        let model = parse_model_string(&warfarin_iov_extra_etas(n_extra)).expect("parse");
+        let n_eff = model.n_eta + model.n_kappa;
+        assert_eq!(n_eff, 4 + n_extra);
+        assert_eq!(
+            n_eff < MAX_TVCOV_AXES,
+            fits,
+            "the pair must straddle the cap"
+        );
+        let stacked: Vec<f64> = (0..n_eff).map(|i| 0.01 * (i as f64 + 1.0).sin()).collect();
+        assert_eq!(
+            iov_analytical_supported(&model),
+            fits,
+            "n_eff = {n_eff}: outer gate"
+        );
+        assert_eq!(
+            analytic_outer_gradient_available(&model),
+            fits,
+            "n_eff = {n_eff}: outer"
+        );
+        assert_eq!(
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).is_some(),
+            fits,
+            "n_eff = {n_eff}: the outer walk must agree with its gate"
+        );
+        assert!(
+            iov_analytical_eta_supported(&model),
+            "n_eff = {n_eff}: inner gate"
+        );
+        assert!(
+            subject_eta_grad_iov(&model, &subject, &theta, &stacked).is_some(),
+            "n_eff = {n_eff}: the η-only inner route seeds no θ"
+        );
+    }
+}
+
+/// Gate ⇒ route, swept over the program width (`n_pad` 0..=27, i.e. 7..=34 axes, across
+/// the 24/25 boundary) and the stacked width (`K` = 1, 2, 4 occasions): whenever
+/// `iov_analytical_supported` admits the model, both the outer walk and the inner η route
+/// serve the subject. Before #1907 every `n_pad ≥ 18` cell broke the implication.
+#[test]
+fn iov_gate_implies_route_across_the_program_width() {
+    for n_pad in 0..=27 {
+        let model = parse_model_string(&warfarin_iov_padded(n_pad)).expect("parse");
+        let theta = warfarin_iov_padded_theta(n_pad);
+        assert!(iov_analytical_supported(&model), "n_pad = {n_pad}: gate");
+        for k in [1usize, 2, 4] {
+            let subject = iov_subject_with_occasions(k);
+            let stacked: Vec<f64> = (0..model.n_eta + k * model.n_kappa)
+                .map(|i| 0.1 * (i as f64 * 0.7 + 0.3).sin())
+                .collect();
+            let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked);
+            assert!(
+                sens.is_some(),
+                "n_pad = {n_pad}, K = {k}: outer walk declined"
+            );
+            assert!(
+                sens.unwrap()
+                    .obs
+                    .iter()
+                    .all(|o| o.f.is_finite() && o.df_dtheta.iter().all(|x| x.is_finite())),
+                "n_pad = {n_pad}, K = {k}: non-finite sensitivity"
+            );
+            assert!(
+                subject_eta_grad_iov(&model, &subject, &theta, &stacked).is_some(),
+                "n_pad = {n_pad}, K = {k}: inner route declined"
+            );
+        }
+    }
+}
+
+/// `base` padded with `n_pad` fixed thetas `P_i`, entering `CL` and `V` in turn with
+/// coefficient `i / 10` (the [`warfarin_iov_padded`] scheme on the two parameters every
+/// closed-form IOV fixture carries). `theta` gains `P_i = ±0.02`, alternating.
+fn pad_iov_fixture(base: &str, theta: &[f64], n_pad: usize) -> (String, Vec<f64>) {
+    let mut sums = [String::new(), String::new()];
+    for i in 1..=n_pad {
+        sums[(i - 1) % 2].push_str(&format!(" + {:.1} * P{i}", i as f64 / 10.0));
+    }
+    let pads: String = (1..=n_pad)
+        .map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n"))
+        .collect();
+    let text = base
+        .replacen("  omega ETA_CL ~", &format!("{pads}  omega ETA_CL ~"), 1)
+        .replacen(
+            "exp(ETA_CL + KAPPA_CL)",
+            &format!("exp(ETA_CL + KAPPA_CL{})", sums[0]),
+            1,
+        )
+        .replacen("exp(ETA_V)", &format!("exp(ETA_V{})", sums[1]), 1);
+    let mut theta = theta.to_vec();
+    theta.extend((1..=n_pad).map(|i| if i % 2 == 0 { 0.02 } else { -0.02 }));
+    (text, theta)
+}
+
+/// The chunked program evaluator under every closed-form IOV feature that reads the program
+/// output: TV covariates (one program evaluation per covariate row), `obs_scale` (plain and
+/// TV-cov), a Form C readout, a `TIME` readout, and `init(...)`. For each, the gate implies
+/// both routes serve the subject across 0..=27 pads, and at 25 pads — two θ chunks, past 24
+/// axes on every fixture — the outer provider matches FD of `predict_iov` and the inner η
+/// route equals the outer's. Before #1907 every one of these declined past 24 axes under a
+/// true gate. The `obs_scale` and `init` cases also pin the inner scale / amount program past
+/// 24 θ, which `eval_scale_dual1` once held in a 24-wide stack buffer. Runs on the fit's own
+/// 32 MiB stack (`api::FIT_RAYON_STACK_SIZE`): in debug the readout walk's `Dual2<M>` frames
+/// outgrow the 2 MiB default test thread (measured at 15 θ on the binding-readout fixture).
+#[test]
+fn iov_variants_past_the_dispatch_width_match_fd() {
+    std::thread::Builder::new()
+        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
+        .spawn(iov_variants_past_the_dispatch_width_body)
+        .expect("spawn wide-stack test thread")
+        .join()
+        .expect("IOV variant sweep panicked");
+}
+
+fn iov_variants_past_the_dispatch_width_body() {
+    let cases: [(&str, &str, &[f64], Subject); 7] = [
+        ("plain", WARFARIN_IOV, &[0.2, 10.0, 1.5], iov_subject()),
+        (
+            "tvcov",
+            WARFARIN_IOV_TVCOV,
+            &[0.2, 10.0, 1.5, 0.75],
+            iov_tvcov_subject(false),
+        ),
+        (
+            "expr_scale",
+            WARFARIN_IOV_EXPRSCALE,
+            &[0.2, 10.0, 1.5],
+            iov_subject(),
+        ),
+        (
+            "tvcov_expr_scale",
+            WARFARIN_IOV_TVCOV_EXPRSCALE,
+            &[0.2, 10.0, 1.5, 0.75],
+            iov_tvcov_subject(false),
+        ),
+        (
+            "binding_readout",
+            WARFARIN_IOV_BINDING_READOUT,
+            &[0.2, 10.0, 3.0, 2.0],
+            iov_subject(),
+        ),
+        (
+            "time_readout",
+            WARFARIN_IOV_TIME_READOUT,
+            &[0.2, 10.0, 0.05],
+            iov_subject(),
+        ),
+        ("init", WARFARIN_IOV_INIT, &[0.2, 10.0, 5.0], iov_subject()),
+    ];
+    for (name, base, base_theta, subject) in &cases {
+        for n_pad in 0..=27 {
+            let (text, theta) = pad_iov_fixture(base, base_theta, n_pad);
+            let model = parse_model_string(&text).expect("parse");
+            assert_eq!(
+                model.n_theta,
+                base_theta.len() + n_pad,
+                "{name}: pads parsed"
+            );
+            let stacked: Vec<f64> = (0..model.n_eta + 2 * model.n_kappa)
+                .map(|i| 0.1 * (i as f64 * 0.7 + 0.3).sin())
+                .collect();
+            assert!(
+                iov_analytical_supported(&model),
+                "{name}, n_pad = {n_pad}: gate"
+            );
+            assert!(
+                subject_sensitivities_iov(&model, subject, &theta, &stacked).is_some(),
+                "{name}, n_pad = {n_pad}: outer walk declined"
+            );
+            assert!(
+                subject_eta_grad_iov(&model, subject, &theta, &stacked).is_some(),
+                "{name}, n_pad = {n_pad}: inner route declined"
+            );
+            if n_pad == 25 {
+                assert!(
+                    model.n_theta + model.n_eta + model.n_kappa > MAX_TVCOV_AXES + 4,
+                    "{name}: fixture must need two chunks"
+                );
+                check_iov_provider_vs_fd(&model, subject, &theta, &stacked);
+                check_iov_inner_matches_outer(&model, subject, &theta, &stacked);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
 // #1505 — the kink bound of the third-order sweep, on hand-built event lists.
 // ------------------------------------------------------------------------------------------
 
