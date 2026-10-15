@@ -40,6 +40,36 @@ fn yaml_cv_pct(cv: f64) -> String {
     }
 }
 
+/// Largest absolute component of [`FitResult::final_gradient`], or `None` when
+/// the fit reported no gradient (#1934). A non-finite component makes the whole
+/// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
+/// fold would report the finite components of a broken gradient as if they were
+/// all of it.
+fn final_gradient_max_abs(result: &FitResult) -> Option<f64> {
+    let g = result.final_gradient.as_ref()?;
+    Some(g.iter().fold(0.0_f64, |m, x| {
+        if !x.is_finite() || m.is_nan() {
+            f64::NAN
+        } else {
+            m.max(x.abs())
+        }
+    }))
+}
+
+/// The `Final gradient:` line printed under `Converged:` (#1934), or `None` when
+/// the fit reported no gradient. It is |g|∞ in the packed optimizer coordinates
+/// (log-θ, Cholesky-Ω, log-σ), labelled with where the vector came from. A
+/// `converged` verdict next to a gradient far from zero is the signal #1934's
+/// false stop carried (|g|∞ 1.14 against ~1e-3 at the optimum) that no other
+/// line of the report showed.
+fn final_gradient_line(result: &FitResult) -> Option<String> {
+    let norm = final_gradient_max_abs(result)?;
+    let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
+    Some(format!(
+        "Final gradient: |g|∞ = {norm:.3e} (packed coordinates, source: {source})"
+    ))
+}
+
 /// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
 fn sd_from_var(var: f64) -> f64 {
     if var > 0.0 {
@@ -1018,6 +1048,9 @@ pub fn print_results(result: &FitResult) {
         "\nConverged: {}",
         if result.converged { "YES" } else { "NO" }
     );
+    if let Some(line) = final_gradient_line(result) {
+        eprintln!("{line}");
+    }
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         eprintln!("Estimation chain:  {}", chain.join(" → "));
@@ -1377,6 +1410,9 @@ pub fn format_summary(result: &FitResult) -> String {
         "Converged:  {}",
         if result.converged { "YES" } else { "NO" }
     );
+    if let Some(line) = final_gradient_line(result) {
+        let _ = writeln!(out, "{line}");
+    }
     let _ = writeln!(out, "Iterations: {}", result.n_iterations);
     let _ = writeln!(
         out,
@@ -2513,6 +2549,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     writeln!(f, "model:").map_err(|e| e.to_string())?;
     writeln!(f, "  converged: {}", result.converged).map_err(|e| e.to_string())?;
+    // |g|∞ of the optimizer's final gradient beside the verdict it qualifies
+    // (#1934). Omitted when the fit reported none, like `covariance_method`
+    // below; `.nan` (YAML's spelling) when a component is non-finite.
+    if let Some(norm) = final_gradient_max_abs(result) {
+        let v = if norm.is_nan() {
+            ".nan".to_string()
+        } else {
+            format!("{norm:.6e}")
+        };
+        writeln!(f, "  final_gradient_max_abs: {v}").map_err(|e| e.to_string())?;
+        let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
+        writeln!(f, "  final_gradient_source: {source}").map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  method: {}", result.method.label()).map_err(|e| e.to_string())?;
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
@@ -3825,6 +3874,86 @@ mod tests {
             !yaml2.contains("covariance_method:"),
             "an unlabelled fit must omit the key, not emit null:\n{yaml2}"
         );
+    }
+
+    /// #1934: |g|∞ is the largest *absolute* component, and a non-finite
+    /// component poisons it instead of being dropped by `f64::max`. The NaN is
+    /// placed first and last because a fold that only checks the incoming
+    /// component (or only the accumulator) recovers on one of the two.
+    #[test]
+    fn final_gradient_max_abs_takes_the_largest_magnitude_and_keeps_nan() {
+        let mut r = comprehensive_result();
+        r.final_gradient = None;
+        assert_eq!(final_gradient_max_abs(&r), None);
+        r.final_gradient = Some(vec![0.1, -2.0, 1.5]);
+        assert_eq!(final_gradient_max_abs(&r), Some(2.0));
+        for g in [
+            vec![f64::NAN, 1.0, 2.0],
+            vec![1.0, 2.0, f64::NAN],
+            vec![1.0, f64::INFINITY],
+        ] {
+            r.final_gradient = Some(g.clone());
+            assert!(
+                final_gradient_max_abs(&r).unwrap().is_nan(),
+                "{g:?} must report NaN, not the finite components' max"
+            );
+        }
+    }
+
+    /// #1934: `ferx summary` prints |g|∞ and its source on the line right under
+    /// `Converged:`, and prints no such line when the fit reported no gradient.
+    /// Both sides in one test, so a line made unconditional (or never printed)
+    /// fails here. `print_results` shares `final_gradient_line`; the CLI test
+    /// `fit_with_data_writes_outputs_and_bundle` pins that it is called.
+    #[test]
+    fn format_summary_prints_the_final_gradient_under_converged() {
+        let mut r = comprehensive_result();
+        r.converged = true;
+        r.final_gradient = Some(vec![1.14, -0.497, 0.0083]);
+        r.final_gradient_source = Some("optimizer".into());
+        let s = format_summary(&r);
+        assert!(
+            s.contains(
+                "Converged:  YES\nFinal gradient: |g|∞ = 1.140e0 \
+                 (packed coordinates, source: optimizer)\n"
+            ),
+            "{s}"
+        );
+
+        r.final_gradient = None;
+        r.final_gradient_source = None;
+        let s = format_summary(&r);
+        assert!(!s.contains("Final gradient"), "{s}");
+    }
+
+    /// #1934: the fit YAML records |g|∞ and its source in the `model:` block,
+    /// omits both keys when there is no gradient, and spells a non-finite norm
+    /// as YAML's `.nan` rather than Rust's `NaN` (a string to a YAML reader).
+    #[test]
+    fn write_estimates_yaml_records_the_final_gradient() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_of = |g: Option<Vec<f64>>, src: Option<&str>, name: &str| {
+            let mut r = comprehensive_result();
+            r.final_gradient = g;
+            r.final_gradient_source = src.map(String::from);
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+
+        let yaml = yaml_of(Some(vec![-1.14, 0.5]), Some("finite_difference"), "g.yaml");
+        assert!(
+            yaml.contains(
+                "  final_gradient_max_abs: 1.140000e0\n  final_gradient_source: finite_difference\n"
+            ),
+            "{yaml}"
+        );
+
+        let yaml = yaml_of(None, None, "none.yaml");
+        assert!(!yaml.contains("final_gradient"), "{yaml}");
+
+        let yaml = yaml_of(Some(vec![f64::NAN]), Some("optimizer"), "nan.yaml");
+        assert!(yaml.contains("  final_gradient_max_abs: .nan\n"), "{yaml}");
     }
 
     #[test]
