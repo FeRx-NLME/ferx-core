@@ -187,6 +187,14 @@ fn fit_with_data_writes_outputs_and_bundle() {
         "summary missing: {stdout}"
     );
     assert!(stdout.contains("OFV:"));
+    // #1934: the report prints |g|∞ right under the verdict it qualifies. This
+    // fit runs a gradient optimizer, so the optimizer's own gradient is reported.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\nConverged: YES\nFinal gradient: |g|∞ = ")
+            && stderr.contains("(packed coordinates, source: optimizer)\n"),
+        "final gradient missing under Converged: {stderr}"
+    );
 
     // Output files are named from the model stem and written to cwd (the tmp).
     for name in ["one_cpt_iv-fit.yaml", "one_cpt_iv-sdtab.csv", "run.fitrx"] {
@@ -216,6 +224,8 @@ fn fit_with_data_writes_outputs_and_bundle() {
     assert!(yaml.contains("  in_docker:"));
     assert!(yaml.contains("  username:"));
     assert!(yaml.contains("  ferx_version:"));
+    assert!(yaml.contains("  final_gradient_max_abs: "));
+    assert!(yaml.contains("  final_gradient_source: optimizer\n"));
 }
 
 /// Drives the `--simulate` half of `main` (no data file). Uses a tiny inline

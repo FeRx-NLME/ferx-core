@@ -207,6 +207,8 @@ A YAML file containing parameter estimates, standard errors, and model diagnosti
 ```yaml
 model:
   converged: true
+  final_gradient_max_abs: 2.290000e-4
+  final_gradient_source: optimizer
   method: FOCE
   covariance_method: r
 objective_function:
@@ -275,17 +277,30 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 ### Key Fields
 
+#### Run status and objective
+
 - **converged**: whether the run reached a solution of the problem posed. It is
   never `true` at an objective that is not a usable number — `NaN`, infinite, or
   the clamped divergence sentinel all report `converged: false` with a
   `W_NONFINITE_OBJECTIVE` warning saying which. See [A non-finite
   objective](warnings.qmd#non-finite-objective).
+- **final_gradient_max_abs** / **final_gradient_source**: |g|∞, the largest
+  absolute component of the fit's `final_gradient`, and where that vector came
+  from (`optimizer` or `finite_difference`). The console prints the same thing
+  as a `Final gradient:` line right under `Converged:` (#1934). It is measured in
+  the packed optimizer coordinates and is a comparative figure, not a pass/fail
+  test — see [What the reporting gradient
+  reads](estimation/optimizers.qmd#what-the-reporting-gradient-reads). Both keys
+  are omitted when the fit reported no gradient; a non-finite component is
+  written as `.nan`.
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
   observations). The Delattre-style variants a model search ranks on (`mixed`,
   `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see
   [Ranking candidates](api/fitting.qmd#ranking-candidates-bic-variants-and-strictness).
+#### Parameter estimates
+
 - **se**: Standard error from the covariance step — see
   [Which covariance estimator produced these numbers](#covariance-estimator)
   before comparing one against another tool
