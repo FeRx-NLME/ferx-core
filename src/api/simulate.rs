@@ -98,6 +98,17 @@ pub struct SimulateOptions {
     pub horizon: Option<f64>,
 }
 
+/// What a `simulate*` entry point lets its caller supply as the TTE administrative
+/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
+#[cfg(feature = "survival")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TteHorizon {
+    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
+    Given(Option<f64>),
+    /// The entry point takes none (`simulate_with_uncertainty`).
+    NotAccepted,
+}
+
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
 /// clear `Err` for a caller to act on.
 ///
@@ -137,17 +148,6 @@ pub struct SimulateOptions {
 /// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
 /// that takes none (`simulate_with_uncertainty`) cannot act on that, so it is told the
 /// model cannot be simulated there and where it can (`E_TTE_NOT_SIMULATABLE`, #1774).
-/// What a `simulate*` entry point lets its caller supply as the TTE administrative
-/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
-#[cfg(feature = "survival")]
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TteHorizon {
-    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
-    Given(Option<f64>),
-    /// The entry point takes none (`simulate_with_uncertainty`).
-    NotAccepted,
-}
-
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
