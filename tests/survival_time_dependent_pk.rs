@@ -48,7 +48,10 @@ mod common;
 use ferx_core::api::{read_population_for, simulate_with_options};
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{CompiledModel, Population};
-use ferx_core::{fit, predict, predict_survival, EstimationMethod, FitOptions, SimulateOptions};
+use ferx_core::{
+    fit, predict, predict_survival, validate_model_file, EstimationMethod, FitOptions,
+    SimulateOptions,
+};
 use std::io::Write;
 
 /// `CL_EXPR` is spliced into `CL`; everything else is held fixed so the arms differ in
@@ -147,6 +150,19 @@ fn assert_is_the_1853_refusal(entry: &str, msg: &str) {
     }
 }
 
+/// The refusal's code and block (#1774): every non-`fit` entry point carries
+/// `E_ENDPOINT_TIME_DEPENDENT_PK` on `event_model`, the diagnostic `ferx check` reports for
+/// the same model. Mutation — route any one entry point back through the `Option<String>`
+/// check and its test dies here with `code() == None`.
+fn assert_is_coded(entry: &str, err: &ferx_core::EngineError) {
+    assert_eq!(
+        err.code(),
+        Some("E_ENDPOINT_TIME_DEPENDENT_PK"),
+        "{entry}: {err}"
+    );
+    assert_eq!(err.block(), Some("event_model"), "{entry}: {err}");
+}
+
 /// `fit()` — the objective. Returns `Err` before any iteration.
 #[test]
 fn fit_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
@@ -163,6 +179,7 @@ fn predict_survival_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
     let err = predict_survival(&m, &population(&m), &m.default_params, &[1.0, 8.0, 20.0])
         .expect_err("predict_survival must refuse");
     assert_is_the_1853_refusal("predict_survival", &err.to_string());
+    assert_is_coded("predict_survival", &err);
 }
 
 /// `predict()` — the Gaussian half alone is correct on such a model, but it shares the
@@ -172,6 +189,7 @@ fn predict_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
     let m = time_dependent();
     let err = predict(&m, &population(&m), &m.default_params).expect_err("predict must refuse");
     assert_is_the_1853_refusal("predict", &err.to_string());
+    assert_is_coded("predict", &err);
 }
 
 /// `simulate()` — `draw_ode_tte_latent` root-finds the same frozen snapshot for its event
@@ -189,6 +207,46 @@ fn simulate_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
     let err = simulate_with_options(&m, &population(&m), &m.default_params, 1, &opts)
         .expect_err("simulate must refuse");
     assert_is_the_1853_refusal("simulate", &err.to_string());
+    assert_is_coded("simulate", &err);
+}
+
+/// `ferx check` without `--data` (#1774): the check is a function of the model alone, so a
+/// model `fit()` refuses is `valid: false` before any dataset is named, with the same code,
+/// block and text as the entry points. The time-free control stays valid, so a check that
+/// refused every joint PK-TTE model would die too.
+#[test]
+fn ferx_check_reports_a_time_dependent_disposition_without_data() {
+    for (cl, refused) in [
+        ("TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)", true),
+        ("TVCL * exp(ETA_CL)", false),
+    ] {
+        let mut f = tempfile::Builder::new()
+            .suffix(".ferx")
+            .tempfile()
+            .expect("create temp model");
+        f.write_all(MODEL.replace("CL_EXPR", cl).as_bytes())
+            .expect("write temp model");
+        let report = validate_model_file(f.path().to_str().expect("utf-8 path"), None);
+        let hits: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E_ENDPOINT_TIME_DEPENDENT_PK")
+            .collect();
+        if refused {
+            assert!(!report.valid, "{cl}: {:?}", report.diagnostics);
+            assert_eq!(hits.len(), 1, "{cl}: {:?}", report.diagnostics);
+            assert!(hits[0].is_error());
+            assert_eq!(hits[0].block.as_deref(), Some("event_model"));
+            assert!(
+                hits[0].line.is_some(),
+                "the [event_model] header line is attached"
+            );
+            assert_is_the_1853_refusal("ferx check", &hits[0].message);
+        } else {
+            assert!(report.valid, "{cl}: {:?}", report.diagnostics);
+            assert!(hits.is_empty(), "{cl}: {hits:?}");
+        }
+    }
 }
 
 /// **The straddle.** The control differs from the refusing arm in one line of `$PK` and is

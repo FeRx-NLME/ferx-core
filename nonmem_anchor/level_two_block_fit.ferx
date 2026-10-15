@@ -1,0 +1,37 @@
+# #1963 NONMEM anchor: two level blocks, the second absorbing nothing.
+#
+# `theta B2[OCC]` (three arms) and `theta PLACEBO[STUDY]` (one study per subject,
+# absorbing ETA_E0) both resolve to sum-to-zero. No intercept: TVE0 is read
+# through a factor of TIME, so nothing but the random effect carries the levels'
+# mean. Before #1963 the binder counted B2 with all its levels and refused
+# PLACEBO "under any contrast". The NONMEM twin, level_two_block.ctl, writes both
+# blocks out as THETAs of that coding; level_two_block_hand.ferx is the same
+# hand spelling in ferx. Data: level_two_block.csv. See nonmem_anchor/README.md.
+
+[parameters]
+  theta TVE0(1.4, -10.0, 10.0)
+  theta TVEMAX(2.8, 0.1, 20.0)
+  theta TVET50(1.6, 0.1, 20.0)
+  theta B2[OCC](0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+
+  omega ETA_E0 ~ 0.1 (variance)
+
+  sigma ADD ~ 0.25 (variance)
+
+[covariates]
+  STUDY categorical
+  OCC   categorical
+
+[individual_parameters]
+  E0 = TVE0 * (1 + 0.01 * TIME * TIME) + B2 + PLACEBO + ETA_E0
+
+[structural_model]
+  y = E0 + TVEMAX * TIME / (TIME + TVET50)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method     = focei
+  covariance = false
