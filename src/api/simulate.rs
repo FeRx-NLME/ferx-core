@@ -399,7 +399,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
                 .join(", ")
         ));
     }
-    first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
+    Err(super::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for

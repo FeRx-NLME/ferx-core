@@ -63,7 +63,7 @@ Treat an unrecognised code as a generic finding of its given `severity`.
 - [Data and dosing](#codes-data-and-dosing)
 - [Scaling, output and derived columns](#codes-scaling-output-and-derived)
 - [Experimental and degraded paths](#codes-experimental-and-degraded)
-- [Simulation and adaptive-dosing codes](#codes-entry-point)
+- [Codes only an entry point raises](#codes-entry-point)
 
 ### Model-file structure {#codes-model-file-structure}
 
@@ -158,7 +158,8 @@ The dataset could not be read, or a dose / observation record is inconsistent wi
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_DATA` | error | The `--data` file could not be read or parsed. |
-| `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
+| `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). On block `covariates`, a column the `[covariates]` block declares is missing from the file. |
+| `E_COVARIATE_NOT_NUMERIC` | error | A column the `[covariates]` block declares holds a value that is not a number. Block `covariates`. |
 | `E_NONFINITE_DV` | error | A subject carries a non-finite (`NaN`/`Inf`) observation. Usually a population read by `read_population_for_simulation()` — a simulation input — passed to `fit()`. |
 | `E_NO_SCORED_OBSERVATIONS` | error | The population has no record the likelihood scores: no Gaussian observation and no endpoint (TTE / binary / categorical / Markov) record on any subject. The data contribute nothing to the objective of such a fit, so no estimate can move off its initial value except under a `[priors]` or regularization penalty. `fit()` refuses it with the same message, where it used to return OFV 0 with the parameters at their initial values. Reported once for the population, after the more specific data codes, so `fit()` still names an unrouted endpoint (`E_ENDPOINT_NO_RECORDS`) or a non-finite `DV` first. When `[data_selection]` removed rows classed as observations, the message gives what it removed and names its clauses as the thing to check; otherwise it says what makes a row scored (`EVID = 0`, `MDV = 0` and a `DV`). Only `ferx check --data` reaches it; without a dataset there is nothing to count ([#1491](https://github.com/FeRx-NLME/ferx-core/issues/1491)). |
 | `W_MISSING_DV` | warning | One or more `EVID=0` rows had a missing `DV` (`.`/`NA`/blank) but were not marked `MDV=1`; they were skipped rather than scored as `DV=0`. |
@@ -235,9 +236,9 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
 | `W_ABSORPTION_TWIN_DECLINED` | warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model stays closed-form with no ODE fallback. Subjects needing the fallback (time-varying covariates, a `TIME`-dependent parameter, IOV, SS or infusion doses, the flip-flop regime) are then rejected with an explicit error. The message carries the twin parser's own reason — most often an individual parameter named after a twin state (`CENTRAL`, `PERIPH`). See [#1008](https://github.com/FeRx-NLME/ferx-core/issues/1008). |
 
-### Simulation and adaptive-dosing codes {#codes-entry-point}
+### Codes only an entry point raises {#codes-entry-point}
 
-`ferx check` never reports these: they refuse an option, a parameter set or a call that a model file and its data do not contain, or a model `fit()` accepts but the entry point cannot run. Each is the `code()` of the `EngineError` the entry point returns ([#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)). They are not the only codes `ferx check` cannot reach: the θ length, parameter shape, fit-binding and population codes are too, and [matching on the code](../warnings.qmd#entry-point-error-codes) lists every code an entry point returns.
+`ferx check` never reports these: they refuse an option, a parameter set, a fit or a call that a model file and its data do not contain, or a model `fit()` accepts but the entry point cannot run. Each is the `code()` of the `EngineError` the entry point returns ([#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)). They are not the only codes `ferx check` cannot reach: the θ length, parameter shape, fit-binding and population codes are too, and [matching on the code](../warnings.qmd#entry-point-error-codes) lists every code an entry point returns.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
@@ -250,6 +251,20 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 | `E_ADAPTIVE_SPEC` | error | An `[adaptive_dosing]` spec that does not compile against the model: an invariant the block parser checks (on a spec built in code), an `assay_cmt` out of range, or an `observe` expression that does not compile. Block `adaptive_dosing`. |
 
 Two refusals of this kind reuse an existing code, since the cause is the same: a missing Ω~IOV~ on `simulate()` is `E_PARAM_SHAPE`, the parameter-shape code the other entry points return (see [matching on the code](../warnings.qmd#entry-point-error-codes)), and an `[adaptive_dosing] observe` covariate the data lack is `E_MISSING_COVARIATE` (block `adaptive_dosing`), the code `ferx check` gives a model covariate missing from the data.
+
+#### Post-hoc steps on a fit {#codes-post-hoc}
+
+`run_sir()` and `run_covariance()` take a fit, and refuse one whose inputs they cannot recover or verify ([#1774](https://github.com/FeRx-NLME/ferx-core/issues/1774)). `ferx check` has no fit, so it raises none of these.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_FIT_INPUT_MISSING` | error | An input the step needs was neither passed nor recorded on the fit: the model file's path (no model passed), the data file's path (no population passed), SIR's covariance matrix, the population of an IOV model passed as a model on a fit that records no reader settings, or the occasion rule of an IOV fit saved before ferx recorded one, on a population that carries no occasion labels. |
+| `E_FIT_INPUT_CHANGED` | error | The model or data file the step re-reads no longer has the SHA-256 the fit recorded. |
+| `E_FIT_INPUT_MODEL` | error | The model the step would run on is not the one the fit was made with: a model passed in bound with other data-derived bindings than the fit's, a model passed in whose covariate statistics the population does not reproduce (on a fit that records no bindings), or a model whose η count is not the width of the fit's per-subject η̂. |
+
+The θ count and the Ω, σ and Ω~IOV~ shape of a fit against the model are `E_THETA_LENGTH` and `E_PARAM_SHAPE`, the codes every entry point gives a parameter vector of the wrong shape. A population that is not the fit's is `E_POPULATION_MISMATCH`, or `E_FIT_SUBJECTS_MISMATCH` when the fit's per-subject rows are what is wrong.
+
+When the step re-reads the model or data file, a failure is the one `ferx check` reports on the same file, with the same code and block: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, and `E_PARSE` on `data_selection` for a recorded selection clause that no longer compiles. The message is the read's own: an `E_DATA` refusal has no `Failed to read data file` lead.
 
 ## Line-number caveat
 

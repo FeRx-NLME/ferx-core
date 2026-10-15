@@ -237,7 +237,7 @@ fn run_sir_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(crate::diagnostics::EngineError::from(format!(
+        return Err(crate::api::fit_input_model(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
@@ -251,10 +251,11 @@ fn run_sir_scoped(
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
-        "run_sir requires fit.covariance_matrix; re-run the original fit \
-         with the covariance step enabled (FitOptions.run_covariance_step = \
-         true, or `covariance = true` in the model file's [fit_options])."
-            .to_string()
+        crate::api::fit_input_missing(
+            "run_sir requires fit.covariance_matrix; re-run the original fit \
+             with the covariance step enabled (FitOptions.run_covariance_step = \
+             true, or `covariance = true` in the model file's [fit_options]).",
+        )
     })?;
 
     // --- Run SIR (identical to the inline path in fit()) ------------------

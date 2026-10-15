@@ -402,18 +402,54 @@ pub(crate) fn check_level_index_columns(
 /// Map an error string from [`read_population_for`] onto a `ferx check`
 /// diagnostic, so the covariate-validation failures the strict reader raises at
 /// fit time surface with the same code/block in `ferx check` (rather than as a
-/// generic `E_DATA`). Classification keys off the reader's stable message
-/// prefixes ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]).
+/// generic `E_DATA`). The classification is [`data_read_diagnostic`]'s; `ferx
+/// check` only words an `E_DATA` read failure with the path it read.
 fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
+    let mut d = data_read_diagnostic(err);
+    if d.code == "E_DATA" {
+        d.message = format!("Failed to read data file '{}': {}", path, err);
+    }
+    d
+}
+
+/// The one classifier of a data-file read failure (#1774): `ferx check`'s read of
+/// the data and `run_sir` / `run_covariance`'s re-read of `fit.data_path` both code
+/// through it. A covariate the strict reader finds missing is
+/// `E_MISSING_COVARIATE`, one it finds non-numeric `E_COVARIATE_NOT_NUMERIC`, both
+/// on block `covariates`; any other failure (the file cannot be opened or parsed)
+/// is `E_DATA`. Keys off the reader's stable message prefixes
+/// ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]). The message is `err`
+/// as given.
+pub(crate) fn data_read_diagnostic(err: &str) -> Diagnostic {
     if err.starts_with(ERR_COV_MISSING_COLUMNS) {
         Diagnostic::error("E_MISSING_COVARIATE", err.to_string()).with_block("covariates")
     } else if err.starts_with(ERR_COV_NON_NUMERIC) {
         Diagnostic::error("E_COVARIATE_NOT_NUMERIC", err.to_string()).with_block("covariates")
     } else {
-        Diagnostic::error(
-            "E_DATA",
-            format!("Failed to read data file '{}': {}", path, err),
-        )
+        Diagnostic::error("E_DATA", err.to_string())
+    }
+}
+
+/// The one classifier of a `[data_selection]` clause that does not compile into a
+/// row filter: `E_PARSE` on block `data_selection`, message as given. `ferx check`
+/// reaches it from a hand-built [`FitOptions`]; `run_sir` / `run_covariance` from
+/// recorded reader settings whose clauses were edited after the fit (#1774).
+pub(crate) fn selection_filter_diagnostic(err: String) -> Diagnostic {
+    Diagnostic::error("E_PARSE", err).with_block("data_selection")
+}
+
+/// The one classifier of a failed model-file read (#1752, #1774): `ferx check` and
+/// `run_sir` / `run_covariance`'s re-read of `fit.model_path` both code through it.
+/// A file that cannot be read or is not UTF-8 is `E_MODEL_READ` with no block; one
+/// that does not parse gets the parse's own code ([`parse_error_to_diagnostic`]);
+/// one whose SHA-256 is not the fit's recorded one is `E_FIT_INPUT_CHANGED`, which
+/// `ferx check` never reaches, since it compares no hash. The message is the read's.
+pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceError) -> Diagnostic {
+    use crate::io::model_source::ModelSourceError;
+    match e {
+        ModelSourceError::Read(m) => Diagnostic::error("E_MODEL_READ", m),
+        ModelSourceError::Hash(m) => crate::api::entry_refusals::fit_input_changed_diag(m),
+        ModelSourceError::Parse(m) => parse_error_to_diagnostic(&m),
     }
 }
 
@@ -434,8 +470,7 @@ fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
 fn check_selection_filter(
     opts: &FitOptions,
 ) -> Result<Option<crate::io::datareader::SelectionFilter>, Diagnostic> {
-    crate::api::run::build_selection_filter(opts)
-        .map_err(|e| Diagnostic::error("E_PARSE", e).with_block("data_selection"))
+    crate::api::run::build_selection_filter(opts).map_err(selection_filter_diagnostic)
 }
 
 /// The code a reader warning already carries, for the `ferx check` diagnostic that
@@ -8064,7 +8099,7 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 /// `data_path` overrides the model's `[data]` block, with a warning
 /// diagnostic when the two differ (see [`resolve_data_path`]).
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
-    use crate::io::model_source::{ModelSource, ModelSourceError};
+    use crate::io::model_source::ModelSource;
 
     // 1. Read and parse, once (#1752): the binding step below takes its text from
     //    this read, so nothing reads the file a second time. A failure is terminal —
@@ -8081,13 +8116,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 .unwrap_or("model")
                 .to_string();
             let data = data_path.map(|s| s.to_string());
-            let diag = match e {
-                ModelSourceError::Read(m) | ModelSourceError::Hash(m) => {
-                    Diagnostic::error("E_MODEL_READ", m)
-                }
-                ModelSourceError::Parse(m) => parse_error_to_diagnostic(&m),
-            };
-            return CheckReport::new(stem, data, vec![diag]);
+            return CheckReport::new(stem, data, vec![model_source_diagnostic(e)]);
         }
     };
     // The report's `model` is the name the fit will carry — the declared

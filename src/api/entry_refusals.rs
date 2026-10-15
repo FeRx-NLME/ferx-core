@@ -9,6 +9,14 @@
 //!
 //! The two refusals that reuse a code `ferx check` or another entry point already has
 //! (`E_PARAM_SHAPE`, `E_MISSING_COVARIATE`) are built here too, by name.
+//!
+//! So are the input refusals of the post-hoc steps on a fit, `run_sir` and
+//! `run_covariance` (#1774 part b): `ferx check` has no fit, so it cannot reach an
+//! input missing from one (`E_FIT_INPUT_MISSING`), a file changed since it
+//! (`E_FIT_INPUT_CHANGED`) or a model that is not its own (`E_FIT_INPUT_MODEL`,
+//! and `E_THETA_LENGTH` for the θ count). Their re-reads of the model and data files
+//! are not here: those failures are `ferx check`'s own, and are coded by its read
+//! classifiers in `validation.rs`.
 
 use crate::diagnostics::{Diagnostic, EngineError};
 
@@ -100,4 +108,42 @@ pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
 /// `observe` expression that does not compile.
 pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
     diag("E_ADAPTIVE_SPEC", Some("adaptive_dosing"), message.into())
+}
+
+/// `E_THETA_LENGTH`: a θ whose length is not the model's (#1614, #1615) — a
+/// parameter vector handed to a `simulate*` / `predict*` entry point, or the fit's θ
+/// against the model `run_sir` / `run_covariance` run on (#1774).
+pub(crate) fn theta_length(message: impl Into<String>) -> EngineError {
+    coded("E_THETA_LENGTH", None, message.into())
+}
+
+/// `E_FIT_INPUT_MISSING`: a post-hoc step on a fit (`run_sir`, `run_covariance`)
+/// needs an input that neither the caller passed nor the fit records — the model
+/// file's path, the data file's path, SIR's covariance matrix, the population of an
+/// IOV model passed as `model = Some` on a fit with no recorded reader settings, or
+/// the occasion rule of an IOV fit whose population carries no occasion labels.
+pub(crate) fn fit_input_missing(message: impl Into<String>) -> EngineError {
+    coded("E_FIT_INPUT_MISSING", None, message.into())
+}
+
+/// `E_FIT_INPUT_CHANGED`: a file a post-hoc step re-reads (`fit.model_path`,
+/// `fit.data_path`) no longer has the SHA-256 the fit recorded.
+pub(crate) fn fit_input_changed(message: impl Into<String>) -> EngineError {
+    EngineError::from_diagnostic(fit_input_changed_diag(message))
+}
+
+/// [`fit_input_changed`] as a [`Diagnostic`], for the model-read classifier
+/// (`validation::model_source_diagnostic`), which codes the model file's hash
+/// failure beside its read and parse failures.
+pub(crate) fn fit_input_changed_diag(message: impl Into<String>) -> Diagnostic {
+    diag("E_FIT_INPUT_CHANGED", None, message.into())
+}
+
+/// `E_FIT_INPUT_MODEL`: the model a post-hoc step would run on is not the one the
+/// fit was made with — a supplied model bound with other data-derived bindings than
+/// the fit's, or (on a fit that records none) with covariate statistics the
+/// population does not reproduce, or a model whose η count is not the width of the
+/// fit's per-subject η̂.
+pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
+    coded("E_FIT_INPUT_MODEL", None, message.into())
 }
