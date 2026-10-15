@@ -32582,6 +32582,92 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
     eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
 }
 
+/// A lean binding skips the fill of a right-shaped buffer, never the resize of a
+/// wrong-shaped one: the f64 scratch is one thread-local shared by every ODE model
+/// on the thread, and a `vars` buffer handed to `eval_rhs_g` may have last held
+/// another model. Two lean, no-hoist, `zero = false` models run smaller then
+/// larger on the same buffer, with no same-shaped call in between; the larger
+/// one's intermediates sit past the smaller buffer's end, so a skipped resize
+/// drops their writes and reads them as 0.
+#[test]
+fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
+    let small_lines = ["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"];
+    let large_lines = [
+        "R1 = CL",
+        "R2 = R1",
+        "R3 = R2",
+        "R4 = R3",
+        "R5 = Q",
+        "d/dt(a) = -R4 * a",
+        "d/dt(b) = R4 * a - R5 * b",
+    ];
+    let small = lean_spec(&small_lines);
+    let large = lean_spec(&large_lines);
+    let full_large = {
+        let _off = RhsLeanBindingOff::enter();
+        lean_spec(&large_lines)
+    };
+    let (sp, lp) = (
+        small.rhs_program.as_ref().unwrap(),
+        large.rhs_program.as_ref().unwrap(),
+    );
+    for (name, p) in [("small", sp), ("large", lp)] {
+        assert!(p.hoist.is_none(), "{name}: must take the no-hoist reset");
+        assert!(
+            !p.binding.zero,
+            "{name}: must be a lean (no re-zero) binding"
+        );
+    }
+    // The straddle: an intermediate the large model writes lies past the end of
+    // the small model's buffer.
+    assert!(
+        lp.n_vars_total > sp.n_vars_total + 1,
+        "large {} vs small {}",
+        lp.n_vars_total,
+        sp.n_vars_total
+    );
+
+    let mut params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+    params[..3].copy_from_slice(&[4.0, 40.0, 0.7]);
+    let u = [100.0, 3.0];
+
+    // f64 closure, shared thread-local. Oracle first, then small, then large.
+    let mut want = [0.0; 2];
+    (full_large.rhs)(&u, &params, 0.5, &mut want);
+    assert!(want.iter().all(|w| w.is_finite() && *w != 0.0));
+    let mut sink = [0.0; 2];
+    (small.rhs)(&u, &params, 0.5, &mut sink);
+    FERX_SCRATCH.with(|c| assert_eq!(c.borrow().rhs_vars.len(), sp.n_vars_total));
+    let mut got = [0.0; 2];
+    (large.rhs)(&u, &params, 0.5, &mut got);
+    for j in 0..2 {
+        assert!(
+            hoist_bits_eq(got[j], want[j]),
+            "f64 closure du[{j}]: lean {} vs full {}",
+            got[j],
+            want[j]
+        );
+    }
+
+    // Generic VM, one `vars` buffer handed to both programs in turn.
+    let (mut vars, mut stack) = (Vec::new(), Vec::new());
+    let mut sink = vec![0.0; 2];
+    sp.eval_rhs_g::<f64>(
+        &u, &params, 0.5, 0.25, 0.1, &mut sink, &mut vars, &mut stack,
+    );
+    assert_eq!(vars.len(), sp.n_vars_total);
+    let mut got = vec![0.0; 2];
+    lp.eval_rhs_g::<f64>(&u, &params, 0.5, 0.25, 0.1, &mut got, &mut vars, &mut stack);
+    for j in 0..2 {
+        assert!(
+            hoist_bits_eq(got[j], want[j]),
+            "generic du[{j}]: lean {} vs full {}",
+            got[j],
+            want[j]
+        );
+    }
+}
+
 /// Which fixtures reach which reset. The no-hoist rows exist to drive the
 /// `hoist = None` arm of both binding sites, and the MACHEPS row to put its only
 /// read inside the lifted code — a fixture whose path silently changed would
