@@ -12,6 +12,14 @@
 # below are intentionally biased (1.5-2x off truth in each direction)
 # so the optimiser has meaningful work to do — running this example
 # should report final estimates close to the truth values above.
+#
+# FOCEI, not FOCE: from these start values the non-interaction FOCE
+# inner objective freezes the residual variance at the population
+# prediction, which at t = 23 h is ~3e-9 — a variance of ~3e-21, so each
+# subject's EBE objective is a set of needle-thin wells no inner solver
+# can certify. NONMEM `METHOD=1` (no INTER) terminates at iteration 0
+# from this start; `METHOD=1 INTER` converges to OFV -54.8526 with
+# TVCL/TVV/TVKA = 1.99/20.1/1.57, which ferx FOCEI reproduces (#1527).
 
 [parameters]
   theta TVCL(5.0, 0.01, 50.0)
@@ -36,6 +44,6 @@
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method     = foce
+  method     = focei
   maxiter    = 100
   covariance = true

@@ -354,7 +354,7 @@ single-dose model. SS is a property of the **dataset**:
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method  = foce
+  method  = focei
   maxiter = 100
 ```
 
