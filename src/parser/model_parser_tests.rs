@@ -31973,3 +31973,40 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
     );
     assert_eq!(du[0], 0.0, "the untaken branch leaves X at the zero-fill");
 }
+
+/// The poison test above for the **production f64 closure**, whose cache lives in
+/// the thread-local `FERX_SCRATCH.rhs_vars` rather than a caller's buffer: a hit must
+/// read the poisoned slot, a parameter change must overwrite it. Without this, a
+/// closure that never reports `warm` stays bit-identical and silently loses the lift.
+#[test]
+fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
+    let model = hoist_model(HOIST_ONE_CPT_RATIO);
+    let prog = hoist_program(&model);
+    let (slot, _) = prog.hoist.as_ref().unwrap().lifted[0];
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    let u = [50.0];
+    let p1 = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let p2 = hoist_params::<f64>(prog, &[3.5, 30.0]);
+    let poison = || FERX_SCRATCH.with(|c| c.borrow_mut().rhs_vars[slot] = 1.0e6);
+    let mut du = [0.0];
+    rhs(&u, &p1, 1.0, &mut du);
+    let clean = du[0];
+
+    poison();
+    rhs(&u, &p1, 2.0, &mut du);
+    assert!(
+        hoist_bits_eq(du[0], 1.0e6 * 50.0),
+        "closure hit did not reuse the cache: {}",
+        du[0]
+    );
+
+    poison();
+    rhs(&u, &p2, 2.0, &mut du);
+    assert!(
+        hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
+        "closure miss did not recompute: {}",
+        du[0]
+    );
+    rhs(&u, &p1, 1.0, &mut du);
+    assert!(hoist_bits_eq(du[0], clean));
+}
