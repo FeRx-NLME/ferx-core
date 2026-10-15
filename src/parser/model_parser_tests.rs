@@ -31915,7 +31915,17 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
                 got_c[j],
                 want[j]
             );
-            assert!(dgot[j].same_bits(&dwant[j]), "call {k} du[{j}] Dual1");
+            // Entry by entry: `same_bits` is part of the code under test.
+            assert!(
+                hoist_bits_eq(dgot[j].value, dwant[j].value),
+                "call {k} du[{j}] Dual1 value"
+            );
+            for a in 0..2 {
+                assert!(
+                    hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
+                    "call {k} du[{j}] Dual1 grad[{a}]"
+                );
+            }
         }
     }
 }
@@ -32090,7 +32100,158 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
                 hoist_bits_eq(got_c[j], want[j]),
                 "set {c} {p:?} du[{j}] f64 closure"
             );
-            assert!(dgot[j].same_bits(&dwant[j]), "set {c} {p:?} du[{j}] Dual1");
+            assert!(
+                hoist_bits_eq(dgot[j].value, dwant[j].value),
+                "set {c} {p:?} du[{j}] Dual1 value"
+            );
+            for a in 0..2 {
+                assert!(
+                    hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
+                    "set {c} {p:?} du[{j}] Dual1 grad[{a}]"
+                );
+            }
+        }
+    }
+}
+
+/// `CL · 2` keeps the sign of a zero `CL` (`−(CL/V)` would not: `0 − (−0) = +0`), so
+/// a key that compared with `==` instead of bits would take `−0.0` for `+0.0` and
+/// replay the lifted `+0` — visible in the derivative's sign bit.
+const HOIST_SIGNED_ZERO: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = (CL * 2.0) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn rhs_hoist_key_tells_signed_zeros_apart() {
+    let model = hoist_model(HOIST_SIGNED_ZERO);
+    let prog = hoist_program(&model);
+    assert!(prog.hoist.is_some());
+    let plain_model = hoist_model_unlifted(HOIST_SIGNED_ZERO);
+    let plain = hoist_program(&plain_model);
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let u = [50.0];
+    for cl in [0.0, -0.0, 0.0, -0.0] {
+        let params = hoist_params::<f64>(prog, &[cl, 30.0]);
+        let mut want = [0.0];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0];
+        prog.eval_rhs_g::<f64>(
+            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+        );
+        let mut got_c = [0.0];
+        rhs(&u, &params, 1.0, &mut got_c);
+        assert_eq!(
+            want[0].is_sign_negative(),
+            cl.is_sign_negative(),
+            "fixture keeps the sign"
+        );
+        assert_eq!(
+            got_g[0].to_bits(),
+            want[0].to_bits(),
+            "CL = {cl:?}: eval_rhs_g"
+        );
+        assert_eq!(
+            got_c[0].to_bits(),
+            want[0].to_bits(),
+            "CL = {cl:?}: f64 closure"
+        );
+    }
+}
+
+/// A `Dual1` key must compare every gradient component: at fixed parameter
+/// *values*, change one jet entry of one parameter at a time between cache hits.
+#[test]
+fn rhs_hoist_dual1_key_compares_every_gradient_component() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
+    let plain = hoist_program(&plain_model);
+    type D = crate::sens::dual1::Dual1<3>;
+    let base: Vec<D> = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| D::var(v, i % 3))
+        .collect();
+    let mut sets = vec![base.clone()];
+    for p in [1usize, 2, 3, 5] {
+        // V1, Q, V2, SH: the four the lifted code reads.
+        for k in 0..3 {
+            let mut s = base.clone();
+            s[p].grad[k] += 0.5;
+            sets.push(s);
+            sets.push(base.clone());
+        }
+    }
+    let ud = [D::constant(80.0), D::var(9.0, 2)];
+    let (mut vars, mut stack) = (Vec::<D>::new(), Vec::<D>::new());
+    for (c, s) in sets.iter().enumerate() {
+        let params = hoist_params::<D>(prog, s);
+        let mut want = [D::constant(0.0); 2];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            1.25,
+            1.25,
+            D::constant(1.25),
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got = [D::constant(0.0); 2];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            1.25,
+            1.25,
+            D::constant(1.25),
+            &mut got,
+            &mut vars,
+            &mut stack,
+        );
+        // Compared entry by entry, not through `same_bits` — the function under test.
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got[j].value, want[j].value),
+                "set {c} du[{j}] value"
+            );
+            for k in 0..3 {
+                assert!(
+                    hoist_bits_eq(got[j].grad[k], want[j].grad[k]),
+                    "set {c} du[{j}] grad[{k}]: {} vs {}",
+                    got[j].grad[k],
+                    want[j].grad[k]
+                );
+            }
         }
     }
 }
