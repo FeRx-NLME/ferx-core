@@ -132,13 +132,47 @@ pub struct SimulateOptions {
 ///
 /// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
 /// it surfaces loudly during integration (never as a silent censor).
+///
+/// `horizon` says what the caller could have supplied. Where a horizon is required and
+/// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
+/// that takes none (`simulate_with_uncertainty`) cannot act on that, so it is told the
+/// model cannot be simulated there and where it can (`E_TTE_NOT_SIMULATABLE`, #1774).
+/// What a `simulate*` entry point lets its caller supply as the TTE administrative
+/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
+#[cfg(feature = "survival")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TteHorizon {
+    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
+    Given(Option<f64>),
+    /// The entry point takes none (`simulate_with_uncertainty`).
+    NotAccepted,
+}
+
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
-    horizon: Option<f64>,
+    horizon: TteHorizon,
 ) -> Result<(), EngineError> {
     use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
+    // The refusal for a required horizon that is missing or not finite and positive.
+    // `what` names the endpoint kind, `why` the reason it needs one.
+    let missing_horizon = |what: &str, why: &str| match horizon {
+        TteHorizon::Given(_) => simulate_horizon(format!(
+            "{what} simulation requires a finite, positive administrative horizon: set \
+             `[simulation] horizon` (or `SimulateOptions.horizon`). {why}"
+        )),
+        TteHorizon::NotAccepted => tte_not_simulatable(format!(
+            "{what} simulation requires a finite, positive administrative horizon, and \
+             `simulate_with_uncertainty` takes none (`SimulateUncertaintyOptions` has no \
+             horizon). {why} Simulate this model with `simulate_with_options` and \
+             `SimulateOptions.horizon` instead."
+        )),
+    };
+    let horizon = match horizon {
+        TteHorizon::Given(h) => h,
+        TteHorizon::NotAccepted => None,
+    };
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
 
     // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
@@ -178,11 +212,9 @@ pub(crate) fn validate_tte_simulatable(
         match horizon {
             Some(h) if h.is_finite() && h > 0.0 => {}
             _ => {
-                return Err(simulate_horizon(
-                    "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
-                     positive administrative horizon: set `[simulation] horizon` (or \
-                     `SimulateOptions.horizon`). The recurrent event stream is generated up to \
-                     that horizon.",
+                return Err(missing_horizon(
+                    "Repeated time-to-event (RTTE, `type = rtte`)",
+                    "The recurrent event stream is generated up to that horizon.",
                 ));
             }
         }
@@ -258,10 +290,10 @@ pub(crate) fn validate_tte_simulatable(
     match horizon {
         Some(h) if h.is_finite() && h > 0.0 => {}
         _ => {
-            return Err(simulate_horizon(
-                "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
-                 administrative horizon: set `[simulation] horizon` (or `SimulateOptions.horizon`). \
-                 A drug-driven hazard can vanish, so there is no implicit observation window."));
+            return Err(missing_horizon(
+                "ODE-accumulated TTE (joint PK-TTE)",
+                "A drug-driven hazard can vanish, so there is no implicit observation window.",
+            ));
         }
     }
     for subject in &population.subjects {
@@ -591,7 +623,7 @@ pub fn simulate_with_options_diag(
     // deep in sampling (a finite horizon is required; resets and left truncation are
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, opts.horizon)?;
+    validate_tte_simulatable(model, population, TteHorizon::Given(opts.horizon))?;
 
     // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
     // as a clean Err here; `simulate` / `simulate_with_seed` get the same `Err` from
@@ -1209,7 +1241,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // returns a clean Err; `simulate` / `simulate_with_seed` reach them only here,
     // and return the same `Err` rather than emitting wrong rows.
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, horizon)?;
+    validate_tte_simulatable(model, population, TteHorizon::Given(horizon))?;
 
     // Same split for the model-vs-population checks (#1083). The
     // `Result`-returning entry points above have already run this list and
@@ -1388,11 +1420,11 @@ pub fn simulate_with_uncertainty_diag(
     // Ω / σ / Ω_IOV (#1764, #1833) are refused by `fitted_params_from_result` below,
     // before any draw: a second gate here rejected exactly the same inputs.
 
-    // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
-    // uncertainty path does not yet expose — validate once here rather than per
-    // draw at the inner chokepoint (which returns the same `Err`).
+    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon, which this
+    // uncertainty path does not expose — validate once here rather than per draw, and say
+    // so rather than ask for an option the caller cannot set (#1774).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, None)?;
+    validate_tte_simulatable(model, population, TteHorizon::NotAccepted)?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector

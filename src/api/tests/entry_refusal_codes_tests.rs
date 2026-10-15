@@ -254,6 +254,16 @@ fn tte_simulation_refusals_carry_their_codes() {
     let sim = |m: &CompiledModel, pop: Population, h: Option<f64>| {
         simulate_with_options(m, &pop, &m.default_params, 1, &opts(h))
     };
+    let unc = |m: &CompiledModel, pop: Population| {
+        let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+        let o = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 0,
+            n_sim_per_draw: 1,
+            seed: Some(1),
+            ..Default::default()
+        };
+        simulate_with_uncertainty(m, &pop, &fit, &o)
+    };
     check_rows(vec![
         row(
             "RTTE without a horizon",
@@ -342,6 +352,31 @@ fn tte_simulation_refusals_carry_their_codes() {
             None,
             "SimulateOptions.horizon (2) is below subject '4' entry_time (5); the \
              administrative horizon must be ≥ every subject's entry time",
+        ),
+        // `simulate_with_uncertainty` takes no horizon (review r1 #4): the same two
+        // horizon-required cases are not an option to set there, so they are
+        // `E_TTE_NOT_SIMULATABLE`, naming the entry point that can simulate the model.
+        row(
+            "uncertainty, RTTE (no horizon option)",
+            unc(&rtte, one(tte_subject(vec![event(2, 0.0)]))),
+            "E_TTE_NOT_SIMULATABLE",
+            Some("event_model"),
+            "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
+             positive administrative horizon, and `simulate_with_uncertainty` takes none \
+             (`SimulateUncertaintyOptions` has no horizon). The recurrent event stream is \
+             generated up to that horizon. Simulate this model with \
+             `simulate_with_options` and `SimulateOptions.horizon` instead.",
+        ),
+        row(
+            "uncertainty, ODE-accumulated TTE (no horizon option)",
+            unc(&ode_tte, one(tte_subject(vec![event(3, 0.0)]))),
+            "E_TTE_NOT_SIMULATABLE",
+            Some("event_model"),
+            "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
+             administrative horizon, and `simulate_with_uncertainty` takes none \
+             (`SimulateUncertaintyOptions` has no horizon). A drug-driven hazard can \
+             vanish, so there is no implicit observation window. Simulate this model with \
+             `simulate_with_options` and `SimulateOptions.horizon` instead.",
         ),
     ]);
 }
