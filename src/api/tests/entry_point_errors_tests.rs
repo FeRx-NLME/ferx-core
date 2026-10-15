@@ -608,7 +608,7 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
 /// #1488: every `simulate*` form refuses a Form C readout of the oral depot amount on a
 /// subject dose superposition cannot reconstruct — **both** arms of
 /// `check_analytic_readout_support`, an EVID=3/4 reset (#650) and a bolus into `CMT=2` (#375) —
-/// with exactly the text `predict_diag()` and `fit()` give.
+/// with exactly the text `predict_diag()` and `fit()` give, and `E_READOUT_DEPOT_UNSUPPORTED`.
 ///
 /// Before the fix none of them ran the check. Measured on this fixture in a release build
 /// (`simulate_with_options`, seed 1, against an `ode(states=[depot, central])` twin with the
@@ -682,6 +682,11 @@ fn every_simulate_form_refuses_a_depot_readout_superposition_cannot_reconstruct(
         for (form, got) in forms {
             let got = got.unwrap_or_else(|| panic!("{form} × {arm}: accepted"));
             assert_eq!(got.to_string(), want.to_string(), "{form} × {arm}");
+            assert_eq!(
+                got.code(),
+                Some("E_READOUT_DEPOT_UNSUPPORTED"),
+                "{form} × {arm}"
+            );
         }
     }
     // The control: the default-compartment bolus, no reset — the readout itself is supported.

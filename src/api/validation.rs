@@ -3927,8 +3927,8 @@ pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> V
 /// model (which integrates the depot state directly). A `central`-only readout
 /// is unaffected. Returns an empty list for the common no-readout / IV / central-only
 /// case, else one `E_READOUT_DEPOT_UNSUPPORTED` error on block `scaling`, which `fit()`,
-/// `predict` / `predict_diag` and `ferx check` (through [`check_model_data_rule`]) report
-/// (#1774).
+/// `predict` / `predict_diag`, every `simulate*` but `simulate_adaptive*` (#1488) and
+/// `ferx check` (through [`check_model_data_rule`]) report (#1774).
 pub(crate) fn check_analytic_readout_support(
     model: &CompiledModel,
     population: &Population,
