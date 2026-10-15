@@ -326,7 +326,7 @@ fn run_score_sa(
                 gamma,
                 // `mstep_damping` off, which is the shipped default, so γ_σ is
                 // `min(γ, SIGMA_SA_MAX_STEP)` exactly as in a production fit.
-                1.0,
+                &[sigma_mstep_sa_step(gamma, 1.0)],
                 &[],
             );
         }
@@ -481,7 +481,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     let i1 = sa.info.clone();
@@ -507,7 +507,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     let fresh = sa_b.info.clone();
@@ -526,7 +526,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         0.5,
-        1.0,
+        &[sigma_mstep_sa_step(0.5, 1.0)],
         &[],
     );
 
@@ -710,7 +710,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert!(
@@ -742,7 +742,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert_eq!(sa.failure_total(), 2, "the counter must accumulate");
@@ -766,7 +766,7 @@ fn every_failure_route_is_counted() {
         &q.sigma_upper,
         &q.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert!(moved_ok, "the free fixture must take a step");
@@ -957,7 +957,7 @@ fn one_step(gamma: f64, gamma_mstep: f64) -> (Vec<f64>, Vec<f64>) {
         &p.sigma_upper,
         &p.mask,
         gamma,
-        gamma_mstep,
+        &[sigma_mstep_sa_step(gamma, gamma_mstep)],
         &[],
     );
     assert!(
