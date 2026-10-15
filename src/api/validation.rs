@@ -1716,6 +1716,11 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_dose_compartments(model, population));
     diags.extend(check_dose_attr_finiteness(model, population));
     diags.extend(validate_output_columns(model, population));
+    // `fit()` refuses both of these inline, ahead of this list, so they change no first
+    // error of `fit()`'s; listed here so `ferx check` reports what `fit()` refuses (#1774).
+    diags.extend(check_analytic_readout_support(model, population));
+    #[cfg(feature = "survival")]
+    diags.extend(check_survival_tv_covariates(model, population));
     // Last, so every more specific data code — `E_NONFINITE_DV`, `E_ENDPOINT_NO_RECORDS`,
     // `E_ENDPOINT_UNROUTED` — still wins `first_error` in `fit()` with its old text (#1491).
     diags.extend(check_scored_observations(population));
@@ -3565,16 +3570,24 @@ pub(crate) fn check_rtte_records(model: &CompiledModel, population: &Population)
 ///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
 ///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
 ///
-/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` and every
-/// predict / simulate entry point surface the message as an `Err` (#898).
+/// Returns an empty list when no endpoint references a time-varying covariate, else one
+/// `E_ENDPOINT_TV_COVARIATE` error whose block is the endpoint's (`binary_model`,
+/// `markov_model` or `event_model`). `fit()` and every predict / simulate entry point
+/// surface it as an `Err` (#898), and `ferx check` reports it through
+/// [`check_model_data_rule`] (#1774).
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_tv_covariates(
     model: &CompiledModel,
     population: &Population,
-) -> Option<String> {
+) -> Vec<Diagnostic> {
     use crate::types::{EndpointLikelihood, HazardSpec};
+    // One code for the four texts: the cause is the same (a time-varying covariate read
+    // by a closure that takes no time), and only the endpoint's block differs.
+    let refuse = |block: &str, message: String| {
+        vec![Diagnostic::error("E_ENDPOINT_TV_COVARIATE", message).with_block(block)]
+    };
     if !model.has_non_gaussian() {
-        return None;
+        return Vec::new();
     }
     for subject in &population.subjects {
         let tv = subject.time_varying_covariate_names();
@@ -3590,14 +3603,17 @@ pub(crate) fn check_survival_tv_covariates(
             // transitively through `[individual_parameters]`.
             if let EndpointLikelihood::Binary { lp_covariates, .. } = endpoint {
                 if let Some(name) = lp_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
-                    return Some(format!(
+                    return refuse(
+                        "binary_model",
+                        format!(
                         "[binary_model] on CMT={cmt}: the logit predictor references covariate \
                          `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
                          on the predictor are not yet supported — it is evaluated at the baseline \
                          covariate value, so the fit would silently use the wrong log-odds (#741). \
                          Use a time-constant (baseline) covariate for now.",
                         subject.id
-                    ));
+                    ),
+                    );
                 }
                 continue;
             }
@@ -3614,7 +3630,9 @@ pub(crate) fn check_survival_tv_covariates(
                     .iter()
                     .find(|c| tv_set.contains(c.as_str()))
                 {
-                    return Some(format!(
+                    return refuse(
+                        "markov_model",
+                        format!(
                         "[markov_model] on CMT={cmt}: a transition intensity references covariate \
                          `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
                          on the generator are not yet supported — the generator is evaluated at the \
@@ -3622,7 +3640,8 @@ pub(crate) fn check_survival_tv_covariates(
                          silently use the wrong intensity (#741). A drug-driven Q(t) is Phase 6; \
                          use a time-constant (baseline) covariate for now.",
                         subject.id
-                    ));
+                    ),
+                    );
                 }
                 continue;
             }
@@ -3640,7 +3659,9 @@ pub(crate) fn check_survival_tv_covariates(
                         .iter()
                         .find(|c| tv_set.contains(c.as_str()))
                     {
-                        return Some(format!(
+                        return refuse(
+                            "event_model",
+                            format!(
                             "[event_model] on CMT={cmt}: the survival hazard references covariate \
                              `{name}`, which is time-varying for subject `{}`. Time-varying \
                              covariates on a hazard are not yet supported — the analytic hazard is \
@@ -3648,26 +3669,30 @@ pub(crate) fn check_survival_tv_covariates(
                              use the wrong hazard (#741). Use a time-constant (baseline) covariate \
                              on the hazard for now.",
                             subject.id
-                        ));
+                        ),
+                        );
                     }
                 }
                 HazardSpec::OdeAccumulated { .. } => {
                     // Any time-varying covariate is frozen by the survival ODE solve's t=0
                     // PK-parameter snapshot; name the first one deterministically (`tv` is sorted).
                     let name = &tv[0];
-                    return Some(format!(
+                    return refuse(
+                        "event_model",
+                        format!(
                         "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
                          integrated with covariates frozen at their t=0 baseline, but covariate \
                          `{name}` is time-varying for subject `{}`. Time-varying covariates on a \
                          drug-driven hazard are not yet supported (#741). Hold the covariate \
                          constant within each subject for now.",
                         subject.id
-                    ));
+                    ),
+                    );
                 }
             }
         }
     }
-    None
+    Vec::new()
 }
 
 /// Reject a model whose **ODE-accumulated hazard integrates a `TIME`-dependent
@@ -3859,6 +3884,20 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     None
 }
 
+/// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`
+/// report: `E_ENDPOINT_TIME_DEPENDENT_PK`, block `event_model` (#1774). One code for every
+/// text, the two fail-closed arms included: each says the hazard pass would read a
+/// TIME-dependent disposition at its TIME=0 snapshot, or cannot rule that out. A function of
+/// the model alone, so `ferx check` reports it without `--data`.
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
+    check_survival_time_dependent_pk(model)
+        .map(|m| {
+            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model")]
+        })
+        .unwrap_or_default()
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
@@ -3886,18 +3925,28 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
 /// variant for the readout to read, so there is nothing to fall back to.
 /// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
 /// model (which integrates the depot state directly). A `central`-only readout
-/// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
+/// is unaffected. Returns an empty list for the common no-readout / IV / central-only
+/// case, else one `E_READOUT_DEPOT_UNSUPPORTED` error on block `scaling`, which `fit()`,
+/// `predict` / `predict_diag` and `ferx check` (through [`check_model_data_rule`]) report
+/// (#1774).
 pub(crate) fn check_analytic_readout_support(
     model: &CompiledModel,
     population: &Population,
-) -> Option<String> {
-    let ar = model.analytic_readout.as_ref()?;
+) -> Vec<Diagnostic> {
+    // One code for both texts: either way the depot amount the readout reads cannot be
+    // reconstructed by dose superposition for this subject.
+    let refuse = |message: String| {
+        vec![Diagnostic::error("E_READOUT_DEPOT_UNSUPPORTED", message).with_block("scaling")]
+    };
+    let Some(ar) = model.analytic_readout.as_ref() else {
+        return Vec::new();
+    };
     if !ar.references_depot() {
-        return None;
+        return Vec::new();
     }
     for subject in &population.subjects {
         if subject.has_resets() {
-            return Some(format!(
+            return refuse(format!(
                 "[scaling] y: an analytic Form C readout that references the oral `depot` \
                  amount is not supported on a subject with an EVID=3/4 reset (subject {}): \
                  the depot amount is reconstructed by dose superposition, which is invalid \
@@ -3908,7 +3957,7 @@ pub(crate) fn check_analytic_readout_support(
             ));
         }
         if crate::pk::dose_needs_event_walk(model.pk_model, subject) {
-            return Some(format!(
+            return refuse(format!(
                 "[scaling] y: an analytic Form C readout that references the oral `depot` \
                  amount is not supported on a subject dosing a non-default compartment \
                  (subject {}): the depot amount is reconstructed by dose superposition, \
@@ -3922,7 +3971,7 @@ pub(crate) fn check_analytic_readout_support(
             ));
         }
     }
-    None
+    Vec::new()
 }
 
 /// Whether `model` is a transit / inverse-Gaussian **closed form carrying no ODE twin** —
@@ -8115,6 +8164,12 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+
+    // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
+    //    function of the model alone, so it needs no `--data`. `fit()` and every
+    //    predict / simulate entry point refuse it; `ferx check` reports it (#1774).
+    #[cfg(feature = "survival")]
+    diags.extend(check_survival_time_dependent_pk_diags(&parsed.model));
 
     // 2d. Undeclared random effects, *without* a dataset. With data present this
     //    is an `E_ETA_NOT_DECLARED` error from `check_covariates` below (we know

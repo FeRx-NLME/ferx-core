@@ -134,12 +134,15 @@ same model and data. A caller can match on `code()` instead of parsing the
 message. `message()` never repeats the suggestion, so show either `to_string()`
 alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
 unbound `theta NAME[...]` block is the one whose `to_string()` also ends with its
-suggestion.) When `ferx check` has no code for the refusal, `code()` is usually
-`None`. The time-varying covariate on a hazard and the depot readout across a reset
-are refusals of that kind. The exceptions are refusals `ferx check` cannot reach,
-since it has no parameter vector and no fit: the θ length and parameter shape codes,
-the binding codes on a fit's bindings, and a population that is not the fit's
-(`E_POPULATION_MISMATCH`).
+suggestion.) A refusal `ferx check` cannot reach has a code too, since it has no
+parameter vector, no fit, no simulation options and no adaptive controller: the θ
+length and parameter shape codes, the binding codes on a fit's bindings, a population
+that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation and adaptive-dosing
+codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
+`code()` is still `None` for the other input checks of `run_sir()` and `run_covariance()`,
+for what the adaptive-dosing driver refuses once it runs (a controller's dose action,
+a decision time that collides with a reset), and for a failure that is not a refusal
+of the input, such as a posthoc eta that does not converge.
 
 Each precondition check emits one of a fixed set of codes, depending on what it
 found:
@@ -161,7 +164,15 @@ found:
 | endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
 | θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
 | population not the fit's (`run_sir()`, `run_covariance()`, `PopulationFingerprint::verify`) | `E_POPULATION_MISMATCH`; on `run_sir()` / `run_covariance()` also `E_FIT_SUBJECTS_MISMATCH` |
-| time-varying covariate on a hazard, depot readout across a reset, a CTMM model, TTE simulatable, Ω~IOV~ present, `horizon`, the adaptive-dosing rejections | none |
+| time-varying covariate on an endpoint | `E_ENDPOINT_TV_COVARIATE` |
+| `TIME`-dependent disposition under a drug-driven hazard | `E_ENDPOINT_TIME_DEPENDENT_PK` |
+| depot readout the dose superposition cannot reconstruct | `E_READOUT_DEPOT_UNSUPPORTED` |
+| a CTMM model (`predict*`, `simulate*`) | `E_CTMM_UNSUPPORTED` |
+| TTE simulatable | `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON` |
+| Ω~IOV~ present (`simulate*`) | `E_PARAM_SHAPE` |
+| `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
+| propensity-score matching inputs | `E_PROPENSITY_INPUT` |
+| adaptive dosing: the model, the options, the spec | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
 
 `fit()` keeps returning a `String`.
 

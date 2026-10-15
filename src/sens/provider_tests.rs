@@ -5062,7 +5062,7 @@ fn depot_readout_with_reset_is_rejected() {
         warnings: Vec::new(),
     };
     assert!(
-        crate::api::check_analytic_readout_support(&depot_m, &pop).is_some(),
+        !crate::api::check_analytic_readout_support(&depot_m, &pop).is_empty(),
         "depot readout + reset subject must be rejected"
     );
 
@@ -5073,7 +5073,7 @@ fn depot_readout_with_reset_is_rejected() {
     );
     let central_m = parse_model_string(&central_src).expect("parse central readout");
     assert!(
-        crate::api::check_analytic_readout_support(&central_m, &pop).is_none(),
+        crate::api::check_analytic_readout_support(&central_m, &pop).is_empty(),
         "central-only readout must be accepted on a reset subject"
     );
 }
