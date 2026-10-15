@@ -1388,33 +1388,73 @@ fn repro555_ode_exprscale_ebe_finds_global_min() {
 /// to the FOCEI gradient), seeds NM from the partial under `ebe_warm_start`, and discards
 /// a non-finite-objective partial. Uses a bimodal 1-D objective (deep well at x=-2,
 /// f=-10; shallow well at x=+2, f=-1).
+/// The bimodal 1-D objective the `argmin_inner_fallback` tests share — deep well at x = −2
+/// (f = −10), shallow well at x = +2 (f = −1) — and its exact gradient.
+fn bimodal_obj(x: &[f64]) -> f64 {
+    let v = x[0];
+    if v < 0.0 {
+        (v + 2.0).powi(2) - 10.0
+    } else {
+        (v - 2.0).powi(2) - 1.0
+    }
+}
+
+fn bimodal_grad(x: &[f64]) -> Vec<f64> {
+    let v = x[0];
+    vec![if v < 0.0 {
+        2.0 * (v + 2.0)
+    } else {
+        2.0 * (v - 2.0)
+    }]
+}
+
+fn never_stall(_: &[f64]) -> bool {
+    false
+}
+
+fn always_stall(_: &[f64]) -> bool {
+    true
+}
+
+/// A [`FallbackCertifier`] for an exact objective (no stall stop, no preconditioner).
+fn exact_cert<'a>(
+    grad: &'a dyn Fn(&[f64]) -> Vec<f64>,
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> FallbackCertifier<'a> {
+    FallbackCertifier {
+        grad,
+        precond: None,
+        stop_precond: None,
+        stall_at: &never_stall,
+        n,
+        max_iter,
+        tol,
+    }
+}
+
 #[test]
 fn argmin_inner_fallback_keeps_better_basin() {
-    let obj = |x: &[f64]| -> f64 {
-        let v = x[0];
-        if v < 0.0 {
-            (v + 2.0).powi(2) - 10.0
-        } else {
-            (v - 2.0).powi(2) - 1.0
-        }
-    };
+    let obj = bimodal_obj;
+    let cert = exact_cert(&bimodal_grad, 1, 200, 1e-8);
     let cold = arm_inner_settings(InnerSettings::default());
 
     // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
     // keeps the lower-objective partial rather than overwriting with the shallow NM
     // result (the old behaviour, which on this multimodal objective inflated the OFV).
-    let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8);
+    let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], &cert);
     assert!((eta[0] + 2.0).abs() < 1e-2, "kept deep well, got {eta:?}");
 
     // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
-    let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8);
+    let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], &cert);
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "NM found deeper well, got {eta2:?}"
     );
 
     // Non-finite partial objective → unusable → NM result is taken.
-    let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8);
+    let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], &cert);
     assert!(
         eta3[0].is_finite(),
         "NaN partial must be discarded, got {eta3:?}"
@@ -1426,7 +1466,7 @@ fn argmin_inner_fallback_keeps_better_basin() {
         warm: true,
         ..Default::default()
     });
-    let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
+    let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], &cert);
     assert!(
         (eta4[0] + 2.0).abs() < 1e-2,
         "warm seed held the deep well, got {eta4:?}"
@@ -3549,7 +3589,13 @@ fn test_find_ebe_iov_honors_mu_shift() {
     let mu = vec![0.1];
     let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu), 0);
 
-    assert!(r1.converged && r2.converged);
+    // No `converged` assertion (#1527): this subject's objective is ~2.68e5 at the mode, where
+    // the FD inner gradient's rounding floor is ε·|f|/h ≈ 2.2e-16·2.68e5/8.6e-7 ≈ 7e-5 — seven
+    // times `tol` — so whether a run is *certified* there is luck, not a property of the
+    // mu-shift. Measured: r1 stops on BFGS `gnorm < tol` (`true`); r2 reaches the Nelder–Mead
+    // fallback and lands 2.2e-7 from r1, which the stationarity certificate cannot certify
+    // (`false`) and Nelder–Mead's simplex spread used to (`true`). The invariant is the η.
+    assert!(r1.eta[0].is_finite() && r2.eta[0].is_finite());
     // This fixture's BSV mode sits far out (η̂ ≈ −7.6) where the FD-gradient
     // inner objective is very flat: the gnorm < 1e-5 stop is satisfied across
     // an η basin wider than 1e-4, so the exact landing point is line-search
@@ -3899,25 +3945,24 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
 /// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). Budgets:
 /// `max_iter = 1` gives each NM 5 iterations — enough for a restart seeded on the shallow
 /// minimum to collapse its 0.1-wide simplex under `tol = 1e-3`, not enough for a polish
-/// from x = −1.5 to reach x = −2 within `tol`. Verified by mutation: returning the
-/// restart's flag turns the first half red.
+/// from x = −1.5 to reach x = −2 within `tol` — and gives the stationarity certifier's
+/// gradient polish (#1527) one BFGS iteration, which ends before its next `gnorm < tol`
+/// test. Verified by mutation: returning the restart's flag turns the first half red.
 #[test]
 fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
-    let obj = |x: &[f64]| -> f64 {
-        let v = x[0];
-        if v < 0.0 {
-            (v + 2.0).powi(2) - 10.0
-        } else {
-            (v - 2.0).powi(2) - 1.0
-        }
-    };
+    let obj = bimodal_obj;
     let _cold = arm_inner_settings(InnerSettings::default());
     let partial = [-1.5];
     let f_partial = obj(&partial);
 
     // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
     // polish cannot certify it.
-    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 1, 1e-3);
+    let (eta, ok) = argmin_inner_fallback(
+        &obj,
+        &partial,
+        &[2.0],
+        &exact_cert(&bimodal_grad, 1, 1, 1e-3),
+    );
     assert!(eta[0] < 0.0, "must stay in the deep well, got {eta:?}");
     assert!(
         obj(&eta) <= f_partial,
@@ -3931,15 +3976,376 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     );
 
     // Normal budget: the polish reaches the deep mode and earns the flag.
-    let (eta2, ok2) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 200, 1e-8);
+    let (eta2, ok2) = argmin_inner_fallback(
+        &obj,
+        &partial,
+        &[2.0],
+        &exact_cert(&bimodal_grad, 1, 200, 1e-8),
+    );
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "polish must reach the deep mode, got {eta2:?}"
     );
+    assert!(ok2, "a stationary returned point is certified");
     assert!(
-        ok2,
-        "an NM run that ended at the returned point certifies it"
+        bimodal_grad(&eta2)[0].abs() < 1e-8,
+        "`converged` must mean stationary at the returned point (#1527), got |g| = {:.3e}",
+        bimodal_grad(&eta2)[0].abs()
     );
+}
+
+/// #1527: the fallback's `converged` is **stationarity at the returned point**, not
+/// Nelder–Mead's `frange < tol` simplex spread. Three cases, both sides of the gate in one
+/// test so forcing the certificate either way reddens it:
+///
+/// 1. **No stationary point exists.** `f(x) = 0.01·x` is a plane: NM's first simplex
+///    (`x = 0` and `x = 0.00025`) already spans `frange = 2.5e-6 < tol = 1e-5`, so NM returns
+///    `true` on its very first check — at a point whose gradient is 1e-2, 1000× `tol`, and on
+///    an objective that has *no* mode. Must report `converged == false`, and keep the point
+///    (the polish cannot certify anything, so it must not move the result either).
+///    **Red on `main`**, which returned NM's `true`.
+/// 2. **NM collapses short of a genuine mode.** `f(x) = 50·(x − 1)²` from `x = 0.9`: NM stops
+///    once its spread is under `tol`, i.e. at `|x − 1| ≈ √(tol/50)` and a gradient of ~1e-2 —
+///    measured below. The certificate must not take that point; the gradient polish carries it
+///    to the mode, and the returned point must be stationary under `tol`. **Red on `main`**,
+///    which returned the NM point (gradient ≫ `tol`) as converged.
+/// 3. **The control:** the same bowl handed its exact mode is certified unchanged by the
+///    gradient test alone.
+#[test]
+fn argmin_inner_fallback_certifies_on_stationarity_not_simplex_spread() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+
+    // 1. A plane: NM's simplex spread is under `tol` at once, and nothing is stationary.
+    let plane = |x: &[f64]| 0.01 * x[0];
+    let plane_grad = |_: &[f64]| vec![0.01];
+    let mut nm_point = vec![0.0];
+    assert!(
+        nelder_mead_minimize(&plane, &mut nm_point, 1, 250, tol),
+        "fixture: NM must report its own `frange < tol` success on the plane, or this case \
+         does not reproduce #1527"
+    );
+    let (eta, ok) =
+        argmin_inner_fallback(&plane, &[0.0], &[0.0], &exact_cert(&plane_grad, 1, 50, tol));
+    assert!(
+        !ok,
+        "NM's simplex collapsed on a plane with |∇f| = 1e-2 = 1000·tol; that is not a \
+         converged EBE (#1527), got converged = true at {eta:?}"
+    );
+    assert_eq!(
+        eta, nm_point,
+        "an uncertified polish must not move the returned point"
+    );
+
+    // 2. A bowl NM approaches but does not reach under a gradient `tol`.
+    let bowl = |x: &[f64]| 50.0 * (x[0] - 1.0).powi(2);
+    let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
+    let mut nm_end = vec![0.9];
+    nelder_mead_minimize(&bowl, &mut nm_end, 1, 250, tol);
+    let nm_gnorm = bowl_grad(&nm_end)[0].abs();
+    assert!(
+        nm_gnorm.is_finite() && nm_gnorm > 10.0 * tol,
+        "fixture: NM must stop short of stationarity here, got |g| = {nm_gnorm:.3e}"
+    );
+    let (eta2, ok2) =
+        argmin_inner_fallback(&bowl, &[0.9], &[0.9], &exact_cert(&bowl_grad, 1, 50, tol));
+    let g2 = bowl_grad(&eta2)[0].abs();
+    assert!(g2.is_finite(), "returned a non-finite gradient at {eta2:?}");
+    assert!(
+        ok2 && g2 < tol,
+        "the gradient polish must certify the bowl's mode: converged = {ok2}, |g| = {g2:.3e} \
+         (NM alone stopped at |g| = {nm_gnorm:.3e})"
+    );
+
+    // 3. Control: already at the mode → certified by the gradient test, point unchanged.
+    let mut at_mode = vec![1.0];
+    assert!(exact_cert(&bowl_grad, 1, 50, tol).certify(&bowl, &mut at_mode));
+    assert_eq!(at_mode, vec![1.0]);
+}
+
+/// #1527's Newton-step test (test 2 of [`FallbackCertifier`]): a point within `tol` of a
+/// **positive-definite** mode is certified in place even when its gradient norm is far above
+/// `tol` — the stiff-direction case no line search can resolve, which is what sends such
+/// subjects to the fallback in the first place — and a point the same distance from a
+/// **saddle** is not. Both sides of the PD gate in one test:
+///
+/// * stiff bowl `f = ½·1e10·(x − 1)²` at `x = 1 + 1e-8`: `‖∇‖ = 100 = 1e7·tol`, Newton step
+///   `1e-8`, and a remaining decrease of `5e-7` — far above the resolution arm's
+///   `INNER_FTOL_REL·(1 + |f|) ≈ 1e-11`, so only the **step** arm can certify it. Certified
+///   **and returned bit-unchanged**: the gradient polish (test 3) would also certify it, but
+///   only after moving it, so `assert_eq!` on the point is what kills a mutation that deletes
+///   test 2 or its step arm.
+/// * saddle `f = 5e3·(x² − y²)` at `(1e-8, 1e-8)`: `‖∇‖ = 1.4e-4 > tol`, Newton step
+///   `‖H⁻¹∇‖ = 1.4e-8 < tol`, but `H = diag(1e4, −1e4)` is indefinite — not a mode. Must not
+///   certify (the polish runs off down `y` and does not certify either), and the point must
+///   come back unchanged. Mutation: solving `H⁻¹∇` without the Cholesky (PD) requirement
+///   certifies the saddle and reddens this half.
+#[test]
+fn fallback_certifier_newton_step_needs_a_positive_definite_mode() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+
+    let stiff = |x: &[f64]| 0.5e10 * (x[0] - 1.0).powi(2);
+    let stiff_grad = |x: &[f64]| vec![1e10 * (x[0] - 1.0)];
+    let start = vec![1.0 + 1e-8];
+    let g0 = stiff_grad(&start)[0].abs();
+    assert!(
+        g0 > 10.0 * tol,
+        "fixture: the gradient test alone must not pass here, got |g| = {g0:.3e}"
+    );
+    let mut x = start.clone();
+    assert!(
+        exact_cert(&stiff_grad, 1, 50, tol).certify(&stiff, &mut x),
+        "a point 1e-8 from a PD mode is within `tol` of it and must be certified"
+    );
+    assert_eq!(
+        x, start,
+        "the Newton-step test certifies in place, without moving the point"
+    );
+
+    let saddle = |x: &[f64]| 5e3 * (x[0] * x[0] - x[1] * x[1]);
+    let saddle_grad = |x: &[f64]| vec![1e4 * x[0], -1e4 * x[1]];
+    let at = vec![1e-8, 1e-8];
+    let gs = saddle_grad(&at);
+    let gs_norm = (gs[0] * gs[0] + gs[1] * gs[1]).sqrt();
+    assert!(
+        gs_norm > tol,
+        "fixture: the saddle point must fail the gradient test, got |g| = {gs_norm:.3e}"
+    );
+    let mut y = at.clone();
+    assert!(
+        !exact_cert(&saddle_grad, 2, 50, tol).certify(&saddle, &mut y),
+        "a saddle is not a mode, however short its Newton step; certified at {y:?}"
+    );
+    assert_eq!(y, at, "an uncertified point is returned unchanged");
+}
+
+/// The certified Nelder–Mead recovery the FREM arm and both runaway-EBE guards use
+/// (`FallbackCertifier::nelder_mead_recover`, #1527), and its admissibility gate:
+///
+/// * on a plane NM's simplex collapses at once and nothing is stationary → `false`;
+/// * on a bowl NM stops short of the mode and the certificate's polish carries it there →
+///   `true`, stationary under `tol`;
+/// * the same bowl with an `admissible` predicate that excludes the mode's neighbourhood —
+///   what the runaway guards pass, so a gradient polish cannot march back past the runaway
+///   limit — must refuse the polished point: `false`, and the NM end point returned as is.
+///   Mutation: ignoring `admissible` certifies the excluded mode and reddens this case.
+#[test]
+fn nelder_mead_recover_is_certified_and_honours_admissibility() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+
+    let plane = |x: &[f64]| 0.01 * x[0];
+    let plane_grad = |_: &[f64]| vec![0.01];
+    let (_, ok) =
+        exact_cert(&plane_grad, 1, 50, tol).nelder_mead_recover(&plane, vec![0.0], &|_| true);
+    assert!(
+        !ok,
+        "a plane has no mode; NM's collapse must not certify one"
+    );
+
+    let bowl = |x: &[f64]| 50.0 * (x[0] - 1.0).powi(2);
+    let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
+    let (x, ok) =
+        exact_cert(&bowl_grad, 1, 50, tol).nelder_mead_recover(&bowl, vec![0.9], &|_| true);
+    let g = bowl_grad(&x)[0].abs();
+    assert!(
+        ok && g < tol,
+        "the bowl's mode is certified: converged = {ok}, |g| = {g:.3e}"
+    );
+
+    let mut nm_end = vec![0.9];
+    nelder_mead_minimize(&bowl, &mut nm_end, 1, 250, tol);
+    let (y, ok) =
+        exact_cert(&bowl_grad, 1, 50, tol)
+            .nelder_mead_recover(&bowl, vec![0.9], &|e: &[f64]| (e[0] - 1.0).abs() > 1e-5);
+    assert!(
+        !ok,
+        "a polish into the excluded region must not certify, ended at {y:?}"
+    );
+    assert_eq!(y, nm_end, "the NM end point is returned unchanged");
+}
+
+/// The Newton test's **resolution arm** (#1527): a point whose remaining Newton decrease
+/// `½∇ᵀH⁻¹∇` is at or below `INNER_FTOL_REL·(1 + |f|)` is a mode to the objective's precision
+/// and is certified in place, whatever `tol` says. It is what keeps tight `inner_tol` fits —
+/// Schnider at 1e-8, the AGQ score fixtures at 1e-11 — from reporting their converged
+/// subjects unconverged. Straddle, one fixture, `f = 100 + ½(x − 1)²`, `tol = 1e-5`,
+/// threshold `1e-11·101 ≈ 1.0e-9`:
+///
+/// * `x = 1 + 3e-5`: `‖∇‖ = 3e-5` and Newton step `3e-5`, both above `tol`, but the decrease
+///   left is `4.5e-10` — certified, returned **unmoved**;
+/// * `x = 1 + 1e-4`: decrease `5e-9`, above the threshold — not certified in place; the
+///   polish certifies it at the mode instead, so the point **moves**.
+///
+/// Mutation: deleting the resolution arm sends the first case to the polish, which moves
+/// it, and the `assert_eq!` reddens.
+#[test]
+fn fallback_certifier_certifies_a_mode_resolved_to_the_objectives_precision() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+    let f = |x: &[f64]| 100.0 + 0.5 * (x[0] - 1.0).powi(2);
+    let g = |x: &[f64]| vec![x[0] - 1.0];
+
+    let inside = vec![1.0 + 3e-5];
+    let mut x = inside.clone();
+    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut x));
+    assert_eq!(
+        x, inside,
+        "a decrease below the objective's resolution is certified in place"
+    );
+
+    let outside = vec![1.0 + 1e-4];
+    let mut y = outside.clone();
+    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut y));
+    assert_ne!(
+        y, outside,
+        "a resolvable decrease is not certified in place — the polish takes it to the mode"
+    );
+    assert!((y[0] - 1.0).abs() < tol, "polished to the mode, got {y:?}");
+}
+
+/// On a numerical objective (`stall_at` true) the certificate skips the Newton-step test —
+/// a finite-difference Hessian of a noise-floored gradient is not evidence — and lets the
+/// stall-armed polish decide (#1527). Observable on an objective of magnitude ~1e12, where
+/// the Newton test's resolution arm (`½∇ᵀH⁻¹∇ ≤ INNER_FTOL_REL·(1 + |f|)`, here ≤ 10)
+/// accepts a point 0.1 from the mode (remaining decrease 0.5): run on a numerical objective
+/// it would certify `x = 1.1` in place. The polish instead carries the point to the mode.
+/// Mutation: applying the Newton test whatever `stall_at` says returns `x = 1.1` and
+/// reddens this test.
+#[test]
+fn fallback_certifier_leaves_numerical_objectives_to_the_stall_polish() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+    let big = |x: &[f64]| 1e12 + 50.0 * (x[0] - 1.0).powi(2);
+    let big_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
+    let cert = FallbackCertifier {
+        stall_at: &always_stall,
+        ..exact_cert(&big_grad, 1, 200, tol)
+    };
+    let mut x = vec![1.1];
+    assert!(
+        cert.certify(&big, &mut x),
+        "the stall polish certifies, ended at {x:?}"
+    );
+    assert!(
+        (x[0] - 1.0).abs() < 1e-2,
+        "a numerical objective's point must come from the polish, not be certified in place \
+         0.1 from the mode by a Hessian it cannot trust: got {x:?}"
+    );
+}
+
+/// The certificate's polish is a gradient driver even under `inner_optimizer = nelder_mead`
+/// (#1527 review round 1): the fit-scoped dispatch would hand it back to Nelder–Mead, whose
+/// simplex-spread exit would then certify exactly what tests 1 and 2 just refused. On the
+/// plane NM collapses at once, so with the polish routed through the configured driver this
+/// returns `true`; with a gradient driver it is `false`. The `auto` control in the same test
+/// pins that the fixture refuses the plane on the ordinary path too.
+#[test]
+fn fallback_certifier_polish_is_gradient_based_under_nelder_mead_mode() {
+    let plane = |x: &[f64]| 0.01 * x[0];
+    let plane_grad = |_: &[f64]| vec![0.01];
+    for mode in [
+        crate::types::InnerOptimizer::Auto,
+        crate::types::InnerOptimizer::NelderMead,
+    ] {
+        let _armed = arm_inner_settings(InnerSettings {
+            mode,
+            ..Default::default()
+        });
+        let mut x = vec![0.0];
+        assert!(
+            !exact_cert(&plane_grad, 1, 50, 1e-5).certify(&plane, &mut x),
+            "{mode:?}: a plane has no mode; the polish must not certify one on simplex spread"
+        );
+        assert_eq!(
+            x,
+            vec![0.0],
+            "{mode:?}: an uncertified point is returned unchanged"
+        );
+    }
+}
+
+/// Test 1 of the certificate is the BFGS criterion itself, `‖∇‖ < tol`, and it is what makes
+/// the common case cheap: a fallback point that is already stationary costs **one** gradient
+/// evaluation. Without it every such point would buy the Newton test's `2n` extra gradients
+/// (the polish would still certify it, unmoved — so this cost is the only observable).
+/// Mutation: deleting test 1 makes the count 1 + 2n = 5 here.
+#[test]
+fn fallback_certifier_certifies_a_stationary_point_with_one_gradient() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let calls = std::cell::Cell::new(0usize);
+    let bowl = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] + 2.0).powi(2);
+    let counted = |x: &[f64]| {
+        calls.set(calls.get() + 1);
+        vec![2.0 * (x[0] - 1.0), 2.0 * (x[1] + 2.0)]
+    };
+    let mut x = vec![1.0, -2.0];
+    assert!(exact_cert(&counted, 2, 50, 1e-5).certify(&bowl, &mut x));
+    assert_eq!(
+        calls.get(),
+        1,
+        "a stationary point is certified on its first gradient"
+    );
+}
+
+/// Deterministic pseudo-noise in `[−1, 1)` — a hash of `x`'s bits, so a fixture can carry a
+/// solver-like noise floor and still be reproducible.
+fn hash_noise(x: f64) -> f64 {
+    let mut h = x.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 31;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 29;
+    (h >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+}
+
+/// #1527's stall arm: on a numerical objective the certificate's gradient polish runs the
+/// inner driver **with the subject's objective-stall predicate** (#555 / #1521), so a mode
+/// whose gradient is floored above `tol` by solver noise is certified rather than reported
+/// unconverged. The fixture models an RK45 objective the way #1521 measured one: a bowl at
+/// `f ≈ 1000` whose value carries `±1e-10` of deterministic noise (far under the stall's
+/// `1e-11·(1 + |f|) ≈ 1e-8` flatness threshold) and whose gradient carries `±1e-4` (ten
+/// times `tol`), so no point can pass `gnorm < tol` and the Newton-step test is skipped.
+///
+/// Both sides of the gate, one fixture: with `stall_at = true` the certificate holds and the
+/// returned point is the mode to the floor's resolution; with `stall_at = false` (the
+/// exact-objective criterion) the same start is **not** certified. Mutation: handing the
+/// polish a constant-`false` stall predicate instead of the certifier's reddens the first
+/// half; deleting the "skip test 2 on a numerical objective" guard does not (the Newton step
+/// from this start is ~3e-3, far above `tol`), which is stated rather than claimed.
+#[test]
+fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+    let noisy = |x: &[f64]| 1000.0 + 50.0 * (x[0] - 1.0).powi(2) + 1e-10 * hash_noise(x[0]);
+    let floored = |x: &[f64]| {
+        let d = x[0] - 1.0;
+        let floor = 1e-4 * (1.5 + 0.5 * hash_noise(x[0] + 0.5));
+        vec![100.0 * d + if d >= 0.0 { floor } else { -floor }]
+    };
+    let start = vec![1.0 + 3e-3];
+
+    let stall_cert = FallbackCertifier {
+        stall_at: &always_stall,
+        ..exact_cert(&floored, 1, 200, tol)
+    };
+    let mut x = start.clone();
+    assert!(
+        stall_cert.certify(&noisy, &mut x),
+        "a noise-floored mode must be certified by the stall stop, ended at {x:?}"
+    );
+    assert!(
+        (x[0] - 1.0).abs() < 1e-5,
+        "the stall-certified point must be the mode to the floor's resolution, got {x:?}"
+    );
+
+    let mut y = start.clone();
+    assert!(
+        !exact_cert(&floored, 1, 200, tol).certify(&noisy, &mut y),
+        "without the stall stop a floor above `tol` cannot be certified — if this passes, the \
+         fixture no longer models a noise floor and the first half proves nothing"
+    );
+    assert_eq!(y, start, "an uncertified point is returned unchanged");
 }
 
 /// The behavioural side of `inner_stall_enabled_at_iov_tracks_the_effective_model`: a
