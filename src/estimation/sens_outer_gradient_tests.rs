@@ -7636,8 +7636,10 @@ fn dense_r_serial_correlation_gradient_matches_fd() {
 /// is proportional to `σ_TOTAL²`, so `σ_TOTAL` is nudged to put it at `k · MIN_VARIANCE`
 /// while every other row stays far above the floor: `k = 1.05` straddles (the `−0.1σ`
 /// point lands at `0.85×`, floored), while `k = 1.5` (all three points live) agrees on
-/// the mask and is served. Asserted for FOCEI and FOCE, whose σ loops are separate code
-/// and which build `R` at different predictions — `f(η̂)` and the frozen `f(η = 0)`.
+/// the mask and is served, as is the straddling `k = 1.05` with that σ `FIX`-ed (a fixed
+/// coordinate's stencil is skipped, so it cannot decline the subject). Asserted for
+/// FOCEI and FOCE, whose σ loops are separate code and which build `R` at different
+/// predictions — `f(η̂)` and the frozen `f(η = 0)`.
 #[test]
 fn dense_r_sigma_stencil_straddling_the_floor_declines() {
     let model = parse_model_string(PAIRED_FU_1CPT).expect("parse");
@@ -7690,9 +7692,13 @@ fn dense_r_sigma_stencil_straddling_the_floor_declines() {
             big.sigma.values[0] *= 1e6;
             r_at(&big)[(lone, lone)] / 1e12
         };
-        for (k, served) in [(1.05, false), (1.5, true)] {
+        // The third cell is the straddling σ held `FIX`: its stencil is never taken, so
+        // it must not decline the subject (#1995 review round 3).
+        for (k, fix, served) in [(1.05, false, false), (1.5, false, true), (1.05, true, true)] {
             let mut p = template.clone();
             p.sigma.values[0] = template.sigma.values[0] * (k * floor / v0).sqrt();
+            p.sigma_fixed = vec![false; p.sigma.values.len()];
+            p.sigma_fixed[0] = fix;
             let r = r_at(&p);
             assert!(
                 (r[(lone, lone)] / floor - k).abs() < 1e-6,
@@ -7711,9 +7717,37 @@ fn dense_r_sigma_stencil_straddling_the_floor_declines() {
             assert_eq!(
                 g.is_some(),
                 served,
-                "k = {k}, interaction = {interaction}: served = {}",
+                "k = {k}, FIX = {fix}, interaction = {interaction}: served = {}",
                 g.is_some()
             );
         }
+    }
+}
+
+/// #1995 review round 3: [`PAIRED_FU_1CPT`] with a full `block_omega`, so the packed Ω
+/// coordinates include off-diagonal Cholesky entries. FOCE assembles its Ω block itself
+/// (`δΩ = δL·Lᵀ + L·δLᵀ` with the column-`col` loop), and a diagonal Ω leaves an
+/// index swap there invisible; FOCEI's borrowed closed form gets the same check.
+#[test]
+fn dense_r_paired_block_omega_gradient_matches_fd() {
+    let src = PAIRED_FU_1CPT.replace(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_FU ~ 0.05\n",
+        "  block_omega (ETA_CL, ETA_V, ETA_FU) = [0.09, 0.025, 0.04, -0.015, 0.01, 0.05]\n",
+    );
+    assert_ne!(
+        src, PAIRED_FU_1CPT,
+        "fixture: the omega lines must be replaced"
+    );
+    let model = parse_model_string(&src).expect("parse");
+    assert!(
+        !model.default_params.omega.diagonal,
+        "fixture: Ω must be a full block"
+    );
+    let theta = [1.1, 11.0, 0.35];
+    let pop = paired_fu_pop(&model, &theta);
+    for interaction in [true, false] {
+        // Measured (Linux arm64): worst relative error 1.1e-6 FOCEI and 2.6e-6 FOCE,
+        // both on x[11]; 2e-5 is ~8× over the larger.
+        run_dense_parity(&model, &pop, &theta, interaction, 2e-5);
     }
 }

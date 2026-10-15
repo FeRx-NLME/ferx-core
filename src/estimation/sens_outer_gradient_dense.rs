@@ -65,7 +65,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use super::{invert_inner_hessian, omega_packed_block_from, theta_dx_chain};
-use crate::estimation::parameterization::{rho_chain, rho_packed_start};
+use crate::estimation::parameterization::{packed_fixed_mask, rho_chain, rho_packed_start};
 use crate::sens::provider::SubjectSens;
 use crate::stats::residual_error::{
     compute_d2r_df2_compact_cov, compute_dr_df_columns_cov, r_matrix_maybe_scaled,
@@ -142,10 +142,14 @@ pub(crate) fn subject_packed_gradient_dense(
     let total = |out: &DirOut| -> f64 { 0.5 * (out.ddata + out.dlogdet) + response(out) };
 
     let mut g = vec![0.0f64; n_packed];
+    let is_fixed = fixed_coordinates(template);
 
     // θ: through f and J, plus a `correlation` line's ρ (a θ) directly through R.
     let serial_theta = model.residual_serial.as_ref().map(|s| s.rho_theta);
     for m in 0..n_theta {
+        if is_fixed(m) {
+            continue;
+        }
         let df = DVector::from_fn(n, |j, _| sens.obs[j].df_dtheta[m]);
         let dj = DMatrix::from_fn(n, ne, |j, k| sens.obs[j].d2f_deta_dtheta[k * n_theta + m]);
         let mut dir = Dir::moving_f(df, dj);
@@ -186,6 +190,9 @@ pub(crate) fn subject_packed_gradient_dense(
     let sigma_start = omega_start + og.len();
     let base_floor = floor_mask(&base.builders_at(model, subject, sigma, cov).0);
     for s in 0..sigma.len() {
+        if is_fixed(sigma_start + s) {
+            continue;
+        }
         let h = sigma_step(sigma[s]);
         let mut sp = sigma.clone();
         sp[s] = sigma[s] + h;
@@ -202,6 +209,9 @@ pub(crate) fn subject_packed_gradient_dense(
     if !corrs.is_empty() {
         let rho_start = rho_packed_start(template);
         for c in 0..corrs.len() {
+            if is_fixed(rho_start + c) {
+                continue;
+            }
             let h = RHO_STEP;
             let at = |rho: f64| -> (DMatrix<f64>, DMatrix<f64>) {
                 let mut cs: Vec<ResidualCorrelation> = corrs.clone();
@@ -346,10 +356,14 @@ pub(crate) fn subject_packed_gradient_foce_dense(
     let response = |dg: &DVector<f64>| -> f64 { -v.dot(dg) };
 
     let mut g = vec![0.0f64; n_packed];
+    let is_fixed = fixed_coordinates(template);
 
     // θ: through f(η̂), J, f(η = 0) (in R⁰), and a `correlation` line's ρ directly.
     let serial_theta = model.residual_serial.as_ref().map(|s| s.rho_theta);
     for m in 0..n_theta {
+        if is_fixed(m) {
+            continue;
+        }
         let df = DVector::from_fn(n, |r_, _| sens.obs[r_].df_dtheta[m]);
         let dj = DMatrix::from_fn(n, ne, |r_, k| sens.obs[r_].d2f_deta_dtheta[k * n_theta + m]);
         let df0: Vec<f64> = sens0.obs.iter().map(|o| o.df_dtheta[m]).collect();
@@ -401,6 +415,9 @@ pub(crate) fn subject_packed_gradient_foce_dense(
     let zero_n = DVector::<f64>::zeros(n);
     let base_floor = floor_mask(&r0);
     for s in 0..sigma.len() {
+        if is_fixed(sigma_start + s) {
+            continue;
+        }
         let h = sigma_step(sigma[s]);
         let mut sp = sigma.clone();
         sp[s] = sigma[s] + h;
@@ -417,6 +434,9 @@ pub(crate) fn subject_packed_gradient_foce_dense(
     if !corrs.is_empty() {
         let rho_start = rho_packed_start(template);
         for c in 0..corrs.len() {
+            if is_fixed(rho_start + c) {
+                continue;
+            }
             let at = |rho: f64| -> DMatrix<f64> {
                 let mut cs: Vec<ResidualCorrelation> = corrs.clone();
                 cs[c].rho = rho;
@@ -435,6 +455,15 @@ pub(crate) fn subject_packed_gradient_foce_dense(
         }
     }
     Some(g)
+}
+
+/// `FIX`-ed packed coordinates (`packed_fixed_mask`). Their gradient entries are zeroed
+/// by the population assembly anyway, so the θ/σ/ρ loops skip them — which matters
+/// because those loops hold the fallible steps (a serial-ρ derivative, a σ/ρ stencil
+/// that straddles the floor): a fixed coordinate must not decline the whole subject.
+fn fixed_coordinates(template: &ModelParameters) -> impl Fn(usize) -> bool {
+    let mask = packed_fixed_mask(template);
+    move |k| mask.get(k).copied().unwrap_or(false)
 }
 
 /// The rows whose diagonal `R` sits on the `MIN_VARIANCE` floor (the builders clamp it
