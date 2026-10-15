@@ -32455,6 +32455,112 @@ const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
         ],
         [false, false, false, false, false],
     ),
+    // An intermediate defined only by an earlier optional arm, read in exactly
+    // one sub-shape of a condition each — the right of `&&` / `||`, under `!`,
+    // in `present()`, in an inline `if`'s condition and in its else value — so
+    // each recursion arm of the walk is the only thing that can see it.
+    (
+        "optional R read on the right of &&",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (a > 0.0 && R > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read on the right of ||",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (a > 1000.0 || R > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read under !",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (!(R > 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by present()",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (present(R)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    // An inline `if` in an assignment compiles to bytecode (the `PushVar` check);
+    // inside an `if` condition it stays an expression tree, the walk's other path.
+    (
+        "optional R read on the right of a comparison",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.0 < R) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the condition of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (R > 0.0) 1.0 else 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the else value of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (a > 50.0) 1.0 else R)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by an inline if's condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "K = (if (R > 0.0) CL / V else Q / V)",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by an inline if's else value",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "K = (if (a > 50.0) CL / V else R)",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "compound conditions on defined values only",
+        &[
+            "R = a / 25.0",
+            "if (!(a > 1000.0) && (R > 2.0 || present(R))) { K = (if (R > 3.0) 2.0 * CL / V else CL / V) } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
     // MACHEPS read only from a parameter-only expression, so on the hoisted
     // paths it is read by the lifted code alone.
     (
