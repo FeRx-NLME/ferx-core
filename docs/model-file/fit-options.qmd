@@ -847,6 +847,9 @@ that is still going somewhere:
   that exceeds 0.1 OFV units the window is re-armed instead (#1934). A slow creep down a
   long valley gains less than 1e-3 per window and still has a lot left: one SLSQP fit was
   stopped 228 OFV units short of its optimum, and reported converged, before this check.
+  The veto is not repeatable at a point that does not move: if a re-armed window ends
+  with the best point unchanged, the guard stops anyway and adds a warning with the
+  predicted gain that was not realised.
   It runs only where the per-subject gradients are exact: closed-form FOCE/FOCEI models
   in the analytic-gradient scope, without a mixture. An ODE model's analytic gradient
   carries the integrator's error, which at the default `ode_reltol` puts the decrement at

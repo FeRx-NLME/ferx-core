@@ -841,6 +841,8 @@ fn fresh_state() -> NloptState {
         best_at_last_improvement: f64::INFINITY,
         recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
+        vetoed_at_best_ofv: None,
+        latch_overrode_veto: false,
         salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
     }
 }
@@ -6749,6 +6751,49 @@ fn detect_stagnation_veto_rearms_the_window() {
     state.n_evals = 50 + 2 * window;
     assert!(detect_stagnation(&mut state, n, true, true, || false));
     assert!(state.stagnation_stopped);
+}
+
+/// A veto that always says "still descending" cannot disable the guard (#1934 review):
+/// once a window expires with the incumbent where the last veto left it, the guard
+/// latches without asking again and records that it overrode the veto. An incumbent
+/// that did move gets asked afresh.
+#[test]
+fn detect_stagnation_latches_when_the_vetoed_incumbent_never_moves() {
+    let n = 7usize;
+    let window = stagnation_window(n, true);
+    let mut state = fresh_state();
+    state.best_ofv = -204.4111;
+    state.best_at_last_improvement = -204.4102;
+    state.last_improvement_eval = 50;
+
+    state.n_evals = 50 + window;
+    assert!(!detect_stagnation(&mut state, n, true, true, || true));
+    assert!(!state.latch_overrode_veto);
+
+    // The incumbent moved (by less than the 1e-3 threshold): ask again, veto again.
+    state.best_ofv -= 1e-5;
+    state.n_evals = 50 + 2 * window;
+    let mut asked = 0;
+    assert!(!detect_stagnation(&mut state, n, true, true, || {
+        asked += 1;
+        true
+    }));
+    assert_eq!(asked, 1, "a moved incumbent is asked afresh");
+
+    // It did not move this time: latch without consulting the veto.
+    state.n_evals = 50 + 3 * window;
+    assert!(detect_stagnation(&mut state, n, true, true, || panic!(
+        "veto re-asked at an unchanged incumbent"
+    )));
+    assert!(state.stagnation_stopped);
+    assert!(state.latch_overrode_veto);
+}
+
+#[test]
+fn veto_override_warning_reports_the_predicted_gain() {
+    let w = veto_override_warning(Some(14.83));
+    assert!(w.contains("14.8300"), "{w}");
+    assert!(w.contains("check the final gradient"), "{w}");
 }
 
 /// The #1934 fixture: `data/two_cpt_iv.csv`, 2-cpt IV, BLOCK(2) η on CL/V1, additive

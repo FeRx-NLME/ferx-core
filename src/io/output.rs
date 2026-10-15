@@ -2556,7 +2556,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let v = if norm.is_nan() {
             ".nan".to_string()
         } else {
-            format!("{norm:.6e}")
+            fmt_cov_entry(norm)
         };
         writeln!(f, "  final_gradient_max_abs: {v}").map_err(|e| e.to_string())?;
         let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
@@ -3928,7 +3928,8 @@ mod tests {
 
     /// #1934: the fit YAML records |g|∞ and its source in the `model:` block,
     /// omits both keys when there is no gradient, and spells a non-finite norm
-    /// as YAML's `.nan` rather than Rust's `NaN` (a string to a YAML reader).
+    /// as YAML's `.nan` rather than Rust's `NaN` (a string to a YAML reader), and
+    /// writes a non-negative exponent with its `+` — `1.140000e0` is a string too.
     #[test]
     fn write_estimates_yaml_records_the_final_gradient() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3944,7 +3945,7 @@ mod tests {
         let yaml = yaml_of(Some(vec![-1.14, 0.5]), Some("finite_difference"), "g.yaml");
         assert!(
             yaml.contains(
-                "  final_gradient_max_abs: 1.140000e0\n  final_gradient_source: finite_difference\n"
+                "  final_gradient_max_abs: 1.140000e+0\n  final_gradient_source: finite_difference\n"
             ),
             "{yaml}"
         );

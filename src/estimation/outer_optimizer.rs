@@ -1177,6 +1177,12 @@ struct NloptState {
     /// gradient so SLSQP/L-BFGS xtol/ftol fires in microseconds instead
     /// of grinding through `maxeval` at full inner-loop cost.
     stagnation_stopped: bool,
+    /// `best_ofv` when the #1934 decrement last vetoed a latch. A window that expires
+    /// with the incumbent still at that objective latches without asking again: the
+    /// same point gives the same decrement, so re-asking would re-arm forever.
+    vetoed_at_best_ofv: Option<f64>,
+    /// The latch overrode a decrement that still predicted a gain (the case above).
+    latch_overrode_veto: bool,
     /// The #1520 salvage guard's bookkeeping: which point a trial is measured against is
     /// decided per optimizer by [`SalvageGuardPolicy`], and the state remembers the
     /// candidates (best evaluation, last gradient point, previous `xs`).
@@ -1289,9 +1295,14 @@ fn detect_stagnation(
         // long valley looks like. Ask the incumbent before latching; if a Newton step
         // from it is still predicted to buy something, re-arm the window instead. The
         // baseline `best_at_last_improvement` is kept, so the creep's accumulated
-        // progress still counts toward the next significant improvement.
-        if still_descending() {
+        // progress still counts toward the next significant improvement. If the
+        // incumbent has not moved since the last veto, its prediction was not realised
+        // and asking again at the same point cannot change the answer: latch.
+        if state.vetoed_at_best_ofv == Some(state.best_ofv) {
+            state.latch_overrode_veto = true;
+        } else if still_descending() {
             state.last_improvement_eval = state.n_evals;
+            state.vetoed_at_best_ofv = Some(state.best_ofv);
             return false;
         }
         state.stagnation_stopped = true;
@@ -1487,6 +1498,8 @@ fn new_nlopt_state(
         best_at_last_improvement: f64::INFINITY,
         recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
+        vetoed_at_best_ofv: None,
+        latch_overrode_veto: false,
     }
 }
 
@@ -2477,6 +2490,19 @@ fn bhhh_newton_decrement(
 /// has nothing left in it a user could act on.
 const LATCH_MAX_PREDICTED_GAIN: f64 = 0.1;
 
+/// The warning for a stagnation latch that overrode the #1934 veto: a Newton step from
+/// the best point still predicted `gain`, but a full re-armed window did not realise any
+/// of it.
+fn veto_override_warning(gain: Option<f64>) -> String {
+    format!(
+        "Stagnation guard stopped the outer optimizer although a Newton step from the best \
+         point was still predicted to lower the objective by {:.4} (BHHH Newton decrement, \
+         max {LATCH_MAX_PREDICTED_GAIN}); a full further window did not realise it. The \
+         estimates may not be at a minimum — check the final gradient.",
+        gain.unwrap_or(f64::NAN)
+    )
+}
+
 /// Is a predicted remaining gain small enough for the guard to latch? `None` — no
 /// decrement could be formed (see [`predicted_remaining_gain`]) — latches as before #1934.
 fn gain_is_negligible(predicted_gain: Option<f64>) -> bool {
@@ -3144,6 +3170,12 @@ fn optimize_nlopt_once(
     // guard-forced `Success` from one NLopt reached on its own (#1530).
     let stagnation_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stagnation_latched_cl = Arc::clone(&stagnation_latched);
+    // #1934: the decrement of the last veto, and whether the latch overrode it, so a
+    // guard stop against a still-predicted gain is reported rather than silent.
+    let last_veto_gain: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let last_veto_gain_cl = Arc::clone(&last_veto_gain);
+    let latch_overrode_veto = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let latch_overrode_veto_cl = Arc::clone(&latch_overrode_veto);
 
     // Best-seen accumulator (issue #59). NLopt returns the last evaluated
     // point, not the best one — when the stagnation guard short-circuits
@@ -3645,6 +3677,9 @@ fn optimize_nlopt_once(
                 &priors,
             );
             let descending = !gain_is_negligible(gain);
+            if descending {
+                *last_veto_gain_cl.lock().unwrap() = gain;
+            }
             if verbose && descending {
                 eprintln!(
                     "Eval {:>4}: no OFV improvement above 1e-3 in the last window, but a \
@@ -3667,6 +3702,7 @@ fn optimize_nlopt_once(
             still_descending,
         ) {
             stagnation_latched_cl.store(true, Ordering::Relaxed);
+            latch_overrode_veto_cl.store(state.latch_overrode_veto, Ordering::Relaxed);
         }
         if state.stagnation_stopped && verbose {
             eprintln!(
@@ -4226,6 +4262,9 @@ fn optimize_nlopt_once(
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
+    }
+    if latch_overrode_veto.load(Ordering::Relaxed) {
+        warnings.push(veto_override_warning(*last_veto_gain.lock().unwrap()));
     }
 
     // Covariance step (skip if user cancelled — it's expensive and the result
