@@ -130,8 +130,11 @@ more rows takes the exact analytic outer gradient of the dense-`R` objective
 subject whose blocks are all single rows keeps the scalar analytic one (for it
 `∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the
 finite-difference outer gradient throughout, as any weighted model with a dense
-`R` does. The covariance step uses the finite-difference Hessian. Nothing is
-approximated on any of these paths; the finite-difference ones are only slower.
+`R` does. The covariance step uses the finite-difference Hessian. None of
+these paths approximates the objective. The dense gradient's `σ` and
+`block_sigma` `ρ` terms are central differences of `R`, exact because `R` is
+quadratic in `σ` and linear in that `ρ` (a stencil that straddles the variance
+floor declines instead), and the finite-difference paths are only slower.
 
 On the naproxen MBMA below, the default outer tolerances stop BOBYQA about
 0.03 OFV short of the optimum along a flat TVEMAX / B_EMAX_FLARE ridge. That is

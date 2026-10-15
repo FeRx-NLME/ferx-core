@@ -779,3 +779,105 @@ fn serial_rho_derivatives_match_fd_of_the_builders() {
         assert!(ddc.iter().any(|v| v.abs() > 1e-3), "{kind:?}: live");
     }
 }
+
+/// #1995 review: a row whose diagonal variance sits on the `MIN_VARIANCE` floor is
+/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
+/// diagonal self-terms (the #958 gate `ErrorSpec::dvar_df` applies on the diagonal
+/// path), while a live row keeps them. Each column is checked against a central
+/// difference in `f_m` of the builder it differentiates (`R` for the first family, the
+/// `∂R/∂f` column form for the second), so a visitor that ignores the floor dies on
+/// the floored row and one that floors every row dies on the live one. The raw slope
+/// the gate removes is asserted nonzero, so the floored cell cannot pass by accident.
+#[test]
+fn dense_derivatives_drop_a_floored_diagonal() {
+    let es = ErrorSpec::Single(crate::types::ErrorModel::Proportional);
+    let sigma = [0.2];
+    let c = cov(ResidualSerialKind::Ar1, 0.4);
+    // Row 1 at f = 1e-7: (f·σ)² = 4e-16, under the floor; the others are live.
+    let mut f = IPREDS;
+    f[1] = 1e-7;
+    let cmts = [1usize; 6];
+    let r_at = |fv: &[f64]| {
+        compute_r_matrix_with_correlations_cov(
+            &es,
+            fv,
+            &cmts,
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &sigma,
+            c,
+        )
+    };
+    let dc_at = |fv: &[f64]| {
+        compute_dr_df_columns_cov(
+            &es,
+            fv,
+            &cmts,
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &sigma,
+            c,
+            None,
+        )
+    };
+    assert_eq!(
+        r_at(&f)[(1, 1)],
+        MIN_VARIANCE,
+        "fixture: row 1 must be floored"
+    );
+    assert!(
+        r_at(&f)[(0, 0)] > MIN_VARIANCE,
+        "fixture: row 0 must be live"
+    );
+    let dc = dc_at(&f);
+    let (_, y) = compute_d2r_df2_compact_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    // What an ungated diagonal would hold on the floored row: 2fσ² (and 2σ²).
+    assert!(es.dvar_df_raw(1, f[1], &sigma) > 0.0);
+    assert_eq!(dc[(1, 1)], 0.0, "floored row keeps a ∂R_11/∂f_1");
+    assert_eq!(y[(1, 1)], 0.0, "floored row keeps a ∂²R_11/∂f_1²");
+    for m in [0usize, 1] {
+        let h = 1e-3 * f[m];
+        let (mut fp, mut fm) = (f, f);
+        fp[m] += h;
+        fm[m] -= h;
+        let fd_r = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+        let fd_dc = (dc_at(&fp) - dc_at(&fm)) / (2.0 * h);
+        for k in 0..f.len() {
+            let tol = |w: f64| 1e-7 * w.abs().max(1e-12);
+            assert!(
+                (dc[(k, m)] - fd_r[(k, m)]).abs() <= tol(fd_r[(k, m)]),
+                "∂R_{k}{m}/∂f_{m}: {} vs FD {}",
+                dc[(k, m)],
+                fd_r[(k, m)]
+            );
+            assert!(
+                (y[(k, m)] - fd_dc[(k, m)]).abs() <= tol(fd_dc[(k, m)]),
+                "∂²R_{k}{m}/∂f_{m}²: {} vs FD {}",
+                y[(k, m)],
+                fd_dc[(k, m)]
+            );
+        }
+    }
+    assert!(
+        dc[(0, 0)] > 0.0 && y[(0, 0)] > 0.0,
+        "live row lost its diagonal terms"
+    );
+}

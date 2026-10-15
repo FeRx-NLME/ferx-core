@@ -1365,10 +1365,9 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
             interaction,
             ..Default::default()
         };
-        // The production per-subject objective with the EBE re-solved at `p`: the
-        // reference both the analytic subject's exact gradient and the paired subject's
-        // reconverged salvage are gradients of.
-        // The EBE the stage's own marginal is linearised around (#1722).
+        // The production per-subject objective with the EBE re-solved at `p`: what both
+        // subjects' exact gradients (scalar and dense) differentiate, with the EBE the
+        // stage's own marginal is linearised around (#1722).
         let ebe_variance =
             crate::estimation::inner_optimizer::EbeVariance::for_options(&options, &model);
         let solve = |s: &Subject, p: &ModelParameters| {
@@ -1436,13 +1435,13 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
             let p = unpack_params(xv, &template);
             2.0 * pop.subjects.iter().map(|s| nll(s, &p)).sum::<f64>()
         };
-        // Measured (macOS arm64). FOCEI, dense assembly since #1960: worst relative error
-        // 5.9e-6 (Ω); with the reconverged salvage it was 9.8e-4, on ρ (the salvage's own
-        // single-step central difference). FOCE, still the salvage: worst 7.6e-4, on ρ;
-        // every other coordinate ≤ 2.1e-7. The held-EBE salvage misses by 1.4e-1 on the
-        // first θ, so the shared 2e-3 bound separates it from either by ≥ 70×.
+        // Measured (Linux arm64), both on the dense assembly since #1960: worst relative
+        // error 6.4e-6 FOCEI (x[3]) and 2.2e-6 FOCE (x[6], ρ). 5e-5 is ~8× over the
+        // larger. The reconverged salvage the paired subject took before #1960 missed by
+        // up to 9.8e-4 (ρ, its single-step central difference) and the held-EBE salvage by
+        // 1.4e-1 (first θ, macOS arm64), so either regression reddens this bound.
         eprintln!("interaction = {interaction}");
-        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 2e-3, 1e-5);
+        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 5e-5, 1e-5);
 
         // #1520 precedence: a blown-up trial (population and subject 1 both 1e6 over an
         // incumbent of 0) skips the structural subject's salvage. The guard reads only the
@@ -7533,11 +7532,11 @@ fn dense_r_paired_block_sigma_gradient_matches_fd_analytic() {
     let pop = paired_fu_pop(&model, &theta);
     let rho = crate::estimation::parameterization::rho_packed_start(&model.default_params);
     for interaction in [true, false] {
-        // Measured (macOS arm64): worst relative error 1.1e-5 FOCEI and 1.4e-5 FOCE (Ω
-        // coordinates) — the reconverged reference's own inner-solve noise; θ and σ ≤
-        // 2.6e-7. The ODE twin's analytic gradient agrees with this one to ~1e-8, so the
-        // bound is set by the FD reference.
-        let g = run_dense_parity(&model, &pop, &theta, interaction, 2e-4);
+        // Measured (Linux arm64): worst relative error 1.1e-5 FOCEI (x[5], Ω) and 1.4e-6
+        // FOCE (x[6]) — the reconverged reference's own inner-solve noise. The ODE twin's
+        // analytic gradient agrees with this one to ~1e-8, so the bound is set by the FD
+        // reference: 1e-4 is ~9× over the FOCEI noise.
+        let g = run_dense_parity(&model, &pop, &theta, interaction, 1e-4);
         // The ρ coordinate is live: the correlation term moves the objective.
         assert!(g[rho].abs() > 1e-2, "ρ gradient {} is inert", g[rho]);
     }
@@ -7557,11 +7556,11 @@ fn dense_r_paired_block_sigma_gradient_matches_fd_ode() {
     let theta = [1.1, 11.0, 0.35];
     let pop = paired_fu_pop(&model, &theta);
     for interaction in [true, false] {
-        // Measured (macOS arm64): FOCEI worst relative error 3.1e-5 (Ω_FU), 2e-4 is ~6×
-        // headroom. FOCE worst 9.3e-5, also Ω_FU — the ODE reference's noise, not the
-        // gradient's: the analytic value there (0.27645942) is the closed-form fixture's
-        // to all printed digits, and that fixture's own FD agrees with it to 6.2e-6.
-        // 5e-4 is ~5× over the FOCE noise.
+        // Measured (Linux arm64): FOCEI worst relative error 1.5e-5 (x[5], Ω_FU), 2e-4 is
+        // ~13× headroom. FOCE worst 1.1e-4, also Ω_FU — the ODE reference's noise, not the
+        // gradient's: the analytic value there is the closed-form fixture's to all printed
+        // digits, and that fixture's own FD agrees with it far tighter (macOS arm64:
+        // 6.2e-6). 5e-4 is ~5× over the FOCE noise.
         let tol = if interaction { 2e-4 } else { 5e-4 };
         run_dense_parity(&model, &pop, &theta, interaction, tol);
     }
@@ -7616,15 +7615,105 @@ fn dense_r_serial_correlation_gradient_matches_fd() {
         ]);
         eprintln!("kind = {kind}");
         for interaction in [true, false] {
-            // Measured (macOS arm64): FOCEI worst relative error 2.4e-6 over the three
-            // kinds (cs, Ω_CL); 2e-5 is ~8× headroom. FOCE worst 2.1e-5 (car1, Ω_V) and
-            // 1.6e-5 (car1, ρ): the reference's, not the gradient's — a 4-point stencil
-            // at h = 1e-3 agrees with the analytic value to 8.8e-10 and 4.7e-9 on those
-            // two coordinates, while the h = 1e-4 Richardson pair straddles a jump in
-            // the frozen-variance inner solve. 1e-4 is ~5× over that noise.
+            // Measured (Linux arm64): FOCEI worst relative error 2.4e-6 over the three
+            // kinds (x[3]); 2e-5 is ~8× headroom. FOCE worst 1.6e-5 (car1, ρ): the
+            // reference's, not the gradient's — on macOS arm64, where the same coordinate
+            // missed by 1.6e-5 and Ω_V by 2.1e-5, a 4-point stencil at h = 1e-3 agrees
+            // with the analytic value to 4.7e-9 and 8.8e-10, while the h = 1e-4
+            // Richardson pair straddles a jump in the frozen-variance inner solve. 1e-4 is
+            // ~6× over that noise.
             let tol = if interaction { 2e-5 } else { 1e-4 };
             let g = run_dense_parity(&model, &pop, &theta, interaction, tol);
             assert!(g[2].abs() > 1e-2, "{kind}: ρ gradient {} is inert", g[2]);
+        }
+    }
+}
+
+/// #1995 review: the dense σ derivative is a central difference of the `R` builder, exact
+/// only while every stencil point floors the same rows (`MIN_VARIANCE`); a stencil that
+/// straddles the floor on some row is not a derivative, and the subject must decline.
+/// The lone total row sits at `t = 160`, where the drug is nearly gone, and its variance
+/// is proportional to `σ_TOTAL²`, so `σ_TOTAL` is nudged to put it at `k · MIN_VARIANCE`
+/// while every other row stays far above the floor: `k = 1.05` straddles (the `−0.1σ`
+/// point lands at `0.85×`, floored), while `k = 1.5` (all three points live) agrees on
+/// the mask and is served. Asserted for FOCEI and FOCE, whose σ loops are separate code
+/// and which build `R` at different predictions — `f(η̂)` and the frozen `f(η = 0)`.
+#[test]
+fn dense_r_sigma_stencil_straddling_the_floor_declines() {
+    let model = parse_model_string(PAIRED_FU_1CPT).expect("parse");
+    let theta = [1.1, 11.0, 0.35];
+    let s = paired_fu_subject(&model, &theta, &[0.5, 2.0, 8.0, 14.0], 160.0);
+    let lone = s.obs_times.len() - 1;
+    let mut template = model.default_params.clone();
+    template.theta = theta.to_vec();
+    let keys = model.error_spec.obs_keys(&s);
+    let floor = crate::stats::residual_error::MIN_VARIANCE;
+    for interaction in [true, false] {
+        // One η for both cells, the EBE at the template σ: the lone row's prediction
+        // moves steeply with η (`∂ln f/∂η_CL ≈ −16` there), so re-solving per cell would
+        // move it off the variance it was placed at. The cells differ in σ by under 20%,
+        // so this η stays near each cell's own EBE and the inner Hessian stays PD.
+        let eta = {
+            let options = crate::types::FitOptions {
+                interaction,
+                ..Default::default()
+            };
+            let v = crate::estimation::inner_optimizer::EbeVariance::for_options(&options, &model);
+            crate::estimation::inner_optimizer::find_ebe_with_variance(
+                &model, &s, &template, 300, 1e-13, None, None, 0, v,
+            )
+            .eta
+            .as_slice()
+            .to_vec()
+        };
+        let r_eta = if interaction {
+            eta.clone()
+        } else {
+            vec![0.0; model.n_eta]
+        };
+        let f = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &r_eta);
+        let r_at = |p: &ModelParameters| {
+            crate::stats::residual_error::r_matrix_maybe_scaled(
+                &model.error_spec,
+                &f,
+                keys.as_ref(),
+                &s,
+                &p.sigma.values,
+                model.residual_cov_at(p),
+                None,
+            )
+        };
+        // The raw (unfloored) variance at the template σ, read where it is far off the
+        // floor (it scales with σ_TOTAL²).
+        let v0 = {
+            let mut big = template.clone();
+            big.sigma.values[0] *= 1e6;
+            r_at(&big)[(lone, lone)] / 1e12
+        };
+        for (k, served) in [(1.05, false), (1.5, true)] {
+            let mut p = template.clone();
+            p.sigma.values[0] = template.sigma.values[0] * (k * floor / v0).sqrt();
+            let r = r_at(&p);
+            assert!(
+                (r[(lone, lone)] / floor - k).abs() < 1e-6,
+                "k = {k}: fixture puts the lone row at {}",
+                r[(lone, lone)]
+            );
+            for j in 0..lone {
+                assert!(r[(j, j)] > 1e6 * floor, "k = {k}: row {j} must stay live");
+            }
+            let x = pack_params(&p);
+            let g = if interaction {
+                subject_packed_gradient(&model, &s, &p, &x, &eta)
+            } else {
+                subject_packed_gradient_foce(&model, &s, &p, &x, &eta)
+            };
+            assert_eq!(
+                g.is_some(),
+                served,
+                "k = {k}, interaction = {interaction}: served = {}",
+                g.is_some()
+            );
         }
     }
 }

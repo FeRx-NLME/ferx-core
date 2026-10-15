@@ -29,11 +29,16 @@
 //! `Ω⁻¹`, so its block is the parent's closed form fed this `H̃⁻¹`, `H⁻¹` and
 //! `∂log|H̃|/∂η` ([`super::omega_packed_block_from`]).
 //!
-//! **The direct σ/ρ derivatives are exact, not approximate.** `R` and `∂R/∂f` are
-//! polynomials of degree two in each σ (every entry is `Σ c c σσ`, the within-row and
-//! cross-row `block_sigma` terms `ρ σ_i σ_j c c`) and of degree one in a `block_sigma`
-//! ρ, so a central difference of the builders *is* their derivative, up to rounding —
-//! the reason a step as wide as `0.1·σ` is used, which keeps that rounding at ~1e-15.
+//! **The direct σ/ρ derivatives are central differences that are exact, not
+//! approximate.** Away from the `MIN_VARIANCE` floor, `R` and `∂R/∂f` are polynomials
+//! of degree two in each σ (every entry is `Σ c c σσ`, the within-row and cross-row
+//! `block_sigma` terms `ρ σ_i σ_j c c`) and of degree one in a `block_sigma` ρ, so a
+//! central difference of the builders *is* their derivative, up to rounding — the
+//! reason a step as wide as `0.1·σ` is used, which keeps that rounding at ~1e-15. A
+//! floored diagonal is constant (the visitors drop its `f`-terms too), so the
+//! difference stays exact while every stencil point agrees on which rows are floored;
+//! a stencil that straddles the floor is not a derivative, and the subject declines
+//! (`floor_mask`).
 //! Differencing the builders rather than re-deriving their entries keeps one home for
 //! the residual covariance (`stats::residual_error`). A `correlation` line's
 //! `C_jk(ρ) = ρ^Δ` is not a polynomial of fixed degree, so its ρ derivative is closed
@@ -64,7 +69,7 @@ use crate::estimation::parameterization::{rho_chain, rho_packed_start};
 use crate::sens::provider::SubjectSens;
 use crate::stats::residual_error::{
     compute_d2r_df2_compact_cov, compute_dr_df_columns_cov, r_matrix_maybe_scaled,
-    serial_rho_derivatives, ResidualCov,
+    serial_rho_derivatives, ResidualCov, MIN_VARIANCE,
 };
 use crate::types::{BloqMethod, CompiledModel, ModelParameters, ResidualCorrelation, Subject};
 use nalgebra::{DMatrix, DVector};
@@ -179,6 +184,7 @@ pub(crate) fn subject_packed_gradient_dense(
 
     // σ: direct through R and ∂R/∂f (log-σ chain).
     let sigma_start = omega_start + og.len();
+    let base_floor = floor_mask(&base.builders_at(model, subject, sigma, cov).0);
     for s in 0..sigma.len() {
         let h = sigma_step(sigma[s]);
         let mut sp = sigma.clone();
@@ -186,6 +192,7 @@ pub(crate) fn subject_packed_gradient_dense(
         let plus = base.builders_at(model, subject, &sp, cov);
         sp[s] = sigma[s] - h;
         let minus = base.builders_at(model, subject, &sp, cov);
+        same_floor(&base_floor, &plus.0, &minus.0)?;
         let dir = Dir::direct(&plus, &minus, h, n, ne);
         g[sigma_start + s] = total(&base.directional(&dir)) * sigma[s];
     }
@@ -207,6 +214,7 @@ pub(crate) fn subject_packed_gradient_dense(
             };
             let plus = at(corrs[c].rho + h);
             let minus = at(corrs[c].rho - h);
+            same_floor(&base_floor, &plus.0, &minus.0)?;
             let dir = Dir::direct(&plus, &minus, h, n, ne);
             g[rho_start + c] = total(&base.directional(&dir)) * rho_chain(corrs[c].rho);
         }
@@ -391,6 +399,7 @@ pub(crate) fn subject_packed_gradient_foce_dense(
     // σ and ρ: through R⁰ only (exact central differences, see the module docs).
     let sigma_start = omega_start + entries.len();
     let zero_n = DVector::<f64>::zeros(n);
+    let base_floor = floor_mask(&r0);
     for s in 0..sigma.len() {
         let h = sigma_step(sigma[s]);
         let mut sp = sigma.clone();
@@ -398,6 +407,7 @@ pub(crate) fn subject_packed_gradient_foce_dense(
         let plus = r0_at(&sp, cov).0;
         sp[s] = sigma[s] - h;
         let minus = r0_at(&sp, cov).0;
+        same_floor(&base_floor, &plus, &minus)?;
         let dr0 = (plus - minus) / (2.0 * h);
         let fixed = marginal(&zero_n, &dr0);
         let resp = response(&inner_dir(&zero_n, &zero_dj, &dr0));
@@ -416,14 +426,28 @@ pub(crate) fn subject_packed_gradient_foce_dense(
                 };
                 r0_at(sigma, cov_c).0
             };
-            let dr0 =
-                (at(corrs[c].rho + RHO_STEP) - at(corrs[c].rho - RHO_STEP)) / (2.0 * RHO_STEP);
+            let (plus, minus) = (at(corrs[c].rho + RHO_STEP), at(corrs[c].rho - RHO_STEP));
+            same_floor(&base_floor, &plus, &minus)?;
+            let dr0 = (plus - minus) / (2.0 * RHO_STEP);
             let fixed = marginal(&zero_n, &dr0);
             let resp = response(&inner_dir(&zero_n, &zero_dj, &dr0));
             g[rho_start + c] = (fixed + resp) * rho_chain(corrs[c].rho);
         }
     }
     Some(g)
+}
+
+/// The rows whose diagonal `R` sits on the `MIN_VARIANCE` floor (the builders clamp it
+/// to exactly that value).
+fn floor_mask(r: &DMatrix<f64>) -> Vec<bool> {
+    (0..r.nrows()).map(|j| r[(j, j)] <= MIN_VARIANCE).collect()
+}
+
+/// `Some(())` when both stencil points floor exactly the rows the base point does, so
+/// their difference is the derivative (module docs); `None` — decline — when the
+/// stencil straddles the floor on some row.
+fn same_floor(base: &[bool], plus: &DMatrix<f64>, minus: &DMatrix<f64>) -> Option<()> {
+    (floor_mask(plus) == base && floor_mask(minus) == base).then_some(())
 }
 
 /// Half-width of the σ central difference: wide, because `R` is quadratic in σ and the

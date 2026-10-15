@@ -5415,9 +5415,12 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             their `block_sigma` residuals are correlated across observation rows (paired \
-             endpoints in one residual block), which the analytic outer gradient does not \
-             cover; those gradients include the EBE-response term but are slower.";
+             their residuals are correlated across observation rows (a paired `block_sigma` or \
+             a `correlation` line) and the analytic outer gradient cannot serve them: the model \
+             pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
+             (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
+             subject's dosing is outside the analytic sensitivities; those gradients include \
+             the EBE-response term but are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
@@ -5578,16 +5581,20 @@ mod outer_fd_fallback {
 
     /// #1960 straddle of [`is_structural_decline`]: a subject whose `block_sigma` pairs two
     /// rows is a structural decline exactly when the dense assembly cannot serve it — on a
-    /// model outside `dense_outer_supported` — and never for an unpaired subject. Every
-    /// cell is asserted, so dropping either half of the predicate (the pairing, or the
-    /// dense-scope carve-out) reddens it.
+    /// model outside `dense_outer_supported`, or because the sensitivity provider declines
+    /// the subject itself (a rate-defined infusion under `F ≠ 1`, #419) — and never for an
+    /// unpaired subject. Every cell is asserted, so dropping any of the three conditions
+    /// (the pairing, the dense-scope carve-out, the provider decline) reddens it.
     #[test]
     fn structural_decline_is_a_cross_row_residual_the_dense_assembly_cannot_serve() {
-        const SRC: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n";
+        const SRC: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(0.7, 0.05, 1.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n  KA = TVKA\n  F  = TVF\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n";
         let model = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
         assert!(crate::estimation::sens_outer_gradient::dense_outer_supported(&model));
         let mut outside = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
-        outside.n_kappa = 1; // any dense-scope exclusion; IOV is the simplest field
+        // A dense-scope exclusion the sensitivity provider still serves (IOV would not
+        // do: the provider declines it too, so the two clauses would cover for each other
+        // and dropping the dense one would leave this test green).
+        outside.bloq_method = crate::types::BloqMethod::M3;
         assert!(!crate::estimation::sens_outer_gradient::dense_outer_supported(&outside));
 
         let subject = |times: &[f64]| {
@@ -5609,18 +5616,45 @@ mod outer_fd_fallback {
         let paired = subject(&[1.0, 1.0, 4.0, 4.0]);
         let unpaired = subject(&[1.0, 2.0, 4.0, 5.0]);
         let params = &model.default_params;
+        let eta = vec![0.0; model.n_eta];
         for (m, name, in_dense_scope) in [(&model, "in scope", true), (&outside, "outside", false)]
         {
             assert_eq!(
-                is_structural_decline(m, &paired, params),
+                is_structural_decline(m, &paired, params, &eta),
                 !in_dense_scope,
                 "paired, {name}"
             );
             assert!(
-                !is_structural_decline(m, &unpaired, params),
+                !is_structural_decline(m, &unpaired, params, &eta),
                 "unpaired, {name}"
             );
         }
+        // The provider-decline cell: the same subjects with their bolus swapped for a
+        // rate-defined infusion, which the provider declines under `F ≠ 1` on the in-scope
+        // model. The straddle is asserted, so the cell cannot quietly stop declining.
+        let infused = |mut s: Subject| {
+            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+            s
+        };
+        let (paired_inf, unpaired_inf) = (infused(paired.clone()), infused(unpaired.clone()));
+        let theta = &params.theta;
+        for m in [&model, &outside] {
+            assert!(
+                crate::sens::provider::subject_sensitivities(m, &paired, theta, &eta).is_some()
+            );
+        }
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &paired_inf, theta, &eta)
+                .is_none()
+        );
+        assert!(
+            is_structural_decline(&model, &paired_inf, params, &eta),
+            "paired, provider declines"
+        );
+        assert!(
+            !is_structural_decline(&model, &unpaired_inf, params, &eta),
+            "unpaired, provider declines"
+        );
     }
 
     /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject

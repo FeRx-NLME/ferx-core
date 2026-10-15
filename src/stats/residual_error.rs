@@ -1,7 +1,7 @@
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
-const MIN_VARIANCE: f64 = 1e-12;
+pub(crate) const MIN_VARIANCE: f64 = 1e-12;
 
 /// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
 /// (#1182), or `None` when the row carries none. An exponent of exactly `1`
@@ -1810,6 +1810,14 @@ fn visit_dr_df_cov(
     let correlations = cov.pairs;
     let n = ipreds.len();
     let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
 
     let pairs = match_partners(
         &vload,
@@ -1821,7 +1829,8 @@ fn visit_dr_df_cov(
         correlations,
     );
     for m in 0..n {
-        if vload[m].is_empty() {
+        // A floored diagonal is locally constant in `f` (#958, `ErrorSpec::dvar_df`).
+        if vload[m].is_empty() || floored[m] {
             continue;
         }
         sink(
@@ -1899,6 +1908,33 @@ fn value_slope_loadings(
     (vload, sload, scaled)
 }
 
+/// Which rows' diagonal residual variance sits on the `MIN_VARIANCE` floor, decided by
+/// the same `variance_at_scaled` the dense `R` builders put on the diagonal (an empty
+/// `mult` row is the bare-σ `variance_at_with_correlations`). On such a row `R_mm` is
+/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
+/// diagonal self-terms — the floor gate `ErrorSpec::dvar_df` applies on the diagonal
+/// path (#958). Off-diagonal entries are never floored and keep their terms.
+fn floored_rows(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<bool> {
+    (0..ipreds.len())
+        .map(|j| {
+            let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+            let row = mult
+                .and_then(|m| m.get(j))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
+                <= MIN_VARIANCE
+        })
+        .collect()
+}
+
 /// `∂R_mm/∂f_m`: the `f`-derivative of the diagonal residual variance
 /// [`ErrorSpec::variance_at_scaled`], built from observation `m`'s value
 /// loadings and their `f`-slopes (both already magnitude-scaled).
@@ -1906,8 +1942,9 @@ fn value_slope_loadings(
 /// `V_mm = Σ_s (c_s σ_s)² + Σ_corr 2 c_i c_j ρ σ_i σ_j` (the within-observation
 /// `block_sigma` cross term), so with `c_s' = slope_s`:
 /// `∂V_mm/∂f = Σ_s 2 c_s c_s' σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i' c_j + c_i c_j')`.
-/// The `.max(1e-12)` variance floor is treated as inactive here, matching the
-/// diagonal interaction path's [`ErrorSpec::dvar_df`].
+/// The `.max(1e-12)` variance floor is not applied here: the dense visitors skip a
+/// floored row's diagonal before calling this (`floored_rows`), the gate
+/// [`ErrorSpec::dvar_df`] applies on the diagonal path.
 fn diag_self_deriv(
     vload: &[(usize, f64)],
     sload: &[(usize, f64)],
@@ -2160,6 +2197,14 @@ fn visit_d2r_df2_cov(
     // loading's own curvature `c''`, which an affine loading never has.
     let (vload, sload, scaled) =
         value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
 
     let pairs = match_partners(
         &vload,
@@ -2171,7 +2216,8 @@ fn visit_d2r_df2_cov(
         correlations,
     );
     for m in 0..n {
-        if vload[m].is_empty() {
+        // A floored diagonal is locally constant in `f`, so its curvature is 0 too.
+        if vload[m].is_empty() || floored[m] {
             continue;
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
