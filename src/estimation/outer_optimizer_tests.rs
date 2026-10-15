@@ -6598,6 +6598,31 @@ fn bhhh_newton_decrement_keeps_only_movable_coordinates() {
         "fixture: coordinate 0 must carry part of the decrement, or dropping it is unobservable"
     );
 
+    // Unbounded (±∞, how the parser packs a θ with no limit): never "on" its bound,
+    // whichever way the gradient points — `∞ <= ∞` must not read as binding. `up`
+    // points coordinate 0 toward −∞ and `down` toward +∞, so each infinite side is
+    // exercised by the case that would drop it.
+    let unbounded = PackedBounds {
+        lower: vec![f64::NEG_INFINITY, -10.0],
+        upper: vec![f64::INFINITY, 10.0],
+    };
+    for g in [&up, &down] {
+        let got = bhhh_newton_decrement(
+            g,
+            &[0.0, 0.0],
+            &DMatrix::zeros(2, 2),
+            &[0.5, 0.0],
+            &unbounded,
+            &[false, false],
+        )
+        .unwrap();
+        assert!(
+            close(got, decrement_free(g).unwrap()),
+            "an infinite bound dropped coordinate 0: {got} vs {}",
+            decrement_free(g).unwrap()
+        );
+    }
+
     // Nothing movable → no decrement at all.
     assert_eq!(
         bhhh_newton_decrement(

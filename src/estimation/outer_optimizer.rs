@@ -2426,7 +2426,10 @@ fn bhhh_newton_decrement(
     let s_full: Vec<f64> = (0..n)
         .map(|k| per_subject.iter().map(|g| g[k]).sum::<f64>() + 0.5 * penalty_grad[k])
         .collect();
-    let at = |b: f64, xk: f64| (xk - b).abs() <= 1e-8 * (1.0 + b.abs());
+    // An infinite bound (an unbounded θ, packed as ±∞ — also `ln(∞)` under log packing)
+    // binds nothing: without the `is_finite` the test reads `∞ <= ∞` and drops the
+    // coordinate whenever its gradient points toward that side.
+    let at = |b: f64, xk: f64| b.is_finite() && (xk - b).abs() <= 1e-8 * (1.0 + b.abs());
     let free: Vec<usize> = (0..n)
         .filter(|&k| {
             !fixed[k]
