@@ -4161,6 +4161,37 @@ fn fallback_certifier_leaves_numerical_objectives_to_the_stall_polish() {
     );
 }
 
+/// The certificate's polish is a gradient driver even under `inner_optimizer = nelder_mead`
+/// (#1527 review round 1): the fit-scoped dispatch would hand it back to Nelder–Mead, whose
+/// simplex-spread exit would then certify exactly what tests 1 and 2 just refused. On the
+/// plane NM collapses at once, so with the polish routed through the configured driver this
+/// returns `true`; with a gradient driver it is `false`. The `auto` control in the same test
+/// pins that the fixture refuses the plane on the ordinary path too.
+#[test]
+fn fallback_certifier_polish_is_gradient_based_under_nelder_mead_mode() {
+    let plane = |x: &[f64]| 0.01 * x[0];
+    let plane_grad = |_: &[f64]| vec![0.01];
+    for mode in [
+        crate::types::InnerOptimizer::Auto,
+        crate::types::InnerOptimizer::NelderMead,
+    ] {
+        let _armed = arm_inner_settings(InnerSettings {
+            mode,
+            ..Default::default()
+        });
+        let mut x = vec![0.0];
+        assert!(
+            !exact_cert(&plane_grad, 1, 50, 1e-5).certify(&plane, &mut x),
+            "{mode:?}: a plane has no mode; the polish must not certify one on simplex spread"
+        );
+        assert_eq!(
+            x,
+            vec![0.0],
+            "{mode:?}: an uncertified point is returned unchanged"
+        );
+    }
+}
+
 /// Test 1 of the certificate is the BFGS criterion itself, `‖∇‖ < tol`, and it is what makes
 /// the common case cheap: a fallback point that is already stationary costs **one** gradient
 /// evaluation. Without it every such point would buy the Newton test's `2n` extra gradients

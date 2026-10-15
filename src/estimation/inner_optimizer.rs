@@ -980,8 +980,8 @@ fn cold_eta_seed(
 ///    indefinite `H` (a saddle or a non-convex region) fails the test. The point is returned
 ///    unchanged. Skipped on a numerical objective (below), where a finite-difference Hessian
 ///    of a noise-floored gradient is not trustworthy and the stall-armed polish decides.
-/// 3. **Gradient polish** — the inner driver itself ([`inner_minimize_with_grad`]) run from η̂,
-///    whose own exit is the certificate. It carries the per-iterate objective-stall predicate
+/// 3. **Gradient polish** — the inner BFGS / L-BFGS driver run from η̂ (never Nelder–Mead, even
+///    under `inner_optimizer = nelder_mead`), whose own exit is the certificate. It carries the per-iterate objective-stall predicate
 ///    (`stall_at`, #555 / #1521), so a subject whose objective is numerical (an ODE, or a
 ///    transit/IG closed form rerouted to its ODE twin) is certified by the stall stop at its
 ///    noise floor rather than held to a `tol` below it. The polished point replaces η̂ only
@@ -1051,27 +1051,46 @@ impl FallbackCertifier<'_> {
         if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g) {
             return true;
         }
+        // A gradient driver, whatever `inner_optimizer` selects: under `nelder_mead` the
+        // fit-scoped dispatch (`inner_minimize_with_grad`) would hand the polish straight back
+        // to Nelder–Mead, whose exit is the simplex spread this certificate exists to replace
+        // (#1527 review). `inner_use_lbfgs` keeps an explicit `bfgs` / `lbfgs` choice and the
+        // `auto` dimension rule, and sends `nelder_mead` to dense BFGS.
         let mut polished = x.clone();
-        let ok = inner_minimize_with_grad(
-            obj,
-            self.grad,
-            &mut polished,
-            self.n,
-            self.max_iter,
-            self.tol,
-            self.precond,
-            None,
-            self.stop_precond,
-            self.stall_at,
-            false,
-        );
+        let ok = if inner_use_lbfgs(self.n) {
+            lbfgs_core(
+                obj,
+                self.grad,
+                &mut polished,
+                self.n,
+                self.max_iter,
+                self.tol,
+                self.precond,
+                self.stop_precond,
+                self.stall_at,
+                false,
+            )
+        } else {
+            dense_bfgs_core(
+                obj,
+                self.grad,
+                &mut polished,
+                self.n,
+                self.max_iter,
+                self.tol,
+                self.precond,
+                None,
+                self.stop_precond,
+                self.stall_at,
+                false,
+            )
+        };
         if !ok || !polished.iter().all(|v| v.is_finite()) || !admissible(&polished) {
             return false;
         }
-        // No objective comparison against the handed-in point: the driver takes only steps
-        // that pass the Armijo test along a descent direction (`backtracking_line_search`),
-        // and Nelder–Mead under `inner_optimizer = nelder_mead` keeps its best vertex, so a
-        // polished point is never worse than its start. A gate re-checking that could not
+        // No objective comparison against the handed-in point: both drivers take only steps
+        // that pass the Armijo test along a descent direction (`backtracking_line_search`), so
+        // a polished point is never worse than its start. A gate re-checking that could not
         // fail, and no test could pin it (#1527 mutation sweep).
         *x = polished;
         true
