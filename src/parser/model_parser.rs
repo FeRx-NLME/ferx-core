@@ -24118,6 +24118,11 @@ enum Op {
     PushThetaGather(u32),
     Add,
     Sub,
+    /// Reverse subtraction: pops `b` then `a`, pushes `b - a`. Emitted for a
+    /// literal-left `c - E` (including unary minus, `0 - E`) compiled as
+    /// `E, c, RSub`, so the constant is the *top* operand and the dual
+    /// evaluator can apply it in place instead of materialising a constant jet.
+    RSub,
     Mul,
     Div,
     Pow,
@@ -24238,6 +24243,7 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             Op::PushConst(_)
             | Op::Add
             | Op::Sub
+            | Op::RSub
             | Op::Mul
             | Op::Div
             | Op::Pow
@@ -24423,6 +24429,7 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Round => 1,
         Op::Add
         | Op::Sub
+        | Op::RSub
         | Op::Mul
         | Op::Div
         | Op::Pow
@@ -25042,6 +25049,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             Op::PushThetaGather(_) => 0,
             Op::Add
             | Op::Sub
+            | Op::RSub
             | Op::Mul
             | Op::Div
             | Op::Mod
@@ -25133,6 +25141,27 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
             let g = bc.gathers.len() as u32;
             bc.gathers.push(spec.clone());
             bc.ops.push(Op::PushThetaGather(g));
+        }
+        // A literal-left `c ⊕ E` is emitted with the literal as the *top* operand,
+        // so the dual evaluator's fused constant path (`eval_bytecode_g`) applies it
+        // in place rather than materialising a full constant jet. `c - E` becomes
+        // `RSub`; `c + E` and `c * E` keep their op, which is exact for f64 and dual
+        // alike: IEEE `+` and `×` are commutative, and with one operand a constant the
+        // dual product's Hessian entry sums the same four terms in either order —
+        // three of them zero products, and adding zeros to `x` gives `x` (an all-`−0`
+        // sum is `−0`, a `NaN` term is `NaN`) whatever the order. So every result is
+        // unchanged; the swap only reorders evaluation of two pure operands.
+        Expression::BinOp(lhs, op @ (BinOp::Add | BinOp::Mul | BinOp::Sub), rhs)
+            if matches!(lhs.as_ref(), Expression::Literal(_))
+                && !matches!(rhs.as_ref(), Expression::Literal(_)) =>
+        {
+            compile_expr_into(bc, rhs);
+            compile_expr_into(bc, lhs);
+            bc.ops.push(match op {
+                BinOp::Add => Op::Add,
+                BinOp::Mul => Op::Mul,
+                _ => Op::RSub,
+            });
         }
         Expression::BinOp(lhs, op, rhs) => {
             compile_expr_into(bc, lhs);
@@ -25320,6 +25349,11 @@ fn eval_bytecode(
                 let a = pop!();
                 push!(a - b);
             }
+            Op::RSub => {
+                let b = pop!();
+                let a = pop!();
+                push!(b - a);
+            }
             Op::Mul => {
                 let b = pop!();
                 let a = pop!();
@@ -25467,6 +25501,44 @@ fn eval_bytecode(
     }
 }
 
+impl Op {
+    /// The arithmetic binary ops `eval_bytecode_g` combines in place.
+    fn is_arith_binary(&self) -> bool {
+        matches!(self, Op::Add | Op::Sub | Op::RSub | Op::Mul | Op::Div)
+    }
+}
+
+/// `a = a ∘ b` for an arithmetic binary `op` (see `Op::is_arith_binary`), with
+/// `Op::Div`'s `|b| < 1e-30 → 0` guard — the in-place form of the by-value arms
+/// in `eval_bytecode_g`.
+#[inline]
+fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
+    match op {
+        Op::Add => a.add_in(b),
+        Op::Sub => a.sub_in(b),
+        Op::RSub => a.rsub_in(b),
+        Op::Mul => a.mul_in(b),
+        Op::Div if b.val().abs() < 1e-30 => *a = T::from_f64(0.0),
+        Op::Div => a.div_in(b),
+        _ => unreachable!("apply_binary_in: {op:?} is not an arithmetic binary op"),
+    }
+}
+
+/// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
+/// `TIME`, whose jet is zero).
+#[inline]
+fn apply_scalar_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, c: f64) {
+    match op {
+        Op::Add => a.add_scalar_in(c),
+        Op::Sub => a.sub_scalar_in(c),
+        Op::RSub => a.rsub_scalar_in(c),
+        Op::Mul => a.mul_scalar_in(c),
+        Op::Div if c.abs() < 1e-30 => *a = T::from_f64(0.0),
+        Op::Div => a.div_scalar_in(c),
+        _ => unreachable!("apply_scalar_in: {op:?} is not an arithmetic binary op"),
+    }
+}
+
 /// Generic counterpart to [`eval_bytecode`] for the analytic-sensitivity path:
 /// the same `Bytecode`, evaluated over any [`PkNum`] `T` so a single program
 /// serves both the scalar value (`T = f64`) and its exact PK-parameter
@@ -25484,7 +25556,7 @@ fn eval_bytecode(
 // Wired into the `Dual2`-state ODE integrator in Phase 3 of #367; until then it
 // has only test callers, so the non-test build sees it as unused.
 #[allow(dead_code)]
-fn eval_bytecode_g<T: crate::sens::num::PkNum>(
+fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
     bc: &Bytecode,
     theta: &[T],
     eta: &[T],
@@ -25516,6 +25588,33 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
 
     while pc < ops.len() {
         match ops[pc] {
+            // Operand fusion: a push consumed directly by a binary arithmetic op is
+            // applied to the stack top in place (`apply_scalar_in` /
+            // `apply_binary_in`), so a several-KB dual is neither copied onto the
+            // stack nor, for a constant, built as an all-zero jet first.
+            Op::PushConst(_) | Op::PushCov(_) | Op::PushTime
+                if !stack.is_empty() && ops.get(pc + 1).is_some_and(Op::is_arith_binary) =>
+            {
+                let c = match ops[pc] {
+                    Op::PushConst(i) => consts[i as usize],
+                    Op::PushCov(i) => covariates.get(i as usize).copied().unwrap_or(0.0),
+                    _ => current_model_time(),
+                };
+                let top = stack.last_mut().expect("guarded non-empty");
+                apply_scalar_in(top, ops[pc + 1], c);
+                pc += 2;
+                continue;
+            }
+            Op::PushVar(i)
+                if !stack.is_empty()
+                    && (i as usize) < vars.len()
+                    && ops.get(pc + 1).is_some_and(Op::is_arith_binary) =>
+            {
+                let top = stack.last_mut().expect("guarded non-empty");
+                apply_binary_in(top, ops[pc + 1], &vars[i as usize]);
+                pc += 2;
+                continue;
+            }
             Op::PushConst(i) => push!(k(consts[i as usize])),
             Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
             Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
@@ -25573,25 +25672,20 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                 };
                 push!(v);
             }
-            Op::Add => {
-                let b = pop!();
-                let a = pop!();
-                push!(a + b);
-            }
-            Op::Sub => {
-                let b = pop!();
-                let a = pop!();
-                push!(a - b);
-            }
-            Op::Mul => {
-                let b = pop!();
-                let a = pop!();
-                push!(a * b);
-            }
-            Op::Div => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.val().abs() < 1e-30 { k(0.0) } else { a / b });
+            // Both operands already on the stack: combine into the lower slot in place
+            // and drop the top. The slice pattern cannot underflow; a malformed
+            // program with fewer than two operands takes the by-value shape, where
+            // `pop!` asserts in debug and reads 0 in release, as it always did.
+            Op::Add | Op::Sub | Op::RSub | Op::Mul | Op::Div => {
+                if let [.., a, b] = stack.as_mut_slice() {
+                    apply_binary_in(a, ops[pc], b);
+                    stack.pop();
+                } else {
+                    let b = pop!();
+                    let mut a = pop!();
+                    apply_binary_in(&mut a, ops[pc], &b);
+                    push!(a);
+                }
             }
             Op::Pow => {
                 let e = pop!();
@@ -25865,7 +25959,7 @@ fn eval_statements_indexed_with_stack(
 /// statement-for-statement; the `eval_statements_g_*` tests pin it to that path.
 // Wired into the `Dual2`-state ODE RHS in Phase 3 of #367; test-only caller so far.
 #[allow(dead_code)]
-fn eval_statements_g<T: crate::sens::num::PkNum>(
+fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     theta: &[T],
     eta: &[T],
@@ -25900,7 +25994,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
 /// already resolved and borrowed by the caller.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-fn eval_statements_g_inner<T: crate::sens::num::PkNum>(
+fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     theta: &[T],
     eta: &[T],
@@ -26536,7 +26630,7 @@ impl OdeRhsProgram {
     /// `state_count`). Mirrors the f64 binding in the `rhs` closure
     /// statement-for-statement (issue #410, inner η-gradient).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn eval_rhs_g<T: crate::sens::num::PkNum>(
+    pub(crate) fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
         &self,
         u: &[T],
         params: &[T],
@@ -26615,6 +26709,7 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::PushCov(_)
         | Op::Add
         | Op::Sub
+        | Op::RSub
         | Op::Mul
         | Op::Div
         | Op::Pow
@@ -27522,7 +27617,7 @@ impl OdeOutputProgram {
     /// covariate snapshot, whose values thread in as constants (#540). `vars`/
     /// `stack` are caller-owned scratch. Only valid when
     /// [`is_dual_evaluable`](Self::is_dual_evaluable) holds.
-    pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
+    pub(crate) fn eval_output_g<T: crate::sens::num::vm::VmNum>(
         &self,
         state: &[T],
         params: &[T],

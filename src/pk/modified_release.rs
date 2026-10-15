@@ -354,7 +354,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
 /// the volume in as `v = 1/m`, `cl = ke/m` (`q = k12/m`, `v2 = q/k21` for
 /// two-compartment). Returns `None` if the readout slope is non-positive
 /// (degenerate) — the caller ([`mr_scope`]) then declines to the ODE path.
-pub fn recover_disp_params_g<T: PkNum>(
+pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
     spec: &OdeSpec,
     disp: &MrDisposition,
     p: &[T],

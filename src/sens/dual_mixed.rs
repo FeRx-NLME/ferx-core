@@ -39,6 +39,161 @@ pub struct DualMixed<const NA: usize, const N: usize> {
 }
 
 impl<const NA: usize, const N: usize> DualMixed<NA, N> {
+    // In-place arithmetic behind `crate::sens::num::vm::VmArith`, the bytecode VM's
+    // operand updates. Each writes over `self` exactly what the by-value operator
+    // below computes — same per-entry formula, same association — so a `DualMixed`
+    // (several KB at the outer gradient's axis counts) is updated where it sits
+    // instead of being moved through temporaries. The `*_scalar_in` forms take a
+    // constant operand `c` (right, or left for `rsub`) and evaluate the operator's
+    // formula against `DualMixed::constant(c)` term by term, zero products
+    // included, so signed zeros and `inf · 0 = NaN` match too.
+
+    /// `self = self + rhs`; same per-entry formula as `Add`.
+    #[inline]
+    pub(crate) fn add_in(&mut self, rhs: &Self) {
+        for i in 0..N {
+            self.grad[i] += rhs.grad[i];
+        }
+        for r in 0..NA {
+            for c in 0..N {
+                self.hess[r][c] += rhs.hess[r][c];
+            }
+        }
+        self.value += rhs.value;
+    }
+
+    /// `self = self - rhs`. `Sub` is `self + (−rhs)`, and IEEE defines `x − y` as
+    /// `x + (−y)`, signed zeros included.
+    #[inline]
+    pub(crate) fn sub_in(&mut self, rhs: &Self) {
+        for i in 0..N {
+            self.grad[i] -= rhs.grad[i];
+        }
+        for r in 0..NA {
+            for c in 0..N {
+                self.hess[r][c] -= rhs.hess[r][c];
+            }
+        }
+        self.value -= rhs.value;
+    }
+
+    /// `self = rhs - self`.
+    #[inline]
+    pub(crate) fn rsub_in(&mut self, rhs: &Self) {
+        for i in 0..N {
+            self.grad[i] = rhs.grad[i] - self.grad[i];
+        }
+        for r in 0..NA {
+            for c in 0..N {
+                self.hess[r][c] = rhs.hess[r][c] - self.hess[r][c];
+            }
+        }
+        self.value = rhs.value - self.value;
+    }
+
+    /// `self = self * rhs`; same formula and association as `Mul`. The Hessian is
+    /// written before the gradient because it reads the old gradient.
+    #[inline]
+    pub(crate) fn mul_in(&mut self, rhs: &Self) {
+        let (a, b) = (self.value, rhs.value);
+        for r in 0..NA {
+            for c in 0..N {
+                self.hess[r][c] = a * rhs.hess[r][c]
+                    + self.grad[r] * rhs.grad[c]
+                    + self.grad[c] * rhs.grad[r]
+                    + self.hess[r][c] * b;
+            }
+        }
+        for i in 0..N {
+            self.grad[i] = a * rhs.grad[i] + self.grad[i] * b;
+        }
+        self.value = a * b;
+    }
+
+    /// `self = self / rhs`, i.e. `self · rhs⁻¹` exactly as `Div` forms it.
+    #[inline]
+    pub(crate) fn div_in(&mut self, rhs: &Self) {
+        let r = rhs.recip();
+        self.mul_in(&r);
+    }
+
+    /// `self = self + constant(c)`: the jet gains `+ 0.0`.
+    #[inline]
+    pub(crate) fn add_scalar_in(&mut self, c: f64) {
+        for i in 0..N {
+            self.grad[i] += 0.0;
+        }
+        for r in 0..NA {
+            for col in 0..N {
+                self.hess[r][col] += 0.0;
+            }
+        }
+        self.value += c;
+    }
+
+    /// `self = self - constant(c)` = `self + (−constant(c))`. The jet gains
+    /// `+ (−0.0)`, which is the identity on every `f64` (signed zeros and `NaN`
+    /// included), so only the value moves.
+    #[inline]
+    pub(crate) fn sub_scalar_in(&mut self, c: f64) {
+        self.value += -c;
+    }
+
+    /// `self = constant(c) - self` = `constant(c) + (−self)`.
+    #[inline]
+    pub(crate) fn rsub_scalar_in(&mut self, c: f64) {
+        for i in 0..N {
+            self.grad[i] = 0.0 + (-self.grad[i]);
+        }
+        for r in 0..NA {
+            for col in 0..N {
+                self.hess[r][col] = 0.0 + (-self.hess[r][col]);
+            }
+        }
+        self.value = c + (-self.value);
+    }
+
+    /// `self = self * constant(c)`: [`Self::mul_in`] with `rhs.grad = rhs.hess = 0`.
+    #[inline]
+    pub(crate) fn mul_scalar_in(&mut self, c: f64) {
+        let a = self.value;
+        for r in 0..NA {
+            for col in 0..N {
+                self.hess[r][col] =
+                    a * 0.0 + self.grad[r] * 0.0 + self.grad[col] * 0.0 + self.hess[r][col] * c;
+            }
+        }
+        for i in 0..N {
+            self.grad[i] = a * 0.0 + self.grad[i] * c;
+        }
+        self.value = a * c;
+    }
+
+    /// `self = self / constant(c)` = `self · recip(constant(c))`, with the constant's
+    /// `recip` jet (`−0·c⁻²`, `−0·c⁻² + 2·0·0·c⁻³`) formed exactly as [`Self::recip`]
+    /// forms it.
+    #[inline]
+    pub(crate) fn div_scalar_in(&mut self, c: f64) {
+        let inv = 1.0 / c;
+        let inv2 = inv * inv;
+        let inv3 = inv2 * inv;
+        let rg = -0.0 * inv2;
+        let rh = -0.0 * inv2 + 2.0 * 0.0 * 0.0 * inv3;
+        let a = self.value;
+        for r in 0..NA {
+            for col in 0..N {
+                self.hess[r][col] =
+                    a * rh + self.grad[r] * rg + self.grad[col] * rg + self.hess[r][col] * inv;
+            }
+        }
+        for i in 0..N {
+            self.grad[i] = a * rg + self.grad[i] * inv;
+        }
+        self.value = a * inv;
+    }
+}
+
+impl<const NA: usize, const N: usize> DualMixed<NA, N> {
     /// A constant (zero gradient and Hessian).
     pub fn constant(value: f64) -> Self {
         DualMixed {
@@ -652,5 +807,129 @@ mod tests {
         assert!((x / y).jets_finite());
         assert!(x.ln().jets_finite());
         assert!(x.sqrt().jets_finite());
+    }
+
+    /// Two operands with every jet entry live: non-zero gradients on all three axes
+    /// and non-zero Hessian rows, so an in-place formula that drops a term, reads a
+    /// gradient after overwriting it, or swaps the operands shows up.
+    fn in_place_operands() -> (DualMixed<2, 3>, DualMixed<2, 3>) {
+        let x = DualMixed::<2, 3>::var(1.3, 0);
+        let y = DualMixed::<2, 3>::var(0.7, 1);
+        let z = DualMixed::<2, 3>::var(2.1, 2);
+        let a = x * y.exp() + z.ln() * x;
+        let b = (y * z).sqrt() - x * x + z;
+        (a, b)
+    }
+
+    /// Operands where the by-value forms' zero terms are visible: `−0.0` jet
+    /// entries (`−0.0 + 0.0 = +0.0`), and an infinite gradient (`∞ · 0 = NaN`).
+    fn edge_operands() -> [DualMixed<2, 3>; 2] {
+        let signed_zero = DualMixed::<2, 3> {
+            value: 2.0,
+            grad: [-0.0, 1.5, -0.0],
+            hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0]],
+        };
+        let infinite = DualMixed::<2, 3> {
+            value: 1.0,
+            grad: [f64::INFINITY, -2.0, 0.0],
+            hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0]],
+        };
+        [signed_zero, infinite]
+    }
+
+    /// `got` equals `want` bit for bit in every entry, any `NaN` matching any `NaN`
+    /// (a payload is not part of the arithmetic's contract).
+    fn assert_same(got: DualMixed<2, 3>, want: DualMixed<2, 3>, what: &str) {
+        let eq = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
+        assert!(
+            eq(got.value, want.value),
+            "{what}: value {} vs {}",
+            got.value,
+            want.value
+        );
+        for i in 0..3 {
+            assert!(
+                eq(got.grad[i], want.grad[i]),
+                "{what}: grad[{i}] {:?} vs {:?}",
+                got.grad[i],
+                want.grad[i]
+            );
+        }
+        for r in 0..2 {
+            for c in 0..3 {
+                assert!(
+                    eq(got.hess[r][c], want.hess[r][c]),
+                    "{what}: hess[{r}][{c}] {:?} vs {:?}",
+                    got.hess[r][c],
+                    want.hess[r][c]
+                );
+            }
+        }
+    }
+
+    /// The in-place operand methods the bytecode VM uses are the by-value operators,
+    /// bit for bit: same formulas, same association.
+    #[test]
+    fn in_place_binary_ops_are_bit_identical_to_the_operators() {
+        let (a0, b0) = in_place_operands();
+        let [e0, e1] = edge_operands();
+        for (a, b) in [(a0, b0), (b0, a0), (e0, a0), (a0, e1), (e1, e0)] {
+            let run = |f: fn(&mut DualMixed<2, 3>, &DualMixed<2, 3>)| {
+                let mut x = a;
+                f(&mut x, &b);
+                x
+            };
+            assert_same(run(DualMixed::add_in), a + b, "add_in");
+            assert_same(run(DualMixed::sub_in), a - b, "sub_in");
+            assert_same(run(DualMixed::rsub_in), b - a, "rsub_in");
+            assert_same(run(DualMixed::mul_in), a * b, "mul_in");
+            assert_same(run(DualMixed::div_in), a / b, "div_in");
+        }
+    }
+
+    /// A scalar operand gives exactly the operator against `DualMixed::constant(c)` —
+    /// the jet a constant used to be materialised as — including the signed zeros and
+    /// `NaN`s its zero jet produces: `+0.0` from `−0.0 + 0.0`, `NaN` from `∞ · 0`.
+    #[test]
+    fn in_place_scalar_ops_are_bit_identical_against_a_constant() {
+        let (a0, _) = in_place_operands();
+        let [e0, e1] = edge_operands();
+        for a in [a0, e0, e1] {
+            for c in [-0.37, 0.0, -0.0, 4.0] {
+                let k = DualMixed::<2, 3>::constant(c);
+                let run = |f: fn(&mut DualMixed<2, 3>, f64)| {
+                    let mut x = a;
+                    f(&mut x, c);
+                    x
+                };
+                assert_same(run(DualMixed::add_scalar_in), a + k, "add_scalar_in");
+                assert_same(run(DualMixed::sub_scalar_in), a - k, "sub_scalar_in");
+                assert_same(run(DualMixed::rsub_scalar_in), k - a, "rsub_scalar_in");
+                assert_same(run(DualMixed::mul_scalar_in), a * k, "mul_scalar_in");
+                // A literal-left `c * E` is compiled as `E * c` (see `compile_expr_into`);
+                // pin that the dual product is exact under that swap.
+                assert_same(
+                    run(DualMixed::mul_scalar_in),
+                    k * a,
+                    "mul_scalar_in (k * a)",
+                );
+                assert_same(run(DualMixed::div_scalar_in), a / k, "div_scalar_in");
+            }
+        }
+        // The cases above must actually exercise the zero terms, or this test cannot
+        // tell the exact form from a plain `value ∘ c` shortcut.
+        let mut sum = e0;
+        DualMixed::add_scalar_in(&mut sum, 1.0);
+        assert_eq!(
+            sum.grad[0].to_bits(),
+            0.0f64.to_bits(),
+            "−0.0 + 0.0 must be +0.0"
+        );
+        let mut prod = e1;
+        DualMixed::mul_scalar_in(&mut prod, 0.0);
+        assert!(
+            prod.hess[0][0].is_nan(),
+            "∞ · 0 must reach the Hessian as NaN"
+        );
     }
 }
