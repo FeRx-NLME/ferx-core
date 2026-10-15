@@ -32522,6 +32522,36 @@ const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
         [true, false, false, false, false],
     ),
     (
+        "optional R read on the left of &&",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (R > 0.0 && a > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the then value of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (a < 50.0) R else 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read under arithmetic inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < exp(2.0 * R) ^ 0.5) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
         "optional R read by the else value of an inline if inside a condition",
         &[
             "if (a > 50.0) { R = 1.0 }",
@@ -32772,6 +32802,111 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
             want[j]
         );
     }
+}
+
+/// Every operand position of the def-before-use walk's expression and condition
+/// recursion, one at a time: an undefined slot there must fail the check, and the
+/// same shape with every slot defined must pass. Complements the end-to-end
+/// `LEAN_FIXTURES` rows, which can only reach the shapes the DSL keeps as trees
+/// (an assignment's right-hand side compiles to bytecode).
+#[test]
+fn lean_rhs_walk_checks_every_operand_position() {
+    let defined = [true, false];
+    let d = || Expression::VariableIdx(0);
+    let u = || Expression::VariableIdx(1);
+    // Each builder takes the expression to place in its one varying position.
+    type Ex = fn(Expression) -> Expression;
+    let exprs: &[(&str, Ex)] = &[
+        ("bare read", |x| x),
+        ("BinOp left", |x| {
+            binop(BinOp::Add, x, Expression::VariableIdx(0))
+        }),
+        ("BinOp right", |x| {
+            binop(BinOp::Mul, Expression::VariableIdx(0), x)
+        }),
+        ("Power base", |x| {
+            Expression::Power(Box::new(x), Box::new(lit(2.0)))
+        }),
+        ("Power exponent", |x| {
+            Expression::Power(Box::new(lit(2.0)), Box::new(x))
+        }),
+        ("UnaryFn", |x| unary("exp", x)),
+        ("Conditional condition", |x| {
+            cond(cmp(x, CmpOp::Gt, lit(0.0)), lit(1.0), lit(2.0))
+        }),
+        ("Conditional then", |x| {
+            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), x, lit(2.0))
+        }),
+        ("Conditional else", |x| {
+            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), lit(1.0), x)
+        }),
+    ];
+    for (name, f) in exprs {
+        assert!(
+            expr_reads_defined(&f(d()), &defined),
+            "{name}: defined read must pass"
+        );
+        assert!(
+            !expr_reads_defined(&f(u()), &defined),
+            "{name}: undefined read must fail"
+        );
+    }
+    type Cx = fn(Expression) -> Condition;
+    let conds: &[(&str, Cx)] = &[
+        ("Compare left", |x| cmp(x, CmpOp::Lt, lit(0.0))),
+        ("Compare right", |x| cmp(lit(0.0), CmpOp::Lt, x)),
+        ("And left", |x| {
+            Condition::And(
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("And right", |x| {
+            Condition::And(
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Or left", |x| {
+            Condition::Or(
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Or right", |x| {
+            Condition::Or(
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Not", |x| {
+            Condition::Not(Box::new(cmp(x, CmpOp::Gt, lit(0.0))))
+        }),
+        ("Present", Condition::Present),
+    ];
+    for (name, f) in conds {
+        assert!(
+            cond_reads_defined(&f(d()), &defined),
+            "{name}: defined read must pass"
+        );
+        assert!(
+            !cond_reads_defined(&f(u()), &defined),
+            "{name}: undefined read must fail"
+        );
+    }
+    // Bytecode: any PushVar of an undefined slot fails, wherever it sits.
+    let bc = |e: Expression| compile_bytecode(&e);
+    assert!(bc_reads_defined(&bc(binop(BinOp::Add, d(), d())), &defined));
+    assert!(!bc_reads_defined(
+        &bc(binop(BinOp::Add, d(), u())),
+        &defined
+    ));
+    assert!(!bc_reads_defined(
+        &bc(binop(BinOp::Add, u(), d())),
+        &defined
+    ));
+    // Out of range is undefined, never a panic.
+    assert!(!expr_reads_defined(&Expression::VariableIdx(7), &defined));
 }
 
 /// Which fixtures reach which reset. The no-hoist rows exist to drive the
