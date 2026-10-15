@@ -1224,6 +1224,8 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     ofv: &F,
     options: &FitOptions,
 ) -> Option<FdStencil> {
+    #[cfg(test)]
+    reconverge_log::record_fd_hessian(initial_eps);
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
     // are finite. Most models use the initial step; halving only kicks in when the OFV
     // overflows at the default perturbation size.
@@ -1276,6 +1278,23 @@ pub(super) mod reconverge_log {
             .push((id, pop.subjects.len(), parallel_subjects));
     }
 
+    /// `initial_eps` of every [`super::fd_ofv_hessian`] call: the witness that a covariance
+    /// step sized its FD step through the probe rather than going straight to the stencil.
+    /// Keyed by the step value, which a test makes unique to itself.
+    static FD_HESSIAN_CALLS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+
+    pub(in crate::estimation) fn record_fd_hessian(initial_eps: f64) {
+        FD_HESSIAN_CALLS.lock().unwrap().push(initial_eps);
+    }
+
+    /// Remove and count the `fd_ofv_hessian` calls made with exactly `initial_eps`.
+    pub(in crate::estimation) fn take_fd_hessian(initial_eps: f64) -> usize {
+        let mut calls = FD_HESSIAN_CALLS.lock().unwrap();
+        let before = calls.len();
+        calls.retain(|&e| e != initial_eps);
+        before - calls.len()
+    }
+
     /// Remove and return `(subject count, parallel_subjects)` for every call whose first
     /// subject id starts with `prefix`.
     pub(in crate::estimation) fn take(prefix: &str) -> Vec<(usize, bool)> {
@@ -1297,12 +1316,14 @@ fn map_subjects<T: Send, F: Fn(usize) -> T + Sync>(
     parallel: bool,
     f: F,
 ) -> Vec<T> {
-    #[cfg(test)]
-    reconverge_log::record(pop, parallel);
     let n = pop.subjects.len();
     if parallel {
+        #[cfg(test)]
+        reconverge_log::record(pop, true);
         (0..n).into_par_iter().map(&f).collect()
     } else {
+        #[cfg(test)]
+        reconverge_log::record(pop, false);
         (0..n).map(f).collect()
     }
 }

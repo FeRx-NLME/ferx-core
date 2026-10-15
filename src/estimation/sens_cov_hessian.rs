@@ -7216,7 +7216,8 @@ mod tests {
     ///
     /// Each production edit this exists to catch moves a count here: calling `select_fd_step`
     /// + `fd_ofv_stencil(…, None, …)` instead of `fd_ofv_hessian` adds `2·n_free` serial
-    /// points; flipping the base point's or `f0_fd`'s `parallel_subjects` to `false` (the
+    /// points; calling `fd_ofv_stencil` at `initial_eps` with no probe at all leaves the counts
+    /// alone but empties the `fd_ofv_hessian` entry log; flipping the base point's or `f0_fd`'s `parallel_subjects` to `false` (the
     /// pre-#1935 behaviour) moves its entry to the serial column; flipping the stencil's to
     /// `true` reintroduces #256's per-point fork/join and empties the serial column.
     #[test]
@@ -7259,11 +7260,18 @@ mod tests {
             salvage_pop.subjects[k].id = format!("t1935-salvage-declined-{tag}");
         }
 
+        // Each route gets its own `fd_hessian_step`, a hair off the `1e-2` default and used by
+        // no other test, so the `fd_ofv_hessian` entry log can be read back per route: the
+        // no-halving counts below cannot tell the probe-then-stencil route from a stencil run
+        // straight at `initial_eps` (same points, same matrix), but the entry log can.
+        const WHOLE_STEP: f64 = 0.010_193_5;
+        const SALVAGE_STEP: f64 = 0.010_193_7;
         let opts = |analytic: bool| FitOptions {
             method: EstimationMethod::FoceI,
             interaction: true,
             analytic_cov_hessian: analytic,
             covariance_method: CovarianceMethod::Hessian,
+            fd_hessian_step: if analytic { SALVAGE_STEP } else { WHOLE_STEP },
             verbose: false,
             ..FitOptions::default()
         };
@@ -7286,6 +7294,11 @@ mod tests {
         };
 
         run(&whole_pop, &opts(false));
+        assert_eq!(
+            reconverge_log::take_fd_hessian(WHOLE_STEP),
+            1,
+            "whole: the step must be sized by the probe, through `fd_ofv_hessian`"
+        );
         let calls = reconverge_log::take("t1935-whole-");
         assert_eq!(
             tally(&calls, 4, true),
@@ -7304,6 +7317,11 @@ mod tests {
         );
 
         run(&salvage_pop, &opts(true));
+        assert_eq!(
+            reconverge_log::take_fd_hessian(SALVAGE_STEP),
+            1,
+            "salvage: the step must be sized by the probe, through `fd_ofv_hessian`"
+        );
         let whole_calls = reconverge_log::take("t1935-salvage-0");
         let subset_calls = reconverge_log::take("t1935-salvage-declined");
         assert_eq!(
