@@ -86,7 +86,8 @@ def arm_options(arm, seed, k):
         base = "impmap_t4_sobol" if "sobol" in arm or "owen" in arm else "impmap_t4"
         return arm_options(base, seed, k)
     # Phase 4 (#1965): IMPMAP at its *default* settings (adaptive K, default
-    # iterations and averaging), with and without Sobol.
+    # iterations and averaging), with and without Sobol. K is ignored, so
+    # `cmd_run` runs these once, labelled K = 300 (impmap_auto's start).
     if arm == "impmap_default":
         return ["method = impmap", f"impmap_seed = {seed}"]
     if arm == "impmap_default_sobol":
@@ -103,7 +104,8 @@ def arm_options(arm, seed, k):
 # every iteration). The toggles existed only in the experiment binary (see
 # README, Phase 2); production code has Owen built in and none of the rest,
 # so on a current binary `impmap_t4_sobol` is the Owen arm and these arms
-# reduce to their base arm.
+# would reduce to their base arm; `check_arms` refuses them unless
+# FERX_BENCH_EXPERIMENT=1.
 PHASE2_ENV = {
     "impmap_t4_owen": {"FERX_BENCH_OWEN": "1"},
     "impmap_t4_crn": {"FERX_BENCH_CRN": "1"},
@@ -123,8 +125,27 @@ PHASE2_ENV = {
 }
 
 
+DEFAULT_ARMS = {"impmap_default", "impmap_default_sobol"}
+DEFAULT_ARM_K = 300
+
+
 def arm_env(arm):
     return {**os.environ, **PHASE2_ENV.get(arm, {})}
+
+
+def check_arms(arms, ks):
+    """Refuse runs whose labels would be false: a Phase 2 arm on a binary
+    without the toggles is silently its base arm, and a default arm ignores K."""
+    p2 = [a for a in arms if a in PHASE2_ENV]
+    if p2 and os.environ.get("FERX_BENCH_EXPERIMENT") != "1":
+        raise SystemExit(
+            f"{', '.join(p2)}: Phase 2 arms need the experiment binary (FERX_BIN) with "
+            "the FERX_BENCH_* toggles; set FERX_BENCH_EXPERIMENT=1 to confirm. A "
+            "production binary ignores the toggles and would run the base arm.")
+    if any(a in DEFAULT_ARMS for a in arms) and ks != [DEFAULT_ARM_K]:
+        raise SystemExit(
+            f"impmap_default arms ignore K (impmap_auto picks it); run them with "
+            f"--k {DEFAULT_ARM_K}, separately from fixed-K arms.")
 
 
 ARMS = ["impmap_prng", "impmap_sobol", "impmap_t4", "saem", "focei"]
@@ -289,6 +310,7 @@ def cmd_run(a):
     models = a.models.split(",") if a.models else list(MODELS)
     arms = a.arms.split(",") if a.arms else ARMS
     ks = [int(x) for x in a.k.split(",")]
+    check_arms(arms, ks)
     jobs = []
     for m in models:
         for arm in arms:

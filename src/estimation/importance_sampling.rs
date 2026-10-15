@@ -80,12 +80,22 @@ fn owen_scramble_u32(x: u32, seed: u32) -> u32 {
     v.reverse_bits()
 }
 
+/// The Owen scramble seed of each of `dim` coordinates: a function of the fit
+/// `seed` and the coordinate index only, so coordinates scramble independently
+/// and appending coordinates leaves the earlier ones alone.
+fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
+    let base = splitmix64(seed.wrapping_add(0x4F57_454E_0000_0000u64));
+    (0..dim)
+        .map(|j| (splitmix64(base ^ (j as u64)) >> 32) as u32)
+        .collect()
+}
+
 /// `k_samples` Sobol points of dimension `dim`, Owen-scrambled (#1965 Phase 2):
 /// each coordinate gets its own nested uniform scramble, seeded from `seed` and
 /// the coordinate index. Owen scrambling keeps the net structure the Cranley–
 /// Patterson shift it replaced destroyed, so on smooth integrands the error
-/// falls faster (measured RMSE ∝ K^−1.36 against K^−0.89 for the shift at
-/// powers of two, see `owen_scrambled_sobol_integrates_faster_than_shifted`).
+/// falls faster (measured RMSE ∝ K^−1.39 against K^−1.08 for the shift from
+/// K = 256 to 1024, see `owen_scrambled_sobol_integrates_faster_than_shifted`).
 ///
 /// A Sobol coordinate does not depend on how many dimensions follow it, and the
 /// scramble seed of coordinate `j` depends only on `seed` and `j`, so the first
@@ -96,10 +106,7 @@ fn owen_scramble_u32(x: u32, seed: u32) -> u32 {
 fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
     use sobol::Sobol;
 
-    let base = splitmix64(seed.wrapping_add(0x4F57_454E_0000_0000u64));
-    let seeds: Vec<u32> = (0..dim)
-        .map(|j| (splitmix64(base ^ (j as u64)) >> 32) as u32)
-        .collect();
+    let seeds = owen_coordinate_seeds(dim, seed);
     Sobol::<u32>::new(dim, sobol_params())
         .take(k_samples)
         .map(|point| {
@@ -2946,15 +2953,17 @@ mod tests {
 
     /// The 1000-row `standard()` Joe–Kuo table extends the 100-row `minimal()`
     /// one, so every Sobol coordinate a pre-#1965 fit used (≤ 100) has the same
-    /// direction numbers under the larger table. Compared on raw, unscrambled
-    /// points at the old table's full width.
+    /// direction numbers under the larger table. Compared on the complete
+    /// 32-bit direction vectors of all 100 coordinates, which fix every point
+    /// the generator can emit, not only the first few hundred.
     #[test]
     fn standard_sobol_table_extends_the_minimal_one() {
         use sobol::params::JoeKuoD6;
         use sobol::Sobol;
-        let minimal = JoeKuoD6::minimal();
-        let old: Vec<Vec<u32>> = Sobol::<u32>::new(100, &minimal).take(512).collect();
-        let new: Vec<Vec<u32>> = Sobol::<u32>::new(100, sobol_params()).take(512).collect();
+        let old = Sobol::<u32>::init_direction_vals(100, 32, &JoeKuoD6::minimal());
+        let new = Sobol::<u32>::init_direction_vals(100, 32, sobol_params());
+        assert_eq!(old.len(), 100);
+        assert!(old.iter().all(|v| v.len() == 32));
         assert_eq!(old, new);
     }
 
@@ -2985,14 +2994,52 @@ mod tests {
                 }
             }
         }
-        // Different seeds scramble differently.
+        // At every depth t = 1..=32 (down to the last bit), two values that
+        // share the first t − 1 digits and differ in digit t must still share
+        // t − 1 digits and differ in digit t: each node of the tree is mapped
+        // by a permutation of its two children. Together with nesting this is
+        // a full 32-bit bijection; a scramble that drops any output bit fails
+        // at that bit's depth.
+        for seed in [0u32, 1, 0xDEAD_BEEF, 0x8000_0001] {
+            for t in 1..=32u32 {
+                let bit = 1u32 << (32 - t);
+                for _ in 0..64 {
+                    let x = rng.random::<u32>();
+                    let y = x ^ bit;
+                    let (sx, sy) = (owen_scramble_u32(x, seed), owen_scramble_u32(y, seed));
+                    let diff = sx ^ sy;
+                    assert_eq!(
+                        diff.leading_zeros(),
+                        t - 1,
+                        "seed {seed:#x}, depth {t}: children not permuted"
+                    );
+                }
+            }
+        }
+        // Full width: 2¹⁶ distinct inputs give 2¹⁶ distinct outputs.
+        let mut out: Vec<u32> = (0..1u32 << 16)
+            .map(|i| owen_scramble_u32(i.wrapping_mul(0x9E37_79B9), 7))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        assert_eq!(out.len(), 1 << 16, "scramble collides at full width");
+        // Each coordinate has its own scramble, and the seed moves all of them.
+        let keys = owen_coordinate_seeds(100, 1);
+        let mut distinct = keys.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 100, "coordinates share a scramble key");
+        let other = owen_coordinate_seeds(100, 2);
+        assert!(keys.iter().zip(&other).all(|(a, b)| a != b));
+        assert_eq!(owen_coordinate_seeds(3, 1)[..], keys[..3]);
+        // ... and different seeds scramble the points differently.
         assert_ne!(sobol_uniforms(2, 8, 1), sobol_uniforms(2, 8, 2));
     }
 
     /// Owen scrambling (#1965 Phase 2) against the Cranley–Patterson shift it
     /// replaced, on `∫ Πⱼ exp(uⱼ) du = (e − 1)³` over 64 seeds. Measured RMSE:
     /// K = 256: shift 2.33e-2, Owen 2.16e-3; K = 1024: shift 5.21e-3, Owen
-    /// 3.12e-4 — Owen falls as about K^−1.36, the shift as K^−0.89. The shift
+    /// 3.12e-4 — Owen falls as about K^−1.39, the shift as K^−1.08. The shift
     /// oracle is the pre-Phase-2 code, copied.
     #[test]
     fn owen_scrambled_sobol_integrates_faster_than_shifted() {

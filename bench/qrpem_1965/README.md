@@ -248,7 +248,7 @@ fit). Tables: `summary_ovn_old.md`, `summary_ovn_new.md`.
 
 - The spreads reproduce the Phase 2 numbers to every printed digit: the fits
   are deterministic given the seed.
-- Owen costs nothing over the shift (medians within 0.5%).
+- Owen costs nothing over the shift (medians within 1%).
 - Control: the pseudo-random arm (seeds 1–3) gives byte-identical fit YAML on
   both binaries apart from the wall-time fields, so Sobol is the only change.
 - **Sobol itself is not free at fixed K.** In both binaries the Sobol fits ran
