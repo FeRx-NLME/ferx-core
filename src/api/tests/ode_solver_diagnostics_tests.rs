@@ -13,6 +13,11 @@ use std::collections::HashMap;
 
 /// A rapid-equilibrium two-state model: the exchange rate `KFAST` sets `|Re λ|max`, so the
 /// same source is a stiff or a benign fixture depending on one theta.
+///
+/// The elimination saturates at a `Km` (1e6) far above any amount the dose produces, keeping the
+/// system structurally nonlinear: these tests observe the *integrator's* decisions, and a linear
+/// RHS is propagated exactly by the matrix exponential instead (#852), with no stiffness to
+/// detect and no steps to count.
 fn two_state_model(kfast: f64) -> CompiledModel {
     let src = format!(
         r#"
@@ -29,7 +34,7 @@ fn two_state_model(kfast: f64) -> CompiledModel {
 [structural_model]
   ode(obs_cmt=central, states=[central, periph])
 [odes]
-  d/dt(central) = -(CL / V) * central - KF * central + KF * periph
+  d/dt(central) = -(CL / V) * central / (1 + central / 1e6) - KF * central + KF * periph
   d/dt(periph)  = KF * central - KF * periph
 [error_model]
   DV ~ proportional(PROP)

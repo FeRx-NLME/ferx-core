@@ -25,6 +25,12 @@ use std::collections::HashMap;
 
 /// A hand-written ODE 1-cpt IV model, so the objective goes through the integrator rather than
 /// a closed form. `tail` carries any `[fit_options]` the case needs baked onto the spec.
+///
+/// The elimination is saturable with a `Km` (1e6) four orders above any amount in the data, so
+/// the objective is the linear model's to well under a tolerance step — but the system is
+/// *structurally* nonlinear, so it is integrated. A linear RHS would be propagated exactly by
+/// the matrix exponential (#852), where `ode_reltol` has nothing to act on and every OFV
+/// comparison below would be a tautology.
 fn ode_model(tail: &str) -> CompiledModel {
     parse_model_string(&format!(
         r#"
@@ -39,7 +45,7 @@ fn ode_model(tail: &str) -> CompiledModel {
 [structural_model]
   ode(states=[central])
 [odes]
-  d/dt(central) = -(CL / V) * central
+  d/dt(central) = -(CL / V) * central / (1 + central / 1e6)
 [scaling]
   y = central / V
 [error_model]

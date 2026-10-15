@@ -5321,6 +5321,22 @@ pub fn parse_full_model_with(
     // for the fields the caller actually moved. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
 
+    // `ode_method = linear` is an assertion, not a preference (#852): a user who names it is
+    // asking for the exact path, so a model that cannot take it is an error here rather than a
+    // silent fall back to integration (which is what `auto` does, by design).
+    if fit_options.ode_method == crate::ode::OdeMethod::Linear {
+        if let Some(reason) = model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.linear_ineligibility())
+        {
+            return Err(format!(
+                "fit option `ode_method = linear`: this [odes] model cannot be propagated \
+                 exactly — {reason}. Use `ode_method = auto` (the default) to integrate it."
+            ));
+        }
+    }
+
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
     // estimator/gradient context) is available. (`gradient = ad` is retired and rejected
@@ -10000,7 +10016,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
                     "fit option `ode_method`: unknown value `{value}` — expected one of \
-                     auto, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
+                     auto, linear, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
                      verner7, ros23, ode23s, rodas5)"
                 )
             })?;
@@ -14084,6 +14100,9 @@ fn build_ode_spec(
         ));
     }
 
+    // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
+    let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
     // covariate reference would have been rejected above).
@@ -14272,6 +14291,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        affine_in_states,
         init_indiv_reads,
         hoist: rhs_hoist,
     };
@@ -26639,6 +26659,10 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition —
+    /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
+    /// `ode_linearity::stmts_affine_in_states`.
+    affine_in_states: bool,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -26936,6 +26960,20 @@ impl OdeRhsProgram {
     /// not a default.
     pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
+    }
+
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition — the
+    /// structural half of the linear fast path's eligibility (#852). The other half is
+    /// [`Self::reads_any_model_time`]; `OdeSpec::linear_ineligibility` asks both.
+    pub(crate) fn is_affine_in_states(&self) -> bool {
+        self.affine_in_states
+    }
+
+    /// Any equation reads `TIME`/`T`/`TAFD`/`TAD` — the injected hazard lines included,
+    /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
+    /// the augmented system and a time-dependent hazard line is part of it.
+    pub(crate) fn reads_any_model_time(&self) -> bool {
+        self.uses_time_vars || self.reads_time_builtin
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -30343,6 +30381,9 @@ fn parse_if_statement(
         p,
     ))
 }
+
+#[path = "ode_linearity.rs"]
+mod ode_linearity;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

@@ -1211,6 +1211,7 @@ pub type ferx_core::ode::predictions::OdeOutputFn = alloc::boxed::Box<(dyn core:
 pub mod ferx_core::ode::solver
 pub enum ferx_core::ode::solver::OdeMethod
 pub ferx_core::ode::solver::OdeMethod::Auto
+pub ferx_core::ode::solver::OdeMethod::Linear
 pub ferx_core::ode::solver::OdeMethod::Rk45
 pub ferx_core::ode::solver::OdeMethod::Rodas4
 pub ferx_core::ode::solver::OdeMethod::Rodas5P
@@ -1270,6 +1271,7 @@ pub const ferx_core::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD: f64
 pub const ferx_core::ode::stiffness::STIFF_TAU_FAST: f64
 pub enum ferx_core::ode::OdeMethod
 pub ferx_core::ode::OdeMethod::Auto
+pub ferx_core::ode::OdeMethod::Linear
 pub ferx_core::ode::OdeMethod::Rk45
 pub ferx_core::ode::OdeMethod::Rodas4
 pub ferx_core::ode::OdeMethod::Rodas5P

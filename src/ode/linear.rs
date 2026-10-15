@@ -4,7 +4,7 @@
 //! Inside one integration segment a certified-linear right-hand side is `du/dt = A·u + b`
 //! with `A` and `b` constant: every PK parameter, infusion rate and zero-order input is fixed
 //! between two break times, and the parser has proved the equations affine in the states
-//! (`OdeRhsProgram::is_linear_time_invariant`). Then
+//! (`OdeSpec::linear_eligible`). Then
 //!
 //! ```text
 //!   ⎡u(t+h)⎤          ⎛⎡A  b⎤  ⎞ ⎡u(t)⎤

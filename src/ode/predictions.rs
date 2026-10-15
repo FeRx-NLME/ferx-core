@@ -3379,8 +3379,69 @@ impl OdeSpec {
     /// `ode_method` / … has no other way to reach the integrator; a site that reads the field
     /// directly silently runs at the parse-time value instead. Outside a fit (`predict`, a
     /// hand-built spec) nothing is armed and this returns the field unchanged.
+    ///
+    /// This is also where the linear fast path is chosen (#852), because it is the one place
+    /// every integration reads: `auto` on a [`linear_eligible`](Self::linear_eligible) spec
+    /// becomes [`OdeMethod::Linear`](crate::ode::OdeMethod::Linear), and `linear` on a spec
+    /// that is not becomes `auto` — so no path can reach the exact propagator with an equation
+    /// the parser did not prove valid for it, whether the request came from the model file or
+    /// a fit-scoped override. A named integrator is left alone, which is how a user opts out.
     pub(crate) fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
-        crate::ode::solver::effective_solver_options(self.solver_opts)
+        use crate::ode::OdeMethod;
+        let mut opts = crate::ode::solver::effective_solver_options(self.solver_opts);
+        match opts.method {
+            OdeMethod::Auto if self.linear_eligible() => opts.method = OdeMethod::Linear,
+            OdeMethod::Linear if !self.linear_eligible() => opts.method = OdeMethod::Auto,
+            _ => {}
+        }
+        opts
+    }
+
+    /// Whether this system can be propagated exactly by the matrix exponential (#852): the
+    /// `[odes]` program is structurally affine in the states and reads no model time, it has
+    /// no absorption forcing, and it is not an SDE. The conditions and their wording live in
+    /// [`linear_ineligibility`](Self::linear_ineligibility).
+    ///
+    /// The forcings (`first_order(...)`, `transit(...)`, `igd(...)`, `weibull(...)`,
+    /// `zero_order(...)`) are lifted out of the equations at parse time and re-added by
+    /// `wrap_rhs_with_forcings` as functions of time since the dose — an input that is not
+    /// constant over a segment, so not `b`. Written as a depot state instead
+    /// (`d/dt(depot) = -KA*depot`), first-order absorption is linear and qualifies.
+    ///
+    /// The SDE exclusion is scope, not correctness: the EKF propagates a covariance alongside
+    /// the mean, and v1 of the exact path has no anchor for that pairing.
+    ///
+    /// A hand-built spec without an `rhs_program` is never eligible.
+    pub(crate) fn linear_eligible(&self) -> bool {
+        self.linear_ineligibility().is_none()
+    }
+
+    /// Why [`linear_eligible`](Self::linear_eligible) is false, phrased for the
+    /// `ode_method = linear` parse error; `None` when the spec is eligible.
+    pub(crate) fn linear_ineligibility(&self) -> Option<&'static str> {
+        let Some(program) = self.rhs_program.as_ref() else {
+            return Some("its right-hand side was not built from an [odes] block");
+        };
+        if !program.is_affine_in_states() {
+            return Some(
+                "an equation is not linear in the states (a state is multiplied by another \
+                 state, divided by, raised to a power other than 1, passed to a function, or \
+                 tested in an `if` condition)",
+            );
+        }
+        if program.reads_any_model_time() {
+            return Some("an equation reads model time (TIME, T, TAFD or TAD)");
+        }
+        if !self.input_rate.is_empty() {
+            return Some(
+                "it uses an absorption input function (first_order, transit, igd, weibull or \
+                 zero_order); write first-order absorption as a depot state instead",
+            );
+        }
+        if !self.diffusion_var.is_empty() {
+            return Some("it is a stochastic ([diffusion]) model");
+        }
+        None
     }
 
     /// Initial compartment-amount vector for a subject, given the flat
@@ -8410,3 +8471,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
 #[cfg(test)]
 #[path = "predictions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "predictions_linear_route.rs"]
+mod linear_route;
