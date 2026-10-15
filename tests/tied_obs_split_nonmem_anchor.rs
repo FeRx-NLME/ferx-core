@@ -17,7 +17,7 @@
 //! | 4 | obs, dose 50 (`ALAG1`), obs | yes | second obs `NaN` |
 //! | 5 | obs, obs, dose 50 (`ALAG1`) | no (both move) | correct |
 //!
-//! NONMEM 7.5.1 ran `tied_obs_split.ctl` (`ADVAN1 TRANS2`, `ALAG1`, `METHOD=1 MAXEVAL=0
+//! NONMEM 7.6.0 ran `tied_obs_split.ctl` (`ADVAN1 TRANS2`, `ALAG1`, `METHOD=1 MAXEVAL=0
 //! POSTHOC`); the ferx twin is `tied_obs_split_fit.ferx`, an `[odes]` model, since only the ODE
 //! engines carried the defect. `maxiter = 0` removes the optimizer from both sides, so the
 //! objective, the EBEs and every prediction are compared at the initial estimates.
@@ -33,7 +33,7 @@ use ferx_core::{fit, parse_full_model_file, read_nonmem_csv};
 use std::path::Path;
 
 /// NONMEM OBJ, the `-1000000000` row of `nonmem_anchor/results/tied_obs_split.ext`.
-const NONMEM_OBJ: f64 = 2.672_681_311_519_764_5;
+const NONMEM_OBJ: f64 = 2.672_681_311_519_760_1;
 
 /// `(ID, TIME, PRED, IPRED, ETA1)` of every observation in
 /// `nonmem_anchor/results/tied_obs_split.tab`.
@@ -177,7 +177,8 @@ fn a_reader_split_tie_matches_nonmem() {
     );
 }
 
-// Measured on macOS arm64 with the fix: |OFV − NONMEM| 1.13e-8, worst |PRED − NONMEM| 9.7e-11
+// Measured with the fix on Linux aarch64 and on macOS arm64, the same in every printed digit,
+// against NONMEM 7.6.0: |OFV − NONMEM| 1.13e-8, worst |PRED − NONMEM| 9.7e-11
 // (the `.tab` prints 11 significant figures, about 1e-10 at these magnitudes), |η − NONMEM|
 // 3.98e-8 (where the two inner optimizers stop) and |IPRED − NONMEM| 1.89e-7, which is that η
 // error times ∂IPRED/∂η ≈ 4.7. Each bound is 10× or more above its measured error. Before the
