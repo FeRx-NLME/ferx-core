@@ -863,7 +863,7 @@ fn test_detect_stagnation_disabled_never_fires() {
     for n_evals in 0..200 {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, 7, false, false),
+            !detect_stagnation(&mut state, 7, false, false, || false),
             "enabled=false must never fire (n_evals={n_evals})"
         );
     }
@@ -889,7 +889,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     for n_evals in 1..window {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, n, true, false),
+            !detect_stagnation(&mut state, n, true, false, || false),
             "must not fire inside window (n_evals={n_evals}, window={window})"
         );
         assert!(!state.stagnation_stopped);
@@ -898,7 +898,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // At the window, fires and latches.
     state.n_evals = window;
     assert!(
-        detect_stagnation(&mut state, n, true, false),
+        detect_stagnation(&mut state, n, true, false, || false),
         "must fire at window (n_evals={window})"
     );
     assert!(
@@ -911,7 +911,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // the short-circuit is on `stagnation_stopped`, not on the counter.
     state.n_evals = 1;
     assert!(
-        detect_stagnation(&mut state, n, true, false),
+        detect_stagnation(&mut state, n, true, false, || false),
         "latched state must stay sticky-true regardless of n_evals"
     );
 }
@@ -929,14 +929,14 @@ fn test_detect_stagnation_resets_on_improvement() {
     let n = 7usize;
     // Walk almost up to the window with zero improvement…
     state.n_evals = 49;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true, false, || false));
 
     // …then improve OFV by > 1e-3.  Improvement must reset the
     // last-improvement counter so the next 50 evals start fresh.
     state.best_ofv = -100.5;
     state.n_evals = 50;
     assert!(
-        !detect_stagnation(&mut state, n, true, false),
+        !detect_stagnation(&mut state, n, true, false, || false),
         "improvement must reset the counter"
     );
     assert_eq!(
@@ -950,9 +950,9 @@ fn test_detect_stagnation_resets_on_improvement() {
 
     // Now we need another full window of zero improvement before firing.
     state.n_evals = 99;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true, false, || false));
     state.n_evals = 100;
-    assert!(detect_stagnation(&mut state, n, true, false));
+    assert!(detect_stagnation(&mut state, n, true, false, || false));
 }
 
 /// Improvement *below* the 1e-3 threshold counts as stagnation — the
@@ -971,7 +971,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
     // NOT reset.
     state.best_ofv = -100.0005;
     state.n_evals = 25;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true, false, || false));
     assert_eq!(
         state.last_improvement_eval, 0,
         "sub-threshold improvement must not advance the counter"
@@ -979,7 +979,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
 
     // 50 evals after the original last_improvement_eval (= 0), it fires.
     state.n_evals = 50;
-    assert!(detect_stagnation(&mut state, n, true, false));
+    assert!(detect_stagnation(&mut state, n, true, false, || false));
 }
 
 /// Both windows, on both sides of each floor (#1530).
@@ -1072,13 +1072,13 @@ fn test_detect_stagnation_short_window_fires_early() {
     long.last_improvement_eval = 30;
 
     short.n_evals = 39;
-    assert!(!detect_stagnation(&mut short, n, true, true));
+    assert!(!detect_stagnation(&mut short, n, true, true, || false));
     short.n_evals = 40;
-    assert!(detect_stagnation(&mut short, n, true, true));
+    assert!(detect_stagnation(&mut short, n, true, true, || false));
     assert!(short.stagnation_stopped);
 
     long.n_evals = 40;
-    assert!(!detect_stagnation(&mut long, n, true, false));
+    assert!(!detect_stagnation(&mut long, n, true, false, || false));
     assert!(!long.stagnation_stopped);
 }
 
@@ -1394,7 +1394,7 @@ fn replay_stagnation(
             pt_ofv = ofv;
             pt_idx = k;
         }
-        if stagnation_after_eval(&mut state, n, true, algo, false, pt_idx, step) {
+        if stagnation_after_eval(&mut state, n, true, algo, false, pt_idx, step, || false) {
             return Some((k, state.best_ofv));
         }
     }
@@ -6485,4 +6485,640 @@ mod outer_fd_fallback {
             g[k]
         );
     }
+}
+
+// ── #1934: the BHHH Newton decrement and the latch-time veto ───────────────────────
+
+/// `bhhh_newton_decrement` with no penalty, everything free and no bound in reach.
+fn decrement_free(per_subject: &[Vec<f64>]) -> Option<f64> {
+    let n = per_subject[0].len();
+    bhhh_newton_decrement(
+        per_subject,
+        &vec![0.0; n],
+        &DMatrix::zeros(n, n),
+        &vec![0.0; n],
+        &PackedBounds {
+            lower: vec![-10.0; n],
+            upper: vec![10.0; n],
+        },
+        &vec![false; n],
+    )
+}
+
+/// The decrement is `sᵀS⁻¹s` with `s = Σgᵢ`, `S = Σgᵢgᵢᵀ` — on one coordinate,
+/// `(Σg)²/Σg²` — and a penalty enters halved on both sides, since its gradient and
+/// Hessian are in OFV units and `s`, `S` in nll units. Hand-computed values, so a
+/// dropped `0.5`, a dropped penalty term or a `2×` on `s` each move the number.
+#[test]
+fn bhhh_newton_decrement_matches_its_closed_form() {
+    let g = vec![vec![1.0], vec![2.0], vec![-0.5]];
+    let plain = decrement_free(&g).unwrap();
+    assert!((plain - 6.25 / 5.25).abs() < 1e-12, "got {plain}");
+
+    // Penalty gradient 2 and Hessian 4 (OFV units): s = 2.5 + 1, curvature = 5.25 + 2.
+    let with_penalty = bhhh_newton_decrement(
+        &g,
+        &[2.0],
+        &DMatrix::from_element(1, 1, 4.0),
+        &[0.0],
+        &PackedBounds {
+            lower: vec![-10.0],
+            upper: vec![10.0],
+        },
+        &[false],
+    )
+    .unwrap();
+    assert!(
+        (with_penalty - 12.25 / 7.25).abs() < 1e-12,
+        "got {with_penalty}"
+    );
+}
+
+/// Scale-free: rescaling a coordinate by `c` divides every subject's gradient component
+/// by `c`, and the decrement does not move. A raw gradient norm moves by `1/c`.
+#[test]
+fn bhhh_newton_decrement_is_invariant_to_rescaling() {
+    let g = vec![
+        vec![0.3, -1.2],
+        vec![0.8, 0.4],
+        vec![-0.1, 0.9],
+        vec![0.5, 0.2],
+    ];
+    let base = decrement_free(&g).unwrap();
+    for c in [1e-3, 0.5, 40.0] {
+        let scaled: Vec<Vec<f64>> = g.iter().map(|gi| vec![gi[0] / c, gi[1]]).collect();
+        let got = decrement_free(&scaled).unwrap();
+        assert!((got - base).abs() < 1e-9 * base, "c = {c}: {got} vs {base}");
+    }
+}
+
+/// Which coordinates count: a fixed one never; one on a bound only when the gradient
+/// does not push it through that bound. Each bound is tested with the gradient on both
+/// sides of the sign test in the same test, so a predicate stuck either way fails.
+#[test]
+fn bhhh_newton_decrement_keeps_only_movable_coordinates() {
+    // Coordinate 0's summed gradient is positive (+1.5): descent wants it lower.
+    let up = vec![vec![1.0, 0.5], vec![0.5, -0.2], vec![0.0, 0.4]];
+    let down: Vec<Vec<f64>> = up.iter().map(|g| vec![-g[0], g[1]]).collect();
+    let only_1 = |g: &[Vec<f64>]| {
+        decrement_free(&g.iter().map(|gi| vec![gi[1]]).collect::<Vec<_>>()).unwrap()
+    };
+    let bounds = PackedBounds {
+        lower: vec![0.0, -10.0],
+        upper: vec![1.0, 10.0],
+    };
+    let run = |g: &[Vec<f64>], x0: f64, fixed0: bool| {
+        bhhh_newton_decrement(
+            g,
+            &[0.0, 0.0],
+            &DMatrix::zeros(2, 2),
+            &[x0, 0.0],
+            &bounds,
+            &[fixed0, false],
+        )
+        .unwrap()
+    };
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-12 * (1.0 + b.abs());
+
+    // On the lower bound: dropped when descent points out (s₀ > 0), kept when it points in.
+    assert!(close(run(&up, 0.0, false), only_1(&up)));
+    assert!(close(
+        run(&down, 0.0, false),
+        decrement_free(&down).unwrap()
+    ));
+    // On the upper bound: the mirror image.
+    assert!(close(run(&down, 1.0, false), only_1(&down)));
+    assert!(close(run(&up, 1.0, false), decrement_free(&up).unwrap()));
+    // Interior: kept either way, so the two cases above are the bound's doing.
+    assert!(close(run(&up, 0.5, false), decrement_free(&up).unwrap()));
+    // Fixed: dropped wherever it sits.
+    assert!(close(run(&down, 0.5, true), only_1(&down)));
+    assert!(
+        decrement_free(&up).unwrap() > only_1(&up) * (1.0 + 1e-6),
+        "fixture: coordinate 0 must carry part of the decrement, or dropping it is unobservable"
+    );
+
+    // Nothing movable → no decrement at all.
+    assert_eq!(
+        bhhh_newton_decrement(
+            &up,
+            &[0.0, 0.0],
+            &DMatrix::zeros(2, 2),
+            &[0.0, 0.0],
+            &bounds,
+            &[false, true],
+        ),
+        None
+    );
+}
+
+/// A direction no subject's gradient spans has a zero eigenvalue — which in floating
+/// point is a rounding residue, not `0.0`, once that direction is not a coordinate axis.
+/// It is left out rather than divided by. A non-finite input gives `None`, never a number.
+#[test]
+fn bhhh_newton_decrement_survives_singular_and_non_finite_input() {
+    // Every subject's gradient lies along the unit direction d = (1, √2)/√3; a penalty
+    // gradient along the orthogonal n = (−√2, 1)/√3, with no curvature, puts part of `s`
+    // in the curvature's null space. Only `s`'s component along `d` (3, from subjects
+    // 1·d and 2·d) may count: 3²/(1² + 2²).
+    let d = [1.0 / 3.0_f64.sqrt(), (2.0_f64 / 3.0).sqrt()];
+    let nrm = [-d[1], d[0]];
+    let g = vec![vec![d[0], d[1]], vec![2.0 * d[0], 2.0 * d[1]]];
+    let got = bhhh_newton_decrement(
+        &g,
+        &[6.0 * nrm[0], 6.0 * nrm[1]],
+        &DMatrix::zeros(2, 2),
+        &[0.0, 0.0],
+        &PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        },
+        &[false, false],
+    )
+    .unwrap();
+    assert!((got - 9.0 / 5.0).abs() < 1e-9, "got {got}");
+
+    assert_eq!(decrement_free(&[vec![f64::NAN], vec![1.0]]), None);
+    assert_eq!(decrement_free(&[vec![0.0], vec![0.0]]), None);
+}
+
+/// The property #1934 needs and a raw gradient norm lacks: two populations with the
+/// *same* summed gradient, `|g|` = 1.14 in OFV units as at the #1934 false stop. In one
+/// every subject pulls the same way (a creep: the data agree there is more to gain); in
+/// the other the subjects pull hard in opposite directions and only a residue survives
+/// the sum, the shape of #1530's flat `clofarabine_brooks` optimum. Any threshold on the
+/// norm passes or fails both; the decrement puts them on opposite sides of the gate.
+#[test]
+fn bhhh_newton_decrement_separates_a_creep_from_a_flat_optimum_of_equal_norm() {
+    let n_subj = 15;
+    let s_target = 0.57; // nll units: |∂OFV/∂x| = 2·0.57 = 1.14
+    let creep: Vec<Vec<f64>> = (0..n_subj)
+        .map(|i| vec![s_target / n_subj as f64 * (1.0 + 0.1 * ((i % 3) as f64 - 1.0))])
+        .collect();
+    let flat: Vec<Vec<f64>> = (0..n_subj)
+        .map(|i| {
+            let swing = if i % 2 == 0 { 3.0 } else { -3.0 };
+            vec![swing + s_target / n_subj as f64 - if i == n_subj - 1 { 3.0 } else { 0.0 }]
+        })
+        .collect();
+    let sum = |g: &[Vec<f64>]| g.iter().map(|gi| gi[0]).sum::<f64>();
+    assert!((sum(&creep) - s_target).abs() < 1e-12);
+    assert!((sum(&flat) - s_target).abs() < 1e-12);
+
+    let creep_gain = decrement_free(&creep).unwrap();
+    let flat_gain = decrement_free(&flat).unwrap();
+    assert!(!gain_is_negligible(Some(creep_gain)), "creep: {creep_gain}");
+    assert!(gain_is_negligible(Some(flat_gain)), "flat: {flat_gain}");
+}
+
+/// The gate's three inputs: no decrement latches as before #1934; the threshold itself
+/// latches; anything above it does not.
+#[test]
+fn gain_is_negligible_at_and_around_the_threshold() {
+    assert!(gain_is_negligible(None));
+    assert!(gain_is_negligible(Some(0.0)));
+    assert!(gain_is_negligible(Some(LATCH_MAX_PREDICTED_GAIN)));
+    assert!(!gain_is_negligible(Some(
+        LATCH_MAX_PREDICTED_GAIN * (1.0 + 1e-12)
+    )));
+    assert!(!gain_is_negligible(Some(14.8)));
+}
+
+/// The veto (#1934): asked only when a window has elapsed; a `true` re-arms the window
+/// at the current eval and keeps the improvement baseline; a later `false` latches one
+/// full window after the re-arm, not before.
+#[test]
+fn detect_stagnation_veto_rearms_the_window() {
+    let n = 7usize;
+    let window = stagnation_window(n, true);
+    let mut state = fresh_state();
+    state.best_ofv = -204.4111;
+    state.best_at_last_improvement = -204.4102;
+    state.last_improvement_eval = 50;
+
+    for k in 51..50 + window {
+        state.n_evals = k;
+        assert!(!detect_stagnation(&mut state, n, true, true, || {
+            panic!("veto consulted inside the window at eval {k}")
+        }));
+    }
+    state.n_evals = 50 + window;
+    let mut asked = 0;
+    assert!(!detect_stagnation(&mut state, n, true, true, || {
+        asked += 1;
+        true
+    }));
+    assert_eq!(asked, 1);
+    assert!(!state.stagnation_stopped, "a vetoed window must not latch");
+    assert_eq!(state.last_improvement_eval, 50 + window, "window re-armed");
+    assert_eq!(
+        state.best_at_last_improvement, -204.4102,
+        "the baseline is kept, so the creep's progress keeps counting"
+    );
+
+    // The re-armed window runs its full length before the veto is asked again.
+    state.n_evals = 50 + 2 * window - 1;
+    assert!(!detect_stagnation(&mut state, n, true, true, || panic!(
+        "veto consulted before the re-armed window elapsed"
+    )));
+    state.n_evals = 50 + 2 * window;
+    assert!(detect_stagnation(&mut state, n, true, true, || false));
+    assert!(state.stagnation_stopped);
+}
+
+/// The #1934 fixture: `data/two_cpt_iv.csv`, 2-cpt IV, BLOCK(2) η on CL/V1, additive
+/// error, FOCEI. The θ, Ω and σ values are filled in per point.
+fn issue_1934_model(cl: f64, v1: f64, q: f64, v2: f64, om: [f64; 3], sig: f64) -> String {
+    issue_1934_model_with_q_prior(cl, v1, q, v2, om, sig, "")
+}
+
+/// [`issue_1934_model`] with `q_prior` appended to the TVQ declaration.
+fn issue_1934_model_with_q_prior(
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    om: [f64; 3],
+    sig: f64,
+    q_prior: &str,
+) -> String {
+    format!(
+        "[parameters]
+  theta TVCL({cl}, 0.01, 100.0)
+  theta TVV1({v1}, 0.1, 500.0)
+  theta TVQ({q}, 0.0001, 100.0) {q_prior}
+  theta TVV2({v2}, 0.1, 5000.0)
+  block_omega (ETA_CL, ETA_V1) = [{}, {}, {}]
+  sigma ADD_ERR ~ {sig}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ additive(ADD_ERR)
+",
+        om[0], om[1], om[2]
+    )
+}
+
+fn focei_options() -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    }
+}
+
+/// The packed point and its EBEs `(x, η̂, H, κ̂)` at `params`, the way the objective
+/// closure gets them.
+#[allow(clippy::type_complexity)]
+fn ebes_at(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    pop: &Population,
+    opts: &FitOptions,
+) -> (
+    Vec<f64>,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+    let (ehs, hms, _, kappas) = run_inner_loop_warm(
+        model,
+        pop,
+        params,
+        opts.inner_maxiter,
+        opts.inner_tol,
+        None,
+        Some(&mu_k),
+        0,
+        0,
+    );
+    (pack_params(params), ehs, hms, kappas)
+}
+
+fn gain_at(model: &CompiledModel, pop: &Population, opts: &FitOptions) -> Option<f64> {
+    let (x, ehs, _, kappas) = ebes_at(model, &model.default_params, pop, opts);
+    predicted_remaining_gain(
+        model,
+        pop,
+        &model.default_params,
+        &x,
+        &ehs,
+        &kappas,
+        &compute_bounds(&model.default_params),
+        opts,
+        &crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts),
+        &build_prior_set(model, &model.default_params),
+    )
+}
+
+/// The straddle on the real fixture (#1934). At the point the short window latched on
+/// `main` (`c25832ca`; OFV −204.4111, TVQ 0.011638) the predicted gain is far above the
+/// threshold; at NONMEM 7.6's FOCEI optimum of the same model and data (−432.16683,
+/// `MINIMIZATION SUCCESSFUL` from TVQ = 2; the `.ext` final row) it is far below. Both
+/// points are this file's own 6-figure rounding of the reported estimates. Measured on
+/// Linux x86_64: 14.83 and 5.8e-7 — a regression to a norm-free gate, or to a decrement
+/// that drops the curvature, cannot keep both sides.
+#[test]
+fn predicted_remaining_gain_straddles_the_issue_1934_false_stop() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let false_stop = parse_model_string(&issue_1934_model(
+        6.735588,
+        16.155540,
+        0.011638,
+        23.488333,
+        [0.061883, -0.018713, 0.101651],
+        0.043717,
+    ))
+    .expect("false-stop model parses");
+    let nonmem_optimum = parse_model_string(&issue_1934_model(
+        4.80976,
+        15.4816,
+        2.94425,
+        19.0347,
+        [0.0973620, -0.00531834, 0.101737],
+        0.00666718,
+    ))
+    .expect("optimum model parses");
+
+    let at_stop = gain_at(&false_stop, &pop, &opts).expect("closed-form fixture has a gain");
+    let at_optimum = gain_at(&nonmem_optimum, &pop, &opts).expect("closed-form fixture has a gain");
+    eprintln!("predicted gain: false stop {at_stop:e}, NONMEM optimum {at_optimum:e}");
+    assert!(
+        at_stop > 10.0 && !gain_is_negligible(Some(at_stop)),
+        "the #1934 creep must veto the latch: {at_stop}"
+    );
+    assert!(
+        at_optimum < 1e-3 && gain_is_negligible(Some(at_optimum)),
+        "NONMEM's optimum must be allowed to latch: {at_optimum}"
+    );
+}
+
+/// Where no decrement is formed, both sides of each exclusion: the ODE twin of a
+/// closed-form example (its gradient is the integrator's, see `predicted_remaining_gain`),
+/// and AGQ, whose objective is not the one `subject_analytic_outer_gradient` differentiates.
+#[test]
+fn predicted_remaining_gain_is_withheld_from_inexact_objectives() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let closed = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
+    let ode = parse_model_file(Path::new("examples/two_cpt_iv_ode.ferx")).expect("parses");
+    assert!(gain_at(&closed, &pop, &opts).is_some(), "closed form");
+    assert_eq!(gain_at(&ode, &pop, &opts), None, "ODE");
+
+    let agq = FitOptions {
+        n_agq: 3,
+        ..focei_options()
+    };
+    let (x, ehs, _, kappas) = ebes_at(&closed, &closed.default_params, &pop, &opts);
+    let per_subject = |o: &FitOptions| {
+        per_subject_outer_gradients(&closed, &pop, &closed.default_params, &x, &ehs, &kappas, o)
+    };
+    assert!(per_subject(&opts).is_some(), "FOCEI");
+    assert_eq!(per_subject(&agq), None, "AGQ");
+
+    // A mixture's objective is the class log-sum-exp, not one class's marginal: its
+    // twin with the `[mixture]` block removed is in scope, the mixture is not.
+    let mixture_src = |mixture: bool| {
+        format!(
+            "[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+{}
+[individual_parameters]
+  CL = {}
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+",
+            if mixture {
+                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n"
+            } else {
+                ""
+            },
+            if mixture {
+                "if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)"
+            } else {
+                "TVCL1 * exp(ETA_CL) * (TVCL2 / TVCL2) * exp(MIXL - MIXL)"
+            }
+        )
+    };
+    let mix_pop = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("mixture data loads");
+    for (mixture, want_some) in [(false, true), (true, false)] {
+        let m =
+            crate::parser::model_parser::parse_model_string(&mixture_src(mixture)).expect("parses");
+        assert_eq!(m.mixture.is_some(), mixture, "fixture's mixture status");
+        let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &mix_pop, &opts);
+        let got =
+            per_subject_outer_gradients(&m, &mix_pop, &m.default_params, &x, &ehs, &kappas, &opts);
+        assert_eq!(got.is_some(), want_some, "mixture = {mixture}");
+    }
+}
+
+/// `per_subject_outer_gradients` is the optimizer's own gradient taken apart: twice its
+/// sum is what `population_gradient_sens_mixed` / `_iov_mixed` hand NLopt, on every free
+/// coordinate. Run on a non-IOV and an IOV fixture, so the stacked `[η, κ…]` arm is
+/// checked too — drop the κ from the stack and the IOV half fails.
+#[test]
+fn per_subject_outer_gradients_sum_to_the_optimizer_gradient() {
+    for (model_file, data_file, iov) in [
+        ("examples/two_cpt_iv.ferx", "data/two_cpt_iv.csv", false),
+        ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", true),
+    ] {
+        let prep = crate::api::prepare_run(model_file, Some(data_file)).expect("prepares");
+        let (model, pop, params) = (&prep.parsed.model, &prep.population, &prep.init_params);
+        let opts = focei_options();
+        let (x, ehs, hms, kappas) = ebes_at(model, params, pop, &opts);
+        assert_eq!(model.n_kappa > 0, iov, "{model_file}: fixture's IOV status");
+        if iov {
+            assert!(
+                kappas.iter().any(|k| k.iter().any(|v| v.norm() > 1e-6)),
+                "{model_file}: κ̂ must be non-zero, or dropping it is unobservable"
+            );
+        }
+        let bounds = compute_bounds(params);
+        let per_subject = per_subject_outer_gradients(model, pop, params, &x, &ehs, &kappas, &opts)
+            .expect("in analytic scope");
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        let population = if iov {
+            population_gradient_sens_iov_mixed(
+                &x,
+                params,
+                model,
+                pop,
+                &ehs,
+                &kappas,
+                &bounds,
+                &opts,
+                OuterTrial::unknown(),
+                &declines,
+            )
+        } else {
+            population_gradient_sens_mixed(
+                &x,
+                params,
+                model,
+                pop,
+                &ehs,
+                &hms,
+                &bounds,
+                &opts,
+                OuterTrial::unknown(),
+                &declines,
+            )
+        };
+        let fixed = packed_fixed_mask(params);
+        for k in (0..x.len()).filter(|&k| !fixed[k]) {
+            let ours = 2.0 * per_subject.iter().map(|g| g[k]).sum::<f64>();
+            assert!(
+                (ours - population[k]).abs() <= 1e-9 * (1.0 + population[k].abs()),
+                "{model_file} coordinate {k}: {ours} vs {}",
+                population[k]
+            );
+        }
+    }
+}
+
+/// The decrement is that of the objective the optimizer minimises, prior included. At
+/// NONMEM's unpenalized optimum the data gradient is ~0, so a prior pulling TVQ toward
+/// 1.0 is the whole of what is left to gain — the gain must be material, and must be
+/// exactly the decrement with the prior's gradient *and* curvature (a fixture where
+/// dropping the curvature moves the number, checked). A prior centred on the estimate
+/// pulls nothing and must leave the gain negligible: the other side of the gate.
+#[test]
+fn predicted_remaining_gain_includes_the_prior_penalty() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let at_optimum = |q_prior: &str| {
+        parse_model_string(&issue_1934_model_with_q_prior(
+            4.80976,
+            15.4816,
+            2.94425,
+            19.0347,
+            [0.0973620, -0.00531834, 0.101737],
+            0.00666718,
+            q_prior,
+        ))
+        .expect("model parses")
+    };
+
+    let pulled = at_optimum("prior(1.0, rse = 10%)");
+    let got = gain_at(&pulled, &pop, &opts).expect("closed form");
+
+    let params = &pulled.default_params;
+    let (x, ehs, _, kappas) = ebes_at(&pulled, params, &pop, &opts);
+    let per_subject =
+        per_subject_outer_gradients(&pulled, &pop, params, &x, &ehs, &kappas, &opts).unwrap();
+    let priors = build_prior_set(&pulled, params);
+    let n = x.len();
+    let mut grad = vec![0.0; n];
+    let mut hess = DMatrix::zeros(n, n);
+    priors.add_gradient(&x, &mut grad);
+    priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
+    let decrement = |h: &DMatrix<f64>| {
+        bhhh_newton_decrement(
+            &per_subject,
+            &grad,
+            h,
+            &x,
+            &compute_bounds(params),
+            &packed_fixed_mask(params),
+        )
+        .unwrap()
+    };
+    let full = decrement(&hess);
+    let no_curvature = decrement(&DMatrix::zeros(n, n));
+    assert!(
+        (got - full).abs() <= 1e-9 * full,
+        "gain {got} vs decrement with the prior {full}"
+    );
+    assert!(
+        (full - no_curvature).abs() > 1e-3 * full,
+        "fixture: the prior's curvature must move the decrement ({full} vs {no_curvature})"
+    );
+    assert!(!gain_is_negligible(Some(got)), "pulled: {got}");
+
+    let centred = at_optimum("prior(2.94425, rse = 10%)");
+    let still = gain_at(&centred, &pop, &opts).expect("closed form");
+    assert!(gain_is_negligible(Some(still)), "centred: {still}");
+}
+
+/// The veto is wired into the objective closure (#1934). The #1934 SLSQP run latched at
+/// eval 60 on an incumbent of −204.4111; with the veto it carries on, and by eval 69 the
+/// escape along TVQ is under way (−244.72; −257.23 at eval 72, the trace in the issue). A
+/// budget of `outer_maxiter = 8` (72 evals for 8 packed parameters) stops it there, well
+/// short of convergence, so this is not a fit to convergence. Without the wiring the
+/// guard latches at eval 60 and both assertions fail.
+#[test]
+fn latch_veto_is_wired_into_the_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(&issue_1934_model(
+        4.0,
+        12.0,
+        0.01,
+        25.0,
+        [0.1, 0.01, 0.1],
+        0.01,
+    ))
+    .expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = FitOptions {
+        optimizer: Optimizer::Slsqp,
+        outer_maxiter: 8,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        ..focei_options()
+    };
+    let (result, outcome) = optimize_nlopt_once(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        false,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+    );
+    assert!(
+        !outcome.stagnation_latched,
+        "the creep must not latch (OFV {})",
+        result.ofv
+    );
+    assert!(
+        result.ofv < -240.0,
+        "the escape must be under way by the budget's end: OFV {}",
+        result.ofv
+    );
 }
