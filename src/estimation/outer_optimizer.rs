@@ -538,11 +538,11 @@ fn evaluate_at_initial_params(
     } else {
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         // Genuine cold start: an eval-only run has no warm EBE history, so pass
-        // `None` (not `Some(zeros)`). Both seed the inner search at η = 0, but `None`
-        // is what marks this as a cold start to the guarded multi-start inner EBE
-        // (`inner_restarts`), so a subject with a multimodal individual posterior —
-        // system resets / TV-covariates, or a weakly-identified random effect (#891)
-        // — is re-seeded here instead of silently reporting a sub-optimal mode. This
+        // `None`. The inner solve treats `None` and `Some(zeros)` alike as cold (#2014),
+        // so the guarded multi-start inner EBE (`inner_restarts`) runs here exactly as on
+        // an estimating fit's first evaluation: a subject with a multimodal individual
+        // posterior — system resets / TV-covariates, or a weakly-identified random effect
+        // (#891) — is re-seeded instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
         let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm_seeded(
             model,

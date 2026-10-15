@@ -4357,3 +4357,115 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
         "a TTE record on a drug-driven hazard has no analytic η-channel"
     );
 }
+
+/// Flip-flop one-compartment oral subject (#2013, #2014). The data are noiseless from
+/// CL = 1, V = 10, ka = 0.02 — absorption slower than elimination (k = 0.1) — and swapping
+/// ka and k with V' = V·k/ka reproduces the curve exactly, so the individual objective has
+/// two modes that differ only in the Ω penalty: the deeper one at η ≈ (0, 0, −3.90) and a
+/// twin at η ≈ (0, +1.58, −2.34) (ka = 0.1, V = 50). BFGS from η = 0 lands in the twin. The
+/// twin is well curved, so `weakly_identified_coords` does not flag it (#2013); `reset`
+/// adds an inert reset before the dose so the subject takes the scan-every-coordinate arm.
+/// NONMEM 7.5.1 at the same estimates agrees on both modes (#2013's comparison).
+fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
+    use crate::types::{DoseEvent, Subject};
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0,0.01,100)\n  theta TVV(10.0,0.1,1000)\n  theta TVKA(1.0,0.001,100)\n  omega ETA_CL ~ 0.04\n  omega ETA_V ~ 0.1\n  omega ETA_KA ~ 1.0\n  sigma PROP_ERR ~ 0.05 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+    )
+    .expect("parse the flip-flop model");
+    let obs_times = vec![
+        0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0,
+    ];
+    let (cl, v, ka) = (1.0_f64, 10.0_f64, 0.02_f64);
+    let k = cl / v;
+    let observations: Vec<f64> = obs_times
+        .iter()
+        .map(|&t| 100.0 * ka / (v * (ka - k)) * ((-k * t).exp() - (-ka * t).exp()))
+        .collect();
+    let n = obs_times.len();
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times,
+        obs_raw_times: Vec::new(),
+        observations,
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: if reset { vec![0.0] } else { Vec::new() },
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
+    assert!(!subject.has_tv_covariates());
+    (model, subject)
+}
+
+/// #2014: every estimating fit hands the inner loop `Some(zeros)` on its first evaluation
+/// (`new_nlopt_state`'s cache, the pre-flight solve), and the guarded multi-start tested
+/// `eta_init.is_none()`, so it never ran before the final cold re-solve. An all-zero start
+/// must multi-start exactly as `None` does, and a genuine warm start must not.
+#[test]
+fn an_all_zero_start_runs_the_guarded_multistart_like_none() {
+    assert!(!is_warm_start(None));
+    assert!(!is_warm_start(Some(&[0.0, 0.0, 0.0])));
+    assert!(is_warm_start(Some(&[0.0, 0.5, 0.0])));
+
+    let (model, subject) = flipflop_fixture(true);
+    let params = &model.default_params;
+    let zeros = vec![0.0; model.n_eta];
+    let trapped = find_ebe(&model, &subject, params, 200, 1e-8, None, None, 0);
+    let from_none = find_ebe(&model, &subject, params, 200, 1e-8, None, None, 1);
+    let from_zeros = find_ebe(&model, &subject, params, 200, 1e-8, Some(&zeros), None, 1);
+
+    // The straddle: on this fixture the multi-start moves the mode, so the equality below
+    // cannot hold merely because the multi-start is a no-op.
+    assert!(
+        trapped.eta[2] > -3.0 && from_none.eta[2] < -3.5,
+        "premise: restarts=0 must sit in the twin and the cold multi-start in the deeper \
+         mode; got η_KA {} and {}",
+        trapped.eta[2],
+        from_none.eta[2]
+    );
+    assert!(
+        from_none.nll + 5.0 < trapped.nll,
+        "premise: the deeper mode is lower ({} vs {})",
+        from_none.nll,
+        trapped.nll
+    );
+
+    assert_eq!(
+        from_zeros.eta.as_slice(),
+        from_none.eta.as_slice(),
+        "an all-zero start skipped the guarded multi-start (#2014)"
+    );
+    assert_eq!(from_zeros.nll.to_bits(), from_none.nll.to_bits());
+
+    // A genuine warm start at the twin is the previous evaluation's mode carried forward,
+    // and is not re-scanned: the multi-start runs once per optimizer leg, not per evaluation.
+    let warm = find_ebe(
+        &model,
+        &subject,
+        params,
+        200,
+        1e-8,
+        Some(trapped.eta.as_slice()),
+        None,
+        1,
+    );
+    assert!(
+        warm.eta[2] > -3.0,
+        "a genuine warm start re-ran the multi-start: η_KA {}",
+        warm.eta[2]
+    );
+}

@@ -7979,7 +7979,8 @@ pub struct FitOptions {
     /// a subject re-solves the EBE **on a cold start** from `inner_restarts`
     /// Ω-scaled alternate seeds and keeps the lowest-objective mode; the outer
     /// loop's warm start then carries the chosen basin forward, so the scan runs
-    /// once per subject per fit (≈0 overhead). Subjects on the event-driven path
+    /// only on cold solves: the pre-flight, the first evaluation and the final
+    /// re-solve (an all-zero start counts as cold, #2014). Subjects on the event-driven path
     /// (system resets / time-varying covariates) re-seed every random effect;
     /// every other subject is probed per coordinate for a weakly-identified
     /// (flat individual objective / high per-subject shrinkage) random effect and
