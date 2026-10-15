@@ -31080,3 +31080,1178 @@ fn every_indiv_param_name_is_in_scope_for_the_compiled_odes_block() {
         );
     }
 }
+
+// ── ODE RHS: parameter-only subexpressions lifted out of the RK stages ─────
+//
+// `build_rhs_hoist` rewrites the evaluation copy of an `[odes]` program so that a
+// subtree reading only individual parameters is computed once per parameter set
+// and reused across the integrator's calls. The oracle for every test below is the
+// same program with the lift switched off (`hoist = None`): the lifted RHS must be
+// bit-identical to it on every call, whatever sequence of inputs the cache sees.
+
+/// The busulfan RHS shape: a time-varying CL plus `Q/V1`, `Q/V2` each read twice.
+const HOIST_TWO_CPT: &str = "
+[parameters]
+  theta TVCL(10.0, 0.01, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(20.0, 0.01, 100.0)
+  theta TVV2(15.0, 1.0, 500.0)
+  theta TVDR(0.1, 0.001, 10.0)
+  theta TVSH(0.05, 0.0001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  DR = TVDR
+  SH = TVSH
+
+[structural_model]
+  ode(states=[central, peripheral])
+
+[odes]
+  FTIME = 1 + DR * exp(-SH * t)
+  CLi = CL * FTIME
+  d/dt(central) = -(CLi / V1) * central - (Q / V1) * central + (Q / V2) * peripheral
+  d/dt(peripheral) = (Q / V1) * central - (Q / V2) * peripheral
+
+[scaling]
+  y = central / V1
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// One-compartment RHS: `CL/V` is a parameter-only subtree.
+const HOIST_ONE_CPT_RATIO: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL / V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// The same layout as `HOIST_ONE_CPT_RATIO` (same states, parameters and slots),
+/// lifting a *different* subtree — `CL * V`. Two programs whose caches are the
+/// same shape, so only the per-program id tells their buffers apart.
+const HOIST_ONE_CPT_PRODUCT: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL * V) * central * 0.001
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Nothing parameter-only with an op in it: `−central · CL` parses as
+/// `(0 − central) · CL`, whose only parameter-only subtree is the leaf `CL`.
+const HOIST_ONE_CPT_NONE: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -central * CL
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+fn hoist_model(src: &str) -> CompiledModel {
+    parse_model_string(src).expect("hoist fixture parses")
+}
+
+/// The same program with the lift switched off — the oracle.
+fn hoist_model_unlifted(src: &str) -> CompiledModel {
+    let mut m = hoist_model(src);
+    m.ode_spec
+        .as_mut()
+        .and_then(|s| s.rhs_program.as_mut())
+        .expect("ODE model has an RHS program")
+        .hoist = None;
+    m
+}
+
+fn hoist_program(model: &CompiledModel) -> &OdeRhsProgram {
+    model
+        .ode_spec
+        .as_ref()
+        .and_then(|s| s.rhs_program.as_ref())
+        .expect("ODE model has an RHS program")
+}
+
+/// Every `PushVar` slot a statement list reads, `if` bodies included.
+fn hoist_stmt_reads(stmts: &[Statement], out: &mut Vec<usize>) {
+    for s in stmts {
+        match s {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                out.extend(bc.ops.iter().filter_map(|op| match *op {
+                    Op::PushVar(v) => Some(v as usize),
+                    _ => None,
+                }))
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    hoist_stmt_reads(body, out);
+                }
+                if let Some(body) = else_body {
+                    hoist_stmt_reads(body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A flat PK-parameter vector (with the two trailing TAFD/TAD anchor slots) holding
+/// `vals[i]` at individual parameter `i`'s slot.
+fn hoist_params<T: crate::sens::num::PkNum>(prog: &OdeRhsProgram, vals: &[T]) -> Vec<T> {
+    let mut p = vec![T::from_f64(0.0); crate::types::MAX_PK_PARAMS + 2];
+    for (i, &slot) in prog.indiv_to_params_slot.iter().enumerate() {
+        p[slot] = vals[i];
+    }
+    p[crate::types::MAX_PK_PARAMS] = T::from_f64(0.0);
+    p[crate::types::MAX_PK_PARAMS + 1] = T::from_f64(0.0);
+    p
+}
+
+/// Bit-for-bit equality, any `NaN` matching any `NaN`.
+fn hoist_bits_eq(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+}
+
+#[test]
+fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_program_alone() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    let h = prog
+        .hoist
+        .as_ref()
+        .expect("the two-cpt RHS has liftable subtrees");
+    // `0 − SH` (unary minus), `Q/V1` and `Q/V2` — each of the last two read twice in
+    // the source and lifted once.
+    let lifted: Vec<String> = h
+        .lifted
+        .iter()
+        .map(|(_, bc)| format!("{:?}", bc.ops))
+        .collect();
+    assert_eq!(lifted.len(), 3, "lifted subtrees: {lifted:?}");
+    assert!(
+        lifted
+            .iter()
+            .all(|s| s.contains("RSub") || s.contains("Div")),
+        "{lifted:?}"
+    );
+    // The two `Div`s are distinct subtrees: deduplication must not merge `Q/V1`
+    // with `Q/V2`.
+    assert_eq!(lifted.iter().filter(|s| s.contains("Div")).count(), 2);
+    // Every lifted slot is read by the evaluation program, the four key slots are the
+    // four parameters the lifted code reads, and the analysis program still reads
+    // the parameters themselves and no slot past its own width.
+    let mut eval_reads = Vec::new();
+    hoist_stmt_reads(&h.stmts, &mut eval_reads);
+    for (slot, _) in &h.lifted {
+        assert!(
+            eval_reads.contains(slot),
+            "lifted slot {slot} is never read"
+        );
+    }
+    assert_eq!(h.key_slots.len(), 4, "key slots: {:?}", h.key_slots);
+    let mut analysis_reads = Vec::new();
+    hoist_stmt_reads(&prog.stmts, &mut analysis_reads);
+    assert!(analysis_reads.iter().all(|&s| s < prog.n_vars_total));
+    for &k in &h.key_slots {
+        assert!(
+            analysis_reads.contains(&k),
+            "analysis program lost read of slot {k}"
+        );
+    }
+
+    // The straddle: `CL/V` is lifted, `(0 − central)·CL` has nothing to lift — and a
+    // program with nothing to lift carries no cache at all.
+    let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
+    assert_eq!(
+        hoist_program(&ratio).hoist.as_ref().map(|h| h.lifted.len()),
+        Some(1)
+    );
+    let none = hoist_model(HOIST_ONE_CPT_NONE);
+    assert!(hoist_program(&none).hoist.is_none());
+}
+
+/// Run `prog` and its unlifted twin over the same call sequence and require
+/// bit-identical derivatives on every call. The sequence is chosen so the cache
+/// both hits (same parameters, new state and time) and misses (a parameter moves,
+/// then moves back), on separate scratch buffers that persist across calls the way
+/// an integrator's do.
+#[test]
+fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    assert!(prog.hoist.is_some());
+    let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
+    let plain = hoist_program(&plain_model);
+    assert!(plain.hoist.is_none());
+    let spec = model.ode_spec.as_ref().unwrap();
+
+    // Indiv params in declaration order: CL, V1, Q, V2, DR, SH.
+    let p1 = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
+    let p2 = [9.0, 41.0, 23.5, 14.0, 0.12, 0.06]; // Q moves: Q/V1 and Q/V2 must refresh
+    let p3 = [9.0, 41.0, 19.0, 14.0, 0.12, 0.07]; // only SH moves: 0 − SH must refresh
+    let calls: [(&[f64; 6], [f64; 2], f64); 6] = [
+        (&p1, [100.0, 3.0], 0.5),
+        (&p1, [80.0, 9.0], 1.25), // hit
+        (&p2, [80.0, 9.0], 1.25), // miss: Q
+        (&p2, [60.0, 12.0], 2.0), // hit
+        (&p3, [60.0, 12.0], 2.0), // miss: SH only
+        (&p1, [100.0, 3.0], 0.5), // miss: back to p1
+    ];
+
+    // f64: the production closure and the generic VM.
+    let mut vars_h: Vec<f64> = Vec::new();
+    let mut stack_h: Vec<f64> = Vec::new();
+    let mut vars_p: Vec<f64> = Vec::new();
+    let mut stack_p: Vec<f64> = Vec::new();
+    for (k, (p, u, t)) in calls.iter().enumerate() {
+        let params = hoist_params::<f64>(prog, &p[..]);
+        let mut want = [0.0; 2];
+        plain.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut want, &mut vars_p, &mut stack_p);
+        let mut got_g = [0.0; 2];
+        prog.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            &mut got_g,
+            &mut vars_h,
+            &mut stack_h,
+        );
+        let mut got_c = [0.0; 2];
+        (spec.rhs)(u, &params, *t, &mut got_c);
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got_g[j], want[j]),
+                "call {k} du[{j}] eval_rhs_g"
+            );
+            assert!(
+                hoist_bits_eq(got_c[j], want[j]),
+                "call {k} du[{j}] f64 closure"
+            );
+        }
+    }
+
+    // `Dual1`: the jets must be keyed too. Calls 0 and 1 carry the same parameter
+    // *values* but seed Q on different axes, so a value-only key would replay Q's
+    // jet from the wrong axis.
+    type D = crate::sens::dual1::Dual1<3>;
+    let seed = |p: &[f64; 6], q_axis: usize| -> Vec<D> {
+        vec![
+            D::var(p[0], 0),
+            D::constant(p[1]),
+            D::var(p[2], q_axis),
+            D::var(p[3], 2),
+            D::constant(p[4]),
+            D::var(p[5], 0) + D::var(0.0, 1),
+        ]
+    };
+    let dcalls: [(Vec<D>, [f64; 2], f64); 5] = [
+        (seed(&p1, 1), [100.0, 3.0], 0.5),
+        (seed(&p1, 2), [100.0, 3.0], 0.5), // same values, Q's jet on a new axis: miss
+        (seed(&p1, 2), [70.0, 5.0], 1.5),  // hit
+        (seed(&p2, 2), [70.0, 5.0], 1.5),  // miss: Q value
+        (seed(&p1, 1), [100.0, 3.0], 0.5), // miss: back
+    ];
+    let mut vars_h: Vec<D> = Vec::new();
+    let mut stack_h: Vec<D> = Vec::new();
+    let mut vars_p: Vec<D> = Vec::new();
+    let mut stack_p: Vec<D> = Vec::new();
+    for (k, (p, u, t)) in dcalls.iter().enumerate() {
+        let params = hoist_params::<D>(prog, p);
+        let ud = [D::constant(u[0]), D::var(u[1], 2)];
+        let mut want = [D::constant(0.0); 2];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut want,
+            &mut vars_p,
+            &mut stack_p,
+        );
+        let mut got = [D::constant(0.0); 2];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut got,
+            &mut vars_h,
+            &mut stack_h,
+        );
+        // The lift is live for `Dual1`: its scratch carries the cache tail.
+        assert_eq!(
+            vars_h.len(),
+            prog.hoist.as_ref().unwrap().n_ext,
+            "Dual1 uses the lift"
+        );
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got[j].value, want[j].value),
+                "dual call {k} du[{j}] value"
+            );
+            for a in 0..3 {
+                assert!(
+                    hoist_bits_eq(got[j].grad[a], want[j].grad[a]),
+                    "dual call {k} du[{j}] grad[{a}]: {} vs {}",
+                    got[j].grad[a],
+                    want[j].grad[a]
+                );
+            }
+        }
+    }
+
+    // Second-order duals skip the lift (their key would cost what the lift saves):
+    // the scratch never grows a cache tail, and the result is the unlifted one.
+    type M = crate::sens::dual_mixed::DualMixed<2, 3>;
+    let params = hoist_params::<M>(
+        prog,
+        &[
+            M::var(9.0, 0),
+            M::constant(41.0),
+            M::var(19.0, 1),
+            M::var(14.0, 2),
+            M::constant(0.12),
+            M::var(0.06, 0),
+        ],
+    );
+    let ud = [M::constant(100.0), M::var(3.0, 2)];
+    let (mut vars_m, mut stack_m) = (Vec::<M>::new(), Vec::<M>::new());
+    let mut got = [M::constant(0.0); 2];
+    prog.eval_rhs_g::<M>(
+        &ud,
+        &params,
+        0.5,
+        0.5,
+        M::constant(0.5),
+        &mut got,
+        &mut vars_m,
+        &mut stack_m,
+    );
+    assert_eq!(
+        vars_m.len(),
+        prog.n_vars_total,
+        "DualMixed must not use the lift"
+    );
+    let mut want = [M::constant(0.0); 2];
+    plain.eval_rhs_g::<M>(
+        &ud,
+        &params,
+        0.5,
+        0.5,
+        M::constant(0.5),
+        &mut want,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    for j in 0..2 {
+        assert!(got[j].same_bits(&want[j]), "DualMixed du[{j}]");
+    }
+}
+
+/// The f64 RHS scratch is one thread-local buffer shared by every ODE model on the
+/// thread. Two programs with the same cache layout, called alternately on the same
+/// parameters, must each get their own lifted value — the per-program id is what
+/// keeps the second from replaying the first's `CL/V` as its `CL·V`.
+#[test]
+fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
+    let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
+    let product = hoist_model(HOIST_ONE_CPT_PRODUCT);
+    let (pr, pp) = (hoist_program(&ratio), hoist_program(&product));
+    let (hr, hp) = (pr.hoist.as_ref().unwrap(), pp.hoist.as_ref().unwrap());
+    // Same shape, or the length check alone would separate them.
+    assert_eq!(hr.n_ext, hp.n_ext);
+    assert_eq!(hr.key_slots, hp.key_slots);
+    assert_ne!(hr.id.to_bits(), hp.id.to_bits());
+
+    let plain_r_model = hoist_model_unlifted(HOIST_ONE_CPT_RATIO);
+    let plain_p_model = hoist_model_unlifted(HOIST_ONE_CPT_PRODUCT);
+    let (plain_r, plain_p) = (hoist_program(&plain_r_model), hoist_program(&plain_p_model));
+    let params = hoist_params::<f64>(pr, &[3.0, 30.0]);
+    let u = [50.0];
+    for round in 0..3 {
+        for (name, model, plain) in [("ratio", &ratio, plain_r), ("product", &product, plain_p)] {
+            let mut want = [0.0];
+            plain.eval_rhs_g::<f64>(
+                &u,
+                &params,
+                1.0,
+                1.0,
+                1.0,
+                &mut want,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            let mut got = [0.0];
+            (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got);
+            assert!(
+                hoist_bits_eq(got[0], want[0]),
+                "round {round} {name}: {} vs {}",
+                got[0],
+                want[0]
+            );
+        }
+    }
+}
+
+/// A hit must actually *reuse* the cached value, and a miss must recompute it —
+/// otherwise a cache that never hits (e.g. one that forgets its snapshot) passes
+/// every equality test while saving nothing. Poison the lifted slot in the scratch
+/// between calls: on a hit the poison reaches `du`, on a miss it is overwritten.
+#[test]
+fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
+    let model = hoist_model(HOIST_ONE_CPT_RATIO);
+    let prog = hoist_program(&model);
+    let h = prog.hoist.as_ref().unwrap();
+    let (slot, _) = h.lifted[0];
+    let u = [50.0];
+    let p1 = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let p2 = hoist_params::<f64>(prog, &[3.5, 30.0]);
+    let mut vars: Vec<f64> = Vec::new();
+    let mut stack: Vec<f64> = Vec::new();
+    let mut du = [0.0];
+    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    let clean = du[0];
+    // The maximal parameter-only subtree of `−(CL/V)·central` is `0 − CL/V`.
+    assert!(
+        hoist_bits_eq(vars[slot], 0.0 - 3.0 / 30.0),
+        "lifted 0 − CL/V after the first call: {}",
+        vars[slot]
+    );
+
+    // Same inputs: a hit, so the poisoned value is what the RHS reads.
+    vars[slot] = 1.0e6;
+    prog.eval_rhs_g::<f64>(&u, &p1, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    assert!(
+        hoist_bits_eq(du[0], 1.0e6 * 50.0),
+        "hit did not reuse the cache: {}",
+        du[0]
+    );
+
+    // A moved parameter: a miss, so the poison is replaced by the fresh value.
+    vars[slot] = 1.0e6;
+    prog.eval_rhs_g::<f64>(&u, &p2, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    assert!(
+        hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
+        "miss did not recompute: {}",
+        du[0]
+    );
+    // And back: a miss again, giving the first call's value.
+    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    assert!(hoist_bits_eq(du[0], clean));
+}
+
+/// Two lifted subtrees with identical ops that differ only in a literal must not
+/// share a slot: deduplication keys on the constants' bits as well as the ops.
+const HOIST_LITERALS: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, peripheral])
+
+[odes]
+  d/dt(central) = central * (CL * 0.5)
+  d/dt(peripheral) = (CL * 0.25) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
+    let model = hoist_model(HOIST_LITERALS);
+    let prog = hoist_program(&model);
+    assert_eq!(prog.hoist.as_ref().map(|h| h.lifted.len()), Some(2));
+    let plain_model = hoist_model_unlifted(HOIST_LITERALS);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let u = [50.0, 0.0];
+    let mut want = [0.0; 2];
+    plain.eval_rhs_g::<f64>(
+        &u,
+        &params,
+        1.0,
+        1.0,
+        1.0,
+        &mut want,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let mut got = [0.0; 2];
+    (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got);
+    for j in 0..2 {
+        assert!(
+            hoist_bits_eq(got[j], want[j]),
+            "du[{j}]: {} vs {}",
+            got[j],
+            want[j]
+        );
+    }
+}
+
+/// `build_rhs_hoist` drops any invariant slot a statement assigns, because a subtree
+/// reading it after the assignment would otherwise be lifted with the pre-assignment
+/// value. Today that rule is defensive: the parser rejects an `[odes]` assignment to
+/// an individual parameter's name outright, so no fixture can reach it. Pin the
+/// rejection, so that lifting it is noticed here and the taint rule gets a fixture.
+#[test]
+fn rhs_hoist_taint_rule_is_unreachable_while_odes_cannot_reassign_a_parameter() {
+    let src = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  CL = CL * 2
+  d/dt(central) = -(CL / V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let err = match parse_model_string(src) {
+        Ok(_) => panic!(
+            "`[odes]` may now reassign an individual parameter: add a fixture for \
+             build_rhs_hoist's taint rule (a subtree reading the reassigned name must \
+             stay inline)"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("collides with a previously-declared individual parameter"),
+        "{err}"
+    );
+}
+
+/// `MIXNUM` can differ between two RHS calls on identical parameters — the mixture
+/// objective evaluates each class on the same subject — so a subtree reading it must
+/// never be lifted: keyed only on `KOUT`, `KOUT·MIXNUM` would replay class 1's value
+/// under class 2. The fixture keeps a liftable `KIN/KOUT` beside it so the cache is
+/// live, and runs both classes through one persistent scratch buffer.
+const HOIST_MIXNUM: &str = "
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+  RATE = KIN / KOUT
+  d/dt(response) = RATE * KOUT - (KOUT * MIXNUM) * response
+
+[error_model]
+  DV ~ additive(ADD)
+";
+
+#[test]
+fn rhs_hoist_never_lifts_a_mixnum_reader() {
+    let model = hoist_model(HOIST_MIXNUM);
+    let prog = hoist_program(&model);
+    let h = prog
+        .hoist
+        .as_ref()
+        .expect("KIN/KOUT is liftable, so the cache is live");
+    for (_, bc) in &h.lifted {
+        assert!(
+            !bc.ops.iter().any(|o| matches!(o, Op::PushMixNum)),
+            "a lifted subtree reads MIXNUM: {:?}",
+            bc.ops
+        );
+    }
+    let plain_model = hoist_model_unlifted(HOIST_MIXNUM);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(prog, &[10.0, 2.0]);
+    let u = [3.0];
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let mut seen = Vec::new();
+    for class in [1usize, 2, 1, 2] {
+        let _class = MixtureClassGuard::enter(class);
+        let mut want = [0.0];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0];
+        prog.eval_rhs_g::<f64>(
+            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+        );
+        let mut got_c = [0.0];
+        (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got_c);
+        assert!(hoist_bits_eq(got_g[0], want[0]), "class {class} eval_rhs_g");
+        assert!(
+            hoist_bits_eq(got_c[0], want[0]),
+            "class {class} f64 closure"
+        );
+        seen.push(want[0]);
+    }
+    // The two classes must actually differ, or this cannot see a stale replay.
+    assert_ne!(seen[0].to_bits(), seen[1].to_bits(), "MIXNUM must move du");
+}
+
+/// Bare `TIME` resolves to `Op::PushTime` (the model-time thread-local), not the
+/// `t` slot, so it is invisible to the slot taint: both lift paths must reject it on
+/// their own. `d/dt(a)` is a whole statement that would otherwise lift entire,
+/// `d/dt(b)` a state-dependent one whose `CL·TIME` subtree would.
+const HOIST_BARE_TIME: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[a, b])
+
+[odes]
+  d/dt(a) = (CL / V) * TIME
+  d/dt(b) = -(CL / V) * b + CL * TIME
+
+[scaling]
+  y = b / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// An intermediate assigned only inside an `if` body reads the zero-fill when the
+/// branch is not taken. On a cache hit the scratch is kept, so the program's own
+/// slots must still be re-zeroed: after the branch fires once, a later call that
+/// skips it must see `X = 0`, not the previous call's value.
+const HOIST_BRANCH_ONLY_WRITE: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  if (t < 1) {
+    X = CL / V
+  }
+  d/dt(central) = -X * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Lifted vs unlifted over `(state, time)` calls on one parameter set — every call
+/// after the first a cache hit on a persistent scratch — for the f64 closure,
+/// `eval_rhs_g::<f64>` and `::<Dual1>`.
+fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
+    let model = hoist_model(src);
+    let prog = hoist_program(&model);
+    assert!(prog.hoist.is_some(), "fixture must have a live cache");
+    let plain_model = hoist_model_unlifted(src);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    type D = crate::sens::dual1::Dual1<2>;
+    let dparams = hoist_params::<D>(prog, &[D::var(3.0, 0), D::var(30.0, 1)]);
+    let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
+    for (k, (u, t)) in calls.iter().enumerate() {
+        let _time = ModelTimeGuard::enter(*t);
+        let mut want = vec![0.0; n_states];
+        plain.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = vec![0.0; n_states];
+        prog.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut got_g, &mut vars, &mut stack);
+        let mut got_c = vec![0.0; n_states];
+        (model.ode_spec.as_ref().unwrap().rhs)(u, &params, *t, &mut got_c);
+        let ud: Vec<D> = u.iter().map(|&x| D::constant(x)).collect();
+        let mut dwant = vec![D::constant(0.0); n_states];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut dwant,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut dgot = vec![D::constant(0.0); n_states];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut dgot,
+            &mut dvars,
+            &mut dstack,
+        );
+        for j in 0..n_states {
+            assert!(
+                hoist_bits_eq(got_g[j], want[j]),
+                "call {k} du[{j}] eval_rhs_g: {} vs {}",
+                got_g[j],
+                want[j]
+            );
+            assert!(
+                hoist_bits_eq(got_c[j], want[j]),
+                "call {k} du[{j}] f64 closure: {} vs {}",
+                got_c[j],
+                want[j]
+            );
+            // Entry by entry: `same_bits` is part of the code under test.
+            assert!(
+                hoist_bits_eq(dgot[j].value, dwant[j].value),
+                "call {k} du[{j}] Dual1 value"
+            );
+            for a in 0..2 {
+                assert!(
+                    hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
+                    "call {k} du[{j}] Dual1 grad[{a}]"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rhs_hoist_never_lifts_a_bare_time_reader() {
+    let model = hoist_model(HOIST_BARE_TIME);
+    for (_, bc) in &hoist_program(&model)
+        .hoist
+        .as_ref()
+        .expect("CL/V lifts")
+        .lifted
+    {
+        assert!(
+            !bc.ops.iter().any(|o| matches!(o, Op::PushTime)),
+            "a lifted subtree reads TIME: {:?}",
+            bc.ops
+        );
+    }
+    assert_hoist_matches_unlifted_over_calls(
+        HOIST_BARE_TIME,
+        2,
+        &[
+            (vec![1.0, 5.0], 0.5),
+            (vec![1.0, 5.0], 2.0),
+            (vec![2.0, 4.0], 7.5),
+        ],
+    );
+}
+
+#[test]
+fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
+    // Taken, then skipped twice (cache hits), then taken again.
+    let calls = [
+        (vec![50.0], 0.5),
+        (vec![50.0], 2.0),
+        (vec![40.0], 3.0),
+        (vec![40.0], 0.25),
+    ];
+    assert_hoist_matches_unlifted_over_calls(HOIST_BRANCH_ONLY_WRITE, 1, &calls);
+    // The skipped calls really do read the zero-fill.
+    let plain_model = hoist_model_unlifted(HOIST_BRANCH_ONLY_WRITE);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(plain, &[3.0, 30.0]);
+    let mut du = [1.0];
+    plain.eval_rhs_g::<f64>(
+        &[50.0],
+        &params,
+        2.0,
+        2.0,
+        2.0,
+        &mut du,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    assert_eq!(du[0], 0.0, "the untaken branch leaves X at the zero-fill");
+}
+
+/// The poison test above for the **production f64 closure**, whose cache lives in
+/// the thread-local `FERX_SCRATCH.rhs_vars` rather than a caller's buffer: a hit must
+/// read the poisoned slot, a parameter change must overwrite it. Without this, a
+/// closure that never reports `warm` stays bit-identical and silently loses the lift.
+#[test]
+fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
+    let model = hoist_model(HOIST_ONE_CPT_RATIO);
+    let prog = hoist_program(&model);
+    let (slot, _) = prog.hoist.as_ref().unwrap().lifted[0];
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    let u = [50.0];
+    let p1 = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let p2 = hoist_params::<f64>(prog, &[3.5, 30.0]);
+    let poison = || FERX_SCRATCH.with(|c| c.borrow_mut().rhs_vars[slot] = 1.0e6);
+    let mut du = [0.0];
+    rhs(&u, &p1, 1.0, &mut du);
+    let clean = du[0];
+
+    poison();
+    rhs(&u, &p1, 2.0, &mut du);
+    assert!(
+        hoist_bits_eq(du[0], 1.0e6 * 50.0),
+        "closure hit did not reuse the cache: {}",
+        du[0]
+    );
+
+    poison();
+    rhs(&u, &p2, 2.0, &mut du);
+    assert!(
+        hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
+        "closure miss did not recompute: {}",
+        du[0]
+    );
+    rhs(&u, &p1, 1.0, &mut du);
+    assert!(hoist_bits_eq(du[0], clean));
+}
+
+/// Every key slot must invalidate the cache on its own: move each individual
+/// parameter alone (between time-varying-parameter snapshots that is exactly what
+/// happens to `V2` while `Q` stays put), on one persistent scratch, and require
+/// parity with the unlifted program for the f64 closure, `eval_rhs_g::<f64>` and
+/// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
+#[test]
+fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    assert_eq!(prog.hoist.as_ref().unwrap().key_slots.len(), 4);
+    let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
+    let plain = hoist_program(&plain_model);
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    type D = crate::sens::dual1::Dual1<2>;
+    let base = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
+    let u = [80.0, 9.0];
+    let ud = [D::constant(80.0), D::var(9.0, 1)];
+    let t = 1.25;
+    // base, then each parameter moved alone and back, so every call after the first
+    // follows a warm buffer whose snapshot differs in exactly one slot.
+    let mut sets = vec![base];
+    for k in 0..base.len() {
+        let mut p = base;
+        p[k] *= 1.1;
+        sets.push(p);
+        sets.push(base);
+    }
+    for (c, p) in sets.iter().enumerate() {
+        let params = hoist_params::<f64>(prog, p);
+        let mut want = [0.0; 2];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            t,
+            t,
+            t,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0; 2];
+        prog.eval_rhs_g::<f64>(&u, &params, t, t, t, &mut got_g, &mut vars, &mut stack);
+        let mut got_c = [0.0; 2];
+        rhs(&u, &params, t, &mut got_c);
+        let dp: Vec<D> = p.iter().map(|&x| D::var(x, 0)).collect();
+        let dparams = hoist_params::<D>(prog, &dp);
+        let mut dwant = [D::constant(0.0); 2];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            t,
+            t,
+            D::constant(t),
+            &mut dwant,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut dgot = [D::constant(0.0); 2];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            t,
+            t,
+            D::constant(t),
+            &mut dgot,
+            &mut dvars,
+            &mut dstack,
+        );
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got_g[j], want[j]),
+                "set {c} {p:?} du[{j}] eval_rhs_g"
+            );
+            assert!(
+                hoist_bits_eq(got_c[j], want[j]),
+                "set {c} {p:?} du[{j}] f64 closure"
+            );
+            assert!(
+                hoist_bits_eq(dgot[j].value, dwant[j].value),
+                "set {c} {p:?} du[{j}] Dual1 value"
+            );
+            for a in 0..2 {
+                assert!(
+                    hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
+                    "set {c} {p:?} du[{j}] Dual1 grad[{a}]"
+                );
+            }
+        }
+    }
+}
+
+/// `CL · 2` keeps the sign of a zero `CL` (`−(CL/V)` would not: `0 − (−0) = +0`), so
+/// a key that compared with `==` instead of bits would take `−0.0` for `+0.0` and
+/// replay the lifted `+0` — visible in the derivative's sign bit.
+const HOIST_SIGNED_ZERO: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = (CL * 2.0) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn rhs_hoist_key_tells_signed_zeros_apart() {
+    let model = hoist_model(HOIST_SIGNED_ZERO);
+    let prog = hoist_program(&model);
+    assert!(prog.hoist.is_some());
+    let plain_model = hoist_model_unlifted(HOIST_SIGNED_ZERO);
+    let plain = hoist_program(&plain_model);
+    let rhs = &model.ode_spec.as_ref().unwrap().rhs;
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    let u = [50.0];
+    for cl in [0.0, -0.0, 0.0, -0.0] {
+        let params = hoist_params::<f64>(prog, &[cl, 30.0]);
+        let mut want = [0.0];
+        plain.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = [0.0];
+        prog.eval_rhs_g::<f64>(
+            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+        );
+        let mut got_c = [0.0];
+        rhs(&u, &params, 1.0, &mut got_c);
+        assert_eq!(
+            want[0].is_sign_negative(),
+            cl.is_sign_negative(),
+            "fixture keeps the sign"
+        );
+        assert_eq!(
+            got_g[0].to_bits(),
+            want[0].to_bits(),
+            "CL = {cl:?}: eval_rhs_g"
+        );
+        assert_eq!(
+            got_c[0].to_bits(),
+            want[0].to_bits(),
+            "CL = {cl:?}: f64 closure"
+        );
+    }
+}
+
+/// A `Dual1` key must compare every gradient component: at fixed parameter
+/// *values*, change one jet entry of one parameter at a time between cache hits.
+#[test]
+fn rhs_hoist_dual1_key_compares_every_gradient_component() {
+    let model = hoist_model(HOIST_TWO_CPT);
+    let prog = hoist_program(&model);
+    let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
+    let plain = hoist_program(&plain_model);
+    type D = crate::sens::dual1::Dual1<3>;
+    let base: Vec<D> = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| D::var(v, i % 3))
+        .collect();
+    let mut sets = vec![base.clone()];
+    for p in [1usize, 2, 3, 5] {
+        // V1, Q, V2, SH: the four the lifted code reads.
+        for k in 0..3 {
+            let mut s = base.clone();
+            s[p].grad[k] += 0.5;
+            sets.push(s);
+            sets.push(base.clone());
+        }
+    }
+    let ud = [D::constant(80.0), D::var(9.0, 2)];
+    let (mut vars, mut stack) = (Vec::<D>::new(), Vec::<D>::new());
+    for (c, s) in sets.iter().enumerate() {
+        let params = hoist_params::<D>(prog, s);
+        let mut want = [D::constant(0.0); 2];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            1.25,
+            1.25,
+            D::constant(1.25),
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got = [D::constant(0.0); 2];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &params,
+            1.25,
+            1.25,
+            D::constant(1.25),
+            &mut got,
+            &mut vars,
+            &mut stack,
+        );
+        // Compared entry by entry, not through `same_bits` — the function under test.
+        for j in 0..2 {
+            assert!(
+                hoist_bits_eq(got[j].value, want[j].value),
+                "set {c} du[{j}] value"
+            );
+            for k in 0..3 {
+                assert!(
+                    hoist_bits_eq(got[j].grad[k], want[j].grad[k]),
+                    "set {c} du[{j}] grad[{k}]: {} vs {}",
+                    got[j].grad[k],
+                    want[j].grad[k]
+                );
+            }
+        }
+    }
+}

@@ -453,6 +453,23 @@ impl<const NA: usize, const N: usize> DualMixed<NA, N> {
         }
     }
 
+    /// Bit-for-bit equality of the value and every jet entry (see
+    /// `crate::sens::num::vm::VmArith::same_bits`).
+    pub(crate) fn same_bits(&self, other: &Self) -> bool {
+        self.value.to_bits() == other.value.to_bits()
+            && self
+                .grad
+                .iter()
+                .zip(&other.grad)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && self
+                .hess
+                .iter()
+                .flatten()
+                .zip(other.hess.iter().flatten())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
     /// Whether every gradient **and** Hessian component is finite. Does **not** look at
     /// `value` — see [`crate::sens::num::PkNum::jets_finite`] for why the two are checked
     /// apart (#1204).

@@ -272,6 +272,11 @@ pub(crate) mod vm {
         fn mul_scalar_in(&mut self, c: f64);
         /// `self = self / from_f64(c)` (no zero guard — the caller owns it).
         fn div_scalar_in(&mut self, c: f64);
+        /// Whether `self` and `other` are the same number bit for bit — the value
+        /// and, for a dual, every jet entry. Keys the ODE RHS's lifted-subexpression
+        /// cache (`RhsHoist` in the parser): a lifted value is a pure function of the
+        /// inputs it reads, so bit-identical inputs give a bit-identical value.
+        fn same_bits(&self, other: &Self) -> bool;
     }
 
     /// [`super::PkNum`] plus the VM's in-place arithmetic: the bound for code that runs
@@ -283,7 +288,7 @@ pub(crate) mod vm {
     /// `VmArith` as the by-value operators, for types small enough that moving them
     /// costs nothing worth saving.
     macro_rules! impl_vm_by_value {
-        ($ty:ty, $lift:expr $(, $c:ident)*) => {
+        ($ty:ty, $lift:expr, $same:expr $(, $c:ident)*) => {
             impl<$(const $c: usize),*> VmArith for $ty {
                 #[inline]
                 fn add_in(&mut self, rhs: &Self) {
@@ -325,12 +330,17 @@ pub(crate) mod vm {
                 fn div_scalar_in(&mut self, c: f64) {
                     *self = *self / $lift(c);
                 }
+                #[inline]
+                fn same_bits(&self, other: &Self) -> bool {
+                    $same(self, other)
+                }
             }
         };
     }
 
-    impl_vm_by_value!(f64, |c: f64| c);
-    impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, N);
+    impl_vm_by_value!(f64, |c: f64| c, |a: &f64, b: &f64| a.to_bits()
+        == b.to_bits());
+    impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, Dual1::<N>::same_bits, N);
 
     impl<const NA: usize, const N: usize> VmArith for DualMixed<NA, N> {
         #[inline]
@@ -372,6 +382,10 @@ pub(crate) mod vm {
         #[inline]
         fn div_scalar_in(&mut self, c: f64) {
             DualMixed::div_scalar_in(self, c)
+        }
+        #[inline]
+        fn same_bits(&self, other: &Self) -> bool {
+            DualMixed::same_bits(self, other)
         }
     }
 }
