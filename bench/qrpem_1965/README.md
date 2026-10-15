@@ -220,14 +220,39 @@ without `impmap_sobol = true`, 10 seeds. Full table: `summary_phase4.md`.
 | two_cpt_oral_cov | 0.00050 | 0.00078 | 0.24 |
 | warfarin | 4.2e-5 | 2.0e-6 | 0.016 |
 
-Sobol costs no measurable time. Timed serially, alternating the two arms, at 2
-threads on a machine shared with one other fit (load 5–11, so wall times carry
-±40% noise): `three_cpt_iv` 71/54/82 s pseudo-random against 49/46/54 s Sobol
-over seeds 1–3; `sparse_combined` 202/484 s against 258/488 s over seeds 1–2,
-the 484/488 pair taken during a load spike.
+At these settings the wall time is dominated by how long `impmap_auto` runs,
+and the timings above could not separate the arms: serial and alternating, but
+on a shared machine (load 5–11), `three_cpt_iv` took 71/54/82 s pseudo-random
+against 49/46/54 s Sobol over seeds 1–3, and `sparse_combined` 202/484 s against
+258/488 s over seeds 1–2. At fixed K the cost is measurable (next section).
 
 **Decision: keep the default off.** At default settings the spread across seeds
 is already 20–500× below the Monte Carlo error of the −2LL itself, so halving it
 buys nothing a user can see, and on `two_cpt_oral_cov` Sobol widened it. Turning
 it on by default would change every seeded IMPMAP fit and re-pin every anchor
 for that. Sobol stays the recommendation for a fixed, small K.
+
+## Old vs new Sobol on an idle machine
+
+The merge-base binary (`ac14b56a`, Cranley–Patterson shift) against this
+branch (Owen), at t₄, K = 300, 200 iterations, 10 seeds. One fit at a time on 2
+threads, binaries alternated seed by seed, load 4–5 (an idle desktop plus the
+fit). Tables: `summary_ovn_old.md`, `summary_ovn_new.md`.
+
+| model | spread, shift | spread, Owen | wall s, shift | wall s, Owen |
+|---|--:|--:|--:|--:|
+| sparse_combined | 0.0050 | 0.0037 | 60.6 | 60.8 |
+| three_cpt_iv | 0.00072 | 0.00040 | 4.13 | 4.09 |
+| two_cpt_oral_cov | 0.0021 | 0.00095 | 4.76 | 4.78 |
+| warfarin | 6.7e-7 | 2.0e-6 | 1.31 | 1.31 |
+
+- The spreads reproduce the Phase 2 numbers to every printed digit: the fits
+  are deterministic given the seed.
+- Owen costs nothing over the shift (medians within 0.5%).
+- Control: the pseudo-random arm (seeds 1–3) gives byte-identical fit YAML on
+  both binaries apart from the wall-time fields, so Sobol is the only change.
+- **Sobol itself is not free at fixed K.** In both binaries the Sobol fits ran
+  8–18% longer than the pseudo-random ones over the same seeds 1–3:
+  sparse_combined 51 → 60 s, three_cpt_iv 3.8 → 4.1 s, two_cpt_oral_cov
+  4.3 → 4.8 s, warfarin 1.13 → 1.33 s. This predates this branch; it was not
+  profiled.
