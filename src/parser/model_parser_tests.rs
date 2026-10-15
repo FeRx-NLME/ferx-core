@@ -32394,7 +32394,232 @@ const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
         ],
         [false, false, false, true, false],
     ),
+    // Nothing to lift (`R = CL` is a bare slot copy), so this re-zero is the
+    // no-hoist reset of both binding sites, not `RhsHoist::reset`.
+    (
+        "no hoist, R defined only inside an if without else",
+        &[
+            "if (a > 50.0) { R = CL }",
+            "d/dt(a) = -R * a",
+            "d/dt(b) = R * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "no hoist, R defined on both arms",
+        &[
+            "if (a > 50.0) { R = CL } else { R = Q }",
+            "d/dt(a) = -R * a",
+            "d/dt(b) = R * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // A condition reading an intermediate that only an earlier optional arm
+    // defined, with every body otherwise clean: only the condition check sees it.
+    (
+        "condition reads an intermediate defined only inside an if",
+        &[
+            "if (a > 50.0) { R = 2.0 }",
+            "if (R > 1.0) { K = 2.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "condition reads an intermediate defined before the if",
+        &[
+            "R = a / 25.0",
+            "if (R > 2.0) { K = 2.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // `else if`: the middle arm alone omits K, so every arm has to be walked.
+    (
+        "else-if arm that omits K",
+        &[
+            "if (a > 90.0) { K = 2.0 * CL / V } else if (a > 50.0) { R = 1.0 } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "else-if, every arm defines K",
+        &[
+            "if (a > 90.0) { K = 2.0 * CL / V } else if (a > 50.0) { K = 3.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // MACHEPS read only from a parameter-only expression, so on the hoisted
+    // paths it is read by the lifted code alone.
+    (
+        "MACHEPS read only by lifted code",
+        &[
+            "K = CL / V + MACHEPS",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, true],
+    ),
 ];
+
+/// The lean `Dual2` RHS against central finite differences of the lean f64
+/// closure — the production value path — on every fixture. Axes: `CL`, `Q`, and a
+/// dose lag that moves `TAD` (seeded as `TAD = t − last − lag`), so a binding
+/// that wrote the `TAD` slot's value but dropped its jet shows up on the fixtures
+/// that read `TAD`, and the asserted non-zero `∂/∂lag` keeps that axis live.
+#[test]
+fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
+    type D2 = crate::sens::dual2::Dual2<3>;
+    let (first, last) = (0.25, 0.4);
+    let points: [([f64; 2], f64); 4] = [
+        ([100.0, 3.0], 0.5),
+        ([80.0, 9.0], 1.25),
+        ([40.0, 9.0], 1.75),
+        ([30.0, 12.0], 2.5),
+    ];
+    // x = [CL, Q, lag]; V fixed.
+    let x0 = [4.0, 0.7, 0.0];
+    let v = 40.0;
+    let ext = |x: &[f64; 3]| -> Vec<f64> {
+        let mut p = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        p[0] = x[0];
+        p[1] = v;
+        p[2] = x[1];
+        p[crate::types::MAX_PK_PARAMS] = first;
+        p[crate::types::MAX_PK_PARAMS + 1] = last + x[2];
+        p
+    };
+    let (mut worst_g, mut worst_h) = (0.0f64, 0.0f64);
+    for (name, lines, _) in LEAN_FIXTURES {
+        let spec = lean_spec(lines);
+        let prog = spec.rhs_program.as_ref().unwrap();
+        let mut lag_live = false;
+        for (u, t) in &points {
+            let f = |x: &[f64; 3]| -> [f64; 2] {
+                let mut du = [0.0; 2];
+                (spec.rhs)(u, &ext(x), *t, &mut du);
+                du
+            };
+            let mut params: Vec<D2> = ext(&x0).iter().map(|&p| D2::constant(p)).collect();
+            params[0] = D2::var(x0[0], 0);
+            params[2] = D2::var(x0[1], 1);
+            let tad = D2::constant(t - last) - D2::var(x0[2], 2);
+            let ud: Vec<D2> = u.iter().map(|&s| D2::constant(s)).collect();
+            let mut du = vec![D2::constant(0.0); 2];
+            let (mut vars, mut stack) = (Vec::new(), Vec::new());
+            prog.eval_rhs_g::<D2>(
+                &ud,
+                &params,
+                *t,
+                t - first,
+                tad,
+                &mut du,
+                &mut vars,
+                &mut stack,
+            );
+
+            let f0 = f(&x0);
+            let shift = |i: usize, hi: f64, j: usize, hj: f64| {
+                let mut x = x0;
+                x[i] += hi;
+                x[j] += hj;
+                f(&x)
+            };
+            for k in 0..2 {
+                assert!(du[k].value.is_finite(), "{name}: du[{k}] not finite");
+                // Not bitwise: `Dual2` divides as `× recip`, the f64 VM divides.
+                assert!(
+                    (du[k].value - f0[k]).abs() <= 1e-14 * (1.0 + f0[k].abs()),
+                    "{name}: value du[{k}] dual {} vs f64 {}",
+                    du[k].value,
+                    f0[k]
+                );
+                let scale = |g: f64| 1.0 + g.abs();
+                for i in 0..3 {
+                    let h = 1e-6;
+                    let fd = (shift(i, h, i, 0.0)[k] - shift(i, -h, i, 0.0)[k]) / (2.0 * h);
+                    let g = du[k].grad[i];
+                    assert!(g.is_finite(), "{name}: grad[{k}][{i}] not finite");
+                    worst_g = worst_g.max((g - fd).abs() / scale(fd));
+                    assert!(
+                        // Measured worst 5.2e-9 relative; 19x headroom.
+                        (g - fd).abs() <= 1e-7 * scale(fd),
+                        "{name} t={t}: ∂du[{k}]/∂x{i} dual {g} vs fd {fd}"
+                    );
+                    if i == 2 && g != 0.0 {
+                        lag_live = true;
+                    }
+                    for j in 0..3 {
+                        let h = 1e-4;
+                        let fd2 =
+                            (shift(i, h, j, h)[k] - shift(i, h, j, -h)[k] - shift(i, -h, j, h)[k]
+                                + shift(i, -h, j, -h)[k])
+                                / (4.0 * h * h);
+                        let hh = du[k].hess[i][j];
+                        assert!(hh.is_finite(), "{name}: hess[{k}][{i}][{j}] not finite");
+                        worst_h = worst_h.max((hh - fd2).abs() / scale(fd2));
+                        assert!(
+                            // Measured worst 1.4e-6 relative (FD noise at h = 1e-4); 14x headroom.
+                            (hh - fd2).abs() <= 2e-5 * scale(fd2),
+                            "{name} t={t}: ∂²du[{k}]/∂x{i}∂x{j} dual {hh} vs fd {fd2}"
+                        );
+                    }
+                }
+            }
+        }
+        // A TAD read only by a condition has no derivative; an arithmetic one must.
+        let want_live = lines
+            .iter()
+            .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
+        assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
+    }
+    eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
+}
+
+/// Which fixtures reach which reset. The no-hoist rows exist to drive the
+/// `hoist = None` arm of both binding sites, and the MACHEPS row to put its only
+/// read inside the lifted code — a fixture whose path silently changed would
+/// leave that branch untested while the plan assertions stayed green.
+#[test]
+fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
+    let has_hoist = |name: &str| {
+        let (_, lines, _) = LEAN_FIXTURES
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .unwrap_or_else(|| panic!("no fixture {name}"));
+        let spec = lean_spec(lines);
+        spec.rhs_program.as_ref().unwrap().hoist.is_some()
+    };
+    for name in [
+        "no hoist, R defined only inside an if without else",
+        "no hoist, R defined on both arms",
+    ] {
+        assert!(!has_hoist(name), "{name}: must take the no-hoist reset");
+    }
+    let spec = lean_spec(&[
+        "K = CL / V + MACHEPS",
+        "d/dt(a) = -K * a",
+        "d/dt(b) = K * a - Q * b",
+    ]);
+    let p = spec.rhs_program.as_ref().unwrap();
+    let h = p.hoist.as_ref().expect("MACHEPS fixture is hoisted");
+    let slot = [p.macheps_slot];
+    assert!(
+        !stmts_read_slots(&h.stmts, &slot)
+            && h.lifted.iter().any(|(_, bc)| bc
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::PushVar(i) if *i as usize == p.macheps_slot))),
+        "MACHEPS must be read only by the lifted code, not the residual statements"
+    );
+    assert!(has_hoist("K defined only inside an if without else"));
+}
 
 #[test]
 fn lean_rhs_binding_plan_matches_each_fixture() {
