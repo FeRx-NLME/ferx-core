@@ -16993,6 +16993,27 @@ fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
     }
 }
 
+/// A malformed program with one operand under a binary op takes the by-value
+/// fallback, where `pop!` reads a missing operand as 0 (it `debug_assert!`s, so this
+/// only runs without debug assertions — the `ci-test` profile). Pins the operand
+/// order of that fallback: `[2, Sub]` is `0 − 2`, `[2, RSub]` is `2 − 0`; swapping
+/// its two pops would flip both signs. (The scalar `eval_bytecode` has no such
+/// fallback — its unchecked stack is only `debug_assert!`ed — so there is no scalar
+/// twin to compare against.)
+#[cfg(not(debug_assertions))]
+#[test]
+fn bytecode_g_underflow_fallback_keeps_the_operand_order() {
+    for (op, want) in [(Op::Sub, -2.0), (Op::RSub, 2.0)] {
+        let mut bc = Bytecode::new();
+        bc.push_const(2.0);
+        bc.ops.push(op);
+        bc.max_stack = 1;
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let dual = eval_bytecode_g::<Dm>(&bc, &[], &[], &[], &[], &nn, &mut Vec::new());
+        assert_eq!(dual.value, want, "{op:?}: dual VM");
+    }
+}
+
 /// The compiler puts a literal-left operand on top of the stack, which is what
 /// lets `eval_bytecode_g` fuse it. Without the swap every `c + E`, `c * E` and
 /// unary minus would still be correct but would silently fall back to building a
