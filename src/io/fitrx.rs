@@ -1296,19 +1296,19 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 
     let wire: FitWire = read_json(&mut archive, "fit.json")?;
     let ebes_csv = read_text(&mut archive, "ebes.csv")?;
-    let ebes_kappa_csv = if archive.file_names().any(|n| n == "ebes_kappa.csv") {
+    let ebes_kappa_csv = if archive.index_for_name("ebes_kappa.csv").is_some() {
         Some(read_text(&mut archive, "ebes_kappa.csv")?)
     } else {
         None
     };
-    let conddist_csv = if archive.file_names().any(|n| n == "conddist.csv") {
+    let conddist_csv = if archive.index_for_name("conddist.csv").is_some() {
         Some(read_text(&mut archive, "conddist.csv")?)
     } else {
         None
     };
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-    let data_csv = if archive.file_names().any(|n| n == "data.csv") {
+    let data_csv = if archive.index_for_name("data.csv").is_some() {
         Some(read_bytes(&mut archive, "data.csv")?)
     } else {
         None
@@ -2576,6 +2576,8 @@ mod tests {
                 dose_covariates: vec![],
                 obs_covariates: vec![],
                 pk_only_times: vec![],
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: vec![],
                 reset_times: vec![],
                 reset_covariates: Vec::new(),
@@ -4317,7 +4319,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "predictions.csv" {
@@ -4405,7 +4407,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "predictions.csv" {
@@ -4453,7 +4455,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -4534,7 +4536,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -4637,7 +4639,7 @@ mod tests {
         let mut removed = false;
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -4690,7 +4692,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {

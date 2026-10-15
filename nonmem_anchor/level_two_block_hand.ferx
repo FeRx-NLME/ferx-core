@@ -1,0 +1,40 @@
+# #1963 NONMEM anchor: level_two_block_fit.ferx with both level blocks written
+# out as θ of their sum-to-zero coding, as level_two_block.ctl does. The last
+# level of each block is minus the others' sum, in the order ferx sums a
+# dependent level, so at the same θ the two ferx spellings evaluate the same
+# floating-point operations. See nonmem_anchor/README.md.
+
+[parameters]
+  theta TVE0(1.4, -10.0, 10.0)
+  theta TVEMAX(2.8, 0.1, 20.0)
+  theta TVET50(1.6, 0.1, 20.0)
+  theta B2_1(0.25, -10.0, 10.0)
+  theta B2_2(-0.15, -10.0, 10.0)
+  theta P_1(0.35, -10.0, 10.0)
+  theta P_2(-0.25, -10.0, 10.0)
+  theta P_3(0.15, -10.0, 10.0)
+  theta P_4(0.05, -10.0, 10.0)
+  theta P_5(-0.40, -10.0, 10.0)
+
+  omega ETA_E0 ~ 0.1 (variance)
+
+  sigma ADD ~ 0.25 (variance)
+
+[covariates]
+  STUDY categorical
+  OCC   categorical
+
+[individual_parameters]
+  B = if (OCC == 1) B2_1 else if (OCC == 2) B2_2 else -(B2_1 + B2_2)
+  P = if (STUDY == 1) P_1 else if (STUDY == 2) P_2 else if (STUDY == 3) P_3 else if (STUDY == 4) P_4 else if (STUDY == 5) P_5 else -((((P_1 + P_2) + P_3) + P_4) + P_5)
+  E0 = TVE0 * (1 + 0.01 * TIME * TIME) + B + P + ETA_E0
+
+[structural_model]
+  y = E0 + TVEMAX * TIME / (TIME + TVET50)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method     = focei
+  covariance = false

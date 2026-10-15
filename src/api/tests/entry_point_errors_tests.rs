@@ -310,7 +310,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "analytic readout support (#650)",
             phrase: "EVID=3/4 reset",
-            code: None,
+            code: Some("E_READOUT_DEPOT_UNSUPPORTED"),
             model: parse_model_string(DEPOT_READOUT).expect("parse"),
             pop: {
                 let mut s = subject_with(vec![bolus()], 2);
@@ -365,7 +365,7 @@ fn survival_families() -> Vec<Family> {
         Family {
             name: "survival time-varying covariate (#741)",
             phrase: "#741",
-            code: None,
+            code: Some("E_ENDPOINT_TV_COVARIATE"),
             model: tv_model,
             pop: population_of(vec![tv_subject], &["CRCL"]),
             theta: None,
@@ -428,9 +428,9 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             f.name
         );
         // #1746: the `Err` carries the diagnostic `ferx check` reports for the same input
-        // — code, block and suggestion — or none when `ferx check` has no code for it.
-        // Both sides of that gate are in this one loop: nine families are coded, two
-        // (#650, #741) are not.
+        // — code, block and suggestion. Since #1774 every family here is coded: the two
+        // that were not (#650, #741) are now in `check_model_data_rule`, so dropping either
+        // from that list leaves `want` empty and the comparison below names the family.
         assert_eq!(got.code(), f.code, "{}: code", f.name);
         let checked = check_diagnostics(&f.model, &f.pop, &params);
         let want = checked.iter().find(|d| d.is_error());

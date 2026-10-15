@@ -4959,3 +4959,60 @@ fn an_unreadable_tentry_is_an_error_on_a_tte_row() {
     );
     read(".").unwrap_or_else(|e| panic!("missing TENTRY: {e}"));
 }
+
+/// #1969: a pk-only row the reader moves one ULP below a co-timed dose keeps the TIME it was
+/// written with, which is what `[individual_parameters]` reads there.
+#[test]
+fn a_moved_pk_only_row_keeps_its_written_time() {
+    // EVID=2 at t=4 listed before the dose there: the #1810 pass moves it to 4⁻.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,.,1,1,100,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()], "moved");
+    assert_eq!(s.pk_only_raw_times, vec![4.0], "the written TIME is kept");
+    assert_eq!(s.param_time_pk_only(0), 4.0);
+    assert!(s.reset_period_times.is_empty(), "no reset period");
+}
+
+/// #1969: every dose and reset row of a period that restarts `TIME` keeps its written time,
+/// exactly, across two restarts and an `ADDL` train; a pk-only row there does too. Decimal
+/// times, so `engine − offset` would round for some of them (asserted, so the fixture keeps
+/// testing the stored table).
+#[test]
+fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,II,ADDL\n\
+         1,0,.,1,1,100,1,.,.\n\
+         1,72.1,5,0,0,.,1,.,.\n\
+         1,0.1,.,4,1,100,1,.,.\n\
+         1,10.7,.,2,1,.,1,.,.\n\
+         1,24.3,.,1,1,100,1,12.1,1\n\
+         1,30.7,4,0,0,.,1,.,.\n\
+         1,2,.,3,1,.,1,.,.\n\
+         1,5.2,.,1,1,100,1,.,.\n\
+         1,6.9,3,0,0,.,1,.,.\n",
+    );
+    let s = read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0);
+    // Both restarts shift: every later row runs past the period before it.
+    assert_eq!(s.reset_times.len(), 2);
+    assert!(s.reset_times[0] > 72.1 && s.reset_times[1] > s.doses[3].time);
+
+    let doses: Vec<f64> = s.doses.iter().map(|d| s.param_time_at(d.time)).collect();
+    assert_eq!(doses, vec![0.0, 0.1, 24.3, 24.3 + 12.1, 5.2]);
+    let resets: Vec<f64> = s.reset_times.iter().map(|&t| s.param_time_at(t)).collect();
+    assert_eq!(resets, vec![0.1, 2.0]);
+    assert_eq!(s.pk_only_raw_times, vec![10.7]);
+    assert_eq!(s.param_time_pk_only(0), 10.7);
+    assert_eq!(s.obs_raw_times, vec![72.1, 30.7, 6.9]);
+
+    // The table is load-bearing: for at least one row the subtraction is not the written time.
+    let offset = s.reset_times[0] - 0.1;
+    assert!(
+        s.doses[1..4]
+            .iter()
+            .zip(&doses[1..4])
+            .any(|(d, &w)| d.time - offset != w),
+        "every row round-trips through the subtraction; pick times that do not"
+    );
+}
