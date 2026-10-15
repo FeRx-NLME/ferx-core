@@ -71,9 +71,9 @@ the same list on each:
 | Entry point | Preconditions it checks, in the order it runs them |
 |---|---|
 | `fit()`, `ferx check` | every item below that is about the model or the data. **Not** the simulate-only ones (TTE simulatable, Ω~IOV~ in the supplied parameters, `horizon`), and **not** the CTMM ones: `fit()` *supports* a `[markov_model]` endpoint — it is prediction and simulation that have no CTMM path yet. |
-| `predict_diag()` | coded `RATE`, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, `[covariate_model]` bound, covariate levels, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
-| `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
-| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), flip-flop without an ODE twin at the point estimate; then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
+| `predict_diag()` | coded `RATE`, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, `[covariate_model]` bound, covariate levels, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout (reset, non-default `CMT`), absorption input rate, a CTMM-only model |
+| `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout (reset, non-default `CMT`), absorption input rate, a CTMM model. |
+| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), flip-flop without an ODE twin at the point estimate; then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, depot readout (reset, non-default `CMT`), absorption input rate, a CTMM model, Ω~IOV~ present. |
 | `predict_survival()` | time-varying covariate on a hazard, θ levels bound, θ length, population bound for the θ levels, covariates present, dose compartment, covariate levels |
 | `predict_categorical()` | time-varying covariate on the linear predictor, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, covariate levels |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
@@ -135,7 +135,7 @@ message. `message()` never repeats the suggestion, so show either `to_string()`
 alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
 unbound `theta NAME[...]` block is the one whose `to_string()` also ends with its
 suggestion.) When `ferx check` has no code for the refusal, `code()` is usually
-`None`. The time-varying covariate on a hazard and the depot readout across a reset
+`None`. The time-varying covariate on a hazard and the depot readout (reset, non-default `CMT`)
 are refusals of that kind. The exceptions are refusals `ferx check` cannot reach,
 since it has no parameter vector and no fit: the θ length and parameter shape codes,
 the binding codes on a fit's bindings, and a population that is not the fit's
@@ -161,7 +161,7 @@ found:
 | endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
 | θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
 | population not the fit's (`run_sir()`, `run_covariance()`, `PopulationFingerprint::verify`) | `E_POPULATION_MISMATCH`; on `run_sir()` / `run_covariance()` also `E_FIT_SUBJECTS_MISMATCH` |
-| time-varying covariate on a hazard, depot readout across a reset, a CTMM model, TTE simulatable, Ω~IOV~ present, `horizon`, the adaptive-dosing rejections | none |
+| time-varying covariate on a hazard, depot readout (reset, non-default `CMT`), a CTMM model, TTE simulatable, Ω~IOV~ present, `horizon`, the adaptive-dosing rejections | none |
 
 `fit()` keeps returning a `String`.
 
