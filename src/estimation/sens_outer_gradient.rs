@@ -46,6 +46,10 @@ use crate::types::{CompiledModel, ModelParameters, Population, ResidualCorrelati
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
+#[path = "sens_outer_gradient_dense.rs"]
+mod dense;
+pub(crate) use dense::dense_outer_supported;
+
 /// Per-observation error-model scalars used throughout the assembly.
 pub(crate) struct ErrTerms {
     pub(crate) r: f64,       // Rⱼ
@@ -482,15 +486,13 @@ fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
 /// (`foce_subject_nll_interaction_dense`) uses, so the gradient stays consistent with
 /// the objective bit-for-bit.
 ///
-/// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) would need
-/// the full dense `M_k`/`B_{kl}` assembly, which this path does not have, so such a
-/// subject is declined. That is **not** a rare defensive case: a covariate-selected
-/// (#669) `block_sigma` model with paired rows (`fluconazole_radboudumc`) routes to the
-/// analytic outer gradient at model level, and every paired subject declines here at
-/// every evaluation. The decline is keyed on
+/// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) needs the
+/// full dense `M_k`/`B_{kl}` assembly, so such a subject is declined here — and never
+/// reaches here from the packed gradients, which route it to the dense assembly first
+/// (`sens_outer_gradient_dense`, #1960). Both are keyed on
 /// [`crate::stats::residual_error::has_cross_observation_residual`] — the same predicate
-/// the outer assembly reads to give these subjects a reconverged gradient rather than the
-/// held-EBE one (#1536) — so the two cannot disagree about which subjects they are. The
+/// the outer assembly reads to decide which declines are structural (#1536) — so the
+/// three cannot disagree about which subjects they are. The
 /// endpoint keys are resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row
 /// branch — not the raw CMT column — drives the diagonal variance builders.
 fn corr_residual_diag(
@@ -2010,11 +2012,33 @@ fn rho_block(
 /// `t_{L,rc} = ½[(v·z)·s_r + z_r·(s·v)]`, `v = L[:,c]`, `s = Ω⁻¹H⁻¹g_eta`
 /// (×`L_kk` for the diagonal log-chain).
 fn omega_packed_block(prep: &Prep, params: &ModelParameters, eta_hat: &[f64]) -> Vec<f64> {
-    let n_eta = prep.n_eta;
+    omega_packed_block_from(
+        &prep.omega_inv,
+        &prep.htilde_inv,
+        &prep.h_inner_inv,
+        &prep.g_eta,
+        params,
+        eta_hat,
+    )
+}
+
+/// [`omega_packed_block`] from its four ingredients. `Ω` enters the FOCEI objective only
+/// as `Ω⁻¹` — in the prior, in `log|Ω|`, and additively in `H̃` and in the inner Hessian —
+/// whatever the residual covariance, so the dense-`R` assembly (#1960) reads the same
+/// closed form with its own `H̃⁻¹`, `H⁻¹` and `∂log|H̃|/∂η`.
+pub(crate) fn omega_packed_block_from(
+    omega_inv: &DMatrix<f64>,
+    htilde_inv: &DMatrix<f64>,
+    h_inner_inv: &DMatrix<f64>,
+    g_eta: &[f64],
+    params: &ModelParameters,
+    eta_hat: &[f64],
+) -> Vec<f64> {
+    let n_eta = omega_inv.nrows();
     let l = &params.omega.chol;
-    let z = &prep.omega_inv * DVector::from_column_slice(eta_hat);
-    let g_mat = &prep.omega_inv * &prep.htilde_inv * &prep.omega_inv;
-    let s = &prep.omega_inv * (&prep.h_inner_inv * DVector::from_column_slice(&prep.g_eta));
+    let z = omega_inv * DVector::from_column_slice(eta_hat);
+    let g_mat = omega_inv * htilde_inv * omega_inv;
+    let s = omega_inv * (h_inner_inv * DVector::from_column_slice(g_eta));
 
     let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
 
@@ -2177,6 +2201,24 @@ pub fn subject_packed_gradient(
     // FD via `iov_analytical_supported`.
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    // A residual covariance coupling two rows takes the dense assembly (#1960); the
+    // scalar `prepare` below serves a diagonal `R` only (`corr_residual_diag`).
+    if crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &params.sigma.values,
+        model.residual_cov_at(&params),
+    ) {
+        return dense::subject_packed_gradient_dense(
+            model,
+            subject,
+            template,
+            &params,
+            &sens,
+            eta_hat,
+            x.len(),
+        );
+    }
     let prep = prepare(model, subject, &params, &sens, eta_hat)?;
 
     let n_theta = params.theta.len();
@@ -2558,6 +2600,25 @@ pub fn subject_packed_gradient_foce(
     if sens.obs.len() != n_obs || sens0.obs.len() != n_obs {
         return None;
     }
+    // A residual covariance coupling two rows takes the dense assembly (#1960); the
+    // Sheiner–Beal assembly below serves a diagonal `R⁰` only (`corr_residual_diag`).
+    if crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &params.sigma.values,
+        model.residual_cov_at(&params),
+    ) {
+        return dense::subject_packed_gradient_foce_dense(
+            model,
+            subject,
+            template,
+            &params,
+            &sens,
+            &sens0,
+            eta_hat,
+            x.len(),
+        );
+    }
 
     let sigma = &params.sigma.values;
     let omega = &params.omega.matrix;
@@ -2579,8 +2640,8 @@ pub fn subject_packed_gradient_foce(
     // Correlated residual (`block_sigma`, #627): `R⁰` (frozen at η=0) and its `∂/∂f`
     // carry the within-observation `combined` cross term. `R⁰` is diagonal in the
     // analytic FOCE scope, so `R̃ = JΩJᵀ + diag(R⁰)` is unchanged apart from the
-    // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
-    // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
+    // correlation-aware `(r0,d0)`; an off-diagonal `R⁰` was routed to the dense assembly
+    // above (#1960). (FOCE is first-order in R — no `∂²R/∂f²`.)
     let correlated = model.residual_cov_at(&params).is_dense();
     let corr = &params.residual_correlations;
     let corr_rd0 = if correlated {

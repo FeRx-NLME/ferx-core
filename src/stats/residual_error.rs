@@ -1,7 +1,7 @@
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
-const MIN_VARIANCE: f64 = 1e-12;
+pub(crate) const MIN_VARIANCE: f64 = 1e-12;
 
 /// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
 /// (#1182), or `None` when the row carries none. An exponent of exactly `1`
@@ -1216,6 +1216,21 @@ fn serial_pairs(
     obs_raw_times: &[f64],
     n: usize,
 ) -> Option<Vec<(usize, usize, f64)>> {
+    serial_pairs_coef(serial, obs_rgroup, obs_times, obs_raw_times, n, false)
+}
+
+/// [`serial_pairs`] with `deriv = true` returning `∂C_jk/∂ρ` in place of `C_jk` (#1960):
+/// `1` under `cs`, `n·ρ^(n−1)` under `ar1` (`n = |p_j − p_k| ≥ 1`) and `Δ·ρ^(Δ−1)` under
+/// `car1` (`Δ = |t_j − t_k|`). The same row pairing, so the derivative of `R` cannot
+/// pair rows `R` does not. A zero derivative is left out like a zero `C_jk`.
+fn serial_pairs_coef(
+    serial: SerialCov,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+    deriv: bool,
+) -> Option<Vec<(usize, usize, f64)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1253,13 +1268,22 @@ fn serial_pairs(
             if obs_rgroup[k] != g {
                 continue;
             }
-            let c = match serial.kind {
-                crate::types::ResidualSerialKind::Cs => serial.rho,
-                crate::types::ResidualSerialKind::Ar1 => {
+            let c = match (serial.kind, deriv) {
+                (crate::types::ResidualSerialKind::Cs, false) => serial.rho,
+                (crate::types::ResidualSerialKind::Cs, true) => 1.0,
+                (crate::types::ResidualSerialKind::Ar1, false) => {
                     serial.rho.powi(pos[j].abs_diff(pos[k]) as i32)
                 }
-                crate::types::ResidualSerialKind::Car1 => {
+                (crate::types::ResidualSerialKind::Ar1, true) => {
+                    let lag = pos[j].abs_diff(pos[k]) as i32;
+                    lag as f64 * serial.rho.powi(lag - 1)
+                }
+                (crate::types::ResidualSerialKind::Car1, false) => {
                     serial.rho.powf((time(j) - time(k)).abs())
+                }
+                (crate::types::ResidualSerialKind::Car1, true) => {
+                    let dt = (time(j) - time(k)).abs();
+                    dt * serial.rho.powf(dt - 1.0)
                 }
             };
             if c != 0.0 {
@@ -1689,7 +1713,179 @@ pub(crate) fn compute_dr_df_matrices_cov(
     cov: ResidualCov<'_>,
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
+    let n = ipreds.len();
+    let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
+    let ok = visit_dr_df_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |m, i, j, v| {
+            out[m][(i, j)] += v;
+            if i != j {
+                out[m][(j, i)] += v;
+            }
+        },
+    );
+    if !ok {
+        out.iter_mut().for_each(|m| m.fill(f64::NAN));
+    }
+    out
+}
+
+/// The `∂R/∂f_m` family of [`compute_dr_df_matrices_cov`] in **column form**: an `n×n`
+/// matrix `Dc` with `Dc[(k, m)] = ∂R_km/∂f_m` (#1960).
+///
+/// `∂R/∂f_m` is nonzero only in row and column `m` (each entry of `R` depends on the two
+/// predictions it couples), so its column `m` determines the whole matrix:
+/// `∂R/∂f_m = Dc[:,m] e_mᵀ + e_m Dc[:,m]ᵀ − Dc[(m,m)] e_m e_mᵀ`. The dense family is `n`
+/// matrices of `n×n`; this is one, filled by the same visitor, so the two cannot differ.
+/// NaN throughout where the dense builder fills NaN.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_dr_df_columns_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> DMatrix<f64> {
+    let n = ipreds.len();
+    let mut dc = DMatrix::<f64>::zeros(n, n);
+    let ok = visit_dr_df_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |m, i, j, v| {
+            let other = if i == m { j } else { i };
+            dc[(other, m)] += v;
+        },
+    );
+    if !ok {
+        dc.fill(f64::NAN);
+    }
+    dc
+}
+
+/// Every nonzero entry of the `∂R/∂f_m` family, as `sink(m, i, j, v)`: add `v` at
+/// `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂R/∂f_m`. One of `i`, `j` is always `m`.
+/// Returns `false` when the residual blocks of a `correlation` line are missing (the
+/// builders then fill NaN). The single home of the formulas both
+/// [`compute_dr_df_matrices_cov`] and [`compute_dr_df_columns_cov`] store.
+#[allow(clippy::too_many_arguments)]
+fn visit_dr_df_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+    sink: &mut impl FnMut(usize, usize, usize, f64),
+) -> bool {
     let correlations = cov.pairs;
+    let n = ipreds.len();
+    let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
+
+    let pairs = match_partners(
+        &vload,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
+    for m in 0..n {
+        // A floored diagonal is locally constant in `f` (#958, `ErrorSpec::dvar_df`).
+        if vload[m].is_empty() || floored[m] {
+            continue;
+        }
+        sink(
+            m,
+            m,
+            m,
+            diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations),
+        );
+    }
+    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
+    // slope loadings of the differentiated row, value loadings of its partner.
+    // Each row picks up one cross term per partner (all-to-all within an L2
+    // group), so `dr[j]` and `dr[k]` carry independent slopes.
+    for &(j, k, _) in &pairs {
+        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
+        sink(j, j, k, djk);
+        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
+        sink(k, k, j, dkj);
+    }
+    // A `correlation` line's `R_jk = C_jk · Σ_s c_j c_k σ²` (#1081), bilinear in
+    // the two rows' loadings like the pairs above: `∂R_jk/∂f_j` takes `j`'s slope.
+    if let Some(serial) = cov.serial {
+        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
+            Some(spairs) => {
+                for (j, k, c) in spairs {
+                    let djk = c * same_slot_covariance(&sload[j], &vload[k], sigma_values);
+                    sink(j, j, k, djk);
+                    let dkj = c * same_slot_covariance(&sload[k], &vload[j], sigma_values);
+                    sink(k, k, j, dkj);
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Per-observation value loadings (coeff·mult), slope loadings (∂coeff/∂f·mult) and
+/// the full [`ScaledLoading`] rows they were read from. The slope loadings carry the
+/// SAME slot presence as the value loadings (additive slots appear with slope 0), so
+/// the bilinear cross-covariance and its within-observation skip logic behave
+/// identically. A `power(...)` slot (#1182) supplies `sign(f)|f|^p` and `p|f|^(p−1)` in
+/// place of `f` and `1` (`ErrorSpec::scaled_loadings`).
+#[allow(clippy::type_complexity)]
+fn value_slope_loadings(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    mult: Option<&[Vec<f64>]>,
+) -> (
+    Vec<Vec<(usize, f64)>>,
+    Vec<Vec<(usize, f64)>>,
+    Vec<Vec<ScaledLoading>>,
+) {
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
@@ -1698,13 +1894,6 @@ pub(crate) fn compute_dr_df_matrices_cov(
             .unwrap_or(&empty)
     };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
-
-    // Per-observation value loadings (coeff·mult) and slope loadings
-    // (∂coeff/∂f·mult). The slope loadings carry the SAME slot presence as the
-    // value loadings (additive slots appear with slope 0), so the bilinear
-    // cross-covariance and its within-observation skip logic behave identically.
-    // A `power(...)` slot (#1182) supplies `sign(f)|f|^p` and `p|f|^(p−1)` in
-    // place of `f` and `1` (`ErrorSpec::scaled_loadings`).
     let scaled: Vec<Vec<ScaledLoading>> = (0..n)
         .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
         .collect();
@@ -1716,53 +1905,43 @@ pub(crate) fn compute_dr_df_matrices_cov(
         .iter()
         .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
         .collect();
+    (vload, sload, scaled)
+}
 
-    let pairs = match_partners(
-        &vload,
-        obs_times,
-        obs_raw_times,
-        occasions,
-        obs_l2,
-        sigma_values,
-        correlations,
-    );
-    let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
-    for m in 0..n {
-        if vload[m].is_empty() {
-            continue;
-        }
-        out[m][(m, m)] = diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations);
-    }
-    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
-    // slope loadings of the differentiated row, value loadings of its partner.
-    // Each row picks up one cross term per partner (all-to-all within an L2
-    // group), so `dr[j]` and `dr[k]` carry independent slopes.
-    for &(j, k, _) in &pairs {
-        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
-        out[j][(j, k)] = djk;
-        out[j][(k, j)] = djk;
-        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
-        out[k][(k, j)] = dkj;
-        out[k][(j, k)] = dkj;
-    }
-    // A `correlation` line's `R_jk = C_jk · Σ_s c_j c_k σ²` (#1081), bilinear in
-    // the two rows' loadings like the pairs above: `∂R_jk/∂f_j` takes `j`'s slope.
-    if let Some(serial) = cov.serial {
-        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
-            Some(spairs) => {
-                for (j, k, c) in spairs {
-                    let djk = c * same_slot_covariance(&sload[j], &vload[k], sigma_values);
-                    out[j][(j, k)] += djk;
-                    out[j][(k, j)] += djk;
-                    let dkj = c * same_slot_covariance(&sload[k], &vload[j], sigma_values);
-                    out[k][(k, j)] += dkj;
-                    out[k][(j, k)] += dkj;
+/// Which rows' diagonal residual variance sits on the `MIN_VARIANCE` floor, decided by
+/// the same call the dense `R` builders put on the diagonal: `variance_at_scaled` under
+/// a magnitude, else `variance_at_with_correlations` — whose legacy `(f·σ)·(f·σ)`
+/// association (with no `block_sigma` pair) differs from `variance_at_scaled`'s by an
+/// ULP, enough to flip the floor decision at the boundary. On such a row `R_mm` is
+/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
+/// diagonal self-terms — the floor gate `ErrorSpec::dvar_df` applies on the diagonal
+/// path (#958). Off-diagonal entries are never floored and keep their terms.
+fn floored_rows(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<bool> {
+    (0..ipreds.len())
+        .map(|j| {
+            let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+            let v = match mult {
+                Some(m) => {
+                    let row = m.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                    error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
                 }
-            }
-            None => out.iter_mut().for_each(|m| m.fill(f64::NAN)),
-        }
-    }
-    out
+                None => error_spec.variance_at_with_correlations(
+                    cmt,
+                    ipreds[j],
+                    sigma_values,
+                    correlations,
+                ),
+            };
+            v <= MIN_VARIANCE
+        })
+        .collect()
 }
 
 /// `∂R_mm/∂f_m`: the `f`-derivative of the diagonal residual variance
@@ -1772,8 +1951,9 @@ pub(crate) fn compute_dr_df_matrices_cov(
 /// `V_mm = Σ_s (c_s σ_s)² + Σ_corr 2 c_i c_j ρ σ_i σ_j` (the within-observation
 /// `block_sigma` cross term), so with `c_s' = slope_s`:
 /// `∂V_mm/∂f = Σ_s 2 c_s c_s' σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i' c_j + c_i c_j')`.
-/// The `.max(1e-12)` variance floor is treated as inactive here, matching the
-/// diagonal interaction path's [`ErrorSpec::dvar_df`].
+/// The `.max(1e-12)` variance floor is not applied here: the dense visitors skip a
+/// floored row's diagonal before calling this (`floored_rows`), the gate
+/// [`ErrorSpec::dvar_df`] applies on the diagonal path.
 fn diag_self_deriv(
     vload: &[(usize, f64)],
     sload: &[(usize, f64)],
@@ -1874,31 +2054,166 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
     cov: ResidualCov<'_>,
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
+    let n = ipreds.len();
+    let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
+    let ok = visit_d2r_df2_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |a, b, i, j, v| {
+            out[a][b][(i, j)] += v;
+            if i != j {
+                out[a][b][(j, i)] += v;
+            }
+        },
+    );
+    if !ok {
+        out.iter_mut()
+            .flat_map(|row| row.iter_mut())
+            .for_each(|m| m.fill(f64::NAN));
+    }
+    out
+}
+
+/// The `∂²R/∂f_a∂f_b` tensor of [`compute_d2r_df2_matrices_cov`] in **compact form**
+/// `(X, Y)` (#1960), two `n×n` matrices instead of `n²` of them:
+///
+/// * `X[(a, b)] = ∂²R_ab/∂f_a∂f_b` for `a ≠ b` — the only entry of `∂²R/∂f_a∂f_b`
+///   (each entry of `R` depends on the two predictions it couples), at `(a,b)`/`(b,a)`;
+/// * `Y[(k, a)] = ∂²R_ka/∂f_a²` — column `a` of `∂²R/∂f_a²`, which is nonzero only in
+///   row and column `a` (the diagonal curvature, plus a `power(...)` slot's own-row
+///   curvature on a `correlation` line). `X`'s diagonal is unused (zero).
+///
+/// Filled by the visitor the dense builder uses, so the two cannot differ.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_d2r_df2_compact_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> (DMatrix<f64>, DMatrix<f64>) {
+    let n = ipreds.len();
+    let mut x = DMatrix::<f64>::zeros(n, n);
+    let mut y = DMatrix::<f64>::zeros(n, n);
+    let ok = visit_d2r_df2_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |a, b, i, j, v| {
+            if a != b {
+                x[(a, b)] += v;
+            } else {
+                let other = if i == a { j } else { i };
+                y[(other, a)] += v;
+            }
+        },
+    );
+    if !ok {
+        x.fill(f64::NAN);
+        y.fill(f64::NAN);
+    }
+    (x, y)
+}
+
+/// `(∂R/∂ρ, ∂Dc/∂ρ)` for the `ρ` of a `correlation <kind>(RHO) by COL` line at fixed
+/// predictions (#1960), `Dc` in the column form of [`compute_dr_df_columns_cov`].
+///
+/// `ρ` enters `R` only through `C_jk` in `R_jk = C_jk · Σ_s c_j c_k σ²`, so both
+/// derivatives are the serial terms of the builders with `C_jk` replaced by `∂C_jk/∂ρ`
+/// ([`serial_pairs_coef`]); the diagonal never depends on `ρ`. `None` without a
+/// `correlation` line, without residual blocks, or where `∂C_jk/∂ρ` is not finite (a
+/// `car1` gap below one time unit at `ρ = 0`), for the caller to decline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serial_rho_derivatives(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
+    let serial = cov.serial?;
+    let n = ipreds.len();
+    let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let spairs = serial_pairs_coef(serial, obs_rgroup, obs_times, obs_raw_times, n, true)?;
+    let mut dr = DMatrix::<f64>::zeros(n, n);
+    let mut ddc = DMatrix::<f64>::zeros(n, n);
+    for (j, k, dc) in spairs {
+        if !dc.is_finite() {
+            return None;
+        }
+        let v = dc * same_slot_covariance(&vload[j], &vload[k], sigma_values);
+        dr[(j, k)] += v;
+        dr[(k, j)] += v;
+        // Column `j` of `∂R/∂f_j` at row `k` is `C_jk · cov(slope_j, value_k)`.
+        ddc[(k, j)] += dc * same_slot_covariance(&sload[j], &vload[k], sigma_values);
+        ddc[(j, k)] += dc * same_slot_covariance(&sload[k], &vload[j], sigma_values);
+    }
+    Some((dr, ddc))
+}
+
+/// Every nonzero entry of the `∂²R/∂f_a∂f_b` tensor, as `sink(a, b, i, j, v)`: add `v`
+/// at `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂²R/∂f_a∂f_b`. For `a ≠ b`, `{i, j} =
+/// {a, b}`; for `a = b`, one of `i`, `j` is `a`. Returns `false` when a `correlation`
+/// line's residual blocks are missing. The single home of the formulas both
+/// [`compute_d2r_df2_matrices_cov`] and [`compute_d2r_df2_compact_cov`] store.
+#[allow(clippy::too_many_arguments)]
+fn visit_d2r_df2_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+    sink: &mut impl FnMut(usize, usize, usize, usize, f64),
+) -> bool {
     let correlations = cov.pairs;
     let n = ipreds.len();
-    let empty: Vec<f64> = Vec::new();
-    let mrow = |j: usize| -> &[f64] {
-        mult.and_then(|m| m.get(j))
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty)
-    };
-    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
-
     // Value loadings gate the emptiness skip exactly as `compute_dr_df_matrices`
     // (an observation with no sigma loadings contributes nothing); slope
     // loadings carry the math — plus, for a `power(...)` slot (#1182), the
     // loading's own curvature `c''`, which an affine loading never has.
-    let scaled: Vec<Vec<ScaledLoading>> = (0..n)
-        .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
-        .collect();
-    let vload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c)).collect())
-        .collect();
-    let sload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
-        .collect();
+    let (vload, sload, scaled) =
+        value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
 
     let pairs = match_partners(
         &vload,
@@ -1909,22 +2224,26 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
         sigma_values,
         correlations,
     );
-    let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
     for m in 0..n {
-        if vload[m].is_empty() {
+        // A floored diagonal is locally constant in `f`, so its curvature is 0 too.
+        if vload[m].is_empty() || floored[m] {
             continue;
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
-        out[m][m][(m, m)] = diag_self_second_deriv(&scaled[m], sigma_values, correlations);
+        sink(
+            m,
+            m,
+            m,
+            m,
+            diag_self_second_deriv(&scaled[m], sigma_values, correlations),
+        );
     }
     // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
     for &(j, k, _) in &pairs {
         let d = cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations);
         if d != 0.0 {
-            out[j][k][(j, k)] = d;
-            out[j][k][(k, j)] = d;
-            out[k][j][(j, k)] = d;
-            out[k][j][(k, j)] = d;
+            sink(j, k, j, k, d);
+            sink(k, j, j, k, d);
         }
     }
     // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and —
@@ -1939,25 +2258,18 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
             Some(spairs) => {
                 for (j, k, c) in spairs {
                     let d = c * same_slot_covariance(&sload[j], &sload[k], sigma_values);
-                    out[j][k][(j, k)] += d;
-                    out[j][k][(k, j)] += d;
-                    out[k][j][(j, k)] += d;
-                    out[k][j][(k, j)] += d;
+                    sink(j, k, j, k, d);
+                    sink(k, j, j, k, d);
                     let djj = c * same_slot_covariance(&cload[j], &vload[k], sigma_values);
-                    out[j][j][(j, k)] += djj;
-                    out[j][j][(k, j)] += djj;
+                    sink(j, j, j, k, djj);
                     let dkk = c * same_slot_covariance(&cload[k], &vload[j], sigma_values);
-                    out[k][k][(j, k)] += dkk;
-                    out[k][k][(k, j)] += dkk;
+                    sink(k, k, j, k, dkk);
                 }
             }
-            None => out
-                .iter_mut()
-                .flat_map(|row| row.iter_mut())
-                .for_each(|m| m.fill(f64::NAN)),
+            None => return false,
         }
     }
-    out
+    true
 }
 
 /// `∂²R_mm/∂f_m²`: the second `f`-derivative of the diagonal residual variance.

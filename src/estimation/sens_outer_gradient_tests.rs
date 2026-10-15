@@ -1322,14 +1322,14 @@ fn cross_observation_residual_gate_follows_pairing_not_values() {
 /// (all 31 subjects paired) L-BFGS then stalled at `‖g‖ ≈ 655` and OFV 807.88, against
 /// 738.05 with the reconverged gradient.
 ///
-/// For **both** FOCEI and FOCE (the salvage choice must not key on `interaction`), the
-/// assembled mixed gradient must match FD of the **full** objective — the paired subject's
-/// marginal with its EBE re-solved at every point, not held — across every θ/Ω/σ/ρ
-/// coordinate, next to an in-scope subject that keeps the exact analytic gradient.
-///
-/// It also pins the precedence with the #1520 guard: at a blown-up trial the structural
-/// subject contributes **zero** (the guard runs before the salvage is chosen), so the
-/// population gradient is exactly the in-scope subject's term and one skip is recorded.
+/// Since #1960 FOCEI and FOCE serve that subject with the exact dense assembly, so it no
+/// longer declines: for **both** (the routing must not key on `interaction`) the paired
+/// subject is analytic, nothing declines, nothing warns, and a blown-up trial (#1520) has
+/// nothing to skip. The assembled mixed gradient must still match FD of the **full**
+/// objective — the paired subject's marginal with its EBE re-solved at every point —
+/// across every θ/Ω/σ/ρ coordinate, next to an unpaired subject on the scalar path.
+/// (Which subjects stay on finite differences — those outside `dense_outer_supported` —
+/// is pinned by `structural_decline_is_a_cross_row_residual_the_dense_assembly_cannot_serve`.)
 #[test]
 fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
     use crate::estimation::outer_optimizer::{population_gradient_sens_mixed, OuterTrial};
@@ -1365,10 +1365,9 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
             interaction,
             ..Default::default()
         };
-        // The production per-subject objective with the EBE re-solved at `p`: the
-        // reference both the analytic subject's exact gradient and the paired subject's
-        // reconverged salvage are gradients of.
-        // The EBE the stage's own marginal is linearised around (#1722).
+        // The production per-subject objective with the EBE re-solved at `p`: what both
+        // subjects' exact gradients (scalar and dense) differentiate, with the EBE the
+        // stage's own marginal is linearised around (#1722).
         let ebe_variance =
             crate::estimation::inner_optimizer::EbeVariance::for_options(&options, &model);
         let solve = |s: &Subject, p: &ModelParameters| {
@@ -1403,15 +1402,12 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
         let ehs: Vec<DVector<f64>> = solved.iter().map(|e| e.eta.clone()).collect();
         let hms: Vec<DMatrix<f64>> = solved.iter().map(|e| e.h_matrix.clone()).collect();
 
-        // Straddle, asserted: subject 0 is analytic, subject 1 declines.
+        // Subject 0 is analytic on the scalar path, subject 1 (paired) on the dense one.
         let per_sub =
             per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, interaction, None);
-        let g_in = per_sub[0]
-            .clone()
-            .unwrap_or_else(|| panic!("interaction = {interaction}: unpaired subject analytic"));
         assert!(
-            per_sub[1].is_none(),
-            "interaction = {interaction}: paired subject must decline"
+            per_sub.iter().all(|g| g.is_some()),
+            "interaction = {interaction}: both subjects analytic"
         );
 
         let declines =
@@ -1429,25 +1425,23 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
             &declines,
         );
         let w =
-            crate::estimation::outer_optimizer::outer_fd_fallback_warning(&model, &pop, &declines)
-                .expect("a declined subject warns");
-        assert!(
-            w.starts_with("1 of 2") && w.contains("correlated across observation rows"),
-            "interaction = {interaction}: the paired subject must be logged as a structural \
-             decline; got: {w}"
+            crate::estimation::outer_optimizer::outer_fd_fallback_warning(&model, &pop, &declines);
+        assert_eq!(
+            w, None,
+            "interaction = {interaction}: nothing declines, so nothing warns"
         );
 
         let ofv = |xv: &[f64]| -> f64 {
             let p = unpack_params(xv, &template);
             2.0 * pop.subjects.iter().map(|s| nll(s, &p)).sum::<f64>()
         };
-        // Measured (FOCEI): worst relative error 9.8e-4, on the ρ coordinate (the salvage's
-        // own single-step central difference against this Richardson reference); every
-        // other coordinate ≤ 6e-6. The held-EBE salvage misses by 1.4e-1 on the first θ,
-        // so the shared 2e-3 bound separates the two by ~70×. FOCE: worst 1.55e-4, also
-        // on ρ.
+        // Measured (Linux arm64), both on the dense assembly since #1960: worst relative
+        // error 6.4e-6 FOCEI (x[3]) and 2.2e-6 FOCE (x[6], ρ). 5e-5 is ~8× over the
+        // larger. The reconverged salvage the paired subject took before #1960 missed by
+        // up to 9.8e-4 (ρ, its single-step central difference) and the held-EBE salvage by
+        // 1.4e-1 (first θ, macOS arm64), so either regression reddens this bound.
         eprintln!("interaction = {interaction}");
-        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 2e-3, 1e-5);
+        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 5e-5, 1e-5);
 
         // #1520 precedence: a blown-up trial (population and subject 1 both 1e6 over an
         // incumbent of 0) skips the structural subject's salvage. The guard reads only the
@@ -1463,12 +1457,11 @@ fn mixed_gradient_with_paired_block_sigma_subject_matches_reconverged_fd() {
         let guarded = population_gradient_sens_mixed(
             &x, &template, &model, &pop, &ehs, &hms, &bounds, &options, blown, &declines,
         );
-        let expected: Vec<f64> = g_in.iter().map(|g| 2.0 * g).collect();
         assert_eq!(
-            guarded, expected,
-            "interaction = {interaction}: a skipped structural subject contributes zero"
+            guarded, mixed,
+            "interaction = {interaction}: the guard has no declined subject to skip"
         );
-        assert_eq!(declines.skipped_salvages(), 1);
+        assert_eq!(declines.skipped_salvages(), 0);
     }
 }
 
@@ -7370,5 +7363,391 @@ fn warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not() {
             "subject {} must be served analytically at its EBE",
             s.id
         );
+    }
+}
+
+// ── #1960: dense-R FOCEI outer gradient ─────────────────────────────────────────────
+
+/// Paired total/unbound endpoints on **different** predictions: `FREE = 0` rows are the
+/// total concentration, `FREE = 1` rows the unbound one, `FU·C`, with its own IIV — the
+/// `fluconazole_radboudumc` shape in miniature. Paired rows (same time and occasion,
+/// different endpoint) share a residual block, so `R` couples them through the
+/// `block_sigma` ρ. Both endpoints are live (different `f`, different `J` rows, both
+/// σ's loaded), so neither side of a paired entry is degenerate.
+const PAIRED_FU_1CPT: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta TVFU(0.4, 0.01, 1.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_FU ~ 0.05\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.025, 0.03]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n  FU = TVFU * exp(ETA_FU)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  y = if (FREE == 0) central / V else FU * central / V\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n";
+
+/// [`PAIRED_FU_1CPT`] on the ODE engine, with the endpoints keyed by `CMT` rather than
+/// by a covariate selector (per-`CMT` error models are ODE-only), so the two fixtures
+/// also cover both endpoint-key paths.
+const PAIRED_FU_ODE: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta TVFU(0.4, 0.01, 1.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_FU ~ 0.05\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.025, 0.03]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n  FU = TVFU * exp(ETA_FU)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y[CMT=1] = central / V\n  y[CMT=2] = FU * central / V\n[error_model]\n  CMT=1: DV ~ proportional(PROP_TOTAL)\n  CMT=2: DV ~ proportional(PROP_UNBOUND)\n[fit_options]\n  method = focei\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n";
+
+/// A subject of [`PAIRED_FU_1CPT`] / [`PAIRED_FU_ODE`]: two doses (so the later rows sit
+/// on residual drug), a total and an unbound row at each of `paired` times, and one
+/// unpaired total row at `lone`. DVs are the predictions at a reference η, perturbed
+/// row by row so residuals are nonzero and of both signs.
+/// `FREE` mirrors `CMT` (`2` ↔ unbound) so one subject serves both fixtures.
+fn paired_fu_subject(model: &CompiledModel, theta: &[f64], paired: &[f64], lone: f64) -> Subject {
+    let mut times = Vec::new();
+    let mut cmts = Vec::new();
+    for &t in paired {
+        times.extend([t, t]);
+        cmts.extend([1usize, 2]);
+    }
+    times.push(lone);
+    cmts.push(1);
+    let mut s = dense_subject(model, theta, &times);
+    s.doses.push(DoseEvent::new(12.0, 80.0, 1, 0.0, false, 0.0));
+    s.obs_covariates = cmts
+        .iter()
+        .map(|&c| HashMap::from([("FREE".to_string(), if c == 2 { 1.0 } else { 0.0 })]))
+        .collect();
+    s.obs_cmts = cmts;
+    let preds = crate::pk::compute_predictions_with_tv(model, &s, theta, &[0.15, -0.1, 0.2]);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * ((j as f64) * 1.7).sin()))
+        .collect();
+    s
+}
+
+/// Two [`paired_fu_subject`]s on different designs.
+fn paired_fu_pop(model: &CompiledModel, theta: &[f64]) -> Population {
+    Population {
+        covariate_names: vec!["FREE".into()],
+        ..pop_of(vec![
+            paired_fu_subject(model, theta, &[0.5, 2.0, 8.0, 14.0], 24.0),
+            paired_fu_subject(model, theta, &[1.0, 4.0, 13.0, 20.0], 6.0),
+        ])
+    }
+}
+
+/// The production FOCEI (`interaction`) or FOCE per-subject objective with the EBE
+/// re-solved at `p`, under the stage's own EBE variance convention (#1722) — the
+/// reference every dense-path parity test differentiates.
+fn reconverged_nll(
+    model: &CompiledModel,
+    s: &Subject,
+    p: &ModelParameters,
+    interaction: bool,
+) -> f64 {
+    let options = crate::types::FitOptions {
+        interaction,
+        ..Default::default()
+    };
+    let v = crate::estimation::inner_optimizer::EbeVariance::for_options(&options, model);
+    let e = crate::estimation::inner_optimizer::find_ebe_with_variance(
+        model, s, p, 300, 1e-13, None, None, 0, v,
+    );
+    crate::stats::likelihood::foce_subject_nll_cov(
+        model,
+        s,
+        &p.theta,
+        &e.eta,
+        &e.h_matrix,
+        &p.omega,
+        &p.sigma.values,
+        model.residual_cov_at(p),
+        interaction,
+    )
+}
+
+/// The analytic dense gradient `2·Σᵢ dFᵢ/dx` for `pop`, asserting every subject both has
+/// a cross-row `R` and is served (no `None`), so a test using it cannot pass on the
+/// scalar path or on a decline.
+fn dense_population_gradient(
+    model: &CompiledModel,
+    pop: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    interaction: bool,
+) -> Vec<f64> {
+    let p = unpack_params(x, template);
+    let options = crate::types::FitOptions {
+        interaction,
+        ..Default::default()
+    };
+    let v = crate::estimation::inner_optimizer::EbeVariance::for_options(&options, model);
+    let mut g = vec![0.0; x.len()];
+    for (i, s) in pop.subjects.iter().enumerate() {
+        assert!(
+            crate::stats::residual_error::has_cross_observation_residual(
+                &model.error_spec,
+                s,
+                &p.sigma.values,
+                model.residual_cov_at(&p)
+            ),
+            "subject {i}: fixture precondition — R must couple two rows"
+        );
+        let e = crate::estimation::inner_optimizer::find_ebe_with_variance(
+            model, s, &p, 300, 1e-13, None, None, 0, v,
+        );
+        let gi = if interaction {
+            subject_packed_gradient(model, s, template, x, e.eta.as_slice())
+        } else {
+            subject_packed_gradient_foce(model, s, template, x, e.eta.as_slice())
+        }
+        .unwrap_or_else(|| panic!("subject {i}: the dense assembly must serve it"));
+        for k in 0..x.len() {
+            g[k] += 2.0 * gi[k];
+        }
+    }
+    g
+}
+
+fn run_dense_parity(
+    model: &CompiledModel,
+    pop: &Population,
+    theta: &[f64],
+    interaction: bool,
+    tol: f64,
+) -> Vec<f64> {
+    let mut template = model.default_params.clone();
+    template.theta = theta.to_vec();
+    let x = pack_params(&template);
+    let analytic = dense_population_gradient(model, pop, &template, &x, interaction);
+    let ofv = |xv: &[f64]| -> f64 {
+        let p = unpack_params(xv, &template);
+        2.0 * pop
+            .subjects
+            .iter()
+            .map(|s| reconverged_nll(model, s, &p, interaction))
+            .sum::<f64>()
+    };
+    eprintln!("interaction = {interaction}");
+    assert_grad_matches_richardson_fd(&x, &analytic, ofv, tol, 1e-5);
+    analytic
+}
+
+/// #1960: the dense FOCEI and FOCE assemblies match Richardson FD of the production
+/// objective (EBE re-solved at every point) across every θ/Ω/σ/ρ coordinate, on the
+/// analytic engine, for subjects whose paired total/unbound rows couple `R`.
+#[test]
+fn dense_r_paired_block_sigma_gradient_matches_fd_analytic() {
+    let model = parse_model_string(PAIRED_FU_1CPT).expect("parse");
+    assert!(crate::sens::provider::analytic_outer_gradient_available(
+        &model
+    ));
+    let theta = [1.1, 11.0, 0.35];
+    let pop = paired_fu_pop(&model, &theta);
+    let rho = crate::estimation::parameterization::rho_packed_start(&model.default_params);
+    for interaction in [true, false] {
+        // Measured (Linux arm64): worst relative error 1.1e-5 FOCEI (x[5], Ω) and 1.4e-6
+        // FOCE (x[6]) — the reconverged reference's own inner-solve noise. The ODE twin's
+        // analytic gradient agrees with this one to ~1e-8, so the bound is set by the FD
+        // reference: 1e-4 is ~9× over the FOCEI noise.
+        let g = run_dense_parity(&model, &pop, &theta, interaction, 1e-4);
+        // The ρ coordinate is live: the correlation term moves the objective.
+        assert!(g[rho].abs() > 1e-2, "ρ gradient {} is inert", g[rho]);
+    }
+}
+
+/// [`dense_r_paired_block_sigma_gradient_matches_fd_analytic`] on the ODE engine.
+#[test]
+fn dense_r_paired_block_sigma_gradient_matches_fd_ode() {
+    let model = parse_model_string(PAIRED_FU_ODE).expect("parse");
+    assert!(
+        model.ode_spec.is_some(),
+        "fixture must run on the ODE engine"
+    );
+    assert!(crate::sens::provider::analytic_outer_gradient_available(
+        &model
+    ));
+    let theta = [1.1, 11.0, 0.35];
+    let pop = paired_fu_pop(&model, &theta);
+    for interaction in [true, false] {
+        // Measured (Linux arm64): FOCEI worst relative error 1.5e-5 (x[5], Ω_FU), 2e-4 is
+        // ~13× headroom. FOCE worst 1.1e-4, also Ω_FU — the ODE reference's noise, not the
+        // gradient's: the analytic value there is the closed-form fixture's to all printed
+        // digits, and that fixture's own FD agrees with it far tighter (macOS arm64:
+        // 6.2e-6). 5e-4 is ~5× over the FOCE noise.
+        let tol = if interaction { 2e-4 } else { 5e-4 };
+        run_dense_parity(&model, &pop, &theta, interaction, tol);
+    }
+}
+
+/// A one-compartment model with a `correlation <kind>(RHO) by ARM` line (#1081) on a
+/// combined error, so both σ slots load every row and `R_jk = C_jk(ρ)·Σ c c σ²`.
+fn serial_model_src(kind: &str) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  \
+         theta RHO(0.45, -0.4, 0.95)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.3 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  \
+         correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n"
+    )
+}
+
+/// A serial-correlation subject: two residual blocks of four rows at uneven times (so
+/// `car1`'s `ρ^Δt` sees non-integer gaps), two doses.
+fn serial_subject(model: &CompiledModel, theta: &[f64], shift: f64) -> Subject {
+    let times: Vec<f64> = [0.5, 1.5, 3.0, 6.5, 13.0, 14.5, 18.0, 23.5]
+        .iter()
+        .map(|t| t + shift)
+        .collect();
+    let mut s = dense_subject(model, theta, &times);
+    s.doses.push(DoseEvent::new(12.0, 80.0, 1, 0.0, false, 0.0));
+    s.obs_rgroup = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let preds = crate::pk::compute_predictions_with_tv(model, &s, theta, &[0.1, -0.15]);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.1 * ((j as f64) * 2.3).cos()) + 0.2)
+        .collect();
+    s
+}
+
+/// #1960: a `correlation cs|ar1|car1` block takes the dense assembly too, and its ρ — a
+/// θ, entering `R` directly through `∂C_jk/∂ρ` — matches FD with every other coordinate.
+/// `ar1` and `car1` are the kinds whose `C_jk(ρ)` is not linear, so they pin the closed
+/// form `serial_rho_derivatives` (a builder difference would have been exact for `cs`
+/// alone).
+#[test]
+fn dense_r_serial_correlation_gradient_matches_fd() {
+    for kind in ["cs", "ar1", "car1"] {
+        let model = parse_model_string(&serial_model_src(kind)).expect("parse");
+        assert!(model.residual_serial.is_some());
+        let theta = [1.1, 11.0, 0.45];
+        let pop = pop_of(vec![
+            serial_subject(&model, &theta, 0.0),
+            serial_subject(&model, &theta, 0.7),
+        ]);
+        eprintln!("kind = {kind}");
+        for interaction in [true, false] {
+            // Measured (Linux arm64): FOCEI worst relative error 2.4e-6 over the three
+            // kinds (x[3]); 2e-5 is ~8× headroom. FOCE worst 1.6e-5 (car1, ρ): the
+            // reference's, not the gradient's — on macOS arm64, where the same coordinate
+            // missed by 1.6e-5 and Ω_V by 2.1e-5, a 4-point stencil at h = 1e-3 agrees
+            // with the analytic value to 4.7e-9 and 8.8e-10, while the h = 1e-4
+            // Richardson pair straddles a jump in the frozen-variance inner solve. 1e-4 is
+            // ~6× over that noise.
+            let tol = if interaction { 2e-5 } else { 1e-4 };
+            let g = run_dense_parity(&model, &pop, &theta, interaction, tol);
+            assert!(g[2].abs() > 1e-2, "{kind}: ρ gradient {} is inert", g[2]);
+        }
+    }
+}
+
+/// #1995 review: the dense σ derivative is a central difference of the `R` builder, exact
+/// only while every stencil point floors the same rows (`MIN_VARIANCE`); a stencil that
+/// straddles the floor on some row is not a derivative, and the subject must decline.
+/// The lone total row sits at `t = 160`, where the drug is nearly gone, and its variance
+/// is proportional to `σ_TOTAL²`, so `σ_TOTAL` is nudged to put it at `k · MIN_VARIANCE`
+/// while every other row stays far above the floor: `k = 1.05` straddles (the `−0.1σ`
+/// point lands at `0.85×`, floored), while `k = 1.5` (all three points live) agrees on
+/// the mask and is served, as is the straddling `k = 1.05` with that σ `FIX`-ed (a fixed
+/// coordinate's stencil is skipped, so it cannot decline the subject). Asserted for
+/// FOCEI and FOCE, whose σ loops are separate code and which build `R` at different
+/// predictions — `f(η̂)` and the frozen `f(η = 0)`.
+#[test]
+fn dense_r_sigma_stencil_straddling_the_floor_declines() {
+    let model = parse_model_string(PAIRED_FU_1CPT).expect("parse");
+    let theta = [1.1, 11.0, 0.35];
+    let s = paired_fu_subject(&model, &theta, &[0.5, 2.0, 8.0, 14.0], 160.0);
+    let lone = s.obs_times.len() - 1;
+    let mut template = model.default_params.clone();
+    template.theta = theta.to_vec();
+    let keys = model.error_spec.obs_keys(&s);
+    let floor = crate::stats::residual_error::MIN_VARIANCE;
+    for interaction in [true, false] {
+        // One η for both cells, the EBE at the template σ: the lone row's prediction
+        // moves steeply with η (`∂ln f/∂η_CL ≈ −16` there), so re-solving per cell would
+        // move it off the variance it was placed at. The cells differ in σ by under 20%,
+        // so this η stays near each cell's own EBE and the inner Hessian stays PD.
+        let eta = {
+            let options = crate::types::FitOptions {
+                interaction,
+                ..Default::default()
+            };
+            let v = crate::estimation::inner_optimizer::EbeVariance::for_options(&options, &model);
+            crate::estimation::inner_optimizer::find_ebe_with_variance(
+                &model, &s, &template, 300, 1e-13, None, None, 0, v,
+            )
+            .eta
+            .as_slice()
+            .to_vec()
+        };
+        let r_eta = if interaction {
+            eta.clone()
+        } else {
+            vec![0.0; model.n_eta]
+        };
+        let f = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &r_eta);
+        let r_at = |p: &ModelParameters| {
+            crate::stats::residual_error::r_matrix_maybe_scaled(
+                &model.error_spec,
+                &f,
+                keys.as_ref(),
+                &s,
+                &p.sigma.values,
+                model.residual_cov_at(p),
+                None,
+            )
+        };
+        // The raw (unfloored) variance at the template σ, read where it is far off the
+        // floor (it scales with σ_TOTAL²).
+        let v0 = {
+            let mut big = template.clone();
+            big.sigma.values[0] *= 1e6;
+            r_at(&big)[(lone, lone)] / 1e12
+        };
+        // The third cell is the straddling σ held `FIX`: its stencil is never taken, so
+        // it must not decline the subject (#1995 review round 3).
+        for (k, fix, served) in [(1.05, false, false), (1.5, false, true), (1.05, true, true)] {
+            let mut p = template.clone();
+            p.sigma.values[0] = template.sigma.values[0] * (k * floor / v0).sqrt();
+            p.sigma_fixed = vec![false; p.sigma.values.len()];
+            p.sigma_fixed[0] = fix;
+            let r = r_at(&p);
+            assert!(
+                (r[(lone, lone)] / floor - k).abs() < 1e-6,
+                "k = {k}: fixture puts the lone row at {}",
+                r[(lone, lone)]
+            );
+            for j in 0..lone {
+                assert!(r[(j, j)] > 1e6 * floor, "k = {k}: row {j} must stay live");
+            }
+            let x = pack_params(&p);
+            let g = if interaction {
+                subject_packed_gradient(&model, &s, &p, &x, &eta)
+            } else {
+                subject_packed_gradient_foce(&model, &s, &p, &x, &eta)
+            };
+            assert_eq!(
+                g.is_some(),
+                served,
+                "k = {k}, FIX = {fix}, interaction = {interaction}: served = {}",
+                g.is_some()
+            );
+        }
+    }
+}
+
+/// #1995 review round 3: [`PAIRED_FU_1CPT`] with a full `block_omega`, so the packed Ω
+/// coordinates include off-diagonal Cholesky entries. FOCE assembles its Ω block itself
+/// (`δΩ = δL·Lᵀ + L·δLᵀ` with the column-`col` loop), and a diagonal Ω leaves an
+/// index swap there invisible; FOCEI's borrowed closed form gets the same check.
+#[test]
+fn dense_r_paired_block_omega_gradient_matches_fd() {
+    let src = PAIRED_FU_1CPT.replace(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_FU ~ 0.05\n",
+        "  block_omega (ETA_CL, ETA_V, ETA_FU) = [0.09, 0.025, 0.04, -0.015, 0.01, 0.05]\n",
+    );
+    assert_ne!(
+        src, PAIRED_FU_1CPT,
+        "fixture: the omega lines must be replaced"
+    );
+    let model = parse_model_string(&src).expect("parse");
+    assert!(
+        !model.default_params.omega.diagonal,
+        "fixture: Ω must be a full block"
+    );
+    let theta = [1.1, 11.0, 0.35];
+    let pop = paired_fu_pop(&model, &theta);
+    for interaction in [true, false] {
+        // Measured (Linux arm64): worst relative error 1.1e-6 FOCEI and 2.6e-6 FOCE,
+        // both on x[11]; 2e-5 is ~8× over the larger.
+        run_dense_parity(&model, &pop, &theta, interaction, 2e-5);
     }
 }

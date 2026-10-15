@@ -4967,25 +4967,45 @@ fn subject_fixed_ebe_gradient(
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
-/// One cause today: a `block_sigma` correlation across observation rows. The analytic
-/// assembly serves only a diagonal residual covariance (`corr_residual_diag` declines on
-/// this same predicate), and the pairing depends on the data alone, so the subject
-/// declines at every evaluation. For such a subject the held-EBE gradient is not an
+/// One cause today: a residual covariance correlated across observation rows (a paired
+/// `block_sigma`, or a `correlation` line) on a subject the dense assembly cannot serve.
+/// The scalar assembly serves only a diagonal residual covariance (`corr_residual_diag`
+/// declines on this same predicate), and the pairing depends on the data alone, so such
+/// a subject declines at every evaluation. For it the held-EBE gradient is not an
 /// occasional stand-in but the **only** gradient it ever contributes, and its missing
 /// EBE-response term then biases every step: on `fluconazole_radboudumc`, where all 31
 /// subjects have paired total/unbound rows, L-BFGS stalled at `‖g‖ ≈ 655` and OFV
 /// 807.88–810.28, against 738.05 with the reconverged gradient (NONMEM: 734.64).
+///
+/// Since #1960 FOCEI and FOCE serve those subjects with the exact dense assembly
+/// (`sens_outer_gradient_dense`) whenever [`dense_outer_supported`] holds, so for them a
+/// decline is parameter-dependent (a non-PD `R`, `R̃`, `H̃` or inner Hessian at a blown-up
+/// trial) and takes the same held-EBE salvage as any other. Two cases stay structural:
+/// a model the dense assembly excludes, and a subject the sensitivity provider itself
+/// cannot serve (`subject_sensitivities` is `None` — e.g. a rate-defined infusion under
+/// `F ≠ 1`, #419). The provider's subject gates are scope, not numerics, so its `None`
+/// recurs at every evaluation exactly as a model-level exclusion does.
+///
+/// [`dense_outer_supported`]: crate::estimation::sens_outer_gradient::dense_outer_supported
 fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
     init_params: &ModelParameters,
+    eta_hat: &[f64],
 ) -> bool {
     crate::stats::residual_error::has_cross_observation_residual(
         &model.error_spec,
         subject,
         &init_params.sigma.values,
         model.residual_cov_at(init_params),
-    )
+    ) && (!crate::estimation::sens_outer_gradient::dense_outer_supported(model)
+        || crate::sens::provider::subject_sensitivities(
+            model,
+            subject,
+            &init_params.theta,
+            eta_hat,
+        )
+        .is_none())
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed`]:
@@ -5756,9 +5776,12 @@ pub(crate) fn outer_fd_fallback_warning(
          `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
          evaluation.";
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
-         their `block_sigma` residuals are correlated across observation rows (paired \
-         endpoints in one residual block), which the analytic outer gradient does not \
-         cover; those gradients include the EBE-response term but are slower.";
+         their residuals are correlated across observation rows (a paired `block_sigma` or \
+         a `correlation` line) and the analytic outer gradient cannot serve them: the model \
+         pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
+         (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
+         subject's dosing is outside the analytic sensitivities; those gradients include \
+         the EBE-response term but are slower.";
     // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.
@@ -5858,7 +5881,8 @@ pub(crate) fn population_gradient_sens_mixed(
                 // has blown up (#1520).
                 None => {
                     declines.record(i);
-                    let structural = is_structural_decline(model, subject, init_params);
+                    let structural =
+                        is_structural_decline(model, subject, init_params, ehs[i].as_slice());
                     if structural {
                         declines.record_structural(i);
                     }

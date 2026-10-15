@@ -602,3 +602,347 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
         "raw {raw:?} vs whitened {want:?}"
     );
 }
+
+/// The two dense derivative families at this file's fixture, for one structure.
+fn dense_families(
+    kind: ResidualSerialKind,
+    rho: f64,
+) -> (Vec<DMatrix<f64>>, Vec<Vec<DMatrix<f64>>>) {
+    let m = mult();
+    let dr = compute_dr_df_matrices_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&m),
+    );
+    let d2 = compute_d2r_df2_matrices_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&m),
+    );
+    (dr, d2)
+}
+
+fn dc_at(kind: ResidualSerialKind, rho: f64) -> DMatrix<f64> {
+    compute_dr_df_columns_cov(
+        &spec(),
+        &IPREDS,
+        &[1; 6],
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &SIGMA,
+        cov(kind, rho),
+        Some(&mult()),
+    )
+}
+
+/// #1960: the column / compact forms the dense outer gradient reads hold **every**
+/// nonzero of the dense `∂R/∂f` and `∂²R/∂f²` families — bit for bit, since both are
+/// filled by one visitor — and the dense families have exactly the row-and-column
+/// pattern those forms assume (anything outside it would be silently dropped).
+#[test]
+fn compact_derivative_forms_equal_the_dense_builders() {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
+        let (dr, d2) = dense_families(kind, 0.4);
+        let dc = dc_at(kind, 0.4);
+        let m = mult();
+        let (x, y) = compute_d2r_df2_compact_cov(
+            &spec(),
+            &IPREDS,
+            &[1; 6],
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &SIGMA,
+            cov(kind, 0.4),
+            Some(&m),
+        );
+        let n = IPREDS.len();
+        let mut off_diagonal = 0usize;
+        for a in 0..n {
+            for i in 0..n {
+                for j in 0..n {
+                    // ∂R/∂f_a from its column.
+                    let want = if i == a {
+                        dc[(j, a)]
+                    } else if j == a {
+                        dc[(i, a)]
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(dr[a][(i, j)], want, "{kind:?}: dR/df_{a} at ({i},{j})");
+                    if i != j && want != 0.0 {
+                        off_diagonal += 1;
+                    }
+                    for b in 0..n {
+                        let want = if a != b {
+                            if (i, j) == (a, b) || (i, j) == (b, a) {
+                                x[(a, b)]
+                            } else {
+                                0.0
+                            }
+                        } else if i == a {
+                            y[(j, a)]
+                        } else if j == a {
+                            y[(i, a)]
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(
+                            d2[a][b][(i, j)],
+                            want,
+                            "{kind:?}: d2R/df_{a}df_{b} ({i},{j})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(off_diagonal > 0, "{kind:?}: fixture must couple rows");
+    }
+}
+
+/// #1960: `serial_rho_derivatives` is the ρ-derivative of the builders — of `R` and of
+/// the `∂R/∂f` column form — against a Richardson central difference in ρ, for each
+/// structure (`ar1` and `car1` are the non-linear `C_jk(ρ)`), and is zero on the
+/// diagonal, which ρ never reaches.
+#[test]
+fn serial_rho_derivatives_match_fd_of_the_builders() {
+    for kind in [
+        ResidualSerialKind::Cs,
+        ResidualSerialKind::Ar1,
+        ResidualSerialKind::Car1,
+    ] {
+        let rho = 0.4;
+        let (dr, ddc) = serial_rho_derivatives(
+            &spec(),
+            &IPREDS,
+            &[1; 6],
+            &times(),
+            &[],
+            &rgroup(),
+            &SIGMA,
+            cov(kind, rho),
+            Some(&mult()),
+        )
+        .expect("finite");
+        let fd = |g: &dyn Fn(f64) -> DMatrix<f64>| {
+            let h = 1e-4;
+            let d1 = (g(rho + h) - g(rho - h)) / (2.0 * h);
+            let d2 = (g(rho + h / 2.0) - g(rho - h / 2.0)) / h;
+            (4.0 * d2 - d1) / 3.0
+        };
+        let want_r = fd(&|r| scaled_r(kind, r));
+        let want_dc = fd(&|r| dc_at(kind, r));
+        let n = IPREDS.len();
+        for i in 0..n {
+            assert_eq!(dr[(i, i)], 0.0, "{kind:?}: ρ never reaches the diagonal");
+            for j in 0..n {
+                assert_relative_eq!(
+                    dr[(i, j)],
+                    want_r[(i, j)],
+                    max_relative = 1e-8,
+                    epsilon = 1e-9
+                );
+                assert_relative_eq!(
+                    ddc[(i, j)],
+                    want_dc[(i, j)],
+                    max_relative = 1e-8,
+                    epsilon = 1e-9
+                );
+            }
+        }
+        assert!(dr.iter().any(|v| v.abs() > 1e-3), "{kind:?}: live");
+        assert!(ddc.iter().any(|v| v.abs() > 1e-3), "{kind:?}: live");
+    }
+}
+
+/// #1995 review: a row whose diagonal variance sits on the `MIN_VARIANCE` floor is
+/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
+/// diagonal self-terms (the #958 gate `ErrorSpec::dvar_df` applies on the diagonal
+/// path), while a live row keeps them. Each column is checked against a central
+/// difference in `f_m` of the builder it differentiates (`R` for the first family, the
+/// `∂R/∂f` column form for the second), so a visitor that ignores the floor dies on
+/// the floored row and one that floors every row dies on the live one. The raw slope
+/// the gate removes is asserted nonzero, so the floored cell cannot pass by accident.
+#[test]
+fn dense_derivatives_drop_a_floored_diagonal() {
+    let es = ErrorSpec::Single(crate::types::ErrorModel::Proportional);
+    let sigma = [0.2];
+    let c = cov(ResidualSerialKind::Ar1, 0.4);
+    // Row 1 at f = 1e-7: (f·σ)² = 4e-16, under the floor; the others are live.
+    let mut f = IPREDS;
+    f[1] = 1e-7;
+    let cmts = [1usize; 6];
+    let r_at = |fv: &[f64]| {
+        compute_r_matrix_with_correlations_cov(
+            &es,
+            fv,
+            &cmts,
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &sigma,
+            c,
+        )
+    };
+    let dc_at = |fv: &[f64]| {
+        compute_dr_df_columns_cov(
+            &es,
+            fv,
+            &cmts,
+            &times(),
+            &[],
+            &[],
+            &[],
+            &rgroup(),
+            &sigma,
+            c,
+            None,
+        )
+    };
+    assert_eq!(
+        r_at(&f)[(1, 1)],
+        MIN_VARIANCE,
+        "fixture: row 1 must be floored"
+    );
+    assert!(
+        r_at(&f)[(0, 0)] > MIN_VARIANCE,
+        "fixture: row 0 must be live"
+    );
+    let dc = dc_at(&f);
+    let (_, y) = compute_d2r_df2_compact_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    // What an ungated diagonal would hold on the floored row: 2fσ² (and 2σ²).
+    assert!(es.dvar_df_raw(1, f[1], &sigma) > 0.0);
+    assert_eq!(dc[(1, 1)], 0.0, "floored row keeps a ∂R_11/∂f_1");
+    assert_eq!(y[(1, 1)], 0.0, "floored row keeps a ∂²R_11/∂f_1²");
+    for m in [0usize, 1] {
+        let h = 1e-3 * f[m];
+        let (mut fp, mut fm) = (f, f);
+        fp[m] += h;
+        fm[m] -= h;
+        let fd_r = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+        let fd_dc = (dc_at(&fp) - dc_at(&fm)) / (2.0 * h);
+        for k in 0..f.len() {
+            let tol = |w: f64| 1e-7 * w.abs().max(1e-12);
+            assert!(
+                (dc[(k, m)] - fd_r[(k, m)]).abs() <= tol(fd_r[(k, m)]),
+                "∂R_{k}{m}/∂f_{m}: {} vs FD {}",
+                dc[(k, m)],
+                fd_r[(k, m)]
+            );
+            assert!(
+                (y[(k, m)] - fd_dc[(k, m)]).abs() <= tol(fd_dc[(k, m)]),
+                "∂²R_{k}{m}/∂f_{m}²: {} vs FD {}",
+                y[(k, m)],
+                fd_dc[(k, m)]
+            );
+        }
+    }
+    assert!(
+        dc[(0, 0)] > 0.0 && y[(0, 0)] > 0.0,
+        "live row lost its diagonal terms"
+    );
+}
+
+/// #1995 review round 2: the visitors' floor decision must be the `R` builder's own, to
+/// the ULP. A serial (no `block_sigma` pair) bare-σ `R` puts `variance_at`'s legacy
+/// `(f·σ)·(f·σ)` on its diagonal, which differs from `variance_at_scaled`'s
+/// `((f·f)·σ)·σ` by an ULP. At this `(f, σ)` — found by a bit scan — the legacy form is
+/// on the floor and the scaled one is not, asserted below so the fixture cannot drift
+/// off the boundary. A visitor deciding with the scaled form keeps `∂R_11/∂f_1` and
+/// `∂²R_11/∂f_1²` on a row the objective holds constant.
+#[test]
+fn dense_derivatives_floor_decision_matches_the_builder_to_the_ulp() {
+    let es = ErrorSpec::Single(crate::types::ErrorModel::Proportional);
+    let sigma = [0.0922368140484057_f64];
+    let f_edge = 1.0841658076732811e-05_f64;
+    assert!(es.variance_at_with_correlations(1, f_edge, &sigma, &[]) <= MIN_VARIANCE);
+    assert!(es.variance_at_scaled(1, f_edge, &sigma, &[], &[]) > MIN_VARIANCE);
+    let c = cov(ResidualSerialKind::Ar1, 0.4);
+    let mut f = IPREDS;
+    f[1] = f_edge;
+    let cmts = [1usize; 6];
+    let r = compute_r_matrix_with_correlations_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+    );
+    assert_eq!(r[(1, 1)], MIN_VARIANCE, "the builder floors row 1");
+    let dc = compute_dr_df_columns_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    let (_, y) = compute_d2r_df2_compact_cov(
+        &es,
+        &f,
+        &cmts,
+        &times(),
+        &[],
+        &[],
+        &[],
+        &rgroup(),
+        &sigma,
+        c,
+        None,
+    );
+    assert_eq!(dc[(1, 1)], 0.0, "∂R_11/∂f_1 on a floored row");
+    assert_eq!(y[(1, 1)], 0.0, "∂²R_11/∂f_1² on a floored row");
+    assert!(
+        dc[(0, 0)] > 0.0 && y[(0, 0)] > 0.0,
+        "live row 0 keeps its terms"
+    );
+}
