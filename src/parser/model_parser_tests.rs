@@ -32262,3 +32262,324 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
         }
     }
 }
+
+// ─── #1523: lean RHS binding (P1c skip re-zero, B3 skip unread seeds) ───────
+
+/// Two states `a`, `b`; individual parameters `CL`, `V`, `Q` at PK slots 0, 1, 2.
+fn lean_spec(lines: &[&str]) -> crate::ode::OdeSpec {
+    let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    build_ode_spec(
+        &lines,
+        &["a".to_string(), "b".to_string()],
+        Some("a"),
+        &["CL".to_string(), "V".to_string(), "Q".to_string()],
+        &[0, 1, 2],
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("lean fixture {lines:?} parses: {e}"))
+}
+
+fn lean_plan(lines: &[&str]) -> RhsBindingPlan {
+    lean_spec(lines)
+        .rhs_program
+        .as_ref()
+        .expect("ODE spec carries its RHS program")
+        .binding
+}
+
+/// Each fixture with the plan it must get. `zero = false` only where every read
+/// provably sees this call's value; each `seed_*` only where that slot is read.
+/// The rows pair up so each field is shown flipping on a one-line change.
+const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
+    // (name, odes, [zero, time, tafd, tad, macheps])
+    (
+        "flat with an intermediate",
+        &[
+            "K = CL / V",
+            "d/dt(a) = -K * a + Q * b",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "nothing to lift",
+        &["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"],
+        [false, false, false, false, false],
+    ),
+    (
+        "if/else both define K",
+        &[
+            "if (a > 50.0) { K = CL / V } else { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "if without else defines K",
+        &[
+            "K = CL / V",
+            "if (a > 50.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "K defined only inside an if without else",
+        &[
+            "if (a > 50.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "d/dt(b) only inside an if without else",
+        &[
+            "d/dt(a) = -CL / V * a",
+            "if (a > 50.0) { d/dt(b) = CL / V * a - Q * b }",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "intermediate read before its first write",
+        &[
+            "K = CL / V",
+            "if (a > 50.0) { R = 2.0 } else { R = K * R }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "reads T",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * T",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, true, false, false, false],
+    ),
+    (
+        "reads TAFD",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * TAFD",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, true, false, false],
+    ),
+    (
+        "reads TAD",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * TAD",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, false, true, false],
+    ),
+    (
+        "reads MACHEPS",
+        &[
+            "d/dt(a) = -CL / V * a + MACHEPS",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, false, false, true],
+    ),
+    (
+        "reads TAD in a condition only",
+        &[
+            "K = CL / V",
+            "if (TAD > 1.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, true, false],
+    ),
+];
+
+#[test]
+fn lean_rhs_binding_plan_matches_each_fixture() {
+    for (name, lines, want) in LEAN_FIXTURES {
+        let p = lean_plan(lines);
+        let got = [p.zero, p.seed_time, p.seed_tafd, p.seed_tad, p.seed_macheps];
+        assert_eq!(&got, want, "{name}: [zero, time, tafd, tad, macheps]");
+    }
+    // The kill switch restores the full binding on every fixture.
+    let _off = RhsLeanBindingOff::enter();
+    for (name, lines, _) in LEAN_FIXTURES {
+        let p = lean_plan(lines);
+        assert!(
+            p.zero && p.seed_time && p.seed_tafd && p.seed_tad && p.seed_macheps,
+            "{name}: RhsLeanBindingOff must give the full binding"
+        );
+    }
+}
+
+/// Garbage a stale slot could hold. Finite and far from anything the fixtures
+/// compute, so a read of it shows up in every output bit.
+const LEAN_GARBAGE: f64 = 3.0e250;
+
+/// The same call sequence through the lean and the full binding, on scratch that
+/// persists across calls the way an integrator's does — and with the lean side's
+/// program slots and `du` overwritten with garbage before every call, the worst a
+/// previous call (or another model sharing the f64 thread-local) could leave.
+/// The full binding re-zeroes, so it is the oracle. States cross the `a > 50`
+/// branch and parameters move, so both arms of each `if` run and the hoist cache
+/// both hits and misses.
+#[test]
+fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
+    type D1 = crate::sens::dual1::Dual1<3>;
+    type D2 = crate::sens::dual2::Dual2<2>;
+
+    let p1 = [4.0, 40.0, 0.7];
+    let p2 = [4.0, 40.0, 1.3];
+    let p3 = [6.5, 33.0, 0.7];
+    let calls: [(&[f64; 3], [f64; 2], f64); 6] = [
+        (&p1, [100.0, 3.0], 0.5),
+        (&p1, [80.0, 9.0], 1.25),
+        (&p2, [40.0, 9.0], 1.75), // branch flips
+        (&p2, [30.0, 12.0], 2.0),
+        (&p3, [60.0, 12.0], 2.5), // branch flips back
+        (&p1, [100.0, 3.0], 0.5),
+    ];
+    // First dose at 0.25 and last at 0.4: TAFD and TAD are live and distinct.
+    let (first, last) = (0.25, 0.4);
+    let ext = |p: &[f64; 3]| -> Vec<f64> {
+        let mut v = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        v[..3].copy_from_slice(p);
+        v[crate::types::MAX_PK_PARAMS] = first;
+        v[crate::types::MAX_PK_PARAMS + 1] = last;
+        v
+    };
+
+    fn pollute<T: crate::sens::num::vm::VmNum>(vars: &mut [T], n: usize, du: &mut [T]) {
+        let n = n.min(vars.len());
+        vars[..n].fill(T::from_f64(LEAN_GARBAGE));
+        du.fill(T::from_f64(-LEAN_GARBAGE));
+    }
+
+    fn run_g<T: crate::sens::num::vm::VmNum>(
+        name: &str,
+        lean: &OdeRhsProgram,
+        full: &OdeRhsProgram,
+        seq: &[(Vec<T>, [f64; 2], f64)],
+        tafd_of: impl Fn(f64) -> f64,
+        tad_of: impl Fn(f64) -> T,
+    ) {
+        let (mut vl, mut sl, mut vf, mut sf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (k, (params, u, t)) in seq.iter().enumerate() {
+            let u: Vec<T> = u.iter().map(|&x| T::from_f64(x)).collect();
+            let mut want = vec![T::from_f64(0.0); 2];
+            full.eval_rhs_g::<T>(
+                &u,
+                params,
+                *t,
+                tafd_of(*t),
+                tad_of(*t),
+                &mut want,
+                &mut vf,
+                &mut sf,
+            );
+            let mut got = vec![T::from_f64(0.0); 2];
+            pollute(&mut vl, lean.n_vars_total, &mut got);
+            lean.eval_rhs_g::<T>(
+                &u,
+                params,
+                *t,
+                tafd_of(*t),
+                tad_of(*t),
+                &mut got,
+                &mut vl,
+                &mut sl,
+            );
+            for j in 0..2 {
+                assert!(
+                    want[j].val().is_finite(),
+                    "{name} call {k}: oracle du[{j}] not finite"
+                );
+                assert!(
+                    got[j].same_bits(&want[j]),
+                    "{name} call {k} du[{j}]: lean {} vs full {}",
+                    got[j].val(),
+                    want[j].val()
+                );
+            }
+        }
+    }
+
+    for (name, lines, _) in LEAN_FIXTURES {
+        let lean_s = lean_spec(lines);
+        let full_s = {
+            let _off = RhsLeanBindingOff::enter();
+            lean_spec(lines)
+        };
+        let lean = lean_s.rhs_program.as_ref().unwrap();
+        let full = full_s.rhs_program.as_ref().unwrap();
+        assert!(full.binding.zero, "{name}: oracle must be the full binding");
+
+        // The f64 closure, on the shared thread-local scratch. All oracle calls
+        // first: interleaving them would hand the lean program a buffer stamped
+        // with the other program's hoist id on every call, so it would never run
+        // warm and the pollution below would test nothing.
+        let wants: Vec<[f64; 2]> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut want = [0.0; 2];
+                (full_s.rhs)(u, &ext(p), *t, &mut want);
+                want
+            })
+            .collect();
+        for (k, ((p, u, t), want)) in calls.iter().zip(&wants).enumerate() {
+            let params = ext(p);
+            let mut got = [-LEAN_GARBAGE; 2];
+            FERX_SCRATCH.with(|c| {
+                let mut s = c.borrow_mut();
+                let n = lean.n_vars_total.min(s.rhs_vars.len());
+                s.rhs_vars[..n].fill(LEAN_GARBAGE);
+            });
+            (lean_s.rhs)(u, &params, *t, &mut got);
+            for j in 0..2 {
+                assert!(
+                    want[j].is_finite(),
+                    "{name} call {k}: oracle du[{j}] not finite"
+                );
+                assert!(
+                    hoist_bits_eq(got[j], want[j]),
+                    "{name} call {k} du[{j}] f64 closure: lean {} vs full {}",
+                    got[j],
+                    want[j]
+                );
+            }
+        }
+
+        let tafd_of = |t: f64| t - first;
+        // f64 through the generic VM.
+        let seq: Vec<(Vec<f64>, [f64; 2], f64)> =
+            calls.iter().map(|(p, u, t)| (ext(p), *u, *t)).collect();
+        run_g::<f64>(name, lean, full, &seq, tafd_of, |t| t - last);
+        // Dual1: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
+        let seq: Vec<(Vec<D1>, [f64; 2], f64)> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut v: Vec<D1> = ext(p).iter().map(|&x| D1::constant(x)).collect();
+                for i in 0..3 {
+                    v[i] = D1::var(p[i], i);
+                }
+                (v, *u, *t)
+            })
+            .collect();
+        run_g::<D1>(name, lean, full, &seq, tafd_of, |t| {
+            D1::constant(t - last) - D1::var(0.0, 0)
+        });
+        // Dual2: second order takes the un-hoisted arm of `eval_rhs_g`.
+        let seq: Vec<(Vec<D2>, [f64; 2], f64)> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut v: Vec<D2> = ext(p).iter().map(|&x| D2::constant(x)).collect();
+                v[0] = D2::var(p[0], 0);
+                v[2] = D2::var(p[2], 1);
+                (v, *u, *t)
+            })
+            .collect();
+        run_g::<D2>(name, lean, full, &seq, tafd_of, |t| D2::constant(t - last));
+    }
+}
