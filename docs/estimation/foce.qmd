@@ -819,6 +819,40 @@ The cold number is also what the convergence self-consistency check reads
 ([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)); a fit whose "optimum" exists only
 under a warm start is still rejected.
 
+#### When the cold solve is *better* {#cold-solve-better}
+
+The comparison runs in the other direction too
+([#1565](https://github.com/FeRx-NLME/ferx-core/issues/1565)). Every evaluation warm-starts
+from the incumbent's EBEs (see [Warm Starting](#warm-starting)), so a subject that enters a
+secondary individual mode early — at poor initial estimates — can be carried there for the
+whole trajectory. The optimizer then minimises a surrogate that lies *above* the FOCE(I)
+objective, and its estimates are that surrogate's optimum. The cold solve finds the lower
+mode, and the OFV it reports is correct *at* those estimates; the estimates themselves are
+not the optimum of it.
+
+So when the cold solve lands more than **0.05 OFV units below** the objective the optimizer
+saw at the same point, the run is not converged, whichever way NLopt stopped. The bound is
+absolute rather than relative because one subject's mode switch is worth the same number of
+units at OFV 790 as at 65,000. ferx then **restarts the optimizer once from that point** on
+the remaining `maxiter` budget, through the same machinery as a
+[mid-descent stall](#stopping-without-converging). The restart's first inner solve is cold,
+so it optimizes the objective the fit reports. It is adopted unless it ends higher; a tie
+goes to the restart, whose own verdict is then the honest one. An adopted restart leaves an
+`optimizer_health` note in `FitResult.warnings`. If the gap survives, because no budget was
+left or the restart found a gap of its own, the fit reports `converged: false` with an
+`ebe_start_dependent` warning. That warning says how far below the cold solve landed and
+how many subjects moved. Refitting from the reported estimates is the remedy, since a new
+fit's first inner solve is cold.
+
+On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
+estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective
+at that point 872.70. Four subjects held a high-V<sub>max</sub> / low-V / low-k<sub>a</sub>
+mode. The restart reaches 775.39 with different estimates (TVVMAX 1.261 → 1.194, TVKM 4.24
+→ 3.90). NONMEM 7.6 FOCEI evaluates the two points at 784.349 and 775.414 when its own η
+search gets enough starts (`MCETA=200`), a gap of 8.935 against ferx's 8.938. Without
+`MCETA`, NONMEM's cold η search puts one subject in the higher mode at the optimum. Its own
+estimation from these starting values stops with rounding errors at 814.84.
+
 ## Configuration Example
 
 ```

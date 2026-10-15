@@ -1,0 +1,39 @@
+# #1565: 1-cpt oral Michaelis-Menten ODE, 3 doses q12h — the #1564 benchmark kit's
+# `mm.ferx`, verbatim. Truth: VMAX 1.2, KM 4, V 10, KA 1.0, dose 100;
+# ω² VMAX 0.1, V 0.1, KA 0.2; proportional sd 0.1. The initial estimates are
+# deliberately PERTURBED: from them a few subjects' warm-started EBEs enter a
+# high-VMAX / low-V / low-KA mode and stay there for the whole trajectory, which
+# is the trap the fix exists for. `mm_n200.csv` is the kit's `sim_mm(200, 31)`;
+# `mm_basin10.csv` is its subjects 1-5, 30, 54, 98, 154 and 165.
+[parameters]
+  theta TVVMAX(0.8, 0.1, 50.0)
+  theta TVKM(8.0, 0.1, 100.0)
+  theta TVV(15.0, 1.0, 200.0)
+  theta TVKA(0.5, 0.05, 20.0)
+
+  omega ETA_VMAX ~ 0.2
+  omega ETA_V    ~ 0.2
+  omega ETA_KA   ~ 0.2
+
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 1000
+  covariance = false

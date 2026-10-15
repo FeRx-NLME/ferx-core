@@ -2265,6 +2265,120 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
     }
 }
 
+/// How far, in absolute OFV units, a cold re-solve may land *below* the best-seen
+/// objective before the run counts as having been optimized under trapped EBEs (#1565).
+///
+/// Absolute, not relative like [`PLATEAU_CONSISTENCY_REL_TOL`]: the question is whether
+/// some subjects sit in a lower individual mode than the one the optimizer measured, and
+/// one subject's mode switch is worth the same number of OFV units at OFV 790 as at
+/// 65,000. A relative bound would be ~0.8 units at the first and ~65 at the second —
+/// wide enough to hide the whole #1565 gap on a large dataset. On a unimodal inner
+/// problem the two solves agree to the inner loop's precision (the #1565 MM fixture's
+/// 195 untrapped subjects agreed to 1e-4 each), so 0.05 sits well above that noise and
+/// two orders of magnitude below the 88-unit gap it exists to catch.
+const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
+
+/// By how much a cold re-solve at the restored point *beat* the objective the optimizer
+/// minimised there, when it beat it by more than [`BASIN_SHIFT_ABS_TOL`] (#1565).
+///
+/// The other half of the self-consistency check [`failure_is_converged_plateau`] and
+/// [`cold_solve_verdict`] apply, which only ever ask whether the cold solve is *worse*.
+/// A cold objective materially *better* than best-seen says some subjects' warm-started
+/// EBEs sat in a secondary mode for the trajectory, so the optimizer minimised a
+/// surrogate lying above the FOCE(I) objective and θ̂ is that surrogate's optimum. The
+/// reported OFV is the cold one and is correct *at* θ̂; it is θ̂ itself that nothing
+/// vouches for. Measured on the #1565 Michaelis–Menten ODE benchmark: best-seen 872.70,
+/// cold 784.33, reported `converged = true`, and a refit from those estimates reached
+/// 775.39 with materially different θ.
+///
+/// `None` for anything that is not a usable comparison — a missing side (the mixture
+/// path has no cold solve; a run with no feasible evaluation has no best-seen) or a
+/// non-finite one, which [`ColdSolveVerdict::NonFinite`] and
+/// [`gate_converged_on_objective`] already own.
+fn cold_solve_beats_best_seen(cold_ofv: Option<f64>, best_seen_ofv: Option<f64>) -> Option<f64> {
+    let (cold, best) = (cold_ofv?, best_seen_ofv?);
+    if !cold.is_finite() || !best.is_finite() {
+        return None;
+    }
+    let gap = best - cold;
+    (gap > BASIN_SHIFT_ABS_TOL).then_some(gap)
+}
+
+/// How many subjects a cold re-solve put in a lower individual mode than the EBEs the
+/// optimizer left at the restored point (#1565): the subjects whose `−2LL` contribution
+/// drops by more than [`PLATEAU_OFV_THRESHOLD`] when the warm EBEs are swapped for the
+/// cold ones.
+///
+/// Each side is scored with its *own* `(η̂, H)` pair through the same per-subject term
+/// `pop_nll` sums, so the count adds up to the gap it explains. The caller only asks
+/// when the held state belongs to this point (see [`IncumbentSolve`]) and the objective
+/// is not AGQ's, whose per-subject term is not this one.
+#[allow(clippy::too_many_arguments)]
+fn subjects_in_a_lower_cold_mode(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    held: &IncumbentSolve,
+    cold_etas: &[DVector<f64>],
+    cold_h_mats: &[DMatrix<f64>],
+    cold_kappas: &[Vec<DVector<f64>>],
+    interaction: bool,
+) -> usize {
+    population
+        .subjects
+        .iter()
+        .enumerate()
+        .filter(|&(i, subject)| {
+            let nll =
+                |etas: &[DVector<f64>], hms: &[DMatrix<f64>], kappas: &[Vec<DVector<f64>>]| {
+                    subject_nll(
+                        model,
+                        subject,
+                        params,
+                        &etas[i],
+                        &hms[i],
+                        kappas.get(i).map_or(&[], Vec::as_slice),
+                        interaction,
+                    )
+                };
+            let warm = nll(&held.etas, &held.h_mats, &held.kappas);
+            let cold = nll(cold_etas, cold_h_mats, cold_kappas);
+            // `>` on a difference: a `NaN` side is never counted as a shift.
+            2.0 * (warm - cold) > PLATEAU_OFV_THRESHOLD
+        })
+        .count()
+}
+
+/// The user-facing message for a run whose cold re-solve beat its best-seen objective
+/// (#1565). It reaches `FitResult` only when the gap survives: an adopted restart
+/// ([`RestartCause::BasinShift`]) replaces this run's result, warnings and all.
+///
+/// Filed under `ebe_start_dependent` by its `W_` token — it is the same fact as #833's
+/// warning (the EBEs at the final estimates depend on where the inner loop starts), in
+/// the other direction, and a consumer branching on that category should see both.
+fn ebe_basin_shift_warning(
+    cold_ofv: f64,
+    best_seen_ofv: f64,
+    gap: f64,
+    n_subjects: Option<usize>,
+) -> String {
+    let who = match n_subjects {
+        Some(1) => "1 subject's EBEs".to_string(),
+        Some(n) => format!("{n} subjects' EBEs"),
+        None => "some subjects' EBEs".to_string(),
+    };
+    format!(
+        "W_EBE_START_DEPENDENT: re-solving the empirical Bayes estimates cold at the final \
+         parameters scores {gap:.4} OFV units *lower* than the objective the optimizer \
+         minimised there ({cold_ofv:.4} vs {best_seen_ofv:.4}): {who} stayed in a higher \
+         individual mode throughout the warm-started trajectory, so the parameters \
+         minimise that higher surrogate, not the objective now reported, and the fit is \
+         not reported as converged. Refit starting from these estimates — the first \
+         inner solve of a new fit is cold, so it starts in the lower modes — or raise \
+         `maxiter` if the fit's evaluation budget ran out before it could be restarted."
+    )
+}
+
 /// Classify a bare NLopt `Failure`/`ForcedStop` as convergence-at-a-plateau
 /// (issue #751). Every eval index and count here is measured over *feasible*
 /// (unguarded) evals only — guarded/penalty evals are excluded entirely, so
@@ -2298,7 +2412,9 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
 ///     none; and
 ///   - **consistency**: the cold-restart `final_ofv` is not materially *worse*
 ///     than `best_seen_ofv` (a large positive gap exposes a warm-start-only
-///     "optimum"). A cold restart that ties or improves is fine.
+///     "optimum"). A cold restart that ties or improves passes *this* check; one
+///     that improves materially is caught by [`cold_solve_beats_best_seen`] on
+///     every termination path, not only this one (#1565).
 /// Pulled out as a pure fn so the decision is unit-testable without driving a
 /// full NLopt fit.
 fn failure_is_converged_plateau(
@@ -2426,11 +2542,44 @@ pub(crate) struct AttemptOutcome {
     /// trace was still descending, at a point that is not a minimum. See
     /// [`resolve_mid_descent_restart`].
     pub(crate) mid_descent_stall: bool,
+    /// The cold re-solve at the restored point beat the objective the optimizer
+    /// minimised there ([`cold_solve_beats_best_seen`]), and the run passes the same
+    /// guards a mid-descent restart does (finite objective, budget left, a feasible
+    /// evaluation). See [`RestartCause::BasinShift`].
+    pub(crate) basin_shift: bool,
     /// The stagnation guard latched during this attempt (#1530).
     pub(crate) stagnation_latched: bool,
     /// `converged` was decided by the plateau check ([`failure_is_converged_plateau`])
     /// rather than read off NLopt's return code.
     pub(crate) plateau_checked: bool,
+}
+
+impl AttemptOutcome {
+    /// Why this attempt is worth restarting from its own best point, if it is. A run
+    /// that both stalled mid-descent and shows a basin shift is filed as the stall: it
+    /// was not finished either way, and keeping the #1277 cause keeps that path — its
+    /// strictly-lower adoption rule and its warning — exactly as it was.
+    fn restart_cause(&self) -> Option<RestartCause> {
+        if self.mid_descent_stall {
+            Some(RestartCause::MidDescent)
+        } else if self.basin_shift {
+            Some(RestartCause::BasinShift)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why [`resolve_mid_descent_restart`] restarts a run from its own best point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartCause {
+    /// NLopt returned a bare `Failure` and the plateau check rejected it: the run quit
+    /// while still descending (#1277).
+    MidDescent,
+    /// The run minimised against EBEs some subjects held in a higher individual mode
+    /// than a cold solve finds (#1565). The restart's first inner solve is cold, so it
+    /// optimizes the objective the fit reports rather than the trapped surrogate.
+    BasinShift,
 }
 
 /// Run the NLopt outer optimizer, with two guarded second attempts for the two
@@ -2493,9 +2642,9 @@ fn optimize_nlopt(
             declines,
             None,
         );
-        ((result, outcome.mid_descent_stall), outcome.left_init)
+        ((result, outcome.restart_cause()), outcome.left_init)
     };
-    let (first, mid_descent_stall) = resolve_stall_retry(
+    let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
         options.verbose,
         attempt(init_params, false),
@@ -2505,8 +2654,8 @@ fn optimize_nlopt(
     resolve_mid_descent_restart(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
-        (first, mid_descent_stall),
-        |stalled| {
+        (first, restart_cause),
+        |stalled, cause| {
             // `escape_from = init_params`, not the point this leg starts at. The
             // restart begins at the stalled estimates, so measuring the published
             // escape verdict against *its own* start would report a fit that
@@ -2538,13 +2687,18 @@ fn optimize_nlopt(
             restarted.n_iterations += stalled.n_iterations;
             // Pushed on the restart's own result, so it reaches `FitResult` only
             // if the restart is adopted — a rejected restart is dropped whole.
-            // `classify_warning` files it under `optimizer_health` on the phrase
+            // `classify_warning` files both under `optimizer_health` on the phrase
             // "resumed from the best point seen".
-            restarted.warnings.push(mid_descent_restart_warning(
-                options.optimizer,
-                stalled.ofv,
-                stalled.n_iterations,
-            ));
+            restarted.warnings.push(match cause {
+                RestartCause::MidDescent => mid_descent_restart_warning(
+                    options.optimizer,
+                    stalled.ofv,
+                    stalled.n_iterations,
+                ),
+                RestartCause::BasinShift => {
+                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
+                }
+            });
             restarted
         },
         penalized,
@@ -2612,21 +2766,36 @@ fn optimize_nlopt(
 /// optimization and change nothing. An adopted restart is named in
 /// `FitResult.warnings` ([`mid_descent_restart_warning`], `optimizer_health`).
 ///
+/// **Basin shift** ([`RestartCause::BasinShift`], #1565) is the second reason to run
+/// the same restart: the run finished, but the cold re-solve at its restored point beat
+/// the objective it had minimised there, because some subjects' warm-started EBEs sat
+/// in a higher individual mode for the whole trajectory. The restart's first inner
+/// solve is cold, so it optimizes the objective the fit reports. Every guard above
+/// applies unchanged, with one difference in the adoption rule: a tie goes to the
+/// **restart**. The stalled run's own `converged` was demoted for the gap (see
+/// [`ebe_basin_shift_warning`]), and a restart that starts at that point and cannot
+/// improve on it is the evidence that the point is a minimum of the reported objective
+/// after all — so its own verdict is the honest one to report. It still never reports a
+/// higher objective, for the same reason as the stall case.
+///
 /// Pulled out as a pure fn — `restart` is handed the stalled result and returns
 /// its successor — so every branch is unit-testable without driving two NLopt
 /// fits.
 fn resolve_mid_descent_restart<T>(
     verbose: bool,
     cancelled: bool,
-    first: (T, bool),
-    restart: impl FnOnce(&T) -> T,
+    first: (T, Option<RestartCause>),
+    restart: impl FnOnce(&T, RestartCause) -> T,
     ofv_of: impl Fn(&T) -> f64,
 ) -> T {
-    let (first, mid_descent_stall) = first;
-    if !mid_descent_stall || cancelled {
+    let (first, cause) = first;
+    let Some(cause) = cause else {
+        return first;
+    };
+    if cancelled {
         return first;
     }
-    let second = restart(&first);
+    let second = restart(&first, cause);
     // `ofv_is_valid` before the comparison, not `<` alone. A strict `<` rejects
     // `NaN` and `+inf` for free but **adopts `−inf`**, and a restart can return a
     // non-finite objective the same way any run can — `gate_converged_on_objective`
@@ -2636,15 +2805,23 @@ fn resolve_mid_descent_restart<T>(
     // finite incumbent and take its usable estimates and diagnostics with it
     // (#1277 review).
     let second_ofv = ofv_of(&second);
-    if !ofv_is_valid(second_ofv) || !(second_ofv < ofv_of(&first)) {
+    let first_ofv = ofv_of(&first);
+    let adopt = ofv_is_valid(second_ofv)
+        && match cause {
+            RestartCause::MidDescent => second_ofv < first_ofv,
+            RestartCause::BasinShift => second_ofv <= first_ofv,
+        };
+    if !adopt {
         return first;
     }
     if verbose {
+        let why = match cause {
+            RestartCause::MidDescent => "stopped mid-descent",
+            RestartCause::BasinShift => "was minimised under EBEs a cold re-solve beats",
+        };
         eprintln!(
-            "Fit stopped mid-descent (OFV = {:.6}); restarted the optimizer from that \
-             point and reached OFV = {:.6}.",
-            ofv_of(&first),
-            ofv_of(&second),
+            "Fit {why} (OFV = {first_ofv:.6}); restarted the optimizer from that point and \
+             reached OFV = {second_ofv:.6}.",
         );
     }
     second
@@ -3762,6 +3939,10 @@ fn optimize_nlopt_once(
     // statement about the cold restart specifically. `None` on the mixture path,
     // whose own solve has no cold/warm split.
     let mut cold_ofv: Option<f64> = None;
+    // #1565: how many subjects the cold solve put in a lower individual mode than the
+    // optimizer's own EBEs, when it beat the best-seen objective and the count is
+    // measurable (see `subjects_in_a_lower_cold_mode`). Feeds the warning only.
+    let mut basin_subjects: Option<usize> = None;
 
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
@@ -3857,9 +4038,35 @@ fn optimize_nlopt_once(
             let cold_missed_the_incumbent = best_seen_ofv.map_or(!cold.is_finite(), |best| {
                 cold_solve_verdict(cold, best).missed()
             });
-            let incumbent = best_solve.lock().unwrap().take().filter(|inc| {
-                cold_missed_the_incumbent && inc.etas.len() == population.subjects.len()
-            });
+            let held = best_solve
+                .lock()
+                .unwrap()
+                .take()
+                .filter(|inc| inc.etas.len() == population.subjects.len());
+            // #1565: the opposite direction. Counting is a diagnostic for the warning,
+            // and it reads the held state as *this point's*, so it needs the same
+            // `xs` match as scoring it does below; AGQ's per-subject term is not the
+            // one `subject_nll` computes.
+            if cold_solve_beats_best_seen(Some(cold), best_seen_ofv).is_some()
+                && options.agq_nodes().is_none()
+            {
+                basin_subjects = held
+                    .as_ref()
+                    .filter(|inc| inc.xs == restored_xs)
+                    .map(|inc| {
+                        subjects_in_a_lower_cold_mode(
+                            model,
+                            population,
+                            &final_params,
+                            inc,
+                            &cold_ehs,
+                            &cold_hms,
+                            &cold_kappas,
+                            options.interaction,
+                        )
+                    });
+            }
+            let incumbent = held.filter(|_| cold_missed_the_incumbent);
             let (ehs, hms, kappas, ofv) = match incumbent {
                 Some(inc) => {
                     // Scoring the held state is only sound when it belongs to the point
@@ -3969,6 +4176,29 @@ fn optimize_nlopt_once(
     // it comes back as a bare `Failure`, not `MaxEvalReached`, and the count can
     // sit a few evals past the budget here.
     let budget_left = spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize;
+
+    // #1565: a cold re-solve materially *below* the objective the optimizer minimised
+    // here means θ was optimized under EBEs some subjects held in a higher mode, on
+    // whichever path NLopt stopped by — `Success`/`FtolReached` as much as the plateau-
+    // checked `Failure`. The reported OFV (the cold one) is right at these estimates;
+    // the estimates are not the optimum of it, so the run is not converged. Demoted
+    // *after* `stalled_mid_descent` is read, which must keep meaning "bare `Failure`
+    // the plateau check rejected": folding this in would also fire the "stopped
+    // mid-descent with its budget spent" advice on a run that did nothing of the kind.
+    // `optimize_nlopt` restarts such a run once ([`RestartCause::BasinShift`]); this
+    // warning reaches the user only if that restart is not adopted or not possible.
+    let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
+    if let (Some(gap), Some(cold), Some(best)) = (basin_gap, cold_ofv, best_seen_ofv) {
+        converged = false;
+        warnings.push(ebe_basin_shift_warning(cold, best, gap, basin_subjects));
+        if options.verbose {
+            eprintln!(
+                "Basin check: cold {cold:.6} beats best-seen {best:.6} by {gap:.4} \
+                 (> {BASIN_SHIFT_ABS_TOL}; {basin_subjects:?} subjects in a lower cold mode) \
+                 → converged = false"
+            );
+        }
+    }
 
     // A cold re-solve that does not reproduce the reported objective — whether it lands
     // materially above it or returns no usable number at all — says the EBEs at these
@@ -4124,6 +4354,15 @@ fn optimize_nlopt_once(
                 budget_left,
                 feasibility.no_feasible(),
             ),
+            // The same three guards as the stall: a non-finite objective, no budget
+            // to run on, or nothing feasible to restart from all rule a restart out
+            // for the same reasons, whatever prompted it.
+            basin_shift: worth_restarting_mid_descent(
+                basin_gap.is_some(),
+                final_ofv,
+                budget_left,
+                feasibility.no_feasible(),
+            ),
             stagnation_latched: latched,
             plateau_checked: stationarity_check_pending,
         },
@@ -4195,6 +4434,21 @@ fn mid_descent_restart_warning(
         optimizer.label(),
         stalled_ofv,
         stalled_evals,
+    )
+}
+
+/// The `FitResult` warning a fit carries when it was restarted for a basin shift
+/// (#1565) and the restart was adopted. Its phrase "resumed from the best point seen"
+/// files it under `optimizer_health` with the #1277 notice: the gap itself was
+/// resolved (had it survived, the restart's own `W_EBE_START_DEPENDENT` would say so),
+/// so what remains to report is that the fit took a second leg, and why.
+fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
+    format!(
+        "Outer optimization had minimised against empirical Bayes estimates that some \
+         subjects held in a higher individual mode than a cold re-solve finds (cold OFV = \
+         {first_cold_ofv:.6} after {first_evals} evaluations, below the objective the \
+         optimizer saw there), and was resumed from the best point seen with cold EBEs on \
+         the remaining maxiter budget; the reported estimates are from the resumed run."
     )
 }
 

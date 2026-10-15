@@ -2811,7 +2811,7 @@ fn test_stall_retry_keeps_the_better_attempt() {
 ///   its warnings) standing.
 #[test]
 fn test_mid_descent_restart_only_fires_for_a_live_stall() {
-    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+    use crate::estimation::outer_optimizer::{resolve_mid_descent_restart, RestartCause};
 
     let ofv = |x: &f64| *x;
 
@@ -2821,8 +2821,8 @@ fn test_mid_descent_restart_only_fires_for_a_live_stall() {
         resolve_mid_descent_restart(
             false,
             false,
-            (-286.0042, false),
-            |_: &f64| panic!("restart must not run for a fit that did not stall mid-descent"),
+            (-286.0042, None),
+            |_: &f64, _| panic!("restart must not run for a fit that did not stall mid-descent"),
             ofv,
         ),
         -286.0042
@@ -2833,8 +2833,8 @@ fn test_mid_descent_restart_only_fires_for_a_live_stall() {
         resolve_mid_descent_restart(
             false,
             true,
-            (3209.8087, true),
-            |_: &f64| panic!("restart must not run on a cancelled fit"),
+            (3209.8087, Some(RestartCause::MidDescent)),
+            |_: &f64, _| panic!("restart must not run on a cancelled fit"),
             ofv,
         ),
         3209.8087
@@ -2843,7 +2843,7 @@ fn test_mid_descent_restart_only_fires_for_a_live_stall() {
 
 #[test]
 fn test_mid_descent_restart_keeps_the_better_attempt() {
-    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+    use crate::estimation::outer_optimizer::{resolve_mid_descent_restart, RestartCause};
 
     let ofv = |x: &f64| *x;
 
@@ -2857,11 +2857,16 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
         resolve_mid_descent_restart(
             true,
             false,
-            (3209.8087, true),
-            |stalled: &f64| {
+            (3209.8087, Some(RestartCause::MidDescent)),
+            |stalled: &f64, cause| {
                 assert_eq!(
                     *stalled, 3209.8087,
                     "restart must start from the stalled point"
+                );
+                assert_eq!(
+                    cause,
+                    RestartCause::MidDescent,
+                    "the cause reaches the restart"
                 );
                 -676.7746
             },
@@ -2872,13 +2877,25 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
 
     // A restart that lands worse keeps the first attempt.
     assert_eq!(
-        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| 3209.8087, ofv),
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (-676.7746, Some(RestartCause::MidDescent)),
+            |_: &f64, _| 3209.8087,
+            ofv
+        ),
         -676.7746
     );
 
     // Ties do not displace the first attempt.
     assert_eq!(
-        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| -676.7746, ofv),
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (-676.7746, Some(RestartCause::MidDescent)),
+            |_: &f64, _| -676.7746,
+            ofv
+        ),
         -676.7746
     );
 }
@@ -2901,12 +2918,18 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
 /// other two.
 #[test]
 fn test_mid_descent_restart_rejects_a_non_finite_successor() {
-    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+    use crate::estimation::outer_optimizer::{resolve_mid_descent_restart, RestartCause};
 
     let ofv = |x: &f64| *x;
     for bad in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
         assert_eq!(
-            resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| bad, ofv),
+            resolve_mid_descent_restart(
+                false,
+                false,
+                (3209.8087, Some(RestartCause::MidDescent)),
+                |_: &f64, _| bad,
+                ofv
+            ),
             3209.8087,
             "a restart scoring {bad:?} must not displace a finite incumbent"
         );
@@ -2916,7 +2939,13 @@ fn test_mid_descent_restart_rejects_a_non_finite_successor() {
     // improvement either. (It would not be, being larger; asserted so the screen
     // is the documented one.)
     assert_eq!(
-        resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| 1e20, ofv),
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (3209.8087, Some(RestartCause::MidDescent)),
+            |_: &f64, _| 1e20,
+            ofv
+        ),
         3209.8087
     );
 }
@@ -4271,6 +4300,203 @@ fn the_start_dependence_warning_reports_what_was_measured() {
     }
 }
 
+/// #1565: the gate that catches a fit optimized under trapped EBEs. A differential pair
+/// straddling the tolerance, at two OFV magnitudes — the bound is absolute, and the
+/// large-OFV pair is the one a relative tolerance like `PLATEAU_CONSISTENCY_REL_TOL`
+/// (65 units at OFV 65,000) would fail: it would call a 1-unit basin shift noise.
+#[test]
+fn a_cold_solve_materially_below_best_seen_is_a_basin_shift() {
+    let tol = BASIN_SHIFT_ABS_TOL;
+    for best in [-141.731784, 65_000.0] {
+        let above = best - (tol + 1e-6);
+        let below = best - (tol - 1e-6);
+        // Assert the straddle itself, so the pair cannot silently collapse onto one side.
+        assert!(best - above > tol && best - below < tol);
+        let gap = cold_solve_beats_best_seen(Some(above), Some(best))
+            .unwrap_or_else(|| panic!("a gap just above {tol} at OFV {best} must fire"));
+        assert!(
+            (gap - (best - above)).abs() < 1e-9,
+            "returns the gap itself: {gap}"
+        );
+        assert_eq!(
+            cold_solve_beats_best_seen(Some(below), Some(best)),
+            None,
+            "a gap just below {tol} at OFV {best} is solve-to-solve noise"
+        );
+    }
+    // A 1-unit shift at OFV 65,000: fires.
+    assert!(cold_solve_beats_best_seen(Some(64_999.0), Some(65_000.0)).is_some());
+    // The #1565 fixture's own numbers.
+    let gap = cold_solve_beats_best_seen(Some(784.332427), Some(872.699765)).unwrap();
+    assert!((gap - 88.367338).abs() < 1e-6);
+
+    // Never in the other direction — that is #833's `Worse`, owned by
+    // `cold_solve_verdict` — nor on a tie.
+    assert_eq!(cold_solve_beats_best_seen(Some(121.36), Some(83.26)), None);
+    assert_eq!(cold_solve_beats_best_seen(Some(83.26), Some(83.26)), None);
+
+    // Not a comparison at all: a missing side (mixture: no cold solve; no feasible
+    // evaluation: no best-seen) or a non-finite one. `-inf` is the case a bare `>` on
+    // the gap would get wrong — `best - (-inf)` is `+inf`, which exceeds any tolerance.
+    assert_eq!(cold_solve_beats_best_seen(None, Some(83.26)), None);
+    assert_eq!(cold_solve_beats_best_seen(Some(80.0), None), None);
+    for bad in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+        assert_eq!(
+            cold_solve_beats_best_seen(Some(bad), Some(83.26)),
+            None,
+            "cold {bad}"
+        );
+        assert_eq!(
+            cold_solve_beats_best_seen(Some(80.0), Some(bad)),
+            None,
+            "best {bad}"
+        );
+    }
+}
+
+/// #1565: a run that both stalled mid-descent and shows a basin shift is filed as the
+/// stall, so that path keeps its strictly-lower rule and its warning unchanged.
+#[test]
+fn a_mid_descent_stall_takes_precedence_over_a_basin_shift() {
+    let outcome = |mid_descent_stall, basin_shift| AttemptOutcome {
+        left_init: true,
+        mid_descent_stall,
+        basin_shift,
+        stagnation_latched: false,
+        plateau_checked: false,
+    };
+    assert_eq!(outcome(false, false).restart_cause(), None);
+    assert_eq!(
+        outcome(true, false).restart_cause(),
+        Some(RestartCause::MidDescent)
+    );
+    assert_eq!(
+        outcome(false, true).restart_cause(),
+        Some(RestartCause::BasinShift)
+    );
+    assert_eq!(
+        outcome(true, true).restart_cause(),
+        Some(RestartCause::MidDescent)
+    );
+}
+
+/// #1565: the basin-shift restart goes through the #1277 resolver, with one difference
+/// — a tie goes to the restart. The trapped leg's `converged` was demoted for the gap; a
+/// restart that starts at that point and cannot improve on it is evidence the point is
+/// a minimum of the reported objective, and its own verdict is the one to report. The
+/// tie rows are the pair that pins the difference: the same tie under `MidDescent`
+/// keeps the first attempt (`test_mid_descent_restart_keeps_the_better_attempt`).
+#[test]
+fn a_basin_shift_restart_is_adopted_on_a_tie_but_never_on_a_worse_objective() {
+    let ofv = |x: &f64| *x;
+    let first = -143.472619;
+
+    // The fixture's numbers: the restart from the trapped point reaches −148.6799, and
+    // it is handed both the trapped result and the cause.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            true,
+            false,
+            (first, Some(RestartCause::BasinShift)),
+            |trapped: &f64, cause| {
+                assert_eq!(*trapped, first, "restart starts from the trapped point");
+                assert_eq!(cause, RestartCause::BasinShift);
+                -148.679924
+            },
+            ofv,
+        ),
+        -148.679924
+    );
+
+    // Tie: adopted under `BasinShift`, not under `MidDescent`. Told apart by a payload
+    // the objective cannot see.
+    let tagged = |x: f64, tag: u8| (x, tag);
+    let by_ofv = |t: &(f64, u8)| t.0;
+    for (cause, winner) in [(RestartCause::BasinShift, 2), (RestartCause::MidDescent, 1)] {
+        let got = resolve_mid_descent_restart(
+            false,
+            false,
+            (tagged(first, 1), Some(cause)),
+            |_, _| tagged(first, 2),
+            by_ofv,
+        );
+        assert_eq!(got.1, winner, "a tie under {cause:?}");
+    }
+
+    // A worse or unusable restart never displaces the trapped leg's (honest, demoted)
+    // result.
+    for bad in [
+        first + 1.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1e20,
+    ] {
+        assert_eq!(
+            resolve_mid_descent_restart(
+                false,
+                false,
+                (first, Some(RestartCause::BasinShift)),
+                |_, _| bad,
+                ofv,
+            ),
+            first,
+            "a basin restart scoring {bad:?} must not be adopted"
+        );
+    }
+
+    // Cancelled: no restart, whatever the cause.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            true,
+            (first, Some(RestartCause::BasinShift)),
+            |_, _| panic!("restart must not run on a cancelled fit"),
+            ofv,
+        ),
+        first
+    );
+}
+
+/// #1565: both messages, and where they are filed. Each assertion names a sentence a
+/// reader acts on: the direction (*lower*, which is what separates it from #833's
+/// worse-cold arm under the same code), the two objectives and the gap, how many
+/// subjects, the verdict, and the remedy.
+#[test]
+fn the_basin_shift_messages_report_what_was_measured() {
+    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1));
+    assert!(w.contains("1.7408 OFV units *lower*"), "{w}");
+    assert!(w.contains("(-143.4726 vs -141.7318)"), "{w}");
+    assert!(w.contains("1 subject's EBEs stayed in a higher"), "{w}");
+    assert!(w.contains("not reported as converged"), "{w}");
+    assert!(w.contains("Refit starting from these estimates"), "{w}");
+    assert!(w.contains("raise `maxiter`"), "{w}");
+    assert!(
+        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4)).contains("4 subjects' EBEs"),
+        "plural count"
+    );
+    // The count is unavailable (AGQ, or a held state from another point): the sentence
+    // still parses, and does not invent a number.
+    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None);
+    assert!(unknown.contains("some subjects' EBEs stayed"), "{unknown}");
+    let entry = crate::types::classify_warning(&w);
+    assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+
+    let r = basin_shift_restart_warning(-143.472619, 47);
+    assert!(
+        r.contains("cold OFV = -143.472619 after 47 evaluations"),
+        "{r}"
+    );
+    assert!(r.contains("higher individual mode"), "{r}");
+    assert!(
+        r.contains("reported estimates are from the resumed run"),
+        "{r}"
+    );
+    let entry = crate::types::classify_warning(&r);
+    assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
+}
+
 #[test]
 fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold
@@ -4287,8 +4513,10 @@ fn plateau_but_inconsistent_cold_restart_is_not_converged() {
 
 #[test]
 fn plateau_with_better_cold_restart_is_converged() {
-    // A cold restart that ties or *improves* on best-seen is a valid minimum —
-    // only the materially-worse direction signals an artifact.
+    // A cold restart that ties or *improves* on best-seen passes the plateau check —
+    // only the materially-worse direction signals a warm-start artifact there. A
+    // material improvement is #1565's basin shift, which is caught separately and on
+    // every termination path (`a_cold_solve_materially_below_best_seen_is_a_basin_shift`).
     assert!(failure_is_converged_plateau(
         50,
         40,
