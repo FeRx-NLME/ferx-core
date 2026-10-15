@@ -520,9 +520,10 @@ pub(crate) fn check_param_shape(
 /// twin-less flip-flop typical value, a time-varying covariate on a hazard (#741 — it would
 /// be silently frozen), an individual parameter that reads `TIME` and reaches an
 /// ODE-accumulated hazard (#1853 — the same freeze on the `TIME` axis, and
-/// `draw_ode_tte_latent` root-finds that frozen snapshot for its event times) or a
-/// malformed built-in absorption input rate (#588) reaches the emitter and produces wrong
-/// rows or a panic deep in the prediction loop.
+/// `draw_ode_tte_latent` root-finds that frozen snapshot for its event times), a
+/// depot-reading analytic readout on a subject superposition cannot reconstruct (#650 / #375 /
+/// #1488) or a malformed built-in absorption input rate (#588) reaches the emitter and
+/// produces wrong rows or a panic deep in the prediction loop.
 fn check_simulate_preconditions(
     model: &CompiledModel,
     population: &Population,
@@ -555,6 +556,12 @@ fn check_simulate_preconditions(
     // snapshot for its event times (#1853; as fit() does).
     #[cfg(feature = "survival")]
     first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // A Form C readout of the oral depot amount on a subject whose doses superposition
+    // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
+    // compartment (#375). Without it a release build returns rows from a phantom depot and
+    // a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
+    // predict_diag() do).
+    first_error(&check_analytic_readout_support(model, population))?;
     first_error(&check_absorption_dosing(model, population))
 }
 
