@@ -7202,13 +7202,17 @@ mod tests {
     }
     /// #1935 at the production call sites, not just in `fd_ofv_hessian`: the population
     /// objectives one `compute_covariance` runs, and which of them re-solve their subjects in
-    /// parallel, read back from the `cfg(test)` log in `reconverge_population`.
+    /// parallel, read back from the `cfg(test)` log that `reconverge_population` writes.
     ///
     /// Whole-population stencil: one parallel base reconvergence at `x̂`, then `2·n_free²`
     /// serial points — the probe's pass and the off-diagonal stencil, the diagonal not
     /// evaluated a second time. Salvage route (#1514): the whole-population base (parallel),
-    /// the declined subject's own base `f0_fd` (parallel), then `2·n_free²` serial points over
-    /// that subject alone.
+    /// the declined subjects' own base `f0_fd` (parallel), then `2·n_free²` serial points over
+    /// those subjects alone.
+    ///
+    /// The log is written by `map_subjects` from the branch it takes, and
+    /// `map_subjects_runs_concurrently_exactly_when_asked` witnesses that each branch runs the
+    /// way it says, so together they pin the actual dispatch, not just the requested flag.
     ///
     /// Each production edit this exists to catch moves a count here: calling `select_fd_step`
     /// + `fd_ofv_stencil(…, None, …)` instead of `fd_ofv_hessian` adds `2·n_free` serial
@@ -7246,10 +7250,14 @@ mod tests {
         };
         let whole_pop = tagged(4, "t1935-whole-");
         let mut salvage_pop = tagged(6, "t1935-salvage-");
-        force_per_subject_decline(&mut salvage_pop.subjects[2]);
-        // The salvaged subject's subset starts with its own id, so its calls need a prefix
-        // that the whole-population calls (first id `…-0`) do not share.
-        salvage_pop.subjects[2].id = "t1935-salvage-declined".into();
+        // Two declined subjects (of six, under the salvage cut of half), so the subset base
+        // point `f0_fd` has more than one subject to re-solve in parallel. The subset starts
+        // with subject 2's id, so its calls carry a prefix the whole-population calls (first
+        // id `…-0`) do not share.
+        for (k, tag) in [(2, "a"), (4, "b")] {
+            force_per_subject_decline(&mut salvage_pop.subjects[k]);
+            salvage_pop.subjects[k].id = format!("t1935-salvage-declined-{tag}");
+        }
 
         let opts = |analytic: bool| FitOptions {
             method: EstimationMethod::FoceI,
@@ -7304,14 +7312,14 @@ mod tests {
             "salvage: the only whole-population objective is the parallel base point"
         );
         assert_eq!(
-            tally(&subset_calls, 1, true),
+            tally(&subset_calls, 2, true),
             1,
-            "salvage: one parallel f0_fd"
+            "salvage: one parallel f0_fd over both declined subjects: {subset_calls:?}"
         );
         assert_eq!(
-            tally(&subset_calls, 1, false),
+            tally(&subset_calls, 2, false),
             2 * nf * nf,
-            "salvage: 2·n_free² serial points over the declined subject (n_free = {nf})"
+            "salvage: 2·n_free² serial points over the declined subjects (n_free = {nf})"
         );
         assert_eq!(
             subset_calls.len(),

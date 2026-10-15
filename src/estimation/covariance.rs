@@ -1089,9 +1089,12 @@ pub(super) struct FdStencil {
 ///
 /// Returns `None` when the step was cancelled mid-stencil.
 ///
-/// #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV points (subjects
-/// iterated serially inside `ofv`) instead of a serial loop firing a per-subject `par_iter` at
-/// every point — removing the fork/join overhead of a rayon barrier per point.
+/// #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV points (each point's
+/// EBE re-solve iterated serially over subjects inside `ofv`) instead of a serial loop firing
+/// a per-subject `par_iter` at every point — removing the fork/join overhead of a rayon
+/// barrier per point. The scoring pass after the re-solve is not covered by that: it keeps
+/// `pop_nll_opts`'s own subject `par_iter` (always for AGQ, size-gated otherwise), which nests
+/// inside this loop — see `reconverge_population`.
 pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,
     x_hat: &[f64],
@@ -1249,9 +1252,9 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     )
 }
 
-/// Test-only record of every [`reconverge_population`] call (#1935): one population objective
-/// per call, with the population it covered and whether its subjects were re-solved in
-/// parallel. Process-global, because the calls run on rayon workers; tests run concurrently,
+/// Test-only record of every [`reconverge_population`] call (#1935), written by
+/// [`map_subjects`] from the branch it actually takes: one population objective per call, with
+/// the population it covered and whether its subjects were re-solved in parallel. Process-global, because the calls run on rayon workers; tests run concurrently,
 /// so a test tags its subjects' ids with a unique prefix and reads back only its own entries.
 #[cfg(test)]
 pub(super) mod reconverge_log {
@@ -1282,6 +1285,25 @@ pub(super) mod reconverge_log {
             .partition(|(id, _, _)| id.starts_with(prefix));
         *calls = rest;
         mine.into_iter().map(|(_, n, p)| (n, p)).collect()
+    }
+}
+
+/// `f(i)` for every subject index of `pop`, in subject order — in parallel or serially, as
+/// `parallel` says. The subject loop of [`reconverge_population`], kept separate so the
+/// dispatch and its `cfg(test)` log entry are one place: the log records the branch this
+/// function takes, and a test witnesses that the parallel branch really runs concurrently.
+fn map_subjects<T: Send, F: Fn(usize) -> T + Sync>(
+    pop: &Population,
+    parallel: bool,
+    f: F,
+) -> Vec<T> {
+    #[cfg(test)]
+    reconverge_log::record(pop, parallel);
+    let n = pop.subjects.len();
+    if parallel {
+        (0..n).into_par_iter().map(&f).collect()
+    } else {
+        (0..n).map(f).collect()
     }
 }
 
@@ -1338,11 +1360,9 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
-    #[cfg(test)]
-    reconverge_log::record(pop, parallel_subjects);
     let params = unpack_params(xv, template);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let solve = |i: usize| {
+    let ebes = map_subjects(pop, parallel_subjects, |i: usize| {
         find_ebe_for_stage(
             model,
             &pop.subjects[i],
@@ -1354,13 +1374,8 @@ pub(super) fn reconverge_population(
             0,
             options,
         )
-    };
+    });
     let n = pop.subjects.len();
-    let ebes: Vec<_> = if parallel_subjects {
-        (0..n).into_par_iter().map(solve).collect()
-    } else {
-        (0..n).map(solve).collect()
-    };
     let mut ehs = Vec::with_capacity(n);
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
@@ -4157,44 +4172,147 @@ mod tests {
             }
         }
     }
+    /// Witness that two calls of a closure were in flight at the same time (#1935).
+    ///
+    /// A latch, not a timing heuristic: the first caller to find nobody else in flight blocks
+    /// on a condition variable until a second caller arrives, so a correct parallel loop
+    /// proves overlap as soon as a second worker picks up any item, however late the scheduler
+    /// runs it. Only a serial loop — where no second caller can ever arrive while the first
+    /// waits — reaches the watchdog, which then releases every later caller so the failing
+    /// test ends in one watchdog period rather than one per item.
+    struct OverlapWitness {
+        /// `(in flight, overlap seen, gave up)`.
+        state: std::sync::Mutex<(usize, bool, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    impl OverlapWitness {
+        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+        fn new() -> Self {
+            Self {
+                state: std::sync::Mutex::new((0, false, false)),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+
+        /// Call at the start of every evaluation.
+        fn enter(&self) {
+            let mut s = self.state.lock().unwrap();
+            s.0 += 1;
+            if s.0 >= 2 {
+                s.1 = true;
+                self.cv.notify_all();
+            } else if !s.1 && !s.2 {
+                let (mut g, timeout) = self
+                    .cv
+                    .wait_timeout_while(s, Self::WATCHDOG, |st| !st.1)
+                    .unwrap();
+                if timeout.timed_out() {
+                    g.2 = true;
+                }
+                s = g;
+            }
+            s.0 -= 1;
+        }
+
+        fn overlapped(&self) -> bool {
+            self.state.lock().unwrap().1
+        }
+    }
+
     /// #1935: a probe pass evaluates its points concurrently. Nothing numerical can see this
-    /// — a serial pass returns the same values — so the witness is overlap itself: each
-    /// evaluation waits (up to 1 s) for a second one to be in flight at the same time. A
-    /// serial pass (`par_iter` → `iter`, the pre-#1935 loop) never overlaps, every call times
-    /// out, and the assertion fails.
+    /// — a serial pass returns the same values — so the witness is overlap itself. A serial
+    /// pass (`par_iter` → `iter`, the pre-#1935 loop) never has two points in flight, and the
+    /// assertion fails after one watchdog period.
     #[test]
     fn the_step_probe_evaluates_its_pass_concurrently() {
         use super::select_fd_step;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
 
         let opts = crate::types::FitOptions::default();
-        let active = AtomicUsize::new(0);
-        let overlapped = AtomicBool::new(false);
+        let witness = OverlapWitness::new();
+        let quad = |x: &[f64]| -> f64 { x.iter().map(|v| v * v).sum() };
         let ofv = |x: &[f64]| -> f64 {
-            active.fetch_add(1, Ordering::SeqCst);
-            let start = Instant::now();
-            while active.load(Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(1) {
-                std::thread::yield_now();
-            }
-            if active.load(Ordering::SeqCst) >= 2 {
-                overlapped.store(true, Ordering::SeqCst);
-            }
-            active.fetch_sub(1, Ordering::SeqCst);
-            x.iter().map(|v| v * v).sum()
+            witness.enter();
+            quad(x)
         };
         let x_hat = [0.5f64, -1.0, 2.0];
-        let f0 = ofv(&x_hat);
-        overlapped.store(false, Ordering::SeqCst);
         let step = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| select_fd_step(&x_hat, &[0, 1, 2], 1e-2, f0, &ofv, &opts));
+            .install(|| select_fd_step(&x_hat, &[0, 1, 2], 1e-2, quad(&x_hat), &ofv, &opts));
         assert_eq!(step.n_halvings, 0);
         assert!(
-            overlapped.load(Ordering::SeqCst),
+            witness.overlapped(),
             "no two probe points were ever in flight together: the pass ran serially"
+        );
+    }
+
+    /// #1935: `map_subjects` with `parallel = true` really re-solves subjects concurrently,
+    /// and with `false` really does not — both sides of the flag in one test, so a branch
+    /// stuck on either arm fails it. Combined with the production test that reads the log
+    /// `map_subjects` writes from the branch it takes, this pins that the base point and
+    /// `f0_fd` run in parallel and the stencil's points do not.
+    #[test]
+    fn map_subjects_runs_concurrently_exactly_when_asked() {
+        use super::map_subjects;
+
+        let pop = crate::types::Population {
+            subjects: (0..6)
+                .map(|k| crate::types::Subject {
+                    id: format!("t1935-map-subjects-{k}"),
+                    ..Default::default()
+                })
+                .collect(),
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+
+        let parallel = OverlapWitness::new();
+        let got = pool.install(|| {
+            map_subjects(&pop, true, |i| {
+                parallel.enter();
+                i * 10
+            })
+        });
+        assert_eq!(got, vec![0, 10, 20, 30, 40, 50], "subject order is kept");
+        assert!(
+            parallel.overlapped(),
+            "parallel = true ran the subjects serially"
+        );
+
+        // The serial arm cannot overlap by construction, so the latch would wait out its
+        // watchdog here; a flat in-flight counter is enough to see a parallel serial arm.
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let got = pool.install(|| {
+            map_subjects(&pop, false, |i| {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = in_flight.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(now, SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                in_flight.fetch_sub(1, SeqCst);
+                i * 10
+            })
+        });
+        assert_eq!(got, vec![0, 10, 20, 30, 40, 50]);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "parallel = false must re-solve one subject at a time"
+        );
+        assert_eq!(
+            super::reconverge_log::take("t1935-map-subjects-"),
+            vec![(6, true), (6, false)],
+            "the log records the branch taken"
         );
     }
 
