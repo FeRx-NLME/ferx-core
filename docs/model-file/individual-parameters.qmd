@@ -287,8 +287,20 @@ event-driven parameter-switching path used for time-varying covariates. This
 matches the NONMEM `$PK IF (TIME.GT.45) ...` event-time convention: `$PK` is
 re-evaluated at each event, and the analytical amount is advanced across each
 inter-event interval with the parameters in effect at the interval's end event.
-For reset-stacked data where the displayed sdtab `TIME` may use the raw
-per-occasion clock, this built-in follows the internal monotone PK event clock.
+
+Each record reads its `TIME` as written in the data file, as NONMEM's `$PK` does
+([#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969)). Two cases make this
+differ from the clock ferx integrates on. A trough or `EVID=2` row listed before a
+co-timed dose is ordered one ULP earlier ([Data format](../data-format.qmd)). In a
+period that an `EVID=3`/`EVID=4` reset starts by restarting `TIME`, ferx shifts the
+records past the previous period, and each record there still reads the `TIME`
+written for it. So `if (TIME >= 24)` switches at 24 within every period, and a dose's
+`F` or lag, or an `init(...)` re-seeded at the reset row, reads that row's own
+written `TIME`. Before #1969 the parameters of a restarted period read the shifted
+clock. **Results change for a model that reads `TIME` in
+`[individual_parameters]` on such data.** On a two-period fixture the old objective was
+9800 units off NONMEM's; it now agrees to 2e-8 (Linux). `TIME` inside `[odes]` still reads the
+integrator's clock, which is the shifted one in a restarted period.
 
 #### Numerical check against NONMEM
 

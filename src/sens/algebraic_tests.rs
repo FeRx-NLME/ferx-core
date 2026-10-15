@@ -63,6 +63,8 @@ fn subject(covariates: Vec<(&str, f64)>, obs_covariates: Vec<Vec<(&str, f64)>>) 
         dose_covariates: vec![],
         obs_covariates: obs_covariates.into_iter().map(to_map).collect(),
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
@@ -490,6 +492,55 @@ fn algebraic_iov_kappa_derivatives_are_per_occasion() {
     assert_eq!(a.df_deta[k_g1], 0.0, "and not on another occasion's kappa");
     assert!(b.df_deta[k_g1].abs() > 1e-6);
     assert_eq!(b.df_deta[k_g0], 0.0);
+}
+
+/// #1969: the subject of `subject()` with its third observation written at 24 but running one
+/// ULP below it, as the reader leaves a trough listed before a co-timed dose, so a `TIME >= 24`
+/// step reads a different branch on each clock.
+fn straddle_subject(iov: bool) -> Subject {
+    let mut s = if iov {
+        iov_subject(vec![])
+    } else {
+        subject(vec![], vec![])
+    };
+    s.obs_times = vec![6.0, 12.0, 24.0f64.next_down(), 30.0, 36.0, 48.0];
+    s.obs_raw_times = vec![6.0, 12.0, 24.0, 30.0, 36.0, 48.0];
+    s
+}
+
+const STEP_PARAM: &str = "  theta TVSTEP(2.0, 0.1, 10.0)\n";
+const STEP_INDIV: &str = "  STEP = if (TIME >= 24.0) TVSTEP else 1.0\n";
+const STEP_EQUATION: &str = "  y = E0 * STEP - EMAX * TIME / (ET50 + TIME)\n";
+
+/// #1969: the algebraic walks seed the individual parameters at the written time
+/// (`obs_context` / `run_obs_*_iov`), as the value path does. The straddle moves the value by more
+/// than 1e-2 (asserted), the jet's value matches the value path (in `check_outer_vs_fd` and
+/// `check_iov_vs_fd`, to 1e-12), and every block matches its FD.
+#[test]
+fn algebraic_walks_read_the_written_time_at_a_moved_observation() {
+    use crate::types::test_helpers::{assert_param_time_straddle_is_live, on_engine_clock};
+    let eta = vec![0.3_f64];
+    let model = compile(&model_src(STEP_PARAM, STEP_INDIV, STEP_EQUATION));
+    let s = straddle_subject(false);
+    let theta = model.default_params.theta.clone();
+    assert_param_time_straddle_is_live(
+        &compute_predictions_with_tv(&model, &s, &theta, &eta),
+        &compute_predictions_with_tv(&model, &on_engine_clock(&s), &theta, &eta),
+        "algebraic",
+    );
+    check_outer_vs_fd(&model, &s);
+    check_inner_matches_outer(&model, &s);
+
+    let model = compile(&iov_model_src(STEP_PARAM, STEP_INDIV, STEP_EQUATION));
+    let s = straddle_subject(true);
+    let theta = model.default_params.theta.clone();
+    let kappas = vec![vec![0.08], vec![-0.12]];
+    assert_param_time_straddle_is_live(
+        &crate::pk::predict_iov(&model, &s, &theta, &[0.15], &kappas),
+        &crate::pk::predict_iov(&model, &on_engine_clock(&s), &theta, &[0.15], &kappas),
+        "algebraic IOV",
+    );
+    check_iov_vs_fd(&model, &s, &[0.15, 0.08, -0.12]);
 }
 
 /// The inner IOV walk must agree with the outer jet's own stacked `∂f/∂η`.

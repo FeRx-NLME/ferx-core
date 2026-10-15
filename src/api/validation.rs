@@ -1049,11 +1049,14 @@ pub(crate) fn check_theta_gather_indices(
         for subj in &population.subjects {
             // Observation rows first — a level is a property of an observation —
             // then dose rows, which read the individual parameters too.
-            // An observation's TIME as written (#1959). A dose stores no written
-            // time: its engine time differs from it only after a stacked reset.
+            // Each row's TIME as written (#1959, #1969): a dose in a reset period that
+            // restarts TIME runs at a shifted engine time the file does not hold.
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
-                .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
+                .chain(
+                    (0..subj.doses.len())
+                        .map(|d| (subj.param_time_at(subj.doses[d].time), subj.dose_cov(d))),
+                );
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
                     diags.push(
@@ -1117,10 +1120,10 @@ pub(crate) fn check_kappa_weights(
             .unwrap_or("<kappa>");
         for subj in &population.subjects {
             for j in 0..subj.obs_times.len() {
-                // Evaluated at the engine clock, as the individual parameters it is
-                // desugared into are; reported at the TIME as written (#1959).
-                let w = (weight.eval)(theta, subj.obs_cov(j), subj.obs_times[j]);
-                let time = subj.readout_time(j);
+                // Evaluated and reported at the TIME as written, as the individual
+                // parameters it is desugared into read it (#1959, #1969).
+                let time = subj.param_time_obs(j);
+                let w = (weight.eval)(theta, subj.obs_cov(j), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
                         "E_KAPPA_WEIGHT_NONPOSITIVE",
@@ -1141,7 +1144,7 @@ pub(crate) fn check_kappa_weights(
             // rebuilt at every dose event), and a dose-only occasion has no
             // observation to have caught it above.
             for d in 0..subj.doses.len() {
-                let time = subj.doses[d].time;
+                let time = subj.param_time_at(subj.doses[d].time);
                 let w = (weight.eval)(theta, subj.dose_cov(d), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
@@ -1192,8 +1195,7 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
             for (occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
                 let mut seen: Option<f64> = None;
                 for &j in &obs_idx {
-                    let time = subj.obs_times.get(j).copied().unwrap_or(0.0);
-                    let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                    let w = (weight.eval)(theta, subj.obs_cov(j), subj.param_time_obs(j));
                     match seen {
                         None => seen = Some(w),
                         Some(prev) if (prev - w).abs() > 1e-9 * prev.abs().max(1.0) => {
@@ -2707,7 +2709,8 @@ pub(crate) fn check_dose_compartments(
 pub(crate) struct DoseSnapshot<'a> {
     /// The `$PK` values the engine resolves at this dose record — a `PkParams::values`.
     pub values: &'a [f64],
-    /// The dose record's time, as the engine passes it to `$PK`.
+    /// The dose record's TIME as written, which is also the TIME its `$PK` reads (#1969).
+    /// Differs from the engine's `DoseEvent::time` in a reset period that restarts TIME.
     pub time: f64,
     /// 0-based index of the dose.
     pub index: usize,
@@ -2797,7 +2800,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
         .enumerate()
         .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
-            time: subject.doses[k].time,
+            time: subject.param_time_at(subject.doses[k].time),
             index: k,
         })
         .collect()

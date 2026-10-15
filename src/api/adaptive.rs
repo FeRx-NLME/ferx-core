@@ -560,11 +560,13 @@ where
                         subject,
                         &subject.covariates,
                     );
+                    // `TIME` as written at the decision (#1969): the identity unless the
+                    // decision falls in a reset period that restarts `TIME`.
                     decision_pk.push((model.pk_param_fn)(
                         &params.theta,
                         &e,
                         dcov,
-                        decision_times[g],
+                        subject.param_time_at(decision_times[g]),
                     ));
                     eta_occ.push(e);
                 }
@@ -941,7 +943,12 @@ pub(crate) fn verify_adaptive_snapshots(
                 subject,
                 &subject.covariates,
             );
-            let dpk = (model.pk_param_fn)(&params.theta, &e, dcov, decision_times[g]);
+            let dpk = (model.pk_param_fn)(
+                &params.theta,
+                &e,
+                dcov,
+                subject.param_time_at(decision_times[g]),
+            );
             if !pk_bits_eq(&dpk, &decision_pk[g]) {
                 return Err(format!(
                     "decision_pk[{g}] (decision at t={}) diverges from an independent \
@@ -1083,11 +1090,15 @@ fn check_event_pk_records(
         ));
     }
     for k in 0..subject.doses.len() {
-        let t = subject.doses[k].time;
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), t);
+        // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969).
+        let (t, pt) = (
+            subject.doses[k].time,
+            subject.param_time_at(subject.doses[k].time),
+        );
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), pt);
         if !pk_bits_eq(&want, &got.dose[k]) {
             return Err(format!(
-                "event_pk.dose[{k}] (base dose at t={t}) diverges from an independent \
+                "event_pk.dose[{k}] (base dose at t={pt}) diverges from an independent \
                  re-derivation — a wrong per-dose covariate or occasion κ in the per-event PK \
                  builder, reused verbatim by the frozen-replay verifier, which cannot catch it \
                  (#748)"
@@ -1102,11 +1113,11 @@ fn check_event_pk_records(
         ));
     }
     for j in 0..subject.obs_times.len() {
-        let t = subject.obs_times[j];
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.obs_cov(j), t);
+        let (t, pt) = (subject.obs_times[j], subject.param_time_obs(j));
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.obs_cov(j), pt);
         if !pk_bits_eq(&want, &got.obs[j]) {
             return Err(format!(
-                "event_pk.obs[{j}] (record at t={t}) diverges from an independent re-derivation \
+                "event_pk.obs[{j}] (record at t={pt}) diverges from an independent re-derivation \
                  — a wrong per-event covariate or occasion κ in the per-event PK builder, reused \
                  verbatim by the frozen-replay verifier, which cannot catch it (#748)"
             ));
@@ -1120,11 +1131,11 @@ fn check_event_pk_records(
         ));
     }
     for m in 0..subject.pk_only_times.len() {
-        let t = subject.pk_only_times[m];
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.pk_only_cov(m), t);
+        let (t, pt) = (subject.pk_only_times[m], subject.param_time_pk_only(m));
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.pk_only_cov(m), pt);
         if !pk_bits_eq(&want, &got.pk_only[m]) {
             return Err(format!(
-                "event_pk.pk_only[{m}] (EVID=2 record at t={t}) diverges from an independent \
+                "event_pk.pk_only[{m}] (EVID=2 record at t={pt}) diverges from an independent \
                  re-derivation — a wrong per-event covariate or occasion κ (#748)"
             ));
         }
@@ -1141,11 +1152,14 @@ fn check_event_pk_records(
         ));
     }
     for r in 0..subject.reset_times.len() {
-        let t = subject.reset_times[r];
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.reset_cov(r), t);
+        let (t, pt) = (
+            subject.reset_times[r],
+            subject.param_time_at(subject.reset_times[r]),
+        );
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.reset_cov(r), pt);
         if !pk_bits_eq(&want, &got.reset[r]) {
             return Err(format!(
-                "event_pk.reset[{r}] (EVID=3/4 record at t={t}) diverges from an independent \
+                "event_pk.reset[{r}] (EVID=3/4 record at t={pt}) diverges from an independent \
                  re-derivation — a wrong reset-row covariate or occasion κ, which the driver \
                  and the frozen-schedule replay would both apply and neither could catch \
                  (#748/#1133)"

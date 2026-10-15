@@ -242,6 +242,8 @@ fn adaptive_base_subject() -> crate::types::Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -927,6 +929,8 @@ fn test_kappa_shrinkages_reads_informed_rule_from_population() {
             observations: vec![1.0, 1.0],
             occasions: vec![1, 2],
             pk_only_times: pk_only_at.into_iter().collect(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_occasions: pk_only_at.map(|_| 3).into_iter().collect(),
             ..Subject::default()
         };

@@ -727,6 +727,257 @@ fn time_builtin_eta_grad_matches_full() {
     }
 }
 
+/// #1969: a `TIME >= 24` step on CL and on the dose's `F` (θ- and η-dependent only after the
+/// step, so a dose derivative seeded on the wrong clock is a wrong derivative), read by the
+/// closed-form per-event walk
+/// at records whose
+/// written time and engine time sit on opposite sides of 24 (a moved trough, a moved `EVID=2`
+/// row, a reset period that restarts `TIME`). Pinned three ways, each of which a dual seeder
+/// reading the engine clock fails while the value path reads the written one:
+///
+/// - the straddle is live: the value prediction on the written clock differs from the one on
+///   the engine clock, so the fixture can tell the clocks apart at all;
+/// - the dual value `.re` equals the value-path prediction bit for bit (FD parity alone passes
+///   when both sides read the same wrong clock);
+/// - every gradient block matches central FD of the value path, outer and inner.
+const STEP_AT_24_IV: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(4.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF_LATE(0.5, 0.01, 0.99)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME >= 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+  F = if (TIME >= 24.0) inv_logit(logit(TVF_LATE) + ETA_V) else 1.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn param_time_written_tvcov_provider_matches_value_and_fd() {
+    use crate::types::test_helpers::{
+        assert_param_time_straddle_is_live, on_engine_clock, param_time_straddle_subject,
+        ParamTimeStraddle,
+    };
+    let m = parse_model_string(STEP_AT_24_IV).expect("parse");
+    let theta = [10.0, 4.0, 50.0, 0.5];
+    let eta = [0.15, -0.10];
+    for kind in [
+        ParamTimeStraddle::Obs,
+        ParamTimeStraddle::PkOnly,
+        ParamTimeStraddle::Reset,
+    ] {
+        let s = param_time_straddle_subject(kind);
+        let value = compute_predictions_with_tv(&m, &s, &theta, &eta);
+        let engine = compute_predictions_with_tv(&m, &on_engine_clock(&s), &theta, &eta);
+        assert_param_time_straddle_is_live(&value, &engine, &format!("{kind:?}"));
+
+        let sens = subject_sensitivities(&m, &s, &theta, &eta)
+            .unwrap_or_else(|| panic!("{kind:?}: the analytic per-event walk serves it"));
+        let light = subject_eta_grad(&m, &s, &theta, &eta)
+            .unwrap_or_else(|| panic!("{kind:?}: the inner walk serves it"));
+        for (j, (o, g)) in sens.obs.iter().zip(&light).enumerate() {
+            assert_eq!(
+                o.f.to_bits(),
+                value[j].to_bits(),
+                "{kind:?} obs {j}: outer .re"
+            );
+            assert_eq!(
+                g.f.to_bits(),
+                value[j].to_bits(),
+                "{kind:?} obs {j}: inner .re"
+            );
+        }
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+        for (o, g) in sens.obs.iter().zip(&light) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    g.df_deta[k],
+                    max_relative = 1e-10,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+}
+
+/// #1969: the covariance kink bound's per-dose snapshots (`dose_pk_snapshots`) read each dose at
+/// its written time, as the event walk's `pk_at_dose` does. A `TIME >= 24` step on the lag, on
+/// the `Reset` straddle, whose doses are written at 0, 0 and 24 (engine 0, 50, 74): the lags
+/// must be 1, 1 and 2 — the engine clock gives 1, 2, 2 — on both the BSV and the IOV branch.
+#[test]
+fn param_time_written_dose_snapshots_for_the_kink_bound() {
+    use crate::types::test_helpers::{param_time_straddle_subject, ParamTimeStraddle};
+    let src = |kappa: &str, iov: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n{kappa}  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n  LAG = if (TIME >= 24.0) 2.0 else 1.0\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)\n[error_model]\n  \
+             DV ~ proportional(PROP_ERR)\n{iov}"
+        )
+    };
+    let s = param_time_straddle_subject(ParamTimeStraddle::Reset);
+    let theta = [10.0, 50.0];
+    let lags = |snaps: Vec<crate::types::PkParams>| -> Vec<f64> {
+        snaps.iter().map(|p| p.lagtime()).collect()
+    };
+
+    let bsv = parse_model_string(&src("", "")).expect("parse");
+    assert_eq!(
+        lags(dose_pk_snapshots(&bsv, &s, &theta, &[0.1], false)),
+        vec![1.0, 1.0, 2.0],
+        "BSV"
+    );
+    let iov = parse_model_string(&src(
+        "  kappa KAPPA_CL ~ 0.04\n",
+        "[fit_options]\n  iov_column = OCC\n",
+    ))
+    .expect("parse");
+    assert_eq!(
+        lags(dose_pk_snapshots(
+            &iov,
+            &s,
+            &theta,
+            &[0.1, 0.05, -0.08],
+            true
+        )),
+        vec![1.0, 1.0, 2.0],
+        "IOV"
+    );
+}
+
+/// #1969, the closed-form IOV sources (`build_iov_sources`): the same straddles (and `F` step)
+/// under a κ on CL, two occasions. Value against `predict_iov` to the harness's 1e-9 (the stacked walk and
+/// `predict_iov` differ by one ULP at some observations, measured), every block against its FD.
+#[test]
+fn param_time_written_iov_provider_matches_value_and_fd() {
+    use crate::types::test_helpers::{
+        assert_param_time_straddle_is_live, on_engine_clock, param_time_straddle_subject,
+        ParamTimeStraddle,
+    };
+    const STEP_AT_24_IOV: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(4.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME >= 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V = TVV * exp(ETA_V)
+  F = if (TIME >= 24.0) 0.5 else 1.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+    let m = parse_model_string(STEP_AT_24_IOV).expect("parse");
+    let theta = [10.0, 4.0, 50.0];
+    let stacked = [0.15, -0.10, 0.05, -0.08];
+    let kappas = vec![vec![0.05], vec![-0.08]];
+    for kind in [
+        ParamTimeStraddle::Obs,
+        ParamTimeStraddle::PkOnly,
+        ParamTimeStraddle::Reset,
+    ] {
+        let s = param_time_straddle_subject(kind);
+        let value = crate::pk::predict_iov(&m, &s, &theta, &stacked[..2], &kappas);
+        let engine =
+            crate::pk::predict_iov(&m, &on_engine_clock(&s), &theta, &stacked[..2], &kappas);
+        assert_param_time_straddle_is_live(&value, &engine, &format!("{kind:?}"));
+        assert!(
+            subject_sensitivities_iov(&m, &s, &theta, &stacked).is_some(),
+            "{kind:?}: the analytic IOV walk serves it"
+        );
+        check_iov_provider_vs_fd(&m, &s, &theta, &stacked);
+    }
+}
+
+/// #1969, the ODE IOV provider (`seed_iov_events`): the same straddles and κ on an `[odes]`
+/// twin, with an `F1` step read at each dose and an `init(central) = BASE` whose `BASE` steps
+/// too, so the `Reset` straddle's re-seed reads the reset row's own written time. The ODE dual and value integrations are separate runs, so `.re` is held to the
+/// harness's 1e-9, not bit identity; the straddle moves the value by more than 1e-3.
+#[test]
+fn param_time_written_ode_iov_provider_matches_value_and_fd() {
+    use crate::types::test_helpers::{
+        assert_param_time_straddle_is_live, on_engine_clock, param_time_straddle_subject,
+        ParamTimeStraddle,
+    };
+    const STEP_AT_24_ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(4.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME >= 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V = TVV * exp(ETA_V)
+  F1 = if (TIME >= 24.0) 0.5 else 1.0
+  BASE = if (TIME >= 24.0) 300.0 else 100.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let m = parse_model_string(STEP_AT_24_ODE_IOV).expect("parse");
+    assert!(crate::sens::ode_provider::ode_iov_supported(&m));
+    let theta = [10.0, 4.0, 50.0];
+    let stacked = [0.15, -0.10, 0.05, -0.08];
+    let kappas = vec![vec![0.05], vec![-0.08]];
+    for kind in [
+        ParamTimeStraddle::Obs,
+        ParamTimeStraddle::PkOnly,
+        ParamTimeStraddle::Reset,
+    ] {
+        let s = param_time_straddle_subject(kind);
+        let value = crate::pk::predict_iov(&m, &s, &theta, &stacked[..2], &kappas);
+        let engine =
+            crate::pk::predict_iov(&m, &on_engine_clock(&s), &theta, &stacked[..2], &kappas);
+        assert_param_time_straddle_is_live(&value, &engine, &format!("{kind:?}"));
+        assert!(
+            subject_sensitivities_iov(&m, &s, &theta, &stacked).is_some(),
+            "{kind:?}: the ODE IOV walk serves it"
+        );
+        check_iov_provider_vs_fd(&m, &s, &theta, &stacked);
+    }
+}
+
 /// #486: a **direct `pk(...=TIME)` structural mapping** (here `q=TIME` on a 2-cpt IV,
 /// so the mapped slot is not a denominator — `v=TIME` would divide by `V = 0` at the
 /// `t = 0` dose). The parser desugars it into a synthetic `__ferx_pktime_q = TIME`
@@ -999,6 +1250,8 @@ fn oral_subject(times: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1761,6 +2014,8 @@ fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -2671,6 +2926,8 @@ fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -3210,6 +3467,8 @@ fn subject_with_doses_and_resets(
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times,
         reset_covariates: Vec::new(),
@@ -5127,6 +5386,8 @@ fn ode_lagtime_full_sens_matches_analytical_twin() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -6036,6 +6297,8 @@ fn tvcov_subject(
         dose_covariates: dose_wts.iter().map(|&w| wt_map(w)).collect(),
         obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
         pk_only_times,
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: pk_only_wts.iter().map(|&w| wt_map(w)).collect(),
         reset_times,
         reset_covariates: Vec::new(),
@@ -7152,6 +7415,8 @@ fn iov_subject() -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -7341,6 +7606,8 @@ fn ss_bolus_lag_iov_subject() -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -8893,6 +9160,8 @@ fn ode_iov_above_legacy_axis_cap_body() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -8975,6 +9244,8 @@ fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -11587,6 +11858,8 @@ fn iov_reset_subject() -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![24.0],
         reset_covariates: Vec::new(),
@@ -11884,6 +12157,8 @@ fn iov_tvcov_subject(pk_only: bool) -> Subject {
         dose_covariates: vec![wt_map(70.0), wt_map(85.0)],
         obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
         pk_only_times,
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates,
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -13703,6 +13978,8 @@ fn iov_subject_with_occasions(k: usize) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -14060,6 +14337,8 @@ fn transit_iov_walk_subject() -> Subject {
         dose_covariates: doses.iter().map(|&(_, _, w)| wt_map(w)).collect(),
         obs_covariates: obs.iter().map(|&(_, _, w)| wt_map(w)).collect(),
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],

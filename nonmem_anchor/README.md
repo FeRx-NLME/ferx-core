@@ -1233,3 +1233,31 @@ TVEMAX / B_EMAX_FLARE ridge, and ferx scores NONMEM's own optimum at −199.7345
 
 Run folder: `~/NONMEMruns/ferx-1081-residual-correlation/`; every stream run with
 `nm3` (NONMEM 7.6.0); `results/` holds the `anchor` build's `.ext` / `.lst`.
+
+## The `TIME` individual parameters read (#1969)
+
+`param_time_<case>.ctl`: a `$PK` step on `TIME` (`IF (TIME.GE.24)`) read at records whose
+TIME as written and engine time sit on opposite sides of 24. NONMEM's `$PK` reads the TIME
+as written. Before #1969 ferx read its internal clock, which is one ULP below the written
+time at a record the reader moves to keep file order (#614, #1810), and shifted past the
+previous period in a reset period that restarts `TIME`. 30 subjects each, FOCEI
+(`METHOD=1 INTER`) fits by the `anchor` build (the arm64 builds agree to < 1e-8 OFV);
+`$TABLE FORMAT=s1PE23.16`. ferx is evaluated at NONMEM's optimum (`maxiter = 0`) on a closed
+form and an `[odes]` twin, `param_time_<case>_{analytic,ode}.ferx`, by
+`tests/param_time_written_nonmem_anchor.rs`.
+
+| case | data | reads `TIME` | NONMEM OBJ | ferx before (944ca32d) | ferx after |
+|---|---|---|---|---|---|
+| `moved` | trough at 24/48 listed before its dose | `CL` | −1018.2145288 | −11.291786 | −1018.2145288 |
+| `pkonly` | `EVID=2` row at 24/48 listed before the dose | `CL` | −609.3845042 | −588.790560 | −609.3845042 |
+| `reset` | `moved` + a second `EVID=4` period from `TIME 0` | `CL` | −2227.0626096 | +7572.676829 | −2227.0626096 |
+| `control` | dose listed first (nothing moved) | `CL` | −626.4938747 | −626.493875 | −626.4938747 |
+| `reset_f` | two periods, oral; `F1` read only at a dose | `F1` | −938.2909435 | +2436.046323 | −938.2909435 |
+| `reset_seed` | two periods; `A_0(1) = BASE` re-seeded at the reset row | `BASE` | −455.4794675 | +466.222177 | −455.4794675 |
+
+IV (or oral) 100 at 0/24/48 (`reset_f`, `reset_seed`: 0/24 per period), so every later dose
+lands on residual drug. Worst `|ΔOFV|` over the twelve cells 1.7e-8 on Linux aarch64 (2.1e-8
+on macOS arm64), worst relative `IPRED` gap against the `.tab` 2.2e-8 on Linux (7.4e-8 on
+macOS). `reset_seed` fixes the step size (`THETA(4)
+FIX`): `BASE` is read only at a period start, so no record identifies it. Run folder:
+`~/NONMEMruns/issue1969-param-time/` (`RUN.md`, generators `gen.py` / `gen2.py`).
