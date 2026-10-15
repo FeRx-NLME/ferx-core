@@ -1516,14 +1516,16 @@ fn fit_inner(
     };
 
     // Covariance step cost warning: fire before chain so user sees it
-    // immediately. Use checked_mul so an absurd parameter count cannot wrap
-    // and produce a bogus estimate; on overflow we still warn but suppress
-    // the numeric estimate.
-    let covariance_n_evals_estimated = if options.run_covariance_step && n_params_pre > 30 {
-        n_params_pre.checked_mul(n_params_pre)
-    } else {
-        None
-    };
+    // immediately. The count is checked arithmetic, so an absurd parameter
+    // count cannot wrap and produce a bogus estimate; on overflow we still warn
+    // but suppress the numeric estimate. No note at all when the step will run
+    // an estimator that builds no `R` (#1803).
+    let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
+        n_params_pre,
+        options,
+        !model.priors.is_empty(),
+    );
+    let covariance_n_evals_estimated = covariance_cost.flatten();
 
     // Compute observation time range from the population.
     let obs_time_range: Option<(f64, f64)> = {
@@ -1631,23 +1633,10 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
-    if options.run_covariance_step && n_params_pre > 30 {
-        if let Some(n_evals) = covariance_n_evals_estimated {
-            accumulated_warnings.push(format!(
-                "Covariance step: {} parameters → {} OFV evaluations \
-                 (finite-difference Hessian). This may take several minutes \
-                 on complex models.",
-                n_params_pre, n_evals
-            ));
-        } else {
-            // n_params² overflowed usize — warn without the (wrapped) number.
-            accumulated_warnings.push(format!(
-                "Covariance step: {} parameters → n² OFV evaluations \
-                 (finite-difference Hessian). Estimate exceeds usize range; \
-                 expect this to be very slow.",
-                n_params_pre
-            ));
-        }
+    if let Some(note) =
+        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
+    {
+        accumulated_warnings.push(note);
     }
 
     // inits_from_nca: derive NCA-based starting values before the optimizer

@@ -504,7 +504,7 @@ describe and the field is `None` (and the YAML key is omitted, never `null`).
 
 **It is the estimator that ran, not the one requested.** Above 100 free
 parameters a *defaulted* `covariance_method = r` is routed onto the
-cross-product, because the `R` matrix would need `n(n+1)/2` re-converged
+cross-product, because the `R` matrix would need `2n² + 2n` re-converged
 objective evaluations; the substitution is reported as a warning and this field
 reports `s`. Reading `covariance_method` back off `[fit_options]` would report
 `r` for standard errors that came out of `S⁻¹`.
@@ -540,7 +540,7 @@ fabricated provenance.
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
-| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step will run, populated only when `run_covariance_step = true` and `n_parameters > 30` |
+| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's finite-difference `R` matrix will run (`2n² + 2n`), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R` |
 | `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |
 
 ### Environment Info

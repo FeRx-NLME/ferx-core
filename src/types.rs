@@ -7359,8 +7359,10 @@ pub struct FitResult {
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
     pub nlopt_missing_algorithms: Vec<String>,
-    /// Estimated OFV evaluations for the covariance step (n_params²), set
-    /// when `run_covariance_step = true` and `n_parameters > 30`.
+    /// Estimated OFV evaluations for the covariance step's finite-difference
+    /// `R` matrix (`2·n_params² + 2·n_params`), set when `run_covariance_step =
+    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
+    /// under `covariance_method = s`, which builds no `R` (#1803).
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -8091,7 +8093,7 @@ pub struct FitOptions {
     /// default. Exists only so the high-dimension routing guard (#1064) can
     /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
     /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
-    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// subject's EBEs at each of `2·n² + 2·n` objective evaluations, so a *defaulted*
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
@@ -9464,9 +9466,10 @@ pub const BOBYQA_MAX_DIM: usize = 64;
 /// routes to the cross-product (#1064).
 ///
 /// The `R` matrix is a finite-difference Hessian of the objective that
-/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
-/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
-/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+/// reconverges every subject's EBEs at each of `2·n² + 2·n` objective
+/// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
+/// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`
+/// builds no `R` (#1803) and needs one pass.
 pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method
