@@ -31787,3 +31787,189 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
     // The two classes must actually differ, or this cannot see a stale replay.
     assert_ne!(seen[0].to_bits(), seen[1].to_bits(), "MIXNUM must move du");
 }
+
+/// Bare `TIME` resolves to `Op::PushTime` (the model-time thread-local), not the
+/// `t` slot, so it is invisible to the slot taint: both lift paths must reject it on
+/// their own. `d/dt(a)` is a whole statement that would otherwise lift entire,
+/// `d/dt(b)` a state-dependent one whose `CL·TIME` subtree would.
+const HOIST_BARE_TIME: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[a, b])
+
+[odes]
+  d/dt(a) = (CL / V) * TIME
+  d/dt(b) = -(CL / V) * b + CL * TIME
+
+[scaling]
+  y = b / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// An intermediate assigned only inside an `if` body reads the zero-fill when the
+/// branch is not taken. On a cache hit the scratch is kept, so the program's own
+/// slots must still be re-zeroed: after the branch fires once, a later call that
+/// skips it must see `X = 0`, not the previous call's value.
+const HOIST_BRANCH_ONLY_WRITE: &str = "
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  if (t < 1) {
+    X = CL / V
+  }
+  d/dt(central) = -X * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Lifted vs unlifted over `(state, time)` calls on one parameter set — every call
+/// after the first a cache hit on a persistent scratch — for the f64 closure,
+/// `eval_rhs_g::<f64>` and `::<Dual1>`.
+fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
+    let model = hoist_model(src);
+    let prog = hoist_program(&model);
+    assert!(prog.hoist.is_some(), "fixture must have a live cache");
+    let plain_model = hoist_model_unlifted(src);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
+    let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
+    type D = crate::sens::dual1::Dual1<2>;
+    let dparams = hoist_params::<D>(prog, &[D::var(3.0, 0), D::var(30.0, 1)]);
+    let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
+    for (k, (u, t)) in calls.iter().enumerate() {
+        let _time = ModelTimeGuard::enter(*t);
+        let mut want = vec![0.0; n_states];
+        plain.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            &mut want,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut got_g = vec![0.0; n_states];
+        prog.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut got_g, &mut vars, &mut stack);
+        let mut got_c = vec![0.0; n_states];
+        (model.ode_spec.as_ref().unwrap().rhs)(u, &params, *t, &mut got_c);
+        let ud: Vec<D> = u.iter().map(|&x| D::constant(x)).collect();
+        let mut dwant = vec![D::constant(0.0); n_states];
+        plain.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut dwant,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut dgot = vec![D::constant(0.0); n_states];
+        prog.eval_rhs_g::<D>(
+            &ud,
+            &dparams,
+            *t,
+            *t,
+            D::constant(*t),
+            &mut dgot,
+            &mut dvars,
+            &mut dstack,
+        );
+        for j in 0..n_states {
+            assert!(
+                hoist_bits_eq(got_g[j], want[j]),
+                "call {k} du[{j}] eval_rhs_g: {} vs {}",
+                got_g[j],
+                want[j]
+            );
+            assert!(
+                hoist_bits_eq(got_c[j], want[j]),
+                "call {k} du[{j}] f64 closure: {} vs {}",
+                got_c[j],
+                want[j]
+            );
+            assert!(dgot[j].same_bits(&dwant[j]), "call {k} du[{j}] Dual1");
+        }
+    }
+}
+
+#[test]
+fn rhs_hoist_never_lifts_a_bare_time_reader() {
+    let model = hoist_model(HOIST_BARE_TIME);
+    for (_, bc) in &hoist_program(&model)
+        .hoist
+        .as_ref()
+        .expect("CL/V lifts")
+        .lifted
+    {
+        assert!(
+            !bc.ops.iter().any(|o| matches!(o, Op::PushTime)),
+            "a lifted subtree reads TIME: {:?}",
+            bc.ops
+        );
+    }
+    assert_hoist_matches_unlifted_over_calls(
+        HOIST_BARE_TIME,
+        2,
+        &[
+            (vec![1.0, 5.0], 0.5),
+            (vec![1.0, 5.0], 2.0),
+            (vec![2.0, 4.0], 7.5),
+        ],
+    );
+}
+
+#[test]
+fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
+    // Taken, then skipped twice (cache hits), then taken again.
+    let calls = [
+        (vec![50.0], 0.5),
+        (vec![50.0], 2.0),
+        (vec![40.0], 3.0),
+        (vec![40.0], 0.25),
+    ];
+    assert_hoist_matches_unlifted_over_calls(HOIST_BRANCH_ONLY_WRITE, 1, &calls);
+    // The skipped calls really do read the zero-fill.
+    let plain_model = hoist_model_unlifted(HOIST_BRANCH_ONLY_WRITE);
+    let plain = hoist_program(&plain_model);
+    let params = hoist_params::<f64>(plain, &[3.0, 30.0]);
+    let mut du = [1.0];
+    plain.eval_rhs_g::<f64>(
+        &[50.0],
+        &params,
+        2.0,
+        2.0,
+        2.0,
+        &mut du,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    assert_eq!(du[0], 0.0, "the untaken branch leaves X at the zero-fill");
+}
