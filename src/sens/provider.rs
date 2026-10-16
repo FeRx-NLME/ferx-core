@@ -4916,8 +4916,10 @@ fn subject_eta_grad_impl(
         return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
     }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
-    // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
-    // scope the outer provider uses, so inner and outer stay on the same route.
+    // switch. Out-of-scope ODE subjects decline (→ FD inner). The inner scope bounds
+    // `n_eta` where the outer bounds `n_theta + n_eta` (#1804), so an analytic outer
+    // implies an analytic inner, but not the reverse: past the axis cap the inner
+    // stays analytic while the outer goes FD.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             // Closed-form modified-release fast path (#860 Phase A6): a *static*
