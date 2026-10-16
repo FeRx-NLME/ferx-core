@@ -1191,9 +1191,16 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     #[cfg(not(feature = "markov"))]
     let design_states: HashMap<usize, usize> = HashMap::new();
 
+    // Nested levels (#1082): a blank level cell is missing, not the previous record's label.
+    let no_carry_forward: std::collections::HashSet<String> = model
+        .nested_levels()
+        .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
+        .unwrap_or_default();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
+        .with_no_carry_forward(no_carry_forward)
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).

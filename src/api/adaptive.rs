@@ -68,6 +68,9 @@ fn check_adaptive_model_data(
     model: &CompiledModel,
     population: &Population,
 ) -> Result<(), EngineError> {
+    if model.has_nested_levels() {
+        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+    }
     first_error(&check_simulation_data(model, population))?;
     reject_selected_error_for_adaptive(model)
 }

@@ -2513,6 +2513,11 @@ pub fn foce_subject_nll_iov(
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
 ) -> f64 {
+    // A nested-level subject with no κ̂ was never given its cells (#1082): refused, not
+    // scored as a BSV-only subject. With cells, `iov_linearization` refuses it below.
+    if kappas.is_empty() && model.has_nested_levels() {
+        return 1e20;
+    }
     if kappas.is_empty() {
         return foce_subject_nll_cov(
             model,
@@ -2552,11 +2557,14 @@ pub fn foce_subject_nll_iov(
 pub(crate) struct IovLinearization {
     /// `f(η̂, κ̂)` through the continuous per-occasion prediction (`pk::predict_iov`).
     pub(crate) ipreds: Vec<f64>,
-    /// `[η̂, κ̂₁, …, κ̂_K]` in [`crate::stats::stacked_layout::StackedLayout`] order.
+    /// `[η̂, κ̂₁, …, κ̂_K]` in [`crate::stats::stacked_layout::StackedLayout`] order — or,
+    /// under nested levels (#1082), the compact `[η̂, κ̂ per group of each level]` of
+    /// `crate::stats::nested_levels::NestedLayout`.
     pub(crate) b_hat: DVector<f64>,
-    /// `[∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]`, `n_obs × n_b`.
+    /// `[∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]`, `n_obs × n_b`, over the same `b`.
     pub(crate) h_full: DMatrix<f64>,
-    /// `blkdiag(Ω, Ω_IOV, …, Ω_IOV)`.
+    /// `blkdiag(Ω, Ω_IOV, …, Ω_IOV)`, or the nested compact prior
+    /// `Ω ⊕_L (I_{G_L} ⊗ Ω_L)`.
     pub(crate) sigma_b: OmegaMatrix,
     /// The number of occasion groups K.
     pub(crate) n_occasions: usize,
@@ -2584,6 +2592,12 @@ pub(crate) fn iov_linearization(
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
 ) -> Option<IovLinearization> {
+    // #1082: the compact layout, built once. A nested-level subject never given its cells
+    // has none, and is the caller's refusal rather than a one-level linearization.
+    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    if model.has_nested_levels() && nested.is_none() {
+        return None;
+    }
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
@@ -2604,6 +2618,56 @@ pub(crate) fn iov_linearization(
     // (the old Option-A version wrote κ_k only on occasion-k's rows).
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
+
+    // #1082: under nested levels `b` is the compact vector (one κ block per group of each
+    // level), so a κ column perturbs one group's κ in every cell that shares it.
+    if let Some(nested) = nested {
+        let b_hat_vec = nested.compact(eta_hat.as_slice(), &kappa_slices)?;
+        let n_b = nested.n_compact();
+        let mut h_full = DMatrix::zeros(n_obs, n_b);
+        for j in 0..n_obs {
+            for c in 0..n_eta {
+                h_full[(j, c)] = h_matrix[(j, c)];
+            }
+        }
+        const EPS: f64 = 1e-6;
+        let mut bpert = b_hat_vec.clone();
+        for c in n_eta..n_b {
+            let orig = bpert[c];
+            let step = EPS * (1.0 + orig.abs());
+            bpert[c] = orig + step;
+            let preds_plus = pk::predict_iov(
+                model,
+                subject,
+                theta,
+                eta_hat.as_slice(),
+                &nested.expand(&bpert),
+            );
+            bpert[c] = orig - step;
+            let preds_minus = pk::predict_iov(
+                model,
+                subject,
+                theta,
+                eta_hat.as_slice(),
+                &nested.expand(&bpert),
+            );
+            bpert[c] = orig;
+            let inv_2step = 1.0 / (2.0 * step);
+            for j in 0..n_obs {
+                h_full[(j, c)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+            }
+        }
+        let sigma_b_mat = nested.prior(&omega_bsv.matrix, &omega_iov.matrix);
+        return Some(IovLinearization {
+            ipreds,
+            b_hat: DVector::from_vec(b_hat_vec),
+            h_full,
+            sigma_b: OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false),
+            n_occasions: k_occ,
+            n_eta,
+            n_iov,
+        });
+    }
 
     let mut h_full = DMatrix::zeros(n_obs, n_b);
     for j in 0..n_obs {
@@ -3350,6 +3414,12 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
 ) -> f64 {
+    // #1082: the compact layout, built once. A nested-level subject never given its cells
+    // has none, and is refused rather than scored as one-level IOV or with κ dropped.
+    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    if model.has_nested_levels() && nested.is_none() {
+        return 1e20;
+    }
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -3361,9 +3431,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
 
     // Kappa priors and IOV log-det
-    let (iov_inv, log_det_iov) = if let Some(iov) = omega_iov {
-        (&iov.inv, iov.log_det)
-    } else {
+    let Some(iov) = omega_iov else {
         // Guaranteed unreachable: the only caller path that admits `omega_iov: None` is
         // `kappas.is_empty()`, which returns above before this point. `1e20` is a defensive
         // sentinel, not a real score — loud in debug/test builds so a future caller that
@@ -3374,13 +3442,27 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
         );
         return 1e20;
     };
+    let (iov_inv, log_det_iov) = (&iov.inv, iov.log_det);
 
-    let mut kappa_prior = 0.0;
-    for kap in kappas {
-        let kap_vec = DVector::from_column_slice(kap.as_ref());
-        kappa_prior += kap_vec.dot(&(iov_inv * &kap_vec));
-    }
-    let k_occasions = kappas.len();
+    // `Σ_k κ_kᵀΩ_IOV⁻¹κ_k + K·log|Ω_IOV|` over the K occasion groups — or, under nested
+    // levels (#1082), the same form over the groups of each level, where the cells of one
+    // group share its κ and count it once (`NestedLayout::kappa_prior`).
+    // The two terms stay separate summands so the one-level sum keeps its association.
+    let (kappa_prior, kappa_log_det) = match nested {
+        Some(nested) => match nested.compact(eta, kappas) {
+            Some(b) => (nested.kappa_prior(&b, iov_inv, &iov.chol), 0.0),
+            None => return 1e20,
+        },
+        None => {
+            let mut kappa_prior = 0.0;
+            for kap in kappas {
+                let kap_vec = DVector::from_column_slice(kap.as_ref());
+                kappa_prior += kap_vec.dot(&(iov_inv * &kap_vec));
+            }
+            let k_occasions = kappas.len();
+            (kappa_prior, (k_occasions as f64) * log_det_iov)
+        }
+    };
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
@@ -3440,7 +3522,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
         accumulate_non_gaussian_nll(model, subject, theta, eta, None, 2.0, &mut data_ll);
     }
 
-    0.5 * (eta_prior + log_det_omega + kappa_prior + (k_occasions as f64) * log_det_iov + data_ll)
+    0.5 * (eta_prior + log_det_omega + kappa_prior + kappa_log_det + data_ll)
 }
 
 #[cfg(test)]
