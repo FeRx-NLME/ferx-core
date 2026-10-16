@@ -82,7 +82,14 @@ pub trait PkNum:
     /// propagator (#852) reads `A` off differences of the RHS, and a cancellation can wipe a
     /// derivative component while the value survives intact, so its self-check compares the
     /// jets of `f(x)` and `A·x + b` too, against a scale built from these magnitudes.
-    fn jet_max_abs(self) -> f64;
+    ///
+    /// Provided, returning `0.0`, so adding it did not break an implementor outside this
+    /// crate. That default is only correct for a jet-free type; every dual in this crate
+    /// overrides it. An external type cannot reach the exact propagator (only a parser-certified
+    /// spec does, and that runs on this crate's types), so the default cannot weaken its check.
+    fn jet_max_abs(self) -> f64 {
+        0.0
+    }
 }
 
 impl PkNum for f64 {
@@ -148,10 +155,6 @@ impl PkNum for f64 {
         // No derivative components to be non-finite. Const-folds away in the guard, so the
         // `f64` prediction path pays nothing for a check only the dual paths can fail.
         true
-    }
-    #[inline]
-    fn jet_max_abs(self) -> f64 {
-        0.0
     }
 }
 

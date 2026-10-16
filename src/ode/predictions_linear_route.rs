@@ -171,12 +171,12 @@ fn ode_method_linear_is_refused_on_an_analytical_model() {
     };
     assert!(
         e.contains(
-            "fit option `ode_method = linear` applies to an [odes] model, and this model has none."
+            "fit option `ode_method = linear` applies to an [odes] model, and this model has none,"
         ),
         "{e}"
     );
     assert!(
-        e.contains("An analytical structural model is already exact; remove the option."),
+        e.contains("so there is nothing for the option to act on; remove it."),
         "{e}"
     );
     // The same model without the option parses: the refusal is the option's, not the fixture's.

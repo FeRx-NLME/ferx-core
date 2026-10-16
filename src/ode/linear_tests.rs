@@ -608,3 +608,73 @@ fn segment_probe_stays_near_the_models_own_magnitudes() {
         hard[0].u[0]
     );
 }
+
+#[test]
+fn segment_keeps_a_large_forcing_jet_finite() {
+    // `du/dt = 1e292·R` at R = 0, u0 = 0: every value is 0, so the generator's value is the
+    // zero matrix and the exponential takes no squarings, while ∂b/∂R = 1e292. The Padé
+    // numerator multiplies that jet by its first coefficient (~3.2e16) and overflowed it to
+    // `inf`; the RHS reads no state, so no self-check reads the corrupted state jet. Exact:
+    // u(t) = 1e292·R·t, so ∂u/∂R = 1e292·t and ∂²u/∂R² = 0.
+    let big = 1e292;
+    let rhs = |_u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+        du[0] = Dual2::<1>::from_f64(big) * p[0];
+    };
+    let t = 1.0;
+    let got = linear_segment_g(
+        &rhs,
+        &[Dual2::<1>::from_f64(0.0)],
+        (0.0, t),
+        &[Dual2::<1>::var(0.0, 0)],
+        &[t],
+        &[],
+    )
+    .map(|(hard, _)| hard[0].u[0]);
+    // Declining (and integrating) would also be safe; returning a non-finite jet is not.
+    let got = got.expect("affine, autonomous: the exact path must serve this");
+    assert!(got.jets_finite(), "{got:?}");
+    assert_eq!(got.val(), 0.0);
+    let rel_g = (got.grad[0] - big * t).abs() / (big * t);
+    assert!(rel_g < 1e-14, "∂u/∂R = {:e} vs {:e}", got.grad[0], big * t);
+    assert_eq!(got.hess[0][0], 0.0);
+}
+
+#[test]
+fn expm_declines_an_overflowed_jet() {
+    // Value zero (no squarings), derivative 1e300: the Padé numerator's first coefficient
+    // (~3.2e16) overflows the jet while every value stays finite. Returning that as an exact
+    // exponential would hand FOCEI an `inf` gradient; declining lets the caller integrate.
+    let mut g = vec![Dual2::<1>::from_f64(0.0); 4];
+    g[1] = Dual2::<1>::var(0.0, 0) * Dual2::<1>::from_f64(1e300);
+    assert!(expm_g(&g, 2).is_none());
+    // The same generator a hundred orders smaller is served: exp([[0, x], [0, 0]]) =
+    // [[1, x], [0, 1]] (to the Padé quotient's rounding — 1 ulp on the diagonal, measured).
+    g[1] = Dual2::<1>::var(0.0, 0) * Dual2::<1>::from_f64(1e200);
+    let e = expm_g(&g, 2).expect("finite jets");
+    assert!((e[0].val() - 1.0).abs() < 1e-15 && (e[3].val() - 1.0).abs() < 1e-15);
+    assert_eq!(e[1].val(), 0.0);
+    assert!(
+        (e[1].grad[0] - 1e200).abs() / 1e200 < 1e-15,
+        "{:e}",
+        e[1].grad[0]
+    );
+}
+
+#[test]
+fn every_dual_overrides_jet_max_abs() {
+    // `PkNum::jet_max_abs` defaults to 0.0 (correct only for `f64`). A dual that fell back to
+    // it would make the propagator's derivative self-check vacuous — on exactly the solves the
+    // gradient comes from — so each dual's override is pinned through the trait.
+    use crate::sens::dual1::Dual1;
+    fn through_trait<T: PkNum>(x: T) -> f64 {
+        x.jet_max_abs()
+    }
+    assert_eq!(through_trait(2.5_f64), 0.0);
+    assert_eq!(
+        through_trait(Dual1::<2>::var(1.0, 1) * Dual1::<2>::from_f64(-3.0)),
+        3.0
+    );
+    let x = Dual2::<1>::var(1.0, 0);
+    assert_eq!(through_trait(x * x * x), 6.0); // ∂ = 3x² = 3, ∂² = 6x = 6: the Hessian counts
+    assert!(through_trait(Dual2::<1>::var(1.0, 0) * Dual2::<1>::from_f64(f64::NAN)).is_nan());
+}

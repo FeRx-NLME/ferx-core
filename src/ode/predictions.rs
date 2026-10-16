@@ -8495,7 +8495,7 @@ pub(crate) fn ode_method_linear_refusal(ode: Option<&OdeSpec>) -> Option<String>
     match ode {
         None => Some(
             "fit option `ode_method = linear` applies to an [odes] model, and this model has \
-             none. An analytical structural model is already exact; remove the option."
+             none, so there is nothing for the option to act on; remove it."
                 .to_string(),
         ),
         Some(ode) => ode.linear_ineligibility().map(|reason| {

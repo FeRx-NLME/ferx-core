@@ -170,7 +170,7 @@ pub(crate) fn expm_g<T: PkNum>(a: &[T], n: usize) -> Option<Vec<T>> {
     for _ in 0..s {
         r = matmul(&r, &r, n);
     }
-    if r.iter().any(|x| !x.val().is_finite()) {
+    if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
         return None;
     }
     Some(r)
@@ -305,7 +305,12 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     // squarings and was declined. Scaling the column to the rates' magnitude leaves the
     // squaring count to `A`, where it belongs; `c` is a plain constant, so the jets are exact.
     let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
-    let b_max = b.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
+    // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
+    // generator's value at zero (no squarings) while the Padé numerator multiplies that jet by
+    // ~3e16 and overflows it.
+    let b_max = b.iter().fold(0.0_f64, |acc, x| {
+        acc.max(x.val().abs()).max(x.jet_max_abs())
+    });
     let c = (b_max / a_max.max(1.0)).max(1.0);
     let inv_c = T::from_f64(1.0 / c);
     let m = n + 1;

@@ -366,7 +366,7 @@ fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
     assert!(analytical.ode_spec.is_none(), "fixture must be analytical");
     let e = refusal(&analytical);
     assert!(
-        e.contains("applies to an [odes] model, and this model has none."),
+        e.contains("applies to an [odes] model, and this model has none,"),
         "{e}"
     );
 
