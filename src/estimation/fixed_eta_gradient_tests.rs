@@ -1456,3 +1456,329 @@ fn obs_nll_subject_grad_sees_a_correlation_rho() {
         grad[2]
     );
 }
+
+/// A FREM model with a **free** covariate σ (`EPSCOV`) and a separate PK σ
+/// (`ADD`), so each σ coordinate is live on exactly one kind of row: `ADD` on the
+/// PK observations, `EPSCOV` on the covariate pseudo-observations. `iov` adds a
+/// κ on CL for the IOV-path twin.
+fn frem_free_cov_sigma_model(iov: bool) -> CompiledModel {
+    let (kappa, kappa_term) = if iov {
+        ("  kappa KAPPA_CL ~ 0.04\n", " + KAPPA_CL")
+    } else {
+        ("", "")
+    };
+    crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.5, 0.1, 10.0)\n  theta TVV(20.0, 1.0, 100.0)\n  \
+         theta TV_WT(70.0, 1.0, 200.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_WT_FREM ~ 100.0\n\
+         {kappa}  sigma ADD ~ 0.5 (sd)\n  sigma EPSCOV ~ 2.0 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL{kappa_term})\n  V  = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ additive(ADD)\n\
+         [fit_options]\n  frem_predictions = TV_WT/ETA_WT_FREM:100\n  frem_sigma = EPSCOV\n"
+    ))
+    .expect("FREM fixture parses")
+}
+
+/// Append covariate pseudo-observations (`FREMTYPE = 100`) with the given DVs to
+/// `subject`, whose existing rows become PK rows (`FREMTYPE = 0`).
+fn with_frem_rows(mut subject: Subject, dvs: &[f64]) -> Subject {
+    let n_pk = subject.observations.len();
+    subject.fremtype = vec![0u16; n_pk];
+    for &dv in dvs {
+        subject.obs_times.push(0.0);
+        subject.observations.push(dv);
+        subject.obs_cmts.push(1);
+        subject.cens.push(0);
+        subject.fremtype.push(100);
+        if !subject.occasions.is_empty() {
+            subject.occasions.push(1);
+        }
+    }
+    subject
+}
+
+/// Relative agreement of an analytic gradient with its FD reference, naming the
+/// coordinate on failure. Non-finite entries fail outright.
+fn assert_grad_close(grad: &[f64], want: &[f64], tol: f64, what: &str) {
+    for (j, (&g, &w)) in grad.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "{what} grad[{j}]: {g} vs {w}"
+        );
+        let err = (g - w).abs() / w.abs().max(1e-8);
+        assert!(
+            err < tol,
+            "{what} grad[{j}]: analytic={g:.6e}, fd={w:.6e}, rel={err:.2e}"
+        );
+    }
+}
+
+/// #1421: on a FREM covariate row the σ score must be the derivative of the
+/// objective that row actually contributes — `½·log σ_cov² + ½·r²/σ_cov²`, which
+/// depends on `EPSCOV` alone. The error model knows nothing about FREMTYPE, so
+/// asking it for that row's `∂V/∂log σ` charged the PK σ (`ADD`) a `2σ_ADD²`
+/// loading against a variance of `σ_cov²`, and gave `EPSCOV` nothing.
+///
+/// The fixture keeps both halves of that mistake observable: the covariate
+/// residuals are deliberately *not* `±σ_cov` (where `1/V − r²/V²` vanishes and
+/// the spurious `ADD` term with it), and `EPSCOV` is free, with the covariate
+/// rows its only source of score.
+///
+/// Mutation-checked, each half separately: deferring FREM rows to the error
+/// model (the pre-#1421 code) fails `ADD` (`grad[3]` 4.244 against FD 4.651);
+/// keeping the FREM arm but returning 0 for `EPSCOV` fails `grad[4]` (0
+/// against −6.500). The IOV twin below dies on both the same way.
+#[test]
+fn obs_nll_subject_grad_scores_frem_rows_against_the_covariate_sigma() {
+    use crate::types::{DoseEvent, Population};
+    let model = frem_free_cov_sigma_model(false);
+    let fc = model.frem_config.as_ref().expect("fixture is FREM");
+    assert_eq!(fc.covariate_sigma_index, 1, "EPSCOV is sigma slot 1");
+    let theta = vec![1.5f64, 20.0, 70.0];
+    let sigma_values = vec![0.5f64, 2.0];
+    let pk = |id: &str, scale: f64| Subject {
+        id: id.into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0, 8.0],
+        observations: vec![4.6 * scale, 3.5 * scale, 2.6 * scale],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        ..Default::default()
+    };
+    let population = Population {
+        // Covariate residuals 5 and −3 (η_WT = 0 / 1) against σ_cov = 2.
+        subjects: vec![
+            with_frem_rows(pk("1", 1.0), &[75.0]),
+            with_frem_rows(pk("2", 1.1), &[68.0]),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let etas: Vec<Vec<f64>> = vec![vec![0.0, 0.0], vec![0.05, 1.0]];
+    let (n_theta, n_sigma) = (theta.len(), sigma_values.len());
+    let n = n_theta + n_sigma;
+
+    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas, &[]);
+    let h = 1e-6;
+    let mut want = vec![0.0f64; n];
+    for i in 0..n_theta {
+        let mut tp = theta.clone();
+        tp[i] += h;
+        want[i] =
+            theta[i] * (obs_nll_sum(&model, &population, &tp, &sigma_values, &etas, &[]) - f0) / h;
+    }
+    for k in 0..n_sigma {
+        let mut sp = sigma_values.clone();
+        sp[k] += h;
+        want[n_theta + k] =
+            sigma_values[k] * (obs_nll_sum(&model, &population, &theta, &sp, &etas, &[]) - f0) / h;
+    }
+    // Non-degeneracy: EPSCOV must carry score, or a zero from the error model
+    // would pass against a zero reference.
+    assert!(
+        want[n_theta + 1].abs() > 0.1,
+        "EPSCOV carries no score on this fixture ({:.3e})",
+        want[n_theta + 1]
+    );
+
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let mut total_nll = 0.0f64;
+    let mut grad = vec![0.0f64; n];
+    let mut scratch = EventPkParams::default();
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let (nll_i, g_i) = obs_nll_subject_grad(
+            &model,
+            subject,
+            &theta,
+            &sigma_values,
+            &etas[i],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        total_nll += nll_i;
+        for (g, gi) in grad.iter_mut().zip(&g_i) {
+            *g += gi;
+        }
+    }
+    assert!((total_nll - f0).abs() < 1e-8, "{total_nll} vs {f0}");
+    assert_grad_close(&grad, &want, 1e-4, "FREM M-step");
+}
+
+/// The IOV twin of the test above: `obs_nll_subject_grad_iov` assembles its σ
+/// score in its own loop, so it gets its own FREM fixture.
+#[test]
+fn obs_nll_subject_grad_iov_scores_frem_rows_against_the_covariate_sigma() {
+    use crate::types::DoseEvent;
+    let model = frem_free_cov_sigma_model(true);
+    assert_eq!(model.n_kappa, 1, "fixture is IOV");
+    let theta = vec![1.5f64, 20.0, 70.0];
+    let sigma = vec![0.5f64, 2.0];
+    let subject = with_frem_rows(
+        Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            observations: vec![4.6, 4.0, 3.5, 7.4, 6.3, 5.5],
+            obs_cmts: vec![1; 6],
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+            ..Default::default()
+        },
+        &[75.0],
+    );
+    let eta = vec![0.1f64, 0.0];
+    let kappas: Vec<Vec<f64>> = vec![vec![0.05], vec![-0.05]];
+    let (n_theta, n_sigma) = (theta.len(), sigma.len());
+    let n = n_theta + n_sigma;
+    let mut scratch = EventPkParams::default();
+    let (nll, grad) = obs_nll_subject_grad_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &[true; 3],
+        &vec![-1e30; n],
+        &vec![1e30; n],
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+    let mut at = |th: &[f64], sg: &[f64]| {
+        obs_nll_subject_into_iov(&model, &subject, th, sg, &eta, &kappas, &mut scratch)
+    };
+    let f0 = at(&theta, &sigma);
+    assert!((nll - f0).abs() < 1e-10, "nll mismatch: {nll} vs {f0}");
+    let h = 1e-6;
+    let mut want = vec![0.0f64; n];
+    for i in 0..n_theta {
+        let mut tp = theta.clone();
+        tp[i] += h;
+        want[i] = theta[i] * (at(&tp, &sigma) - f0) / h;
+    }
+    for k in 0..n_sigma {
+        let mut sp = sigma.clone();
+        sp[k] += h;
+        want[n_theta + k] = sigma[k] * (at(&theta, &sp) - f0) / h;
+    }
+    assert!(
+        want[n_theta + 1].abs() > 0.1,
+        "EPSCOV carries no score on this fixture ({:.3e})",
+        want[n_theta + 1]
+    );
+    assert_grad_close(&grad, &want, 1e-4, "FREM IOV M-step");
+}
+
+/// #1421 lifted FREM out of the expected-information scope gap. On a
+/// paired-residual fixture — PK rows at `f ± √V`, covariate rows at
+/// `θ_cov + η_cov ± σ_cov` — the observed Hessian of the M-step objective *is*
+/// the expected information, so the closed form must reproduce it on FREM rows
+/// too, `EPSCOV`'s diagonal and the `TV_WT` row included.
+///
+/// Realised worst relative disagreement **1.815e-5**, at `(TVV, TVV)` — the
+/// forward-difference θ derivative, as on the PK-only fixture above; the bound
+/// is the same 2.1e-4. Mutation-checked: re-adding the pre-#1421 `frem_ov`
+/// gate withholds the information (this test alone dies), and dropping
+/// `obs_dvar_dlogsigma`'s FREM arm leaves `EPSCOV`'s diagonal at 0 against 8.
+#[test]
+fn fisher_information_matches_the_observed_hessian_on_frem_rows() {
+    use crate::types::{DoseEvent, Population};
+    let model = frem_free_cov_sigma_model(false);
+    let theta = vec![1.5f64, 20.0, 70.0];
+    let sigma_values = vec![0.5f64, 2.0];
+    let (n_theta, n_sigma) = (theta.len(), sigma_values.len());
+    let n = n_theta + n_sigma;
+    let etas = vec![vec![0.0f64, 0.0], vec![0.12, 3.0]];
+    let subjects: Vec<Subject> = etas
+        .iter()
+        .enumerate()
+        .map(|(i, eta)| {
+            let s = paired_residual_subject(
+                &model,
+                &format!("{}", i + 1),
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                &[0.5, 2.0, 6.0, 12.0],
+                &theta,
+                &sigma_values,
+                eta,
+            );
+            let f_cov = theta[2] + eta[1];
+            with_frem_rows(s, &[f_cov + sigma_values[1], f_cov - sigma_values[1]])
+        })
+        .collect();
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let mut scratch = EventPkParams::default();
+    let mut info = vec![0.0f64; n * n];
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let (_, _, fi) = obs_nll_subject_grad_fisher(
+            &model,
+            subject,
+            &theta,
+            &sigma_values,
+            &etas[i],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        let fi = fi.expect("FREM is inside the Gaussian scope (#1421)");
+        for (a, v) in fi.iter().enumerate() {
+            info[a] += v;
+        }
+    }
+    let href = fd_packed_hessian(&model, &population, &theta, &sigma_values, &etas, 1e-4);
+    let scale = href.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    // Both coordinates only the covariate rows inform must be live.
+    for a in [2, n_theta + 1] {
+        assert!(
+            href[a * n + a] > 1e-3 * scale,
+            "coordinate {a} carries no information on this fixture"
+        );
+    }
+    let mut worst = 0.0f64;
+    let mut worst_at = (0usize, 0usize);
+    for a in 0..n {
+        for b in 0..n {
+            let (got, want) = (info[a * n + b], href[a * n + b]);
+            assert!(
+                got.is_finite() && want.is_finite(),
+                "non-finite entry at ({a},{b}): info={got}, ref={want}"
+            );
+            let rel = (got - want).abs() / want.abs().max(1e-3 * scale);
+            if rel > worst {
+                worst = rel;
+                worst_at = (a, b);
+            }
+        }
+    }
+    assert!(
+        worst < 2.1e-4,
+        "expected information disagrees with the observed Hessian on FREM rows: \
+         worst relative {worst:.3e} at {worst_at:?} (info {:.6e} vs ref {:.6e})",
+        info[worst_at.0 * n + worst_at.1],
+        href[worst_at.0 * n + worst_at.1]
+    );
+}
