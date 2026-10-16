@@ -384,6 +384,14 @@ const OMEGA_SA_MAX_STEP: f64 = 0.1;
 ///
 /// It is deliberately not a fit option, because it restores the Robbins-Monro
 /// averaging every other SAEM statistic already has rather than adding a knob.
+///
+/// **Since #1464 the exploration half is per component.** A component the
+/// frozen-η objective identifies well (`SE(log σ_k)` at or under
+/// [`SIGMA_CAP_RELEASE_MAX_LOG_SE`]) is released from it during exploration,
+/// because there the cap protects nothing and its lag reaches every no-ETA θ
+/// through the shared objective (busulfan `TVQ`, ~15 IS units). The minority
+/// component this cap was measured on stays under it, and the convergence
+/// hand-off is unchanged for every component. See [`sigma_mstep_sa_steps`].
 const SIGMA_SA_MAX_STEP: f64 = 0.2;
 
 /// Default exploration-phase cap on the stochastic-approximation step for the
@@ -599,6 +607,107 @@ fn sigma_mstep_sa_step(gamma: f64, gamma_mstep: f64) -> f64 {
     gamma.min(SIGMA_SA_MAX_STEP).min(gamma_mstep)
 }
 
+/// Largest standard error of `log σ_k` — under the frozen-η conditional
+/// objective, from [`sigma_log_se`] — at which a residual σ component is
+/// released from [`SIGMA_SA_MAX_STEP`] during **exploration** (#1464).
+///
+/// The cap is load-bearing for one shape and biasing for another, and the
+/// difference is identification, not the error model. On cefepime (#1445) the
+/// additive term carries ~1 % of the residual variance at the observed
+/// concentrations; its per-draw maximiser is boundary-heavy and, assigned, puts
+/// the component on its floor. On busulfan both terms are pinned by ~5,400
+/// observations, the cap only slows σ's exploration trajectory, and that
+/// trajectory reaches the no-ETA `TVQ` through the same frozen-η objective the
+/// M-step maximises — leaving it ~0.2 log units off and the marginal
+/// likelihood ~15 units worse.
+///
+/// `SE(log σ)` is the statistic that separates them, and it is the right
+/// scale: it is how far, in log units, one draw's maximiser of that component
+/// can wander. Measured along 6-seed fits (`ferx-testdata`, default schedule):
+/// cefepime's `ADD_ERR` reads **0.15–0.24** throughout exploration; busulfan's
+/// reads 0.64 at its 1.0 start (a minority there, correctly held) and falls to
+/// **0.06** as it grows to its converged ~28; every proportional term reads
+/// 0.01–0.03. The threshold sits under the smallest cefepime value with 1.5×
+/// headroom. The same 6 seeds, on importance-sampled −2 log L against the
+/// always-capped schedule:
+///
+/// | | B2 cefepime | B6 busulfan, 600 subj | B6, `TVQ` FIX |
+/// |---|---|---|---|
+/// | cap on every component (pre-#1464) | 4296.02 ± 1.28 | 62379.42 ± 6.00 | 62343.79 ± 3.44 |
+/// | **release at SE ≤ 0.10** | 4295.85 ± 1.31 (−0.2) | **62363.80 ± 4.27 (−15.6)** | 62337.85 ± 5.21 (−5.9) |
+/// | release at SE ≤ 0.12 | 4297.00 ± 2.11 (+1.0) | 62364.65 ± 2.47 (−14.8) | 62335.90 ± 5.06 (−7.9) |
+/// | release every component | 4297.00 ± 1.07 (+1.0) | 62365.13 ± 3.10 (−14.3) | 62339.07 ± 4.55 (−4.7) |
+///
+/// and per-seed cefepime `ADD_ERR`, which is the readout that fails: capped
+/// 1.10–1.25, released at 0.10 **1.22–1.41**, released everywhere
+/// 1.18 / 0.735 / 1.35 / **0.051** / **0.104** / 1.06 — #1445 back on two
+/// seeds in six. Busulfan's `TVQ` goes from 11.7–15.3 to 8.8–11.5 (the
+/// `TVQ`-FIX control sits at 8.44), so most of the gain is the no-ETA θ, as
+/// #1464 measured.
+///
+/// It is not a fit option for the reason [`SIGMA_SA_MAX_STEP`] is not: it
+/// decides where an averaging that every other SAEM statistic already has is
+/// needed, rather than adding a knob.
+const SIGMA_CAP_RELEASE_MAX_LOG_SE: f64 = 0.1;
+
+/// Per-component σ step for this iteration (#1464): [`sigma_mstep_sa_step`]
+/// everywhere, except that during **exploration** a component whose
+/// `log_se[k] <= SIGMA_CAP_RELEASE_MAX_LOG_SE` takes `min(γ, γ_mstep)` — the
+/// θ half's step, so #1445's one-sided guarantee (σ never steps faster than θ)
+/// still holds, and with `mstep_damping` off that component is assigned the
+/// maximiser exactly as θ is.
+///
+/// `log_se` is [`sigma_log_se`]'s output; `None` (out of scope, not computed,
+/// or a singular block) keeps the cap on every component, which is the
+/// pre-#1464 schedule bit-for-bit. **Convergence is never released**: the
+/// hand-off cap — that `γ = 1/(k−k1) = 1` at `k = k1+1` must not overwrite
+/// the exploration average with one draw — is #1445's second half, and the
+/// #1464 measurement is of the first. It binds for four iterations either
+/// way.
+fn sigma_mstep_sa_steps(
+    gamma: f64,
+    gamma_mstep: f64,
+    exploring: bool,
+    log_se: Option<&[f64]>,
+    n_sigma: usize,
+) -> Vec<f64> {
+    let capped = sigma_mstep_sa_step(gamma, gamma_mstep);
+    (0..n_sigma)
+        .map(|k| match log_se.and_then(|se| se.get(k)) {
+            Some(&se) if exploring && se <= SIGMA_CAP_RELEASE_MAX_LOG_SE => gamma.min(gamma_mstep),
+            _ => capped,
+        })
+        .collect()
+}
+
+/// Is the #1464 per-component release of the σ exploration cap in scope for
+/// this fit? `None` means yes; `Some(reason)` keeps the cap on every component.
+///
+/// * Everything [`numerical_mstep_scope_gap`] excludes — IOV, mixture, M3, a
+///   `block_sigma` correlation, a TTE endpoint, `[covariate_nn]`, a residual
+///   magnitude, FREM. [`sigma_log_se`] is the σ–σ block of the same
+///   information, so it is defined on the same scope and no wider; outside it
+///   the frozen-η objective is conditioned on more than η, or the variance has
+///   a second channel the closed form does not carry.
+/// * **`iiv_on_ruv`.** σ shares a ridge with ω_RUV there (#895), η_RUV is
+///   re-centred into σ every iteration (#904), and that shape has its own open
+///   σ-side drift (#1421). The conditional SE is well defined — it is the
+///   *marginal* identification it misreads — and none of the #1464 benchmarks
+///   exercises it, so it keeps the measured #1445 schedule. Its default
+///   `mstep_damping` of 0.03 already sits under the cap anyway.
+fn sigma_cap_release_scope_gap(
+    model: &CompiledModel,
+    numerical_mstep_scope_gap: Option<&'static str>,
+) -> Option<&'static str> {
+    if numerical_mstep_scope_gap.is_some() {
+        return numerical_mstep_scope_gap;
+    }
+    if model.residual_error_eta.is_some() {
+        return Some("the model has `iiv_on_ruv`");
+    }
+    None
+}
+
 /// Sanitise the `mstep_damping` fit option at its point of use.
 ///
 /// The parser rejects anything outside `(0, 1]`, but `FitOptions` is public: a
@@ -672,12 +781,12 @@ fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
 /// the undamped assignment is reproduced bit-for-bit. A non-finite `new`
 /// (NLopt returned garbage for a coordinate) leaves that coordinate alone
 /// rather than poisoning the running average.
-fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
-    if gamma >= 1.0 {
-        cur.copy_from_slice(new);
-        return;
-    }
-    for (c, &n) in cur.iter_mut().zip(new.iter()) {
+fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: &[f64]) {
+    for ((c, &n), &gamma) in cur.iter_mut().zip(new.iter()).zip(gamma.iter()) {
+        if gamma >= 1.0 {
+            *c = n;
+            continue;
+        }
         if !n.is_finite() {
             continue;
         }
@@ -686,6 +795,111 @@ fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
             *c = 0.5 * blended.ln();
         }
     }
+}
+
+/// Per-component standard error of `log σ_k` under the frozen-η conditional
+/// objective, from the inverse of the σ–σ block of its expected information
+/// (#1464).
+///
+/// For a Gaussian observation with variance `V_j = Σ_k V_jk`, the information
+/// about `(log σ_a, log σ_b)` is
+///
+/// ```text
+/// I_ab = ½ Σ_j (∂V_j/∂log σ_a)(∂V_j/∂log σ_b) / V_j²
+/// ```
+///
+/// — the σ–σ block of the information [`MstepScoreSa`] accumulates, assembled
+/// from the same `dvar_dlogsigma`. It needs one prediction pass and no θ
+/// derivatives, because predictions do not depend on σ. The block is inverted
+/// rather than read off its diagonal so that two components the data cannot
+/// tell apart (an additive and a proportional term over a narrow concentration
+/// range) both read as weak, even when each one alone would look identified.
+///
+/// `free[k]` selects the components to include; a FIXed σ is a constant of the
+/// objective, not a coordinate of it. The returned vector is indexed like
+/// `sigma`, with `f64::INFINITY` for a component that is not free. `None` when
+/// there is no free component, the block is not positive definite, or a term
+/// is not finite — every caller reads `None` as "keep the cap", which is the
+/// pre-#1464 behaviour.
+///
+/// Scope is the caller's: [`sigma_cap_release_scope_gap`] must already have
+/// ruled out every residual channel this closed form does not describe.
+fn sigma_log_se(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma: &[f64],
+    free: &[bool],
+    etas: &[Vec<f64>],
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
+) -> Option<Vec<f64>> {
+    use rayon::prelude::*;
+    let free_idx: Vec<usize> = (0..sigma.len())
+        .filter(|&k| free.get(k).copied().unwrap_or(false))
+        .collect();
+    let m = free_idx.len();
+    if m == 0 {
+        return None;
+    }
+    // Collected in subject order and folded serially, as everywhere else in
+    // this file: a parallel reduction would depend on the worker count (#703).
+    let per_subj: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let preds = crate::pk::compute_predictions_with_tv_into_with_schedule(
+                model,
+                subject,
+                theta,
+                &etas[i],
+                scratch,
+                schedules.get(i).and_then(|s| s.as_ref()),
+            );
+            // An `iiv_on_ruv` scale `s` would multiply ∂V and V alike and
+            // cancel in ∂V·∂V/V², so the information is scale-free; that
+            // shape is out of scope anyway (`sigma_cap_release_scope_gap`).
+            let keys = model.error_spec.obs_keys(subject);
+            let mut info = vec![0.0f64; m * m];
+            let mut dv = vec![0.0f64; m];
+            for (j, &p) in preds.iter().enumerate().take(subject.observations.len()) {
+                let f = model.floor_prediction(p);
+                let v = model
+                    .residual_variance_at_scaled(keys[j], f, sigma, None)
+                    .max(1e-12);
+                for (a, &k) in free_idx.iter().enumerate() {
+                    dv[a] = model.error_spec.dvar_dlogsigma(keys[j], k, f, sigma);
+                }
+                for a in 0..m {
+                    for b in 0..m {
+                        info[a * m + b] += 0.5 * dv[a] * dv[b] / (v * v);
+                    }
+                }
+            }
+            info
+        })
+        .collect();
+    let mut info = DMatrix::<f64>::zeros(m, m);
+    for s in &per_subj {
+        for a in 0..m {
+            for b in 0..m {
+                info[(a, b)] += s[a * m + b];
+            }
+        }
+    }
+    if info.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let inv = info.cholesky()?.inverse();
+    let mut se = vec![f64::INFINITY; sigma.len()];
+    for (a, &k) in free_idx.iter().enumerate() {
+        let var = inv[(a, a)];
+        if !(var.is_finite() && var > 0.0) {
+            return None;
+        }
+        se[k] = var.sqrt();
+    }
+    Some(se)
 }
 
 /// Is the frozen-η M-step objective of this fit inside the plain Gaussian scope
@@ -980,7 +1194,10 @@ const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 /// `sigma_mstep_sa_step(g_k, gamma_mstep) = min(g_k, SIGMA_SA_MAX_STEP,
 /// gamma_mstep)` fraction of the way there **on the variance scale** — the same
 /// two lines the derivative-free arms run. It is one implementation, so a change
-/// to the policy cannot reach one arm and miss the other.
+/// to the policy cannot reach one arm and miss the other: since #1464 the caller
+/// computes the per-component vector once ([`sigma_mstep_sa_steps`], which
+/// releases a well-identified component during exploration) and hands the same
+/// vector to this arm and to the three blends.
 ///
 /// This is **not** the blend stacked on top of a `gamma`-scaled step — that
 /// really would move sigma at `gamma^2`. The step contributes the target; the
@@ -1129,7 +1346,7 @@ impl MstepScoreSa {
         sigma_upper: &[f64],
         theta_packs_log_mask: &[bool],
         gamma: f64,
-        gamma_mstep: f64,
+        gamma_sigma: &[f64],
         schedules: &[Option<crate::pk::event_driven::EventSchedule>],
     ) -> bool {
         use rayon::prelude::*;
@@ -1206,8 +1423,9 @@ impl MstepScoreSa {
         let g_eff = gamma.clamp(0.0, 1.0);
         // #1480: σ's coordinates of the step take the #1445 schedule, θ's take
         // `g_eff`. See the type's docs for why the shared step size was the
-        // #1445 single-draw readout in another spelling.
-        let g_sigma = sigma_mstep_sa_step(g_eff, gamma_mstep.clamp(0.0, 1.0));
+        // #1445 single-draw readout in another spelling. The caller hands the
+        // per-component schedule in from `sigma_mstep_sa_steps` (#1464), the
+        // same vector the derivative-free arms blend at.
         // The information is the matrix gain of the whole system, so it keeps
         // the shared γ — capping it per coordinate would not be a slower σ, it
         // would be a different (and asymmetric) preconditioner.
@@ -1272,7 +1490,7 @@ impl MstepScoreSa {
                     sigma_target[j] = (ls[j] + step).clamp(lower[i], upper[i]);
                 }
             }
-            damp_mstep_sigma_variance(&mut ls, &sigma_target, g_sigma);
+            damp_mstep_sigma_variance(&mut ls, &sigma_target, gamma_sigma);
             // Finiteness only - see "Why there is no generalised-EM guard".
             // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
             // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
@@ -4421,6 +4639,11 @@ pub fn run_saem(
     // Both need the plain Gaussian scope below; a model outside it keeps the
     // historical solver and is told so by name.
     let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, n_kappa, saem_mix.is_some());
+    // #1464: where the σ exploration cap may be lifted per component.
+    let sigma_cap_release_gap = sigma_cap_release_scope_gap(model, numerical_mstep_scope_gap);
+    let sigma_free: Vec<bool> = (0..n_sigma)
+        .map(|i| !init_params.sigma_fixed.get(i).copied().unwrap_or(false))
+        .collect();
     let (use_score_sa, mstep_draws, mstep_option_warnings) = resolve_mstep_options(
         options.saem_mstep_solver,
         options.saem_mstep_draws,
@@ -4541,9 +4764,6 @@ pub fn run_saem(
             gamma,
             mstep_damping_cap,
         );
-        // #1445: the σ half of that same joint maximiser takes its own,
-        // always-on Robbins-Monro step. See `sigma_mstep_sa_step`.
-        let gamma_sigma = sigma_mstep_sa_step(gamma, gamma_mstep);
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -5246,6 +5466,35 @@ pub fn run_saem(
             None
         };
         if run_mstep {
+            // #1445 / #1464: the σ half of the joint θ/σ maximiser takes its
+            // own Robbins-Monro step, per component. The exploration cap stays
+            // on a component the frozen-η objective identifies only weakly, and
+            // is lifted from one it identifies well — see
+            // `sigma_mstep_sa_steps`. The SE is read at this iteration's draw,
+            // before the M-step moves anything, and only where it can matter.
+            let sigma_se = if k <= k1
+                && sigma_cap_release_gap.is_none()
+                && scalar_residual_model.is_none()
+                && sigma_mstep_sa_step(gamma, gamma_mstep) < gamma.min(gamma_mstep)
+            {
+                let theta_now: Vec<f64> = (0..n_theta)
+                    .map(|i| unpack_theta(i, log_theta[i]))
+                    .collect();
+                let sigma_now: Vec<f64> = log_sigma.iter().map(|v| v.exp()).collect();
+                sigma_log_se(
+                    model,
+                    population,
+                    &theta_now,
+                    &sigma_now,
+                    &sigma_free,
+                    &state.etas,
+                    &schedules,
+                )
+            } else {
+                None
+            };
+            let gamma_sigma =
+                sigma_mstep_sa_steps(gamma, gamma_mstep, k <= k1, sigma_se.as_deref(), n_sigma);
             // Use a few more iterations after exploration, when the M-step is
             // expected to settle rather than find its basin.
             let mstep_maxiter = if k <= k1 { 3 } else { 5 };
@@ -5435,7 +5684,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
-                            gamma_mstep,
+                            &gamma_sigma,
                             &schedules,
                         );
                     } else {
@@ -5462,7 +5711,7 @@ pub fn run_saem(
                             &extra_eta_draws,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
                     }
                 }
             } else if use_closed_form_mstep {
@@ -5565,7 +5814,7 @@ pub fn run_saem(
                     &[],
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
             } else {
                 // mu_referencing = false (or a mixture whose class thetas could not
                 // be class-aware mu-referenced): full NLopt M-step for all thetas
@@ -5590,7 +5839,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
-                            gamma_mstep,
+                            &gamma_sigma,
                             &schedules,
                         );
                     } else {
@@ -5618,7 +5867,7 @@ pub fn run_saem(
                             &extra_eta_draws,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
                     }
                 }
             }
@@ -6621,7 +6870,7 @@ mod tests {
         );
 
         let wanted = format!(
-            "{}{sigma_arg},&sigma_new,gamma_sigma)",
+            "{}{sigma_arg},&sigma_new,&gamma_sigma)",
             "damp_mstep_sigma_variance"
         );
         let calls = src.matches(&wanted).count();
@@ -6631,29 +6880,29 @@ mod tests {
              blend σ at γ_σ; found {calls} of `{wanted}`"
         );
 
-        // ...and that the γ they are handed is the σ schedule, not θ's.
+        // ...and that the γ they are handed is the per-component σ schedule
+        // (#1464), not θ's.
         let schedule = format!(
-            "letgamma_sigma={}(gamma,gamma_mstep)",
-            "sigma_mstep_sa_step"
+            "letgamma_sigma={}(gamma,gamma_mstep,",
+            "sigma_mstep_sa_steps"
         );
         assert!(
             src.contains(&schedule),
             "γ_σ must come from the σ schedule: `{schedule}` not found"
         );
 
-        // #1480: the `score_sa` arm is the fourth consumer of the same policy,
-        // and it reaches it through `step`'s `gamma_mstep` argument. Passing
-        // `gamma` there instead is a **no-op under the shipped default**
-        // (`min(γ, 0.2, γ)` and `min(γ, 0.2, 1)` are the same number), so it is
-        // invisible to every fit in the repo that does not set `mstep_damping`;
-        // `mstep_damping_reaches_sigma_under_score_sa` in
-        // `tests/saem_covariate_mu_ref.rs` is the behavioural test that kills
-        // it, and this is the cheap structural half that names the call shape.
-        let sa_call = format!("gamma,{}_mstep,&schedules,", "gamma");
+        // #1480: the `score_sa` arm is the fourth consumer of the same policy.
+        // Since #1464 it is handed the same per-component `gamma_sigma` vector
+        // the three blends above use, so the policy is computed once per
+        // iteration; `mstep_damping_reaches_sigma_under_score_sa` in
+        // `tests/saem_covariate_mu_ref.rs` is the behavioural test that
+        // `gamma_mstep` still reaches σ through it, and this is the cheap
+        // structural half that names the call shape.
+        let sa_call = format!("gamma,&{}_sigma,&schedules,", "gamma");
         let sa_calls = src.matches(&sa_call).count();
         assert_eq!(
             sa_calls, 2,
-            "expected the two `score_sa` M-step arms (mu-ref and              mu_referencing = false) to hand `MstepScoreSa::step` both γ and              γ_mstep, so σ can take the #1445 schedule; found {sa_calls} of              `{sa_call}`"
+            "expected the two `score_sa` M-step arms (mu-ref and              mu_referencing = false) to hand `MstepScoreSa::step` γ and the              per-component γ_σ, so σ takes the #1445 / #1464 schedule; found {sa_calls} of              `{sa_call}`"
         );
     }
 
@@ -6674,14 +6923,14 @@ mod tests {
         for g in [1.0_f64, 2.0] {
             let mut cur = [0.5_f64, -1.0];
             let new = [(0.2_f64).ln(), (3.0_f64).ln()];
-            damp_mstep_sigma_variance(&mut cur, &new, g);
+            damp_mstep_sigma_variance(&mut cur, &new, &[g; 2]);
             assert_eq!(cur, new, "γ = {g} must assign outright");
         }
 
         // A FIXed / pinned σ (NLopt returns it unchanged) is a no-op at any γ.
         for g in [0.0_f64, 0.1, 0.5, 1.0] {
             let mut cur = [(1.7_f64).ln(); 2];
-            damp_mstep_sigma_variance(&mut cur, &[(1.7_f64).ln(); 2], g);
+            damp_mstep_sigma_variance(&mut cur, &[(1.7_f64).ln(); 2], &[g; 2]);
             for c in cur {
                 assert!(
                     (c - (1.7_f64).ln()).abs() < 1e-15,
@@ -6694,7 +6943,7 @@ mod tests {
         // is a floating-point tolerance and nothing else:
         // σ = √(0.75·2² + 0.25·4²) = √7 = 2.6457513110645906.
         let mut cur = [(2.0_f64).ln()];
-        damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], 0.25);
+        damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], &[0.25]);
         let want = 7.0_f64.sqrt();
         assert!(
             (cur[0].exp() - want).abs() < 1e-12,
@@ -6716,7 +6965,7 @@ mod tests {
         // poisoning the running average with NaN.
         let mut cur = [(1.5_f64).ln(), (2.5_f64).ln()];
         let before = cur;
-        damp_mstep_sigma_variance(&mut cur, &[f64::NAN, f64::INFINITY], 0.1);
+        damp_mstep_sigma_variance(&mut cur, &[f64::NAN, f64::INFINITY], &[0.1; 2]);
         assert_eq!(cur, before);
 
         // The discriminator. A boundary-heavy sequence — half the M-step
@@ -6735,7 +6984,7 @@ mod tests {
         let mut log_scale = [(1.0_f64).ln()];
         for (i, &s) in seq.iter().enumerate() {
             let g = 1.0 / (i + 1) as f64;
-            damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], g);
+            damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], &[g]);
             damp_mstep(&mut log_scale, &[s.ln()], g);
         }
         let want_var = 1.414_231_239_932_140_6_f64;
@@ -11402,3 +11651,7 @@ mod hotpath_tests;
 #[cfg(test)]
 #[path = "saem_mstep_sa_tests.rs"]
 mod mstep_sa_tests;
+
+#[cfg(test)]
+#[path = "saem_sigma_release_tests.rs"]
+mod sigma_release_tests;

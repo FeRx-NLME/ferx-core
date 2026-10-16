@@ -156,6 +156,27 @@ $$
 
 **Damped σ step.** The residual σ that rides the numerical M-step gets its own capped step, $\gamma_k^\sigma = \min(\gamma_k,\,0.2,\,\gamma_k^\theta)$, applied to $\sigma^2$ rather than to $\log\sigma$ (issue #1445). Until then it was the one SAEM statistic with no stochastic approximation at all — assigned outright in both phases — so the reported σ was a single draw of the M-step maximiser rather than its average. The cap is on in **both** phases, which is what distinguishes it from the Ω step: Ω accepts the $\gamma=1$ assignment at the first convergence iteration because $(1/N)\sum_i \eta_i\eta_i^T$ over $N$ subjects is a well-determined statistic, while the σ maximiser of a *minority* variance component is not. The additive half of a `combined(PROP, ADD)` model on sparse data is exactly that: its single-draw conditional maximiser is boundary-heavy, so an assigned σ reports whichever value the last iteration happened to draw. Beyond $k-K_1 = 5$ the cap no longer binds and the full decaying $\gamma_k = 1/(k-K_1)$ takes over, which is what lets the SA estimate settle. Averaging on the variance scale is deliberate — it is the scale the [scalar residual sufficient statistic](#scalar-residual-error-update) already averages on, and a geometric mean of a sequence with mass near zero collapses where the arithmetic mean of $\sigma^2$ does not (measured: $\log\sigma$ averaging leaves the #1445 fixture's $\sigma_{\text{add}}$ at 0.47 against a truth of 1.8, where the $\sigma^2$ average reaches 1.4). The third term is one-sided: σ never steps *faster* than θ, but the two are not always equal. They are equal during **exploration** whenever `mstep_damping` is at or below 0.2 (the `iiv_on_ruv` default of 0.03 is), and from the fifth convergence iteration on, where $1/(k-K_1) \le 0.2$. They differ over the four hand-off iterations $k-K_1 \in \{1,2,3,4\}$ — θ takes 1, ½, ⅓, ¼ while σ takes 0.2 — and during exploration for any `mstep_damping` above 0.2, where σ is the slower of the two. So no configuration, `iiv_on_ruv` included, is bit-identical to before; what is preserved is that σ is never given a larger step than the θ it shares a maximiser with.
 
+#### Which σ components the exploration cap applies to {#saem-sigma-cap-release}
+
+Since issue #1464 the exploration half of that cap is **per component**. The cap protects a variance component that the data identify only weakly. For one the data pin down, it only slows σ's exploration trajectory. That trajectory reaches every θ without an ETA through the same frozen-η objective the numerical M-step maximises. At each exploration M-step ferx computes the standard error of $\log\sigma_k$ under that objective, from the inverse of the σ–σ block of its expected information at the current draw:
+
+$$
+I_{ab} = \tfrac12 \sum_j \frac{\partial V_j/\partial\log\sigma_a \;\, \partial V_j/\partial\log\sigma_b}{V_j^2}.
+$$
+
+The block is inverted rather than read off its diagonal, so two components the data cannot tell apart both read as weak. A component with $\mathrm{SE}(\log\sigma_k) \le 0.10$ takes θ's step, $\min(\gamma_k, \gamma_k^\theta)$, and keeps the guarantee that σ never steps faster than θ. Every other component keeps the 0.2 cap. The convergence hand-off is unchanged for every component.
+
+That standard error is how far one draw's maximiser of the component can wander, in log units. Measured along 6-seed fits, cefepime's additive term reads 0.15–0.24 throughout exploration. Busulfan's additive term starts at 0.64 from its 1.0 initial estimate (a minority at that point, so it is correctly held) and falls to 0.06 once it has grown to its converged ~28. Every proportional term reads 0.01–0.03. On importance-sampled −2 log L over the same 6 seeds, against the cap on every component:
+
+| | cefepime (run64) | busulfan, 600 subjects | busulfan, `TVQ` FIX |
+|---|---|---|---|
+| release at SE ≤ 0.10 (shipped) | −0.2 | **−15.6** | −5.9 |
+| release every component | +1.0 | −14.3 | −4.7 |
+
+The table hides the readout that fails. Releasing every component puts cefepime's `ADD_ERR` at 0.051 and 0.104 on two seeds in six, which is #1445 again. The shipped gate keeps all six at 1.22–1.41, up from 1.10–1.25 with the cap everywhere and closer to NONMEM FOCEI's 1.550 on the same data. On busulfan the no-ETA `TVQ` moves from 11.7–15.3 to 8.8–11.5; the `TVQ`-FIX control sits at 8.44.
+
+The release applies only in the plain Gaussian scope of [`mstep_solver = score_sa`](#saem-mstep-jensen), and not to `iiv_on_ruv` models. An `iiv_on_ruv` σ shares a ridge with ω_RUV, and the conditional standard error misreads that ridge. Outside that scope the schedule is the #1445 one unchanged.
+
 ### 3. M-Step for Omega (Closed Form)
 
 $$
