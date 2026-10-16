@@ -160,6 +160,35 @@ pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
     t - t_start >= EVENT_MATCH_TOL && t <= t_end
 }
 
+/// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
+/// `times` that [`reads_in_segment`] assigns to it, plus `t_end` itself so the state still
+/// advances through a segment that reads nothing (two doses with no record between them),
+/// sorted so the solver's linear save cursor works on out-of-order input.
+///
+/// Duplicates are dropped only when **bit-identical**. Every caller maps the returned points
+/// back to its records by `t.to_bits()`, so a time dropped here is a record never written.
+/// The callers used to dedup at `1e-15`, which merges a time with the one a ULP below it at
+/// any time up to `8.0` (one ULP below `8.0` is `8.9e-16`), and one ULP is exactly how far
+/// the reader moves the first of two co-timed records below their tie (#614, #1810). The
+/// record left at the tie then kept a `NaN` prediction whenever no break sat at that time to
+/// read it instead: two observations at one `TIME` with an EVID=2 row listed after the
+/// first, or an observation each side of a lagged dose. The solver needs no merging of
+/// near-equal entries: after each accepted step it saves every entry within `1e-12`, each
+/// under its own time and with the same state.
+pub(crate) fn segment_saveat(times: &[f64], t_start: f64, t_end: f64) -> Vec<f64> {
+    let mut saveat: Vec<f64> = times
+        .iter()
+        .copied()
+        .filter(|&t| reads_in_segment(t, t_start, t_end))
+        .collect();
+    if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
+        saveat.push(t_end);
+    }
+    saveat.sort_by(f64::total_cmp);
+    saveat.dedup_by(|a, b| a.to_bits() == b.to_bits());
+    saveat
+}
+
 /// A subject's record times sorted once, for resolving which records each break claims.
 ///
 /// Built per subject and queried per break, so the whole break loop costs
@@ -3590,18 +3619,7 @@ fn integrate_segment(
     // the half-open `(t_start, t_end]` minus `t_start`'s own band: the upper bound is
     // **exact**, so a time up to `EVENT_MATCH_TOL` past `t_end` belongs to `t_end`'s band
     // on the next iteration, post-event, rather than to this pre-event integration (#1226).
-    let mut saveat: Vec<f64> = subject
-        .obs_times
-        .iter()
-        .filter(|&&t| reads_in_segment(t, t_start, t_end))
-        .cloned()
-        .collect();
-    // Always include t_end so u is updated for next segment
-    if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
-        saveat.push(t_end);
-    }
-    saveat.sort_by(|a, b| a.total_cmp(b));
-    saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    let saveat = segment_saveat(&subject.obs_times, t_start, t_end);
 
     if (t_end - t_start).abs() < 1e-15 {
         return Vec::new();
@@ -7640,24 +7658,10 @@ pub fn ode_predictions_with_states(
         }
         let t_end = break_times[k + 1];
 
-        let mut saveat: Vec<f64> = subject
-            .obs_times
-            .iter()
-            .cloned()
-            .filter(|&t| reads_in_segment(t, t_start, t_end))
-            .collect();
-        // Always include t_end so u is advanced to segment end, even when there
-        // are no observations in the segment (e.g. two doses with no obs between
-        // them). Without this, solve_ode returns an empty solution and u is not
-        // updated, leaving the wrong (undecayed) state for the next segment.
-        if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
-            saveat.push(t_end);
-        }
-        // Mirror ode_predictions lines 530-531: sort + dedup so solve_ode's
-        // linear save_idx cursor works correctly even if obs_times contains
-        // duplicate entries or arrives out of order.
-        saveat.sort_by(|a, b| a.total_cmp(b));
-        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+        // The same save points as `ode_predictions`. `t_end` is always among them, so
+        // `u` advances through a segment with no observations; without it solve_ode
+        // returns an empty solution and the next segment starts from an undecayed state.
+        let saveat = segment_saveat(&subject.obs_times, t_start, t_end);
 
         // TAD anchor: last effective dose time before this segment, SS-aware.
         // For SS doses, rem_euclid maps the elapsed time back into [0, II) so
@@ -8291,21 +8295,7 @@ pub(crate) fn ode_dense_solve_states_reading(
             break;
         };
 
-        let mut seg_saveat: Vec<f64> = saveat
-            .iter()
-            .cloned()
-            .filter(|&t| reads_in_segment(t, t_start, t_end))
-            .collect();
-        // Always include t_end so u advances through empty segments (e.g. two
-        // consecutive doses with no saveat points between them).
-        if seg_saveat.is_empty() || (seg_saveat.last().unwrap() - t_end).abs() > 1e-12 {
-            seg_saveat.push(t_end);
-        }
-        // Mirror ode_predictions lines 530-531 (and the same fix applied to
-        // ode_predictions_with_states): sort + dedup so solve_ode's linear
-        // save_idx cursor works correctly for duplicate / out-of-order times.
-        seg_saveat.sort_by(|a, b| a.total_cmp(b));
-        seg_saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+        let seg_saveat = segment_saveat(saveat, t_start, t_end);
 
         let wrapped_rhs = wrap_rhs_with_forcings(
             ode,
