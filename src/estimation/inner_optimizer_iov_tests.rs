@@ -4524,7 +4524,7 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
             "{label}: the inner gradient must be analytic"
         );
         let layout = NestedLayout::of(&model, subject).expect("prepared");
-        let b = fx::point(&model, &layout, 1.0);
+        let b = fx::point(&layout, 1.0);
         let k = iov_occasion_groups(subject).len();
         let mult = model.ruv_obs_mult(subject, &params.theta);
         let g = analytic_eta_nll_gradient_iov(
@@ -4606,24 +4606,70 @@ fn the_nested_walks_decline_a_transit_twin_and_an_unprepared_subject() {
         iov_fd_reason(&transit, &pop.subjects[0]),
         "nested variability levels on a closed-form transit/IG model"
     );
-    for src in [fx::closed_form(), fx::ode()] {
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
         let (m, pop) = fx::prepared(&src, 1);
         let prepared = &pop.subjects[0];
         assert_eq!(
             walks(&m, prepared),
             (true, true),
-            "the prepared twin is served"
+            "{label}: the prepared twin is served"
         );
         // Unprepared: occasion labels no longer parallel to the records.
         let mut bare = prepared.clone();
         bare.occasions.pop();
         assert!(crate::stats::stacked_layout::StackedLayout::sens_of(&m, &bare).is_none());
-        assert_eq!(walks(&m, &bare), (false, false), "unprepared subject");
-        if m.ode_spec.is_some() {
-            assert_eq!(
-                iov_fd_reason(&m, &bare),
-                "nested-level subject without level cells"
-            );
-        }
+        assert_eq!(
+            walks(&m, &bare),
+            (false, false),
+            "{label}: unprepared subject"
+        );
+        assert_eq!(
+            iov_fd_reason(&m, &bare),
+            "nested-level subject without level cells",
+            "{label}"
+        );
+    }
+}
+
+/// #1082 PR3, review 1 finding 1: the nested EBE search really runs on the analytic
+/// gradient. `find_ebe_iov` searches the compact vector, and `agrad` must hand the walk
+/// the per-cell stack; handed the compact one, the analytic gradient declines and every
+/// step silently falls back to FD while the fit still reports the analytic route. So the
+/// route is read off `agrad` itself (`IOV_AGRAD_ROUTE`): analytic steps taken, FD none —
+/// on each walk, and on a solve long enough to take several steps.
+#[test]
+fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (m, pop) = fx::prepared(&src, 1);
+        let stage = FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(
+            &m,
+            &pop.subjects[0],
+            &m.default_params,
+            200,
+            1e-8,
+            None,
+            None,
+            0,
+            &stage,
+        );
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(ebe.converged && ebe.nll.is_finite(), "{label}");
+        assert!(analytic >= 3, "{label}: {analytic} analytic steps");
+        assert_eq!(fd, 0, "{label}: {fd} steps fell back to FD");
     }
 }

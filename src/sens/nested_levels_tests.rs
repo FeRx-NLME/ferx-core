@@ -140,7 +140,7 @@ impl Fd<'_> {
 /// The compact layout, the evaluation point and the stacked vector the walks read.
 fn point(model: &CompiledModel, subject: &Subject) -> (NestedLayout, Vec<f64>, Vec<f64>) {
     let layout = NestedLayout::of(model, subject).expect("prepared");
-    let b = fx::point(model, &layout, 1.0);
+    let b = fx::point(&layout, 1.0);
     let stacked = fx::stacked(&layout, &b);
     // The straddle that makes the compact axes observable at all: the stacked vector the
     // walks read is wider than the compact one they differentiate over.

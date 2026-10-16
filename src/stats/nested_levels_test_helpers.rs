@@ -162,7 +162,7 @@ pub(crate) fn prepared(src: &str, n_subjects: usize) -> (CompiledModel, Populati
 
 fn with_data(model: &CompiledModel, s: &mut Subject, i: usize) {
     let layout = NestedLayout::of(model, s).expect("prepared");
-    let b = point(model, &layout, 0.6 + 0.2 * i as f64);
+    let b = point(&layout, 0.6 + 0.2 * i as f64);
     let f = crate::pk::predict_iov(
         model,
         s,
@@ -187,8 +187,7 @@ fn with_data(model: &CompiledModel, s: &mut Subject, i: usize) {
 
 /// A compact vector with every entry non-zero and distinct, scaled by `scale`: η first,
 /// then each κ block (study, then arm).
-pub(crate) fn point(model: &CompiledModel, layout: &NestedLayout, scale: f64) -> Vec<f64> {
-    let _ = model;
+pub(crate) fn point(layout: &NestedLayout, scale: f64) -> Vec<f64> {
     (0..layout.n_compact())
         .map(|i| scale * 0.1 * (1.0 + 0.37 * i as f64).sin())
         .collect()

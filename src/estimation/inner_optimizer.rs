@@ -222,6 +222,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
     }
+    // A nested-level subject never given its cells has no compact axes (#1082): every walk
+    // declines it (`StackedLayout::sens_of` is `None`), on every model class.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return "nested-level subject without level cells";
+    }
     // #814: attribute against the *effective* model for this subject. A closed-form
     // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
     // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
@@ -284,14 +289,15 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if eff.ss_absorption_out_of_scope(subject) {
             return "steady-state dose + built-in absorption forcing";
         }
-        let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
-        else {
-            return "nested-level subject without level cells";
-        };
+        let layout = crate::stats::stacked_layout::StackedLayout::of(eff, subject);
         if layout.n_groups() == 0 {
             return "no observation occasions";
         }
-        let m_dim = eff.n_theta + layout.n_axes();
+        // The walk's width: the compact axis count under nested levels (the unprepared
+        // case returned above, so `sens_of` only falls back for a model without levels).
+        let n_axes = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
+            .map_or(layout.n_stacked(), |l| l.n_axes());
+        let m_dim = eff.n_theta + n_axes;
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
@@ -2313,6 +2319,16 @@ fn find_ebe_solve(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `(analytic, finite-difference)` gradient steps `find_ebe_iov`'s `agrad` has taken on
+    /// this thread when the analytic inner route is in scope. The FD arm is a silent
+    /// per-iterate fallback — the fit still reports the analytic route — so a test that
+    /// means "the search ran on the analytic gradient" reads this (#2053 review 1).
+    pub(crate) static IOV_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
 /// where bsv_psi = bsv_eta + mu (matches the non-IOV path's mu-referencing
 /// shift). Kappas are zero-centered IOV draws and are not mu-shifted.
@@ -2501,8 +2517,16 @@ fn find_ebe_iov(
             mult.as_deref(),
             frozen,
         ) {
-            Some(g) => g,
-            None => gradient_fd(&obj, p, n_flat),
+            Some(g) => {
+                #[cfg(test)]
+                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                g
+            }
+            None => {
+                #[cfg(test)]
+                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                gradient_fd(&obj, p, n_flat)
+            }
         }
     };
 
