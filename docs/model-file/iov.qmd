@@ -377,6 +377,64 @@ This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `
 
 **Identifiability.** A rule that yields only one occasion for every subject (e.g. `time(...)` breakpoints outside the sampling window, or `dose` on single-dose subjects) leaves kappa confounded with between-subject variability, so `fit()` errors. The count is over doses and observations: an `EVID=2` or `MDV=1` row that a breakpoint puts in an occasion of its own lies before or after all of them, so its κ informs nothing and does not lift the error. Set breakpoints inside the sampling window, use `dose` on a multiple-dose design, or supply an `iov_column`. On the other end, `dose` on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer `time(...)` windows there. If the model declares no `kappa`, `iov_occasion` has no effect and a warning says so.
 
+## Nested levels below the subject (`level … by … in …`) {#nested-levels}
+
+The occasion is one level of grouping below `ID`. A model can declare several, nested inside each other: sponsor → study → arm for a model-based meta-analysis, or subject → period → day in a clinical study. Each kappa lives at one level and is drawn once per group of that level, so a study effect is shared by every arm of the study while each arm gets its own arm effect.
+
+All levels are integrated inside one subject. The coarsest grouping that needs a random effect is `ID` (in the meta-analysis below, the sponsor), and everything finer is a level. The FOCE/FOCEI marginal of each subject is the exact one over all of its random effects together, as for ordinary IOV.
+
+### Declaring levels {#nested-levels-declaring}
+
+```
+[parameters]
+  omega ETA_SP ~ 0.09                       # at ID: one per sponsor
+  level STUDY by STUDY in ID                # groups of rows with one STUDY value, inside a subject
+  level ARM   by ARM   in STUDY             # groups with one ARM value, inside a study
+  kappa K_ST  ~ 0.04 at STUDY               # between-study, unweighted
+  kappa K_ARM ~ 4.0  at ARM weight = NARM   # between-arm, gamma^2 / NARM
+
+[individual_parameters]
+  EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)
+```
+
+- `level NAME by COLUMN in PARENT` declares a level. `PARENT` is `ID` for the first level and the level declared just before it for each later one, so the levels form one chain. Two levels inside the same parent would be *crossed* levels, which are not supported.
+- `kappa … at LEVEL` (or `block_kappa (…) = […] at LEVEL`) attaches a kappa to a level. A block lives at one level, so random effects at two levels are never correlated. Once a `level` is declared, every kappa says where it lives.
+- **Groups are nested by key.** A group is identified by its labels from the outermost level down, so `ARM = 1` in study 1 and `ARM = 1` in study 2 are two different arms. Arm labels need not be unique across studies, and numbering them uniquely gives the same fit to the bit.
+- **The weight is on the kappa**, exactly as for [sample-size-weighted IOV](#sample-size-weighted-iov-weight-...): one level can hold a weighted and an unweighted kappa. `weight = W` scales that kappa's variance to `γ²/W`. `W` must be constant within a group of the kappa's own level; `W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION` names the group where it is not.
+- **Centering.** The prior of every level has mean zero, and the estimated random effects of a level are not forced to average to zero. That is NONMEM's `LEVCENTER = 0`.
+
+**One level is today's IOV.** `level OCC by OCC in ID` with `kappa … at OCC` is the explicit spelling of `iov_column = OCC`. It reads the same column the same way and fits to the same bits, so it works with every method that supports IOV. A `level` replaces `iov_column` and `iov_occasion` rather than combining with them. Writing both in the model file, setting `iov_occasion` to `dose` or `time(...)` in the fit options of a model with nested levels, or a kappa without `at` once levels are declared, is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`.
+
+### The data {#nested-levels-data}
+
+The level columns are read with the data, like covariates, so they need no `[covariates]` declaration. Every record needs a value in every level column, since its group at each level is identified by those values, and a label is a **numeric code**: a text id such as `NCT01` has to be written as a number. A record with no numeric value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time.
+
+Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group. This holds when the data are read for the model: by the model file's own fit, by `read_population_for` (the CLI and the R package use it) and by `ferx check --data`. The model-blind readers (`read_nonmem_csv*`) carry a blank level cell forward like any covariate, so a population built with them should have a label on every row.
+
+A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
+
+### What this release supports {#nested-levels-scope}
+
+Nested levels (more than one `level`) are estimated with `method = foce` or `focei` at `n_agq = 1`. In this release:
+
+- **Gradients are finite differences.** The fit reports `gradient_method_inner` as `finite differences`, `optimizer = auto` takes its derivative-free choice for the outer loop, and the covariance step finite-differences the objective. The analytic sensitivities follow in a later release.
+- **Other estimators are refused** with `E_NESTED_LEVEL_METHOD_UNSUPPORTED`: SAEM, IMP, IMPMAP, Bayes, VI, Laplace and FOCEI quadrature, GN, a `[mixture]` and FREM. Each is enabled later with its own anchor. A single level is not affected.
+- **Simulation is refused** with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`, on `simulate()` and the adaptive-dosing entry points: the simulator draws one kappa per occasion, and a kappa at an outer level must be drawn once per group.
+- **A residual `correlation … by` line** is refused with `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED`.
+- **A `theta NAME[COL, …]` level block** whose levels each lie inside one group of a level that carries a kappa could absorb that kappa. The check that decides whether it does is not yet available for nested levels, so such a model is refused with `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`. A block whose levels cross those groups (`PLACEBO[TIME]`, say) fits as before.
+- **Post-fit output is per occasion cell.** Each distinct combination of labels (one arm of one study) is reported as one occasion: `FitResult.ebe_kappas` holds, per cell, the kappas that cell reads, so a study kappa appears once for each of its arms. Kappa shrinkage and the typical arm size are taken over those cells, not over the groups of each kappa's level. Output per level follows in a later release.
+
+### Validation against NONMEM {#nested-levels-nonmem}
+
+NONMEM's exact spelling of nested levels is the IOV idiom: re-base `ID` at the coarsest level and write each finer level's random effects as occasion-style `ETA` slots with `$OMEGA BLOCK(1) SAME`, the arm-size weight written by hand as `ETA/SQRT(NARM)`. ferx is anchored against that coding on a synthetic three-level arm-mean dataset (12 sponsors × 2 studies × 2 arms × 5 visits, `nonmem_anchor/nested_levels_3.*`). At NONMEM 7.6.0's FOCEI optimum both engines evaluate the same parameters:
+
+| | NONMEM 7.6.0 | ferx |
+|---|---|---|
+| OFV | 107.04357106 | 107.04357096 |
+| worst \|Δ\| over the 108 compared η̂ and κ̂ (84 distinct: each study κ̂ is read by both of its arms) | | 8.5e-6 |
+
+NONMEM's `$LEVEL` is a different object and is not an oracle for this: its help describes its FOCE as a linearized approximation at the super-ID level. On the same data it recovers γ² = 0.88 against a truth of 4 (the IOV-idiom coding recovers 3.76), and its covariance step aborts.
+
 ## Algorithm Details
 
 ### Inner loop
@@ -482,4 +540,5 @@ That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's 
 | Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |
 | Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]`; `OCC` can also be read in `[individual_parameters]` (`if (OCC == 2) …`), no `[covariates]` declaration needed |
 | Occasion from model | `IF(TIME.LT.24) OCC=1` logic in `$PK` | `iov_occasion = dose` or `time(...)` in `[fit_options]` |
+| Nested levels below the subject | `ETA` slots per level with `$OMEGA BLOCK(1) SAME` under a re-based `ID` (`$LEVEL` is a linearized approximation) | `level NAME by COL in PARENT` and `kappa … at NAME` ([nested levels](#nested-levels)) |
 | Kappa in PK | `ETA(n)` with `SAME` block | `KAPPA_xxx` in `[individual_parameters]` |
