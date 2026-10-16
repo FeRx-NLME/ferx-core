@@ -1038,6 +1038,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_restarts,
                 cache,
                 policy,
+                options.cancel.as_ref(),
                 take_terminal_work,
             ),
             None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
@@ -1051,9 +1052,23 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 policy,
+                options.cancel.as_ref(),
                 take_terminal_work,
             ),
         };
+        // A cancel observed during the pass left placeholders, not modes: do not run
+        // the quadrature on them (#574).
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return (
+                etas,
+                h_matrices,
+                stats,
+                kappas,
+                f64::INFINITY,
+                None,
+                Vec::new(),
+            );
+        }
         let n_nodes = options.agq_nodes().expect("AGQ branch");
         let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
             Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
@@ -1132,6 +1147,7 @@ fn run_inner_loop_and_nll_prepared(
             options.inner_restarts,
             cache,
             policy,
+            options.cancel.as_ref(),
             finish_subject,
         )
     } else {
@@ -1146,10 +1162,16 @@ fn run_inner_loop_and_nll_prepared(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             policy,
+            options.cancel.as_ref(),
             finish_subject,
         )
     };
-    let nll = contributions.iter().sum();
+    // A cancelled pass sums placeholder contributions (#574); never report it as an OFV.
+    let nll = if crate::cancel::is_cancelled(&options.cancel) {
+        f64::INFINITY
+    } else {
+        contributions.iter().sum()
+    };
     (etas, h_matrices, stats, kappas, nll, None, contributions)
 }
 

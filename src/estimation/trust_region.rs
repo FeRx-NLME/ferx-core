@@ -193,6 +193,11 @@ impl CostFunction for FoceiProblem<'_> {
 
     fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
         let (etas, h_mats) = self.run_inner(p);
+        // A cancel during the inner pass leaves placeholder EBEs (#574): score the trial
+        // as rejected and keep it out of the gradient cache.
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return Ok(1e20);
+        }
         let ofv = self.ofv_fixed(p, &etas, &h_mats);
         // Pre-warm the gradient cache with EBEs so that a subsequent
         // gradient() call on the same x skips the redundant run_inner().
@@ -482,6 +487,8 @@ struct TrustRegionWithStop {
     ever_progressed: bool,
     /// Verbose diagnostics for the iteration trace.
     verbose: bool,
+    /// Cooperative cancel (#574): polled at every iteration boundary.
+    cancel: Option<crate::cancel::CancelFlag>,
 }
 
 impl TrustRegionWithStop {
@@ -507,6 +514,7 @@ impl TrustRegionWithStop {
             stalled_iters: 0,
             ever_progressed: false,
             verbose: options.verbose,
+            cancel: options.cancel.clone(),
         }
     }
 
@@ -568,6 +576,11 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
     }
 
     fn terminate(&mut self, state: &TrState) -> TerminationStatus {
+        if crate::cancel::is_cancelled(&self.cancel) {
+            return TerminationStatus::Terminated(TerminationReason::SolverExit(
+                TRUST_REGION_CANCELLED.to_string(),
+            ));
+        }
         let x = match state.get_param() {
             Some(p) => p.clone(),
             None => return TerminationStatus::NotTerminated,
@@ -583,6 +596,9 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
         TerminationStatus::NotTerminated
     }
 }
+
+/// `SolverExit` reason for a run stopped by a cooperative cancel (#574).
+const TRUST_REGION_CANCELLED: &str = "cancelled by user";
 
 /// `SolverExit` reason for a run that rejected every step from iteration 0.
 /// Matched by [`classify_termination`] so the warning names the starting values
@@ -768,7 +784,12 @@ pub fn optimize_trust_region(
             let OptimizationResult {
                 problem: mut prob, ..
             } = res;
-            let grad = prob.gradient(&vec).ok();
+            // A cancelled run is discarded by `fit()`; skip the extra gradient pass.
+            let grad = if crate::cancel::is_cancelled(&options.cancel) {
+                None
+            } else {
+                prob.gradient(&vec).ok()
+            };
             if let Some(mut w) = warning {
                 if let Some(g) = grad.as_deref() {
                     // Under covariate-NN regularization this gradient is of the
@@ -1592,6 +1613,97 @@ mod tests {
         assert_eq!(
             res.n_iterations, 2,
             "the reported iteration count must be the budget it exhausted"
+        );
+    }
+
+    /// #574: the trust region polls the cancel flag at every iteration boundary and
+    /// skips the post-run gradient pass. Without the `terminate` check a pre-cancelled
+    /// run walks on (every trial scored 1e20) until the no-initial-progress stop, whose
+    /// warning names the starting values instead of the cancel.
+    #[test]
+    fn a_cancelled_trust_region_stops_at_the_next_iteration() {
+        use crate::io::datareader::read_nonmem_csv;
+        use std::path::Path;
+
+        let model = warfarin_model();
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let opts = FitOptions {
+            outer_maxiter: 50,
+            run_covariance_step: false,
+            verbose: false,
+            cancel: Some(flag),
+            ..FitOptions::default()
+        };
+        let res = optimize_trust_region(&model, &population, &model.default_params, &opts);
+        assert!(!res.converged);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("cancelled by user")),
+            "the stop must name the cancel: {:?}",
+            res.warnings
+        );
+        assert!(res.n_iterations <= 1, "ran {} iterations", res.n_iterations);
+        assert!(
+            res.final_gradient.is_none(),
+            "a cancelled run paid a gradient pass"
+        );
+    }
+
+    /// #574: a trial whose inner pass saw the cancel scores as rejected and leaves the
+    /// gradient cache empty, so no placeholder EBE is reused. Same problem, flag unset,
+    /// is the other side of the gate.
+    #[test]
+    fn a_cancelled_cost_is_rejected_and_not_cached() {
+        use crate::estimation::parameterization::compute_bounds;
+        use crate::io::datareader::read_nonmem_csv;
+        use std::path::Path;
+
+        let model = warfarin_model();
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        let init = &model.default_params;
+        let x = pack_params(init);
+        let problem = |options: &FitOptions| -> (f64, bool) {
+            let p = FoceiProblem {
+                model: &model,
+                population: &population,
+                options,
+                init_params: init,
+                bounds: compute_bounds(init),
+                cached_etas: std::sync::Mutex::new(Vec::new()),
+                grad_cache: std::sync::Mutex::new(None),
+                nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
+                    &model,
+                    &population,
+                    options,
+                ),
+                priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
+            };
+            let cost = p.cost(&x).unwrap();
+            let cached = p.grad_cache.lock().unwrap().is_some();
+            (cost, cached)
+        };
+        let base = FitOptions {
+            inner_maxiter: 20,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let (cost, cached) = problem(&base);
+        assert!(cost.is_finite() && cost < 1e19, "control cost {cost}");
+        assert!(cached, "control must warm the gradient cache");
+
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let (cost, cached) = problem(&FitOptions {
+            cancel: Some(flag),
+            ..base
+        });
+        assert_eq!(cost, 1e20);
+        assert!(
+            !cached,
+            "a cancelled trial's placeholder EBEs reached the cache"
         );
     }
 

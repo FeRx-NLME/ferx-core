@@ -378,6 +378,7 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
         0,
         0,
         InnerSolvePolicy::default(),
+        None,
         |subject, ebe| {
             (
                 subject.id.clone(),
@@ -398,5 +399,205 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
             result.1[i].as_ptr() as usize,
             "Jacobian buffer was copied after EBE"
         );
+    }
+}
+
+// ── #574: the inner pass polls the cancel flag per subject ───────────────────────────
+//
+// The outer optimizers poll `FitOptions.cancel` only between objective evaluations, and
+// one evaluation of a large ODE population is minutes of EBE solves — so an R Ctrl-C used
+// to wait out the whole pass. These pin that a cancel landing *inside* a pass stops the
+// subjects not yet started.
+
+/// A cancel flipped by the first subject's finish skips every later subject. One worker
+/// thread makes "later" deterministic. The same run with the flag present but never
+/// flipped is the other side of the gate: every subject is solved and none is rejected.
+#[test]
+fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for iov in [false, true] {
+        let (model, pop) = fixture(iov, false);
+        let n = pop.subjects.len();
+        let params = &model.default_params;
+        // A non-zero warm start, so the placeholder's η is distinguishable from zeros.
+        let warm: Vec<DVector<f64>> = (0..n)
+            .map(|i| DVector::from_element(model.n_eta, 0.01 * (i + 1) as f64))
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .build()
+            .unwrap();
+        let run = |flip: bool| {
+            let flag = crate::cancel::CancelFlag::new();
+            let finished = AtomicUsize::new(0);
+            let out = pool.install(|| {
+                run_inner_loop_warm_map(
+                    &model,
+                    &pop,
+                    params,
+                    20,
+                    1e-6,
+                    Some(&warm),
+                    None,
+                    0,
+                    0,
+                    InnerSolvePolicy::default(),
+                    Some(&flag),
+                    |_, ebe| {
+                        finished.fetch_add(1, Ordering::SeqCst);
+                        if flip {
+                            flag.cancel();
+                        }
+                        ebe.nll
+                    },
+                )
+            });
+            (out, finished.into_inner())
+        };
+
+        let (control, control_finished) = run(false);
+        assert_eq!(
+            control_finished, n,
+            "iov={iov}: control must solve every subject"
+        );
+        assert_eq!(
+            control.2.n_start_rejected, 0,
+            "iov={iov}: control rejected a subject"
+        );
+        assert!(control.4.iter().all(|v| v.is_finite()), "iov={iov}");
+        if iov {
+            assert!(
+                !control.3[1].is_empty(),
+                "fixture: IOV subjects must carry κ"
+            );
+        }
+
+        let (cancelled, cancelled_finished) = run(true);
+        assert_eq!(
+            cancelled_finished, 1,
+            "iov={iov}: subjects after the cancel must not be solved"
+        );
+        assert_eq!(
+            cancelled.2.n_start_rejected,
+            n - 1,
+            "iov={iov}: every skipped subject must hard-reject the trial"
+        );
+        // The solved subject is untouched; the skipped ones are placeholders with the
+        // shapes of a real result, so nothing downstream indexes out of bounds.
+        assert_eq!(
+            cancelled.0[0].as_slice(),
+            control.0[0].as_slice(),
+            "iov={iov}"
+        );
+        for i in 1..n {
+            assert_eq!(
+                cancelled.0[i].as_slice(),
+                warm[i].as_slice(),
+                "iov={iov} subj {i}"
+            );
+            assert_eq!(
+                cancelled.1[i].shape(),
+                control.1[i].shape(),
+                "iov={iov} subj {i}"
+            );
+            assert!(
+                cancelled.1[i].iter().all(|&v| v == 0.0),
+                "iov={iov} subj {i}"
+            );
+            assert_eq!(
+                cancelled.3[i].len(),
+                control.3[i].len(),
+                "iov={iov} subj {i}"
+            );
+            assert_eq!(
+                cancelled.4[i], 0.0,
+                "iov={iov}: skipped subject ran its finish"
+            );
+        }
+    }
+}
+
+/// The stage-seeded entry point the trust region, Gauss–Newton and the final inner pass
+/// use reads the cancel flag off the stage options it is handed — not only callers that
+/// pass a flag explicitly.
+#[test]
+fn the_stage_seeded_inner_pass_reads_the_stage_cancel_flag() {
+    let (model, pop) = fixture(false, false);
+    let params = &model.default_params;
+    let base = FitOptions {
+        inner_maxiter: 20,
+        ..Default::default()
+    };
+    let run = |stage: &FitOptions| {
+        run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            params,
+            20,
+            1e-6,
+            None,
+            None,
+            0,
+            0,
+            InnerHessianSeed::for_options(stage),
+            stage,
+        )
+        .2
+        .n_start_rejected
+    };
+    assert_eq!(run(&base), 0, "control rejected a subject");
+    let flag = crate::cancel::CancelFlag::new();
+    flag.cancel();
+    let cancelled = FitOptions {
+        cancel: Some(flag),
+        ..base
+    };
+    assert_eq!(run(&cancelled), pop.subjects.len());
+}
+
+/// The FOCE/FOCEI pass the outer optimizers score never reports a cancelled pass as an
+/// objective: the placeholders' zero contributions would otherwise sum to a finite — and
+/// spuriously low — OFV, which the derivative-free and legacy-BFGS callers do not guard
+/// against. Both branches of `run_inner_loop_and_nll_prepared`: the FOCE marginal, and
+/// the AGQ quadrature, which must not run on placeholders at all.
+#[test]
+fn a_cancelled_inner_pass_scores_no_objective() {
+    let (model, pop) = fixture(false, false);
+    let params = &model.default_params;
+    for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
+        let base = FitOptions {
+            method,
+            inner_maxiter: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            base.agq_nodes().is_some(),
+            method == EstimationMethod::Laplace,
+            "fixture: one arm per branch"
+        );
+        let (_, _, stats, _, nll) =
+            run_inner_loop_and_nll(&model, &pop, params, &base, None, None, None);
+        assert!(
+            nll.is_finite(),
+            "{method:?}: control objective must be finite"
+        );
+        assert_eq!(stats.n_start_rejected, 0, "{method:?}");
+
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let cancelled = FitOptions {
+            cancel: Some(flag),
+            ..base
+        };
+        let (etas, _, stats, _, nll) =
+            run_inner_loop_and_nll(&model, &pop, params, &cancelled, None, None, None);
+        assert_eq!(
+            nll,
+            f64::INFINITY,
+            "{method:?}: a cancelled pass scored {nll}"
+        );
+        assert_eq!(stats.n_start_rejected, pop.subjects.len(), "{method:?}");
+        assert_eq!(etas.len(), pop.subjects.len(), "{method:?}");
     }
 }

@@ -152,8 +152,11 @@ See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usa
 `ferx_fit()` runs the estimator on a worker thread and polls for R interrupts on
 the main thread every ~100 ms, so **Ctrl-C** (or RStudio's red stop button) aborts
 the fit cleanly. The worker exits at the next safe checkpoint — typically within a
-second or two, but up to one inner-loop evaluation for heavy ODE models. The call
-then returns with an R error:
+second or two. FOCE, FOCEI and Laplace check before every subject's EBE solve, so
+the worst case is the subject solves already running (one per thread), not a whole
+population pass; mixture models and the other estimators check at their
+evaluation, iteration or sweep boundaries. The call then
+returns with an R error:
 
 ```
 Error: ferx_fit: cancelled by user
