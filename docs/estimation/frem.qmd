@@ -152,6 +152,51 @@ predates both fixes and is kept as the historical measurement rather than
 half-updated.
 :::
 
+## IIV on residual error (`iiv_on_ruv`) {#frem-iiv-on-ruv}
+
+### The residual-error eta stays out of the covariate block
+
+An `iiv_on_ruv` eta scales the residual SD. It is not a structural parameter, so
+covariates do not explain it. `prepare_frem()` therefore emits it as its own diagonal
+`omega` outside the FREM `block_omega`. It keeps a `FIX` and a prior fit's value.
+This is the structure NONMEM / PsN FREM use (a separate `$OMEGA` for the IIV-on-RUV
+eta). Before [#904](https://github.com/FeRx-NLME/ferx-core/issues/904) the generator
+put it inside the block, with a nonzero starting covariance to every covariate eta. If
+the base model correlates it with a PK eta (`block_omega (ETA_CL, ETA_RUV)`), it stays
+in the block so that covariance is kept, but it starts with no covariate cross-terms.
+
+On the 475-subject, 8-covariate workshop reprex of #904, the old layout is a superset
+model. It has 11 extra covariances, which estimate to small values (|ρ| ≤ 0.22). Under
+SAEM it scores 6851.2 ± 0.8 importance-sampled −2 log L, against 6866.6 ± 1.2 for the
+split layout. A 15-unit drop for 11 parameters is not significant (χ²₁₁, p ≈ 0.17).
+The change is a structural match to NONMEM, not a fix for the σ × ω_RUV runaway; that
+fix is [η_RUV re-centring](saem.qmd#iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge).
+
+### Which estimator
+
+Measured on the #904 reprex (split layout, σ started 5.5× low at 0.032), Linux,
+2026-10-16. In the two FOCEI rows the zero covariate–covariate covariances are
+1e-4 in both engines, because NONMEM refuses a zero inside a non-band `BLOCK`.
+
+| Estimator | ω_RUV | σ | objective |
+|---|---:|---:|---|
+| ferx SAEM (`n_exploration = n_convergence = 1000`, `n_mh_steps = 50`) | 0.269 | 0.174 | IS −2 log L 6866.6 ± 1.2 (K = 20000) |
+| NONMEM IMP, as reported in #904 (`run6_imp`) | 0.279 | 0.177 | 6852 |
+| ferx FOCEI | 0.298 | 0.032 | 12039.4523, never leaves the start |
+| NONMEM 7.6 FOCEI, same start | 0.298 | 0.032 | 12039.4523, `MINIMIZATION TERMINATED` at the start |
+
+Use **SAEM** (or IMPMAP), and compare fits by the importance-sampled objective
+(`imp_eval_only = true`, `imp_samples = 20000`). The FOCE objective is not a
+reliable ranking tool for `iiv_on_ruv` (see [SAEM](saem.qmd#the-focei-objective-cannot-rank-iiv_on_ruv-fits)).
+**FOCEI** fails on this model in NONMEM too: both engines report the same objective
+at the start to every printed digit, and neither moves from it. On the same data
+without the covariate rows, FOCEI estimates ω_RUV = 0.058 in ferx and 0.062 in
+NONMEM, against ≈ 0.28 from SAEM / IMP. At the start the two objectives agree to
+every printed digit (549.7913), and ferx's optimum is 23 units lower than NONMEM's.
+Both engines underestimate ω_RUV, so that is a property of the FOCE approximation,
+not of ferx. Standalone `method = imp` on large
+FREM models is tracked in [#1365](https://github.com/FeRx-NLME/ferx-core/issues/1365).
+
 ## Limitations
 
 - Categorical covariates are binarized (one-hot encoded) before the FREM
