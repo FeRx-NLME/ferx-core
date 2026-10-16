@@ -209,10 +209,11 @@ fn obs_groups_at_keys_a_group_by_its_whole_path() {
     let a = obs_groups_at(levels, &p.subjects[0], 0);
     assert_eq!(
         a,
-        vec![("1".into(), vec![0, 1, 2]), ("2".into(), vec![3, 4, 5])]
+        vec![("A 1".into(), vec![0, 1, 2]), ("A 2".into(), vec![3, 4, 5])]
     );
     let b = obs_groups_at(levels, &p.subjects[0], 1);
     // Four arms, though only two arm labels: study 2's arm 1 is its own group.
     assert_eq!(b.len(), 4);
-    assert_eq!(b[2], ("1".into(), vec![3]));
+    // ...and its label says which study: `B 1` alone would name an arm in both.
+    assert_eq!(b[2], ("A 2 / B 1".into(), vec![3]));
 }

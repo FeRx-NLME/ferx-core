@@ -124,8 +124,9 @@ pub(crate) fn assign_level_cells(model: &CompiledModel, population: &mut Populat
 }
 
 /// The observation rows of `subject` per group of level `l`, as `(label, rows)` in
-/// first-row order, the label the group's own value at `l`. Rows with a missing label are
-/// left out (the data check refuses them).
+/// first-row order. The label is the group's whole path, `STUDY 1 / ARM 2`, since under
+/// nesting by key the value at `l` alone (`ARM 2`) names a group in every study. Rows with
+/// a missing label are left out (the data check refuses them).
 pub(crate) fn obs_groups_at(
     levels: &NestedLevels,
     subject: &Subject,
@@ -144,7 +145,16 @@ pub(crate) fn obs_groups_at(
     }
     groups
         .into_iter()
-        .map(|(key, rows)| (f64::from_bits(key[l]).to_string(), rows))
+        .map(|(key, rows)| {
+            let label = levels
+                .levels
+                .iter()
+                .zip(&key)
+                .map(|(level, &v)| format!("{} {}", level.name, f64::from_bits(v)))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            (label, rows)
+        })
         .collect()
 }
 

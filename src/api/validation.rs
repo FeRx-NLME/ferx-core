@@ -1196,10 +1196,9 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
             // the weight must be constant there; otherwise once per occasion.
             let groups: Vec<(String, Vec<usize>)> = match model.nested_levels() {
                 Some(levels) => {
-                    let level = &levels.levels[levels.kappa_level[k]];
                     crate::stats::nested_levels::obs_groups_at(levels, subj, levels.kappa_level[k])
                         .into_iter()
-                        .map(|(label, idx)| (format!("`{}` group {label}", level.name), idx))
+                        .map(|(label, idx)| (format!("group `{label}`"), idx))
                         .collect()
                 }
                 None => crate::stats::likelihood::iov_occasion_groups(subj)
@@ -1943,10 +1942,11 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
             return vec![Diagnostic::error(
                 "E_LEVEL_MISSING_LABEL",
                 format!(
-                    "level `{}` reads column `{}`, which has no value on the {what} record of \
-                     subject `{}` at TIME {time}. Every record needs a label at every level, \
-                     since its group is identified by its labels from the outermost level \
-                     down.",
+                    "level `{}` reads column `{}`, which has no numeric value on the {what} \
+                     record of subject `{}` at TIME {time}. Every record needs a label at every \
+                     level, since its group is identified by its labels from the outermost \
+                     level down, and a label is a numeric code: write a text id such as `NCT01` \
+                     as a number.",
                     level.name, level.column, subj.id
                 ),
             )
@@ -4910,6 +4910,26 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     format!(
                         "{what} is not yet supported on a model with nested levels (more than \
                          one `level`). Fit it with method = focei (or foce) at n_agq = 1."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // A fit-time occasion rule (review r1 #1): `[fit_options]` is refused at parse
+        // time, but `FitOptions::iov_occasion` reaches `fit()` without the file, and a
+        // derived rule would overwrite the level cells.
+        if options.iov_occasion != IovOccasionRule::Column {
+            let first = model
+                .nested_levels()
+                .map(|l| l.levels[0].name.clone())
+                .unwrap_or_default();
+            diags.push(
+                Diagnostic::error(
+                    "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+                    format!(
+                        "the fit options set `iov_occasion` on a model that declares `level \
+                         {first}`. The levels already define the groups; leave `iov_occasion` \
+                         at its default (`column`)."
                     ),
                 )
                 .with_block("fit_options"),

@@ -4998,7 +4998,11 @@ pub fn parse_full_model_with(
             .iter()
             .map(|at| {
                 at.as_ref()
-                    .and_then(|a| declared_levels.iter().position(|l| &l.name == a))
+                    .and_then(|a| {
+                        declared_levels
+                            .iter()
+                            .position(|l| l.name.eq_ignore_ascii_case(a))
+                    })
                     .expect("check_level_declarations: every kappa names a declared level")
             })
             .collect(),
@@ -14880,7 +14884,12 @@ fn check_level_declarations(kappas: &ParsedKappas) -> Result<(), String> {
     }
     for (name, at) in kappas.names_ordered.iter().zip(&kappas.at) {
         match at {
-            Some(level) if !kappas.levels.iter().any(|l| &l.name == level) => {
+            Some(level)
+                if !kappas
+                    .levels
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(level)) =>
+            {
                 return Err(if kappas.levels.is_empty() {
                     format!(
                         "[parameters] kappa {name} at {level}: no level is declared. Declare \

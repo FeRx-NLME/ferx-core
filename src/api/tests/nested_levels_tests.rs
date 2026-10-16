@@ -267,13 +267,17 @@ fn a_record_without_a_level_label_is_refused() {
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(
         msg.contains(
-            "level `ARM` reads column `ARM`, which has no value on the observation \
+            "level `ARM` reads column `ARM`, which has no numeric value on the observation \
                       record of subject `2` at TIME 3"
         ),
         "{msg}"
     );
     assert!(
         msg.contains("Every record needs a label at every level"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("a label is a numeric code: write a text id such as `NCT01` as a number."),
         "{msg}"
     );
     // A pk-only row names its kind.
@@ -629,7 +633,7 @@ fn a_weight_varying_inside_its_kappas_group_warns_per_level() {
     let msg = warn(&m, &inside).expect("warned");
     assert!(
         msg.contains(
-            "weight `NARM` is not constant within `ARM` group 1 of subject `1` (50 then 25)"
+            "weight `NARM` is not constant within group `STUDY 1 / ARM 1` of subject `1` (50 then 25)"
         ),
         "{msg}"
     );
@@ -645,7 +649,7 @@ fn a_weight_varying_inside_its_kappas_group_warns_per_level() {
     .unwrap();
     let msg = warn(&at_study, &between).expect("warned");
     assert!(
-        msg.contains("kappa `K_ST` weight `NARM` is not constant within `STUDY` group 1"),
+        msg.contains("kappa `K_ST` weight `NARM` is not constant within group `STUDY 1` of"),
         "{msg}"
     );
 }
@@ -692,7 +696,7 @@ fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_for
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(
         msg.contains(
-            "level `ARM` reads column `ARM`, which has no value on the observation \
+            "level `ARM` reads column `ARM`, which has no numeric value on the observation \
                       record of subject `1` at TIME 3"
         ),
         "{msg}"
@@ -707,4 +711,127 @@ fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_for
     // Without blanks every record keeps its own label.
     let full = read("ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,50\n");
     assert!(code_in(&check_model_data(&m, &full), "E_LEVEL_MISSING_LABEL").is_none());
+}
+
+/// Review r1 #1: a fit-time occasion rule on a nested model. `[fit_options]` is refused at
+/// parse time, but `FitOptions::iov_occasion` (and R's `settings`) reach `fit()` directly.
+/// Both sides of the gate in one test: `Column` (the default) passes, a derived rule is
+/// refused under the mixing code.
+#[test]
+fn a_fit_time_occasion_rule_is_refused_on_a_nested_model() {
+    let m = model();
+    let with = |rule: IovOccasionRule| FitOptions {
+        method: EstimationMethod::FoceI,
+        iov_occasion: rule,
+        ..Default::default()
+    };
+    assert!(code_in(
+        &check_model_options(&m, &with(IovOccasionRule::Column)),
+        "E_LEVEL_MIXED_WITH_IOV_COLUMN"
+    )
+    .is_none());
+    for rule in [
+        IovOccasionRule::PerDose,
+        IovOccasionRule::TimeWindows(vec![2.5]),
+    ] {
+        let msg = code_in(
+            &check_model_options(&m, &with(rule.clone())),
+            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+        )
+        .unwrap_or_else(|| panic!("{rule:?} not refused"));
+        assert!(msg.contains("the fit options set `iov_occasion`"), "{msg}");
+        assert!(
+            msg.contains("on a model that declares `level STUDY`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("The levels already define the groups"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("leave `iov_occasion` at its default (`column`)"),
+            "{msg}"
+        );
+        let err = crate::api::fit(&m, &full_design(), &m.default_params, &with(rule))
+            .err()
+            .expect("fit refuses it");
+        assert!(err.contains("the fit options set `iov_occasion`"), "{err}");
+    }
+    // A one-level model keeps the rule.
+    let one = parse_model_string(&src().replace("  level ARM by ARM in STUDY\n", "").replace(
+        "kappa K_ARM ~ 4.0 at ARM weight = NARM",
+        "kappa K_ARM ~ 4.0 at STUDY weight = NARM",
+    ))
+    .unwrap();
+    assert!(code_in(
+        &check_model_options(&one, &with(IovOccasionRule::PerDose)),
+        "E_LEVEL_MIXED_WITH_IOV_COLUMN"
+    )
+    .is_none());
+}
+
+/// The post-hoc steps (`run_covariance`, `run_sir`) prepare the population with the rule
+/// the fit recorded, through `fitted_population`, without `check_model_options`. On a
+/// nested model the level cells must win there whatever the rule says, so a regrouping
+/// cannot get in by that door either.
+#[test]
+fn fitted_population_keeps_the_level_cells_under_a_derived_rule() {
+    let m = model();
+    let pop = full_design();
+    let mut warnings = Vec::new();
+    for rule in [
+        IovOccasionRule::Column,
+        IovOccasionRule::TimeWindows(vec![2.5]),
+    ] {
+        let prepared = crate::api::fit::fitted_population(
+            &m,
+            &rule,
+            false,
+            std::borrow::Cow::Borrowed(&pop),
+            &mut warnings,
+        );
+        for s in &prepared.subjects {
+            assert_eq!(s.occasions, vec![1, 2, 3, 4], "{rule:?}");
+        }
+    }
+}
+
+/// Review r1 #2: a text study id is not a label the engine can read. It reaches the data
+/// check as a missing numeric value, and the message says a label is a numeric code
+/// rather than claiming the cell is empty.
+#[test]
+fn a_text_level_label_is_refused_as_a_non_numeric_value() {
+    let m = model();
+    let path = std::env::temp_dir().join(format!("ferx_nested_text_{}.csv", std::process::id()));
+    std::fs::write(
+        &path,
+        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,NCT01,1,50\n1,2,11,NCT01,2,50\n1,3,12,NCT02,1,50\n",
+    )
+    .unwrap();
+    let (pop, _) =
+        crate::api::read_population_for(&m, &None, path.to_str().unwrap(), None, None, None, &[])
+            .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
+    assert!(
+        msg.contains("level `STUDY` reads column `STUDY`, which has no numeric value"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("write a text id such as `NCT01` as a number"),
+        "{msg}"
+    );
+}
+
+/// Review r1 #8: `at LEVEL` names a level as `in PARENT` and the uniqueness rule do,
+/// ignoring ASCII case, and resolves to that level.
+#[test]
+fn at_names_a_level_ignoring_case_like_the_other_level_rules() {
+    let m = parse_model_string(
+        &src()
+            .replace("level STUDY by STUDY in ID", "level Study by STUDY in ID")
+            .replace("level ARM by ARM in STUDY", "level ARM by ARM in Study"),
+    )
+    .expect("`at STUDY` names `level Study`");
+    assert_eq!(m.nested_levels().unwrap().kappa_level, vec![0, 1]);
 }

@@ -403,13 +403,15 @@ All levels are integrated inside one subject. The coarsest grouping that needs a
 - **The weight is on the kappa**, exactly as for [sample-size-weighted IOV](#sample-size-weighted-iov-weight-...): one level can hold a weighted and an unweighted kappa. `weight = W` scales that kappa's variance to `γ²/W`. `W` must be constant within a group of the kappa's own level; `W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION` names the group where it is not.
 - **Centering.** The prior of every level has mean zero, and the estimated random effects of a level are not forced to average to zero. That is NONMEM's `LEVCENTER = 0`.
 
-**One level is today's IOV.** `level OCC by OCC in ID` with `kappa … at OCC` is the explicit spelling of `iov_column = OCC`. It reads the same column the same way and fits to the same bits, so it works with every method that supports IOV. A `level` replaces `iov_column` and `iov_occasion` rather than combining with them. Writing both, or a kappa without `at` once levels are declared, is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`.
+**One level is today's IOV.** `level OCC by OCC in ID` with `kappa … at OCC` is the explicit spelling of `iov_column = OCC`. It reads the same column the same way and fits to the same bits, so it works with every method that supports IOV. A `level` replaces `iov_column` and `iov_occasion` rather than combining with them. Writing both in the model file, setting `iov_occasion` to `dose` or `time(...)` in the fit options of a model with nested levels, or a kappa without `at` once levels are declared, is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`.
 
 ### The data {#nested-levels-data}
 
-The level columns are read with the data, like covariates, so they need no `[covariates]` declaration. Every record needs a value in every level column, since its group at each level is identified by those values. A record with no value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time. Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group.
+The level columns are read with the data, like covariates, so they need no `[covariates]` declaration. Every record needs a value in every level column, since its group at each level is identified by those values, and a label is a **numeric code**: a text id such as `NCT01` has to be written as a number. A record with no numeric value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time.
 
-A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits.
+Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group. This holds when the data are read for the model: by the model file's own fit, by `read_population_for` (the CLI and the R package use it) and by `ferx check --data`. The model-blind readers (`read_nonmem_csv*`) carry a blank level cell forward like any covariate, so a population built with them should have a label on every row.
+
+A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
 
 ### What this release supports {#nested-levels-scope}
 
@@ -429,7 +431,7 @@ NONMEM's exact spelling of nested levels is the IOV idiom: re-base `ID` at the c
 | | NONMEM 7.6.0 | ferx |
 |---|---|---|
 | OFV | 107.04357106 | 107.04357096 |
-| worst \|Δ\| over the 108 η̂ and κ̂ | | 8.5e-6 |
+| worst \|Δ\| over the 108 compared η̂ and κ̂ (84 distinct: each study κ̂ is read by both of its arms) | | 8.5e-6 |
 
 NONMEM's `$LEVEL` is a different object and is not an oracle for this: its help describes its FOCE as a linearized approximation at the super-ID level. On the same data it recovers γ² = 0.88 against a truth of 4 (the IOV-idiom coding recovers 3.76), and its covariance step aborts.
 
