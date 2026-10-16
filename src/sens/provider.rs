@@ -1910,10 +1910,6 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    // Nested levels (#1082): finite differences until PR3 (`iov_sens_supported_core`).
-    if model.has_nested_levels() {
-        return None;
-    }
     // Closed-form transit/IG IOV → the absorption walk or its ODE twin (#1560, #719); a
     // no-op otherwise. See `subject_sensitivities_iov`.
     let model = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
@@ -1951,10 +1947,6 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    // Nested levels (#1082): finite differences until PR3 (`iov_sens_supported_core`).
-    if model.has_nested_levels() {
-        return None;
-    }
     // #905: IOV twin of the non-IOV `subject_routes_to_event_walk` gate. An analytical
     // subject with no Gaussian observation feeds the predictor nothing; declining here
     // (→ the caller drops it to FD) keeps FOCE/FOCEI out of the IOV sens walk, whose

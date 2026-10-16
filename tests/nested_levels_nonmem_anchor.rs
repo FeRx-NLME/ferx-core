@@ -234,3 +234,61 @@ fn the_anchor_files_are_where_the_tests_read_them() {
         assert!(Path::new("nonmem_anchor").join(f).exists(), "{f}");
     }
 }
+
+/// The covariance step on a nested model is the finite-difference one. Its analytic
+/// R-matrix assembly is reached on `analytic_cov_hessian` alone, and its stacked prior is
+/// the one-level `Ω ⊕ (I_K ⊗ Ω_IOV)`, which would treat every arm as owning its own study
+/// κ; each subject declines it, so asking for the analytic matrix and asking for the
+/// stencil give the same bits. Three sponsors and two θ fixed keep the stencil small.
+#[test]
+fn the_covariance_step_finite_differences_a_nested_model() {
+    let src = MODEL
+        .replace(
+            "theta ED50(33.4048, 0.1, 10000.0)",
+            "theta ED50(33.4048, 0.1, 10000.0, FIX)",
+        )
+        .replace(
+            "theta ET50(3.20150, 0.01, 1000.0)",
+            "theta ET50(3.20150, 0.01, 1000.0, FIX)",
+        );
+    assert_ne!(src, MODEL);
+    let run = |analytic: bool| {
+        let parsed = parse_full_model(&src).unwrap();
+        let (mut pop, _) = read_population_for(
+            &parsed.model,
+            &parsed.covariate_decls,
+            "nonmem_anchor/nested_levels_3.csv",
+            None,
+            None,
+            None,
+            &parsed.column_map,
+        )
+        .unwrap();
+        pop.subjects.truncate(3);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            outer_maxiter: 0,
+            run_covariance_step: true,
+            analytic_cov_hessian: analytic,
+            ..parsed.fit_options.clone()
+        };
+        fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap()
+    };
+    let (a, fd) = (run(true), run(false));
+    let cov = |r: &FitResult| r.covariance_matrix.clone().expect("a covariance matrix");
+    assert!(cov(&fd).iter().all(|v| v.is_finite()), "{}", cov(&fd));
+    // The two FIXed θ have zero rows; the six free parameters (two θ, ω²_sponsor, the
+    // two κ variances, σ) have variances.
+    let free = (0..cov(&fd).nrows())
+        .filter(|&i| cov(&fd)[(i, i)] > 0.0)
+        .count();
+    assert_eq!(free, 6, "{}", cov(&fd));
+    let bits = |m: nalgebra::DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(cov(&a)),
+        bits(cov(&fd)),
+        "analytic {} vs fd {}",
+        cov(&a),
+        cov(&fd)
+    );
+}

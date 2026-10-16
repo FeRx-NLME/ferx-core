@@ -445,10 +445,6 @@ pub(crate) fn covariance_sensitivities(
     theta: &[f64],
     b: &[f64],
 ) -> Option<SubjectSens> {
-    // Nested levels (#1082): the covariance step finite-differences the objective.
-    if model.has_nested_levels() {
-        return None;
-    }
     if model.n_kappa > 0 {
         crate::sens::provider::subject_sensitivities_cov_iov(model, subject, theta, b)
     } else {
@@ -472,7 +468,10 @@ fn iov_stack(
     params: &ModelParameters,
     b: &[f64],
 ) -> Option<Option<IovStack>> {
-    // Nested levels (#1082): the stacked prior below is the one-level one; decline.
+    // Nested levels (#1082): the stacked prior below is the one-level one, so the subject
+    // declines and the covariance step finite-differences the objective. This is the
+    // analytic covariance path's only gate: `analytic_cov_assembly` is reached on
+    // `FitOptions::analytic_cov_hessian` alone, not through `iov_sens_supported`.
     if model.has_nested_levels() {
         return None;
     }
