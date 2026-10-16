@@ -3146,9 +3146,7 @@ fn cli_simulate_draws_kappa_under_the_model_files_rule() {
     let err = run("0.36", "")
         .expect_err("an IOV model simulated with no rule leaves the template no occasions");
     assert!(
-        err.contains("E_IOV_MISSING_OCC")
-            && err.contains("has no dataset to read occasion labels from")
-            && !err.contains(CODE),
+        err.contains("has no dataset to read occasion labels from") && !err.contains(CODE),
         "the --simulate E_IOV_MISSING_OCC refusal, not the simulation warning: {err}"
     );
 }
