@@ -347,22 +347,29 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
     );
 }
 
-/// Uniform all-FD IOV populations are silent, matching the non-IOV contract:
-/// the `finite-difference` banner already makes a model-level fallback obvious.
+/// An all-FD IOV population warns when the model-level label still says analytic — the
+/// #926 clause of the non-IOV twin, which the IOV warning lacked (#1907): with the label
+/// and the banner both claiming analytic, nothing else tells the user every subject ran
+/// FD. Both sides of the clause in one test: the same population is silent once
+/// `gradient = fd` makes the label say FD too.
 #[test]
-fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
-    let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  gradient = fd\n  iov_column = OCC\n",
-        )
-        .expect("parse ODE IOV + gradient = fd");
-    let mk_subject = |id: &str| Subject {
+fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
+    let auto = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse ODE IOV");
+    // Every subject has more occasion groups than the ODE IOV dispatch serves.
+    let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
+    let wide_subject = |id: &str| Subject {
         obs_rgroup: Vec::new(),
         id: id.into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        obs_times: vec![1.0, 6.0, 25.0, 30.0],
+        doses: (0..n_wide)
+            .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
+            .collect(),
+        obs_times: (0..n_wide).map(|i| i as f64 * 24.0 + 1.0).collect(),
         obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 7.0, 5.0],
-        obs_cmts: vec![1; 4],
+        observations: vec![8.0; n_wide],
+        obs_cmts: vec![1; n_wide],
         covariates: HashMap::new(),
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
@@ -372,27 +379,47 @@ fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: vec![1, 1, 2, 2],
+        cens: vec![0; n_wide],
+        occasions: (1..=n_wide as u32).collect(),
         obs_l2: Vec::new(),
-        dose_occasions: vec![1],
+        dose_occasions: (1..=n_wide as u32).collect(),
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
     let population = Population {
-        subjects: vec![mk_subject("1"), mk_subject("2")],
+        subjects: vec![wide_subject("1"), wide_subject("2")],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
     };
-    // gradient = fd routes every subject to FD (uniform) → no warning.
+
     assert!(
-        fd_fallback_warning(&model, &population, &model.default_params.theta).is_none(),
-        "uniform all-FD population must not warn"
+        inner_reports_analytic_model(&auto),
+        "fixture: the label must claim analytic"
+    );
+    let warning = fd_fallback_warning(&auto, &population, &auto.default_params.theta)
+        .expect("all-FD population under an analytic label must warn");
+    assert!(warning.contains("2 of 2"), "got: {warning}");
+    assert!(
+        warning.contains("ODE IOV stacked axis cap"),
+        "got: {warning}"
+    );
+
+    // `gradient = fd` as `run` stamps it onto the model (`GradientMethod::effective`);
+    // `parse_model_string` leaves the option on the parsed `FitOptions`.
+    let mut fd = auto;
+    fd.gradient_method = crate::types::GradientMethod::Fd;
+    assert!(
+        !inner_reports_analytic_model(&fd),
+        "fixture: the label must say FD"
+    );
+    assert!(
+        fd_fallback_warning(&fd, &population, &fd.default_params.theta).is_none(),
+        "all-FD population under an FD label must not warn"
     );
 }
 

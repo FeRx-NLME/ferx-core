@@ -1915,34 +1915,39 @@ fn check_finite_observations(population: &Population) -> Vec<Diagnostic> {
     )]
 }
 
-/// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
-/// every subject has an empty `occasions` vector the kappa random effects are
-/// silently ignored — catch this early instead.
+/// The gate of `E_IOV_MISSING_OCC`, shared by the dataset check
+/// (`check_iov_occasions`) and the `[simulation]` one
+/// (`check_simulation_iov_occasions`), which differ only in their advice (#2005).
+/// When `n_kappa > 0` but every subject has an empty `occasions` vector the kappa
+/// random effects are silently ignored.
+fn iov_occasions_missing(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> bool {
+    // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
+    // occasion labels at fit time from each subject's timeline, so the dataset need
+    // not carry them — the empty-occasions check does not apply.
+    // `all()` on an empty iterator is vacuously true; an empty population is not
+    // a missing-OCC problem so skip the check when there are no subjects.
+    // Nested levels (#1082) name their groups from the level columns when the population
+    // is prepared, so neither a dataset nor a simulated template carries occasion labels;
+    // `check_nested_levels` checks the columns instead.
+    model.n_kappa > 0
+        && !model.has_nested_levels()
+        && *iov_rule == IovOccasionRule::Column
+        && !population.subjects.is_empty()
+        && population.subjects.iter().all(|s| s.occasions.is_empty())
+}
+
+/// IOV models require occasion labels in the dataset — catch their absence early
+/// instead of silently ignoring the kappas.
 fn check_iov_occasions(
     model: &CompiledModel,
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
-    if model.n_kappa == 0 {
-        return Vec::new();
-    }
-    // Nested levels (#1082) name their groups from the level columns when the population
-    // is prepared, so the dataset carries no occasion labels; `check_nested_levels` checks
-    // the columns instead.
-    if model.has_nested_levels() {
-        return Vec::new();
-    }
-    // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
-    // occasion labels at fit time from each subject's timeline, so the dataset need
-    // not carry them — the empty-occasions check does not apply.
-    if *iov_rule != IovOccasionRule::Column {
-        return Vec::new();
-    }
-    // `all()` on an empty iterator is vacuously true; an empty population is not
-    // a missing-OCC problem so skip the check when there are no subjects.
-    let all_empty = !population.subjects.is_empty()
-        && population.subjects.iter().all(|s| s.occasions.is_empty());
-    if !all_empty {
+    if !iov_occasions_missing(model, population, iov_rule) {
         return Vec::new();
     }
     vec![Diagnostic::error(
@@ -2139,6 +2144,44 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
         }
     }
     Vec::new()
+}
+
+/// `E_IOV_MISSING_OCC` for the template population `run_model_simulate` builds from
+/// the `[simulation]` block (#2005), checked before anything is simulated.
+///
+/// The gate is the dataset check's, but the advice cannot be: `[simulation]` has no
+/// dataset and no occasion field, so every template subject is unlabelled and no
+/// `iov_column` can change that. Nor can `iov_occasion = dose`: every template
+/// subject gets the block's one dose, so it derives a single occasion, which `fit()`
+/// then refuses as unidentifiable. Only `iov_occasion = time(...)` with a breakpoint
+/// inside the `times` grid labels a simulated population, so it is the one remedy
+/// named. An `iov_column` the model already sets is called out as having no effect
+/// rather than asked for.
+pub(crate) fn check_simulation_iov_occasions(
+    model: &CompiledModel,
+    template: &Population,
+    iov_rule: &IovOccasionRule,
+    iov_column: Option<&str>,
+) -> Option<Diagnostic> {
+    if !iov_occasions_missing(model, template, iov_rule) {
+        return None;
+    }
+    let mut message = String::from(
+        "Model declares kappa (IOV) parameters, but a population simulated from the \
+         [simulation] block has no dataset to read occasion labels from, so every record \
+         is unlabelled. Set `iov_occasion = time(...)` in [fit_options], with a breakpoint \
+         between the first and last of the [simulation] `times`, to derive the occasions in \
+         the model, so that per-occasion kappas can be estimated. `iov_occasion = dose` \
+         cannot label it: each simulated subject receives a single dose, so that rule \
+         derives one occasion.",
+    );
+    if let Some(col) = iov_column {
+        message.push_str(&format!(
+            " The model's `iov_column = {col}` names a dataset column, so it has no effect \
+             on a simulated population."
+        ));
+    }
+    Some(Diagnostic::error("E_IOV_MISSING_OCC", message).with_block("fit_options"))
 }
 
 /// Derive each subject's IOV occasion labels from a model-side rule

@@ -728,6 +728,20 @@ pub fn run_model_simulate_with_overrides(
     crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
     let template = template;
 
+    // #2005: the template has no occasion labels, so without a model-side rule `fit()`
+    // would refuse it with `E_IOV_MISSING_OCC` — after simulating, and with the dataset
+    // advice (set `iov_column`), which cannot label a simulated population. Refuse here
+    // instead, with the one remedy that works on this path. Every refusal above keeps
+    // its precedence.
+    if let Some(d) = check_simulation_iov_occasions(
+        &parsed.model,
+        &template,
+        &parsed.fit_options.iov_occasion,
+        parsed.fit_options.iov_column.as_deref(),
+    ) {
+        return Err(crate::diagnostics::EngineError::from_diagnostic(d).to_string());
+    }
+
     // Simulate
     eprintln!(
         "Simulating {} subjects (seed={})...",

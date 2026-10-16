@@ -386,11 +386,14 @@ fn iov_fd_fallback_warning(
             *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
         }
     }
-    // Mirror the non-IOV contract: only warn for a *mixed* population. An
-    // all-analytic (`n_fd == 0`) population needs no warning, and an all-FD
-    // (`n_fd == n_total`) one is already obvious from the `finite-difference`
-    // banner and the model itself (e.g. `gradient = fd`, LTBS). #590 review.
-    if n_fd == 0 || n_fd == n_total {
+    // Mirror the non-IOV contract, its #926 clause included: warn for a *mixed*
+    // population, and for an all-FD one whose model-level report still claims analytic
+    // (`gradient_method_inner` reads the same `inner_reports_analytic_model`), since
+    // nothing else would correct that label. An all-analytic (`n_fd == 0`) population
+    // needs no warning, and an all-FD one that also *reports* FD (e.g. `gradient = fd`)
+    // is already obvious from the banner and the label (#590 review, #1907).
+    let model_reports_analytic = inner_reports_analytic_model(model);
+    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic) {
         return None;
     }
     let reason_text = reasons

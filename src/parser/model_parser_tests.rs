@@ -14647,6 +14647,96 @@ fn scale_deriv_program_matches_fd() {
     }
 }
 
+/// The one-compartment oral model with `n_extra` more BSV etas `ETA_X1..`, read only by an
+/// `obs_scale = exp(Σ (i/100)·ETA_Xi)`, so the scale program's η axis count is
+/// `3 + n_extra` and every η past the PK ones carries its own coefficient.
+fn scale_model_with_extra_etas(n_extra: usize) -> String {
+    let omegas: String = (1..=n_extra)
+        .map(|i| format!("  omega ETA_X{i} ~ 0.01\n"))
+        .collect();
+    let sum: String = (1..=n_extra)
+        .map(|i| format!(" + {:.2} * ETA_X{i}", i as f64 / 100.0))
+        .collect();
+    format!(
+        "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.20
+{omegas}  sigma PROP ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[scaling]
+  obs_scale = exp(0.0{sum})
+"
+    )
+}
+
+/// `eval_scale_dual1` holds θ/η in a `MAX_SCALE_AXES`-wide stack buffer, and since #1907
+/// takes a heap `Vec` past it, because the IOV gate no longer caps the width. The 24/25 η
+/// straddle puts the two programs on opposite sides of that branch: the 25-η one, with its
+/// extra η at 0, is the same function, so value and every shared gradient axis must be
+/// bit-identical. The 25-η one is also evaluated at `N = 24`, so its last η lands past the
+/// dual width and must enter as a constant — the heap branch's `k ≥ N` arm.
+#[test]
+fn scale_dual1_past_the_stack_buffer_matches_its_24_eta_twin() {
+    use crate::sens::dual1::Dual1;
+    use crate::sens::provider::MAX_SCALE_AXES;
+    let prog_of = |n_extra: usize| {
+        let model = parse_model_string(&scale_model_with_extra_etas(n_extra)).expect("parse");
+        match model.scaling {
+            ScalingSpec::ExpressionScale { deriv: Some(p), .. } => p,
+            other => panic!("expected ExpressionScale with deriv, got {other:?}"),
+        }
+    };
+    let narrow = prog_of(21);
+    let wide = prog_of(22);
+    assert_eq!(
+        narrow.n_eta_axis(),
+        MAX_SCALE_AXES,
+        "narrow fits the buffer"
+    );
+    assert_eq!(wide.n_eta_axis(), MAX_SCALE_AXES + 1, "wide is one past it");
+    // The scale reads no individual parameter, so its var slots only need the right length.
+    let n_vars = narrow.var_to_pk_slot().len();
+    assert_eq!(n_vars, wide.var_to_pk_slot().len());
+    let theta = [0.13, 8.0, 1.0];
+    let cov = HashMap::new();
+    let eta_narrow: Vec<f64> = (0..MAX_SCALE_AXES)
+        .map(|k| 0.1 * (k as f64 * 0.7 + 0.3).sin())
+        .collect();
+    let mut eta_wide = eta_narrow.clone();
+    eta_wide.push(0.0);
+    const N: usize = MAX_SCALE_AXES;
+    let vars = vec![Dual1::<N>::constant(1.0); n_vars];
+    let a = narrow.eval_scale_dual1::<N>(&theta, &eta_narrow, &cov, &vars);
+    let b = wide.eval_scale_dual1::<N>(&theta, &eta_wide, &cov, &vars);
+    assert_eq!(a.value.to_bits(), b.value.to_bits(), "value");
+    let vars_c = vec![Dual1::<{ N + 1 }>::constant(1.0); n_vars];
+    let c = wide.eval_scale_dual1::<{ N + 1 }>(&theta, &eta_wide, &cov, &vars_c);
+    for k in 0..N {
+        assert_eq!(a.grad[k].to_bits(), b.grad[k].to_bits(), "η{k}: N = 24");
+        assert_eq!(a.grad[k].to_bits(), c.grad[k].to_bits(), "η{k}: N = 25");
+    }
+    // The axis the N = 24 evaluation drops is live at N = 25: ∂/∂ETA_X22 = 0.22 · scale.
+    let want = 0.22 * c.value;
+    assert!(want.abs() > 1e-3, "fixture must make the 25th η live");
+    assert!(
+        (c.grad[N] - want).abs() <= 1e-12 * want.abs(),
+        "∂/∂η24 = {} vs {want}",
+        c.grad[N]
+    );
+}
+
 #[test]
 fn test_parse_scaling_expression_uses_covariate() {
     let src = analytical_model_with_scaling(Some("  obs_scale = WT / 70\n"));
