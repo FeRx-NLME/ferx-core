@@ -2444,6 +2444,76 @@ mod tests {
         println!("EKF reader-split tie: worst relative difference {worst:.3e}");
     }
 
+    /// **An obs / dose / obs tie the reader split takes one update too.**
+    ///
+    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4`
+    /// between the pair. The `4⁻` record reads the state before the dose and the `4` record
+    /// the state after it, but the pair is still one instant, so it takes one update, as the
+    /// unsplit `[4, 4]` does. This tie was already filled before #2010's fix, since a break
+    /// sits at `4`, but from two updates: the `4⁻` point took an in-segment update and the
+    /// boundary read at `4` a second one. The one-ULP-up lookup makes it one, so an EKF fit
+    /// with such a tie moves its objective.
+    ///
+    /// Measured on macOS arm64: `p_obs` 0.33658 / 0.0097115 / 0.33985 before the fix and
+    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred`
+    /// is 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
+    ///
+    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
+    /// record at `4` falls back to 0.0097 and the bit-equality below fails.
+    #[test]
+    fn ekf_reader_split_tie_across_a_dose_is_one_update() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let t = 4.0f64;
+        let dosed = vec![
+            bolus_dose(100.0),
+            DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let run_dosed = |obs: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1],
+                &pk,
+                &Default::default(),
+                &[],
+                &dosed,
+                obs,
+                &[0.01; 3],
+                opts,
+            )
+        };
+        let split = run_dosed(&[t.next_down(), t, 8.0]);
+        let unsplit = run_dosed(&[t, t, 8.0]);
+        for (i, s) in split.iter().enumerate() {
+            assert!(
+                s.ipred > 0.0 && s.p_obs > 0.0 && s.p_obs.is_finite(),
+                "dosed split idx {i}: {s:?} (a prefill reads 0.0)"
+            );
+        }
+        // The means straddle the dose: `4⁻` is pre-dose, `4` post-dose (`ipred` is the
+        // amount here, so the step is the dose itself), and the post-dose one is the
+        // unsplit run's.
+        assert_relative_eq!(split[1].ipred - split[0].ipred, 100.0, max_relative = 1e-12);
+        assert_relative_eq!(split[1].ipred, unsplit[1].ipred, max_relative = 1e-12);
+        // One update for the pair: both records carry its `p_obs`, the unsplit pair's, and
+        // the next observation sees the covariance one update leaves.
+        assert_eq!(
+            split[0].p_obs.to_bits(),
+            split[1].p_obs.to_bits(),
+            "obs / dose / obs at one instant must share one update: p_obs {} then {}",
+            split[0].p_obs,
+            split[1].p_obs
+        );
+        assert_relative_eq!(split[1].p_obs, unsplit[1].p_obs, max_relative = 1e-12);
+        assert_relative_eq!(split[2].p_obs, unsplit[2].p_obs, max_relative = 1e-12);
+    }
+
     /// **The EKF covariance on a time-varying rate, against a quadrature oracle.**
     ///
     /// `time_reading_rhs_gets_finite_anchors_on_the_ekf_walk` asserts `p_obs > 0.0`. That is
