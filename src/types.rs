@@ -7405,6 +7405,10 @@ pub struct FitResult {
     /// declined any segment of the prediction pass at the final estimates
     /// ([`OdeSolverStats::linear_declined_segments`](crate::ode::OdeSolverStats)), since those
     /// segments were integrated.
+    ///
+    /// `#[serde(default)]`: a fit JSON written before #852 has no such key, and reads back as
+    /// `false` — the route those fits did run on.
+    #[serde(default)]
     pub ode_linear_exact: bool,
     /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
     pub uses_sde: bool,
