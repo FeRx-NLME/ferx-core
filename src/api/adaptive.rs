@@ -503,7 +503,9 @@ where
 
     // The driver's refusals that are a function of the inputs alone (#1983): checked here,
     // before any subject is simulated, rather than on the first subject the driver reaches.
-    // In the order the driver checked them.
+    // Within one subject, in the order the driver checked them; but base × reset now runs
+    // over every subject before `max_decisions` and the monitor checks, so on an input with
+    // two of these faults the one reported first can differ from the driver's.
     //
     // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
     // supported on the constant-covariate path (the controller augments it), on the time-
