@@ -15,7 +15,8 @@
 //! input missing from one (`E_FIT_INPUT_MISSING`), a file changed since it
 //! (`E_FIT_INPUT_CHANGED`) or a model that is not its own (`E_FIT_INPUT_MODEL`,
 //! and `E_THETA_LENGTH` for the θ count), and it runs no SIR, so it cannot refuse
-//! SIR's settings (`E_SIR_OPTIONS`). Their re-reads of the model and data files are
+//! SIR's settings (`E_SIR_OPTIONS`) or a fit with nothing free to sample
+//! (`E_SIR_NOTHING_TO_SAMPLE`). Their re-reads of the model and data files are
 //! not here: those failures are `ferx check`'s own, and are coded by its read
 //! classifiers in `validation.rs`.
 
@@ -158,4 +159,15 @@ pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
 /// degrees of freedom, or `sir_scale = natural` on a model with `prior(...)`.
 pub(crate) fn sir_options(message: impl Into<String>) -> EngineError {
     coded("E_SIR_OPTIONS", None, message.into())
+}
+
+/// `E_SIR_NOTHING_TO_SAMPLE`: every packed parameter of the fit is FIX, so SIR has
+/// no free direction to propose in. The model's own `[parameters]`, not the SIR
+/// settings, which is why it is not `E_SIR_OPTIONS`.
+pub(crate) fn sir_nothing_to_sample(message: impl Into<String>) -> EngineError {
+    coded(
+        "E_SIR_NOTHING_TO_SAMPLE",
+        Some("parameters"),
+        message.into(),
+    )
 }

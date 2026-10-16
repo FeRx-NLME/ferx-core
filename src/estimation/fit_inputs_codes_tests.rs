@@ -638,12 +638,14 @@ fn a_model_that_is_not_the_fits_carries_its_code() {
 /// SIR's own input refusals through `run_sir`, from the shared core
 /// (`run_sir_core_coded`): `E_SIR_OPTIONS` for settings the resampler cannot run with,
 /// `E_FIT_INPUT_MODEL` for a covariance matrix that is not the size of the model's
-/// packed parameters. Not attributed to the entry point, as before. The fourth option
+/// packed parameters, `E_SIR_NOTHING_TO_SAMPLE` on `[parameters]` for a fit whose
+/// θ, Ω and σ are all FIX. Not attributed to the entry point, as before. The fourth option
 /// refusal, `sir_scale = natural` under a prior, is pinned on the core in
 /// `sir_low_ess_tests::natural_scale_is_refused_with_a_prior_only`.
 ///
-/// Mutations — any of the three sites back on a bare `String` (`code()` `None`);
-/// `sir_options` / `fit_input_model` swapped (code); `run_sir` calling the `String`
+/// Mutations — any of the four sites back on a bare `String` (`code()` `None`);
+/// `sir_options` / `fit_input_model` / `sir_nothing_to_sample` swapped (code), the
+/// last one's block dropped (block); `run_sir` calling the `String`
 /// wrapper `run_sir_core` (every row's code); a sentence deleted (`to_string()`).
 #[test]
 fn sirs_own_input_refusals_carry_their_codes() {
@@ -662,6 +664,13 @@ fn sirs_own_input_refusals_carry_their_codes() {
     let mut df = c.opts.clone();
     df.sir_df = 0.0;
     let chi2 = rand_distr::ChiSquared::<f64>::new(0.0).unwrap_err();
+    let mut all_fix = c.fit.clone();
+    all_fix.theta_fixed.iter_mut().for_each(|b| *b = true);
+    all_fix.omega_fixed.iter_mut().for_each(|b| *b = true);
+    all_fix.sigma_fixed.iter_mut().for_each(|b| *b = true);
+    // A FIX that does not reach every packed coordinate is a sampled run, not this
+    // refusal: the row must not pass on a fixture with no Ω or σ to fix.
+    assert!(!all_fix.omega_fixed.is_empty() && !all_fix.sigma_fixed.is_empty());
     let sir = |fit: &FitResult, o: &FitOptions| run_sir(fit, None, None, o).map(|_| ());
     let plain = |name: &str, got, code, text: String| Row {
         name: format!("run_sir/{name}"),
@@ -690,5 +699,14 @@ fn sirs_own_input_refusals_carry_their_codes() {
             "E_FIT_INPUT_MODEL",
             format!("Covariance matrix dimensions (2,2) don't match packed parameters ({n})"),
         ),
+        Row {
+            block: Some("parameters"),
+            ..plain(
+                "every packed parameter FIX",
+                sir(&all_fix, &c.opts),
+                "E_SIR_NOTHING_TO_SAMPLE",
+                "run_sir_core: every packed parameter is FIX — nothing to sample.".to_string(),
+            )
+        },
     ]);
 }

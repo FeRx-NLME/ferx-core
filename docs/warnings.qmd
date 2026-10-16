@@ -175,7 +175,7 @@ found:
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
 | adaptive dosing: the model, the options, the spec | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
-| SIR settings (`run_sir()`) | `E_SIR_OPTIONS` |
+| SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
 | re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 
 `fit()` keeps returning a `String`.
@@ -227,6 +227,9 @@ Of the input refusals, these carry a code:
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
   above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
   prior. `fit()` with `sir = true` reports the same text as a warning;
+- a fit whose θ, Ω and σ are all FIX, so SIR has nothing to sample
+  (`E_SIR_NOTHING_TO_SAMPLE`, on `[parameters]`). `fit()` with `sir = true`
+  reports the same text as a warning;
 - a re-read of the fit's model or data file that fails: the code and block
   `ferx check` gives the same file, so a re-read with a covariate column missing
   is `E_MISSING_COVARIATE` on `covariates`. The message is the read's own: an

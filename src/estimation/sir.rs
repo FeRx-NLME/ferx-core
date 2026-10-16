@@ -884,7 +884,8 @@ pub fn run_sir_core(
 /// [`run_sir_core`], refusing with an [`EngineError`](crate::EngineError) that carries
 /// the code of a refusal of its input (#1774): `E_SIR_OPTIONS` for SIR settings it
 /// cannot run with, `E_FIT_INPUT_MODEL` for a proposal covariance that is not the
-/// size of the packed parameters. `run_sir` returns it as is; `run_sir_core`, and
+/// size of the packed parameters, `E_SIR_NOTHING_TO_SAMPLE` for a fit whose packed
+/// parameters are all FIX. `run_sir` returns it as is; `run_sir_core`, and
 /// through it `fit()`'s in-fit SIR, keep the text, unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sir_core_coded(
@@ -1044,7 +1045,9 @@ fn run_sir_in_box(
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
-        return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".into());
+        return Err(crate::api::sir_nothing_to_sample(
+            "run_sir_core: every packed parameter is FIX — nothing to sample.",
+        ));
     }
 
     // A `LogitProbability` θ is proposed on the logit scale (#1548): a proposal
