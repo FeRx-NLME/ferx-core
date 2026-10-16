@@ -8,7 +8,7 @@
 //! derivative for the duration of the infusion via an RHS wrapper.
 
 use crate::ode::solver::{
-    solve_ode, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
+    solve_ode_certified, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
     OdeSolverStats,
 };
 use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
@@ -774,7 +774,7 @@ fn equilibrate_ss_input_rate(
     // The cycle's pulse sits at local `0`, so `TAD = t` across the whole window (#1139).
     let ext = ss_run_in_params(pk_params_flat, 0.0);
     let advance = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
+        solve_ode_certified(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
@@ -1316,7 +1316,8 @@ fn equilibrate_ss_pk_state(
                 pk_params_flat,
                 tad_anchor_for(&local_doses, &no_lag, seg_start),
             );
-            let sol = solve_ode(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
+            let sol =
+                solve_ode_certified(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1367,7 +1368,7 @@ fn equilibrate_ss_pk_state(
     // used costs one 1 KB stack array per infusion cycle — against that cycle's ODE solve —
     // and removes the invariant rather than documenting it.
     let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(
+        solve_ode_certified(
             &base_rhs,
             u0,
             (0.0, dose.ii),
@@ -1389,7 +1390,7 @@ fn equilibrate_ss_pk_state(
                     dy[cmt_idx] += rate;
                 }
             };
-            let mut y = solve_ode(
+            let mut y = solve_ode_certified(
                 &wrapped_rhs,
                 u0,
                 (0.0, t_inf),
@@ -1404,15 +1405,22 @@ fn equilibrate_ss_pk_state(
                 // Pulse at local `−T_inf`: this window re-opens its clock at `0` but sits
                 // `T_inf` after the cycle's pulse. See `ss_run_in_params`.
                 let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
-                y = solve_ode(&base_rhs, &y, (0.0, quiet), &ext_quiet, &[quiet], &eq_opts)
-                    .last()
-                    .map(|p| p.u.clone())?;
+                y = solve_ode_certified(
+                    &base_rhs,
+                    &y,
+                    (0.0, quiet),
+                    &ext_quiet,
+                    &[quiet],
+                    &eq_opts,
+                )
+                .last()
+                .map(|p| p.u.clone())?;
             }
             Some(y)
         } else {
             let mut y = u0.to_vec();
             y[cmt_idx] += f_bio * dose.amt;
-            solve_ode(
+            solve_ode_certified(
                 &base_rhs,
                 &y,
                 (0.0, dose.ii),
@@ -1457,7 +1465,8 @@ fn equilibrate_ss_pk_state(
                     dy[cmt_idx] += rate;
                 }
             };
-            let sol = solve_ode(&wrapped_rhs, &u, (0.0, t_inf), &ext_cycle, &[t_inf], opts);
+            let sol =
+                solve_ode_certified(&wrapped_rhs, &u, (0.0, t_inf), &ext_cycle, &[t_inf], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1466,7 +1475,8 @@ fn equilibrate_ss_pk_state(
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
                 let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
-                let sol = solve_ode(&base_rhs, &u, (0.0, quiet), &ext_quiet, &[quiet], opts);
+                let sol =
+                    solve_ode_certified(&base_rhs, &u, (0.0, quiet), &ext_quiet, &[quiet], opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -1483,7 +1493,8 @@ fn equilibrate_ss_pk_state(
             // suppressed for an input-rate compartment and `R_in` integrated over
             // the cycle instead.
             u[cmt_idx] += f_bio * dose.amt;
-            let sol = solve_ode(&base_rhs, &u, (0.0, dose.ii), &ext_cycle, &[dose.ii], opts);
+            let sol =
+                solve_ode_certified(&base_rhs, &u, (0.0, dose.ii), &ext_cycle, &[dose.ii], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1614,7 +1625,7 @@ fn ss_state_at_phase_pk(
                 dy[cmt_idx] += rate;
             }
         };
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (0.0, active),
@@ -1627,7 +1638,7 @@ fn ss_state_at_phase_pk(
         }
         if phase > t_inf {
             let quiet = phase - t_inf;
-            let sol = solve_ode(
+            let sol = solve_ode_certified(
                 &base_rhs,
                 &u,
                 (0.0, quiet),
@@ -1644,7 +1655,7 @@ fn ss_state_at_phase_pk(
         // an input-rate compartment is rejected upstream by `E_ABSORPTION_SS`;
         // see the matching note in `equilibrate_ss_state`.
         u[cmt_idx] += f_bio * dose.amt;
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &base_rhs,
             &u,
             (0.0, phase),
@@ -7650,7 +7661,7 @@ pub fn ode_predictions_with_states(
             &zero_order,
         );
 
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
@@ -8271,7 +8282,7 @@ pub(crate) fn ode_dense_solve_states_reading(
             &forcings.zero_order,
         );
 
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
@@ -8475,3 +8486,23 @@ mod tests;
 #[cfg(test)]
 #[path = "predictions_linear_route.rs"]
 mod linear_route;
+
+/// The refusal for `ode_method = linear` (#852) on `ode`, or `None` when the model can take
+/// the exact path. One message for both places the option can arrive: the model file's
+/// `[fit_options]` (a parse error) and a caller's `FitOptions` (`E_ODE_METHOD_LINEAR` from
+/// `check_model_options`), so the two cannot word the same refusal differently.
+pub(crate) fn ode_method_linear_refusal(ode: Option<&OdeSpec>) -> Option<String> {
+    match ode {
+        None => Some(
+            "fit option `ode_method = linear` applies to an [odes] model, and this model has \
+             none. An analytical structural model is already exact; remove the option."
+                .to_string(),
+        ),
+        Some(ode) => ode.linear_ineligibility().map(|reason| {
+            format!(
+                "fit option `ode_method = linear`: this [odes] model cannot be propagated \
+                 exactly — {reason}. Use `ode_method = auto` (the default) to integrate it."
+            )
+        }),
+    }
+}

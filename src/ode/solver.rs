@@ -251,12 +251,16 @@ pub enum OdeMethod {
     /// `exp([[A, b], [0, 0]]·h)`, exact to roundoff. A model gets it in one of two ways — the
     /// parser selects it for [`Auto`](OdeMethod::Auto) when its `[odes]` block is
     /// *structurally* affine in the states, reads no model time and carries no absorption
-    /// forcing; or the user names `ode_method = linear`, which asserts that and is a parse
-    /// error on a model that is not. Any named integrator opts a linear model out.
+    /// forcing; or the user names `ode_method = linear`, which asserts that and is refused on
+    /// a model that is not (a parse error from the model file, `E_ODE_METHOD_LINEAR` from a
+    /// caller's `FitOptions`). Any named integrator opts a linear model out.
     ///
-    /// A segment the exact path cannot serve — a forcing that switches inside the span, or a
-    /// programmatic `Linear` on an RHS the parser never certified — is integrated as `Auto`
-    /// would integrate it, so the answer is never worse than the stepping one.
+    /// Only a parser-certified spec takes the exact path. The public `solve_ode*` functions
+    /// take an arbitrary closure and integrate `Linear` as `Auto`: the propagator's runtime
+    /// self-check samples finitely many points, so it cannot certify a closure. A certified
+    /// segment it still declines (an overflowing exponential, say) is integrated as `Auto`
+    /// would integrate it and counted in
+    /// [`OdeSolverStats::linear_declined_segments`].
     Linear,
 }
 
@@ -1509,6 +1513,13 @@ fn integrate_dense_g<T: PkNum>(
 
 /// Integrate an ODE system from `t_start` to `t_end`, returning the state at each `saveat`
 /// time. Uses whichever stepper [`OdeSolverOptions::method`] selects.
+///
+/// [`OdeMethod::Linear`] is integrated as [`OdeMethod::Auto`] here, as on every public
+/// `solve_ode*` entry point: `rhs` is an arbitrary closure no parser has certified, and the
+/// exact propagator's runtime self-check samples finitely many points, so it cannot tell a
+/// right-hand side that is affine from one that only agrees with an affine map where it looks
+/// (a generator that varies in time between its sample points, say). The exact path is taken
+/// only for a model whose `[odes]` block the parser certified (#852).
 pub fn solve_ode(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u0: &[f64],
@@ -1518,6 +1529,21 @@ pub fn solve_ode(
     opts: &OdeSolverOptions,
 ) -> Vec<SolPoint> {
     solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode`] for a caller holding options from
+/// [`OdeSpec::effective_solver_opts`](crate::ode::predictions::OdeSpec) on the RHS that spec
+/// built — the one place [`OdeMethod::Linear`] is honoured, because only there did the parser
+/// certify the system linear.
+pub(crate) fn solve_ode_certified(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPoint> {
+    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, None).0
 }
 
 /// [`solve_ode`] with optional adaptive-step instrumentation.
@@ -1533,6 +1559,8 @@ pub fn solve_ode_with_stats(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
+    // Uncertified closure: never the exact path (see `solve_ode`).
+    let opts = &opts.for_integration();
     solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
 }
 
@@ -1985,6 +2013,32 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
     solve_ode_g_with_stats(rhs, u0, t_span, params, saveat, opts, None)
 }
 
+/// [`solve_ode_g`] for a certified spec's options — the generic twin of
+/// [`solve_ode_certified`], and like it the only `solve_ode_g*` route that honours
+/// [`OdeMethod::Linear`].
+pub(crate) fn solve_ode_g_certified<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPointG<T>> {
+    let mut auto_state = OdeAutoSwitchState::default();
+    integrate_resolved_g(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        &[],
+        opts,
+        None,
+        &mut auto_state,
+    )
+    .0
+}
+
 /// [`solve_ode_g`] with optional adaptive-step instrumentation.
 pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
@@ -2036,7 +2090,8 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
         params,
         saveat,
         interp_at,
-        opts,
+        // Uncertified closure: never the exact path (see `solve_ode`).
+        &opts.for_integration(),
         stats,
         &mut auto_state,
     )

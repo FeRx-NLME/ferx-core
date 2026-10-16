@@ -27,6 +27,7 @@
 //! | `E_BLOCK_FEATURE_DISABLED`| a `[block]` needs a cargo feature this binary was not built with |
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |
 //! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data |
+//! | `E_ODE_METHOD_LINEAR`     | `ode_method = linear` on a model that cannot take the exact linear path |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
 //! | `W_PER_CMT_UNMATCHED`     | the other direction of the two above: a **declared** per-CMT entry — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, or a `y[CMT=N]` readout on either engine — that no observation is recorded on, so the entry is inert. A warning rather than an error because nothing goes `NaN`, and one code for all three channels, with the channel named in the message. Names `[data_selection]` as a candidate cause only for the dead compartments a clause actually emptied. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead (#1405) |

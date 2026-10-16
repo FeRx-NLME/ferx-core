@@ -284,11 +284,15 @@ Infusions, bolus doses, lag times, bioavailability, `init(...)`, resets, IOV and
 covariates all work on this path — each is constant between two events, which is all the
 exponential needs.
 
-One computation still steps with the integrator on a linear model: locating the time at which
-a cumulative hazard crosses its drawn threshold, when `simulate()` draws event times for an
-ODE time-to-event model. That search needs the crossing inside a segment, not the state at
-its end, so its event times carry `ode_reltol`-level error; predictions and the objective do
-not.
+Two computations still step with the integrator on a linear model, and carry
+`ode_reltol`-level error where the PK predictions do not:
+
+- locating the time at which a cumulative hazard crosses its drawn threshold, when
+  `simulate()` draws event times for an ODE time-to-event model — the search needs the
+  crossing inside a segment, not the state at its end;
+- the transition probabilities of a drug-driven Markov (`ctmm`) endpoint, whose generator
+  follows the drug concentration and so changes within every interval. Its share of the
+  objective is integrated; the PK model that drives it is not.
 
 ### Asserting it, or opting out {#linear-exact-control}
 

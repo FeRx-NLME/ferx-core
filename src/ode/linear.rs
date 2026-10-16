@@ -191,8 +191,7 @@ const SELF_CHECK_RTOL: f64 = 1e-9;
 /// `(hard, soft)` contract as the stepping drivers, so a caller cannot tell which produced it.
 ///
 /// `A` and `b` are read off the RHS itself at the segment midpoint: `b = f(0)` and column `j`
-/// of `A` is `(f(s·e_j) − b)/s`, with the probe scale `s` raised wherever the forcing would
-/// otherwise swamp the column. That keeps the dynamics in one place — the parser-built RHS, with
+/// of `A` is `(f(s·e_j) − b)/s`, with `s = 2^500` so the probe dominates any forcing. That keeps the dynamics in one place — the parser-built RHS, with
 /// its infusion and zero-order wrapping — instead of a second symbolic copy of the model that
 /// could drift from it.
 ///
@@ -223,54 +222,29 @@ pub(crate) fn linear_segment_g<T: PkNum>(
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
     //
-    // The difference cancels b, so its rounding error is ~ε·|b_i| in absolute terms, i.e.
-    // ε·|b_i|/(s·|A_ij|) relative to the entry. A unit probe (s = 1) is fine when the forcing
-    // and the state coefficients are of one magnitude, and loses every digit when they are not:
-    // an infusion of 1e9 ng/h into a compartment with k = 1e-3 /h reads A to ~1e-4, and
-    // `du/dt = 1e20 − u` reads A = 0. So a first unit-probe pass estimates each column, and a
-    // column whose forcing dominates it is re-probed at `s ≈ max_i |b_i|/|A_ij|`, which brings
-    // `s·A_ij` level with `b_i` and the entry back to ~ε relative. The RHS is certified affine,
-    // so any probe scale is exact in exact arithmetic; the cap only keeps `s·A` finite.
-    const MAX_PROBE_SCALE: f64 = 1e150;
+    // The difference cancels b, so it carries rounding of order ε·|b_i| — in the value and,
+    // separately, in every derivative component — i.e. ε·|b_i|/(s·|A_ij|) relative to the
+    // entry. A unit probe loses every digit wherever the forcing dwarfs the coefficient: an
+    // infusion of 1e9 into k = 1e-3 reads A to ~1e-7, `du/dt = 1e20 − u` reads A = 0, and a
+    // forcing whose *sensitivity* is large (`C·p` with C = 1e20) zeroes ∂A/∂p while the value
+    // is fine — so no scale chosen from values alone is safe. A probe far above any forcing
+    // makes `s·A_ij` dominate `b_i` in every component instead, leaving ~ε relative on each:
+    // `fl(s·A + b) − b` is `s·A·(1 + δ)`. A power of two keeps the multiply and the divide
+    // exact. The RHS is certified affine, so the size of the probe is otherwise immaterial;
+    // the bound is overflow, which needs `|A|` near 1e158 and is caught below as non-finite.
+    const PROBE: f64 = 3.273_390_607_896_142e150; // 2^500, exactly
     let mut probe = vec![zero; n];
     let mut b = vec![zero; n];
     rhs(&probe, params, t_mid, &mut b);
     let mut a = vec![zero; n * n];
     let mut col = vec![zero; n];
-    let mut read_column = |j: usize, scale: f64, a: &mut [T], probe: &mut [T]| {
-        probe[j] = T::from_f64(scale);
-        rhs(probe, params, t_mid, &mut col);
-        probe[j] = zero;
-        let inv = T::from_f64(1.0 / scale);
-        for i in 0..n {
-            a[i * n + j] = (col[i] - b[i]) * inv;
-        }
-    };
+    let inv_probe = T::from_f64(1.0 / PROBE);
     for j in 0..n {
-        read_column(j, 1.0, &mut a, &mut probe);
-        // A column the forcing swamped entirely reads as rounding noise, so the first rescale
-        // is only as good as that noise; a second read at the scale the first one implies
-        // lands at ~ε. Converges in at most three reads (unit, noise-level, final).
-        let mut current = 1.0_f64;
-        for _ in 0..2 {
-            let mut scale = 1.0_f64;
-            for i in 0..n {
-                let bi = b[i].val().abs();
-                if bi == 0.0 {
-                    continue;
-                }
-                // An entry indistinguishable from the last read's rounding (ε·|b_i| over that
-                // read's scale) is probed as if it were that rounding: the largest scale the
-                // row can ask for on what is known so far.
-                let aij = a[i * n + j].val().abs().max(f64::EPSILON * bi / current);
-                scale = scale.max(bi / aij);
-            }
-            let scale = scale.min(MAX_PROBE_SCALE);
-            if scale <= 2.0 * current {
-                break;
-            }
-            read_column(j, scale, &mut a, &mut probe);
-            current = scale;
+        probe[j] = T::from_f64(PROBE);
+        rhs(&probe, params, t_mid, &mut col);
+        probe[j] = zero;
+        for i in 0..n {
+            a[i * n + j] = (col[i] - b[i]) * inv_probe;
         }
     }
     if a.iter().chain(&b).any(|x| !x.val().is_finite()) {

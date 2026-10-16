@@ -251,8 +251,8 @@ fn segment_reads_a_column_the_forcing_dwarfs() {
     // `b = f(0)` is cancelled out of every probe, so a unit probe reads `A_ij` to ~ε·|b_i|
     // absolutely. Each case puts the forcing many orders above the coefficient: a unit probe
     // reads A = 0 on the first and third, and the segment is declined (and integrated) on all
-    // three. The first also needs the forcing column of the augmented generator scaled down,
-    // or ‖M‖ = 1e20 exhausts the squaring budget.
+    // three; a probe of 1e12 still fails the bound. The first also needs the forcing column
+    // of the augmented generator scaled down, or ‖M‖ = 1e20 exhausts the squaring budget.
     for (k, r, t) in [(1.0, 1e20, 1.0), (1e-3, 1e9, 24.0), (0.37, 3.3e19, 1.7)] {
         let (hard, _) =
             linear_segment_g::<f64>(&one_cpt_infusion, &[0.0], (0.0, t), &[k, r], &[t], &[])
@@ -260,14 +260,47 @@ fn segment_reads_a_column_the_forcing_dwarfs() {
         let exact = r / k * -(-k * t).exp_m1();
         let rel = (hard[0].u[0] - exact).abs() / exact;
         assert!(hard[0].u[0].is_finite());
-        // Measured ≤ 3.2e-16 across the three. A single rescale reads the third case's A to
-        // 3e-13 (answer 8.3e-14 off), which this bound rejects.
+        // Measured ≤ 3.2e-16 across the three.
         assert!(
             rel < 1e-14,
             "k={k}, r={r}: {} vs {exact} (rel {rel:e})",
             hard[0].u[0]
         );
     }
+}
+
+#[test]
+fn segment_reads_a_jet_the_forcing_sensitivity_dwarfs() {
+    // `du/dt = C·p − (1 + p)·u` at p = 0, u0 = C: the value of `b` is 0, but its derivative
+    // is C, so a unit probe's `(C − 1) − C` rounds ∂A/∂p from −1 to 0 while every value
+    // check passes. Exact: u = C·e^{−t}, ∂u/∂p = C·(1 − e^{−t}) − C·t·e^{−t}.
+    let c = 1e20;
+    let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+        let one = Dual2::<1>::from_f64(1.0);
+        du[0] = Dual2::<1>::from_f64(c) * p[0] - (one + p[0]) * u[0];
+    };
+    let t = 1.0;
+    let (hard, _) = linear_segment_g(
+        &rhs,
+        &[Dual2::<1>::from_f64(c)],
+        (0.0, t),
+        &[Dual2::<1>::var(0.0, 0)],
+        &[t],
+        &[],
+    )
+    .expect("affine, autonomous");
+    let got = hard[0].u[0];
+    let e = (-t).exp();
+    let (value, grad) = (c * e, c * (1.0 - e) - c * t * e);
+    let rel_v = (got.val() - value).abs() / value;
+    let rel_g = (got.grad[0] - grad).abs() / grad.abs();
+    assert!(got.val().is_finite() && got.grad[0].is_finite(), "{got:?}");
+    // Measured 1.1e-16 (value) and 7.8e-16 (∂/∂p). A unit probe gives ∂/∂p 139% off, a
+    // probe of 1e12 gives 5.7e-9: the derivative needs the probe above the *jet* of b.
+    assert!(
+        rel_v < 1e-14 && rel_g < 1e-14,
+        "value rel {rel_v:e}, ∂/∂p rel {rel_g:e}"
+    );
 }
 
 /// Two compartments, depot absorption, constant infusion into central — the shape the
@@ -316,27 +349,33 @@ fn segment_agrees_with_a_tight_integrator() {
 #[test]
 fn segment_declines_a_nonlinear_rhs() {
     // Michaelis–Menten elimination: the classifier rejects it structurally; this is the
-    // runtime backstop for a programmatic `OdeMethod::Linear` on an uncertified model.
+    // runtime backstop behind that certification (public `solve_ode*` never get here).
     let mm = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
         du[0] = -p[0] * u[0] / (p[1] + u[0]);
     };
     assert!(linear_segment_g::<f64>(&mm, &[50.0], (0.0, 4.0), &[10.0, 5.0], &[4.0], &[]).is_none());
-    // `du/dt = u²` from `u0 = 1` agrees with its unit-probe secant (A = 1, b = 0) at `u0`
-    // itself, so the entry-state checks pass; only the state the propagation reaches
-    // (e^0.5 against the true 2) exposes it.
-    let square = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
-    assert!(linear_segment_g::<f64>(&square, &[1.0], (0.0, 0.5), &[], &[0.5], &[]).is_none());
-    // With Km far above every state reached, MM is affine to rounding at every checked point
-    // and the backstop accepts it — which is why it is not the certification. Accepting it is
-    // harmless because the answer is then right to that same precision: pinned here.
-    let (hard, _) =
-        linear_segment_g::<f64>(&mm, &[0.5], (0.0, 4.0), &[10.0, 1e12], &[4.0], &[]).unwrap();
-    let linearised = 0.5 * (-10.0 / 1e12 * 4.0_f64).exp();
-    assert!(
-        (hard[0].u[0] - linearised).abs() < 1e-15,
-        "{}",
-        hard[0].u[0]
+    // The probe sits at 2^500, so a saturable term is read at its plateau: even with Km far
+    // above every state the trajectory reaches, the column (≈ −Vmax/2^500) disagrees with the
+    // RHS at `u0` and the segment is declined.
+    assert!(linear_segment_g::<f64>(&mm, &[0.5], (0.0, 4.0), &[10.0, 1e12], &[4.0], &[]).is_none());
+    // A nonlinear RHS built to agree with its probe secant at `u0 = 1` *and* at the probe:
+    // `u·(1 + (u − 1)·(s − u)/s)` is `u` at both, so A = 1, b = 0 and the entry checks pass.
+    // Only the states the propagation reaches (`u ≈ e^0.5`, where the RHS is ~1.65× A·u)
+    // expose it.
+    let s = 2f64.powi(500);
+    let secant_twin = move |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+        du[0] = u[0] * (1.0 + (u[0] - 1.0) * ((s - u[0]) / s))
+    };
+    let mut at_u0 = [0.0];
+    secant_twin(&[1.0], &[], 0.0, &mut at_u0);
+    let mut at_probe = [0.0];
+    secant_twin(&[s], &[], 0.0, &mut at_probe);
+    assert_eq!(
+        (at_u0[0], at_probe[0]),
+        (1.0, s),
+        "fixture must match its secant at both"
     );
+    assert!(linear_segment_g::<f64>(&secant_twin, &[1.0], (0.0, 0.5), &[], &[0.5], &[]).is_none());
 }
 
 #[test]
@@ -399,4 +438,110 @@ fn segment_dual_gradient_matches_fd() {
             epsilon = 1e-8
         );
     }
+}
+
+/// `du/dt = −g(t)·u` with `g = 1 + 1000·[(t − ¼)(t − ½)(t − ¾)]²`: `g = 1` at the midpoint
+/// (where A is read) and at both quarter-point checks, so the sampled self-check cannot see
+/// the time dependence and the exact path returns `e^{−1}` — while the truth over (0, 1) is
+/// `e^{−∫g} = e^{−(1 + 1000·107/107520)}`. The CTMM occupancy RHS (`markov`) is shaped like
+/// this and reached `solve_ode` with the PK model's `Linear` route (#852 review).
+fn time_varying_rate(u: &[f64], _p: &[f64], t: f64, du: &mut [f64]) {
+    let q = (t - 0.25) * (t - 0.5) * (t - 0.75);
+    du[0] = -(1.0 + 1000.0 * q * q) * u[0];
+}
+
+#[test]
+fn public_solve_ode_never_takes_the_exact_path() {
+    let linear = OdeSolverOptions {
+        method: OdeMethod::Linear,
+        reltol: 1e-10,
+        abstol: 1e-12,
+        ..Default::default()
+    };
+    let truth = (-(1.0 + 1000.0 * 107.0 / 107_520.0_f64)).exp();
+    let frozen = (-1.0_f64).exp();
+    // The straddle: on the certified route the fixture really does fool the exact path, so
+    // the public assertions below are not passing because nothing could go wrong.
+    let certified = crate::ode::solver::solve_ode_certified(
+        &time_varying_rate,
+        &[1.0],
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &linear,
+    );
+    assert!(
+        (certified[0].u[0] - frozen).abs() < 1e-14,
+        "fixture must fool the sampled self-check: {}",
+        certified[0].u[0]
+    );
+    let check = |label: &str, got: f64| {
+        assert!(got.is_finite(), "{label}: {got}");
+        assert!(
+            (got - truth).abs() / truth < 1e-7,
+            "{label}: {got} vs integrated truth {truth} (frozen-generator answer {frozen})"
+        );
+    };
+    check(
+        "solve_ode",
+        solve_ode(&time_varying_rate, &[1.0], (0.0, 1.0), &[], &[1.0], &linear)[0].u[0],
+    );
+    let rhs_g = |u: &[Dual2<1>], _p: &[Dual2<1>], t: f64, du: &mut [Dual2<1>]| {
+        let q = (t - 0.25) * (t - 0.5) * (t - 0.75);
+        du[0] = u[0] * Dual2::<1>::from_f64(-(1.0 + 1000.0 * q * q));
+    };
+    let u0 = [Dual2::<1>::from_f64(1.0)];
+    check(
+        "solve_ode_g",
+        crate::ode::solver::solve_ode_g(&rhs_g, &u0, (0.0, 1.0), &[], &[1.0], &linear)[0].u[0]
+            .val(),
+    );
+    check(
+        "solve_ode_g_dense",
+        crate::ode::solver::solve_ode_g_dense(
+            &rhs_g,
+            &u0,
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &[],
+            &linear,
+            None,
+        )
+        .0[0]
+            .u[0]
+            .val(),
+    );
+}
+
+/// The drug-driven CTMM transition integrates its occupancy equation through public
+/// `solve_ode` with the PK spec's options — `Linear` on a linear PK model. Its generator varies
+/// in time, so it must be integrated: `P[0,0] = e^{−∫g}`, not the frozen `e^{−1}`.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_occupancy_ignores_the_pk_models_exact_route() {
+    let linear = OdeSolverOptions {
+        method: OdeMethod::Linear,
+        reltol: 1e-10,
+        abstol: 1e-12,
+        ..Default::default()
+    };
+    let p = crate::markov::ctmm_inhomogeneous_transition_with_opts(
+        |t| {
+            let q = (t - 0.25) * (t - 0.5) * (t - 0.75);
+            let g = 1.0 + 1000.0 * q * q;
+            nalgebra::DMatrix::from_row_slice(2, 2, &[-g, g, 0.0, 0.0])
+        },
+        1.0,
+        2,
+        &linear,
+    );
+    let truth = (-(1.0 + 1000.0 * 107.0 / 107_520.0_f64)).exp();
+    assert!(p[(0, 0)].is_finite(), "{p}");
+    assert!(
+        (p[(0, 0)] - truth).abs() / truth < 1e-7,
+        "P[0,0] = {} vs {truth} (frozen generator: {})",
+        p[(0, 0)],
+        (-1.0_f64).exp()
+    );
 }

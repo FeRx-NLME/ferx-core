@@ -4353,6 +4353,18 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let chain = options.method_chain();
     let mut diags = Vec::new();
 
+    // `ode_method = linear` is an assertion (#852). From the model file the parser refuses it;
+    // a caller's `FitOptions` never passes the parser, and without this the fit-scoped override
+    // would quietly integrate an ineligible model (`effective_solver_opts` demotes it to
+    // `auto`) or ignore the option on an analytical one.
+    if options.ode_method == crate::ode::OdeMethod::Linear {
+        if let Some(refusal) =
+            crate::ode::predictions::ode_method_linear_refusal(model.ode_spec.as_ref())
+        {
+            diags.push(Diagnostic::error("E_ODE_METHOD_LINEAR", refusal).with_block("fit_options"));
+        }
+    }
+
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
     // variable to integrate over, so every estimator whose objective *is* an
     // integral over η degenerates there. SAEM's E-step is empty — it runs,

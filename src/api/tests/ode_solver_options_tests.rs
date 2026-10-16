@@ -328,3 +328,51 @@ const LINEAR_SOURCE: &str = r#"
 [error_model]
   DV ~ proportional(PROP)
 "#;
+
+/// `ode_method = Linear` handed to `fit()` in a caller's `FitOptions` asserts the exact path
+/// exactly as it does from the model file (where the parser refuses it). Without the
+/// `check_model_options` gate the override is demoted to `auto` on an ineligible model and
+/// ignored on an analytical one, and both fits succeed.
+#[test]
+fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
+    let pop = population();
+    let linear_opts = FitOptions {
+        ode_method: crate::ode::OdeMethod::Linear,
+        ..eval_opts()
+    };
+    let refusal =
+        |model: &CompiledModel| match fit(model, &pop, &model.default_params, &linear_opts) {
+            Ok(_) => panic!("`ode_method = Linear` from FitOptions must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+    let e = refusal(&ode_model(""));
+    assert!(
+        e.contains("this [odes] model cannot be propagated exactly — an equation is not linear in the states"),
+        "{e}"
+    );
+    assert!(
+        e.contains("Use `ode_method = auto` (the default) to integrate it."),
+        "{e}"
+    );
+
+    let analytical = parse_model_string(
+        &LINEAR_SOURCE
+            .replace("ode(states=[central])", "pk one_cpt_iv(cl=CL, v=V)")
+            .replace("[odes]\n  d/dt(central) = -(CL / V) * central\n", "")
+            .replace("[scaling]\n  y = central / V\n", ""),
+    )
+    .expect("analytical twin parses");
+    assert!(analytical.ode_spec.is_none(), "fixture must be analytical");
+    let e = refusal(&analytical);
+    assert!(
+        e.contains("applies to an [odes] model, and this model has none."),
+        "{e}"
+    );
+
+    // The straddle: the same option on a certified model fits, on the exact path.
+    let linear = parse_model_string(LINEAR_SOURCE).expect("linear model parses");
+    let fitted = fit(&linear, &pop, &linear.default_params, &linear_opts)
+        .expect("a certified model accepts ode_method = Linear");
+    assert!(fitted.ode_linear_exact);
+}
