@@ -6501,6 +6501,76 @@ fn covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name() {
     );
 }
 
+/// A group records the single anchors whose theta it reads (#1630), with the
+/// anchor-stopped reachability walk alongside the group-stopped one. Cells:
+///
+/// - (a) `V2 = TVV2*exp(ETA_V2)` next to a `V1` group reading `TVV2`: the
+///   anchor is recorded, `TVV2` is outside the group (through `V2`) but not
+///   outside groups *and* anchors; an anchor on a theta the group does not read
+///   (`KA`) is not listed;
+/// - (b) a third reader of `TVV2` (`Q`) is outside both walks;
+/// - (c) a later assignment that is no longer an anchor (`V2 = TVV2 + ETA_V2`)
+///   retires it, as it retires a group — a stale anchor would be absorbed and
+///   stepped from an expression the model no longer evaluates;
+/// - (d) an anchor whose eta a second right-hand side reads says so.
+#[test]
+fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
+    let tn = ["TVV2", "TH_R", "TH_WT", "TVKA"];
+    let en = ["ETA_V1", "ETA_V2", "ETA_KA"];
+    let group = "V1 = TVV2 * TH_R * (WT / 70.0)^TH_WT * exp(ETA_V1)";
+    let base = format!("V2 = TVV2 * exp(ETA_V2)\nKA = TVKA * exp(ETA_KA)\n{group}");
+
+    let g = detect_groups_outside(&base, &tn, &en, &["V1", "V2", "KA"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].read_outside_groups, vec!["TVV2"], "(a)");
+    assert!(
+        g[0].read_outside_groups_and_anchors.is_empty(),
+        "(a) {:?}",
+        g[0].read_outside_groups_and_anchors
+    );
+    assert_eq!(g[0].colliding_anchors.len(), 1, "(a)");
+    let a = &g[0].colliding_anchors[0];
+    assert_eq!(a.eta_name, "ETA_V2");
+    assert_eq!(a.theta_names, vec!["TVV2"]);
+    assert_eq!(a.transform, MuTransform::Log);
+    assert!(a.read_outside_groups_and_anchors.is_empty(), "(a)");
+    assert!(!a.eta_shared, "(a)");
+
+    // (a') A second group that reads `TVKA` but not `TVV2`: each group lists
+    // the anchors on *its* thetas only.
+    let tn2 = ["TVV2", "TH_R", "TH_WT", "TVKA", "TH_KA"];
+    let two = format!("{base}\nKA = TVKA * (WT / 70.0)^TH_KA * exp(ETA_KA)");
+    let g = detect_groups_outside(&two, &tn2, &en, &["V1", "V2", "KA"]);
+    assert_eq!(g.len(), 2, "(a')");
+    assert_eq!(g[0].eta_name, "ETA_V1");
+    let etas = |g: &CovariateMuRef| -> Vec<String> {
+        g.colliding_anchors
+            .iter()
+            .map(|a| a.eta_name.clone())
+            .collect()
+    };
+    assert_eq!(etas(&g[0]), vec!["ETA_V2"], "(a')");
+    // `ETA_KA`'s plain line is overwritten by its group, so it is no anchor.
+    assert!(etas(&g[1]).is_empty(), "(a') {:?}", etas(&g[1]));
+
+    let third = format!("{base}\nQ = TVV2 * 0.1");
+    let g = detect_groups_outside(&third, &tn, &en, &["V1", "V2", "KA", "Q"]);
+    assert_eq!(g[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
+    assert_eq!(
+        g[0].colliding_anchors[0].read_outside_groups_and_anchors,
+        vec!["TVV2"],
+        "(b)"
+    );
+
+    let retired = format!("{base}\nV2 = TVV2 + ETA_V2");
+    let g = detect_groups_outside(&retired, &tn, &en, &["V1", "V2", "KA"]);
+    assert!(g[0].colliding_anchors.is_empty(), "(c)");
+
+    let shared_eta = format!("{base}\nQ = 3.0 * exp(0.5 * ETA_V2)");
+    let g = detect_groups_outside(&shared_eta, &tn, &en, &["V1", "V2", "KA", "Q"]);
+    assert!(g[0].colliding_anchors[0].eta_shared, "(d)");
+}
+
 #[test]
 fn covariate_mu_ref_reaches_the_compiled_model() {
     let src = r"

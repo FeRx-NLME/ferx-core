@@ -1218,6 +1218,11 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
 /// uppercased identifier set of every block *other* than `[parameters]` and
 /// `[individual_parameters]`, which is how a theta reaching the likelihood
 /// through `[odes]` or `[derived]` is seen from here.
+///
+/// The same walk notes every one-theta typical value of the same shapes
+/// ([`classify_single_anchor`]), and each group carries the ones on its own
+/// thetas as [`CovariateMuRef::colliding_anchors`] (#1630), so SAEM / IMP can
+/// take such an anchor into the group's joint M-step instead of declining it.
 fn detect_covariate_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
@@ -1227,6 +1232,11 @@ fn detect_covariate_mu_refs(
 ) -> Vec<CovariateMuRef> {
     let mut scope = InlineScope::new(stmts);
     let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
+    // One-theta typical values, kept apart from `found` (#1630): eta, owner,
+    // and the one theta. Only the ones a group collides with are materialised,
+    // after the walk — building every anchor's inlined typical value would
+    // undo the lazy inlining (#1684) on every plain mu-reference.
+    let mut anchors: Vec<(usize, String, usize)> = Vec::new();
     // The top-level statement that recorded each owner's surviving group. An
     // owner is retired on any later assignment to its name, so the latest
     // recording is the one `found` keeps.
@@ -1241,10 +1251,17 @@ fn detect_covariate_mu_refs(
                 let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
                 // Retire before recording, and retire whether or not this line is
                 // itself a group: an assignment that no longer classifies still
-                // supersedes the one it overwrites.
+                // supersedes the one it overwrites. Single anchors are retired
+                // by the same rule, for the same reason.
                 retire_superseded_group(&mut found, name, expr);
+                retire_superseded_group(&mut anchors, name, expr);
                 if let Some((eta_idx, entry)) = classified {
                     found.push((eta_idx, name.clone(), entry));
+                    recorded_at.insert(name.clone(), si);
+                } else if let Some((eta_idx, theta_idx)) =
+                    single_anchor_of(expr, theta_names.len(), n_bsv_eta.min(eta_names.len()))
+                {
+                    anchors.push((eta_idx, name.clone(), theta_idx));
                     recorded_at.insert(name.clone(), si);
                 }
                 scope.record(si, name, raw_expr);
@@ -1258,9 +1275,11 @@ fn detect_covariate_mu_refs(
             } => {
                 for (_, body) in branches {
                     retire_superseded_groups_in(&mut found, body);
+                    retire_superseded_groups_in(&mut anchors, body);
                 }
                 if let Some(eb) = else_body {
                     retire_superseded_groups_in(&mut found, eb);
+                    retire_superseded_groups_in(&mut anchors, eb);
                 }
             }
             _ => {}
@@ -1272,24 +1291,80 @@ fn detect_covariate_mu_refs(
     // earlier assignment to the same name is an ordinary reader.
     let recording = |owner: &str| -> &Statement { &stmts[recorded_at[owner]] };
     let all_owners: Vec<&Statement> = found.iter().map(|(_, owner, _)| recording(owner)).collect();
+    // The single anchors whose theta some group reads, materialised from their
+    // own statement (a definition is assigned once, so the view is the one the
+    // walk saw).
+    let group_thetas: Vec<&str> = found
+        .iter()
+        .flat_map(|(_, _, g)| g.theta_names.iter().map(String::as_str))
+        .collect();
+    let anchors: Vec<(usize, String, CovariateMuRef)> = anchors
+        .into_iter()
+        .filter(|&(_, _, t)| group_thetas.contains(&theta_names[t].as_str()))
+        .filter_map(|(eta_idx, owner, _)| {
+            let Statement::Assign(_, raw) = recording(&owner) else {
+                return None;
+            };
+            let (_, entry) = classify_single_anchor(
+                scope.view(recorded_at[&owner], raw),
+                theta_names,
+                eta_names,
+                n_bsv_eta,
+            )?;
+            Some((eta_idx, owner, entry))
+        })
+        .collect();
+    // The same walk stopped at those anchors too, for a joint M-step that also
+    // takes them in (#1630). An anchor reads its one theta and nothing that
+    // carries another's taint (a second theta would have made it a group, an
+    // unresolved name rejects it), so stopping only at the colliding ones is
+    // the same as stopping at all of them. The anchors get every reachability
+    // field a group gets: once absorbed they are members like any other.
+    let owners_and_anchors: Vec<&Statement> = all_owners
+        .iter()
+        .copied()
+        .chain(anchors.iter().map(|(_, owner, _)| recording(owner)))
+        .collect();
+    let fill = |owner: &str, eta_idx: usize, entry: &mut CovariateMuRef| {
+        entry.shared_thetas = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &[recording(owner)],
+            &entry.theta_names,
+        );
+        entry.read_outside_groups = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &all_owners,
+            &entry.theta_names,
+        );
+        entry.read_outside_groups_and_anchors = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &owners_and_anchors,
+            &entry.theta_names,
+        );
+        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+    };
+    let anchors: Vec<CovariateMuRef> = anchors
+        .into_iter()
+        .map(|(eta_idx, owner, mut entry)| {
+            fill(&owner, eta_idx, &mut entry);
+            entry
+        })
+        .collect();
     found
         .into_iter()
         .map(|(eta_idx, owner, mut entry)| {
-            entry.shared_thetas = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &[recording(&owner)],
-                &entry.theta_names,
-            );
-            entry.read_outside_groups = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &all_owners,
-                &entry.theta_names,
-            );
-            entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
+            fill(&owner, eta_idx, &mut entry);
+            entry.colliding_anchors = anchors
+                .iter()
+                .filter(|a| entry.theta_names.contains(&a.theta_names[0]))
+                .cloned()
+                .collect();
             entry
         })
         .collect()
@@ -1307,8 +1382,8 @@ fn detect_covariate_mu_refs(
 /// unconditional and keyed two ways: on the eta the new right-hand side carries
 /// (the same key recording uses) and on the assigned parameter name, which is
 /// the only handle left when the new line carries no eta at all (`CL = TVCL`).
-fn retire_superseded_group<'a, V: RhsView<'a>>(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
+fn retire_superseded_group<'a, V: RhsView<'a>, T>(
+    found: &mut Vec<(usize, String, T)>,
     name: &str,
     expr: V,
 ) {
@@ -1318,10 +1393,7 @@ fn retire_superseded_group<'a, V: RhsView<'a>>(
 
 /// [`retire_superseded_group`] over a conditional body, recursively. Retires
 /// only — see the `Statement::If` arm of [`detect_covariate_mu_refs`].
-fn retire_superseded_groups_in(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
-    stmts: &[Statement],
-) {
+fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts: &[Statement]) {
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => retire_superseded_group(found, name, expr),
@@ -1527,6 +1599,47 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     eta_names: &[String],
     n_bsv_eta: usize,
 ) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n >= 2)
+}
+
+/// `(eta_idx, theta_idx)` when [`classify_single_anchor`] would accept the
+/// right-hand side, without building its typical value — the per-statement
+/// test of [`detect_covariate_mu_refs`], which materialises only the anchors a
+/// group collides with.
+fn single_anchor_of<'a, V: RhsView<'a>>(
+    expr: V,
+    n_thetas: usize,
+    n_bsv_eta: usize,
+) -> Option<(usize, usize)> {
+    let (typical, eta_idx, _) = split_typical_and_eta(expr)?;
+    let read = typical.summary();
+    (eta_idx < n_bsv_eta && !read.other && read.thetas.len() == 1 && read.thetas[0] < n_thetas)
+        .then(|| (eta_idx, read.thetas[0]))
+}
+
+/// The one-theta twin of [`classify_covariate_mu_ref`]: a typical value of
+/// the same shapes and the same admissible reads, with exactly **one** theta —
+/// `V2 = TVV2 * exp(ETA_V2)`, `V = TVV * WT/70 * exp(ETA_V)`. Recorded only so
+/// that a group reading that theta can take the anchor into its joint M-step
+/// (#1630, [`CovariateMuRef::colliding_anchors`]).
+fn classify_single_anchor<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n == 1)
+}
+
+/// [`classify_covariate_mu_ref`] and [`classify_single_anchor`], told apart by
+/// how many thetas the typical value may read.
+fn classify_typical_value<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    theta_count_ok: impl Fn(usize) -> bool,
+) -> Option<(usize, CovariateMuRef)> {
     let (typical, eta_idx, transform) = split_typical_and_eta(expr)?;
     if eta_idx >= n_bsv_eta || eta_idx >= eta_names.len() {
         return None;
@@ -1535,7 +1648,10 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     // rejected line never needs.
     let read = typical.summary();
     let mut theta_idx = read.thetas;
-    if read.other || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
+    if read.other
+        || !theta_count_ok(theta_idx.len())
+        || theta_idx.iter().any(|&i| i >= theta_names.len())
+    {
         return None;
     }
     theta_idx.sort_unstable();
@@ -1546,12 +1662,14 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names: read.covariates,
-            // All three filled by `detect_covariate_mu_refs` once the whole block
+            // All filled by `detect_covariate_mu_refs` once the whole block
             // (and the other blocks' identifiers) are in view; a single
             // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
             read_outside_groups: Vec::new(),
             eta_shared: false,
+            read_outside_groups_and_anchors: Vec::new(),
+            colliding_anchors: Vec::new(),
             typical: typical.build(),
         },
     ))

@@ -4407,7 +4407,12 @@ pub fn run_saem(
         ));
     }
     // A theta anchoring two etas has no single closed-form shift (see
-    // `classify_mu_ref_pairs`); it and both its pairs go to the numerical M-step.
+    // `classify_mu_ref_pairs`); it and both its pairs go to the numerical M-step
+    // — unless a covariate group took both pairs in and moves it (#1630).
+    let dropped_shared_theta: Vec<usize> = dropped_shared_theta
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
     if !dropped_shared_theta.is_empty() && options.mu_referencing {
         let names: Vec<&str> = dropped_shared_theta
             .iter()
@@ -7403,6 +7408,34 @@ mod tests {
         s
     }
 
+    /// `TVP` anchors `ETA_CL` and `ETA_V` both — no single closed-form shift — and
+    /// `{q}` decides whether a covariate group on `ETA_Q` also reads it.
+    fn shared_anchor_model_1630(q: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVP(5.0, 0.01, 100.0)
+  theta TH_Q(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_Q ~ 0.09
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVP * exp(ETA_CL)
+  V  = TVP * 10.0 * exp(ETA_V)
+  Q  = {q}
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=50.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("parses")
+    }
+
     fn covmuref_pop(with_v_eta: bool) -> Population {
         use std::io::Write;
         let csv = covmuref_csv(with_v_eta);
@@ -7668,10 +7701,48 @@ mod tests {
         assert_eq!(res.saem_mu_ref_m_step_evals_saved, None);
     }
 
-    /// A group whose theta is also another eta's single anchor is declined
-    /// with a note naming both, and the fit proceeds on the numerical M-step.
+    /// A theta anchoring two etas is named in the "more than one ETA"
+    /// warning, which says it falls to the numerical M-step — unless a
+    /// covariate group takes both pairs in (#1630), when the group moves it and
+    /// the warning would be false. Both sides of that gate, one test.
     #[test]
-    fn saem_covariate_group_sharing_an_anchor_is_declined_with_a_note() {
+    fn saem_shared_anchor_warning_drops_a_theta_a_group_took_in() {
+        let fit = |q: &str| {
+            let model = shared_anchor_model_1630(q);
+            let pop = covmuref_pop(true);
+            let mut opts = FitOptions::default();
+            opts.method = crate::types::EstimationMethod::Saem;
+            opts.saem_n_exploration = 3;
+            opts.saem_n_convergence = 2;
+            opts.saem_seed = Some(1630);
+            opts.run_covariance_step = false;
+            crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok")
+        };
+        let shared = |r: &crate::types::FitResult| {
+            r.warnings
+                .iter()
+                .any(|w| w.contains("mu-reference anchor of more than one ETA"))
+        };
+        let plain = fit("3.0 * exp(ETA_Q)");
+        assert!(shared(&plain), "control: {:?}", plain.warnings);
+        let grouped = fit("TVP * TH_Q * exp(ETA_Q)");
+        assert!(
+            grouped
+                .warnings
+                .iter()
+                .any(|w| w
+                    .contains("ETA_CL (anchored on TVP) and ETA_V (anchored on TVP) share TVP")),
+            "premise: the group took both pairs in, got {:?}",
+            grouped.warnings
+        );
+        assert!(!shared(&grouped), "{:?}", grouped.warnings);
+    }
+
+    /// A group whose theta is also another eta's plain single anchor takes
+    /// that anchor in as a one-theta member (#1630) — before, it was declined —
+    /// and the fit says so in the joint-step note, end to end through `fit`.
+    #[test]
+    fn saem_covariate_group_sharing_an_anchor_takes_it_in_with_a_note() {
         let src = r"
 [parameters]
   theta TVCL(4.0, 0.0, 100.0)
@@ -7699,12 +7770,19 @@ mod tests {
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
-        let note = res
-            .warnings
-            .iter()
-            .find(|w| w.contains("covariate mu-reference on ETA_V"))
-            .unwrap_or_else(|| panic!("expected the #619 note, got {:?}", res.warnings));
-        assert!(note.contains("TVCL") && note.contains("ETA_CL"), "{note}");
+        assert!(
+            res.warnings.iter().any(|w| w.ends_with(
+                "mu-references on ETA_V (reads TVCL, TH_CRCL) and ETA_CL (anchored on TVCL) \
+                 share TVCL and take one joint M-step that re-centres both (#1620, #1630)."
+            )),
+            "expected the #1630 joint-step note, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings.iter().any(|w| w.contains("is not used")),
+            "{:?}",
+            res.warnings
+        );
     }
 
     #[test]

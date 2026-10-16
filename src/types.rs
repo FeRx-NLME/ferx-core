@@ -3675,7 +3675,8 @@ pub struct CovariateMuRef {
     /// The BSV eta this typical value carries.
     pub eta_name: String,
     /// Every theta the typical value reads, in declaration order. At least two —
-    /// a single-theta typical value is a plain [`MuRef`].
+    /// a single-theta typical value is a plain [`MuRef`] (the crate-internal
+    /// `colliding_anchors` entries are the one exception).
     pub theta_names: Vec<String>,
     /// Which link relates the typical value to the individual parameter:
     /// [`MuTransform::Log`] for `A * exp(η)` / `exp(log(A) + η)`,
@@ -3719,6 +3720,22 @@ pub struct CovariateMuRef {
     /// the group — it forces the prior-plus-data engine, which evaluates the
     /// observation term with the shift applied.
     pub(crate) eta_shared: bool,
+    /// [`Self::read_outside_groups`] with the taint also stopped at every
+    /// recorded **single-anchor** statement (`V2 = TVV2 * exp(ETA_V2)`, see
+    /// [`Self::colliding_anchors`]).
+    ///
+    /// That anchor's `φ_i` is frozen only when the estimator takes it into the
+    /// group (#1630); when it does not, the anchor's theta is live in the data
+    /// after all, and the estimator adds it back. So this field is exact only
+    /// together with that add-back, which is why `read_outside_groups` stays.
+    pub(crate) read_outside_groups_and_anchors: Vec<String>,
+    /// The single-anchor mu-references whose one theta this typical value also
+    /// reads — `V2 = TVV2 * exp(ETA_V2)` next to a group on `V1 = TVV2 * TH_R *
+    /// (WT/70)^TH_WT * exp(ETA_V1)` (#1630). Each is a one-theta entry of this
+    /// same type, its reachability fields filled the same way, so SAEM and
+    /// IMP/IMPMAP can take it into the group's joint M-step as a member instead
+    /// of declining the group. Empty on the entries themselves.
+    pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced already inlined.
     pub(crate) typical: crate::parser::model_parser::Expression,
