@@ -161,11 +161,13 @@ fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
 
 /// Tier-2, #1422: a weight ratio assigned in both arms of an `if`/`else` is the
 /// same covariate group as the direct `(WT/70)^TH_WT` form, so `TH_WT` gets
-/// the group step instead of the "NO associated ETA" advisory. The pair
+/// the group step instead of an un-anchored-theta advisory. The pair
 /// straddles the fold: the #1415 fixture writes the same values through a
 /// local the fold does not resolve (assigned before an `if` with no `else`),
 /// and must still carry the advisory — so a test that passed because the
-/// advisory had stopped being emitted at all would fail here.
+/// advisory had stopped being emitted at all would fail here. Since #1715 that
+/// advisory is the carries-an-ETA one (`TH_WT` shares `CL` with `ETA_CL`), so
+/// the control also pins that it is not reported as ETA-less.
 #[test]
 fn an_if_else_assigned_covariate_local_joins_the_group() {
     let (direct, _) = load("covmuref_power_saem_fit.ferx", "covmuref_power.csv");
@@ -193,19 +195,29 @@ fn an_if_else_assigned_covariate_local_joins_the_group() {
         saem_n_convergence: 1,
         ..saem_opts()
     };
-    let no_eta_advisory_names_th_wt = |model: &ferx_core::CompiledModel| {
+    // (named in the ETA-less advisory, named in the carries-an-ETA advisory)
+    let advisories_naming_th_wt = |model: &ferx_core::CompiledModel| {
         let result = fit(model, &pop, &model.default_params, &opts).expect("short SAEM must run");
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT"))
+        let names = |phrase: &str| {
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains(phrase) && w.contains("TH_WT"))
+        };
+        (
+            names("NO associated ETA"),
+            names("but not as a mu-referenced typical value"),
+        )
     };
-    assert!(
-        no_eta_advisory_names_th_wt(&numeric),
-        "control: the unresolved local must still leave TH_WT on the numerical M-step"
+    assert_eq!(
+        advisories_naming_th_wt(&numeric),
+        (false, true),
+        "control: the unresolved local must still leave TH_WT on the numerical M-step, \
+         reported as carrying an ETA (#1715)"
     );
-    assert!(
-        !no_eta_advisory_names_th_wt(&ifelse),
+    assert_eq!(
+        advisories_naming_th_wt(&ifelse),
+        (false, false),
         "the if/else local must put TH_WT in the covariate group"
     );
 }
@@ -327,7 +339,7 @@ fn saem_recovers_the_allometric_exponent_through_an_if_else_local() {
 /// the weight covariate goes through a local assigned before an `if` with no
 /// `else` and again in its arm, which the #619 classifier cannot resolve (the
 /// `if`/`else` form this fixture used before #1422 is now a group), so `TH_WT`
-/// carries no ETA and is moved only by the eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
+/// anchors no mu-reference and is moved only by the eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
 /// [`saem_recovers_the_allometric_exponent`].
 ///
 /// Before #1415 this fixture reproduced the issue exactly: the M-step's NLopt
@@ -362,8 +374,10 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT")),
-        "TH_WT must be reported as the no-ETA numerical-M-step theta: {:?}",
+            // #1715: TH_WT shares `CL` with ETA_CL, so it is named in the
+            // carries-an-ETA advisory, not the ETA-less one.
+            .any(|w| w.contains("but not as a mu-referenced typical value") && w.contains("TH_WT")),
+        "TH_WT must be reported as the un-anchored numerical-M-step theta: {:?}",
         result.warnings
     );
     let th_wt = theta(&result, "TH_WT");
@@ -433,7 +447,7 @@ fn imp_recovers_the_additive_renal_gradient() {
 /// nightly runs behind `score_sa` (#1475).
 ///
 /// **Why this fixture is the right regression.** `TH_WT` here is the whole
-/// point of #1458: it carries no ETA, defeats covariate mu-reference detection
+/// point of #1458: it shares `CL` with `ETA_CL` but defeats covariate mu-reference detection
 /// (asserted below, as in the test above), and therefore moves *only* through
 /// the numerical M-step. NONMEM 7.5.1 `METHOD=SAEM` on the same data and the
 /// same start puts it at 0.921283, which is an external reference rather than
